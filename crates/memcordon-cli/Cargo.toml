@@ -1,0 +1,20 @@
+[package]
+name = "memcordon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+libc.workspace = true
+memcordon-core = { path = "../memcordon-core" }
+memcordon-platform = { path = "../memcordon-platform" }
+serde_json.workspace = true
+
+[dev-dependencies]
+memcordon-testkit = { path = "../memcordon-testkit" }
+
+[lints]
+workspace = true
+
