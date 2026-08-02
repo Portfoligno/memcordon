@@ -202,7 +202,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: fuzz/target
-          key: cargo-target-release-v1-fuzz-nightly-2026-07-31-${{ hashFiles('fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'crates/**') }}
+          key: cargo-target-release-v2-fuzz-nightly-2026-07-31-${{ hashFiles('fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'crates/**', 'tools/**', 'ci/tools.toml', 'ci/toolchains.toml') }}
       - id: fuzz-tools
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:

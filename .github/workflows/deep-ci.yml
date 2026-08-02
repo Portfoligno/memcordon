@@ -69,8 +69,10 @@ jobs:
       - id: fuzz-target
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: target/ci
-          key: cargo-target-deep-v1-fuzz-nightly-2026-07-31-${{ hashFiles('Cargo.lock', 'fuzz/**', 'crates/**', 'tools/**', 'ci/tools.toml') }}
+          path: |
+            target/ci
+            fuzz/target
+          key: cargo-target-deep-v2-fuzz-nightly-2026-07-31-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'crates/**', 'tools/**', 'ci/tools.toml', 'ci/toolchains.toml') }}
       - id: fuzz-tools
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -81,7 +83,9 @@ jobs:
       - if: always() && steps.fuzz-target.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: target/ci
+          path: |
+            target/ci
+            fuzz/target
           key: ${{ steps.fuzz-target.outputs.cache-primary-key }}
       - if: always() && steps.fuzz-tools.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -105,8 +109,6 @@ jobs:
         include:
           - id: linux-x64
             runner: ubuntu-24.04
-          - id: linux-arm64
-            runner: ubuntu-24.04-arm
           - id: macos-arm64
             runner: macos-15
           - id: macos-x64

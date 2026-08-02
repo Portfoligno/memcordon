@@ -5,6 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use memcordon_ci::capability;
+
 use crate::command::{CommandSpec, git, rustup_cargo};
 use crate::config;
 use crate::{CiError, Result, Suite, policy, release};
@@ -209,7 +211,7 @@ fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
         .join("ci-tools")
         .join("bin")
         .join("cargo-fuzz");
-    for target in [
+    let targets = [
         "byte_size",
         "cleanup_json",
         "duration",
@@ -219,8 +221,21 @@ fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
         "report_json",
         "state_machine",
         "workflow_parser",
-    ] {
-        CommandSpec::new("rustup", root, Duration::from_secs(120))
+    ];
+    for target in targets {
+        CommandSpec::new("rustup", root, CARGO_DEADLINE)
+            .args([
+                OsString::from("run"),
+                OsString::from(nightly),
+                cargo_fuzz.clone().into_os_string(),
+                OsString::from("fuzz"),
+                OsString::from("build"),
+                OsString::from(target),
+            ])
+            .run()?;
+    }
+    for target in targets {
+        CommandSpec::new("rustup", root, Duration::from_secs(5 * 60))
             .args([
                 OsString::from("run"),
                 OsString::from(nightly),
@@ -260,6 +275,19 @@ fn stress(root: &Path, stable: &str) -> Result<()> {
             "--release",
         ],
     )?;
+    let probe = capability::probe(
+        root,
+        stable,
+        &root.join("target").join("ci").join("stress"),
+        CARGO_DEADLINE,
+    )?;
+    if cfg!(target_os = "linux") && capability::selected(&probe).is_none() {
+        eprintln!(
+            "deep backend-dependent stress is unavailable on this runner; mandatory protected backend certification remains authoritative: {probe}"
+        );
+        return Ok(());
+    }
+    capability::require_selected(&probe)?;
     cargo(
         root,
         stable,

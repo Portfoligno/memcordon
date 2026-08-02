@@ -16,6 +16,8 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
+use memcordon_ci::capability;
+
 use crate::command::{CommandSpec, git, rustup_cargo};
 use crate::config::{self, AssetTarget, RegistryCredentialPolicy};
 use crate::{CiError, ReleasePhase, Result};
@@ -1123,37 +1125,42 @@ pub fn native_asset(root: &Path) -> Result<()> {
         RELEASE_DEADLINE,
     )
     .run()?;
-    rustup_cargo(
-        root,
-        &toolchains.stable,
-        [
-            "test",
-            "--target-dir",
-            "target/ci/release-native",
-            "--package",
-            "memcordon",
-            "--features",
-            "test-fixtures",
-            "--test",
-            "stress",
-            "--release",
-            "--locked",
-            "--",
-            "release_short_children_are_bounded_reaped_and_observed",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ],
-        RELEASE_DEADLINE,
-    )
-    .run()?;
+    let release_target = root.join("target").join("ci").join("release-native");
+    let probe = capability::probe(root, &toolchains.stable, &release_target, RELEASE_DEADLINE)?;
+    if capability::selected(&probe).is_some() {
+        rustup_cargo(
+            root,
+            &toolchains.stable,
+            [
+                "test",
+                "--target-dir",
+                "target/ci/release-native",
+                "--package",
+                "memcordon",
+                "--features",
+                "test-fixtures",
+                "--test",
+                "stress",
+                "--release",
+                "--locked",
+                "--",
+                "release_short_children_are_bounded_reaped_and_observed",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            RELEASE_DEADLINE,
+        )
+        .run()?;
+    } else {
+        eprintln!(
+            "release-native backend-dependent stress is unavailable on this runner; required dedicated backend certification remains authoritative: {probe}"
+        );
+    }
     let arguments = vec![
         OsString::from("build"),
         OsString::from("--target-dir"),
-        root.join("target")
-            .join("ci")
-            .join("release-native")
-            .into_os_string(),
+        release_target.into_os_string(),
         OsString::from("--package"),
         OsString::from("memcordon"),
         OsString::from("--release"),
