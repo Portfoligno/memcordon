@@ -28,7 +28,7 @@ flate2 = "1.1.2"
 hex = "0.4.3"
 semver = { version = "1.0.26", features = ["serde"] }
 serde_yaml = "0.9.34"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 syn = { version = "2.0.111", features = ["full", "visit"] }
 tar = "0.4.44"
 tempfile = "3.20.0"
