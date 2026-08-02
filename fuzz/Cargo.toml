@@ -1,0 +1,80 @@
+[package]
+name = "memcordon-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+memcordon-core = { path = "../crates/memcordon-core" }
+memcordon = { path = "../crates/memcordon-cli" }
+memcordon-ci = { path = "../tools/memcordon-ci" }
+serde_json = "1"
+
+[[bin]]
+name = "byte_size"
+path = "fuzz_targets/byte_size.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "outcome_sequences"
+path = "fuzz_targets/outcome_sequences.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "report_json"
+path = "fuzz_targets/report_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "duration"
+path = "fuzz_targets/duration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "outcome_json"
+path = "fuzz_targets/outcome_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cleanup_json"
+path = "fuzz_targets/cleanup_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_machine"
+path = "fuzz_targets/state_machine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_parser"
+path = "fuzz_targets/policy_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "workflow_parser"
+path = "fuzz_targets/workflow_parser.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

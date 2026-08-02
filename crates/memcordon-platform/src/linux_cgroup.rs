@@ -22,27 +22,8 @@ const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
 pub fn probe() -> ProbeReport {
     match delegated_parent() {
         Ok(path) => {
-            let required = [
-                "cgroup.procs",
-                "cgroup.events",
-                "memory.current",
-                "memory.events",
-                "memory.max",
-            ];
-            if let Some(missing) = required.iter().find(|name| !path.join(name).exists()) {
-                return unavailable(format!(
-                    "delegated cgroup {} lacks {missing}",
-                    path.display()
-                ));
-            }
-            if fs::metadata(&path)
-                .map(|metadata| metadata.permissions().readonly())
-                .unwrap_or(true)
-            {
-                return unavailable(format!(
-                    "delegated cgroup {} is not writable",
-                    path.display()
-                ));
+            if let Err(error) = probe_delegated_parent(&path) {
+                return unavailable(error);
             }
             let backend = info();
             ProbeReport {
@@ -53,6 +34,61 @@ pub fn probe() -> ProbeReport {
         }
         Err(error) => unavailable(error),
     }
+}
+
+fn probe_delegated_parent(parent: &Path) -> Result<(), String> {
+    let child = create_cgroup(parent).map_err(|error| {
+        format!(
+            "cannot create a probe cgroup under {}: {error}",
+            parent.display()
+        )
+    })?;
+    let controls = check_probe_cgroup(&child);
+    let removal = fs::remove_dir(&child).map_err(|error| {
+        format!(
+            "cannot remove the empty probe cgroup {}: {error}",
+            child.display()
+        )
+    });
+    match (controls, removal) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(check_error), Err(removal_error)) => Err(format!("{check_error}; {removal_error}")),
+    }
+}
+
+fn check_probe_cgroup(path: &Path) -> Result<(), String> {
+    let required = [
+        "cgroup.procs",
+        "cgroup.events",
+        "memory.current",
+        "memory.events",
+        "memory.max",
+    ];
+    if let Some(missing) = required.iter().find(|name| !path.join(name).exists()) {
+        return Err(format!("probe cgroup {} lacks {missing}", path.display()));
+    }
+    for readable in [
+        "cgroup.procs",
+        "cgroup.events",
+        "memory.current",
+        "memory.events",
+        "memory.max",
+    ] {
+        fs::read_to_string(path.join(readable)).map_err(|error| {
+            format!(
+                "cannot read {readable} in probe cgroup {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    fs::write(path.join("memory.max"), "max\n").map_err(|error| {
+        format!(
+            "cannot write memory.max in probe cgroup {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn unavailable(reason: String) -> ProbeReport {
@@ -178,6 +214,7 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
         let _ = guardian.disarm();
         return Err(setup_io(error));
     }
+    let monitor_failure_ready = monitor_failure_ready_file(command);
     let mut stored = None;
     let mut peak = 0_u64;
     let mut outcome = loop {
@@ -225,7 +262,7 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
             };
         }
 
-        let usage = match cgroup.current() {
+        let usage = match cgroup.current(monitor_failure_ready.as_deref()) {
             Ok(usage) => usage,
             Err(error) => {
                 let cleanup = cgroup.cleanup_workload(&mut child, &mut stored, true);
@@ -375,7 +412,12 @@ impl Cgroup {
         parse_key_values(&fs::read_to_string(self.path.join("memory.events"))?)
     }
 
-    fn current(&self) -> io::Result<u64> {
+    fn current(&self, monitor_failure_ready: Option<&Path>) -> io::Result<u64> {
+        if monitor_failure_ready.is_some_and(Path::exists) {
+            return Err(io::Error::other(
+                "certification fixture induced a supervisor monitor read failure",
+            ));
+        }
         parse_u64_file(&self.path.join("memory.current"))
     }
 
@@ -482,6 +524,22 @@ impl Cgroup {
     fn remove(&mut self) -> io::Result<()> {
         fs::remove_dir(&self.path)
     }
+}
+
+#[cfg(feature = "test-support")]
+fn monitor_failure_ready_file(command: &CommandSpec) -> Option<PathBuf> {
+    if Path::new(command.program()).file_name()?.to_str()? != "memcordon-test-fixture"
+        || command.arguments().first()?.to_str()? != "monitor-failure"
+        || command.arguments().get(1)?.to_str()? != "--pid-file"
+    {
+        return None;
+    }
+    command.arguments().get(2).map(PathBuf::from)
+}
+
+#[cfg(not(feature = "test-support"))]
+fn monitor_failure_ready_file(_command: &CommandSpec) -> Option<PathBuf> {
+    None
 }
 
 impl Drop for Cgroup {
@@ -659,8 +717,12 @@ fn cleanup_error(operation: &str, error: io::Error) -> CleanupErrorRecord {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
 
-    use super::limit_delta;
+    use memcordon_core::{ByteSize, Policy};
+    use tempfile::TempDir;
+
+    use super::{Cgroup, limit_delta};
 
     #[test]
     fn limit_evidence_requires_counter_delta() {
@@ -668,5 +730,57 @@ mod tests {
         assert!(limit_delta(&baseline, &baseline).is_none());
         let current = HashMap::from([("max".to_owned(), 5)]);
         assert!(limit_delta(&baseline, &current).is_some());
+    }
+
+    #[test]
+    fn cgroup_controls_are_written_exactly() {
+        let temporary = TempDir::new().expect("temporary cgroup should exist");
+        for control in ["memory.oom.group", "memory.max", "memory.swap.max"] {
+            fs::write(temporary.path().join(control), b"").expect("control should exist");
+        }
+        let cgroup = Cgroup {
+            path: temporary.path().to_path_buf(),
+        };
+        let expected_limit = ByteSize::from_bytes(192 * 1024 * 1024);
+        let policy = Policy::new(expected_limit);
+        cgroup
+            .configure(&policy)
+            .expect("controls should configure");
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("memory.max")).expect("memory.max"),
+            format!("{}\n", expected_limit.bytes())
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("memory.swap.max")).expect("memory.swap.max"),
+            "0\n"
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("memory.oom.group"))
+                .expect("memory.oom.group"),
+            "1\n"
+        );
+    }
+
+    #[test]
+    fn monitor_file_errors_are_reported_instead_of_treated_as_success() {
+        let temporary = TempDir::new().expect("temporary cgroup should exist");
+        let cgroup = Cgroup {
+            path: temporary.path().to_path_buf(),
+        };
+        assert!(cgroup.current(None).is_err());
+        assert!(cgroup.memory_events().is_err());
+        assert!(cgroup.populated().is_err());
+    }
+
+    #[test]
+    fn cgroup_identity_verification_rejects_the_wrong_process() {
+        let temporary = TempDir::new().expect("temporary cgroup should exist");
+        fs::write(temporary.path().join("cgroup.procs"), "41\n42\n")
+            .expect("membership should write");
+        let cgroup = Cgroup {
+            path: temporary.path().to_path_buf(),
+        };
+        cgroup.verify(42).expect("member should verify");
+        assert!(cgroup.verify(43).is_err());
     }
 }

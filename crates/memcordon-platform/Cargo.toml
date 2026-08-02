@@ -4,17 +4,30 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+description = "Native Linux, macOS, and Windows workload-containment backends for MemCordon"
+keywords = ["memory", "cgroup", "job-object", "process"]
+categories = ["os", "development-tools"]
+publish = ["crates-io"]
+
+[features]
+test-support = []
 
 [dependencies]
 libc.workspace = true
-memcordon-core = { path = "../memcordon-core" }
+memcordon-core = { path = "../memcordon-core", version = "=0.1.0-dev" }
 serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_SystemInformation",

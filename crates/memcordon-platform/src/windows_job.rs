@@ -19,8 +19,8 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_ASSOCIATE_COMPLETION_PORT,
-    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOBOBJECT_NOTIFICATION_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
     JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
@@ -131,14 +131,7 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
     job.configure(policy.memory.bytes()).map_err(setup_error)?;
     let mut process =
         SuspendedProcess::create(command).map_err(|error| spawn_error(error, command))?;
-    if let Err(error) = job.assign(process.process) {
-        process.terminate();
-        return Err(setup_error(error));
-    }
-    process.resume().map_err(|error| {
-        process.terminate();
-        setup_error(error)
-    })?;
+    assign_then_resume(&job, &mut process).map_err(setup_error)?;
 
     let child_pid = process.id;
     let mut peak = 0_u64;
@@ -240,6 +233,19 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
     })
 }
 
+fn assign_then_resume(job: &Job, process: &mut SuspendedProcess) -> io::Result<()> {
+    if let Err(error) = job.assign(process.process) {
+        process.terminate();
+        return Err(error);
+    }
+    if let Err(error) = process.resume() {
+        process.terminate();
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
 struct Job {
     handle: HANDLE,
     completion_port: HANDLE,
@@ -261,7 +267,7 @@ impl Job {
             unsafe { CloseHandle(handle) };
             return Err(error);
         }
-        let association = JOB_OBJECT_ASSOCIATE_COMPLETION_PORT {
+        let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
             CompletionKey: handle,
             CompletionPort: completion_port,
         };
@@ -271,8 +277,7 @@ impl Job {
                 handle,
                 JobObjectAssociateCompletionPortInformation,
                 (&raw const association).cast(),
-                u32::try_from(size_of::<JOB_OBJECT_ASSOCIATE_COMPLETION_PORT>())
-                    .unwrap_or(u32::MAX),
+                u32::try_from(size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>()).unwrap_or(u32::MAX),
             )
         };
         if result == 0 {
@@ -475,7 +480,9 @@ impl Drop for Job {
         // SAFETY: both handles are uniquely owned and closed exactly once.
         unsafe {
             CloseHandle(self.completion_port);
-            CloseHandle(self.handle);
+            if !self.handle.is_null() {
+                CloseHandle(self.handle);
+            }
         }
     }
 }
@@ -631,13 +638,130 @@ fn cleanup_error(operation: &str, error: io::Error) -> CleanupErrorRecord {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::fs;
 
-    use super::quote_windows;
+    use memcordon_core::CommandSpec;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    use super::{
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, Job, SuspendedProcess,
+        assign_then_resume, quote_windows,
+    };
 
     #[test]
     fn windows_quoting_preserves_spaces_and_quotes() {
         assert_eq!(quote_windows(OsStr::new("plain")), "plain");
         assert_eq!(quote_windows(OsStr::new("two words")), "\"two words\"");
         assert_eq!(quote_windows(OsStr::new("a\"b")), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn target_remains_suspended_until_successful_job_assignment() {
+        let command = CommandSpec::new("cmd.exe").args(["/C", "exit", "0"]);
+        let mut process = SuspendedProcess::create(&command).expect("target should be created");
+        // SAFETY: process handle is live and queried without mutation.
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.process, 0) },
+            WAIT_TIMEOUT
+        );
+        let job = Job::create().expect("job should be created");
+        job.configure(256 * 1024 * 1024)
+            .expect("job should configure");
+        job.assign(process.process)
+            .expect("suspended target should enter job");
+        assert_eq!(job.active_processes().expect("active count"), 1);
+        process
+            .resume()
+            .expect("target should resume after assignment");
+        // SAFETY: process handle remains live until process is dropped.
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.process, 5_000) },
+            WAIT_OBJECT_0
+        );
+    }
+
+    #[test]
+    fn kill_on_job_close_terminates_a_running_member() {
+        let command = CommandSpec::new("cmd.exe").args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+        let mut process = SuspendedProcess::create(&command).expect("target should be created");
+        let job = Job::create().expect("job should be created");
+        job.configure(256 * 1024 * 1024)
+            .expect("job should configure");
+        job.assign(process.process)
+            .expect("target should enter job");
+        process.resume().expect("target should resume");
+        assert!(job.active_processes().expect("active count") > 0);
+        drop(job);
+        // SAFETY: process handle remains live until process is dropped.
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.process, 5_000) },
+            WAIT_OBJECT_0
+        );
+    }
+
+    #[test]
+    fn nested_assignment_is_accounted_by_the_memcordon_job() {
+        let command = CommandSpec::new("cmd.exe").args(["/C", "exit", "0"]);
+        let mut process = SuspendedProcess::create(&command).expect("target should be created");
+        let outer = Job::create().expect("outer job should be created");
+        outer
+            .configure(512 * 1024 * 1024)
+            .expect("outer job should configure");
+        outer
+            .assign(process.process)
+            .expect("target should enter outer job");
+        let memcordon = Job::create().expect("MemCordon job should be created");
+        memcordon
+            .configure(256 * 1024 * 1024)
+            .expect("MemCordon job should configure");
+        memcordon
+            .assign(process.process)
+            .expect("nested target should enter the MemCordon job");
+        assert_eq!(
+            memcordon.active_processes().expect("inner active count"),
+            1,
+            "membership must be accounted by the MemCordon job, not merely an outer job"
+        );
+        let limits = memcordon
+            .query()
+            .expect("MemCordon job limits should query");
+        assert_eq!(limits.JobMemoryLimit, 256 * 1024 * 1024);
+        assert_eq!(
+            limits.BasicLimitInformation.LimitFlags
+                & (JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE),
+            JOB_OBJECT_LIMIT_JOB_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        );
+        process.resume().expect("nested target should resume");
+        // SAFETY: process handle remains live until process is dropped.
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.process, 5_000) },
+            WAIT_OBJECT_0
+        );
+    }
+
+    #[test]
+    fn assignment_failure_terminates_suspended_target_before_execution() {
+        let temporary = tempfile::tempdir().expect("temporary directory should exist");
+        let marker = temporary.path().join("target-executed.txt");
+        let script = format!("echo executed>\"{}\"", marker.display());
+        let command = CommandSpec::new("cmd.exe").args(["/D", "/S", "/C", &script]);
+        let mut process = SuspendedProcess::create(&command).expect("target should be created");
+        let mut invalid_job = Job::create().expect("job should be created");
+        // SAFETY: invalidate the uniquely owned handle to exercise the production assignment
+        // failure path. Drop observes the null replacement and does not close it twice.
+        unsafe { CloseHandle(invalid_job.handle) };
+        invalid_job.handle = std::ptr::null_mut();
+        assert!(assign_then_resume(&invalid_job, &mut process).is_err());
+        // SAFETY: assignment failure synchronously terminates and waits for the suspended target.
+        assert_eq!(
+            unsafe { WaitForSingleObject(process.process, 0) },
+            WAIT_OBJECT_0
+        );
+        assert!(
+            fs::metadata(marker).is_err(),
+            "target executed despite MemCordon job assignment failure"
+        );
     }
 }

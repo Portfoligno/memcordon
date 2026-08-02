@@ -1,0 +1,59 @@
+schema_version = 1
+repository = "Portfoligno/memcordon"
+workflow = "release.yml"
+registry = "crates-io"
+publish_packages = ["memcordon-core", "memcordon-platform", "memcordon"]
+github_api_version = "2022-11-28"
+maximum_package_bytes = 10485760
+maximum_asset_bytes = 134217728
+
+[registry_credentials]
+policy = "first-release-token-primary"
+first_release_version = "0.1.0"
+
+[assets]
+output_directory = "target/ci/release-bundle"
+manifest = "release-manifest.json"
+publication_report = "publication-report.json"
+checksums = "SHA256SUMS"
+notes = "RELEASE_NOTES.md"
+
+[[assets.target]]
+id = "linux-x64"
+rust_target = "x86_64-unknown-linux-gnu"
+archive = "tar-gz"
+executable = "memcordon"
+
+[[assets.target]]
+id = "linux-arm64"
+rust_target = "aarch64-unknown-linux-gnu"
+archive = "tar-gz"
+executable = "memcordon"
+
+[[assets.target]]
+id = "macos-arm64"
+rust_target = "aarch64-apple-darwin"
+archive = "tar-gz"
+executable = "memcordon"
+
+[[assets.target]]
+id = "macos-x64"
+rust_target = "x86_64-apple-darwin"
+archive = "tar-gz"
+executable = "memcordon"
+
+[[assets.target]]
+id = "windows-x64"
+rust_target = "x86_64-pc-windows-msvc"
+archive = "zip"
+executable = "memcordon.exe"
+
+[registry_wait]
+initial_milliseconds = 500
+maximum_milliseconds = 8000
+total_seconds = 300
+
+[network_retry]
+initial_milliseconds = 500
+maximum_milliseconds = 8000
+total_seconds = 120

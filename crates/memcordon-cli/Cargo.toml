@@ -4,17 +4,31 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+description = "Cross-platform command memory containment and watchdog CLI"
+keywords = ["memory", "process", "cgroup", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+publish = ["crates-io"]
+
+[features]
+test-fixtures = ["memcordon-platform/test-support"]
+
+[[bin]]
+name = "memcordon-test-fixture"
+path = "src/bin/memcordon-test-fixture.rs"
+required-features = ["test-fixtures"]
 
 [dependencies]
 clap.workspace = true
 libc.workspace = true
-memcordon-core = { path = "../memcordon-core" }
-memcordon-platform = { path = "../memcordon-platform" }
+memcordon-core = { path = "../memcordon-core", version = "=0.1.0-dev" }
+memcordon-platform = { path = "../memcordon-platform", version = "=0.1.0-dev" }
 serde_json.workspace = true
 
 [dev-dependencies]
 memcordon-testkit = { path = "../memcordon-testkit" }
+toml.workspace = true
 
 [lints]
 workspace = true
-

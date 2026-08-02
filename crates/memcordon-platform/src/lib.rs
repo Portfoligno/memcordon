@@ -8,6 +8,8 @@ mod linux_cgroup;
 #[cfg(target_os = "macos")]
 mod macos_watchdog;
 mod signal;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 mod unix_watchdog;
 #[cfg(target_os = "windows")]

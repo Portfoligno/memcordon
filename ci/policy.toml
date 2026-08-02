@@ -1,0 +1,84 @@
+[workspace]
+production_packages = [
+  "memcordon-core",
+  "memcordon-platform",
+  "memcordon",
+  "memcordon-testkit",
+]
+ci_packages = ["memcordon-ci"]
+publish_packages = ["memcordon-core", "memcordon-platform", "memcordon"]
+non_publish_packages = ["memcordon-testkit", "memcordon-ci"]
+
+[workflow]
+required_public_matrix = [
+  "linux-x64",
+  "linux-arm64",
+  "macos-arm64",
+  "macos-x64",
+  "windows-x64",
+]
+self_extracting_shell_allowlist = []
+allowed_run_commands = [
+  "rustup toolchain install 1.97.1 --profile minimal",
+  "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",
+  "rustup toolchain install 1.85.0 --profile minimal",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite policy",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite quality",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite msrv",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite native",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite supply-chain",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite miri",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite fuzz",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite stress",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-macos-watchdog",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite release-preflight",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite release-native",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite release-macos",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- release assemble",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release stage-github",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release publish-next",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release verify-crates",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/verify-bootstrap --package memcordon-ci -- release verify-public",
+]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "GITHUB_TOKEN"
+source = "${{ github.token }}"
+steps = ["Stage GitHub draft and assets", "Finalize GitHub release"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRY_TOKEN"
+source = "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+steps = [
+  "Publish next crate in stored-token slot 1",
+  "Publish next crate in stored-token slot 2",
+  "Publish next crate in stored-token slot 3",
+]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRY_TOKEN"
+source = "${{ steps.crates_auth_fallback_1.outputs.token }}"
+steps = ["Publish next crate in OIDC fallback slot 1"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRY_TOKEN"
+source = "${{ steps.crates_auth_fallback_2.outputs.token }}"
+steps = ["Publish next crate in OIDC fallback slot 2"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRY_TOKEN"
+source = "${{ steps.crates_auth_fallback_3.outputs.token }}"
+steps = ["Publish next crate in OIDC fallback slot 3"]
+
+[test]
+fast_short_child_iterations = 128
+deep_short_child_iterations = 4096
+release_short_child_iterations = 4096

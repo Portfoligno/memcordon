@@ -1,0 +1,8 @@
+paths = [
+  "docs/assets/banner.png",
+  "docs/assets/how-it-works.png",
+  "docs/assets/key-guarantees.png",
+  "docs/assets/logo.png",
+  "docs/assets/platform-architecture.png",
+]
+extensions = []

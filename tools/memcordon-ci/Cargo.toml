@@ -1,0 +1,31 @@
+[package]
+name = "memcordon-ci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+cargo_metadata.workspace = true
+clap.workspace = true
+flate2.workspace = true
+hex.workspace = true
+memcordon-testkit = { path = "../../crates/memcordon-testkit", version = "=0.1.0-dev" }
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+syn.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+ureq.workspace = true
+walkdir.workspace = true
+zip.workspace = true
+
+[lints]
+workspace = true

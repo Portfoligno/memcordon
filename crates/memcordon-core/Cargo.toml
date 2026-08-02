@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+description = "Platform-neutral memory-limit policy, outcome, and report types for MemCordon"
+keywords = ["memory", "process", "containment", "limits"]
+categories = ["development-tools"]
+publish = ["crates-io"]
 
 [dependencies]
 serde.workspace = true
@@ -12,4 +18,3 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
-
