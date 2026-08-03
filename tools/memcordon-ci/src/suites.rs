@@ -583,6 +583,8 @@ fn certification(
             "--locked",
             "--package",
             "memcordon",
+            "--bin",
+            "memcordon",
             "--",
             "probe",
             "--json",

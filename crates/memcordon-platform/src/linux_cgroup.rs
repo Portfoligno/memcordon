@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
@@ -222,12 +222,6 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
             "child PID cannot be represented by native APIs",
         )
     })?;
-    // SAFETY: the launcher is blocked and `child_pid` identifies it. Establishing its own process
-    // group before release ensures signal forwarding cannot include the wrapper.
-    if unsafe { libc::setpgid(child_pid, child_pid) } != 0 {
-        abort_gated(&mut child, release_fd);
-        return Err(setup_io(io::Error::last_os_error()));
-    }
     if let Err(error) = cgroup
         .assign(child_pid)
         .and_then(|()| cgroup.verify(child_pid))
@@ -252,8 +246,66 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
     let mut stored = None;
     let mut peak = 0_u64;
     let mut outcome = loop {
-        match try_reap(&mut child, &mut stored) {
-            Ok(Some(status))
+        let direct_status = match try_reap(&mut child, &mut stored) {
+            Ok(status) => status,
+            Err(error) => {
+                let cleanup = cgroup.cleanup_workload(&mut child, &mut stored, true);
+                break RunOutcome::MonitorFailed {
+                    error: format!("direct-child wait failed: {error}"),
+                    child_after_termination: stored.clone(),
+                    cleanup,
+                };
+            }
+        };
+
+        let events = match cgroup.memory_events() {
+            Ok(events) => events,
+            Err(error) => {
+                let cleanup = cgroup.cleanup_workload(&mut child, &mut stored, true);
+                break RunOutcome::MonitorFailed {
+                    error: format!("memory.events read failed: {error}"),
+                    child_after_termination: stored.clone(),
+                    cleanup,
+                };
+            }
+        };
+        // A cgroup OOM can reap the direct child before the next monitor pass. Collect the
+        // authoritative kernel event before classifying that stored SIGKILL as an ordinary exit.
+        if let Some(mut detail) = limit_delta(&baseline, &events) {
+            let observed = match cgroup.current(monitor_failure_ready.as_deref()) {
+                Ok(usage) => {
+                    peak = peak.max(usage);
+                    Some(ByteSize::from_bytes(usage))
+                }
+                Err(error) => {
+                    detail.push_str("; memory.current unavailable after confirmed limit: ");
+                    detail.push_str(&error.to_string());
+                    None
+                }
+            };
+            if !policy.limit_grace.is_zero() {
+                cgroup.signal_group(child_pid, libc::SIGTERM);
+                thread::sleep(policy.limit_grace);
+            }
+            let cleanup = cgroup.cleanup_workload(&mut child, &mut stored, true);
+            break RunOutcome::LimitExceeded {
+                limit: policy.memory,
+                observed,
+                peak: Some(ByteSize::from_bytes(
+                    cgroup.peak().unwrap_or(peak).max(peak),
+                )),
+                evidence: LimitEvidence {
+                    backend: "linux-cgroup-v2".to_owned(),
+                    metric: "linux-cgroup-memory".to_owned(),
+                    detail,
+                },
+                child_after_termination: stored.clone(),
+                cleanup,
+            };
+        }
+
+        match direct_status {
+            Some(status)
                 if policy.lifetime == Lifetime::Command || !cgroup.populated().unwrap_or(true) =>
             {
                 let cleanup = if policy.lifetime == Lifetime::Workload {
@@ -273,16 +325,9 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
                     cleanup,
                 };
             }
-            Ok(_) => {}
-            Err(error) => {
-                let cleanup = cgroup.cleanup_workload(&mut child, &mut stored, true);
-                break RunOutcome::MonitorFailed {
-                    error: format!("direct-child wait failed: {error}"),
-                    child_after_termination: stored.clone(),
-                    cleanup,
-                };
-            }
+            _ => {}
         }
+
         if let Some(signal) = signal_source.take() {
             cgroup.signal_group(child_pid, signal);
             if !policy.signal_grace.is_zero() {
@@ -308,38 +353,6 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
             }
         };
         peak = peak.max(usage);
-        let events = match cgroup.memory_events() {
-            Ok(events) => events,
-            Err(error) => {
-                let cleanup = cgroup.cleanup_workload(&mut child, &mut stored, true);
-                break RunOutcome::MonitorFailed {
-                    error: format!("memory.events read failed: {error}"),
-                    child_after_termination: stored.clone(),
-                    cleanup,
-                };
-            }
-        };
-        if let Some(detail) = limit_delta(&baseline, &events) {
-            if !policy.limit_grace.is_zero() {
-                cgroup.signal_group(child_pid, libc::SIGTERM);
-                thread::sleep(policy.limit_grace);
-            }
-            let cleanup = cgroup.cleanup_workload(&mut child, &mut stored, true);
-            break RunOutcome::LimitExceeded {
-                limit: policy.memory,
-                observed: Some(ByteSize::from_bytes(usage)),
-                peak: Some(ByteSize::from_bytes(
-                    cgroup.peak().unwrap_or(peak).max(peak),
-                )),
-                evidence: LimitEvidence {
-                    backend: "linux-cgroup-v2".to_owned(),
-                    metric: "linux-cgroup-memory".to_owned(),
-                    detail,
-                },
-                child_after_termination: stored.clone(),
-                cleanup,
-            };
-        }
         thread::sleep(policy.poll_interval);
     };
 
@@ -700,7 +713,10 @@ fn spawn_gated(command: &CommandSpec) -> Result<(Child, RawFd), Error> {
         return Err(setup_io(error));
     }
     let mut builder = Command::new(std::env::current_exe().map_err(setup_io)?);
+    // Establish the launcher's process group in the child before exec. A parent-side setpgid
+    // after Command::spawn returns is too late because the launcher executable has already run.
     builder
+        .process_group(0)
         .arg("__launcher")
         .arg(descriptors[0].to_string())
         .arg("--")

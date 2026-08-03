@@ -202,7 +202,13 @@ fn certified_backend_preserves_ordinary_status_and_reaps() {
         Duration::from_secs(5),
     )
     .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(output.status.code(), Some(37));
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "stdout={:?}; stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_stdout_empty(&output);
 }
 
@@ -227,7 +233,13 @@ fn certified_backend_reports_limit_and_removes_workload() {
     ]);
     let output = run_with_deadline(&mut command, Duration::from_secs(10))
         .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(output.status.code(), Some(124));
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "stdout={:?}; stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_stdout_empty(&output);
 }
 
