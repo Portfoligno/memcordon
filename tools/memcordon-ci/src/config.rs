@@ -6,6 +6,8 @@ use serde::Deserialize;
 
 use crate::Result;
 
+pub const RELEASE_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Toolchains {
     pub stable: String,
@@ -172,6 +174,25 @@ pub fn binary_files(root: &Path) -> Result<BinaryFiles> {
 
 pub fn release(root: &Path) -> Result<Release> {
     read(&root.join("ci").join("release.toml"))
+}
+
+pub fn validate_release_configuration_identity(release: &Release) -> Result<()> {
+    if release.schema_version != RELEASE_SCHEMA_VERSION
+        || release.registry != "crates-io"
+        || release.workflow != "release.yml"
+        || release.github_api_version.is_empty()
+        || release.maximum_package_bytes == 0
+        || release.maximum_asset_bytes == 0
+        || release.registry_wait.initial_milliseconds == 0
+        || release.registry_wait.maximum_milliseconds < release.registry_wait.initial_milliseconds
+        || release.network_retry.initial_milliseconds == 0
+        || release.network_retry.maximum_milliseconds < release.network_retry.initial_milliseconds
+    {
+        return Err(crate::CiError::Message(
+            "release configuration identity is invalid".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_registry_credentials(

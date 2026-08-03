@@ -469,19 +469,7 @@ fn publish_order(metadata: &Metadata, configured: &[String]) -> Result<Vec<Strin
 
 pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
     let release = config::release(root)?;
-    if release.schema_version != 1
-        || release.registry != "crates-io"
-        || release.workflow != "release.yml"
-        || release.github_api_version.is_empty()
-        || release.maximum_package_bytes == 0
-        || release.maximum_asset_bytes == 0
-        || release.registry_wait.initial_milliseconds == 0
-        || release.registry_wait.maximum_milliseconds < release.registry_wait.initial_milliseconds
-        || release.network_retry.initial_milliseconds == 0
-        || release.network_retry.maximum_milliseconds < release.network_retry.initial_milliseconds
-    {
-        return Err(failure("release configuration identity is invalid"));
-    }
+    config::validate_release_configuration_identity(&release)?;
     let configured_first = configured_first_release(&release)?;
     let status = git(root, ["status", "--porcelain=v1", "-z"])?;
     if !status.is_empty() {
@@ -1433,7 +1421,7 @@ fn assemble(root: &Path) -> Result<()> {
         &identity.commit,
     )?;
     let manifest = ReleaseManifest {
-        schema_version: release.schema_version,
+        schema_version: config::RELEASE_SCHEMA_VERSION,
         project: "memcordon".to_owned(),
         tag: identity.tag.clone(),
         version: identity.version.to_string(),
@@ -1455,9 +1443,13 @@ fn assemble(root: &Path) -> Result<()> {
 
 fn bundle_manifest(root: &Path) -> Result<(config::Release, ReleaseManifest, PathBuf)> {
     let release = config::release(root)?;
+    config::validate_release_configuration_identity(&release)?;
     let output = root.join(&release.assets.output_directory);
     let manifest: ReleaseManifest =
         serde_json::from_slice(&fs::read(output.join(&release.assets.manifest))?)?;
+    if manifest.schema_version != config::RELEASE_SCHEMA_VERSION {
+        return Err(failure("release manifest schema identity is invalid"));
+    }
     Ok((release, manifest, output))
 }
 
@@ -2797,7 +2789,7 @@ mod tests {
         let output = root.join(&release.assets.output_directory);
         fs::create_dir_all(&output).expect("release output should exist");
         let manifest = ReleaseManifest {
-            schema_version: 1,
+            schema_version: config::RELEASE_SCHEMA_VERSION,
             project: "memcordon".to_owned(),
             tag: "1.2.3".to_owned(),
             version: "1.2.3".to_owned(),
