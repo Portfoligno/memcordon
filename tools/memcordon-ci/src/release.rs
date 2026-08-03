@@ -27,6 +27,7 @@ const RELEASE_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const GITHUB_API_ROOT: &str = "https://api.github.com";
 const GITHUB_UPLOADS_ROOT: &str = "https://uploads.github.com";
 const CRATES_IO_API_ROOT: &str = "https://crates.io";
+const GITHUB_RELEASES_PER_PAGE: usize = 100;
 
 #[derive(Clone, Debug)]
 struct HttpEndpoints {
@@ -1477,6 +1478,26 @@ fn retry_transient<T>(
     }
 }
 
+fn wait_for_remote_state<T>(
+    wait: &config::RegistryWait,
+    mut operation: impl FnMut() -> Result<Option<T>>,
+) -> Result<Option<T>> {
+    let started = Instant::now();
+    let total = Duration::from_secs(wait.total_seconds);
+    let maximum = Duration::from_millis(wait.maximum_milliseconds);
+    let mut delay = Duration::from_millis(wait.initial_milliseconds);
+    loop {
+        match operation()? {
+            Some(value) => return Ok(Some(value)),
+            None if started.elapsed() < total => {
+                thread::sleep(delay);
+                delay = delay.saturating_mul(2).min(maximum);
+            }
+            None => return Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 fn existing_or_create<T>(existing: Option<T>, create: impl FnOnce() -> Result<T>) -> Result<T> {
     match existing {
@@ -1631,6 +1652,36 @@ fn github_release_at(
     endpoints: &HttpEndpoints,
 ) -> Result<Option<serde_json::Value>> {
     let (release, manifest, _) = bundle_manifest(root)?;
+    if let Some(token) = token {
+        let mut matched = None;
+        let mut page = 1_usize;
+        loop {
+            let url = format!(
+                "{}/repos/{}/releases?per_page={GITHUB_RELEASES_PER_PAGE}&page={page}",
+                endpoints.github_api, release.repository
+            );
+            let response =
+                github_json_request(&release, endpoints, "GET", &url, Some(token), None)?;
+            let releases = response
+                .as_array()
+                .ok_or_else(|| failure("GitHub release listing is not an array"))?;
+            for remote in releases.iter().filter(|remote| {
+                remote.get("tag_name").and_then(serde_json::Value::as_str)
+                    == Some(manifest.tag.as_str())
+            }) {
+                if matched.is_some() {
+                    return Err(failure("multiple GitHub releases use the expected tag"));
+                }
+                matched = Some(remote.clone());
+            }
+            if releases.len() < GITHUB_RELEASES_PER_PAGE {
+                return Ok(matched);
+            }
+            page = page
+                .checked_add(1)
+                .ok_or_else(|| failure("GitHub release listing page overflow"))?;
+        }
+    }
     let url = format!(
         "{}/repos/{}/releases/tags/{}",
         endpoints.github_api, release.repository, manifest.tag
@@ -1685,7 +1736,7 @@ fn static_asset_paths(
     release: &config::Release,
     manifest: &ReleaseManifest,
     output: &Path,
-) -> Vec<PathBuf> {
+) -> Result<Vec<PathBuf>> {
     let mut paths: Vec<PathBuf> = manifest
         .assets
         .iter()
@@ -1703,7 +1754,19 @@ fn static_asset_paths(
             .map(|record| output.join(&record.evidence_path)),
     );
     paths.sort();
-    paths
+    let mut names = BTreeSet::new();
+    for path in &paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| failure("static GitHub asset name is not UTF-8"))?;
+        if !names.insert(name) {
+            return Err(failure(format!(
+                "static GitHub asset name is duplicated: {name}"
+            )));
+        }
+    }
+    Ok(paths)
 }
 
 fn public_asset_records(
@@ -1882,7 +1945,11 @@ fn create_or_reconcile_github_draft_at(
     match create_github_draft_at(root, token, endpoints) {
         Ok(remote) => Ok(remote),
         Err(error) if ambiguous_mutation_error(&error) => {
-            github_release_at(root, Some(token), endpoints)?.ok_or(error)
+            let (release, _, _) = bundle_manifest(root)?;
+            wait_for_remote_state(&release.network_retry, || {
+                github_release_at(root, Some(token), endpoints)
+            })?
+            .ok_or(error)
         }
         Err(error) => Err(error),
     }
@@ -1899,27 +1966,48 @@ fn upload_or_reconcile_github_asset_at(
     match upload_github_asset_at(release, endpoints, release_id, token, path) {
         Ok(asset) => Ok(asset),
         Err(error) if ambiguous_mutation_error(&error) => {
+            let (_, manifest, _) = bundle_manifest(root)?;
             let name = path
                 .file_name()
                 .and_then(|value| value.to_str())
                 .ok_or_else(|| failure("release asset name is not UTF-8"))?;
-            let remote = github_release_at(root, Some(token), endpoints)?
-                .ok_or_else(|| failure("GitHub release disappeared after ambiguous upload"))?;
-            let asset = remote
-                .get("assets")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|assets| {
-                    assets.iter().find(|asset| {
+            wait_for_remote_state(&release.network_retry, || {
+                let Some(remote) = github_release_at(root, Some(token), endpoints)? else {
+                    return Ok(None);
+                };
+                match classify_remote_release(
+                    &remote,
+                    &manifest.tag,
+                    &manifest.source_commit,
+                    manifest.prerelease,
+                )? {
+                    RemoteReleaseState::Draft(id) | RemoteReleaseState::Published(id)
+                        if id == release_id => {}
+                    _ => {
+                        return Err(failure(
+                            "GitHub release identity changed after ambiguous upload",
+                        ));
+                    }
+                }
+                let assets = remote
+                    .get("assets")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| failure("GitHub release has no asset inventory"))?;
+                let matching: Vec<&serde_json::Value> = assets
+                    .iter()
+                    .filter(|asset| {
                         asset.get("name").and_then(serde_json::Value::as_str) == Some(name)
                     })
-                })
-                .ok_or(error)?;
-            if !asset_matches(asset, path)? {
-                return Err(failure(format!(
-                    "GitHub release asset conflicts after ambiguous upload: {name}"
-                )));
-            }
-            Ok(asset.clone())
+                    .collect();
+                match matching.as_slice() {
+                    [] => Ok(None),
+                    [asset] if asset_matches(asset, path)? => Ok(Some((*asset).clone())),
+                    [..] => Err(failure(format!(
+                        "GitHub release asset conflicts after ambiguous upload: {name}"
+                    ))),
+                }
+            })?
+            .ok_or(error)
         }
         Err(error) => Err(error),
     }
@@ -1927,9 +2015,12 @@ fn upload_or_reconcile_github_asset_at(
 
 fn stage_github(root: &Path) -> Result<()> {
     let token = github_token()?;
+    stage_github_at(root, &token, &HttpEndpoints::production())
+}
+
+fn stage_github_at(root: &Path, token: &str, endpoints: &HttpEndpoints) -> Result<()> {
     let (release, manifest, output) = bundle_manifest(root)?;
-    let endpoints = HttpEndpoints::production();
-    let remote = create_or_reconcile_github_draft_at(root, &token, &endpoints)?;
+    let remote = create_or_reconcile_github_draft_at(root, token, endpoints)?;
     let state = classify_remote_release(
         &remote,
         &manifest.tag,
@@ -1944,38 +2035,45 @@ fn stage_github(root: &Path) -> Result<()> {
         .get("assets")
         .and_then(serde_json::Value::as_array)
         .cloned()
-        .unwrap_or_default();
-    let mut names: Vec<String> = manifest
-        .assets
-        .iter()
-        .map(|asset| asset.name.clone())
-        .collect();
-    names.extend([
-        release.assets.checksums.clone(),
-        release.assets.manifest.clone(),
-        release.assets.notes.clone(),
-    ]);
-    names.sort();
-    for name in names {
-        let path = output.join(&name);
-        if let Some(asset) = existing.iter().find(|asset| {
-            asset.get("name").and_then(serde_json::Value::as_str) == Some(name.as_str())
-        }) {
-            if !asset_matches(asset, &path)? {
+        .ok_or_else(|| failure("GitHub release has no asset inventory"))?;
+    let static_paths = static_asset_paths(&release, &manifest, &output)?;
+    for path in &static_paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| failure("static GitHub asset name is not UTF-8"))?;
+        if let Some(asset) = existing
+            .iter()
+            .find(|asset| asset.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        {
+            if !asset_matches(asset, path)? {
                 return Err(failure(format!("GitHub release asset conflicts: {name}")));
             }
         } else {
+            if !draft {
+                return Err(failure(format!(
+                    "published GitHub release lacks static asset: {name}"
+                )));
+            }
             let uploaded = upload_or_reconcile_github_asset_at(
-                root, &release, &endpoints, release_id, &token, &path,
+                root, &release, endpoints, release_id, token, path,
             )?;
-            if !asset_matches(&uploaded, &path)? {
+            if !asset_matches(&uploaded, path)? {
                 return Err(failure(format!("GitHub rejected asset digest: {name}")));
             }
         }
     }
-    let reconciled = github_release_at(root, Some(&token), &endpoints)?
+    let reconciled = github_release_at(root, Some(token), endpoints)?
         .ok_or_else(|| failure("GitHub release disappeared during staging"))?;
-    let static_paths = static_asset_paths(&release, &manifest, &output);
+    if classify_remote_release(
+        &reconciled,
+        &manifest.tag,
+        &manifest.source_commit,
+        manifest.prerelease,
+    )? != state
+    {
+        return Err(failure("GitHub release state changed during staging"));
+    }
     public_asset_records(&release, &reconciled, &static_paths)?;
     if !draft {
         let publication_report = reconciled
@@ -1989,7 +2087,7 @@ fn stage_github(root: &Path) -> Result<()> {
             })
             .ok_or_else(|| failure("published GitHub release lacks publication report"))?;
         let report_path = output.join(&release.assets.publication_report);
-        download_github_asset(&release, publication_report, Some(&token), &report_path)?;
+        download_github_asset(&release, publication_report, Some(token), &report_path)?;
     }
     Ok(())
 }
@@ -2392,11 +2490,13 @@ fn finalize_github(root: &Path) -> Result<()> {
     let endpoints = HttpEndpoints::production();
     let remote = github_release_at(root, Some(&token), &endpoints)?
         .ok_or_else(|| failure("GitHub draft is absent"))?;
-    let is_draft = remote
-        .get("draft")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| failure("GitHub release has no draft classification"))?;
-    if !is_draft {
+    let state = classify_remote_release(
+        &remote,
+        &manifest.tag,
+        &manifest.source_commit,
+        manifest.prerelease,
+    )?;
+    if let RemoteReleaseState::Published(_) = state {
         let report_asset = remote
             .get("assets")
             .and_then(serde_json::Value::as_array)
@@ -2411,11 +2511,10 @@ fn finalize_github(root: &Path) -> Result<()> {
         download_github_asset(&release, report_asset, Some(&token), &report_path)?;
         return verify_public(root);
     }
-    let release_id = remote
-        .get("id")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| failure("GitHub release lacks an id"))?;
-    let static_paths = static_asset_paths(&release, &manifest, &output);
+    let RemoteReleaseState::Draft(release_id) = state else {
+        unreachable!("published release returned above")
+    };
+    let static_paths = static_asset_paths(&release, &manifest, &output)?;
     let assets = public_asset_records(&release, &remote, &static_paths)?;
     let report = PublicationReport {
         schema_version: 1,
@@ -2457,6 +2556,15 @@ fn finalize_github(root: &Path) -> Result<()> {
     }
     let refreshed = github_release_at(root, Some(&token), &endpoints)?
         .ok_or_else(|| failure("GitHub release disappeared during finalization"))?;
+    if classify_remote_release(
+        &refreshed,
+        &manifest.tag,
+        &manifest.source_commit,
+        manifest.prerelease,
+    )? != RemoteReleaseState::Draft(release_id)
+    {
+        return Err(failure("GitHub draft identity changed during finalization"));
+    }
     let uploaded_report = refreshed
         .get("assets")
         .and_then(serde_json::Value::as_array)
@@ -2495,18 +2603,24 @@ fn finalize_github(root: &Path) -> Result<()> {
         Err(error) if ambiguous_mutation_error(&error) => Some(error),
         Err(error) => return Err(error),
     };
-    let published = github_release_at(root, Some(&token), &endpoints)?
-        .ok_or_else(|| failure("GitHub release disappeared after publication"))?;
-    if published.get("draft").and_then(serde_json::Value::as_bool) != Some(false)
-        || published
-            .get("prerelease")
-            .and_then(serde_json::Value::as_bool)
-            != Some(manifest.prerelease)
-    {
-        if let Some(error) = mutation_error {
-            return Err(error);
+    let published = wait_for_remote_state(&release.network_retry, || {
+        let Some(remote) = github_release_at(root, Some(&token), &endpoints)? else {
+            return Ok(None);
+        };
+        match classify_remote_release(
+            &remote,
+            &manifest.tag,
+            &manifest.source_commit,
+            manifest.prerelease,
+        )? {
+            RemoteReleaseState::Published(id) if id == release_id => Ok(Some(remote)),
+            RemoteReleaseState::Draft(id) if id == release_id => Ok(None),
+            _ => Err(failure("GitHub release identity changed after publication")),
         }
-        return Err(failure("GitHub release publication classification differs"));
+    })?;
+    if published.is_none() {
+        return Err(mutation_error
+            .unwrap_or_else(|| failure("GitHub release publication classification differs")));
     }
     Ok(())
 }
@@ -2552,7 +2666,7 @@ fn verify_public(root: &Path) -> Result<()> {
         .get("id")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| failure("public release has no id"))?;
-    let static_paths = static_asset_paths(&release, &manifest, &output);
+    let static_paths = static_asset_paths(&release, &manifest, &output)?;
     let public_assets = public_asset_records(&release, &remote, &static_paths)?;
     if report.manifest_sha256 != sha256_file(&output.join(&release.assets.manifest))?
         || report.crates != verify_crates(root)?
@@ -2774,6 +2888,13 @@ mod tests {
         )
         .expect("mock headers should write");
         stream.write_all(body).expect("mock body should write");
+    }
+
+    fn request_json_body(request: &str) -> serde_json::Value {
+        let start = request
+            .find('{')
+            .expect("JSON request should contain an object body");
+        serde_json::from_str(&request[start..]).expect("request JSON should parse")
     }
 
     fn release_fixture() -> (TempDir, config::Release) {
@@ -3019,6 +3140,19 @@ mod tests {
         })
     }
 
+    fn remote_asset(path: &Path, id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("asset name should be UTF-8"),
+            "size": fs::metadata(path).expect("asset metadata").len(),
+            "digest": format!("sha256:{}", sha256_file(path).expect("asset digest")),
+            "url": "unused",
+        })
+    }
+
     fn write_crate(path: &Path, manifest: &str, commit: &str, reverse: bool) {
         let file = File::create(path).expect("crate archive should be created");
         let encoder = GzEncoder::new(file, Compression::best());
@@ -3261,13 +3395,124 @@ mod tests {
     }
 
     #[test]
+    fn http_mock_authenticated_github_lookup_finds_draft_in_release_listing() {
+        let (temporary, _) = release_fixture();
+        let server = MockServer::scripted(vec![MockResponse::Json(
+            200,
+            serde_json::json!([remote(true)]),
+        )]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let found = github_release_at(temporary.path(), Some("token"), &endpoints)
+            .expect("authenticated release listing should succeed")
+            .expect("authenticated release listing should include the draft");
+        assert_eq!(found, remote(true));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .starts_with("GET /repos/Portfoligno/memcordon/releases?per_page=100&page=1 ")
+        );
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer token")
+        );
+        assert!(!requests[0].contains("/releases/tags/"));
+    }
+
+    #[test]
+    fn http_mock_authenticated_github_lookup_rejects_duplicate_tag_releases() {
+        let (temporary, _) = release_fixture();
+        let mut first_page: Vec<serde_json::Value> = (0..GITHUB_RELEASES_PER_PAGE - 1)
+            .map(|index| {
+                let mut other = remote(false);
+                other["id"] = serde_json::json!(index);
+                other["tag_name"] = serde_json::json!(format!("other-{index}"));
+                other
+            })
+            .collect();
+        first_page.push(remote(true));
+        let mut duplicate = remote(false);
+        duplicate["id"] = serde_json::json!(42);
+        let server = MockServer::scripted(vec![
+            MockResponse::Json(200, serde_json::Value::Array(first_page)),
+            MockResponse::Json(200, serde_json::json!([duplicate])),
+        ]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let result = github_release_at(temporary.path(), Some("token"), &endpoints);
+        assert!(result.is_err(), "duplicate tag ownership must fail closed");
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("per_page=100&page=1"));
+        assert!(requests[1].contains("per_page=100&page=2"));
+    }
+
+    #[test]
+    fn http_mock_authenticated_github_lookup_paginates_until_draft() {
+        let (temporary, _) = release_fixture();
+        let first_page: Vec<serde_json::Value> = (0..GITHUB_RELEASES_PER_PAGE)
+            .map(|index| {
+                let mut other = remote(false);
+                other["id"] = serde_json::json!(index);
+                other["tag_name"] = serde_json::json!(format!("other-{index}"));
+                other
+            })
+            .collect();
+        let server = MockServer::scripted(vec![
+            MockResponse::Json(200, serde_json::Value::Array(first_page)),
+            MockResponse::Json(200, serde_json::json!([remote(true)])),
+        ]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let found = github_release_at(temporary.path(), Some("token"), &endpoints)
+            .expect("paginated release listing should succeed")
+            .expect("second page should contain the draft");
+        assert_eq!(found, remote(true));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("per_page=100&page=1"));
+        assert!(requests[1].contains("per_page=100&page=2"));
+    }
+
+    #[test]
+    fn http_mock_authenticated_github_lookup_rejects_malformed_listing() {
+        let (temporary, _) = release_fixture();
+        let server = MockServer::scripted(vec![MockResponse::Json(
+            200,
+            serde_json::json!({"unexpected": "object"}),
+        )]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let result = github_release_at(temporary.path(), Some("token"), &endpoints);
+        assert!(
+            result.is_err(),
+            "non-array release listing must fail closed"
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn http_mock_public_github_lookup_uses_published_tag_endpoint() {
+        let (temporary, _) = release_fixture();
+        let server = MockServer::scripted(vec![MockResponse::Json(200, remote(false))]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let found = github_release_at(temporary.path(), None, &endpoints)
+            .expect("public release lookup should succeed")
+            .expect("published release should exist");
+        assert_eq!(found, remote(false));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /repos/Portfoligno/memcordon/releases/tags/1.2.3 "));
+        assert!(!requests[0].to_ascii_lowercase().contains("authorization:"));
+    }
+
+    #[test]
     fn http_mock_github_response_loss_is_reconciled_and_rerun_is_idempotent() {
         let (temporary, _) = release_fixture();
         let server = MockServer::scripted(vec![
-            MockResponse::Json(404, serde_json::json!({"message": "not found"})),
+            MockResponse::Json(200, serde_json::json!([])),
             MockResponse::LoseResponse,
-            MockResponse::Json(200, remote(true)),
-            MockResponse::Json(200, remote(true)),
+            MockResponse::Json(200, serde_json::json!([])),
+            MockResponse::Json(200, serde_json::json!([remote(true)])),
+            MockResponse::Json(200, serde_json::json!([remote(true)])),
         ]);
         let endpoints = HttpEndpoints::fixed_test_server(&server.root);
         let first = create_or_reconcile_github_draft_at(temporary.path(), "token", &endpoints)
@@ -3276,11 +3521,16 @@ mod tests {
             .expect("end-to-end rerun should reuse the draft");
         assert_eq!(first, second);
         let requests = server.finish();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 5);
         assert!(requests[0].starts_with("GET "));
         assert!(requests[1].starts_with("POST "));
         assert!(requests[2].starts_with("GET "));
         assert!(requests[3].starts_with("GET "));
+        assert!(requests[4].starts_with("GET "));
+        for request in [&requests[0], &requests[2], &requests[3], &requests[4]] {
+            assert!(request.contains("/releases?per_page=100&page=1"));
+            assert!(!request.contains("/releases/tags/"));
+        }
         assert_eq!(
             requests
                 .iter()
@@ -3307,7 +3557,8 @@ mod tests {
         release_state["assets"] = serde_json::json!([asset.clone()]);
         let server = MockServer::scripted(vec![
             MockResponse::Json(422, serde_json::json!({"message": "already_exists"})),
-            MockResponse::Json(200, release_state),
+            MockResponse::Json(200, serde_json::json!([remote(true)])),
+            MockResponse::Json(200, serde_json::json!([release_state])),
         ]);
         let endpoints = HttpEndpoints::fixed_test_server(&server.root);
         let reconciled = upload_or_reconcile_github_asset_at(
@@ -3321,9 +3572,151 @@ mod tests {
         .expect("upload collision should reconcile canonical asset");
         assert_eq!(reconciled, asset);
         let requests = server.finish();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert!(requests[0].starts_with("POST "));
-        assert!(requests[1].starts_with("GET "));
+        assert!(
+            requests[1]
+                .starts_with("GET /repos/Portfoligno/memcordon/releases?per_page=100&page=1 ")
+        );
+        assert!(
+            requests[2]
+                .starts_with("GET /repos/Portfoligno/memcordon/releases?per_page=100&page=1 ")
+        );
+    }
+
+    #[test]
+    fn http_mock_stage_uploads_complete_static_inventory_including_certification() {
+        let (temporary, release) = release_fixture();
+        let output = temporary.path().join(&release.assets.output_directory);
+        let certification = [
+            (
+                "linux-cgroup-v2",
+                "certification/backend-linux-cgroup-v2.json",
+            ),
+            (
+                "windows-job-object",
+                "certification/backend-windows-job-object.json",
+            ),
+            (
+                "macos-watchdog",
+                "certification/backend-macos-watchdog.json",
+            ),
+        ];
+        fs::create_dir_all(output.join("certification"))
+            .expect("certification directory should exist");
+        fs::write(output.join(&release.assets.checksums), b"checksums\n")
+            .expect("checksums should write");
+        let native_path = output.join("memcordon-linux-x64.tar.gz");
+        fs::write(&native_path, b"native archive\n").expect("native asset should write");
+        let manifest_path = output.join(&release.assets.manifest);
+        let mut manifest: ReleaseManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("manifest should read"))
+                .expect("manifest should parse");
+        manifest.assets.push(AssetRecord {
+            name: "memcordon-linux-x64.tar.gz".to_owned(),
+            target: "linux-x64".to_owned(),
+            size: fs::metadata(&native_path)
+                .expect("native asset metadata")
+                .len(),
+            sha256: sha256_file(&native_path).expect("native asset digest"),
+        });
+        for (backend, relative) in certification {
+            let evidence_path = output.join(relative);
+            fs::write(&evidence_path, format!("{backend} certified\n"))
+                .expect("certification evidence should write");
+            manifest.certification.insert(
+                backend.to_owned(),
+                CertificationRecord {
+                    evidence_path: relative.to_owned(),
+                    sha256: sha256_file(&evidence_path).expect("evidence digest"),
+                },
+            );
+        }
+        write_json(&manifest_path, &manifest).expect("manifest should update");
+        let static_paths = static_asset_paths(&release, &manifest, &output)
+            .expect("static asset inventory should be valid");
+        let assets: Vec<serde_json::Value> = static_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| remote_asset(path, 100 + index as u64))
+            .collect();
+        let mut final_remote = remote(true);
+        final_remote["assets"] = serde_json::Value::Array(assets.clone());
+        let mut responses = vec![
+            MockResponse::Json(200, serde_json::json!([])),
+            MockResponse::Json(201, remote(true)),
+        ];
+        responses.extend(
+            assets
+                .iter()
+                .cloned()
+                .map(|asset| MockResponse::Json(201, asset)),
+        );
+        responses.push(MockResponse::Json(200, serde_json::json!([final_remote])));
+        let server = MockServer::scripted(responses);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        stage_github_at(temporary.path(), "token", &endpoints)
+            .expect("complete static inventory should stage");
+        let requests = server.finish();
+        assert_eq!(requests.len(), static_paths.len() + 3);
+        let create_body = request_json_body(&requests[1]);
+        assert_eq!(create_body["draft"], true);
+        assert_eq!(create_body["tag_name"], "1.2.3");
+        assert_eq!(create_body["target_commitish"], "0123456789abcdef");
+        assert!(
+            requests
+                .last()
+                .expect("stage should perform a final reconciliation read")
+                .starts_with("GET /repos/Portfoligno/memcordon/releases?per_page=100&page=1 ",)
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.starts_with("POST /repos/Portfoligno/memcordon/releases HTTP/")
+                })
+                .count(),
+            1,
+            "stage must create at most one draft"
+        );
+        for path in &static_paths {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("asset name should be UTF-8");
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| {
+                        request.starts_with("POST /repos/Portfoligno/memcordon/releases/41/assets?")
+                            && request.contains(&format!("name={name}"))
+                    })
+                    .count(),
+                1,
+                "each canonical static asset must upload exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn http_mock_stage_rejects_missing_asset_inventory_before_mutation() {
+        let (temporary, _) = release_fixture();
+        let mut malformed = remote(true);
+        malformed
+            .as_object_mut()
+            .expect("remote release should be an object")
+            .remove("assets");
+        let server = MockServer::scripted(vec![MockResponse::Json(
+            200,
+            serde_json::json!([malformed]),
+        )]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let result = stage_github_at(temporary.path(), "token", &endpoints);
+        assert!(result.is_err(), "missing asset inventory must fail closed");
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET "));
+        assert!(requests.iter().all(|request| !request.starts_with("POST ")));
     }
 
     #[test]
