@@ -10,6 +10,9 @@ use crate::command;
 use crate::config;
 use crate::{CiError, Result};
 
+pub const MAXIMUM_YAML_BYTES: usize = 1_048_576;
+pub const MAXIMUM_YAML_DEPTH: usize = 64;
+
 fn failure(message: impl Into<String>) -> CiError {
     CiError::Message(message.into())
 }
@@ -103,6 +106,37 @@ fn scalar<'a>(mapping: &'a Mapping, name: &str) -> Option<&'a str> {
     mapping.get(key(name)).and_then(Value::as_str)
 }
 
+fn validate_yaml_depth(value: &Value, depth: usize) -> Result<()> {
+    if depth > MAXIMUM_YAML_DEPTH {
+        return Err(failure("YAML nesting exceeds configured depth policy"));
+    }
+    match value {
+        Value::Sequence(sequence) => {
+            for value in sequence {
+                validate_yaml_depth(value, depth + 1)?;
+            }
+        }
+        Value::Mapping(mapping) => {
+            for (key, value) in mapping {
+                validate_yaml_depth(key, depth + 1)?;
+                validate_yaml_depth(value, depth + 1)?;
+            }
+        }
+        Value::Tagged(tagged) => validate_yaml_depth(&tagged.value, depth + 1)?,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+    Ok(())
+}
+
+fn parse_yaml(bytes: &[u8]) -> Result<Value> {
+    if bytes.len() > MAXIMUM_YAML_BYTES {
+        return Err(failure("YAML input exceeds configured size policy"));
+    }
+    let document = serde_yaml::from_slice(bytes)?;
+    validate_yaml_depth(&document, 1)?;
+    Ok(document)
+}
+
 fn exact_mapping_keys(mapping: &Mapping, expected: &[&str], context: &str) -> Result<()> {
     let actual: BTreeSet<&str> = mapping
         .keys()
@@ -137,6 +171,74 @@ fn exact_string_sequence(value: &Value, expected: &[&str], context: &str) -> Res
         return Err(failure(format!(
             "{context} differs: actual={actual:?} expected={expected:?}"
         )));
+    }
+    Ok(())
+}
+
+fn check_dependabot_update(
+    value: &Value,
+    ecosystem: &str,
+    directory: &str,
+    pull_request_limit: u64,
+) -> Result<()> {
+    let update = mapping(value, "Dependabot update")?;
+    exact_mapping_keys(
+        update,
+        &[
+            "package-ecosystem",
+            "directory",
+            "schedule",
+            "open-pull-requests-limit",
+        ],
+        "Dependabot update",
+    )?;
+    if scalar(update, "package-ecosystem") != Some(ecosystem)
+        || scalar(update, "directory") != Some(directory)
+        || update
+            .get(key("open-pull-requests-limit"))
+            .and_then(Value::as_u64)
+            != Some(pull_request_limit)
+    {
+        return Err(failure("Dependabot update target or limit differs"));
+    }
+    let schedule = mapping(
+        update
+            .get(key("schedule"))
+            .ok_or_else(|| failure("Dependabot update schedule is absent"))?,
+        "Dependabot update schedule",
+    )?;
+    exact_mapping_keys(schedule, &["interval"], "Dependabot update schedule")?;
+    if scalar(schedule, "interval") != Some("weekly") {
+        return Err(failure("Dependabot update schedule must be weekly"));
+    }
+    Ok(())
+}
+
+pub fn validate_dependabot_bytes(bytes: &[u8]) -> Result<()> {
+    let document = parse_yaml(bytes)?;
+    let dependabot = mapping(&document, "Dependabot configuration")?;
+    exact_mapping_keys(
+        dependabot,
+        &["version", "updates"],
+        "Dependabot configuration",
+    )?;
+    if dependabot.get(key("version")).and_then(Value::as_u64) != Some(2) {
+        return Err(failure("Dependabot configuration version differs"));
+    }
+    let updates = dependabot
+        .get(key("updates"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("Dependabot updates must be a sequence"))?;
+    let expected = [
+        ("cargo", "/", 5),
+        ("cargo", "/fuzz", 3),
+        ("github-actions", "/", 3),
+    ];
+    if updates.len() != expected.len() {
+        return Err(failure("Dependabot update count differs"));
+    }
+    for (update, (ecosystem, directory, pull_request_limit)) in updates.iter().zip(expected) {
+        check_dependabot_update(update, ecosystem, directory, pull_request_limit)?;
     }
     Ok(())
 }
@@ -1047,7 +1149,7 @@ fn validate_workflow_bytes_into(
             "release-bootstrap workflow and environment references are forbidden",
         ));
     }
-    let document: Value = serde_yaml::from_slice(bytes)?;
+    let document = parse_yaml(bytes)?;
     let workflow = mapping(&document, "workflow")?;
     if workflow.contains_key(key("shell")) || workflow.contains_key(key("env")) {
         return Err(failure(format!(
@@ -1614,6 +1716,7 @@ pub fn run(root: &Path) -> Result<()> {
     }
     let files = inventory(root)?;
     check_files(root, &files, &policy)?;
+    validate_dependabot_bytes(&fs::read(root.join(".github/dependabot.yml"))?)?;
     let main_source = fs::read_to_string(root.join("tools/memcordon-ci/src/main.rs"))?;
     if main_source.contains("BootstrapCrates") || main_source.contains("bootstrap-crates") {
         return Err(failure("obsolete bootstrap-crates CLI path is forbidden"));

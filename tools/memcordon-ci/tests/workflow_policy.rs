@@ -7,6 +7,39 @@ fn repository_root() -> PathBuf {
 }
 
 #[test]
+fn dependabot_requires_each_independent_dependency_surface() {
+    let exact = include_str!("../../../.github/dependabot.yml").replace("\r\n", "\n");
+    policy::validate_dependabot_bytes(exact.as_bytes())
+        .expect("the exact Dependabot dependency matrix should pass");
+
+    let fuzz_update = r#"  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+"#;
+    let cases = [
+        (fuzz_update, ""),
+        ("    directory: /fuzz\n", "    directory: /\n"),
+        (
+            "    directory: /fuzz\n    schedule:\n      interval: weekly\n",
+            "    directory: /fuzz\n    schedule:\n      interval: daily\n",
+        ),
+        (
+            "    directory: /fuzz\n    schedule:\n      interval: weekly\n    open-pull-requests-limit: 3\n",
+            "    directory: /fuzz\n    schedule:\n      interval: weekly\n    open-pull-requests-limit: 4\n",
+        ),
+    ];
+
+    for (expected, replacement) in cases {
+        let invalid = exact.replacen(expected, replacement, 1);
+        assert_ne!(invalid, exact, "Dependabot fixture mutation must apply");
+        policy::validate_dependabot_bytes(invalid.as_bytes())
+            .expect_err("a Dependabot dependency-surface regression must be rejected");
+    }
+}
+
+#[test]
 fn action_input_boolean_value_selection_is_rejected() {
     let root = repository_root();
     let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");

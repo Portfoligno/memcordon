@@ -569,7 +569,7 @@ pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
     let workspace_version = metadata
         .packages
         .iter()
-        .find(|package| package.name == "memcordon")
+        .find(|package| package.name.as_ref() == "memcordon")
         .map(|package| package.version.clone())
         .ok_or_else(|| failure("workspace version is unavailable"))?;
     if workspace_version != version {
@@ -803,7 +803,7 @@ fn canonical_source_tree(root: &Path, package: &str, inventory: &str) -> Result<
     let package = metadata
         .packages
         .iter()
-        .find(|candidate| candidate.name == package)
+        .find(|candidate| candidate.name.as_ref() == package)
         .ok_or_else(|| failure("package metadata is absent"))?;
     let package_root = package
         .manifest_path
@@ -1533,25 +1533,53 @@ fn github_json_request(
         return Err(failure("GitHub API destination is not allowlisted"));
     }
     let send = || {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(60))
-            .build();
-        let mut request = agent
-            .request(method, url)
-            .set("Accept", "application/vnd.github+json")
-            .set("X-GitHub-Api-Version", &release.github_api_version)
-            .set("User-Agent", "memcordon-ci");
-        if let Some(token) = token {
-            request = request.set("Authorization", &format!("Bearer {token}"));
+        let agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_recv_body(Some(Duration::from_secs(60)))
+            .build()
+            .new_agent();
+        let authorization = token.map(|token| format!("Bearer {token}"));
+        let response = match (method, &body) {
+            ("GET", None) => {
+                let mut request = agent
+                    .get(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", &release.github_api_version)
+                    .header("User-Agent", "memcordon-ci");
+                if let Some(authorization) = &authorization {
+                    request = request.header("Authorization", authorization);
+                }
+                request.call()
+            }
+            ("POST", Some(value)) => {
+                let mut request = agent
+                    .post(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", &release.github_api_version)
+                    .header("User-Agent", "memcordon-ci");
+                if let Some(authorization) = &authorization {
+                    request = request.header("Authorization", authorization);
+                }
+                request.send_json(value)
+            }
+            ("PATCH", Some(value)) => {
+                let mut request = agent
+                    .patch(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", &release.github_api_version)
+                    .header("User-Agent", "memcordon-ci");
+                if let Some(authorization) = &authorization {
+                    request = request.header("Authorization", authorization);
+                }
+                request.send_json(value)
+            }
+            _ => return Err(failure("unsupported GitHub API request shape")),
         }
-        match &body {
-            Some(value) => request.send_json(value.clone()),
-            None => request.call(),
-        }
-        .map_err(|error| CiError::Http(Box::new(error)))
+        .map_err(|error| CiError::Http(Box::new(error)))?;
+        Ok(response)
     };
-    let response = if method == "GET" {
+    let mut response = if method == "GET" {
         retry_transient(&release.network_retry, send)?
     } else {
         // Mutations are attempted exactly once. A transport failure or transient response can
@@ -1560,8 +1588,9 @@ fn github_json_request(
         send()?
     };
     response
-        .into_json()
-        .map_err(|error| CiError::Io(std::io::Error::other(error)))
+        .body_mut()
+        .read_json()
+        .map_err(|error| CiError::Http(Box::new(error)))
 }
 
 fn github_raw_get(
@@ -1577,18 +1606,19 @@ fn github_raw_get(
     }
     retry_transient(&release.network_retry, || {
         let mut request = ureq::get(url)
-            .set("Accept", accept)
-            .set("X-GitHub-Api-Version", &release.github_api_version)
-            .set("User-Agent", "memcordon-ci");
+            .header("Accept", accept)
+            .header("X-GitHub-Api-Version", &release.github_api_version)
+            .header("User-Agent", "memcordon-ci");
         if let Some(token) = token {
-            request = request.set("Authorization", &format!("Bearer {token}"));
+            request = request.header("Authorization", format!("Bearer {token}"));
         }
-        let response = request
+        let mut response = request
             .call()
             .map_err(|error| CiError::Http(Box::new(error)))?;
         let mut bytes = Vec::new();
         response
-            .into_reader()
+            .body_mut()
+            .as_reader()
             .take(maximum_bytes.saturating_add(1))
             .read_to_end(&mut bytes)?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum_bytes {
@@ -1614,7 +1644,7 @@ fn github_release_at(
     );
     match github_json_request(&release, endpoints, "GET", &url, token, None) {
         Ok(value) => Ok(Some(value)),
-        Err(CiError::Http(error)) if matches!(*error, ureq::Error::Status(404, _)) => Ok(None),
+        Err(CiError::Http(error)) if matches!(*error, ureq::Error::StatusCode(404)) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -1764,21 +1794,22 @@ fn download_github_asset_at(
     if !url.starts_with(&format!("{}/", endpoints.github_api)) {
         return Err(failure("GitHub asset API URL is not allowlisted"));
     }
-    let mut request = ureq::get(url)
-        .set("Accept", "application/octet-stream")
-        .set("X-GitHub-Api-Version", &release.github_api_version)
-        .set("User-Agent", "memcordon-ci");
-    if let Some(token) = token {
-        request = request.set("Authorization", &format!("Bearer {token}"));
-    }
+    let authorization = token.map(|token| format!("Bearer {token}"));
     let bytes = retry_transient(&release.network_retry, || {
-        let response = request
-            .clone()
+        let mut request = ureq::get(url)
+            .header("Accept", "application/octet-stream")
+            .header("X-GitHub-Api-Version", &release.github_api_version)
+            .header("User-Agent", "memcordon-ci");
+        if let Some(authorization) = &authorization {
+            request = request.header("Authorization", authorization);
+        }
+        let mut response = request
             .call()
             .map_err(|error| CiError::Http(Box::new(error)))?;
         let mut bytes = Vec::new();
         response
-            .into_reader()
+            .body_mut()
+            .as_reader()
             .take(release.maximum_asset_bytes.saturating_add(1))
             .read_to_end(&mut bytes)?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > release.maximum_asset_bytes {
@@ -1815,22 +1846,26 @@ fn upload_github_asset_at(
     );
     let bytes = fs::read(path)?;
     // Upload is non-idempotent and therefore deliberately receives one network attempt.
-    let response = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .timeout_read(Duration::from_secs(120))
+    let agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_recv_response(Some(Duration::from_secs(120)))
+        .timeout_recv_body(Some(Duration::from_secs(120)))
         .build()
+        .new_agent();
+    let mut response = agent
         .post(&url)
         .query("name", name)
-        .set("Accept", "application/vnd.github+json")
-        .set("X-GitHub-Api-Version", &release.github_api_version)
-        .set("User-Agent", "memcordon-ci")
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Content-Type", "application/octet-stream")
-        .send_bytes(&bytes)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", &release.github_api_version)
+        .header("User-Agent", "memcordon-ci")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/octet-stream")
+        .send(bytes.as_slice())
         .map_err(|error| CiError::Http(Box::new(error)))?;
     response
-        .into_json()
-        .map_err(|error| CiError::Io(std::io::Error::other(error)))
+        .body_mut()
+        .read_json()
+        .map_err(|error| CiError::Http(Box::new(error)))
 }
 
 fn ambiguous_mutation_error(error: &CiError) -> bool {
@@ -1839,7 +1874,7 @@ fn ambiguous_mutation_error(error: &CiError) -> bool {
         || matches!(
             error,
             CiError::Http(inner)
-                if matches!(inner.as_ref(), ureq::Error::Status(409 | 422, _))
+                if matches!(inner.as_ref(), ureq::Error::StatusCode(409 | 422))
         )
 }
 
@@ -1982,15 +2017,16 @@ fn crate_name_exists_at(
     let url = format!("{}/api/v1/crates/{name}", endpoints.crates_io);
     let result = retry_transient(&release.network_retry, || {
         ureq::get(&url)
-            .set("User-Agent", "memcordon-ci")
+            .header("User-Agent", "memcordon-ci")
             .call()
             .map_err(|error| CiError::Http(Box::new(error)))
     });
     match result {
-        Ok(response) => {
+        Ok(mut response) => {
             let value: serde_json::Value = response
-                .into_json()
-                .map_err(|error| CiError::Io(std::io::Error::other(error)))?;
+                .body_mut()
+                .read_json()
+                .map_err(|error| CiError::Http(Box::new(error)))?;
             let observed = value
                 .get("crate")
                 .and_then(|crate_value| crate_value.get("id"))
@@ -2003,7 +2039,7 @@ fn crate_name_exists_at(
             }
             Ok(true)
         }
-        Err(CiError::Http(error)) if matches!(*error, ureq::Error::Status(404, _)) => Ok(false),
+        Err(CiError::Http(error)) if matches!(*error, ureq::Error::StatusCode(404)) => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -2017,22 +2053,23 @@ fn crate_checksum_at(
     let url = format!("{}/api/v1/crates/{name}/{version}", endpoints.crates_io);
     let result = retry_transient(&release.network_retry, || {
         ureq::get(&url)
-            .set("User-Agent", "memcordon-ci")
+            .header("User-Agent", "memcordon-ci")
             .call()
             .map_err(|error| CiError::Http(Box::new(error)))
     });
     match result {
-        Ok(response) => {
+        Ok(mut response) => {
             let value: serde_json::Value = response
-                .into_json()
-                .map_err(|error| CiError::Io(std::io::Error::other(error)))?;
+                .body_mut()
+                .read_json()
+                .map_err(|error| CiError::Http(Box::new(error)))?;
             Ok(value
                 .get("version")
                 .and_then(|version| version.get("checksum"))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned))
         }
-        Err(CiError::Http(error)) if matches!(*error, ureq::Error::Status(404, _)) => Ok(None),
+        Err(CiError::Http(error)) if matches!(*error, ureq::Error::StatusCode(404)) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -2064,13 +2101,14 @@ fn public_crate_archive_at(
         endpoints.crates_io
     );
     let bytes = retry_transient(&release.network_retry, || {
-        let response = ureq::get(&url)
-            .set("User-Agent", "memcordon-ci")
+        let mut response = ureq::get(&url)
+            .header("User-Agent", "memcordon-ci")
             .call()
             .map_err(|error| CiError::Http(Box::new(error)))?;
         let mut bytes = Vec::new();
         response
-            .into_reader()
+            .body_mut()
+            .as_reader()
             .take(release.maximum_package_bytes.saturating_add(1))
             .read_to_end(&mut bytes)?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > release.maximum_package_bytes {
@@ -2133,10 +2171,22 @@ fn verify_public_crate(
 fn transient_network_error(error: &CiError) -> bool {
     match error {
         CiError::Http(error) => match error.as_ref() {
-            ureq::Error::Transport(_) => true,
-            ureq::Error::Status(status, _) => {
+            ureq::Error::StatusCode(status) => {
                 matches!(*status, 408 | 425 | 429) || (500..=599).contains(status)
             }
+            ureq::Error::Timeout(_) | ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => {
+                true
+            }
+            ureq::Error::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            _ => false,
         },
         CiError::Io(error) => matches!(
             error.kind(),

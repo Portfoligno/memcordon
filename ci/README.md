@@ -17,6 +17,11 @@ Repository policy requires those exact trigger sets. Deep CI cancels an older
 in-progress same-ref run, while Backend Certification preserves the in-progress
 same-ref run so its evidence can complete.
 
+Dependabot checks the root and independent fuzz Cargo workspaces separately each
+week, with open pull request limits of five and three respectively. It also
+checks GitHub Actions weekly with an open pull request limit of three. Repository
+policy enforces that exact dependency-surface matrix.
+
 Hard cgroup and Job Object certification uses the exact standard GitHub-hosted
 labels `ubuntu-24.04` and `windows-2025`. Each certification job receives a
 fresh VM, performs runtime qualification, runs every required scenario, and

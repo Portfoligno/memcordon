@@ -204,7 +204,7 @@ fn failure(message: impl Into<String>) -> CiError {
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn read_report(path: &Path) -> Result<Vec<u8>> {

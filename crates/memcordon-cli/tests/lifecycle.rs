@@ -42,10 +42,9 @@ fn backend_available() -> bool {
 
 fn configured_iterations(name: &str) -> u32 {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ci/policy.toml");
-    let policy: toml::Value = fs::read_to_string(path)
-        .expect("CI policy should be readable")
-        .parse()
-        .expect("CI policy should be valid TOML");
+    let policy: toml::Value =
+        toml::from_str(&fs::read_to_string(path).expect("CI policy should be readable"))
+            .expect("CI policy should be valid TOML");
     policy["test"][name]
         .as_integer()
         .and_then(|value| value.try_into().ok())

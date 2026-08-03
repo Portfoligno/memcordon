@@ -180,7 +180,7 @@ fn valid_reports_are_copied_and_digest_bound() {
         assert_eq!(record.evidence_path, format!("certification/{report_name}"));
         let evidence = fs::read(output.join(&record.evidence_path))
             .expect("copied evidence should be readable");
-        assert_eq!(record.sha256, format!("{:x}", Sha256::digest(evidence)));
+        assert_eq!(record.sha256, hex::encode(Sha256::digest(evidence)));
     }
 }
 
