@@ -875,6 +875,7 @@ fn check_release_structure(
     workflow: &Mapping,
     jobs: &Mapping,
     release: &config::Release,
+    toolchains: &config::Toolchains,
     auth_action: &str,
 ) -> Result<()> {
     let events = mapping(
@@ -966,6 +967,59 @@ fn check_release_structure(
             != Some(false)
     {
         return Err(failure("release publication must be globally serialized"));
+    }
+    let preflight = mapping(
+        jobs.get(key("preflight"))
+            .ok_or_else(|| failure("release preflight job is absent"))?,
+        "release preflight job",
+    )?;
+    let preflight_steps = preflight
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("release preflight steps are absent"))?;
+    let actual_run_commands: Vec<&str> = preflight_steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter_map(|step| scalar(step, "run"))
+        .collect();
+    let expected_run_commands = [
+        format!(
+            "rustup toolchain install {} --profile minimal --component clippy --component rustfmt",
+            toolchains.stable
+        ),
+        format!(
+            "rustup toolchain install {} --profile minimal",
+            toolchains.msrv
+        ),
+        format!(
+            "rustup run {} cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite release-preflight",
+            toolchains.stable
+        ),
+    ];
+    if actual_run_commands.len() != expected_run_commands.len()
+        || !actual_run_commands
+            .iter()
+            .zip(&expected_run_commands)
+            .all(|(actual, expected)| *actual == expected)
+    {
+        return Err(failure("release preflight toolchain provisioning differs"));
+    }
+    let preflight_target =
+        step_with_id(preflight_steps, "preflight-target", "release preflight job")?;
+    let preflight_target_inputs = mapping(
+        preflight_target
+            .get(key("with"))
+            .ok_or_else(|| failure("release preflight target cache inputs are absent"))?,
+        "release preflight target cache inputs",
+    )?;
+    let expected_preflight_target_key = format!(
+        "cargo-target-release-v2-preflight-{}-msrv-{}-${{{{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'CHANGELOG.md', 'RELEASING.md', '.github/workflows/release.yml') }}}}",
+        toolchains.stable, toolchains.msrv
+    );
+    if scalar(preflight_target_inputs, "path") != Some("target/ci")
+        || scalar(preflight_target_inputs, "key") != Some(expected_preflight_target_key.as_str())
+    {
+        return Err(failure("release preflight target cache identity differs"));
     }
     let dependency_key = "cargo-deps-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}";
     let target_key = "cargo-target-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
@@ -1346,13 +1400,14 @@ fn validate_workflow_bytes_into(
     }
     if relative == Path::new(".github/workflows/release.yml") {
         let release = config::release(root)?;
+        let toolchains = config::toolchains(root)?;
         let auth_action = pins
             .action
             .iter()
             .find(|pin| pin.name == "crates-io-auth")
             .map(|pin| pin.uses.as_str())
             .ok_or_else(|| failure("crates.io authentication action pin is absent"))?;
-        check_release_structure(workflow, jobs, &release, auth_action)?;
+        check_release_structure(workflow, jobs, &release, &toolchains, auth_action)?;
         if text.contains("release-bootstrap") || text.contains("bootstrap-crates") {
             return Err(failure("obsolete crates.io bootstrap path is forbidden"));
         }
@@ -2005,9 +2060,10 @@ jobs:
             "release jobs",
         )?;
         let mut release = config::release(&root)?;
+        let toolchains = config::toolchains(&root)?;
         release.registry_credentials.policy = config::RegistryCredentialPolicy::OidcOnly;
         release.registry_credentials.first_release_version = None;
-        check_release_structure(workflow, jobs, &release, AUTH_ACTION)
+        check_release_structure(workflow, jobs, &release, &toolchains, AUTH_ACTION)
     }
 
     #[test]

@@ -69,6 +69,49 @@ fn fuzz_dependency_cache_keys_require_the_fuzz_lockfile() {
 }
 
 #[test]
+fn release_preflight_binds_provisioning_and_cache_to_toolchain_config() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    let exact = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+        .expect("release workflow fixture should be readable")
+        .replace("\r\n", "\n");
+    for (case, source, replacement, expected_error) in [
+        (
+            "missing MSRV install",
+            "      - run: rustup toolchain install 1.85.0 --profile minimal\n",
+            "",
+            "release preflight toolchain provisioning differs",
+        ),
+        (
+            "wrong MSRV install",
+            "      - run: rustup toolchain install 1.85.0 --profile minimal\n",
+            "      - run: rustup toolchain install 1.97.1 --profile minimal\n",
+            "release preflight toolchain provisioning differs",
+        ),
+        (
+            "wrong MSRV cache identity",
+            "cargo-target-release-v2-preflight-1.97.1-msrv-1.85.0-",
+            "cargo-target-release-v2-preflight-1.97.1-msrv-1.97.1-",
+            "release preflight target cache identity differs",
+        ),
+    ] {
+        let invalid = exact.replacen(source, replacement, 1);
+        assert_ne!(invalid, exact, "{case} mutation must apply");
+        let error = policy::validate_workflow_bytes(
+            &root,
+            Path::new(".github/workflows/release.yml"),
+            invalid.as_bytes(),
+            &repository_policy,
+        )
+        .expect_err("release preflight toolchain drift must fail");
+        assert!(
+            error.to_string().contains(expected_error),
+            "unexpected {case} policy error: {error}"
+        );
+    }
+}
+
+#[test]
 fn action_input_boolean_value_selection_is_rejected() {
     let root = repository_root();
     let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");

@@ -2823,6 +2823,11 @@ mod tests {
         )
         .expect("policy should be copied");
         fs::write(
+            root.join("ci/toolchains.toml"),
+            include_bytes!("../../../ci/toolchains.toml"),
+        )
+        .expect("toolchain policy should be copied");
+        fs::write(
             root.join(".github/action-pins.toml"),
             include_bytes!("../../../.github/action-pins.toml"),
         )

@@ -58,8 +58,9 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: target/ci
-          key: cargo-target-release-v1-preflight-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'CHANGELOG.md', 'RELEASING.md', '.github/workflows/release.yml') }}
+          key: cargo-target-release-v2-preflight-1.97.1-msrv-1.85.0-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'CHANGELOG.md', 'RELEASING.md', '.github/workflows/release.yml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+      - run: rustup toolchain install 1.85.0 --profile minimal
       - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite release-preflight
       - if: always() && steps.preflight-target.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
