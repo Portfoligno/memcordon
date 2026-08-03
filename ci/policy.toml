@@ -6,6 +6,7 @@ production_packages = [
   "memcordon-testkit",
 ]
 ci_packages = ["memcordon-ci"]
+ci_package_rust_versions = { memcordon-ci = "1.88.0" }
 publish_packages = ["memcordon-core", "memcordon-platform", "memcordon"]
 non_publish_packages = ["memcordon-testkit", "memcordon-ci"]
 

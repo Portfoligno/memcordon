@@ -10,6 +10,12 @@ Local credential-free entry points include:
     cargo run --locked --package memcordon-ci -- suite quality
     cargo run --locked --package memcordon-ci -- suite native
 
+The production packages support Rust 1.85 and the MSRV suite selects those
+packages explicitly. The non-publishable `memcordon-ci` tool requires Rust 1.88
+and is bootstrapped in CI with the pinned stable toolchain. Consequently,
+workspace-wide Cargo commands such as `cargo test --workspace` are intentionally
+unsupported on Rust 1.85; use the package-selected MSRV suite for that contract.
+
 Public CI uses fixed Linux x64/arm64, macOS arm64/x64, and Windows x64 runners.
 Deep CI and Backend Certification run on every unfiltered branch or tag push and
 support inputless manual dispatch; neither workflow runs on a schedule.

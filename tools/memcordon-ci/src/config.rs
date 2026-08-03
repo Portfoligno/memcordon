@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -30,6 +31,7 @@ pub struct Policy {
 pub struct WorkspacePolicy {
     pub production_packages: Vec<String>,
     pub ci_packages: Vec<String>,
+    pub ci_package_rust_versions: BTreeMap<String, semver::Version>,
     pub publish_packages: Vec<String>,
     pub non_publish_packages: Vec<String>,
 }

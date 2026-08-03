@@ -1289,6 +1289,13 @@ fn validate_workflow_bytes_into(
                     if cache_key.contains("'**/Cargo.toml'") {
                         return Err(failure("cache keys may not use broad manifest globs"));
                     }
+                    if cache_key.contains("'fuzz/Cargo.toml'")
+                        && !cache_key.contains("'fuzz/Cargo.lock'")
+                    {
+                        return Err(failure(
+                            "cache keys that include the fuzz manifest must include its lockfile",
+                        ));
+                    }
                     if [".ssh", ".gnupg", ".aws", ".config/gh", ".cargo/credentials"]
                         .iter()
                         .any(|secret_path| cache_path.contains(secret_path))
@@ -1602,6 +1609,17 @@ fn check_manifests(root: &Path, policy: &config::Policy) -> Result<()> {
             "workspace policy package lists are incomplete: actual={actual:?}"
         )));
     }
+    let actual_rust_versions: BTreeMap<String, semver::Version> = packages
+        .iter()
+        .filter_map(|(name, package)| {
+            package
+                .rust_version
+                .clone()
+                .map(|version| ((*name).to_owned(), version))
+        })
+        .collect();
+    let production_msrv = semver::Version::parse(&config::toolchains(root)?.msrv)?;
+    validate_package_rust_versions(&actual_rust_versions, &policy.workspace, &production_msrv)?;
     for (name, package) in &packages {
         for dependency in &package.dependencies {
             let internal = packages.contains_key(dependency.name.as_str());
@@ -1667,6 +1685,49 @@ fn check_manifests(root: &Path, policy: &config::Policy) -> Result<()> {
         {
             return Err(failure(format!(
                 "package must declare publish=false: {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_package_rust_versions(
+    actual: &BTreeMap<String, semver::Version>,
+    workspace: &config::WorkspacePolicy,
+    production_msrv: &semver::Version,
+) -> Result<()> {
+    let configured_ci: BTreeSet<&str> = workspace.ci_packages.iter().map(String::as_str).collect();
+    let versioned_ci: BTreeSet<&str> = workspace
+        .ci_package_rust_versions
+        .keys()
+        .map(String::as_str)
+        .collect();
+    if configured_ci != versioned_ci {
+        return Err(failure(
+            "CI package Rust-version policy does not match the configured CI package set",
+        ));
+    }
+    for package in &workspace.production_packages {
+        let version = actual
+            .get(package)
+            .ok_or_else(|| failure(format!("package lacks rust-version: {package}")))?;
+        if version != production_msrv {
+            return Err(failure(format!(
+                "production package rust-version differs: {package} expected={production_msrv} actual={version}"
+            )));
+        }
+    }
+    for package in &workspace.ci_packages {
+        let expected = workspace
+            .ci_package_rust_versions
+            .get(package)
+            .ok_or_else(|| failure(format!("CI package lacks Rust-version policy: {package}")))?;
+        let version = actual
+            .get(package)
+            .ok_or_else(|| failure(format!("package lacks rust-version: {package}")))?;
+        if version != expected {
+            return Err(failure(format!(
+                "CI package rust-version differs: {package} expected={expected} actual={version}"
             )));
         }
     }

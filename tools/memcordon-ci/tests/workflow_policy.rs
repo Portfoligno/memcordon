@@ -40,6 +40,35 @@ fn dependabot_requires_each_independent_dependency_surface() {
 }
 
 #[test]
+fn fuzz_dependency_cache_keys_require_the_fuzz_lockfile() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    for relative in [
+        ".github/workflows/deep-ci.yml",
+        ".github/workflows/release.yml",
+    ] {
+        let exact = std::fs::read_to_string(root.join(relative))
+            .expect("workflow fixture should be readable")
+            .replace("\r\n", "\n");
+        let invalid = exact.replacen("'fuzz/Cargo.lock', ", "", 1);
+        assert_ne!(invalid, exact, "fuzz lockfile mutation must apply");
+        let error = policy::validate_workflow_bytes(
+            &root,
+            Path::new(relative),
+            invalid.as_bytes(),
+            &repository_policy,
+        )
+        .expect_err("a fuzz dependency cache key without its lockfile must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("fuzz manifest must include its lockfile"),
+            "unexpected policy error: {error}"
+        );
+    }
+}
+
+#[test]
 fn action_input_boolean_value_selection_is_rejected() {
     let root = repository_root();
     let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");

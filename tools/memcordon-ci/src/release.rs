@@ -569,7 +569,7 @@ pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
     let workspace_version = metadata
         .packages
         .iter()
-        .find(|package| package.name.as_ref() == "memcordon")
+        .find(|package| package.name.as_str() == "memcordon")
         .map(|package| package.version.clone())
         .ok_or_else(|| failure("workspace version is unavailable"))?;
     if workspace_version != version {
@@ -803,7 +803,7 @@ fn canonical_source_tree(root: &Path, package: &str, inventory: &str) -> Result<
     let package = metadata
         .packages
         .iter()
-        .find(|candidate| candidate.name.as_ref() == package)
+        .find(|candidate| candidate.name.as_str() == package)
         .ok_or_else(|| failure("package metadata is absent"))?;
     let package_root = package
         .manifest_path
@@ -993,6 +993,7 @@ fn build_archive(root: &Path, identity: &ReleaseIdentity, target: &AssetTarget) 
             let name = top.join(relative).to_string_lossy().replace('\\', "/");
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
+                .system(zip::System::Unix)
                 .last_modified_time(zip::DateTime::default())
                 .unix_permissions(mode);
             writer.start_file(name, options)?;
