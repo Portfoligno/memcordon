@@ -145,3 +145,92 @@ fn certification_runner_regressions_are_rejected_structurally() {
             .expect_err("noncanonical certification runner must be rejected");
     }
 }
+
+#[test]
+fn deep_and_backend_workflows_require_unfiltered_push_and_manual_dispatch() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    let expected_trigger = "on:\n  push:\n  workflow_dispatch:\n";
+    let branch_filtered_push = "on:\n  push:\n    branches:\n      - main\n  workflow_dispatch:\n";
+    let tag_filtered_push = "on:\n  push:\n    tags:\n      - release\n  workflow_dispatch:\n";
+    let path_filtered_push = "on:\n  push:\n    paths:\n      - crates/**\n  workflow_dispatch:\n";
+    let ignored_path_push =
+        "on:\n  push:\n    paths-ignore:\n      - docs/**\n  workflow_dispatch:\n";
+    let missing_dispatch = "on:\n  push:\n";
+    let dispatch_inputs =
+        "on:\n  push:\n  workflow_dispatch:\n    inputs:\n      reason:\n        required: false\n";
+    let cases = [
+        (
+            Path::new(".github/workflows/deep-ci.yml"),
+            include_str!("../../../.github/workflows/deep-ci.yml"),
+            "on:\n  schedule:\n    - cron: \"17 3 * * 1\"\n  workflow_dispatch:\n",
+        ),
+        (
+            Path::new(".github/workflows/backend-certification.yml"),
+            include_str!("../../../.github/workflows/backend-certification.yml"),
+            "on:\n  schedule:\n    - cron: \"43 4 * * 3\"\n  workflow_dispatch:\n",
+        ),
+    ];
+
+    for (path, fixture, scheduled_trigger) in cases {
+        let exact = fixture.replace("\r\n", "\n");
+        policy::validate_workflow_bytes(&root, path, exact.as_bytes(), &repository_policy)
+            .expect("exact push and manual workflow triggers should pass");
+        for replacement in [
+            scheduled_trigger,
+            branch_filtered_push,
+            tag_filtered_push,
+            path_filtered_push,
+            ignored_path_push,
+            missing_dispatch,
+            dispatch_inputs,
+        ] {
+            let invalid = exact.replacen(expected_trigger, replacement, 1);
+            assert_ne!(
+                invalid, exact,
+                "workflow trigger fixture mutation must apply: {path:?}"
+            );
+            policy::validate_workflow_bytes(&root, path, invalid.as_bytes(), &repository_policy)
+                .expect_err("workflow trigger regression must be rejected");
+        }
+    }
+
+    let deep = include_str!("../../../.github/workflows/deep-ci.yml").replace("\r\n", "\n");
+    let backend =
+        include_str!("../../../.github/workflows/backend-certification.yml").replace("\r\n", "\n");
+    let concurrency_cases = [
+        (
+            Path::new(".github/workflows/deep-ci.yml"),
+            deep.as_str(),
+            "  group: deep-ci-${{ github.ref }}\n",
+            "  group: deep-ci-all\n",
+        ),
+        (
+            Path::new(".github/workflows/deep-ci.yml"),
+            deep.as_str(),
+            "  cancel-in-progress: true\n",
+            "  cancel-in-progress: false\n",
+        ),
+        (
+            Path::new(".github/workflows/backend-certification.yml"),
+            backend.as_str(),
+            "  group: backend-certification-${{ github.ref }}\n",
+            "  group: backend-certification-all\n",
+        ),
+        (
+            Path::new(".github/workflows/backend-certification.yml"),
+            backend.as_str(),
+            "  cancel-in-progress: false\n",
+            "  cancel-in-progress: true\n",
+        ),
+    ];
+    for (path, fixture, exact, replacement) in concurrency_cases {
+        let invalid = fixture.replacen(exact, replacement, 1);
+        assert_ne!(
+            invalid, fixture,
+            "workflow concurrency fixture mutation must apply: {path:?}"
+        );
+        policy::validate_workflow_bytes(&root, path, invalid.as_bytes(), &repository_policy)
+            .expect_err("workflow concurrency regression must be rejected");
+    }
+}

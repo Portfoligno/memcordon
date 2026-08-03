@@ -1,8 +1,7 @@
 name: Backend Certification
 
 on:
-  schedule:
-    - cron: "43 4 * * 3"
+  push:
   workflow_dispatch:
 
 permissions:

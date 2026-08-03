@@ -11,6 +11,12 @@ Local credential-free entry points include:
     cargo run --locked --package memcordon-ci -- suite native
 
 Public CI uses fixed Linux x64/arm64, macOS arm64/x64, and Windows x64 runners.
+Deep CI and Backend Certification run on every unfiltered branch or tag push and
+support inputless manual dispatch; neither workflow runs on a schedule.
+Repository policy requires those exact trigger sets. Deep CI cancels an older
+in-progress same-ref run, while Backend Certification preserves the in-progress
+same-ref run so its evidence can complete.
+
 Hard cgroup and Job Object certification uses the exact standard GitHub-hosted
 labels `ubuntu-24.04` and `windows-2025`. Each certification job receives a
 fresh VM, performs runtime qualification, runs every required scenario, and

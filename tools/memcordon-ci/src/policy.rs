@@ -157,6 +157,60 @@ fn check_top_level_permissions(workflow: &Mapping) -> Result<()> {
     Ok(())
 }
 
+fn check_push_and_dispatch_events(workflow: &Mapping, context: &str) -> Result<()> {
+    let events = mapping(
+        workflow
+            .get(key("on"))
+            .ok_or_else(|| failure(format!("{context} has no event map")))?,
+        &format!("{context} events"),
+    )?;
+    exact_mapping_keys(
+        events,
+        &["push", "workflow_dispatch"],
+        &format!("{context} events"),
+    )?;
+    for event in ["push", "workflow_dispatch"] {
+        let configuration = events
+            .get(key(event))
+            .ok_or_else(|| failure(format!("{context} {event} is absent")))?;
+        if !configuration.is_null()
+            && configuration
+                .as_mapping()
+                .is_none_or(|mapping| !mapping.is_empty())
+        {
+            return Err(failure(format!(
+                "{context} {event} must be unfiltered and have no inputs"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_deep_ci_structure(workflow: &Mapping) -> Result<()> {
+    check_push_and_dispatch_events(workflow, "deep CI")?;
+    check_top_level_permissions(workflow)?;
+    let concurrency = mapping(
+        workflow
+            .get(key("concurrency"))
+            .ok_or_else(|| failure("deep CI lacks concurrency"))?,
+        "deep CI concurrency",
+    )?;
+    exact_mapping_keys(
+        concurrency,
+        &["group", "cancel-in-progress"],
+        "deep CI concurrency",
+    )?;
+    if scalar(concurrency, "group") != Some("deep-ci-${{ github.ref }}")
+        || concurrency
+            .get(key("cancel-in-progress"))
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(failure("deep CI concurrency differs"));
+    }
+    Ok(())
+}
+
 fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Policy) -> Result<()> {
     let events = mapping(
         workflow
@@ -446,41 +500,7 @@ fn check_certification_job(
 }
 
 fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
-    let events = mapping(
-        workflow
-            .get(key("on"))
-            .ok_or_else(|| failure("backend certification has no event map"))?,
-        "backend certification events",
-    )?;
-    exact_mapping_keys(
-        events,
-        &["schedule", "workflow_dispatch"],
-        "backend certification events",
-    )?;
-    let schedule = events
-        .get(key("schedule"))
-        .and_then(Value::as_sequence)
-        .ok_or_else(|| failure("backend certification schedule is absent"))?;
-    if schedule.len() != 1 {
-        return Err(failure("backend certification schedule count differs"));
-    }
-    let schedule = mapping(&schedule[0], "backend certification schedule")?;
-    exact_mapping_keys(schedule, &["cron"], "backend certification schedule")?;
-    if scalar(schedule, "cron") != Some("43 4 * * 3") {
-        return Err(failure("backend certification cron differs"));
-    }
-    let dispatch = events
-        .get(key("workflow_dispatch"))
-        .ok_or_else(|| failure("backend certification workflow_dispatch is absent"))?;
-    if !dispatch.is_null()
-        && dispatch
-            .as_mapping()
-            .is_none_or(|mapping| !mapping.is_empty())
-    {
-        return Err(failure(
-            "backend certification workflow_dispatch must have no inputs",
-        ));
-    }
+    check_push_and_dispatch_events(workflow, "backend certification")?;
     check_top_level_permissions(workflow)?;
     let concurrency = mapping(
         workflow
@@ -1208,6 +1228,9 @@ fn validate_workflow_bytes_into(
         if text.contains("paths:") || text.contains("paths-ignore:") {
             return Err(failure("CI workflow must not use path filters"));
         }
+    }
+    if relative == Path::new(".github/workflows/deep-ci.yml") {
+        check_deep_ci_structure(workflow)?;
     }
     if relative == Path::new(".github/workflows/backend-certification.yml") {
         check_backend_certification_structure(workflow, jobs)?;
