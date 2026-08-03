@@ -1508,13 +1508,22 @@ The release pipeline includes:
 - Linux x86_64 and arm64 build/test.
 - macOS arm64 and x86_64 build/test while those targets remain supported.
 - Windows x86_64 build/test.
-- Dedicated runners with cgroup delegation and Job Object integration tests.
+- Exact-label standard GitHub-hosted `ubuntu-24.04` and `windows-2025` jobs with
+  per-run cgroup delegation/runtime qualification and Job Object integration
+  tests.
 - Sanitizer or Miri runs for portable core components where applicable.
 - Fuzz smoke tests.
 - Clippy and rustfmt.
 - License and dependency audit.
 
-Capability-dependent tests may skip on ordinary public runners, but a release cannot be cut unless the dedicated backend runner passes. “Skipped everywhere” is not a passing backend.
+Capability-dependent tests may skip in non-authoritative ordinary CI, but a
+release cannot be cut unless both exact-label hard-backend certification jobs
+select the required backend, pass all structured runtime checks and exact
+scenarios, and report zero skipped tests for the tagged commit. A hosted-runner
+capability failure fails certification; “skipped everywhere” is not a passing
+backend. The `ephemeral-certified` report class denotes a fresh standard
+GitHub-hosted job VM plus successful per-run evidence, not an image certified in
+advance.
 
 ### 26.8 Performance gates
 
@@ -1545,7 +1554,7 @@ The project should publish measurements rather than promise arbitrary universal 
 | Lifecycle operations panic | Typed `Result`; no runtime unwraps; aggregate cleanup errors | Catastrophic process aborts remain possible in any native program, but are not normal control flow. |
 | Wrapper interruption may leave workload running | Signal forwarding; force cleanup; cgroup guardian; Windows kill-on-close; macOS guardian | SIGKILL plus guardian failure can leave capped Linux tasks or escaped macOS tasks. |
 | Diagnostics corrupt stdout | Wrapper diagnostics stderr-only; separate JSON report file | Explicit user selection can still direct reports to stdout. |
-| Tests cover parser rather than product | Multi-layer backend and race suite; defect-report regression; dedicated CI runners | Some hostile races cannot be proven absent in watchdog mode. |
+| Tests cover parser rather than product | Multi-layer backend and race suite; defect-report regression; exact-label hosted certification jobs | Some hostile races cannot be proven absent in watchdog mode. |
 
 ---
 

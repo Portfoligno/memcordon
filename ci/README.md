@@ -11,9 +11,22 @@ Local credential-free entry points include:
     cargo run --locked --package memcordon-ci -- suite native
 
 Public CI uses fixed Linux x64/arm64, macOS arm64/x64, and Windows x64 runners.
-Hard cgroup and Job Object certification uses dedicated one-job ephemeral
-runners. A cache miss affects speed only. Toolchains are installed rather than
-cached; Cargo sources, suite targets, and pinned CI tools use separate keys.
+Hard cgroup and Job Object certification uses the exact standard GitHub-hosted
+labels `ubuntu-24.04` and `windows-2025`. Each certification job receives a
+fresh VM, performs runtime qualification, runs every required scenario, and
+fails rather than treating an unavailable hard backend as a passing skip. Linux
+uses root only inside the typed CI driver to establish a systemd delegation and
+runs qualification as the unprivileged runner user; the workflow itself remains
+credential-free and read-only.
+
+In certification schema 2, `runner_class: "ephemeral-certified"` means a fresh
+standard GitHub-hosted job VM selected by an exact policy-validated label, with
+`runner_provider`, `runner_label`, runtime evidence, and exact per-test results
+validated for that run. It is not advance certification of a rolling runner
+image. A cache miss affects speed only. Toolchains are installed rather than
+cached; Cargo sources and the `target/ci/bootstrap` and `target/ci/backend`
+compilation outputs use separate complete keys. Reports and credentials are
+never cached, and every runtime qualification and scenario runs on every job.
 
 Release phases derive source identity and the typed credential path from Git and
 GitHub event metadata, never from a custom project environment variable. The

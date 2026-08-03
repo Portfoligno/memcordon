@@ -224,7 +224,7 @@ jobs:
   linux-certification:
     name: Release / Linux cgroup certification
     needs: preflight
-    runs-on: [self-hosted, memcordon, linux, x64, cgroup-v2, ephemeral]
+    runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
       - name: Check out pushed tag
@@ -241,6 +241,21 @@ jobs:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+      - id: certification-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - id: certification-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/backend
+          key: cargo-target-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -249,11 +264,27 @@ jobs:
           path: target/ci/reports/backend-linux-cgroup-v2.json
           if-no-files-found: error
           retention-days: 14
+          compression-level: 0
+      - if: always() && steps.certification-target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/backend
+          key: ${{ steps.certification-target.outputs.cache-primary-key }}
+      - if: always() && steps.certification-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.certification-deps.outputs.cache-primary-key }}
 
   windows-certification:
     name: Release / Windows Job Object certification
     needs: preflight
-    runs-on: [self-hosted, memcordon, windows, x64, job-object, ephemeral]
+    runs-on: windows-2025
     timeout-minutes: 75
     steps:
       - name: Check out pushed tag
@@ -270,6 +301,21 @@ jobs:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+      - id: certification-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - id: certification-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/backend
+          key: cargo-target-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -278,6 +324,22 @@ jobs:
           path: target/ci/reports/backend-windows-job-object.json
           if-no-files-found: error
           retention-days: 14
+          compression-level: 0
+      - if: always() && steps.certification-target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/backend
+          key: ${{ steps.certification-target.outputs.cache-primary-key }}
+      - if: always() && steps.certification-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.certification-deps.outputs.cache-primary-key }}
 
   macos-acceptance:
     name: Release / macOS arm64 acceptance

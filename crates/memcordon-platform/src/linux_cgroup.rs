@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs;
 use std::io;
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
@@ -61,9 +63,11 @@ fn check_probe_cgroup(path: &Path) -> Result<(), String> {
     let required = [
         "cgroup.procs",
         "cgroup.events",
+        "cgroup.kill",
         "memory.current",
         "memory.events",
         "memory.max",
+        "memory.swap.max",
     ];
     if let Some(missing) = required.iter().find(|name| !path.join(name).exists()) {
         return Err(format!("probe cgroup {} lacks {missing}", path.display()));
@@ -88,6 +92,36 @@ fn check_probe_cgroup(path: &Path) -> Result<(), String> {
             path.display()
         )
     })?;
+    let memory_max = fs::read_to_string(path.join("memory.max")).map_err(|error| {
+        format!(
+            "cannot read back memory.max in probe cgroup {}: {error}",
+            path.display()
+        )
+    })?;
+    if memory_max.trim() != "max" {
+        return Err(format!(
+            "memory.max read-back in probe cgroup {} was {memory_max:?}",
+            path.display()
+        ));
+    }
+    fs::write(path.join("memory.swap.max"), "0\n").map_err(|error| {
+        format!(
+            "cannot write memory.swap.max in probe cgroup {}: {error}",
+            path.display()
+        )
+    })?;
+    let memory_swap_max = fs::read_to_string(path.join("memory.swap.max")).map_err(|error| {
+        format!(
+            "cannot read back memory.swap.max in probe cgroup {}: {error}",
+            path.display()
+        )
+    })?;
+    if memory_swap_max.trim() != "0" {
+        return Err(format!(
+            "memory.swap.max read-back in probe cgroup {} was {memory_swap_max:?}",
+            path.display()
+        ));
+    }
     Ok(())
 }
 
@@ -330,18 +364,118 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
 }
 
 fn delegated_parent() -> Result<PathBuf, String> {
-    let controllers = fs::read_to_string("/sys/fs/cgroup/cgroup.controllers")
+    let mount = Path::new("/sys/fs/cgroup");
+    fs::read_to_string(mount.join("cgroup.controllers"))
         .map_err(|error| format!("cgroup v2 unified hierarchy unavailable: {error}"))?;
-    if !controllers.split_whitespace().any(|item| item == "memory") {
-        return Err("cgroup v2 memory controller is unavailable".to_owned());
-    }
     let membership = fs::read_to_string("/proc/self/cgroup")
         .map_err(|error| format!("cannot read process cgroup membership: {error}"))?;
     let relative = membership
         .lines()
         .find_map(|line| line.strip_prefix("0::"))
         .ok_or_else(|| "process is not in a unified cgroup v2 hierarchy".to_owned())?;
-    Ok(Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/')))
+    let current = mount.join(relative.trim_start_matches('/'));
+    let mut ancestor = current.parent();
+    while let Some(candidate) = ancestor {
+        if candidate == mount {
+            break;
+        }
+        if has_systemd_delegate_marker(candidate)? {
+            prepare_delegated_root(candidate)?;
+            return Ok(candidate.to_path_buf());
+        }
+        ancestor = candidate.parent();
+    }
+    Err(format!(
+        "process cgroup {} is not below a marked systemd delegation boundary",
+        current.display()
+    ))
+}
+
+fn has_systemd_delegate_marker(path: &Path) -> Result<bool, String> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "cgroup path {} contains an interior NUL byte",
+            path.display()
+        )
+    })?;
+    let mut value = [0_u8; 16];
+    // SAFETY: both C strings are NUL-terminated and `value` is writable for its full length.
+    let length = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            c"user.delegate".as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if length < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENODATA) {
+            return Ok(false);
+        }
+        return Err(format!(
+            "cannot inspect systemd delegation marker on {}: {error}",
+            path.to_string_lossy()
+        ));
+    }
+    let length = usize::try_from(length)
+        .map_err(|_| "systemd delegation marker length is invalid".to_owned())?;
+    Ok(value.get(..length) == Some(b"1"))
+}
+
+fn prepare_delegated_root(path: &Path) -> Result<(), String> {
+    let members = fs::read_to_string(path.join("cgroup.procs")).map_err(|error| {
+        format!(
+            "cannot read delegation-root membership at {}: {error}",
+            path.display()
+        )
+    })?;
+    if !members.trim().is_empty() {
+        return Err(format!(
+            "systemd delegation root {} contains processes",
+            path.display()
+        ));
+    }
+    let controllers = fs::read_to_string(path.join("cgroup.controllers")).map_err(|error| {
+        format!(
+            "cannot read delegated controllers at {}: {error}",
+            path.display()
+        )
+    })?;
+    if !controllers.split_whitespace().any(|item| item == "memory") {
+        return Err(format!(
+            "systemd delegation root {} does not delegate the memory controller",
+            path.display()
+        ));
+    }
+    let subtree_control = path.join("cgroup.subtree_control");
+    let enabled = fs::read_to_string(&subtree_control).map_err(|error| {
+        format!(
+            "cannot read cgroup.subtree_control at {}: {error}",
+            path.display()
+        )
+    })?;
+    if !enabled.split_whitespace().any(|item| item == "memory") {
+        fs::write(&subtree_control, "+memory\n").map_err(|error| {
+            format!(
+                "cannot enable memory controller at systemd delegation root {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    let enabled = fs::read_to_string(&subtree_control).map_err(|error| {
+        format!(
+            "cannot verify cgroup.subtree_control at {}: {error}",
+            path.display()
+        )
+    })?;
+    if !enabled.split_whitespace().any(|item| item == "memory") {
+        return Err(format!(
+            "memory controller did not remain enabled at systemd delegation root {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn create_cgroup(parent: &Path) -> io::Result<PathBuf> {

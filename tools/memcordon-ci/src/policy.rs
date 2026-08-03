@@ -228,6 +228,326 @@ fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Polic
     Ok(())
 }
 
+fn runner_selects_self_hosted(value: &Value) -> bool {
+    match value {
+        Value::String(runner) => runner == "self-hosted",
+        Value::Sequence(runners) => runners
+            .iter()
+            .any(|runner| runner.as_str() == Some("self-hosted")),
+        _ => false,
+    }
+}
+
+fn certification_steps<'a>(job: &'a Mapping, context: &str) -> Result<&'a Vec<Value>> {
+    job.get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure(format!("{context} steps are absent")))
+}
+
+fn action_steps<'a>(steps: &'a [Value], action: &str) -> Result<Vec<&'a Mapping>> {
+    steps
+        .iter()
+        .filter_map(|value| {
+            let step = value.as_mapping()?;
+            (scalar(step, "uses") == Some(action)).then_some(Ok(step))
+        })
+        .collect()
+}
+
+fn step_with_id<'a>(steps: &'a [Value], id: &str, context: &str) -> Result<&'a Mapping> {
+    let matches: Vec<&Mapping> = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter(|step| scalar(step, "id") == Some(id))
+        .collect();
+    if matches.len() != 1 {
+        return Err(failure(format!(
+            "{context} must contain exactly one {id} step"
+        )));
+    }
+    Ok(matches[0])
+}
+
+fn check_certification_cache(
+    steps: &[Value],
+    restore_action: &str,
+    save_action: &str,
+    dependency_key: &str,
+    target_key: &str,
+    context: &str,
+) -> Result<()> {
+    const DEPENDENCY_PATHS: &str =
+        "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n";
+    const TARGET_PATHS: &str = "target/ci/bootstrap\ntarget/ci/backend\n";
+
+    let restores = action_steps(steps, restore_action)?;
+    let saves = action_steps(steps, save_action)?;
+    if restores.len() != 2 || saves.len() != 2 {
+        return Err(failure(format!(
+            "{context} must contain two split cache restores and saves"
+        )));
+    }
+
+    for (id, path, expected_key) in [
+        ("certification-deps", DEPENDENCY_PATHS, dependency_key),
+        ("certification-target", TARGET_PATHS, target_key),
+    ] {
+        let restore = step_with_id(steps, id, context)?;
+        exact_mapping_keys(restore, &["id", "uses", "with"], context)?;
+        if scalar(restore, "uses") != Some(restore_action) {
+            return Err(failure(format!("{context} {id} must restore a cache")));
+        }
+        let inputs = mapping(
+            restore
+                .get(key("with"))
+                .ok_or_else(|| failure(format!("{context} {id} lacks cache inputs")))?,
+            context,
+        )?;
+        exact_mapping_keys(inputs, &["path", "key"], context)?;
+        if scalar(inputs, "path") != Some(path) || scalar(inputs, "key") != Some(expected_key) {
+            return Err(failure(format!("{context} {id} cache inputs differ")));
+        }
+
+        let expected_condition = format!("always() && steps.{id}.outputs.cache-hit != 'true'");
+        let expected_primary_key = format!("${{{{ steps.{id}.outputs.cache-primary-key }}}}");
+        let matching_saves: Vec<&Mapping> = saves
+            .iter()
+            .copied()
+            .filter(|step| scalar(step, "if") == Some(expected_condition.as_str()))
+            .collect();
+        if matching_saves.len() != 1 {
+            return Err(failure(format!(
+                "{context} must contain exactly one save for {id}"
+            )));
+        }
+        let save = matching_saves[0];
+        exact_mapping_keys(save, &["if", "uses", "with"], context)?;
+        let inputs = mapping(
+            save.get(key("with"))
+                .ok_or_else(|| failure(format!("{context} {id} save lacks inputs")))?,
+            context,
+        )?;
+        exact_mapping_keys(inputs, &["path", "key"], context)?;
+        if scalar(inputs, "path") != Some(path)
+            || scalar(inputs, "key") != Some(expected_primary_key.as_str())
+        {
+            return Err(failure(format!("{context} {id} cache save inputs differ")));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_certification_job(
+    job: &Mapping,
+    expected_runner: &str,
+    timeout_minutes: u64,
+    checkout_count: usize,
+    dependency_key: &str,
+    target_key: &str,
+    suite_command: &str,
+    artifact_name: &str,
+    artifact_path: &str,
+    context: &str,
+) -> Result<()> {
+    if scalar(job, "runs-on") != Some(expected_runner) {
+        return Err(failure(format!(
+            "{context} must run on exact label {expected_runner}"
+        )));
+    }
+    if job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(timeout_minutes) {
+        return Err(failure(format!("{context} timeout differs")));
+    }
+    let steps = certification_steps(job, context)?;
+    if steps.len() != checkout_count + 7 {
+        return Err(failure(format!("{context} step count differs")));
+    }
+
+    let checkout_action = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
+    let restore_action = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
+    let save_action = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
+    let upload_action = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+
+    let checkouts = action_steps(steps, checkout_action)?;
+    if checkouts.len() != checkout_count {
+        return Err(failure(format!("{context} checkout count differs")));
+    }
+    for checkout in checkouts {
+        let inputs = mapping(
+            checkout
+                .get(key("with"))
+                .ok_or_else(|| failure(format!("{context} checkout lacks inputs")))?,
+            context,
+        )?;
+        if inputs
+            .get(key("persist-credentials"))
+            .and_then(Value::as_bool)
+            != Some(false)
+        {
+            return Err(failure(format!(
+                "{context} checkout must not persist credentials"
+            )));
+        }
+    }
+
+    let run_commands: Vec<&str> = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter_map(|step| scalar(step, "run"))
+        .collect();
+    if run_commands
+        != [
+            "rustup toolchain install 1.97.1 --profile minimal",
+            suite_command,
+        ]
+    {
+        return Err(failure(format!("{context} run commands differ")));
+    }
+
+    check_certification_cache(
+        steps,
+        restore_action,
+        save_action,
+        dependency_key,
+        target_key,
+        context,
+    )?;
+
+    let uploads = action_steps(steps, upload_action)?;
+    if uploads.len() != 1 {
+        return Err(failure(format!("{context} artifact upload count differs")));
+    }
+    let inputs = mapping(
+        uploads[0]
+            .get(key("with"))
+            .ok_or_else(|| failure(format!("{context} artifact lacks inputs")))?,
+        context,
+    )?;
+    exact_mapping_keys(
+        inputs,
+        &[
+            "name",
+            "path",
+            "if-no-files-found",
+            "retention-days",
+            "compression-level",
+        ],
+        context,
+    )?;
+    if scalar(inputs, "name") != Some(artifact_name)
+        || scalar(inputs, "path") != Some(artifact_path)
+        || scalar(inputs, "if-no-files-found") != Some("error")
+        || inputs.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
+        || inputs.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
+    {
+        return Err(failure(format!("{context} artifact inputs differ")));
+    }
+    Ok(())
+}
+
+fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
+    let events = mapping(
+        workflow
+            .get(key("on"))
+            .ok_or_else(|| failure("backend certification has no event map"))?,
+        "backend certification events",
+    )?;
+    exact_mapping_keys(
+        events,
+        &["schedule", "workflow_dispatch"],
+        "backend certification events",
+    )?;
+    let schedule = events
+        .get(key("schedule"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("backend certification schedule is absent"))?;
+    if schedule.len() != 1 {
+        return Err(failure("backend certification schedule count differs"));
+    }
+    let schedule = mapping(&schedule[0], "backend certification schedule")?;
+    exact_mapping_keys(schedule, &["cron"], "backend certification schedule")?;
+    if scalar(schedule, "cron") != Some("43 4 * * 3") {
+        return Err(failure("backend certification cron differs"));
+    }
+    let dispatch = events
+        .get(key("workflow_dispatch"))
+        .ok_or_else(|| failure("backend certification workflow_dispatch is absent"))?;
+    if !dispatch.is_null()
+        && dispatch
+            .as_mapping()
+            .is_none_or(|mapping| !mapping.is_empty())
+    {
+        return Err(failure(
+            "backend certification workflow_dispatch must have no inputs",
+        ));
+    }
+    check_top_level_permissions(workflow)?;
+    let concurrency = mapping(
+        workflow
+            .get(key("concurrency"))
+            .ok_or_else(|| failure("backend certification lacks concurrency"))?,
+        "backend certification concurrency",
+    )?;
+    exact_mapping_keys(
+        concurrency,
+        &["group", "cancel-in-progress"],
+        "backend certification concurrency",
+    )?;
+    if scalar(concurrency, "group") != Some("backend-certification-${{ github.ref }}")
+        || concurrency
+            .get(key("cancel-in-progress"))
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err(failure("backend certification concurrency differs"));
+    }
+    exact_mapping_keys(jobs, &["linux", "windows"], "backend certification jobs")?;
+
+    let dependency_key = "cargo-deps-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}";
+    let target_key = "cargo-target-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
+    for (job_name, runner, suite, artifact_name, artifact_path) in [
+        (
+            "linux",
+            "ubuntu-24.04",
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup",
+            "backend-linux-cgroup-v2",
+            "target/ci/reports/backend-linux-cgroup-v2.json",
+        ),
+        (
+            "windows",
+            "windows-2025",
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job",
+            "backend-windows-job-object",
+            "target/ci/reports/backend-windows-job-object.json",
+        ),
+    ] {
+        let job = mapping(
+            jobs.get(key(job_name)).ok_or_else(|| {
+                failure(format!("backend certification {job_name} job is absent"))
+            })?,
+            job_name,
+        )?;
+        exact_mapping_keys(
+            job,
+            &["name", "runs-on", "timeout-minutes", "steps"],
+            &format!("backend certification {job_name} job"),
+        )?;
+        check_certification_job(
+            job,
+            runner,
+            45,
+            1,
+            dependency_key,
+            target_key,
+            suite,
+            artifact_name,
+            artifact_path,
+            &format!("backend certification {job_name} job"),
+        )?;
+    }
+    Ok(())
+}
+
 fn named_steps<'a>(jobs: &'a Mapping, job_name: &str) -> Result<BTreeMap<&'a str, &'a Mapping>> {
     let job = mapping(
         jobs.get(key(job_name))
@@ -525,6 +845,71 @@ fn check_release_structure(
     {
         return Err(failure("release publication must be globally serialized"));
     }
+    let dependency_key = "cargo-deps-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}";
+    let target_key = "cargo-target-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
+    for (job_name, runner, suite, artifact_name, artifact_path) in [
+        (
+            "linux-certification",
+            "ubuntu-24.04",
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup",
+            "release-certification-linux",
+            "target/ci/reports/backend-linux-cgroup-v2.json",
+        ),
+        (
+            "windows-certification",
+            "windows-2025",
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job",
+            "release-certification-windows",
+            "target/ci/reports/backend-windows-job-object.json",
+        ),
+    ] {
+        let job = mapping(
+            jobs.get(key(job_name))
+                .ok_or_else(|| failure(format!("release {job_name} job is absent")))?,
+            job_name,
+        )?;
+        exact_mapping_keys(
+            job,
+            &["name", "needs", "runs-on", "timeout-minutes", "steps"],
+            &format!("release {job_name} job"),
+        )?;
+        if scalar(job, "needs") != Some("preflight") {
+            return Err(failure(format!(
+                "release {job_name} must depend only on preflight"
+            )));
+        }
+        check_certification_job(
+            job,
+            runner,
+            75,
+            2,
+            dependency_key,
+            target_key,
+            suite,
+            artifact_name,
+            artifact_path,
+            &format!("release {job_name} job"),
+        )?;
+    }
+    let assemble = mapping(
+        jobs.get(key("assemble"))
+            .ok_or_else(|| failure("release assemble job is absent"))?,
+        "assemble job",
+    )?;
+    exact_string_sequence(
+        assemble
+            .get(key("needs"))
+            .ok_or_else(|| failure("release assemble dependencies are absent"))?,
+        &[
+            "native",
+            "miri",
+            "fuzz",
+            "linux-certification",
+            "windows-certification",
+            "macos-acceptance",
+        ],
+        "release assemble dependencies",
+    )?;
     let publish = mapping(
         jobs.get(key("publish"))
             .ok_or_else(|| failure("release publish job is absent"))?,
@@ -690,11 +1075,9 @@ fn validate_workflow_bytes_into(
                 "named GitHub environments are forbidden: {job_name}"
             )));
         }
-        if relative == Path::new(".github/workflows/ci.yml") {
-            if let Some(runner) = job.get(key("runs-on")) {
-                if serde_yaml::to_string(runner)?.contains("self-hosted") {
-                    return Err(failure("public CI may not select self-hosted runners"));
-                }
+        if let Some(runner) = job.get(key("runs-on")) {
+            if runner_selects_self_hosted(runner) {
+                return Err(failure("workflow may not select self-hosted runners"));
             }
         }
         let Some(steps) = job.get(key("steps")).and_then(Value::as_sequence) else {
@@ -825,6 +1208,9 @@ fn validate_workflow_bytes_into(
         if text.contains("paths:") || text.contains("paths-ignore:") {
             return Err(failure("CI workflow must not use path filters"));
         }
+    }
+    if relative == Path::new(".github/workflows/backend-certification.yml") {
+        check_backend_certification_structure(workflow, jobs)?;
     }
     if relative == Path::new(".github/workflows/release.yml") {
         let release = config::release(root)?;
@@ -1393,13 +1779,47 @@ jobs:
 
     fn check_steady_fixture(text: &str) -> Result<()> {
         let root = repository_root();
-        let document: Value = serde_yaml::from_str(text)?;
-        let workflow = mapping(&document, "steady workflow")?;
-        let jobs = mapping(
-            workflow
+        let fixture: Value = serde_yaml::from_str(text)?;
+        let fixture_workflow = mapping(&fixture, "steady workflow")?;
+        let fixture_jobs = mapping(
+            fixture_workflow
                 .get(key("jobs"))
                 .ok_or_else(|| failure("steady fixture jobs are absent"))?,
             "steady jobs",
+        )?;
+        let mut document: Value =
+            serde_yaml::from_slice(include_bytes!("../../../.github/workflows/release.yml"))?;
+        {
+            let workflow = document
+                .as_mapping_mut()
+                .ok_or_else(|| failure("release workflow must be a mapping"))?;
+            workflow.insert(
+                key("on"),
+                fixture_workflow
+                    .get(key("on"))
+                    .ok_or_else(|| failure("steady fixture events are absent"))?
+                    .clone(),
+            );
+            let jobs = workflow
+                .get_mut(key("jobs"))
+                .and_then(Value::as_mapping_mut)
+                .ok_or_else(|| failure("release jobs are absent"))?;
+            for job_name in ["publish", "verify-public"] {
+                jobs.insert(
+                    key(job_name),
+                    fixture_jobs
+                        .get(key(job_name))
+                        .ok_or_else(|| failure(format!("steady {job_name} job is absent")))?
+                        .clone(),
+                );
+            }
+        }
+        let workflow = mapping(&document, "release workflow")?;
+        let jobs = mapping(
+            workflow
+                .get(key("jobs"))
+                .ok_or_else(|| failure("release jobs are absent"))?,
+            "release jobs",
         )?;
         let mut release = config::release(&root)?;
         release.registry_credentials.policy = config::RegistryCredentialPolicy::OidcOnly;

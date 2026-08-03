@@ -17,6 +17,7 @@ use tempfile::TempDir;
 use walkdir::WalkDir;
 
 use memcordon_ci::capability;
+use memcordon_ci::release_evidence::{CertificationRecord, collect_certification};
 
 use crate::command::{CommandSpec, git, rustup_cargo};
 use crate::config::{self, AssetTarget, RegistryCredentialPolicy};
@@ -103,7 +104,7 @@ struct ReleaseManifest {
     rust_toolchain: String,
     assets: Vec<AssetRecord>,
     crates: Vec<CrateRecord>,
-    certification: BTreeMap<String, String>,
+    certification: BTreeMap<String, CertificationRecord>,
     source_date: String,
 }
 
@@ -1371,70 +1372,6 @@ fn workflow_provenance_at(
     ))
 }
 
-fn collect_certification(
-    root: &Path,
-    identity: &ReleaseIdentity,
-) -> Result<BTreeMap<String, String>> {
-    let input = root.join("target").join("ci").join("release-inputs");
-    let mut reports = BTreeMap::new();
-    for required in ["linux-cgroup-v2", "windows-job-object", "macos-watchdog"] {
-        let expected_runner_class = if required == "macos-watchdog" {
-            "hosted-release-acceptance"
-        } else {
-            "ephemeral-certified"
-        };
-        let expected_tests = match required {
-            "linux-cgroup-v2" | "windows-job-object" => 17,
-            "macos-watchdog" => 8,
-            _ => unreachable!("required backend inventory is static"),
-        };
-        let mut found = Vec::new();
-        for entry in WalkDir::new(&input) {
-            let entry = entry.map_err(|error| failure(error.to_string()))?;
-            if entry.file_type().is_file() && entry.file_name().to_string_lossy().contains(required)
-            {
-                let value: serde_json::Value = serde_json::from_slice(&fs::read(entry.path())?)?;
-                if value.get("schema").and_then(serde_json::Value::as_u64) != Some(1)
-                    || value.get("backend").and_then(serde_json::Value::as_str) != Some(required)
-                    || value.get("certified").and_then(serde_json::Value::as_bool) != Some(true)
-                    || value.get("tests_run").and_then(serde_json::Value::as_u64)
-                        != Some(expected_tests)
-                    || value
-                        .get("scenarios")
-                        .and_then(serde_json::Value::as_array)
-                        .map(|scenarios| scenarios.len())
-                        != Some(expected_tests as usize)
-                    || value
-                        .get("tests_skipped")
-                        .and_then(serde_json::Value::as_u64)
-                        != Some(0)
-                    || value.get("commit").and_then(serde_json::Value::as_str)
-                        != Some(identity.commit.as_str())
-                    || value
-                        .get("runner_class")
-                        .and_then(serde_json::Value::as_str)
-                        != Some(expected_runner_class)
-                {
-                    return Err(failure(format!(
-                        "required certification failed: {required}"
-                    )));
-                }
-                found.push(sha256_file(entry.path())?);
-            }
-        }
-        if found.len() != 1 {
-            return Err(failure(format!(
-                "expected exactly one certification report: {required}"
-            )));
-        }
-        reports.insert(
-            required.to_owned(),
-            found.pop().expect("one certification report was checked"),
-        );
-    }
-    Ok(reports)
-}
-
 fn assemble(root: &Path) -> Result<()> {
     let identity = preflight(root)?;
     let release = config::release(root)?;
@@ -1489,6 +1426,11 @@ fn assemble(root: &Path) -> Result<()> {
     fs::write(output.join(&release.assets.notes), notes)?;
     let (workflow_commit, workflow_ref, workflow_sha256, action_revisions) =
         workflow_provenance(root, &identity, &release)?;
+    let certification = collect_certification(
+        &root.join("target").join("ci").join("release-inputs"),
+        &output,
+        &identity.commit,
+    )?;
     let manifest = ReleaseManifest {
         schema_version: release.schema_version,
         project: "memcordon".to_owned(),
@@ -1503,7 +1445,7 @@ fn assemble(root: &Path) -> Result<()> {
         rust_toolchain: toolchains.stable,
         assets,
         crates,
-        certification: collect_certification(root, &identity)?,
+        certification,
         source_date: identity.source_date,
     };
     write_json(&output.join(&release.assets.manifest), &manifest)?;
@@ -1731,6 +1673,12 @@ fn static_asset_paths(
         output.join(&release.assets.manifest),
         output.join(&release.assets.notes),
     ]);
+    paths.extend(
+        manifest
+            .certification
+            .values()
+            .map(|record| output.join(&record.evidence_path)),
+    );
     paths.sort();
     paths
 }

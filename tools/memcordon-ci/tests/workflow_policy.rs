@@ -76,3 +76,72 @@ fn named_github_environments_are_rejected() {
         "unexpected policy error: {error}"
     );
 }
+
+#[test]
+fn certification_runner_regressions_are_rejected_structurally() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    let backend =
+        include_str!("../../../.github/workflows/backend-certification.yml").replace("\r\n", "\n");
+    let release = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
+    let cases = [
+        (
+            Path::new(".github/workflows/backend-certification.yml"),
+            backend.as_str(),
+            "    runs-on: ubuntu-24.04\n",
+            "    runs-on: [self-hosted, memcordon, linux, x64, cgroup-v2, ephemeral]\n",
+        ),
+        (
+            Path::new(".github/workflows/backend-certification.yml"),
+            backend.as_str(),
+            "    runs-on: windows-2025\n",
+            "    runs-on: [self-hosted, memcordon, windows, x64, job-object, ephemeral]\n",
+        ),
+        (
+            Path::new(".github/workflows/release.yml"),
+            release.as_str(),
+            "  linux-certification:\n    name: Release / Linux cgroup certification\n    needs: preflight\n    runs-on: ubuntu-24.04\n",
+            "  linux-certification:\n    name: Release / Linux cgroup certification\n    needs: preflight\n    runs-on: [self-hosted, memcordon, linux, x64, cgroup-v2, ephemeral]\n",
+        ),
+        (
+            Path::new(".github/workflows/release.yml"),
+            release.as_str(),
+            "  windows-certification:\n    name: Release / Windows Job Object certification\n    needs: preflight\n    runs-on: windows-2025\n",
+            "  windows-certification:\n    name: Release / Windows Job Object certification\n    needs: preflight\n    runs-on: [self-hosted, memcordon, windows, x64, job-object, ephemeral]\n",
+        ),
+        (
+            Path::new(".github/workflows/backend-certification.yml"),
+            backend.as_str(),
+            "    runs-on: ubuntu-24.04\n",
+            "    runs-on: ubuntu-latest\n",
+        ),
+        (
+            Path::new(".github/workflows/backend-certification.yml"),
+            backend.as_str(),
+            "    runs-on: windows-2025\n",
+            "    runs-on: windows-latest\n",
+        ),
+        (
+            Path::new(".github/workflows/release.yml"),
+            release.as_str(),
+            "  linux-certification:\n    name: Release / Linux cgroup certification\n    needs: preflight\n    runs-on: ubuntu-24.04\n",
+            "  linux-certification:\n    name: Release / Linux cgroup certification\n    needs: preflight\n    runs-on: ubuntu-latest\n",
+        ),
+        (
+            Path::new(".github/workflows/release.yml"),
+            release.as_str(),
+            "  windows-certification:\n    name: Release / Windows Job Object certification\n    needs: preflight\n    runs-on: windows-2025\n",
+            "  windows-certification:\n    name: Release / Windows Job Object certification\n    needs: preflight\n    runs-on: windows-latest\n",
+        ),
+    ];
+
+    for (path, fixture, exact, replacement) in cases {
+        let invalid = fixture.replacen(exact, replacement, 1);
+        assert_ne!(
+            invalid, fixture,
+            "runner fixture mutation must apply: {path:?}"
+        );
+        policy::validate_workflow_bytes(&root, path, invalid.as_bytes(), &repository_policy)
+            .expect_err("noncanonical certification runner must be rejected");
+    }
+}

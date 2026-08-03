@@ -36,3 +36,18 @@ pub fn require_selected(probe: &Value) -> Result<&Value> {
         ))
     })
 }
+
+pub fn require_single_test_success(output: &[u8], test_name: &str) -> Result<()> {
+    let output = String::from_utf8_lossy(output);
+    let passed_once = output.lines().any(|line| {
+        line.starts_with("test result: ok.")
+            && line.contains("1 passed; 0 failed; 0 ignored; 0 measured;")
+    });
+    if passed_once {
+        Ok(())
+    } else {
+        Err(CiError::Message(format!(
+            "exact certification test {test_name} did not report exactly one passing test: {output}"
+        )))
+    }
+}

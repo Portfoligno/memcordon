@@ -16,6 +16,16 @@ slot in dependency order, verifies public package content, uploads a
 deterministic publication report, publishes the GitHub Release, and performs a
 credential-free public verification.
 
+Linux cgroup v2 and Windows Job Object certification runs on fresh standard
+GitHub-hosted VMs selected by the exact labels `ubuntu-24.04` and
+`windows-2025`. Those jobs retain only `contents: read`, do not receive release
+credentials, and must pass per-run runtime qualification and every exact
+hard-backend scenario with zero skips before assembly can start. In schema 2,
+`ephemeral-certified` is evidence about that exact hosted job run: the report
+also binds the provider, fixed label, tagged commit, runtime checks, and passed
+test inventory. A rolling hosted image is never considered certified in
+advance; an image or capability regression blocks the release.
+
 Rerun a partially completed first release by manually dispatching the workflow
 from the same existing protected tag, supplying that exact tag and deliberately
 selecting `stored-token` or `oidc-fallback`. Public registry and release state are

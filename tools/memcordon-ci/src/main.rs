@@ -28,6 +28,13 @@ enum TopLevel {
         #[arg(value_enum)]
         phase: ReleasePhase,
     },
+    #[command(hide = true)]
+    DelegatedLinuxCertification {
+        #[arg(long)]
+        rustup: PathBuf,
+        #[arg(long)]
+        uid: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -77,6 +84,9 @@ fn run() -> Result<()> {
     match cli.command {
         TopLevel::Suite { suite } => suites::run(&root, suite),
         TopLevel::Release { phase } => release::run(&root, phase),
+        TopLevel::DelegatedLinuxCertification { rustup, uid } => {
+            suites::delegated_linux_certification(&root, &rustup, &uid)
+        }
     }
 }
 

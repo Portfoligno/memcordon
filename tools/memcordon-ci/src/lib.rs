@@ -4,6 +4,7 @@ pub mod capability;
 pub mod command;
 pub mod config;
 pub mod policy;
+pub mod release_evidence;
 
 use thiserror::Error;
 
