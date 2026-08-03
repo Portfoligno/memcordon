@@ -16,7 +16,7 @@ test-support = []
 
 [dependencies]
 libc.workspace = true
-memcordon-core = { path = "../memcordon-core", version = "=0.1.3" }
+memcordon-core = { path = "../memcordon-core", version = "=0.1.4-dev" }
 serde.workspace = true
 
 [dev-dependencies]
