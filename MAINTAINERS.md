@@ -1,0 +1,131 @@
+# Maintaining MemCordon
+
+This document describes the current workspace, validation paths, and CI trust
+boundary. Public behavior belongs in `README.md`, `docs/reference.md`, generated
+CLI help, and Rust API documentation. Historical proposals are available in Git
+history and are not current contracts.
+
+## Workspace architecture
+
+The workspace separates platform-neutral contracts from native execution:
+
+- `memcordon-core` owns policies, outcomes, state, errors, and report types.
+- `memcordon-platform` owns native backends and depends on core.
+- The `memcordon` facade and binary own `Limiter`, CLI behavior, report assembly,
+  exit mapping, and stable public re-exports.
+- `memcordon-testkit` owns black-box process-test support.
+- `tools/memcordon-ci` owns repository policy, certification, and release checks.
+
+Every supported launch path establishes containment before allowing target code
+to run. Linux assigns a gated launcher to a cgroup; Windows creates the target
+suspended and assigns it to a Job Object; macOS establishes a process group
+before `exec`. The supervisor retains the direct-child handle until it has been
+reaped. Process-table presence is never the authority for direct-child liveness.
+
+Changes to public behavior must update the owning source, generated help or API
+documentation, the contract reference, and any affected README recipe together.
+Do not present an accepted option as effective on a backend unless the backend
+implements it.
+
+## Local validation
+
+Credential-free entry points include:
+
+```console
+cargo run --locked --package memcordon-ci -- suite policy
+cargo run --locked --package memcordon-ci -- suite quality
+cargo run --locked --package memcordon-ci -- suite native
+```
+
+The production packages support Rust 1.85. The non-publishable `memcordon-ci`
+package requires Rust 1.88 and is compiled in CI with the pinned stable
+toolchain. Workspace-wide Cargo commands are therefore not the Rust 1.85
+contract; use the package-selected MSRV suite.
+
+Choose validation from the behavior changed:
+
+- policy, parsing, outcome, and report changes require focused unit and CLI
+  tests;
+- lifecycle and cleanup changes require black-box process tests;
+- backend changes require the relevant native contract tests and stress tests;
+- release or workflow changes require repository policy and release preflight
+  coverage;
+- Rust changes require `cargo fmt` before commit.
+
+Tests and fixtures under `tests/`, snapshots, and regression files are evidence
+of previously identified behavior. Do not delete them to make a failure pass.
+When a test fails, verify that its input is valid before changing production
+code or expected output.
+
+## Documentation validation
+
+Review documentation changes against:
+
+- generated command help and defaults;
+- the current public Rust surface on docs.rs;
+- serialized probe and report structures;
+- all three backend implementations;
+- internal anchors and repository links;
+- release, schema, target, and MSRV statements.
+
+The README provides one complete ordinary path and concise conditional recipes.
+`docs/reference.md` owns exact CLI and machine contracts. Avoid new standalone
+pages unless their audience or compatibility requirements cannot be served by
+those two files.
+
+## Continuous integration
+
+GitHub Actions selects events, runners, permissions, caches, artifacts, and the
+credential boundary. The typed `memcordon-ci` driver performs sequencing with
+argument vectors and monotonic subprocess deadlines.
+
+- `ci.yml` runs repository policy, quality, MSRV, supply-chain, and five-target
+  native checks.
+- `deep-ci.yml` runs Miri, fuzz smoke tests, and native stress tests.
+- `backend-certification.yml` produces exact-run Linux and Windows hard-backend
+  evidence.
+- `release.yml` repeats release-grade gates before assembly, publication, and
+  public-state verification.
+
+The architecture uses GitHub-hosted runners only. Public CI covers Linux x64 and
+ARM64, macOS x64 and ARM64, and Windows x64. Deep CI and backend certification
+run on every unfiltered branch or tag push and support inputless manual
+dispatch. Repository policy is the source of truth for exact triggers,
+permissions, pins, cache separation, and dependency-update coverage.
+
+## Backend certification
+
+Hard-backend certification uses the exact standard GitHub-hosted labels
+`ubuntu-24.04` and `windows-2025`. Each job receives a fresh VM, performs runtime
+qualification, runs every required scenario, and fails instead of accepting an
+unavailable backend as a skip.
+
+Linux uses privilege only inside the typed CI driver to establish a systemd
+delegation; qualification and scenarios run as the unprivileged runner user.
+Windows qualification and the real assignment test run in the same job context.
+
+In certification schema 2, `runner_class: "ephemeral-certified"` describes the
+evidence from that exact hosted job run. It includes provider, fixed label,
+runtime qualification, commit identity, and per-test results; it is not advance
+certification of a rolling runner image. Reports and credentials are never
+cached, and all qualification and scenarios execute on every certification job.
+
+Local or generic CI success establishes only behavior exercised by that
+environment. A release cannot proceed until both hard-backend jobs pass every
+required scenario with zero skips for the tagged commit.
+
+## Release maintenance
+
+The actionable release procedure and credential invariants live in
+[RELEASING.md](RELEASING.md). User-visible changes belong in
+[CHANGELOG.md](CHANGELOG.md), which is parsed by release tooling.
+
+Release source identity is derived from Git and GitHub event metadata. The
+OIDC-only path uses a fresh short-lived crates.io capability for each
+dependency-ordered publication slot. Stored registry tokens, named GitHub
+Environments, credential-bearing caches or artifacts, and force-moving a
+published tag are outside the release policy.
+
+When changing release configuration, update its tests and policy identities in
+the same change. The workflow and typed driver must agree on the tag, commit,
+package graph, artifact checksums, certification evidence, and public state.

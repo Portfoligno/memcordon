@@ -1,44 +1,33 @@
 # MemCordon
 
-![MemCordon banner](docs/assets/banner.png)
+![MemCordon memory-limit terminal banner](docs/assets/banner.png)
 
-MemCordon launches a command inside the strongest supported workload boundary and
-limits or watches the memory used by the command and its descendants.
+MemCordon applies a memory policy to a command and its descendants: cgroup v2
+and Job Object hard limits on Linux and Windows, and sampled watchdog
+enforcement on macOS. When it detects the configured limit, it terminates the
+workload.
 
-The executable provides a lifecycle-safe macOS watchdog, a delegated Linux
-cgroup v2 backend, and a Windows Job Object backend. Capability probing happens
-before target launch and never silently weakens `--enforcement hard`.
+## Install
+
+Download the [latest release](https://github.com/Portfoligno/memcordon/releases/latest)
+for your platform and place `memcordon` (`.exe`) on `PATH`, or install with
+Cargo:
 
 ```console
-cargo run -p memcordon -- run --memory 8GiB -- cargo test --workspace
-cargo run -p memcordon -- probe
+cargo install memcordon
 ```
 
-On macOS, `auto` selects sampled physical-footprint accounting and emits a
-warning. Use `--enforcement hard` when automation must fail closed rather than
-accept watchdog semantics.
+## Run
 
-Important contracts:
+```console
+memcordon run --memory 8GiB -- cargo test --workspace
+```
 
-- The direct child's owned handle is the liveness authority and is reaped
-  promptly.
-- Descendants are workload members by default.
-- A confirmed limit event returns `124`; monitor failure returns `125`.
-- Child output remains untouched and wrapper diagnostics go to stderr.
-- Memory values remain `u64` and aggregate sampling saturates safely.
+Replace `cargo test --workspace` with your command. Everything after `--` is
+passed to it unchanged.
 
-See [guarantees](docs/guarantees.md), [metrics](docs/metrics.md),
-[backends](docs/backends.md), and the complete
-[normative design](docs/design.md).
+## Reference
 
-## Workspace architecture
-
-The design's public API example creates a dependency cycle if `Limiter` lives in
-the platform-neutral core. This workspace resolves it without weakening the
-layers:
-
-- `memcordon-core` owns policies, outcomes, state, errors, and report types.
-- `memcordon-platform` depends on core and owns native backends.
-- The `memcordon` facade/binary depends on both, owns `Limiter`, and re-exports
-  the stable public types.
-- `memcordon-testkit` contains black-box process-test support.
+- [CLI and platform behavior](docs/reference.md)
+- [Rust API](https://docs.rs/memcordon/)
+- [Changelog](CHANGELOG.md)
