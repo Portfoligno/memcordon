@@ -683,10 +683,10 @@ fn named_steps<'a>(jobs: &'a Mapping, job_name: &str) -> Result<BTreeMap<&'a str
     let mut named = BTreeMap::new();
     for step in steps {
         let step = mapping(step, "release step")?;
-        if let Some(name) = scalar(step, "name") {
-            if named.insert(name, step).is_some() {
-                return Err(failure(format!("duplicate release step name: {name}")));
-            }
+        if let Some(name) = scalar(step, "name")
+            && named.insert(name, step).is_some()
+        {
+            return Err(failure(format!("duplicate release step name: {name}")));
         }
     }
     Ok(named)
@@ -1197,10 +1197,10 @@ fn validate_workflow_bytes_into(
                 "named GitHub environments are forbidden: {job_name}"
             )));
         }
-        if let Some(runner) = job.get(key("runs-on")) {
-            if runner_selects_self_hosted(runner) {
-                return Err(failure("workflow may not select self-hosted runners"));
-            }
+        if let Some(runner) = job.get(key("runs-on"))
+            && runner_selects_self_hosted(runner)
+        {
+            return Err(failure("workflow may not select self-hosted runners"));
         }
         let Some(steps) = job.get(key("steps")).and_then(Value::as_sequence) else {
             continue;
@@ -1455,25 +1455,21 @@ impl<'ast> Visit<'ast> for RustPolicy {
             if segments.len() >= 2
                 && segments[segments.len() - 2] == "Command"
                 && segments.last().is_some_and(|segment| segment == "new")
+                && let Some(syn::Expr::Lit(literal)) = expression.args.first()
+                && let syn::Lit::Str(program) = &literal.lit
+                && [
+                    "sh",
+                    "bash",
+                    "cmd",
+                    "powershell",
+                    "pwsh",
+                    "/bin/sh",
+                    "/bin/bash",
+                ]
+                .contains(&program.value().as_str())
             {
-                if let Some(syn::Expr::Lit(literal)) = expression.args.first() {
-                    if let syn::Lit::Str(program) = &literal.lit {
-                        if [
-                            "sh",
-                            "bash",
-                            "cmd",
-                            "powershell",
-                            "pwsh",
-                            "/bin/sh",
-                            "/bin/bash",
-                        ]
-                        .contains(&program.value().as_str())
-                        {
-                            self.violations
-                                .push("shell process spawn is forbidden".to_owned());
-                        }
-                    }
-                }
+                self.violations
+                    .push("shell process spawn is forbidden".to_owned());
             }
         }
         syn::visit::visit_expr_call(self, expression);
