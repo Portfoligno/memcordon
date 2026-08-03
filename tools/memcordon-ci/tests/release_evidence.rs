@@ -8,6 +8,8 @@ use tempfile::TempDir;
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
+type ReportMutation = fn(&mut Value);
+
 const LINUX_TESTS: &[&str] = &[
     "certified_backend_preserves_ordinary_status_and_reaps",
     "certified_backend_reports_limit_and_removes_workload",
@@ -184,7 +186,7 @@ fn valid_reports_are_copied_and_digest_bound() {
 
 #[test]
 fn hard_report_contract_mutations_fail_closed() {
-    let cases: &[(&str, fn(&mut Value))] = &[
+    let cases: &[(&str, ReportMutation)] = &[
         ("schema", |report| report["schema"] = json!(1)),
         ("provider", |report| {
             report["runner_provider"] = json!("self-hosted")
