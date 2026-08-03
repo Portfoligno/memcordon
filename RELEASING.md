@@ -26,34 +26,28 @@ also binds the provider, fixed label, tagged commit, runtime checks, and passed
 test inventory. A rolling hosted image is never considered certified in
 advance; an image or capability regression blocks the release.
 
-Rerun a partially completed first release by manually dispatching the workflow
-from the same existing protected tag, supplying that exact tag and deliberately
-selecting `stored-token` or `oidc-fallback`. Public registry and release state are
-authoritative. Identical public crates/assets are accepted; conflicting
-same-version content fails permanently. OIDC fallback is prohibited until every
-configured crate name exists, and a failed stored-token slot never switches
-credentials automatically. Never move or reuse a published tag or version.
-Yanking is an explicit incident-response decision.
+Rerun a partially completed release by manually dispatching the workflow from
+the same existing protected tag and supplying that exact tag. Public registry
+and release state are authoritative. Identical public crates/assets are
+accepted; conflicting same-version content fails permanently. Never move or
+reuse a published tag or version. Yanking is an explicit incident-response
+decision.
 
-For the first publication only, create the narrowest, shortest-lived crates.io
-token that can create the three intended crate names and store it as the
-repository Actions secret `CARGO_REGISTRY_TOKEN`. Do not store it at organization
-scope or in a GitHub Environment. The protected first-tag run injects it only
-into each selected publication step. It must never be passed on an argument,
-written by `cargo login`, copied to another variable, cached, uploaded, or
-printed.
+Independently audit each crates.io trusted publisher before release with owner
+`Portfoligno`, repository `memcordon`, and workflow `release.yml`. The publish job
+must retain `id-token: write`; each of the three dependency-ordered publication
+slots acquires its own short-lived capability from the pinned crates.io action.
+The paired publication step passes that capability in memory through the typed
+Cargo credential provider; the isolated Cargo configuration contains only the
+provider executable and the selected artifact identity. The capability must
+never be passed on an argument, written by `cargo login`, persisted, cached,
+uploaded, or logged. Any missing OIDC capability or failed publication blocks
+finalization.
 
-After all three names exist, configure and independently audit each crates.io
-trusted publisher with owner `Portfoligno`, repository `memcordon`, workflow
-`release.yml`. Exercise the exact same first tag once in `oidc-fallback` mode and
-require complete public reconciliation. Before another release tag is created,
-freeze tag creation, revoke the API token, delete the repository Actions secret,
-and merge the reviewed cleanup that changes
-`ci/release.toml` to `oidc-only`, removes `first_release_version` and the dispatch
-choice, deletes every stored-token slot, and makes the three OIDC slots
-unconditional. Verify the repository has no crates.io token secret before
-release tags resume. The immutable first tag retains historical workflow bytes,
-but the credential is revoked and every later tag is OIDC-only.
+The retired first-release credential is revoked and no repository,
+organization, or GitHub Environment secret may replace trusted publishing. The
+immutable first tag retains its historical workflow bytes, while every current
+and future tag uses the closed `oidc-only` policy.
 
 No workflow job uses a named GitHub Environment. Release execution therefore
 has no environment approval, environment secret, or environment-bound OIDC

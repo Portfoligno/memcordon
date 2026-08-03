@@ -710,9 +710,7 @@ fn require_publication_step(
     if scalar(step, "if") != condition
         || step.contains_key(key("continue-on-error"))
         || scalar(step, "run")
-            != Some(
-                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release publish-next",
-            )
+            != Some("target/ci/publish-bootstrap/debug/memcordon-ci release publish-next")
     {
         return Err(failure(format!(
             "release publication step shape differs: {name}"
@@ -723,8 +721,8 @@ fn require_publication_step(
             .ok_or_else(|| failure(format!("publication step has no credential: {name}")))?,
         "publication environment",
     )?;
-    exact_mapping_keys(environment, &["CARGO_REGISTRY_TOKEN"], name)?;
-    if scalar(environment, "CARGO_REGISTRY_TOKEN") != Some(source) {
+    exact_mapping_keys(environment, &["CARGO_REGISTRIES_CRATES_IO_TOKEN"], name)?;
+    if scalar(environment, "CARGO_REGISTRIES_CRATES_IO_TOKEN") != Some(source) {
         return Err(failure(format!(
             "publication credential source differs: {name}"
         )));
@@ -791,6 +789,18 @@ fn check_release_credentials(
         ));
     }
     let steps = named_steps(jobs, "publish")?;
+    let publish_job = mapping(
+        jobs.get(key("publish"))
+            .ok_or_else(|| failure("publish job is absent"))?,
+        "publish job",
+    )?;
+    let ordered_names: Vec<Option<&str>> = publish_job
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("publish steps are absent"))?
+        .iter()
+        .map(|step| step.as_mapping().and_then(|step| scalar(step, "name")))
+        .collect();
     require_github_step(
         &steps,
         "Stage GitHub draft and assets",
@@ -801,51 +811,31 @@ fn check_release_credentials(
         "Finalize GitHub release",
         "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github",
     )?;
-    let transition_condition =
-        "github.event_name == 'push' || inputs.registry_auth == 'stored-token'";
-    let fallback_condition =
-        "github.event_name == 'workflow_dispatch' && inputs.registry_auth == 'oidc-fallback'";
+    let mut previous_publish_position = None;
     for slot in 1..=release.publish_packages.len() {
-        match release.registry_credentials.policy {
-            config::RegistryCredentialPolicy::FirstReleaseTokenPrimary => {
-                require_publication_step(
-                    &steps,
-                    &format!("Publish next crate in stored-token slot {slot}"),
-                    Some(transition_condition),
-                    &stored_token_source(),
-                )?;
-                let action_id = format!("crates_auth_fallback_{slot}");
-                require_oidc_step(
-                    &steps,
-                    &format!("Acquire crates.io OIDC token for fallback slot {slot}"),
-                    Some(fallback_condition),
-                    &action_id,
-                    auth_action,
-                )?;
-                require_publication_step(
-                    &steps,
-                    &format!("Publish next crate in OIDC fallback slot {slot}"),
-                    Some(fallback_condition),
-                    &format!("${{{{ steps.{action_id}.outputs.token }}}}"),
-                )?;
-            }
-            config::RegistryCredentialPolicy::OidcOnly => {
-                let action_id = format!("crates_auth_{slot}");
-                require_oidc_step(
-                    &steps,
-                    &format!("Acquire crates.io token for publication slot {slot}"),
-                    None,
-                    &action_id,
-                    auth_action,
-                )?;
-                require_publication_step(
-                    &steps,
-                    &format!("Publish next crate in slot {slot}"),
-                    None,
-                    &format!("${{{{ steps.{action_id}.outputs.token }}}}"),
-                )?;
-            }
+        let acquire_name = format!("Acquire crates.io token for publication slot {slot}");
+        let publish_name = format!("Publish next crate in slot {slot}");
+        let acquire_position = ordered_names
+            .iter()
+            .position(|name| *name == Some(acquire_name.as_str()))
+            .ok_or_else(|| failure(format!("crates.io OIDC step is absent: {acquire_name}")))?;
+        if ordered_names.get(acquire_position + 1).copied() != Some(Some(publish_name.as_str())) {
+            return Err(failure(format!(
+                "crates.io publication slot {slot} is not an adjacent acquire/publish pair"
+            )));
         }
+        if previous_publish_position.is_some_and(|position| acquire_position <= position) {
+            return Err(failure("crates.io publication slots are out of order"));
+        }
+        previous_publish_position = Some(acquire_position + 1);
+        let action_id = format!("crates_auth_{slot}");
+        require_oidc_step(&steps, &acquire_name, None, &action_id, auth_action)?;
+        require_publication_step(
+            &steps,
+            &publish_name,
+            None,
+            &format!("${{{{ steps.{action_id}.outputs.token }}}}"),
+        )?;
     }
     let oidc_count = steps
         .values()
@@ -854,15 +844,11 @@ fn check_release_credentials(
     if oidc_count != release.publish_packages.len() {
         return Err(failure("crates.io OIDC action slot count differs"));
     }
-    let expected_environment_steps = match release.registry_credentials.policy {
-        config::RegistryCredentialPolicy::FirstReleaseTokenPrimary => 8,
-        config::RegistryCredentialPolicy::OidcOnly => 5,
-    };
     if steps
         .values()
         .filter(|step| step.contains_key(key("env")))
         .count()
-        != expected_environment_steps
+        != 5
     {
         return Err(failure(
             "publish job credential mapping count differs from profile",
@@ -910,38 +896,7 @@ fn check_release_structure(
             .ok_or_else(|| failure("release dispatch lacks inputs"))?,
         "release inputs",
     )?;
-    match release.registry_credentials.policy {
-        config::RegistryCredentialPolicy::FirstReleaseTokenPrimary => {
-            exact_mapping_keys(inputs, &["tag", "registry_auth"], "release inputs")?;
-            let registry_auth = mapping(
-                inputs
-                    .get(key("registry_auth"))
-                    .ok_or_else(|| failure("release registry_auth input is absent"))?,
-                "release registry_auth input",
-            )?;
-            exact_mapping_keys(
-                registry_auth,
-                &["description", "required", "default", "type", "options"],
-                "release registry_auth input",
-            )?;
-            if registry_auth.get(key("required")).and_then(Value::as_bool) != Some(true)
-                || scalar(registry_auth, "default") != Some("stored-token")
-                || scalar(registry_auth, "type") != Some("choice")
-            {
-                return Err(failure("release registry_auth input shape differs"));
-            }
-            exact_string_sequence(
-                registry_auth
-                    .get(key("options"))
-                    .ok_or_else(|| failure("release registry_auth options are absent"))?,
-                &["stored-token", "oidc-fallback"],
-                "release registry_auth options",
-            )?;
-        }
-        config::RegistryCredentialPolicy::OidcOnly => {
-            exact_mapping_keys(inputs, &["tag"], "release inputs")?;
-        }
-    }
+    exact_mapping_keys(inputs, &["tag"], "release inputs")?;
     let tag = mapping(
         inputs
             .get(key("tag"))
@@ -1272,7 +1227,9 @@ fn validate_workflow_bytes_into(
             }
             if step.get(key("with")).is_some_and(|with| {
                 serde_yaml::to_string(with).is_ok_and(|text| {
-                    text.contains("CARGO_REGISTRY_TOKEN") || text.contains(&stored_token_source())
+                    text.contains("CARGO_REGISTRY_TOKEN")
+                        || text.contains("CARGO_REGISTRIES_CRATES_IO_TOKEN")
+                        || text.contains(&stored_token_source())
                 })
             }) {
                 return Err(failure(
@@ -1411,39 +1368,22 @@ fn validate_workflow_bytes_into(
         if text.contains("release-bootstrap") || text.contains("bootstrap-crates") {
             return Err(failure("obsolete crates.io bootstrap path is forbidden"));
         }
-        let expected_token_mentions = match release.registry_credentials.policy {
-            config::RegistryCredentialPolicy::FirstReleaseTokenPrimary => 9,
-            config::RegistryCredentialPolicy::OidcOnly => 3,
-        };
-        if text.matches("CARGO_REGISTRY_TOKEN").count() != expected_token_mentions {
+        if text.matches("CARGO_REGISTRIES_CRATES_IO_TOKEN").count() != 3 {
             return Err(failure(
                 "release credential text occurs outside exact step-local mappings",
             ));
         }
-        let expected_stored_sources = match release.registry_credentials.policy {
-            config::RegistryCredentialPolicy::FirstReleaseTokenPrimary => 3,
-            config::RegistryCredentialPolicy::OidcOnly => 0,
-        };
-        if text.matches(&stored_token_source()).count() != expected_stored_sources {
-            return Err(failure(
-                "stored-token source count differs from credential profile",
-            ));
-        }
-        let expected_publish_next = match release.registry_credentials.policy {
-            config::RegistryCredentialPolicy::FirstReleaseTokenPrimary => 6,
-            config::RegistryCredentialPolicy::OidcOnly => 3,
-        };
-        if text.matches("release publish-next").count() != expected_publish_next
+        if text.contains("CARGO_REGISTRY_TOKEN")
+            || text.contains(&stored_token_source())
+            || text.matches("release publish-next").count() != 3
             || text.matches("outputs.token").count() != 3
-            || text.matches("secrets.").count() != expected_stored_sources
+            || text.contains("secrets.")
         {
             return Err(failure(
                 "release publication or credential source occurs outside canonical slots",
             ));
         }
-        if release.registry_credentials.policy == config::RegistryCredentialPolicy::OidcOnly
-            && (text.contains("stored-token") || text.contains("oidc-fallback"))
-        {
+        if text.contains("stored-token") || text.contains("oidc-fallback") {
             return Err(failure(
                 "steady-state workflow retains transition credential literals",
             ));
@@ -1489,6 +1429,7 @@ fn check_workflow(
 #[derive(Default)]
 struct RustPolicy {
     violations: Vec<String>,
+    allow_environment_mutation: bool,
 }
 
 impl<'ast> Visit<'ast> for RustPolicy {
@@ -1531,7 +1472,9 @@ impl<'ast> Visit<'ast> for RustPolicy {
     }
 
     fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
-        if matches!(expression.method.to_string().as_str(), "env" | "envs") {
+        if !self.allow_environment_mutation
+            && matches!(expression.method.to_string().as_str(), "env" | "envs")
+        {
             self.violations
                 .push("subprocess environment mutation is forbidden".to_owned());
         }
@@ -1596,7 +1539,10 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
                 "Rust syntax parse failed for {relative:?}: {error}"
             ))
         })?;
-        let mut visitor = RustPolicy::default();
+        let mut visitor = RustPolicy {
+            allow_environment_mutation: relative == Path::new("tools/memcordon-ci/src/command.rs"),
+            ..RustPolicy::default()
+        };
         visitor.visit_file(&syntax);
         if !visitor.violations.is_empty() {
             return Err(failure(format!(
@@ -1618,13 +1564,6 @@ fn check_manifests(root: &Path, policy: &config::Policy) -> Result<()> {
         .iter()
         .map(|package| (package.name.as_str(), package))
         .collect();
-    let workspace_version = packages
-        .get("memcordon")
-        .ok_or_else(|| failure("memcordon workspace package is absent"))?
-        .version
-        .clone();
-    let release = config::release(root)?;
-    config::validate_registry_credentials(&release.registry_credentials, &workspace_version)?;
     let production: BTreeSet<&str> = policy
         .workspace
         .production_packages
@@ -1788,6 +1727,13 @@ pub fn validate_package_rust_versions(
 fn check_cargo_configuration(root: &Path, files: &[PathBuf]) -> Result<()> {
     for relative in files {
         let file_name = relative.file_name().and_then(|name| name.to_str());
+        if relative.starts_with(".cargo")
+            && matches!(file_name, Some("credentials" | "credentials.toml"))
+        {
+            return Err(failure(format!(
+                "tracked Cargo credentials are forbidden: {relative:?}"
+            )));
+        }
         let is_manifest = file_name == Some("Cargo.toml");
         let is_cargo_config =
             relative.starts_with(".cargo") && matches!(file_name, Some("config" | "config.toml"));
@@ -1798,6 +1744,32 @@ fn check_cargo_configuration(root: &Path, files: &[PathBuf]) -> Result<()> {
         if is_cargo_config && document.get("env").is_some() {
             return Err(failure(format!(
                 "Cargo environment definitions are forbidden: {relative:?}"
+            )));
+        }
+        if is_cargo_config
+            && (document.get("credential-alias").is_some()
+                || document
+                    .get("registry")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|registry| {
+                        registry.contains_key("token")
+                            || registry.contains_key("credential-provider")
+                            || registry.contains_key("global-credential-providers")
+                    })
+                || document
+                    .get("registries")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|registries| {
+                        registries.values().any(|registry| {
+                            registry.as_table().is_some_and(|registry| {
+                                registry.contains_key("token")
+                                    || registry.contains_key("credential-provider")
+                            })
+                        })
+                    }))
+        {
+            return Err(failure(format!(
+                "tracked Cargo credential configuration is forbidden: {relative:?}"
             )));
         }
         if is_manifest {
@@ -1841,14 +1813,22 @@ pub fn run(root: &Path) -> Result<()> {
             "temporary release bootstrap workflow must be removed in steady state",
         ));
     }
-    let release = config::release(root)?;
-    if release.registry_credentials.policy == config::RegistryCredentialPolicy::OidcOnly {
-        let forbidden = ["secrets.", "CARGO_REGISTRY_TOKEN"].concat();
-        for relative in &files {
-            let bytes = fs::read(root.join(relative))?;
-            if std::str::from_utf8(&bytes).is_ok_and(|text| text.contains(&forbidden)) {
+    let stored_secret_source = ["secrets.", "CARGO_REGISTRY_TOKEN"].concat();
+    for relative in &files {
+        let bytes = fs::read(root.join(relative))?;
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            if text.contains(&stored_secret_source) {
                 return Err(failure(format!(
-                    "stored crates.io token source remains under oidc-only: {relative:?}"
+                    "stored crates.io token source remains: {relative:?}"
+                )));
+            }
+            if text.contains("CARGO_REGISTRY_TOKEN")
+                && relative != Path::new("tools/memcordon-ci/src/command.rs")
+                && relative != Path::new("tools/memcordon-ci/src/policy.rs")
+                && relative != Path::new("tools/memcordon-ci/src/release.rs")
+            {
+                return Err(failure(format!(
+                    "legacy crates.io token interface remains outside negative policy assertions: {relative:?}"
                 )));
             }
         }
@@ -1890,19 +1870,14 @@ pub fn run(root: &Path) -> Result<()> {
             })
         })
         .collect();
-    let release = config::release(root)?;
     let release_environment: Vec<&EnvironmentDefinition> = environment_definitions
         .iter()
         .filter(|definition| definition.file == ".github/workflows/release.yml")
         .collect();
-    let expected_release_environment_count = match release.registry_credentials.policy {
-        config::RegistryCredentialPolicy::FirstReleaseTokenPrimary => 8,
-        config::RegistryCredentialPolicy::OidcOnly => 5,
-    };
-    if release_environment.len() != expected_release_environment_count {
-        return Err(failure(format!(
-            "release workflow must have exactly {expected_release_environment_count} credential mappings"
-        )));
+    if release_environment.len() != 5 {
+        return Err(failure(
+            "release workflow must have exactly five credential mappings",
+        ));
     }
     for name in ["Stage GitHub draft and assets", "Finalize GitHub release"] {
         if !release_environment.iter().any(|definition| {
@@ -1990,22 +1965,22 @@ jobs:
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
       - name: Publish next crate in slot 1
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth_1.outputs.token }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release publish-next
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_1.outputs.token }}
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
       - name: Acquire crates.io token for publication slot 2
         id: crates_auth_2
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
       - name: Publish next crate in slot 2
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth_2.outputs.token }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release publish-next
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_2.outputs.token }}
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
       - name: Acquire crates.io token for publication slot 3
         id: crates_auth_3
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
       - name: Publish next crate in slot 3
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth_3.outputs.token }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release publish-next
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_3.outputs.token }}
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
       - name: Finalize GitHub release
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -2059,15 +2034,13 @@ jobs:
                 .ok_or_else(|| failure("release jobs are absent"))?,
             "release jobs",
         )?;
-        let mut release = config::release(&root)?;
+        let release = config::release(&root)?;
         let toolchains = config::toolchains(&root)?;
-        release.registry_credentials.policy = config::RegistryCredentialPolicy::OidcOnly;
-        release.registry_credentials.first_release_version = None;
         check_release_structure(workflow, jobs, &release, &toolchains, AUTH_ACTION)
     }
 
     #[test]
-    fn exact_transition_and_steady_workflow_profiles_are_accepted() {
+    fn exact_oidc_only_workflow_profile_is_accepted() {
         let root = repository_root();
         let policy = config::policy(&root).expect("repository policy should parse");
         validate_workflow_bytes(
@@ -2076,7 +2049,7 @@ jobs:
             include_bytes!("../../../.github/workflows/release.yml"),
             &policy,
         )
-        .expect("transition workflow should satisfy production policy");
+        .expect("OIDC-only workflow should satisfy production policy");
         check_steady_fixture(steady_workflow_fixture())
             .expect("cleanup steady-state workflow should satisfy structure policy");
     }
@@ -2097,6 +2070,13 @@ jobs:
         );
         assert!(check_steady_fixture(&wrong_output).is_err());
 
+        let separated_pair = steady_workflow_fixture().replacen(
+            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18\n      - name: Publish next crate in slot 1\n",
+            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18\n      - run: rustup toolchain install 1.97.1 --profile minimal\n      - name: Publish next crate in slot 1\n",
+            1,
+        );
+        assert!(check_steady_fixture(&separated_pair).is_err());
+
         let stored = steady_workflow_fixture().replacen(
             "${{ steps.crates_auth_1.outputs.token }}",
             &stored_token_source(),
@@ -2113,43 +2093,32 @@ jobs:
     }
 
     #[test]
-    fn transition_profile_rejects_missing_condition_automatic_fallback_and_secret_if() {
+    fn oidc_only_profile_rejects_legacy_token_and_transition_input() {
         let root = repository_root();
         let policy = config::policy(&root).expect("repository policy should parse");
         let exact = std::str::from_utf8(include_bytes!("../../../.github/workflows/release.yml"))
             .expect("workflow should be UTF-8")
             .replace("\r\n", "\n");
-        let stored_environment = format!(
+        let legacy_environment = format!(
             "        env:\n          CARGO_REGISTRY_TOKEN: {}\n",
             stored_token_source()
         );
-        let automatic_fallback_environment = format!(
-            "        continue-on-error: true\n        env:\n          CARGO_REGISTRY_TOKEN: {}\n",
-            stored_token_source()
-        );
-        let secret_condition = format!("        if: {} != ''\n", stored_token_source());
+        let transition_input =
+            "      registry_auth:\n        required: true\n        type: choice\n";
         for (case, invalid) in [
             (
-                "missing stored-token condition",
+                "legacy stored credential",
                 exact.replacen(
-                    "        if: github.event_name == 'push' || inputs.registry_auth == 'stored-token'\n",
-                    "",
+                    "        env:\n          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_1.outputs.token }}\n",
+                    &legacy_environment,
                     1,
                 ),
             ),
             (
-                "automatic stored-token fallback",
+                "retired transition input",
                 exact.replacen(
-                    &stored_environment,
-                    &automatic_fallback_environment,
-                    1,
-                ),
-            ),
-            (
-                "secret-backed step condition",
-                exact.replacen(
-                    "        if: github.event_name == 'push' || inputs.registry_auth == 'stored-token'\n",
-                    &secret_condition,
+                    "  workflow_dispatch:\n    inputs:\n",
+                    &format!("  workflow_dispatch:\n    inputs:\n{transition_input}"),
                     1,
                 ),
             ),

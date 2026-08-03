@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,7 +20,7 @@ use memcordon_ci::capability;
 use memcordon_ci::release_evidence::{CertificationRecord, collect_certification};
 
 use crate::command::{CommandSpec, git, rustup_cargo};
-use crate::config::{self, AssetTarget, RegistryCredentialPolicy};
+use crate::config::{self, AssetTarget};
 use crate::{CiError, ReleasePhase, Result};
 
 const RELEASE_DEADLINE: Duration = Duration::from_secs(30 * 60);
@@ -28,6 +28,41 @@ const GITHUB_API_ROOT: &str = "https://api.github.com";
 const GITHUB_UPLOADS_ROOT: &str = "https://uploads.github.com";
 const CRATES_IO_API_ROOT: &str = "https://crates.io";
 const GITHUB_RELEASES_PER_PAGE: usize = 100;
+const CRATES_IO_TOKEN_VARIABLE: &str = "CARGO_REGISTRIES_CRATES_IO_TOKEN";
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialRequest {
+    v: u32,
+    kind: String,
+    operation: String,
+    name: String,
+    vers: String,
+    cksum: String,
+    registry: CredentialRegistry,
+    args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialRegistry {
+    #[serde(rename = "index-url")]
+    index_url: String,
+    name: Option<String>,
+    #[serde(rename = "headers", default)]
+    _headers: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CargoHomeConfig {
+    registry: CargoRegistryConfig,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct CargoRegistryConfig {
+    credential_provider: Vec<String>,
+}
 
 #[derive(Clone, Debug)]
 struct HttpEndpoints {
@@ -155,81 +190,16 @@ enum RemoteReleaseState {
     Published(u64),
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-enum DispatchRegistryAuth {
-    StoredToken,
-    OidcFallback,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DispatchInputs {
     tag: String,
-    #[serde(default)]
-    registry_auth: Option<DispatchRegistryAuth>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WorkflowEvent {
     #[serde(default)]
     inputs: Option<DispatchInputs>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RegistryAuthPath {
-    StoredToken,
-    OidcFallback,
-    OidcOnly,
-}
-
-fn select_registry_auth_path(
-    policy: RegistryCredentialPolicy,
-    event_name: &str,
-    event: &WorkflowEvent,
-) -> Result<RegistryAuthPath> {
-    match (policy, event_name) {
-        (RegistryCredentialPolicy::FirstReleaseTokenPrimary, "push") => {
-            Ok(RegistryAuthPath::StoredToken)
-        }
-        (RegistryCredentialPolicy::FirstReleaseTokenPrimary, "workflow_dispatch") => {
-            let inputs = event
-                .inputs
-                .as_ref()
-                .ok_or_else(|| failure("workflow_dispatch inputs are missing"))?;
-            match inputs.registry_auth {
-                Some(DispatchRegistryAuth::StoredToken) => Ok(RegistryAuthPath::StoredToken),
-                Some(DispatchRegistryAuth::OidcFallback) => Ok(RegistryAuthPath::OidcFallback),
-                None => Err(failure(
-                    "transition workflow_dispatch registry_auth input is missing",
-                )),
-            }
-        }
-        (RegistryCredentialPolicy::OidcOnly, "push" | "workflow_dispatch") => {
-            Ok(RegistryAuthPath::OidcOnly)
-        }
-        (_, other) => Err(failure(format!("unsupported release event: {other}"))),
-    }
-}
-
-fn configured_first_release(release: &config::Release) -> Result<Option<&Version>> {
-    match (
-        release.registry_credentials.policy,
-        release.registry_credentials.first_release_version.as_ref(),
-    ) {
-        (RegistryCredentialPolicy::FirstReleaseTokenPrimary, Some(version))
-            if version.pre.is_empty() && version.build.is_empty() =>
-        {
-            Ok(Some(version))
-        }
-        (RegistryCredentialPolicy::OidcOnly, None) => Ok(None),
-        (RegistryCredentialPolicy::FirstReleaseTokenPrimary, _) => Err(failure(
-            "first-release-token-primary requires a stable first_release_version",
-        )),
-        (RegistryCredentialPolicy::OidcOnly, Some(_)) => Err(failure(
-            "oidc-only forbids a first_release_version transition setting",
-        )),
-    }
 }
 
 fn release_tag_version(tag: &str) -> Option<Version> {
@@ -266,42 +236,27 @@ fn workflow_event() -> Result<(String, WorkflowEvent)> {
     Ok((event_name, event))
 }
 
-fn validate_registry_auth_context(
-    release: &config::Release,
-    tag: &str,
-) -> Result<RegistryAuthPath> {
+fn validate_registry_auth_context(tag: &str) -> Result<()> {
     let (event_name, event) = workflow_event()?;
-    let path = select_registry_auth_path(release.registry_credentials.policy, &event_name, &event)?;
-    if event_name == "workflow_dispatch" {
-        let input_tag = &event
-            .inputs
-            .as_ref()
-            .ok_or_else(|| failure("workflow_dispatch inputs are missing"))?
-            .tag;
-        if input_tag != tag {
-            return Err(failure(
-                "workflow_dispatch tag input differs from the protected release tag",
-            ));
+    match event_name.as_str() {
+        "push" => {
+            if event.inputs.is_some() {
+                return Err(failure("push release event unexpectedly contains inputs"));
+            }
         }
-    }
-    if path == RegistryAuthPath::OidcFallback {
-        require_oidc_fallback_names(&release.publish_packages, |package| {
-            crate_name_exists(release, package)
-        })?;
-    }
-    Ok(path)
-}
-
-fn require_oidc_fallback_names(
-    packages: &[String],
-    mut exists: impl FnMut(&str) -> Result<bool>,
-) -> Result<()> {
-    for package in packages {
-        if !exists(package)? {
-            return Err(failure(format!(
-                "OIDC fallback is forbidden while crates.io package name is absent: {package}"
-            )));
+        "workflow_dispatch" => {
+            let input_tag = &event
+                .inputs
+                .as_ref()
+                .ok_or_else(|| failure("workflow_dispatch inputs are missing"))?
+                .tag;
+            if input_tag != tag {
+                return Err(failure(
+                    "workflow_dispatch tag input differs from the protected release tag",
+                ));
+            }
         }
+        other => return Err(failure(format!("unsupported release event: {other}"))),
     }
     Ok(())
 }
@@ -330,7 +285,12 @@ fn git_text_os(root: &Path, arguments: impl IntoIterator<Item = OsString>) -> Re
 }
 
 fn metadata(root: &Path) -> Result<Metadata> {
-    Ok(MetadataCommand::new().current_dir(root).exec()?)
+    let mut command = MetadataCommand::new();
+    command
+        .current_dir(root)
+        .env_remove("CARGO_REGISTRY_TOKEN")
+        .env_remove(CRATES_IO_TOKEN_VARIABLE);
+    Ok(command.exec()?)
 }
 
 fn parse_changelog(root: &Path, version: &Version) -> Result<(String, String)> {
@@ -471,7 +431,6 @@ fn publish_order(metadata: &Metadata, configured: &[String]) -> Result<Vec<Strin
 pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
     let release = config::release(root)?;
     config::validate_release_configuration_identity(&release)?;
-    let configured_first = configured_first_release(&release)?;
     let status = git(root, ["status", "--porcelain=v1", "-z"])?;
     if !status.is_empty() {
         return Err(failure("release worktree or index is dirty"));
@@ -525,35 +484,6 @@ pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
         ));
     }
     validate_release_version(&version)?;
-    if let Some(first) = configured_first {
-        if version != *first {
-            return Err(failure(format!(
-                "transition credential policy is restricted to first release version {first}"
-            )));
-        }
-        let remote_tags = utf8(
-            git(root, ["ls-remote", "--tags", "origin"])?,
-            "remote release tag inventory",
-        )?;
-        for candidate in remote_tags.lines().filter_map(|line| {
-            let reference = line.split_whitespace().nth(1)?;
-            let tag = reference
-                .strip_prefix("refs/tags/")?
-                .strip_suffix("^{}")
-                .unwrap_or_else(|| {
-                    reference
-                        .strip_prefix("refs/tags/")
-                        .expect("prefix checked")
-                });
-            release_tag_version(tag)
-        }) {
-            if candidate > *first {
-                return Err(failure(format!(
-                    "later release tag {candidate} exists while transition credential policy remains"
-                )));
-            }
-        }
-    }
     let metadata = metadata(root)?;
     let workspace_version = metadata
         .packages
@@ -586,7 +516,7 @@ pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
             "release workflow did not execute at the exact tag ref",
         ));
     }
-    validate_registry_auth_context(&release, &tag)?;
+    validate_registry_auth_context(&tag)?;
     CommandSpec::new("git", root, Duration::from_secs(120))
         .args(["diff", "--quiet", "HEAD", "--", "Cargo.lock"])
         .run()
@@ -2096,10 +2026,7 @@ fn crate_checksum(release: &config::Release, name: &str, version: &str) -> Resul
     crate_checksum_at(release, &HttpEndpoints::production(), name, version)
 }
 
-fn crate_name_exists(release: &config::Release, name: &str) -> Result<bool> {
-    crate_name_exists_at(release, &HttpEndpoints::production(), name)
-}
-
+#[cfg(test)]
 fn crate_name_exists_at(
     release: &config::Release,
     endpoints: &HttpEndpoints,
@@ -2398,12 +2325,141 @@ fn wait_for_public_crate(
     }
 }
 
-fn require_registry_token(token: Option<&std::ffi::OsStr>) -> Result<()> {
-    if token.is_none_or(|token| token.is_empty()) {
+fn require_registry_token(token: Option<&str>) -> Result<&str> {
+    if token.is_none_or(str::is_empty) {
+        return Err(failure(format!(
+            "{CRATES_IO_TOKEN_VARIABLE} is absent or empty for the selected publication slot"
+        )));
+    }
+    Ok(token.expect("nonempty token checked"))
+}
+
+fn cargo_publish_home(root: &Path, record: &CrateRecord) -> Result<PathBuf> {
+    let cargo_home = root.join("target").join("ci").join("cargo-publish-home");
+    fs::create_dir_all(&cargo_home)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o700))?;
+    }
+    for credentials in ["credentials", "credentials.toml"] {
+        if cargo_home.join(credentials).exists() {
+            return Err(failure(format!(
+                "isolated Cargo home unexpectedly contains {credentials}"
+            )));
+        }
+    }
+    let provider = std::env::current_exe()?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| failure("credential provider executable path is not UTF-8"))?;
+    let configuration = CargoHomeConfig {
+        registry: CargoRegistryConfig {
+            credential_provider: vec![
+                provider,
+                record.name.clone(),
+                record.version.clone(),
+                record.archive_sha256.clone(),
+            ],
+        },
+    };
+    fs::write(
+        cargo_home.join("config.toml"),
+        toml::to_string(&configuration)
+            .map_err(|error| {
+                failure(format!(
+                    "Cargo provider config serialization failed: {error}"
+                ))
+            })?
+            .as_bytes(),
+    )?;
+    Ok(cargo_home)
+}
+
+fn credential_request_error(message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "Err": {
+            "kind": "other",
+            "message": message.into(),
+        }
+    })
+}
+
+fn validate_credential_request(root: &Path, request: &CredentialRequest) -> Result<CrateRecord> {
+    if request.v != 1
+        || request.kind != "get"
+        || request.operation != "publish"
+        || request.registry.name.as_deref() != Some("crates-io")
+        || !matches!(
+            request.registry.index_url.as_str(),
+            "https://github.com/rust-lang/crates.io-index" | "sparse+https://index.crates.io/"
+        )
+        || request.cksum.is_empty()
+        || request.args.len() != 3
+    {
+        return Err(failure("Cargo credential request identity is invalid"));
+    }
+    let (_, manifest, _) = bundle_manifest(root)?;
+    let record = manifest
+        .crates
+        .into_iter()
+        .find(|record| record.name == request.name && record.version == request.vers)
+        .ok_or_else(|| failure("Cargo credential request is absent from the release manifest"))?;
+    if request.args.first().map(String::as_str) != Some(record.name.as_str())
+        || request.args.get(1).map(String::as_str) != Some(record.version.as_str())
+        || request.args.get(2).map(String::as_str) != Some(record.archive_sha256.as_str())
+        || request.cksum != record.archive_sha256
+    {
         return Err(failure(
-            "CARGO_REGISTRY_TOKEN is absent or empty for the selected publication slot",
+            "Cargo credential request differs from the selected release artifact",
         ));
     }
+    Ok(record)
+}
+
+fn credential_response(
+    root: &Path,
+    request: serde_json::Result<CredentialRequest>,
+    token: Option<&str>,
+) -> serde_json::Value {
+    match request {
+        Ok(request) => match validate_credential_request(root, &request) {
+            Ok(_) => match token {
+                Some(token) if !token.is_empty() => serde_json::json!({
+                    "Ok": {
+                        "kind": "get",
+                        "token": token,
+                        "cache": "never",
+                        "operation_independent": false,
+                    }
+                }),
+                _ => credential_request_error("trusted-publishing capability is absent"),
+            },
+            Err(error) => credential_request_error(error.to_string()),
+        },
+        Err(_) => credential_request_error("Cargo credential request is malformed"),
+    }
+}
+
+pub fn cargo_credential_provider(root: &Path) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer(&mut output, &serde_json::json!({ "v": [1] }))?;
+    writeln!(output)?;
+    output.flush()?;
+
+    let stdin = std::io::stdin();
+    let mut input = BufReader::new(stdin.lock());
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        return Err(failure("Cargo credential provider received no request"));
+    }
+    let request = serde_json::from_str::<CredentialRequest>(line.trim_end());
+    let token = std::env::var(CRATES_IO_TOKEN_VARIABLE).ok();
+    let response = credential_response(root, request, token.as_deref());
+    serde_json::to_writer(&mut output, &response)?;
+    writeln!(output)?;
+    output.flush()?;
     Ok(())
 }
 
@@ -2419,8 +2475,8 @@ fn reconcile_publication_result(
 }
 
 fn publish_next(root: &Path) -> Result<()> {
-    let token = std::env::var_os("CARGO_REGISTRY_TOKEN");
-    require_registry_token(token.as_deref())?;
+    let token = std::env::var(CRATES_IO_TOKEN_VARIABLE).ok();
+    let token = require_registry_token(token.as_deref())?;
     let (release, manifest, _) = bundle_manifest(root)?;
     let metadata = metadata(root)?;
     let order = publish_order(&metadata, &release.publish_packages)?;
@@ -2444,12 +2500,14 @@ fn publish_next(root: &Path) -> Result<()> {
             .find(|record| record.name == package)
             .ok_or_else(|| failure(format!("release manifest lacks crate {package}")))?;
         let toolchains = config::toolchains(root)?;
+        let cargo_home = cargo_publish_home(root, record)?;
         let publication = rustup_cargo(
             root,
             &toolchains.stable,
             [
                 "publish",
                 "--locked",
+                "--no-verify",
                 "--registry",
                 "crates-io",
                 "--package",
@@ -2457,7 +2515,22 @@ fn publish_next(root: &Path) -> Result<()> {
             ],
             RELEASE_DEADLINE,
         )
+        .environment_variable("CARGO_HOME", cargo_home.into_os_string())
+        .environment_variable(CRATES_IO_TOKEN_VARIABLE, token)
         .run();
+        for credentials in ["credentials", "credentials.toml"] {
+            if root
+                .join("target")
+                .join("ci")
+                .join("cargo-publish-home")
+                .join(credentials)
+                .exists()
+            {
+                return Err(failure(format!(
+                    "Cargo publication persisted forbidden {credentials}"
+                )));
+            }
+        }
         let publicly_visible = if publication.is_err() {
             crate_checksum(&release, &record.name, &record.version)?.is_some()
         } else {
@@ -2963,88 +3036,12 @@ mod tests {
         (temporary, release, identity)
     }
 
-    fn dispatch_event(auth: Option<DispatchRegistryAuth>) -> WorkflowEvent {
-        WorkflowEvent {
-            inputs: Some(DispatchInputs {
-                tag: "0.1.0".to_owned(),
-                registry_auth: auth,
-            }),
-        }
-    }
-
     #[test]
-    fn credential_selector_covers_profiles_events_and_dispatch_choices() {
-        let push = WorkflowEvent { inputs: None };
-        assert_eq!(
-            select_registry_auth_path(
-                RegistryCredentialPolicy::FirstReleaseTokenPrimary,
-                "push",
-                &push,
-            )
-            .expect("transition push should select stored token"),
-            RegistryAuthPath::StoredToken
-        );
-        assert_eq!(
-            select_registry_auth_path(
-                RegistryCredentialPolicy::FirstReleaseTokenPrimary,
-                "workflow_dispatch",
-                &dispatch_event(Some(DispatchRegistryAuth::StoredToken)),
-            )
-            .expect("stored-token dispatch should select stored token"),
-            RegistryAuthPath::StoredToken
-        );
-        assert_eq!(
-            select_registry_auth_path(
-                RegistryCredentialPolicy::FirstReleaseTokenPrimary,
-                "workflow_dispatch",
-                &dispatch_event(Some(DispatchRegistryAuth::OidcFallback)),
-            )
-            .expect("fallback dispatch should select OIDC fallback"),
-            RegistryAuthPath::OidcFallback
-        );
-        for event_name in ["push", "workflow_dispatch"] {
-            assert_eq!(
-                select_registry_auth_path(
-                    RegistryCredentialPolicy::OidcOnly,
-                    event_name,
-                    &dispatch_event(None),
-                )
-                .expect("steady-state event should select OIDC"),
-                RegistryAuthPath::OidcOnly
-            );
-        }
-        assert!(
-            select_registry_auth_path(
-                RegistryCredentialPolicy::FirstReleaseTokenPrimary,
-                "workflow_dispatch",
-                &dispatch_event(None),
-            )
-            .is_err()
-        );
-        for policy in [
-            RegistryCredentialPolicy::FirstReleaseTokenPrimary,
-            RegistryCredentialPolicy::OidcOnly,
-        ] {
-            for event_name in ["pull_request", "merge_group", "unknown"] {
-                assert!(select_registry_auth_path(policy, event_name, &push).is_err());
-            }
-        }
-    }
-
-    #[test]
-    fn workflow_event_deserialization_is_typed_and_steady_dispatch_compatible() {
+    fn workflow_event_deserialization_rejects_retired_dispatch_inputs() {
         let steady: WorkflowEvent =
             serde_json::from_str(r#"{"inputs":{"tag":"0.2.0"},"repository":{"private":false}}"#)
                 .expect("steady-state dispatch payload should parse");
-        assert_eq!(
-            select_registry_auth_path(
-                RegistryCredentialPolicy::OidcOnly,
-                "workflow_dispatch",
-                &steady,
-            )
-            .expect("steady dispatch should select OIDC"),
-            RegistryAuthPath::OidcOnly
-        );
+        assert_eq!(steady.inputs.expect("dispatch inputs").tag, "0.2.0");
         assert!(
             serde_json::from_str::<WorkflowEvent>(
                 r#"{"inputs":{"tag":"0.1.0","registry_auth":"unknown"}}"#
@@ -3062,27 +3059,81 @@ mod tests {
     #[test]
     fn publication_slot_requires_a_nonempty_source_agnostic_token() {
         assert!(require_registry_token(None).is_err());
-        assert!(require_registry_token(Some(std::ffi::OsStr::new(""))).is_err());
-        require_registry_token(Some(std::ffi::OsStr::new("opaque-test-capability")))
+        assert!(require_registry_token(Some("")).is_err());
+        require_registry_token(Some("opaque-test-capability"))
             .expect("any nonempty credential source is accepted");
     }
 
     #[test]
-    fn oidc_fallback_requires_every_configured_crate_name() {
-        let packages = vec![
-            "memcordon-core".to_owned(),
-            "memcordon-platform".to_owned(),
-            "memcordon".to_owned(),
-        ];
-        let mut checked = Vec::new();
-        let partial = require_oidc_fallback_names(&packages, |package| {
-            checked.push(package.to_owned());
-            Ok(package != "memcordon-platform")
-        });
-        assert!(partial.is_err());
-        assert_eq!(checked, ["memcordon-core", "memcordon-platform"]);
-        require_oidc_fallback_names(&packages, |_| Ok(true))
-            .expect("fallback should proceed only after all names exist");
+    fn credential_request_is_bound_to_the_release_artifact() {
+        let (temporary, release) = release_fixture();
+        let manifest_path = temporary
+            .path()
+            .join(&release.assets.output_directory)
+            .join(&release.assets.manifest);
+        let mut manifest: ReleaseManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("manifest should read"))
+                .expect("manifest should parse");
+        let record = CrateRecord {
+            name: "memcordon-core".to_owned(),
+            version: "1.2.3".to_owned(),
+            archive_sha256: "ab".repeat(32),
+            canonical_tree_sha256: "cd".repeat(32),
+            canonical_identity_sha256: "ef".repeat(32),
+            vcs_commit: manifest.source_commit.clone(),
+        };
+        manifest.crates.push(record.clone());
+        write_json(&manifest_path, &manifest).expect("manifest should update");
+        let request = CredentialRequest {
+            v: 1,
+            kind: "get".to_owned(),
+            operation: "publish".to_owned(),
+            name: record.name.clone(),
+            vers: record.version.clone(),
+            cksum: record.archive_sha256.clone(),
+            registry: CredentialRegistry {
+                index_url: "sparse+https://index.crates.io/".to_owned(),
+                name: Some("crates-io".to_owned()),
+                _headers: Vec::new(),
+            },
+            args: vec![
+                record.name.clone(),
+                record.version.clone(),
+                record.archive_sha256.clone(),
+            ],
+        };
+        validate_credential_request(temporary.path(), &request)
+            .expect("exact publish request should pass");
+        let accepted = credential_response(
+            temporary.path(),
+            Ok(request.clone()),
+            Some("opaque-test-capability"),
+        );
+        assert_eq!(accepted["Ok"]["kind"], "get");
+        assert_eq!(accepted["Ok"]["cache"], "never");
+        assert_eq!(accepted["Ok"]["operation_independent"], false);
+        assert_eq!(accepted["Ok"]["token"], "opaque-test-capability");
+        let missing = credential_response(temporary.path(), Ok(request.clone()), None);
+        assert_eq!(missing["Err"]["kind"], "other");
+
+        let cargo_home = cargo_publish_home(temporary.path(), &record)
+            .expect("isolated Cargo home should be prepared");
+        let provider_config =
+            fs::read_to_string(cargo_home.join("config.toml")).expect("config should read");
+        assert!(!provider_config.contains("opaque-test-capability"));
+        let provider_config: toml::Value =
+            toml::from_str(&provider_config).expect("config should parse");
+        let provider = provider_config["registry"]["credential-provider"]
+            .as_array()
+            .expect("provider should be an argv array");
+        assert_eq!(provider.len(), 4);
+        assert_eq!(provider[1].as_str(), Some(record.name.as_str()));
+        assert_eq!(provider[2].as_str(), Some(record.version.as_str()));
+        assert_eq!(provider[3].as_str(), Some(record.archive_sha256.as_str()));
+
+        let mut wrong_checksum = request;
+        wrong_checksum.cksum = "00".repeat(32);
+        assert!(validate_credential_request(temporary.path(), &wrong_checksum).is_err());
     }
 
     #[test]
@@ -3108,23 +3159,9 @@ mod tests {
             assets: Vec::new(),
             crates: Vec::new(),
         };
-        let cross_mode_bytes: Vec<Vec<u8>> = [
-            RegistryAuthPath::StoredToken,
-            RegistryAuthPath::OidcFallback,
-            RegistryAuthPath::OidcOnly,
-        ]
-        .into_iter()
-        .map(|_attempt_local_path| {
-            serde_json::to_vec(&report).expect("report should serialize identically")
-        })
-        .collect();
-        assert!(
-            cross_mode_bytes.windows(2).all(|pair| pair[0] == pair[1]),
-            "credential origin must not change final report bytes"
-        );
-        let bytes = &cross_mode_bytes[0];
-        let text = std::str::from_utf8(bytes).expect("report should be UTF-8");
-        for forbidden in ["StoredToken", "OidcFallback", "OidcOnly", "registry_auth"] {
+        let bytes = serde_json::to_vec(&report).expect("report should serialize");
+        let text = std::str::from_utf8(&bytes).expect("report should be UTF-8");
+        for forbidden in ["token", "credential", "registry_auth"] {
             assert!(!text.contains(forbidden));
         }
     }

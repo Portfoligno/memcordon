@@ -14,8 +14,10 @@ use memcordon_ci::{CiError, Result, command, config, policy};
     about = "Typed MemCordon CI and release orchestrator"
 )]
 struct Cli {
+    #[arg(long, hide = true)]
+    cargo_plugin: bool,
     #[command(subcommand)]
-    command: TopLevel,
+    command: Option<TopLevel>,
 }
 
 #[derive(Subcommand)]
@@ -81,12 +83,16 @@ fn workspace_root(start: &Path) -> Result<PathBuf> {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let root = workspace_root(&std::env::current_dir()?)?;
-    match cli.command {
-        TopLevel::Suite { suite } => suites::run(&root, suite),
-        TopLevel::Release { phase } => release::run(&root, phase),
-        TopLevel::DelegatedLinuxCertification { rustup, uid } => {
+    match (cli.cargo_plugin, cli.command) {
+        (true, None) => release::cargo_credential_provider(&root),
+        (false, Some(TopLevel::Suite { suite })) => suites::run(&root, suite),
+        (false, Some(TopLevel::Release { phase })) => release::run(&root, phase),
+        (false, Some(TopLevel::DelegatedLinuxCertification { rustup, uid })) => {
             suites::delegated_linux_certification(&root, &rustup, &uid)
         }
+        _ => Err(CiError::Message(
+            "exactly one CI command or --cargo-plugin is required".to_owned(),
+        )),
     }
 }
 

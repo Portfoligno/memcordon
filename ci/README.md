@@ -45,20 +45,19 @@ cached; Cargo sources and the `target/ci/bootstrap` and `target/ci/backend`
 compilation outputs use separate complete keys. Reports and credentials are
 never cached, and every runtime qualification and scenario runs on every job.
 
-Release phases derive source identity and the typed credential path from Git and
-GitHub event metadata, never from a custom project environment variable. The
-first-release transition accepts exactly two step-local variables in
-`release.yml`: `GITHUB_TOKEN` for GitHub staging/finalization and
-`CARGO_REGISTRY_TOKEN` for each selected crates.io publication slot. A protected
-tag push selects the temporary repository Actions secret; a same-tag manual
-dispatch may deliberately select that path or OIDC fallback. The fallback is
-rejected until every configured crate name exists. No job names a GitHub
-Environment, so execution requires no environment approval or environment OIDC
-claim. Repository policy rejects any named GitHub Environment.
+Release phases derive source identity from Git and GitHub event metadata, never
+from a custom project environment variable. The closed `oidc-only` credential
+policy accepts exactly two step-local variable names in `release.yml`:
+`GITHUB_TOKEN` for GitHub staging/finalization and a registry-specific provider
+input for each crates.io publication slot. Each slot obtains a fresh short-lived
+token from the pinned crates.io trusted-publishing action, passes it in memory to
+the paired typed Cargo credential provider, and fails closed if acquisition or
+publication fails. No job names a GitHub Environment, so execution requires no
+environment approval or environment OIDC claim. Repository policy rejects any
+named GitHub Environment.
 
-After the first-tag OIDC reconciliation, the required cleanup changes the closed
-credential policy to `oidc-only`, removes the stored secret and transition input,
-and promotes the three OIDC pairs to the sole unconditional publication path.
-The crates.io trusted-publisher identity is owner, repository, and workflow.
-Repository policy enforces exact transition and steady-state shapes and prevents
-the stored-token path from surviving into a later version.
+The crates.io trusted-publisher identity is owner `Portfoligno`, repository
+`memcordon`, and workflow `release.yml`. Repository policy enforces the exact
+three unconditional OIDC pairs, rejects stored credentials and transition
+inputs, and prevents publication credentials from being passed through action
+inputs, command arguments, caches, artifacts, or reports.

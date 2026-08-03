@@ -10,14 +10,6 @@ on:
         description: Existing protected SemVer tag to publish or reconcile
         required: true
         type: string
-      registry_auth:
-        description: First-release crates.io credential path
-        required: true
-        default: stored-token
-        type: choice
-        options:
-          - stored-token
-          - oidc-fallback
 
 permissions:
   contents: read
@@ -445,48 +437,27 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release stage-github
-      - name: Publish next crate in stored-token slot 1
-        if: github.event_name == 'push' || inputs.registry_auth == 'stored-token'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release publish-next
-      - name: Acquire crates.io OIDC token for fallback slot 1
-        if: github.event_name == 'workflow_dispatch' && inputs.registry_auth == 'oidc-fallback'
-        id: crates_auth_fallback_1
+      - name: Acquire crates.io token for publication slot 1
+        id: crates_auth_1
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Publish next crate in OIDC fallback slot 1
-        if: github.event_name == 'workflow_dispatch' && inputs.registry_auth == 'oidc-fallback'
+      - name: Publish next crate in slot 1
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth_fallback_1.outputs.token }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release publish-next
-      - name: Publish next crate in stored-token slot 2
-        if: github.event_name == 'push' || inputs.registry_auth == 'stored-token'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release publish-next
-      - name: Acquire crates.io OIDC token for fallback slot 2
-        if: github.event_name == 'workflow_dispatch' && inputs.registry_auth == 'oidc-fallback'
-        id: crates_auth_fallback_2
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_1.outputs.token }}
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
+      - name: Acquire crates.io token for publication slot 2
+        id: crates_auth_2
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Publish next crate in OIDC fallback slot 2
-        if: github.event_name == 'workflow_dispatch' && inputs.registry_auth == 'oidc-fallback'
+      - name: Publish next crate in slot 2
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth_fallback_2.outputs.token }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release publish-next
-      - name: Publish next crate in stored-token slot 3
-        if: github.event_name == 'push' || inputs.registry_auth == 'stored-token'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release publish-next
-      - name: Acquire crates.io OIDC token for fallback slot 3
-        if: github.event_name == 'workflow_dispatch' && inputs.registry_auth == 'oidc-fallback'
-        id: crates_auth_fallback_3
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_2.outputs.token }}
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
+      - name: Acquire crates.io token for publication slot 3
+        id: crates_auth_3
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Publish next crate in OIDC fallback slot 3
-        if: github.event_name == 'workflow_dispatch' && inputs.registry_auth == 'oidc-fallback'
+      - name: Publish next crate in slot 3
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates_auth_fallback_3.outputs.token }}
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release publish-next
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_3.outputs.token }}
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
       - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release verify-crates
       - name: Finalize GitHub release
         env:

@@ -101,7 +101,6 @@ pub struct Release {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RegistryCredentialPolicy {
-    FirstReleaseTokenPrimary,
     OidcOnly,
 }
 
@@ -109,7 +108,6 @@ pub enum RegistryCredentialPolicy {
 #[serde(deny_unknown_fields)]
 pub struct RegistryCredentials {
     pub policy: RegistryCredentialPolicy,
-    pub first_release_version: Option<semver::Version>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -195,112 +193,24 @@ pub fn validate_release_configuration_identity(release: &Release) -> Result<()> 
     Ok(())
 }
 
-pub fn validate_registry_credentials(
-    credentials: &RegistryCredentials,
-    workspace_version: &semver::Version,
-) -> Result<()> {
-    match (
-        credentials.policy,
-        credentials.first_release_version.as_ref(),
-    ) {
-        (RegistryCredentialPolicy::FirstReleaseTokenPrimary, Some(first))
-            if first.pre.is_empty()
-                && first.build.is_empty()
-                && workspace_version.build.is_empty()
-                && (workspace_version == first
-                    || (workspace_version.major == first.major
-                        && workspace_version.minor == first.minor
-                        && workspace_version.patch == first.patch
-                        && workspace_version.pre.as_str() == "dev")) =>
-        {
-            Ok(())
-        }
-        (RegistryCredentialPolicy::FirstReleaseTokenPrimary, Some(first))
-            if first.pre.is_empty() && first.build.is_empty() =>
-        {
-            Err(crate::CiError::Message(format!(
-                "first-release-token-primary permits only {first} and its corresponding -dev workspace version"
-            )))
-        }
-        (RegistryCredentialPolicy::FirstReleaseTokenPrimary, _) => Err(crate::CiError::Message(
-            "first-release-token-primary requires a stable first_release_version".to_owned(),
-        )),
-        (RegistryCredentialPolicy::OidcOnly, None) => Ok(()),
-        (RegistryCredentialPolicy::OidcOnly, Some(_)) => Err(crate::CiError::Message(
-            "oidc-only forbids first_release_version".to_owned(),
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use semver::Version;
-
-    fn transition(first: Option<&str>) -> RegistryCredentials {
-        RegistryCredentials {
-            policy: RegistryCredentialPolicy::FirstReleaseTokenPrimary,
-            first_release_version: first.map(|value| Version::parse(value).expect("valid version")),
-        }
-    }
 
     #[test]
-    fn transition_version_policy_accepts_only_first_and_corresponding_dev() {
-        let credentials = transition(Some("0.1.0"));
-        for accepted in ["0.1.0", "0.1.0-dev"] {
-            validate_registry_credentials(
-                &credentials,
-                &Version::parse(accepted).expect("valid accepted version"),
-            )
-            .expect("first release version shape should pass");
-        }
-        for rejected in ["0.1.0-alpha", "0.1.0+build", "0.1.1-dev", "0.2.0"] {
+    fn credential_configuration_is_closed_to_oidc_only() {
+        toml::from_str::<RegistryCredentials>("policy = \"oidc-only\"\n")
+            .expect("OIDC-only credentials should parse");
+        for legacy in [
+            "policy = \"arbitrary-provider\"\n",
+            "policy = \"first-release-token-primary\"\nfirst_release_version = \"0.1.3\"\n",
+            "policy = \"oidc-only\"\nfirst_release_version = \"0.1.3\"\n",
+        ] {
             assert!(
-                validate_registry_credentials(
-                    &credentials,
-                    &Version::parse(rejected).expect("valid rejected version"),
-                )
-                .is_err(),
-                "transition unexpectedly accepted {rejected}"
+                toml::from_str::<RegistryCredentials>(legacy).is_err(),
+                "legacy credential configuration unexpectedly parsed"
             );
         }
-    }
-
-    #[test]
-    fn credential_configuration_is_closed_and_profile_consistent() {
-        assert!(
-            toml::from_str::<RegistryCredentials>(
-                "policy = \"arbitrary-provider\"\nfirst_release_version = \"0.1.0\"\n"
-            )
-            .is_err()
-        );
-        assert!(
-            validate_registry_credentials(
-                &transition(None),
-                &Version::parse("0.1.0-dev").expect("valid version")
-            )
-            .is_err()
-        );
-        let oidc = RegistryCredentials {
-            policy: RegistryCredentialPolicy::OidcOnly,
-            first_release_version: None,
-        };
-        validate_registry_credentials(
-            &oidc,
-            &Version::parse("9.0.0").expect("valid later version"),
-        )
-        .expect("oidc-only accepts later releases");
-        let inconsistent = RegistryCredentials {
-            first_release_version: Some(Version::parse("0.1.0").expect("valid version")),
-            ..oidc
-        };
-        assert!(
-            validate_registry_credentials(
-                &inconsistent,
-                &Version::parse("0.1.0").expect("valid version")
-            )
-            .is_err()
-        );
     }
 
     #[test]

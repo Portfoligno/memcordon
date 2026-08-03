@@ -11,6 +11,7 @@ use crate::{CiError, Result};
 pub struct CommandSpec {
     program: PathBuf,
     arguments: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
     current_dir: PathBuf,
     deadline: Duration,
 }
@@ -20,6 +21,7 @@ impl CommandSpec {
         Self {
             program: program.into(),
             arguments: Vec::new(),
+            environment: Vec::new(),
             current_dir: current_dir.to_path_buf(),
             deadline,
         }
@@ -39,6 +41,15 @@ impl CommandSpec {
         self
     }
 
+    pub fn environment_variable(
+        mut self,
+        name: impl Into<OsString>,
+        value: impl Into<OsString>,
+    ) -> Self {
+        self.environment.push((name.into(), value.into()));
+        self
+    }
+
     pub fn run(&self) -> Result<Vec<u8>> {
         eprintln!("ci subprocess program: {:?}", self.program);
         for argument in &self.arguments {
@@ -46,7 +57,12 @@ impl CommandSpec {
         }
         eprintln!("ci subprocess deadline: {:?}", self.deadline);
         let mut command = Command::new(&self.program);
-        command.args(&self.arguments).current_dir(&self.current_dir);
+        command
+            .args(&self.arguments)
+            .env_remove("CARGO_REGISTRY_TOKEN")
+            .env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN")
+            .envs(self.environment.iter().map(|(name, value)| (name, value)))
+            .current_dir(&self.current_dir);
         let output = run_with_deadline(&mut command, self.deadline)?;
         if output.status.success() {
             if !output.stdout.is_empty() {
