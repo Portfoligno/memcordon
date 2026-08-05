@@ -1,13 +1,15 @@
 # MemCordon contract reference
 
-This reference defines MemCordon's public CLI, platform behavior, status precedence, and machine-readable output contracts.
+This reference defines MemCordon's public CLI, platform behavior, status
+precedence, and machine-readable output contracts. For installation and a
+first run, see the [README](../README.md).
 
 ## Invocation
 
 ```text
 memcordon [EXECUTION OPTIONS] [BUDGET]... [--] COMMAND [ARGUMENT]...
 memcordon doctor [--json] [--require hard|watchdog]
-memcordon plan [POLICY OPTIONS] [BUDGET]...
+memcordon plan [POLICY OPTIONS] [--json] [BUDGET]...
 memcordon clean [--dry-run] [--json]
 ```
 
@@ -15,35 +17,9 @@ Budgets are optional, contiguous, and order-independent. At most one `+MEMORY` a
 
 No memory budget installs or samples a MemCordon memory policy and cannot produce status 124. No time budget installs a deadline and cannot produce status 123. Containment remains active without either budget.
 
-## Deadline and restart policy
-
-Attempt deadlines reset at the platform authorization point: Linux release-byte write, Windows suspended-thread resume, or macOS pre-spawn. A supervision deadline starts with the first authorization and includes later cleanup, setup, backoff, and cooldown. It is terminal and cannot trigger restart. Confirmed memory evidence wins a same-cycle deadline race.
-
-Execution is one-shot unless `--restart` or `--restart-on both|memory-limit|deadline` is supplied. `--restart-on` independently enables restart. Enabled restart defaults to both applicable conditions and unlimited additional launches. A finite `--restart-limit N` counts additional launches. Only selected MemCordon limits restart, and only after the child and helpers are reaped, the workload is proven empty, and containment is removed or incapable of retaining members.
-
-Backoff model `logistic-odds-v1` uses exact rational arithmetic and upward whole-millisecond rounding:
-
-```text
-next = max * multiplier * current / (max + (multiplier - 1) * current)
-```
-
-Defaults are 1s initial, multiplier 2, and 30s maximum. Circuit breaker options `--restart-burst`, `--restart-window`, and `--cooldown` are all-or-none. Cooldown replaces a logistic wait and does not advance its sequence.
-
-## Platforms
-
-Linux uses the installed MemCordon CLI launcher gate: READY validation, cgroup assignment and readback, guardian startup, release byte, then typed target `CommandExt::exec`. Time-only and budgetless execution require containment delegation but not the memory controller.
-
-Windows creates the target suspended, assigns it to a fresh kill-on-close Job Object, then resumes it. Memory flags and notifications are configured only with a memory budget.
-
-macOS creates a fresh process group and launches its guardian through an explicit `MemcordonExecutable`. Sampling is absent without memory. There is no hidden workload-drain deadline; only `+TIME` sets an elapsed-time limit.
-
-## Status and schemas
-
-Status 123 is a terminal MemCordon deadline, 124 a confirmed memory-limit event, and 125 a wrapper, monitoring, cleanup, report, or restart-safety failure. Ordinary child statuses are otherwise preserved.
-
-Execution reports use schema 3. They include nullable budgets, requested/effective policy, backend capability, supervision summary, bounded attempt history, aggregates, restart decisions, and terminal provenance. Detailed history retains attempt 1 and the latest 255 later attempts while aggregates include every attempt. `plan` and `doctor` use schema 2. `clean` remains schema 1. Consumers must inspect `schema_version`.
-
-MemCordon never parses command strings, launches a shell, or defines a custom environment-variable control plane. Program and arguments remain distinct native values on every attempt.
+MemCordon never parses command strings, launches a shell, or defines a custom
+environment-variable control plane. Program and arguments remain distinct
+native values on every attempt.
 
 ## Budget grammar
 
@@ -58,7 +34,7 @@ exponent notation are rejected. When two budgets are present, their original
 order is retained in reports even though the effective memory and deadline
 policies are typed separately.
 
-### Execution options
+## Execution options
 
 | Option | Values | Default |
 |---|---|---|
@@ -110,16 +86,24 @@ limitations, and `launch_proof: false`. Plan JSON uses schema 2.
 reports candidates without changing the host. Clean JSON remains schema 1;
 incomplete cleanup returns 125.
 
+Machine-readable consumers must inspect `schema_version`.
+
 Root `--version` prints one line. Private launcher and guardian routes do not
 appear in public help or the Rust facade.
 
 ## Behavior summary
 
-The following illustration summarizes supervision goals, not universal guarantees. The exact workload membership, metrics, platform limitations, and status precedence documented below are the contract. In particular, sampled macOS monitoring can overshoot or miss short bursts, deliberately escaped descendants can leave its sampled boundary, and higher-precedence failures can replace a child status. "Low overhead" describes the bounded, non-busy polling design; it is not a measured performance claim.
+MemCordon treats the command and descendants within its platform boundary as
+one workload, reports explicitly named platform metrics, preserves ordinary
+exit status when no higher-precedence result applies, and uses bounded,
+non-busy monitoring. When a configured limit or monitoring failure requires
+termination, it performs bounded cleanup and reports any failure. On macOS,
+sampling can overshoot or miss short bursts, and escaped descendants can leave
+the sampled boundary.
 
-![Overview of MemCordon workload supervision, metrics, cleanup, status handling, and polling goals](assets/key-guarantees.png)
+![Non-normative overview of workload supervision, named metrics, cleanup, status precedence, and bounded polling](assets/key-guarantees.png)
 
-## Backend-effective behavior
+## Platform behavior
 
 | Platform | Backend | Startup and effective behavior |
 |---|---|---|
@@ -201,6 +185,25 @@ after the direct child exits; it does not alter startup membership.
 | Windows | Cleans remaining Job Object members | Backend capability reporting describes any effective adjustment |
 | macOS | Cleans known process-group members | Waits for discovered members without a hidden timeout |
 
+## Deadline and restart policy
+
+Attempt deadlines reset at the platform authorization point: Linux release-byte write, Windows suspended-thread resume, or macOS pre-spawn. A supervision deadline starts with the first authorization and includes later cleanup, setup, backoff, and cooldown. It is terminal and cannot trigger restart. Confirmed memory evidence wins a same-cycle deadline race.
+
+Execution is one-shot unless `--restart` or `--restart-on both|memory-limit|deadline` is supplied. `--restart-on` independently enables restart. Enabled restart defaults to both applicable conditions and unlimited additional launches. A finite `--restart-limit N` counts additional launches. Only selected MemCordon limits restart, and only after the child and helpers are reaped, the workload is proven empty, and containment is removed or incapable of retaining members.
+
+Restart delays use logistic backoff, increasing smoothly from
+`--backoff-initial` toward `--backoff-max`:
+
+```text
+next = max * multiplier * current / (max + (multiplier - 1) * current)
+```
+
+Calculations use exact rational arithmetic and round upward to whole
+milliseconds. Reports identify the schedule as `logistic-odds-v1`. Defaults are
+1s initial, multiplier 2, and 30s maximum. Circuit breaker options
+`--restart-burst`, `--restart-window`, and `--cooldown` are all-or-none.
+Cooldown replaces a logistic wait and does not advance its sequence.
+
 ## Execution report schema 3
 
 `--report PATH` requests a mandatory pretty-printed JSON document ending in
@@ -231,8 +234,8 @@ outcome or error provenance, cleanup proof, and restart decision. Aggregates
 include omitted attempts. A deadline reached during backoff, cooldown, or later
 setup is a top-level outside-attempt terminal. Initial spawn errors use typed
 `initial_spawn_failure` provenance; statuses 126 and 127 derive exclusively
-from `not-executable` and `not-found`. Consumers must reject or explicitly
-migrate unsupported schema versions.
+from `not-executable` and `not-found`. Consumers must reject unsupported schema
+versions.
 
 ## Exit status and precedence
 
@@ -244,7 +247,7 @@ migrate unsupported schema versions.
 | `125` | Backend, setup, monitoring, cleanup, report, or restart-safety failure |
 | `126` | Command found but not executable |
 | `127` | Command not found |
-| `2` | Usage or removed-interface migration diagnostic |
+| `2` | Usage diagnostic |
 | `128 + signal` | Unix interruption or child signal when no higher-precedence event applies |
 
 Within one observation cycle, confirmed memory evidence precedes deadline,

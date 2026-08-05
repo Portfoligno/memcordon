@@ -146,17 +146,22 @@ fn invalid_limits_and_boundaries_have_stable_codes() {
 }
 
 #[test]
-fn removed_commands_route_only_to_migration_errors() {
-    for (command, code) in [
-        ("run", "MCCLI-LEGACY-RUN"),
-        ("probe", "MCCLI-LEGACY-PROBE"),
-        ("explain", "MCCLI-LEGACY-EXPLAIN"),
-        ("cleanup", "MCCLI-LEGACY-CLEANUP"),
-        ("version", "MCCLI-LEGACY-VERSION"),
-        ("compat", "MCCLI-LEGACY-COMPAT"),
+fn compatibility_routes_return_stable_actionable_diagnostics() {
+    for (command, code, replacement) in [
+        ("run", "MCCLI-LEGACY-RUN", "memcordon [OPTIONS] [BUDGET]..."),
+        ("probe", "MCCLI-LEGACY-PROBE", "memcordon doctor"),
+        ("explain", "MCCLI-LEGACY-EXPLAIN", "memcordon plan +MEMORY"),
+        ("cleanup", "MCCLI-LEGACY-CLEANUP", "memcordon clean"),
+        ("version", "MCCLI-LEGACY-VERSION", "memcordon --version"),
+        (
+            "compat",
+            "MCCLI-LEGACY-COMPAT",
+            "memcordon --enforcement watchdog +MEMORY",
+        ),
     ] {
-        let error = route(&native(&[command])).expect_err("legacy command should fail");
+        let error = route(&native(&[command])).expect_err("compatibility route should fail");
         assert_eq!(error.code, code);
+        assert!(error.message.contains(replacement), "command={command}");
     }
 }
 
@@ -282,7 +287,7 @@ fn removed_run_binary_path_never_launches() {
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args(["run", "+1GiB", "definitely-not-launched"])
         .output()
-        .expect("migration diagnostic should run");
+        .expect("legacy diagnostic should run");
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("MCCLI-LEGACY-RUN"));
 }

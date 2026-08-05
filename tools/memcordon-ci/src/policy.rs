@@ -87,21 +87,6 @@ fn check_files(root: &Path, files: &[PathBuf], policy: &config::Policy) -> Resul
                 "tracked text file lacks trailing newline: {path:?}"
             )));
         }
-        if matches!(extension, Some("md" | "rs" | "toml" | "yml" | "yaml"))
-            && path != Path::new("docs/reference.md")
-            && path != Path::new("CHANGELOG.md")
-            && path != Path::new("crates/memcordon-cli/tests/cli.rs")
-        {
-            let text = std::str::from_utf8(&bytes)
-                .map_err(|_| failure(format!("tracked text is not UTF-8: {path:?}")))?;
-            let removed_execution = ["memcordon", "run"].join(" ");
-            let removed_memory = ["--", "memory"].concat();
-            if text.contains(&removed_execution) || text.contains(&removed_memory) {
-                return Err(failure(format!(
-                    "removed MemCordon CLI syntax is forbidden outside migration coverage: {path:?}"
-                )));
-            }
-        }
     }
     for path in binary_paths {
         if !files.contains(&path) {

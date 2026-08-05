@@ -594,6 +594,147 @@ fn normalized_member_path(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+fn markdown_anchor(text: &str) -> String {
+    let mut anchor = String::new();
+    for character in text.trim().chars() {
+        if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+            anchor.push(character.to_ascii_lowercase());
+        } else if character.is_whitespace() {
+            anchor.push('-');
+        }
+    }
+    anchor
+}
+
+fn markdown_anchors(markdown: &str) -> BTreeSet<String> {
+    markdown
+        .lines()
+        .filter_map(|line| {
+            let heading = line.trim_start().strip_prefix('#')?;
+            let heading = heading.trim_start_matches('#').trim();
+            (!heading.is_empty()).then(|| markdown_anchor(heading))
+        })
+        .collect()
+}
+
+fn markdown_links(markdown: &str) -> Vec<&str> {
+    let mut links = Vec::new();
+    let mut remaining = markdown;
+    while let Some(start) = remaining.find("](") {
+        remaining = &remaining[start + 2..];
+        let Some(end) = remaining.find(')') else {
+            break;
+        };
+        let destination = remaining[..end]
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(['<', '>']);
+        if !destination.is_empty() {
+            links.push(destination);
+        }
+        remaining = &remaining[end + 1..];
+    }
+    links
+}
+
+fn resolve_document_link<'a>(
+    source: &Path,
+    destination: &'a str,
+) -> Result<(PathBuf, Option<&'a str>)> {
+    let (path, anchor) = destination
+        .split_once('#')
+        .map_or((destination, None), |(path, anchor)| (path, Some(anchor)));
+    let mut resolved = if path.is_empty() {
+        source.to_path_buf()
+    } else {
+        source
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf()
+    };
+    if !path.is_empty() {
+        for component in Path::new(path).components() {
+            match component {
+                Component::Normal(value) => resolved.push(value),
+                Component::ParentDir => {
+                    if !resolved.pop() {
+                        return Err(failure("Markdown link escapes its package or archive"));
+                    }
+                }
+                Component::CurDir => {}
+                _ => return Err(failure("Markdown link is not a normal relative path")),
+            }
+        }
+    }
+    Ok((resolved, anchor))
+}
+
+fn validate_markdown_documents(documents: &BTreeMap<PathBuf, Vec<u8>>) -> Result<()> {
+    for (source, bytes) in documents {
+        if source.extension() != Some(OsStr::new("md")) {
+            continue;
+        }
+        let markdown = std::str::from_utf8(bytes)
+            .map_err(|_| failure(format!("Markdown document is not UTF-8: {source:?}")))?;
+        for destination in markdown_links(markdown) {
+            if destination.contains("://") || destination.starts_with("mailto:") {
+                continue;
+            }
+            let (target, anchor) = resolve_document_link(source, destination)?;
+            let target_bytes = documents.get(&target).ok_or_else(|| {
+                failure(format!(
+                    "Markdown link target is absent from package or archive: {source:?} -> {target:?}"
+                ))
+            })?;
+            if let Some(anchor) = anchor.filter(|anchor| !anchor.is_empty()) {
+                let target_markdown = std::str::from_utf8(target_bytes).map_err(|_| {
+                    failure(format!("Markdown anchor target is not UTF-8: {target:?}"))
+                })?;
+                if !markdown_anchors(target_markdown).contains(anchor) {
+                    return Err(failure(format!(
+                        "Markdown anchor is absent: {source:?} -> {target:?}#{anchor}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_crate_readme(path: &Path, package: &str) -> Result<()> {
+    let decoder = GzDecoder::new(File::open(path)?);
+    let mut archive = tar::Archive::new(decoder);
+    let mut documents = BTreeMap::new();
+    let mut readme = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let normalized = normalized_member_path(&entry.path()?)?;
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        if normalized == Path::new("Cargo.toml") {
+            let manifest: toml::Value = toml::from_str(
+                std::str::from_utf8(&bytes)
+                    .map_err(|_| failure("normalized Cargo.toml is not UTF-8"))?,
+            )?;
+            readme = manifest
+                .get("package")
+                .and_then(|value| value.get("readme"))
+                .and_then(toml::Value::as_str)
+                .map(PathBuf::from);
+        }
+        documents.insert(normalized, bytes);
+    }
+    let readme = readme.ok_or_else(|| failure(format!("{package} has no normalized README")))?;
+    documents
+        .get(&readme)
+        .ok_or_else(|| failure(format!("{package} normalized README is absent")))?;
+    validate_markdown_documents(&documents)
+}
+
 fn canonical_crate_tree(path: &Path) -> Result<String> {
     let decoder = GzDecoder::new(File::open(path)?);
     let mut archive = tar::Archive::new(decoder);
@@ -812,6 +953,7 @@ fn package_crate(
             "Cargo-normalized package identity/provenance differs for {package}"
         )));
     }
+    validate_crate_readme(&archive, package)?;
     let archive_sha256 = sha256_file(&archive)?;
     Ok(CrateRecord {
         name: package.to_owned(),
@@ -903,6 +1045,26 @@ fn build_archive(root: &Path, identity: &ReleaseIdentity, target: &AssetTarget) 
         (executable, PathBuf::from(&target.executable), 0o755),
         (root.join("README.md"), PathBuf::from("README.md"), 0o644),
         (root.join("LICENSE"), PathBuf::from("LICENSE"), 0o644),
+        (
+            root.join("CHANGELOG.md"),
+            PathBuf::from("CHANGELOG.md"),
+            0o644,
+        ),
+        (
+            root.join("docs/reference.md"),
+            PathBuf::from("docs/reference.md"),
+            0o644,
+        ),
+        (
+            root.join("docs/assets/banner.png"),
+            PathBuf::from("docs/assets/banner.png"),
+            0o644,
+        ),
+        (
+            root.join("docs/assets/key-guarantees.png"),
+            PathBuf::from("docs/assets/key-guarantees.png"),
+            0o644,
+        ),
     ];
     entries.sort_by_key(|entry| top.join(&entry.1));
     if target.archive == "zip" {
@@ -1000,12 +1162,27 @@ fn inspect_extract_and_smoke(
         top.join(&target.executable),
         top.join("README.md"),
         top.join("LICENSE"),
+        top.join("CHANGELOG.md"),
+        top.join("docs/reference.md"),
+        top.join("docs/assets/banner.png"),
+        top.join("docs/assets/key-guarantees.png"),
     ]);
     if extracted_files != expected {
         return Err(failure(format!(
             "release archive member set differs: expected={expected:?} actual={extracted_files:?}"
         )));
     }
+    let mut documents = BTreeMap::new();
+    for path in &extracted_files {
+        let relative = path
+            .strip_prefix(&top)
+            .map_err(|_| failure("release archive member is outside its top-level directory"))?;
+        documents.insert(
+            relative.to_path_buf(),
+            fs::read(temporary.path().join(path))?,
+        );
+    }
+    validate_markdown_documents(&documents)?;
     let executable = temporary.path().join(top).join(&target.executable);
     #[cfg(unix)]
     {
@@ -2831,6 +3008,41 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn markdown_validation_accepts_packaged_relative_targets_and_anchors() {
+        let documents = BTreeMap::from([
+            (
+                PathBuf::from("README.md"),
+                b"# Package\n\n[Top](#package)\n[Details](docs/reference.md#exact-contract)\n"
+                    .to_vec(),
+            ),
+            (
+                PathBuf::from("docs/reference.md"),
+                b"# Reference\n\n## Exact contract\n".to_vec(),
+            ),
+        ]);
+        validate_markdown_documents(&documents)
+            .expect("packaged relative target and anchor should validate");
+    }
+
+    #[test]
+    fn markdown_validation_rejects_missing_packaged_target_or_anchor() {
+        let missing_target = BTreeMap::from([(
+            PathBuf::from("README.md"),
+            b"# Package\n\n[Missing](docs/missing.md)\n".to_vec(),
+        )]);
+        assert!(validate_markdown_documents(&missing_target).is_err());
+
+        let missing_anchor = BTreeMap::from([
+            (
+                PathBuf::from("README.md"),
+                b"# Package\n\n[Missing](reference.md#missing)\n".to_vec(),
+            ),
+            (PathBuf::from("reference.md"), b"# Reference\n".to_vec()),
+        ]);
+        assert!(validate_markdown_documents(&missing_anchor).is_err());
+    }
 
     enum MockResponse {
         Json(u16, serde_json::Value),
