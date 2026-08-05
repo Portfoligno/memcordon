@@ -2,6 +2,41 @@
 
 All notable user-visible changes to MemCordon are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Added optional `+MEMORY` and `+TIME` budgets, including workload containment
+  without a memory or time limit and deadline exit status `123`.
+- Added attempt- and supervision-scoped deadlines, cleanup-gated restarts,
+  logistic backoff, circuit breaking, and bounded per-attempt history.
+- Added `doctor`, `plan`, and `clean` utilities for backend inspection, policy
+  resolution without launch, and stale-artifact cleanup.
+- Added a Rust `Supervisor` API with typed deadline and restart policies while
+  retaining `Limiter` for one-shot execution.
+
+### Changed
+
+- Strengthened startup containment and cleanup proofs across Linux cgroup v2,
+  Windows Job Objects, and the macOS watchdog, including lossless native
+  argument handling and explicit target-spawn provenance.
+- Release archives now include the changelog, contract reference, and
+  documentation images; published crates use package-specific READMEs.
+- crates.io publication now uses per-slot short-lived OIDC credentials bound to
+  the selected release artifact.
+
+### Breaking changes
+
+- Replaced the `run`, `probe`, `explain`, `cleanup`, `version`, and `compat`
+  command forms with direct budget execution, `doctor`, `plan`, `clean`, and
+  `--version`; removed forms return actionable usage diagnostics.
+- Replaced execution report schema 1 with schema 3, adding requested/effective
+  policy, native invocation identity, supervision summaries, attempt records,
+  and typed failure provenance. Doctor and plan JSON use schema 2.
+- Changed the public policy and report models for optional memory and deadline
+  budgets, and added typed supervision outcomes; consumers must update for the
+  0.3 interfaces.
+
 ## [0.1.3] - 2026-08-03
 
 ### Added
