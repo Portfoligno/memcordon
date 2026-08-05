@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use serde_yaml::{Mapping, Value};
@@ -36,7 +37,14 @@ fn inventory(root: &Path) -> Result<Vec<PathBuf>> {
                 "tracked path escapes repository: {path:?}"
             )));
         }
-        files.push(path);
+        match fs::symlink_metadata(root.join(&path)) {
+            Ok(_) => files.push(path),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // `git ls-files` reports index entries. A pre-commit policy run must
+                // tolerate an entry that the working tree intentionally deletes.
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     files.sort();
     Ok(files)
@@ -78,6 +86,21 @@ fn check_files(root: &Path, files: &[PathBuf], policy: &config::Policy) -> Resul
             return Err(failure(format!(
                 "tracked text file lacks trailing newline: {path:?}"
             )));
+        }
+        if matches!(extension, Some("md" | "rs" | "toml" | "yml" | "yaml"))
+            && path != Path::new("docs/reference.md")
+            && path != Path::new("CHANGELOG.md")
+            && path != Path::new("crates/memcordon-cli/tests/cli.rs")
+        {
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| failure(format!("tracked text is not UTF-8: {path:?}")))?;
+            let removed_execution = ["memcordon", "run"].join(" ");
+            let removed_memory = ["--", "memory"].concat();
+            if text.contains(&removed_execution) || text.contains(&removed_memory) {
+                return Err(failure(format!(
+                    "removed MemCordon CLI syntax is forbidden outside migration coverage: {path:?}"
+                )));
+            }
         }
     }
     for path in binary_paths {
@@ -697,6 +720,7 @@ fn require_publication_step(
     name: &str,
     condition: Option<&str>,
     source: &str,
+    cargo_home: &str,
 ) -> Result<()> {
     let step = steps
         .get(name)
@@ -721,8 +745,14 @@ fn require_publication_step(
             .ok_or_else(|| failure(format!("publication step has no credential: {name}")))?,
         "publication environment",
     )?;
-    exact_mapping_keys(environment, &["CARGO_REGISTRIES_CRATES_IO_TOKEN"], name)?;
-    if scalar(environment, "CARGO_REGISTRIES_CRATES_IO_TOKEN") != Some(source) {
+    exact_mapping_keys(
+        environment,
+        &["CARGO_HOME", "CARGO_REGISTRIES_CRATES_IO_TOKEN"],
+        name,
+    )?;
+    if scalar(environment, "CARGO_REGISTRIES_CRATES_IO_TOKEN") != Some(source)
+        || scalar(environment, "CARGO_HOME") != Some(cargo_home)
+    {
         return Err(failure(format!(
             "publication credential source differs: {name}"
         )));
@@ -835,6 +865,7 @@ fn check_release_credentials(
             &publish_name,
             None,
             &format!("${{{{ steps.{action_id}.outputs.token }}}}"),
+            &format!("target/ci/cargo-publish-home/slot-{slot}"),
         )?;
     }
     let oidc_count = steps
@@ -1429,7 +1460,11 @@ fn check_workflow(
 #[derive(Default)]
 struct RustPolicy {
     violations: Vec<String>,
-    allow_environment_mutation: bool,
+    calls_current_exe: bool,
+    names_proc_self_exe: bool,
+    calls_env_remove: bool,
+    pre_exec_calls: usize,
+    fork_calls: usize,
 }
 
 impl<'ast> Visit<'ast> for RustPolicy {
@@ -1443,14 +1478,26 @@ impl<'ast> Visit<'ast> for RustPolicy {
                 .collect();
             if segments.len() >= 2
                 && segments[segments.len() - 2] == "env"
-                && segments.last().is_some_and(|segment| segment == "set_var")
+                && segments
+                    .last()
+                    .is_some_and(|segment| matches!(segment.as_str(), "set_var" | "remove_var"))
             {
                 self.violations
-                    .push("std::env::set_var is forbidden".to_owned());
+                    .push("std::env environment mutation is forbidden".to_owned());
             }
             if segments.len() >= 2
-                && segments[segments.len() - 2] == "Command"
-                && segments.last().is_some_and(|segment| segment == "new")
+                && segments[segments.len() - 2] == "libc"
+                && segments.last().is_some_and(|segment| segment == "fork")
+            {
+                self.fork_calls += 1;
+            }
+            if segments
+                .last()
+                .is_some_and(|segment| segment == "current_exe")
+            {
+                self.calls_current_exe = true;
+            }
+            if segments.last().is_some_and(|segment| segment == "new")
                 && let Some(syn::Expr::Lit(literal)) = expression.args.first()
                 && let syn::Lit::Str(program) = &literal.lit
                 && [
@@ -1472,9 +1519,13 @@ impl<'ast> Visit<'ast> for RustPolicy {
     }
 
     fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
-        if !self.allow_environment_mutation
-            && matches!(expression.method.to_string().as_str(), "env" | "envs")
-        {
+        if expression.method == "env_remove" {
+            self.calls_env_remove = true;
+        }
+        if expression.method == "pre_exec" {
+            self.pre_exec_calls += 1;
+        }
+        if matches!(expression.method.to_string().as_str(), "env" | "envs") {
             self.violations
                 .push("subprocess environment mutation is forbidden".to_owned());
         }
@@ -1487,6 +1538,60 @@ impl<'ast> Visit<'ast> for RustPolicy {
                 .push("regular-expression infrastructure is forbidden".to_owned());
         }
         syn::visit::visit_path(self, path);
+    }
+
+    fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+        if literal.value() == "/proc/self/exe" {
+            self.names_proc_self_exe = true;
+        }
+        syn::visit::visit_lit_str(self, literal);
+    }
+}
+
+/// Parses untrusted Rust source and applies the repository's semantic subprocess policy.
+pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
+    let source = std::str::from_utf8(bytes)
+        .map_err(|_| failure(format!("Rust source is not UTF-8: {relative:?}")))?;
+    let syntax = syn::parse_file(source).map_err(|error| {
+        failure(format!(
+            "Rust syntax parse failed for {relative:?}: {error}"
+        ))
+    })?;
+    let mut visitor = RustPolicy::default();
+    visitor.visit_file(&syntax);
+    let test_support = Path::new("crates/memcordon-platform/src/test_support.rs");
+    let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
+    if visitor.pre_exec_calls != 0 && relative != test_support {
+        visitor.violations.push(
+            "pre_exec is allowed only at the exact reviewed process-test boundary".to_owned(),
+        );
+    }
+    if visitor.fork_calls != 0 {
+        visitor.violations.push("raw fork is forbidden".to_owned());
+    }
+    if relative.starts_with(Path::new("crates/memcordon-platform/src"))
+        && (visitor.names_proc_self_exe
+            || (visitor.calls_current_exe && relative != macos_watchdog))
+    {
+        visitor
+            .violations
+            .push("platform helper self-execution is forbidden".to_owned());
+    }
+    if visitor.calls_env_remove
+        && relative != Path::new("tools/memcordon-ci/src/command.rs")
+        && relative != Path::new("tools/memcordon-ci/src/release.rs")
+    {
+        visitor
+            .violations
+            .push("credential removal is allowed only in exact CI tooling".to_owned());
+    }
+    if visitor.violations.is_empty() {
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "Rust policy failed for {relative:?}: {:?}",
+            visitor.violations
+        )))
     }
 }
 
@@ -1504,6 +1609,7 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
             .join("src")
             .join("bin"),
         root.join("crates").join("memcordon-cli").join("tests"),
+        root.join("crates").join("memcordon-platform").join("src"),
     ] {
         for entry in WalkDir::new(base) {
             let entry = entry.map_err(|error| failure(error.to_string()))?;
@@ -1523,33 +1629,56 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
             }
         }
     }
+    let mut test_boundary_pre_exec = 0_usize;
     for relative in &candidates {
-        let in_scope = relative.starts_with("tools/memcordon-ci")
-            || relative.starts_with("crates/memcordon-testkit")
-            || relative == Path::new("crates/memcordon-cli/src/bin/memcordon-test-fixture.rs")
-            || relative
-                .components()
-                .any(|component| component.as_os_str() == "tests");
-        if !in_scope {
-            continue;
-        }
         let source = fs::read_to_string(root.join(relative))?;
         let syntax = syn::parse_file(&source).map_err(|error| {
             failure(format!(
                 "Rust syntax parse failed for {relative:?}: {error}"
             ))
         })?;
-        let mut visitor = RustPolicy {
-            allow_environment_mutation: relative == Path::new("tools/memcordon-ci/src/command.rs"),
-            ..RustPolicy::default()
-        };
+        let mut visitor = RustPolicy::default();
         visitor.visit_file(&syntax);
+        let test_support = Path::new("crates/memcordon-platform/src/test_support.rs");
+        let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
+        if visitor.pre_exec_calls != 0 && relative != test_support {
+            visitor
+                .violations
+                .push("pre_exec is allowed only at the reviewed process-test boundary".to_owned());
+        }
+        if visitor.fork_calls != 0 {
+            visitor.violations.push("raw fork is forbidden".to_owned());
+        }
+        if relative == test_support {
+            test_boundary_pre_exec = visitor.pre_exec_calls;
+        }
+        if relative.starts_with(Path::new("crates/memcordon-platform/src"))
+            && (visitor.names_proc_self_exe
+                || (visitor.calls_current_exe && relative != macos_watchdog))
+        {
+            visitor
+                .violations
+                .push("platform helper self-execution is forbidden".to_owned());
+        }
+        if visitor.calls_env_remove
+            && relative != Path::new("tools/memcordon-ci/src/command.rs")
+            && relative != Path::new("tools/memcordon-ci/src/release.rs")
+        {
+            visitor
+                .violations
+                .push("credential removal is allowed only in exact CI tooling".to_owned());
+        }
         if !visitor.violations.is_empty() {
             return Err(failure(format!(
                 "Rust policy failed for {relative:?}: {:?}",
                 visitor.violations
             )));
         }
+    }
+    if test_boundary_pre_exec != 1 {
+        return Err(failure(
+            "reviewed process-test boundary must contain exactly one pre_exec hook",
+        ));
     }
     Ok(())
 }
@@ -1612,6 +1741,12 @@ fn check_manifests(root: &Path, policy: &config::Policy) -> Result<()> {
     validate_package_rust_versions(&actual_rust_versions, &policy.workspace, &production_msrv)?;
     for (name, package) in &packages {
         for dependency in &package.dependencies {
+            if ["regex", "xshell", "duct", "shell-words"].contains(&dependency.name.as_str()) {
+                return Err(failure(format!(
+                    "forbidden regex or shell dependency (including aliases): {name} -> {}",
+                    dependency.name
+                )));
+            }
             let internal = packages.contains_key(dependency.name.as_str());
             let exact = dependency.req.to_string() == format!("={}", package.version);
             let unpublished_dev_path = dependency.kind
@@ -1874,9 +2009,9 @@ pub fn run(root: &Path) -> Result<()> {
         .iter()
         .filter(|definition| definition.file == ".github/workflows/release.yml")
         .collect();
-    if release_environment.len() != 5 {
+    if release_environment.len() != 8 {
         return Err(failure(
-            "release workflow must have exactly five credential mappings",
+            "release workflow must have exactly eight step-local environment mappings",
         ));
     }
     for name in ["Stage GitHub draft and assets", "Finalize GitHub release"] {
@@ -1965,6 +2100,7 @@ jobs:
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
       - name: Publish next crate in slot 1
         env:
+          CARGO_HOME: target/ci/cargo-publish-home/slot-1
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_1.outputs.token }}
         run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
       - name: Acquire crates.io token for publication slot 2
@@ -1972,6 +2108,7 @@ jobs:
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
       - name: Publish next crate in slot 2
         env:
+          CARGO_HOME: target/ci/cargo-publish-home/slot-2
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_2.outputs.token }}
         run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
       - name: Acquire crates.io token for publication slot 3
@@ -1979,6 +2116,7 @@ jobs:
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
       - name: Publish next crate in slot 3
         env:
+          CARGO_HOME: target/ci/cargo-publish-home/slot-3
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_3.outputs.token }}
         run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
       - name: Finalize GitHub release
@@ -2109,7 +2247,7 @@ jobs:
             (
                 "legacy stored credential",
                 exact.replacen(
-                    "        env:\n          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_1.outputs.token }}\n",
+                    "        env:\n          CARGO_HOME: target/ci/cargo-publish-home/slot-1\n          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_1.outputs.token }}\n",
                     &legacy_environment,
                     1,
                 ),

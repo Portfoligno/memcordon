@@ -577,25 +577,28 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memcordon"
-version = "0.1.4-dev"
+version = "0.3.1-dev"
 dependencies = [
  "clap",
  "libc",
  "memcordon-core",
  "memcordon-platform",
  "memcordon-testkit",
+ "serde",
  "serde_json",
+ "tempfile",
  "toml",
 ]
 
 [[package]]
 name = "memcordon-ci"
-version = "0.1.4-dev"
+version = "0.3.1-dev"
 dependencies = [
  "cargo_metadata",
  "clap",
  "flate2",
  "hex",
+ "memcordon-core",
  "memcordon-testkit",
  "semver",
  "serde",
@@ -614,16 +617,18 @@ dependencies = [
 
 [[package]]
 name = "memcordon-core"
-version = "0.1.4-dev"
+version = "0.3.1-dev"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
 [[package]]
 name = "memcordon-platform"
-version = "0.1.4-dev"
+version = "0.3.1-dev"
 dependencies = [
  "libc",
  "memcordon-core",
@@ -634,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "memcordon-testkit"
-version = "0.1.4-dev"
+version = "0.3.1-dev"
 dependencies = [
  "libc",
  "memcordon-platform",

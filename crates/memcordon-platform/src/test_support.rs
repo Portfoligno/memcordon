@@ -3,10 +3,72 @@
 use std::io;
 use std::process::{Child, Command};
 
+#[cfg(target_os = "linux")]
+use memcordon_core::ByteSize;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub birth: u128,
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_limit_delta_is_authoritative() -> bool {
+    crate::linux_cgroup::test_limit_delta()
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_configure(path: &std::path::Path, limit: u64) -> io::Result<()> {
+    crate::linux_cgroup::test_configure(path, ByteSize::from_bytes(limit))
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_monitor_errors(path: &std::path::Path) -> bool {
+    crate::linux_cgroup::test_monitor_errors(path)
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_verify(path: &std::path::Path, pid: i32) -> io::Result<()> {
+    crate::linux_cgroup::test_verify(path, pid)
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_launcher_status(bytes: &[u8]) -> io::Result<Option<i32>> {
+    crate::linux_cgroup::test_launcher_status(bytes)
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_launcher_status_timeout() -> io::ErrorKind {
+    crate::linux_cgroup::test_launcher_status_timeout()
+}
+
+#[cfg(windows)]
+pub fn windows_encode_command_line(
+    program: std::ffi::OsString,
+    arguments: Vec<std::ffi::OsString>,
+) -> Vec<u16> {
+    let command = memcordon_core::CommandSpec::new(program).args(arguments);
+    crate::windows_job::test_encode_command_line(&command)
+}
+
+#[cfg(windows)]
+pub fn windows_target_remains_suspended_until_assignment() -> io::Result<bool> {
+    crate::windows_job::test_target_remains_suspended_until_assignment()
+}
+
+#[cfg(windows)]
+pub fn windows_kill_on_job_close() -> io::Result<bool> {
+    crate::windows_job::test_kill_on_job_close()
+}
+
+#[cfg(windows)]
+pub fn windows_nested_assignment() -> io::Result<bool> {
+    crate::windows_job::test_nested_assignment()
+}
+
+#[cfg(windows)]
+pub fn windows_assignment_failure() -> io::Result<bool> {
+    crate::windows_job::test_assignment_failure()
 }
 
 impl ProcessIdentity {

@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
+use memcordon_core::{DOCTOR_REPORT_SCHEMA_VERSION, DoctorReport};
 use serde_json::Value;
 
 use crate::command::rustup_cargo;
@@ -18,7 +19,7 @@ pub fn probe(root: &Path, stable: &str, target_dir: &Path, deadline: Duration) -
         OsString::from("--bin"),
         OsString::from("memcordon"),
         OsString::from("--"),
-        OsString::from("probe"),
+        OsString::from("doctor"),
         OsString::from("--json"),
     ];
     let output = rustup_cargo(root, stable, arguments, deadline).run()?;
@@ -32,9 +33,32 @@ pub fn selected(probe: &Value) -> Option<&Value> {
 pub fn require_selected(probe: &Value) -> Result<&Value> {
     selected(probe).ok_or_else(|| {
         CiError::Message(format!(
-            "stress requires a supported backend, but the capability probe reported: {probe}"
+            "stress requires a supported backend, but doctor reported: {probe}"
         ))
     })
+}
+
+pub fn require_certified_hard_backend(probe: &Value, backend: &str) -> Result<()> {
+    let report: DoctorReport = serde_json::from_value(probe.clone())?;
+    let selected = report.selected.as_ref().ok_or_else(|| {
+        CiError::Message(format!(
+            "required backend capability is unavailable: {probe}"
+        ))
+    })?;
+    let hard_memory = selected
+        .memory
+        .as_ref()
+        .is_some_and(|memory| memory.supported && memory.class == "hard");
+    if report.schema_version != DOCTOR_REPORT_SCHEMA_VERSION
+        || selected.name != backend
+        || !selected.containment.supported
+        || !hard_memory
+    {
+        return Err(CiError::Message(format!(
+            "required certified hard backend is not selected: {probe}"
+        )));
+    }
+    Ok(())
 }
 
 pub fn require_single_test_success(output: &[u8], test_name: &str) -> Result<()> {

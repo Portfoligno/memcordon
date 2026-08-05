@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.4-dev"
+version = "0.3.1-dev"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
@@ -17,6 +17,7 @@ repository = "https://github.com/Portfoligno/memcordon"
 readme = "README.md"
 
 [workspace.dependencies]
+base64 = "0.22.1"
 clap = { version = "4.5.53", features = ["derive"] }
 libc = "0.2.178"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -39,6 +40,7 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(miri)'] }
 
 [workspace.lints.clippy]
 all = "warn"

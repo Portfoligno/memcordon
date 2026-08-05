@@ -30,7 +30,7 @@ fn temporary_pid_file() -> PathBuf {
 
 fn backend_available() -> bool {
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
-        .args(["probe", "--json"])
+        .args(["doctor", "--json"])
         .output()
         .expect("probe should run");
     let value: serde_json::Value =
@@ -55,15 +55,13 @@ fn configured_iterations(name: &str) -> u32 {
 fn wrapped(command: impl AsRef<OsStr>, args: &[&str]) -> Command {
     let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     invocation.args([
-        "run",
         "--enforcement",
         if cfg!(target_os = "macos") {
             "watchdog"
         } else {
             "hard"
         },
-        "--memory",
-        "8GiB",
+        "+8GiB",
         "--",
     ]);
     invocation.arg(command);
@@ -128,11 +126,9 @@ fn hard_unavailability_refuses_before_target_execution() {
     let marker = temporary_pid_file();
     let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     invocation.args([
-        "run",
         "--enforcement",
         "hard",
-        "--memory",
-        "1GiB",
+        "+1GiB",
         "--",
         fixture(),
         "exit",
@@ -181,18 +177,16 @@ fn confirmed_limit_has_dedicated_status() {
     }
     let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     invocation.args([
-        "run",
         "--enforcement",
         if cfg!(target_os = "macos") {
             "watchdog"
         } else {
             "hard"
         },
-        "--memory",
         if cfg!(target_os = "macos") {
-            "1B"
+            "+1B"
         } else {
-            "32MiB"
+            "+32MiB"
         },
         "--",
         fixture(),
@@ -250,13 +244,11 @@ fn wrapper_interrupt_is_forwarded_cleaned_and_mapped() {
 fn virtual_metric_is_explicitly_supported() {
     let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     invocation.args([
-        "run",
         "--enforcement",
         "watchdog",
         "--metric",
         "virtual",
-        "--memory",
-        "1TiB",
+        "+1TiB",
         "--",
         "/usr/bin/true",
     ]);

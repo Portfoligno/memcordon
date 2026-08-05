@@ -215,13 +215,22 @@ fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
         .join("bin")
         .join("cargo-fuzz");
     let targets = [
+        "backoff_multiplier",
+        "bounded_history",
+        "budget_classifier",
         "byte_size",
         "cleanup_json",
         "duration",
+        "invocation_router",
+        "logistic_recurrence",
+        "limit_token",
+        "native_argument",
         "outcome_json",
         "outcome_sequences",
         "policy_parser",
         "report_json",
+        "restart_controller",
+        "schema_three",
         "state_machine",
         "workflow_parser",
     ];
@@ -381,7 +390,7 @@ enum CertificationRuntime {
 #[derive(Clone, Copy)]
 enum CargoTestTarget {
     BackendContract,
-    PlatformLibrary,
+    PlatformTest(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -402,11 +411,15 @@ impl HardBackendScenario {
         }
     }
 
-    const fn platform(public_name: &'static str, exact_name: &'static str) -> Self {
+    const fn platform(
+        test_binary: &'static str,
+        public_name: &'static str,
+        exact_name: &'static str,
+    ) -> Self {
         Self {
             public_name,
             exact_name,
-            target: CargoTestTarget::PlatformLibrary,
+            target: CargoTestTarget::PlatformTest(test_binary),
             ignored: false,
         }
     }
@@ -421,31 +434,44 @@ const COMMON_HARD_SCENARIOS: [HardBackendScenario; 4] = [
     HardBackendScenario::integration("certified_backend_allows_bounded_transient_burst"),
 ];
 
-const LINUX_HARD_SCENARIOS: [HardBackendScenario; 13] = [
+const LINUX_HARD_SCENARIOS: [HardBackendScenario; 18] = [
     HardBackendScenario::integration("linux_cgroup_v2_contains_aggregate_tree"),
     HardBackendScenario::integration("linux_cgroup_v2_handles_rapid_process_churn"),
     HardBackendScenario::integration("linux_cgroup_controls_are_applied_before_target_observation"),
+    HardBackendScenario::integration(
+        "linux_embedding_limiter_blocks_target_until_containment_is_verified",
+    ),
+    HardBackendScenario::integration("linux_embedding_limiter_preserves_non_utf8_target_argv"),
+    HardBackendScenario::integration("linux_target_spawn_failures_preserve_native_provenance"),
     HardBackendScenario::integration("linux_memory_events_produce_limit_evidence"),
     HardBackendScenario::integration("linux_cleanup_evidence_confirms_empty_reaped_cgroup"),
     HardBackendScenario::integration("linux_cgroup_identity_is_verified_before_exec"),
-    HardBackendScenario::integration("linux_guardian_cleans_cgroup_after_wrapper_crash"),
+    HardBackendScenario::integration("linux_report_pid_is_the_actual_target_pid"),
+    HardBackendScenario::integration(
+        "linux_gate_failures_kill_the_blocked_target_before_fixture_code",
+    ),
+    HardBackendScenario::integration("linux_guardian_kills_process_group_after_wrapper_crash"),
     HardBackendScenario::integration("linux_cgroup_kill_reaps_continually_forking_workload"),
     HardBackendScenario::integration("linux_supervisor_monitor_error_fails_closed_end_to_end"),
     HardBackendScenario::platform(
+        "linux_cgroup",
         "limit_evidence_requires_counter_delta",
-        "linux_cgroup::tests::limit_evidence_requires_counter_delta",
+        "limit_evidence_requires_counter_delta",
     ),
     HardBackendScenario::platform(
+        "linux_cgroup",
         "cgroup_controls_are_written_exactly",
-        "linux_cgroup::tests::cgroup_controls_are_written_exactly",
+        "cgroup_controls_are_written_exactly",
     ),
     HardBackendScenario::platform(
+        "linux_cgroup",
         "monitor_file_errors_are_reported_instead_of_treated_as_success",
-        "linux_cgroup::tests::monitor_file_errors_are_reported_instead_of_treated_as_success",
+        "monitor_file_errors_are_reported_instead_of_treated_as_success",
     ),
     HardBackendScenario::platform(
+        "linux_cgroup",
         "cgroup_identity_verification_rejects_the_wrong_process",
-        "linux_cgroup::tests::cgroup_identity_verification_rejects_the_wrong_process",
+        "cgroup_identity_verification_rejects_the_wrong_process",
     ),
 ];
 
@@ -459,24 +485,29 @@ const WINDOWS_HARD_SCENARIOS: [HardBackendScenario; 13] = [
     HardBackendScenario::integration("windows_kill_on_close_cleans_workload"),
     HardBackendScenario::integration("windows_wrapper_crash_closes_job_and_reaps_descendants"),
     HardBackendScenario::platform(
+        "windows_job",
         "windows_quoting_preserves_spaces_and_quotes",
-        "windows_job::tests::windows_quoting_preserves_spaces_and_quotes",
+        "windows_native_encoder_quotes_without_shell_interpretation",
     ),
     HardBackendScenario::platform(
+        "windows_job",
         "target_remains_suspended_until_successful_job_assignment",
-        "windows_job::tests::target_remains_suspended_until_successful_job_assignment",
+        "target_remains_suspended_until_successful_job_assignment",
     ),
     HardBackendScenario::platform(
+        "windows_job",
         "kill_on_job_close_terminates_a_running_member",
-        "windows_job::tests::kill_on_job_close_terminates_a_running_member",
+        "kill_on_job_close_terminates_a_running_member",
     ),
     HardBackendScenario::platform(
+        "windows_job",
         "nested_assignment_is_accounted_by_the_memcordon_job",
-        "windows_job::tests::nested_assignment_is_accounted_by_the_memcordon_job",
+        "nested_assignment_is_accounted_by_the_memcordon_job",
     ),
     HardBackendScenario::platform(
+        "windows_job",
         "assignment_failure_terminates_suspended_target_before_execution",
-        "windows_job::tests::assignment_failure_terminates_suspended_target_before_execution",
+        "assignment_failure_terminates_suspended_target_before_execution",
     ),
 ];
 
@@ -537,13 +568,16 @@ fn run_hard_scenario(
             OsString::from("--test"),
             OsString::from("backend_contract"),
         ],
-        CargoTestTarget::PlatformLibrary => vec![
+        CargoTestTarget::PlatformTest(test_binary) => vec![
             OsString::from("--target-dir"),
             OsString::from("target/ci/backend"),
             OsString::from("--locked"),
             OsString::from("--package"),
             OsString::from("memcordon-platform"),
-            OsString::from("--lib"),
+            OsString::from("--features"),
+            OsString::from("test-support"),
+            OsString::from("--test"),
+            OsString::from(test_binary),
         ],
     };
     arguments.push(OsString::from("--"));
@@ -586,29 +620,12 @@ fn certification(
             "--bin",
             "memcordon",
             "--",
-            "probe",
+            "doctor",
             "--json",
         ],
     )?;
     let probe: serde_json::Value = serde_json::from_slice(&output)?;
-    let selected = probe
-        .get("selected")
-        .filter(|selected| !selected.is_null())
-        .ok_or_else(|| {
-            CiError::Message(format!(
-                "required backend capability is unavailable: {probe}"
-            ))
-        })?;
-    if selected.get("name").and_then(serde_json::Value::as_str) != Some(backend)
-        || selected
-            .get("hard_limit")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-    {
-        return Err(CiError::Message(format!(
-            "required certified hard backend is not selected: {probe}"
-        )));
-    }
+    capability::require_certified_hard_backend(&probe, backend)?;
     let scenarios = hard_backend_scenarios(backend)?;
     let mut tests = Vec::with_capacity(scenarios.len());
     for scenario in scenarios {

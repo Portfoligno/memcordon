@@ -13,6 +13,10 @@ pub fn probe() -> ProbeReport {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "execution preserves the public categorized Error contract on unsupported Unix targets"
+)]
 pub fn run(_policy: Policy, _command: &CommandSpec) -> Result<Execution, Error> {
     Err(Error::new(
         ErrorCategory::Unsupported,

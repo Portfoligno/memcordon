@@ -1,17 +1,12 @@
 # MemCordon
 
-![MemCordon memory-limit terminal banner](docs/assets/banner.png)
+MemCordon runs a command and its descendants with optional memory and elapsed-time budgets. It uses native containment on Linux and Windows and sampled monitoring on macOS, terminating the workload when a configured limit is detected.
 
-MemCordon applies a memory policy to a command and its descendants: cgroup v2
-and Job Object hard limits on Linux and Windows, and sampled watchdog
-enforcement on macOS. When it detects the configured limit, it terminates the
-workload.
+![MemCordon memory-limit terminal banner](docs/assets/banner.png)
 
 ## Install
 
-Download the [latest release](https://github.com/Portfoligno/memcordon/releases/latest)
-for your platform and place `memcordon` (`.exe`) on `PATH`, or install with
-Cargo:
+Download the [latest release](https://github.com/Portfoligno/memcordon/releases/latest) for your platform and place `memcordon` (`.exe` on Windows) on `PATH`, or install with Cargo:
 
 ```console
 cargo install memcordon
@@ -20,14 +15,13 @@ cargo install memcordon
 ## Run
 
 ```console
-memcordon run --memory 8GiB -- cargo test --workspace
+memcordon +8GiB -- cargo test --workspace
 ```
 
-Replace `cargo test --workspace` with your command. Everything after `--` is
-passed to it unchanged.
+Replace `cargo test --workspace` with your command. Everything after `--` is passed to it unchanged. If the command stays within the 8 GiB budget, its exit status is preserved unless MemCordon encounters a higher-precedence supervision failure; a confirmed memory-limit event returns status 124.
 
 ## Reference
 
-- [CLI and platform behavior](docs/reference.md)
+- [CLI, platform, and status reference](docs/reference.md)
 - [Rust API](https://docs.rs/memcordon/)
 - [Changelog](CHANGELOG.md)

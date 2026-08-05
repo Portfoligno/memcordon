@@ -1,293 +1,257 @@
 # MemCordon contract reference
 
-This document describes the public contracts of the source revision that
-contains it. Automation should pin a MemCordon release and consult the matching
-tagged copy. Generated `--help`, the CLI parser, and serialized Rust types are
-the implementation sources of truth.
+This reference defines MemCordon's public CLI, platform behavior, status precedence, and machine-readable output contracts.
 
-MemCordon addresses accidental or buggy resource exhaustion, not hostile code.
-Use a container, virtual machine, dedicated identity, or platform sandbox when
-the workload may attack its supervisor.
-
-<a id="cli"></a>
-## CLI
+## Invocation
 
 ```text
-memcordon run [OPTIONS] --memory MEMORY -- COMMAND...
-memcordon probe [--json]
-memcordon explain [--enforcement MODE] [--memory MEMORY]
-memcordon cleanup [--dry-run]
-memcordon version [--verbose]
-memcordon compat [--children] [--virtual] AMOUNT COMMAND...
+memcordon [EXECUTION OPTIONS] [BUDGET]... [--] COMMAND [ARGUMENT]...
+memcordon doctor [--json] [--require hard|watchdog]
+memcordon plan [POLICY OPTIONS] [BUDGET]...
+memcordon clean [--dry-run] [--json]
 ```
 
-The `--` boundary is required before the `run` command vector. MemCordon passes
-the program and arguments directly and does not parse shell source.
+Budgets are optional, contiguous, and order-independent. At most one `+MEMORY` and one `+TIME` are accepted. Time units are `ms`, `s`, and `m`; `h` is not accepted. The explicit `--` boundary is required for programs beginning with `+` or `-` and for utility-like program names. Every argument after the program is opaque native argv.
 
-### Run options
+No memory budget installs or samples a MemCordon memory policy and cannot produce status 124. No time budget installs a deadline and cannot produce status 123. Containment remains active without either budget.
 
-| Option | Accepted value | Default |
+## Deadline and restart policy
+
+Attempt deadlines reset at the platform authorization point: Linux release-byte write, Windows suspended-thread resume, or macOS pre-spawn. A supervision deadline starts with the first authorization and includes later cleanup, setup, backoff, and cooldown. It is terminal and cannot trigger restart. Confirmed memory evidence wins a same-cycle deadline race.
+
+Execution is one-shot unless `--restart` or `--restart-on both|memory-limit|deadline` is supplied. `--restart-on` independently enables restart. Enabled restart defaults to both applicable conditions and unlimited additional launches. A finite `--restart-limit N` counts additional launches. Only selected MemCordon limits restart, and only after the child and helpers are reaped, the workload is proven empty, and containment is removed or incapable of retaining members.
+
+Backoff model `logistic-odds-v1` uses exact rational arithmetic and upward whole-millisecond rounding:
+
+```text
+next = max * multiplier * current / (max + (multiplier - 1) * current)
+```
+
+Defaults are 1s initial, multiplier 2, and 30s maximum. Circuit breaker options `--restart-burst`, `--restart-window`, and `--cooldown` are all-or-none. Cooldown replaces a logistic wait and does not advance its sequence.
+
+## Platforms
+
+Linux uses the installed MemCordon CLI launcher gate: READY validation, cgroup assignment and readback, guardian startup, release byte, then typed target `CommandExt::exec`. Time-only and budgetless execution require containment delegation but not the memory controller.
+
+Windows creates the target suspended, assigns it to a fresh kill-on-close Job Object, then resumes it. Memory flags and notifications are configured only with a memory budget.
+
+macOS creates a fresh process group and launches its guardian through an explicit `MemcordonExecutable`. Sampling is absent without memory. There is no hidden workload-drain deadline; only `+TIME` sets an elapsed-time limit.
+
+## Status and schemas
+
+Status 123 is a terminal MemCordon deadline, 124 a confirmed memory-limit event, and 125 a wrapper, monitoring, cleanup, report, or restart-safety failure. Ordinary child statuses are otherwise preserved.
+
+Execution reports use schema 3. They include nullable budgets, requested/effective policy, backend capability, supervision summary, bounded attempt history, aggregates, restart decisions, and terminal provenance. Detailed history retains attempt 1 and the latest 255 later attempts while aggregates include every attempt. `plan` and `doctor` use schema 2. `clean` remains schema 1. Consumers must inspect `schema_version`.
+
+MemCordon never parses command strings, launches a shell, or defines a custom environment-variable control plane. Program and arguments remain distinct native values on every attempt.
+
+## Budget grammar
+
+Memory budgets contain exactly one leading ASCII `+`. The remainder accepts
+bare bytes, `B`, decimal `KB` through `EB`, and binary `KiB` through `EiB`.
+Decimal fractions round upward. Zero, ambiguous units such as `G`, overflow,
+non-ASCII text, and repeated leading plus signs are rejected.
+
+Time budgets use decimal `ms`, `s`, or `m` values and round upward to a whole
+millisecond. Zero, overflow, unsupported units (including `h`), signs, and
+exponent notation are rejected. When two budgets are present, their original
+order is retained in reports even though the effective memory and deadline
+policies are typed separately.
+
+### Execution options
+
+| Option | Values | Default |
 |---|---|---|
-| `--memory` | byte size | required |
 | `--enforcement` | `auto`, `hard`, `watchdog` | `auto` |
-| `--lifetime` | `command`, `workload` | `command` |
+| `--wait-for` | `command`, `workload` | `command` |
 | `--metric` | `native`, `physical-footprint`, `rss`, `virtual` | `native` |
-| `--poll-interval` | duration, at least 10 ms | `50ms` |
+| `--poll-interval` | duration of at least 10 ms | `50ms` |
 | `--signal-grace` | duration | `2s` |
 | `--limit-grace` | duration | `0s` |
-| `--swap` | byte size, `0`, `0B`, `unlimited`, or `host` | `0B` |
-| `--report` | `none`, `text`, `json` | `none` |
-| `--report-file` | path; required with JSON reporting | unset |
+| `--swap` | byte size, `0`, `0B`, `unlimited`, `host` | `0B` |
+| `--deadline-scope` | `attempt`, `supervision` | `attempt` |
+| `--restart` | flag | false |
+| `--restart-on` | `both`, `memory-limit`, `deadline` | unset |
+| `--restart-limit` | additional-launch count or `unlimited` | `unlimited` |
+| `--backoff-initial` | duration | `1s` |
+| `--backoff-multiplier` | exact decimal greater than 1 and at most 100 | `2` |
+| `--backoff-max` | duration | `30s` |
+| `--restart-burst` | positive count | unset |
+| `--restart-window` | duration | unset |
+| `--cooldown` | duration | unset |
+| `--report` | existing-parent filesystem path | unset |
+| `--summary` | flag | false |
 | `--quiet` | flag | false |
-| `--no-backend-warning` | flag | false |
 
-Memory sizes accept bare bytes, `B`, decimal `KB` through `EB`, and binary
-`KiB` through `EiB`. Decimal fractions are rounded upward to a whole byte;
-ambiguous units such as `G`, zero memory limits, and values outside `u64` are
-rejected. Durations accept decimal `ms`, `s`, or `m` values and are rounded
-upward to a whole millisecond.
+Options precede the budget block. MemCordon removes at most one exact `--`
+after the budgets. `--summary` writes one final line to stderr and conflicts
+with `--quiet`. Quiet mode never suppresses required diagnostics, cleanup
+errors, child streams, or a required report. Execution reports never use
+stdout, and `-` is not a report path.
 
-`--quiet` suppresses optional wrapper output, not child streams or required
-errors. `--no-backend-warning` suppresses the warning emitted when macOS `auto`
-selects watchdog enforcement; it does not change the backend.
+Restart tuning is valid only when restart is enabled. The three circuit-breaker
+options are an atomic group. A requested restart condition without its
+corresponding budget is recorded as dormant rather than treated as effective.
 
-Text reports are written to stderr. Only JSON reporting writes
-`--report-file`; a supplied path has no effect on text reporting.
+## Utilities
 
-<a id="compat"></a>
-### `memlimit` compatibility
+`doctor` reports tool and host identity, selected, available, and unavailable
+backends, lifecycle and memory capabilities, startup containment, supported
+deadline scopes and restart conditions, and limitations. `--require hard` or
+`--require watchdog` returns 125 when the selected backend does not satisfy the
+predicate. Doctor JSON uses schema 2.
 
-`memcordon compat [--children] [--virtual] AMOUNT COMMAND...` is a macOS-only
-migration interface. It always requests watchdog enforcement. `--children` is a
-deprecated no-op because descendants are already workload members, and
-`--virtual` selects the compatibility-only virtual-size metric. New use should
-prefer `memcordon run`.
+`plan` applies the same qualification and policy resolver as execution without
+launching a target. It reports ordered budget tokens, requested and effective
+memory/deadline/restart policy, dormant conditions, option effects,
+limitations, and `launch_proof: false`. Plan JSON uses schema 2.
 
-<a id="backends"></a>
+`clean` removes only stale MemCordon-owned backend artifacts. `--dry-run`
+reports candidates without changing the host. Clean JSON remains schema 1;
+incomplete cleanup returns 125.
+
+Root `--version` prints one line. Private launcher and guardian routes do not
+appear in public help or the Rust facade.
+
+## Behavior summary
+
+The following illustration summarizes supervision goals, not universal guarantees. The exact workload membership, metrics, platform limitations, and status precedence documented below are the contract. In particular, sampled macOS monitoring can overshoot or miss short bursts, deliberately escaped descendants can leave its sampled boundary, and higher-precedence failures can replace a child status. "Low overhead" describes the bounded, non-busy polling design; it is not a measured performance claim.
+
+![Overview of MemCordon workload supervision, metrics, cleanup, status handling, and polling goals](assets/key-guarantees.png)
+
 ## Backend-effective behavior
 
-The host platform determines which backend can run. An accepted option is not
-necessarily effective on every backend.
+| Platform | Backend | Startup and effective behavior |
+|---|---|---|
+| Linux | `linux-cgroup-v2` | An installed MemCordon CLI starts as a gated process-group leader. The supervisor verifies cgroup assignment, validates launcher readiness, starts a guardian, and then releases the launcher to execute the typed target. |
+| Windows | `windows-job-object` | The target is created suspended, assigned to a fresh unnamed kill-on-close Job Object, and resumed only after assignment. The native metric is job-wide committed memory. |
+| macOS | `macos-watchdog` | A process group is established before execution. Known descendants are sampled only when a memory budget exists; enforcement can overshoot or miss short bursts. |
+| Other Unix | none | Parsing remains portable, then execution fails before target launch. |
 
-| Platform | Backend | Enforcement accepted | Effective policy |
-|---|---|---|---|
-| Linux | `linux-cgroup-v2` | `auto`, `hard`; rejects `watchdog` | Both lifetimes, limit grace, signal grace, and swap policy are implemented; non-native metric requests do not change the cgroup metric |
-| Windows | `windows-job-object` | `auto`, `hard`; rejects `watchdog` | Command-style cleanup always applies; `workload` lifetime, limit grace, swap, and non-native metrics have no effect; signal grace applies to interruption |
-| macOS | `macos-watchdog` | `auto`, `watchdog`; rejects `hard` | Both lifetimes, metric selection, polling, signal grace, and limit grace are implemented; swap has no effect |
-| Other Unix | none | none | `run` fails with `MCUNSUPPORTED-UNIX` before target launch |
+An accepted option is not necessarily effective on every backend. Typed option
+effects in plan and execution reports describe ignored or adjusted settings.
 
 ### Linux cgroup v2
 
-MemCordon creates a package-owned child cgroup, configures its memory policy,
-assigns and verifies a gated launcher, and releases the target only after that
-setup succeeds. Its process must be below an empty cgroup v2 ancestry entry
-marked with systemd `user.delegate=1`, with the memory controller delegated and
-available for MemCordon to enable in `cgroup.subtree_control`. Installing
-MemCordon does not create this delegation; the session or service manager must
-provide it in the exact execution context.
+The process must run below a usable delegated cgroup v2 boundary. MemCordon
+creates a package-owned child cgroup and always uses it for containment. The
+memory controller and its files are required only when a memory budget is
+requested; time-only and budgetless execution must not manufacture a memory
+policy.
 
-Probe requires `cgroup.procs`, `cgroup.events`, `cgroup.kill`,
-`memory.current`, `memory.events`, `memory.max`, and `memory.swap.max`. It
-creates an empty child cgroup and verifies write/read-back of
-`memory.max=max` and `memory.swap.max=0`. A populated delegation root must be
-emptied by the service manager rather than bypassed by MemCordon. Limit evidence
-comes from `memory.events`.
+The installed CLI launcher emits and validates a versioned READY record. After
+cgroup assignment and readback and guardian startup, the supervisor writes one
+release byte. The launcher then uses typed `CommandExt::exec`, preserving PID,
+native argv, inherited descriptors, current directory, and environment. A
+release/exec-status race must preserve typed target-spawn failure provenance.
 
-The kernel may temporarily report `memory.current` above `memory.max`. Swap is
-a separately configured cgroup policy. Some allocation failures can occur
-without a recorded group kill; MemCordon turns recorded limit attempts into
-complete workload termination where possible. Under workload lifetime,
-MemCordon waits without a separate drain timeout until the cgroup becomes empty
-or another outcome occurs.
+Memory evidence comes from `memory.events`; sampled `memory.current` is not a
+substitute for the authoritative event. Under workload waiting, the cgroup is
+observed until empty or another terminal event occurs. Cleanup uses whole-cgroup
+termination, reaps the direct child and guardian, and removes the cgroup before
+a restart can be authorized.
 
 ### Windows Job Objects
 
-MemCordon creates the target suspended, assigns it to an unnamed kill-on-close
-Job Object, and resumes it only after successful assignment. Probe can create a
-Job Object but cannot prove that a future target can be assigned under the
-runner's enclosing job. The notification threshold is one native page below
-the hard job-wide commit cap.
+Containment is configured even without a memory budget. Memory limit flags and
+completion-port memory notifications are added only when a budget exists.
+Assignment precedes thread resume so target code cannot escape startup
+containment. Enclosing Job Object policy can still prevent assignment.
 
-After direct-child exit, remaining job members are force-terminated regardless
-of the requested lifetime. Console graceful termination is application
-dependent. JSON preserves a child's full unsigned 32-bit native status even
-when the invoking shell cannot represent it.
-
-The job-wide commit cap can cause an application allocation to fail without
-immediately ending the application. MemCordon combines the cap with a
-completion-port threshold and terminates the job when the notification arrives.
+The hard metric is job-wide committed memory, not resident physical memory.
+Console graceful termination is application dependent. Limit grace applies to
+memory and deadline terminals; signal grace applies only to external console
+interruption. Closing or force-terminating the Job Object must leave no live
+members before restart.
 
 ### macOS watchdog
 
-MemCordon establishes a process group before target execution, tracks the
-direct child through an owned handle, samples known descendants, and repeatedly
-attempts cleanup. Sampling can miss short bursts and cannot prevent overshoot.
-An undiscovered descendant can escape by creating a new session.
+MemCordon establishes a fresh process group before target execution, tracks the
+direct child through an owned handle, and discovers descendants by process
+identity. Physical footprint, RSS, and virtual size remain distinct metrics.
+Sampling can miss short bursts, cannot prevent overshoot, and cannot recover a
+descendant that deliberately escapes into another session.
 
-Under workload lifetime, a discovered workload that remains alive after the
-direct child exits fails once total run time exceeds 30 seconds. This is not a
-fresh 30-second allowance measured from child exit.
+Library callers provide an explicit absolute `MemcordonExecutable` for the
+guardian. Workload waiting has no implicit drain timeout. It ends on workload
+completion, explicit deadline, interruption, or a monitoring/cleanup failure.
 
-![MemCordon workload handling, metrics, failure handling, status mapping, and watchdog polling](assets/key-guarantees.png)
-
-<a id="metrics"></a>
 ## Memory metrics
 
 | Name | Meaning |
 |---|---|
 | `linux-cgroup-memory` | Native Linux cgroup memory charge controlled by `memory.max` |
-| `windows-job-commit` | Native Windows job-wide committed memory, not resident physical memory |
+| `windows-job-commit` | Native Windows job-wide committed memory |
 | `physical-footprint-sum` | Sum of physical footprint for known macOS workload processes |
-| `rss-sum` | Optional macOS summed resident-set size; shared pages may be counted more than once and swapped pages are absent |
-| `virtual-size-sum` | Compatibility-only macOS summed virtual size; not physical memory |
+| `rss-sum` | Summed resident-set size; shared pages may be counted more than once |
+| `virtual-size-sum` | Summed virtual address-space size, not physical memory |
 
-These quantities are not directly interchangeable. All configured limits and
-measurements use `u64`. A saturated aggregate proves, for comparison purposes,
-that every representable limit was crossed, but no longer represents an exact
-peak.
+These quantities are not interchangeable. Configured values and measurements
+use `u64`; a saturated aggregate proves comparison against representable limits
+but is no longer an exact peak.
 
-<a id="lifetime"></a>
-## Workload membership and lifetime
+## Workload membership and waiting
 
-Descendants are workload members by default. Lifetime controls what happens
-after the direct child exits; it does not change initial membership.
+Descendants are workload members by default. `--wait-for` controls behavior
+after the direct child exits; it does not alter startup membership.
 
 | Platform | `command` | Requested `workload` |
 |---|---|---|
 | Linux | Cleans remaining cgroup members | Waits for the cgroup to become empty |
-| Windows | Force-cleans remaining Job Object members | Currently ignored; command-style cleanup applies |
-| macOS | Cleans known process-group members | Waits for discovered members within the total-run deadline described above |
+| Windows | Cleans remaining Job Object members | Backend capability reporting describes any effective adjustment |
+| macOS | Cleans known process-group members | Waits for discovered members without a hidden timeout |
 
-The run report records the requested lifetime, not a separately resolved
-effective lifetime.
+## Execution report schema 3
 
-<a id="exit-status"></a>
-## Exit status
+`--report PATH` requests a mandatory pretty-printed JSON document ending in
+exactly one newline. It is written through a same-directory temporary file,
+synchronized, and atomically persisted. The parent directory must exist. A
+write failure returns 125.
+
+The envelope contains tool and native invocation identity, requested/effective
+policy, nullable backend capability, a supervision summary, bounded attempt
+records, and either terminal supervision or pre-supervision error provenance.
+Native non-text arguments use an authoritative base64 raw representation:
+`unix-bytes-base64` or `windows-u16le-base64`.
+
+Its top-level sections are `tool`, `invocation`, `policy`, `backend`,
+`supervision`, `attempts`, and `error`. `invocation.budget_tokens` preserves
+source order. Normalized memory and deadline values are nullable. `policy`
+separates requested and effective values and records dormant restart
+conditions. `supervision` records duration, terminal phase and outcome,
+wrapper status, attempt and restart counters, bounded-history metadata,
+aggregate outcomes, maximum observed peak, deadline state, and circuit state.
+
+Attempt history has capacity 256. Attempt 1 is retained permanently and the
+latest 255 attempts form a contiguous ascending tail. Declared retained,
+omitted, total, aggregate, authorization, restart, terminal-attempt, phase, and
+wrapper-status fields are mutually checked when reports are deserialized. Each
+attempt records its number, kind, phase, offsets, target PID, launch evidence,
+outcome or error provenance, cleanup proof, and restart decision. Aggregates
+include omitted attempts. A deadline reached during backoff, cooldown, or later
+setup is a top-level outside-attempt terminal. Initial spawn errors use typed
+`initial_spawn_failure` provenance; statuses 126 and 127 derive exclusively
+from `not-executable` and `not-found`. Consumers must reject or explicitly
+migrate unsupported schema versions.
+
+## Exit status and precedence
 
 | Status | Meaning |
 |---:|---|
-| child code | Ordinary direct-child exit when representable and cleanup completes |
+| child code | Ordinary direct-child exit when representable and cleanup succeeds |
+| `123` | MemCordon elapsed-time deadline |
 | `124` | Confirmed workload memory-limit event |
-| `125` | Backend, wrapper, monitoring, required-report, unavailable child status, out-of-range Windows status, or incomplete-cleanup failure |
+| `125` | Backend, setup, monitoring, cleanup, report, or restart-safety failure |
 | `126` | Command found but not executable |
 | `127` | Command not found |
-| `2` | CLI usage or configuration error before launch |
-| `128 + signal` | Unix interruption or child signal when cleanup completes and no higher-precedence event applies |
+| `2` | Usage or removed-interface migration diagnostic |
+| `128 + signal` | Unix interruption or child signal when no higher-precedence event applies |
 
-A confirmed limit maps to 124 and a monitor failure maps to 125. Cleanup errors
-or a nonempty workload override an interruption or ordinary child result with
-125. Otherwise an interruption, child signal, or ordinary child code is
-preserved. A child can independently return a reserved value, so numeric status
-alone does not establish provenance.
+Within one observation cycle, confirmed memory evidence precedes deadline,
+monitor/wait failure, interruption, and ordinary completion. Cleanup failure can
+replace an otherwise ordinary or interrupted result with status 125. A child
+may independently return a reserved number; the report establishes provenance.
 
-<a id="probe-json"></a>
-## Probe JSON document
+## Security boundary
 
-`memcordon probe --json` emits an unversioned object:
-
-| Field | Type | Meaning |
-|---|---|---|
-| `selected` | backend object or `null` | Backend selected by `auto` on this host |
-| `available` | array of backend objects | Backends that passed implemented qualification |
-| `unavailable` | array of unavailable objects | Backend names and qualification reasons |
-
-A backend object contains `name`, `class`, `metric`, `hard_limit`,
-`startup_containment`, and `limitations`. An unavailable object contains `name`
-and `reason`.
-
-Probe returns status 0 after successfully serializing the document even when
-`selected` is null. Consumers should pin MemCordon, reject missing fields, and
-test content rather than status alone:
-
-```sh
-memcordon probe --json \
-  | jq -e '.selected != null and .selected.hard_limit == true' \
-  >/dev/null
-```
-
-This is an early diagnostic, not launch proof. Keep `--enforcement hard` on a
-run that must fail before launch when hard enforcement cannot be established.
-
-<a id="hard-enforcement-automation"></a>
-### Hard enforcement in automation
-
-For an early diagnostic in a POSIX shell, fail the job when probe does not
-select a hard backend. Keep `--enforcement hard` on the real invocation:
-
-```sh
-set -eu
-
-probe_json="$(memcordon probe --json)"
-printf '%s\n' "$probe_json" \
-  | jq -e '.selected != null and .selected.hard_limit == true' \
-  >/dev/null
-
-memcordon run \
-  --enforcement hard \
-  --memory 8GiB \
-  --report json \
-  --report-file memcordon-result.json \
-  -- cargo test --workspace
-```
-
-The equivalent PowerShell gate is:
-
-```powershell
-$probe = memcordon probe --json | ConvertFrom-Json
-if ($null -eq $probe.selected -or -not $probe.selected.hard_limit) {
-    throw "Required hard MemCordon backend is unavailable"
-}
-
-& memcordon run `
-    --enforcement hard `
-    --memory 8GiB `
-    --report json `
-    --report-file memcordon-result.json `
-    -- cargo test --workspace
-exit $LASTEXITCODE
-```
-
-Retain the report and stderr with the job logs. Probe success on Windows does
-not prove that the later target can be assigned under the enclosing Job Object;
-the hard run remains the launch-time check.
-
-<a id="run-report"></a>
-## JSON run report
-
-JSON output requires `--report json --report-file PATH`. Schema 1 is an object
-with these fields:
-
-- `schema_version`: integer `1`.
-- `tool`: strings `name` and `version`.
-- `command`: string `program`, string array `args`, and nullable integer `pid`.
-- `policy`: strings `requested_enforcement`, `effective_enforcement`,
-  `swap_policy`, and `lifetime`; integer `memory_limit_bytes`; nullable integer
-  `swap_limit_bytes`; and integer `poll_interval_ms`.
-- `backend`: strings `name`, `class`, and `metric`; boolean `hard_limit`; and a
-  string array `limitations`.
-- `result`: string `outcome`; signed integer `wrapper_exit_code`; nullable
-  `child`; nullable `limit_evidence`; nullable integer `peak_bytes`; and integer
-  `duration_ms`.
-- `cleanup`: booleans `graceful_attempted`, `force_attempted`, and
-  `direct_child_reaped`; nullable boolean `workload_empty`; and array `errors`.
-
-`result.outcome` is `child-exited`, `limit-exceeded`, `interrupted`, or
-`monitor-failed`. A child object is tagged by `kind`: `exit-code` with signed
-`code`, `unix-signal` with signed `signal`, `windows-status` with unsigned
-`status`, or `unavailable`. Limit evidence contains string `backend`, `metric`,
-and `detail`. Each cleanup error contains string `operation` and `message`.
-
-The file is written as pretty JSON with a trailing newline to a sibling
-temporary file, synchronized, and renamed over the requested path. Failure of a
-required write returns 125 and removes the temporary file when possible.
-
-### Schema 1 observability limits
-
-The report is assembled only after backend execution returns an outcome, so
-usage, setup, or spawn failures can return 125 without a report. A report-write
-failure can also leave no durable file. Preserve stderr when diagnosis matters.
-
-The policy section is not a fully resolved policy record. It does not contain
-requested/effective metric pairs, signal grace, or limit grace, and its
-lifetime, swap, and polling fields do not prove that those requests affected the
-selected backend. `monitor-failed` does not retain the monitor error string.
+MemCordon controls the documented workload resources and lifecycle; it is not a hostile-code security sandbox. On macOS, a descendant that deliberately escapes into another session can also leave the sampled workload boundary.

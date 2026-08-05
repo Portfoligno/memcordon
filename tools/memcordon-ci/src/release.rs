@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -1019,7 +1019,7 @@ fn inspect_extract_and_smoke(
             .arg("--version")
             .run()?;
         CommandSpec::new(&executable, root, Duration::from_secs(30))
-            .args(["probe", "--json"])
+            .args(["doctor", "--json"])
             .run()?;
     }
     Ok(())
@@ -1101,7 +1101,7 @@ pub fn native_asset(root: &Path) -> Result<()> {
         .arg("--version")
         .run()?;
     CommandSpec::new(&executable, root, Duration::from_secs(30))
-        .args(["probe", "--json"])
+        .args(["doctor", "--json"])
         .run()?;
     let archive = build_archive(root, &identity, target)?;
     if fs::metadata(&archive)?.len() > release.maximum_asset_bytes {
@@ -2325,30 +2325,18 @@ fn wait_for_public_crate(
     }
 }
 
-fn require_registry_token(token: Option<&str>) -> Result<&str> {
+fn require_registry_token(token: Option<&str>) -> Result<()> {
     if token.is_none_or(str::is_empty) {
         return Err(failure(format!(
             "{CRATES_IO_TOKEN_VARIABLE} is absent or empty for the selected publication slot"
         )));
     }
-    Ok(token.expect("nonempty token checked"))
+    Ok(())
 }
 
-fn cargo_publish_home(root: &Path, record: &CrateRecord) -> Result<PathBuf> {
-    let cargo_home = root.join("target").join("ci").join("cargo-publish-home");
-    fs::create_dir_all(&cargo_home)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&cargo_home, fs::Permissions::from_mode(0o700))?;
-    }
-    for credentials in ["credentials", "credentials.toml"] {
-        if cargo_home.join(credentials).exists() {
-            return Err(failure(format!(
-                "isolated Cargo home unexpectedly contains {credentials}"
-            )));
-        }
-    }
+fn cargo_publish_config(root: &Path, record: &CrateRecord) -> Result<PathBuf> {
+    let configuration_directory = root.join("target").join("ci").join("cargo-publish-config");
+    fs::create_dir_all(&configuration_directory)?;
     let provider = std::env::current_exe()?
         .into_os_string()
         .into_string()
@@ -2363,8 +2351,10 @@ fn cargo_publish_home(root: &Path, record: &CrateRecord) -> Result<PathBuf> {
             ],
         },
     };
+    let configuration_path =
+        configuration_directory.join(PathBuf::from(&record.name).with_extension("toml"));
     fs::write(
-        cargo_home.join("config.toml"),
+        &configuration_path,
         toml::to_string(&configuration)
             .map_err(|error| {
                 failure(format!(
@@ -2373,7 +2363,14 @@ fn cargo_publish_home(root: &Path, record: &CrateRecord) -> Result<PathBuf> {
             })?
             .as_bytes(),
     )?;
-    Ok(cargo_home)
+    Ok(configuration_path)
+}
+
+fn workflow_cargo_home() -> Result<PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| failure("CARGO_HOME is absent for the selected publication slot"))
 }
 
 fn credential_request_error(message: impl Into<String>) -> serde_json::Value {
@@ -2476,7 +2473,7 @@ fn reconcile_publication_result(
 
 fn publish_next(root: &Path) -> Result<()> {
     let token = std::env::var(CRATES_IO_TOKEN_VARIABLE).ok();
-    let token = require_registry_token(token.as_deref())?;
+    require_registry_token(token.as_deref())?;
     let (release, manifest, _) = bundle_manifest(root)?;
     let metadata = metadata(root)?;
     let order = publish_order(&metadata, &release.publish_packages)?;
@@ -2500,32 +2497,28 @@ fn publish_next(root: &Path) -> Result<()> {
             .find(|record| record.name == package)
             .ok_or_else(|| failure(format!("release manifest lacks crate {package}")))?;
         let toolchains = config::toolchains(root)?;
-        let cargo_home = cargo_publish_home(root, record)?;
+        let cargo_config = cargo_publish_config(root, record)?;
+        let cargo_home = workflow_cargo_home()?;
         let publication = rustup_cargo(
             root,
             &toolchains.stable,
             [
-                "publish",
-                "--locked",
-                "--no-verify",
-                "--registry",
-                "crates-io",
-                "--package",
-                package,
+                OsStr::new("--config"),
+                cargo_config.as_os_str(),
+                OsStr::new("publish"),
+                OsStr::new("--locked"),
+                OsStr::new("--no-verify"),
+                OsStr::new("--registry"),
+                OsStr::new("crates-io"),
+                OsStr::new("--package"),
+                OsStr::new(package),
             ],
             RELEASE_DEADLINE,
         )
-        .environment_variable("CARGO_HOME", cargo_home.into_os_string())
-        .environment_variable(CRATES_IO_TOKEN_VARIABLE, token)
+        .inherit_workflow_registry_credentials()
         .run();
         for credentials in ["credentials", "credentials.toml"] {
-            if root
-                .join("target")
-                .join("ci")
-                .join("cargo-publish-home")
-                .join(credentials)
-                .exists()
-            {
+            if cargo_home.join(credentials).exists() {
                 return Err(failure(format!(
                     "Cargo publication persisted forbidden {credentials}"
                 )));
@@ -3116,10 +3109,9 @@ mod tests {
         let missing = credential_response(temporary.path(), Ok(request.clone()), None);
         assert_eq!(missing["Err"]["kind"], "other");
 
-        let cargo_home = cargo_publish_home(temporary.path(), &record)
-            .expect("isolated Cargo home should be prepared");
-        let provider_config =
-            fs::read_to_string(cargo_home.join("config.toml")).expect("config should read");
+        let cargo_config = cargo_publish_config(temporary.path(), &record)
+            .expect("isolated Cargo configuration should be prepared");
+        let provider_config = fs::read_to_string(cargo_config).expect("config should read");
         assert!(!provider_config.contains("opaque-test-capability"));
         let provider_config: toml::Value =
             toml::from_str(&provider_config).expect("config should parse");

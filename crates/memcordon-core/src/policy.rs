@@ -150,14 +150,6 @@ pub enum Metric {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum ReportMode {
-    None,
-    Text,
-    Json,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum SwapPolicy {
     Bytes(ByteSize),
     Unlimited,
@@ -198,7 +190,8 @@ impl CommandSpec {
 
 #[derive(Clone, Debug)]
 pub struct Policy {
-    pub memory: ByteSize,
+    pub memory: Option<ByteSize>,
+    pub deadline: Option<DeadlinePolicy>,
     pub enforcement: Enforcement,
     pub lifetime: Lifetime,
     pub metric: Metric,
@@ -206,15 +199,13 @@ pub struct Policy {
     pub signal_grace: Duration,
     pub limit_grace: Duration,
     pub swap: SwapPolicy,
-    pub report: ReportMode,
-    pub quiet: bool,
-    pub backend_warning: bool,
 }
 
 impl Policy {
     pub fn new(memory: ByteSize) -> Self {
         Self {
-            memory,
+            memory: Some(memory),
+            deadline: None,
             enforcement: Enforcement::Auto,
             lifetime: Lifetime::Command,
             metric: Metric::Native,
@@ -222,76 +213,98 @@ impl Policy {
             signal_grace: Duration::from_secs(2),
             limit_grace: Duration::ZERO,
             swap: SwapPolicy::Bytes(ByteSize::from_bytes(0)),
-            report: ReportMode::None,
-            quiet: false,
-            backend_warning: true,
         }
     }
+
+    pub fn unbounded() -> Self {
+        Self {
+            memory: None,
+            deadline: None,
+            enforcement: Enforcement::Auto,
+            lifetime: Lifetime::Command,
+            metric: Metric::Native,
+            poll_interval: Duration::from_millis(50),
+            signal_grace: Duration::from_secs(2),
+            limit_grace: Duration::ZERO,
+            swap: SwapPolicy::Bytes(ByteSize::from_bytes(0)),
+        }
+    }
+
+    pub fn with_deadline(mut self, duration: Duration) -> Result<Self, DeadlinePolicyError> {
+        self.deadline = Some(DeadlinePolicy::new(duration, DeadlineScope::Attempt)?);
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeadlinePolicy {
+    duration: Duration,
+    scope: DeadlineScope,
+}
+
+impl DeadlinePolicy {
+    pub fn new(duration: Duration, scope: DeadlineScope) -> Result<Self, DeadlinePolicyError> {
+        let milliseconds = duration.as_millis();
+        if milliseconds == 0 || u64::try_from(milliseconds).is_err() {
+            return Err(DeadlinePolicyError);
+        }
+        Ok(Self { duration, scope })
+    }
+
+    pub const fn duration(self) -> Duration {
+        self.duration
+    }
+
+    pub const fn scope(self) -> DeadlineScope {
+        self.scope
+    }
+}
+
+impl Serialize for DeadlinePolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("DeadlinePolicy", 2)?;
+        state.serialize_field(
+            "duration_ms",
+            &u64::try_from(self.duration.as_millis()).map_err(serde::ser::Error::custom)?,
+        )?;
+        state.serialize_field("scope", &self.scope)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for DeadlinePolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            duration_ms: u64,
+            scope: DeadlineScope,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(Duration::from_millis(wire.duration_ms), wire.scope)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("deadline must be positive and representable as u64 milliseconds")]
+pub struct DeadlinePolicyError;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeadlineScope {
+    Attempt,
+    Supervision,
 }
 
 impl Default for Policy {
     fn default() -> Self {
         Self::new(ByteSize::gib(1))
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ResolvedPolicy {
-    pub memory: ByteSize,
-    pub requested_enforcement: Enforcement,
-    pub effective_enforcement: Enforcement,
-    pub lifetime: Lifetime,
-    pub metric: Metric,
-    #[serde(with = "duration_millis")]
-    pub poll_interval: Duration,
-    #[serde(with = "duration_millis")]
-    pub signal_grace: Duration,
-    #[serde(with = "duration_millis")]
-    pub limit_grace: Duration,
-    pub swap: SwapPolicy,
-    pub report: ReportMode,
-}
-
-mod duration_millis {
-    use std::time::Duration;
-
-    use serde::Serializer;
-
-    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_u64(duration.as_millis().try_into().unwrap_or(u64::MAX))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ByteSize, ByteSizeParseError};
-
-    #[test]
-    fn parses_exact_binary_and_decimal_units() {
-        assert_eq!(
-            "1.5GiB".parse::<ByteSize>().map(ByteSize::bytes),
-            Ok(1_610_612_736)
-        );
-        assert_eq!("1.1B".parse::<ByteSize>().map(ByteSize::bytes), Ok(2));
-        assert_eq!(
-            "8000MB".parse::<ByteSize>().map(ByteSize::bytes),
-            Ok(8_000_000_000)
-        );
-    }
-
-    #[test]
-    fn rejects_ambiguous_zero_and_overflow() {
-        assert!(matches!(
-            "8G".parse::<ByteSize>(),
-            Err(ByteSizeParseError::InvalidUnit(_))
-        ));
-        assert_eq!("0".parse::<ByteSize>(), Err(ByteSizeParseError::Zero));
-        assert_eq!(
-            "999999999999999999999999EB".parse::<ByteSize>(),
-            Err(ByteSizeParseError::Overflow)
-        );
     }
 }

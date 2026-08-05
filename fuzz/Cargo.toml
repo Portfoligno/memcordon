@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-memcordon-core = { path = "../crates/memcordon-core" }
+memcordon-core = { path = "../crates/memcordon-core", features = ["test-support"] }
 memcordon = { path = "../crates/memcordon-cli" }
 memcordon-ci = { path = "../tools/memcordon-ci" }
 serde_json = "1"
@@ -73,6 +73,69 @@ bench = false
 [[bin]]
 name = "workflow_parser"
 path = "fuzz_targets/workflow_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "limit_token"
+path = "fuzz_targets/limit_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "invocation_router"
+path = "fuzz_targets/invocation_router.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_argument"
+path = "fuzz_targets/native_argument.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "budget_classifier"
+path = "fuzz_targets/budget_classifier.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "backoff_multiplier"
+path = "fuzz_targets/backoff_multiplier.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "logistic_recurrence"
+path = "fuzz_targets/logistic_recurrence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bounded_history"
+path = "fuzz_targets/bounded_history.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "restart_controller"
+path = "fuzz_targets/restart_controller.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "schema_three"
+path = "fuzz_targets/schema_three.rs"
 test = false
 doc = false
 bench = false

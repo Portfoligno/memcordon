@@ -12,7 +12,8 @@ cargo_metadata.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
-memcordon-testkit = { path = "../../crates/memcordon-testkit", version = "=0.1.4-dev" }
+memcordon-core = { path = "../../crates/memcordon-core", version = "=0.3.1-dev" }
+memcordon-testkit = { path = "../../crates/memcordon-testkit", version = "=0.3.1-dev" }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

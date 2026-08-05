@@ -1,0 +1,852 @@
+use std::path::Path;
+
+use memcordon::exit_mapping::error_exit_code;
+use memcordon::invocation::{
+    BudgetSet, BudgetToken, CleanArgs, DoctorArgs, ExecutionArgs, PlanArgs, PolicyArgs, Requirement,
+};
+use memcordon_core::{
+    BackendCapabilityReport, BackoffPolicyReport, BudgetKindReport, BudgetTokenReport,
+    CLEAN_REPORT_SCHEMA_VERSION, CircuitBreakerPolicyReport, CleanReport, CommandSpec,
+    DOCTOR_REPORT_SCHEMA_VERSION, DeadlinePolicyReport, DeadlineScope, DoctorReport,
+    DormantRestartCondition, EffectiveMemoryPolicyReport, EffectivePolicyReport,
+    EffectiveRestartPolicyReport, Enforcement, Error, ErrorCategory, ExecutionErrorReport,
+    HostReport, InvocationReport, LOGISTIC_MODEL, Lifetime, MemcordonReport, Metric,
+    OptionEffectReport, PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanResolutionReport, Policy,
+    PolicyEnvelopeReport, RequestedMemoryPolicyReport, RequestedPolicyReport,
+    RequestedRestartPolicyReport, RequirementReport, RestartCondition, RestartConditions,
+    RestartPolicy, RestartSettings, SupervisionExecution, SupervisionTerminal, SwapPolicy,
+    SwapReport, ToolReport, UnavailableCapabilityReport, write_report_atomic,
+};
+use memcordon_platform::{SupervisorRequest, capabilities, cleanup_stale, probe, supervise};
+
+#[derive(Clone, Debug)]
+struct Resolution {
+    backend: BackendCapabilityReport,
+    policy: Policy,
+    restart: RestartPolicy,
+    report: PolicyEnvelopeReport,
+}
+
+pub fn execute(args: ExecutionArgs) -> i32 {
+    if let Some(path) = &args.output.report_path {
+        let parent = path
+            .parent()
+            .filter(|value| !value.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if !parent.is_dir() {
+            eprintln!(
+                "memcordon: report parent directory does not exist: {}",
+                parent.display()
+            );
+            return 125;
+        }
+    }
+    let (program, arguments) = args.command.split_first().expect("router requires command");
+    let command = CommandSpec::new(program.clone()).args(arguments.iter().cloned());
+    let resolution = match resolve(&args.policy, &args.budgets) {
+        Ok(value) => value,
+        Err(error) => return finish_error(&args, &command, None, *error),
+    };
+    if !args.output.quiet {
+        render_effect_warnings(&resolution.report.effects);
+    }
+    let helper = match helper_path() {
+        Ok(value) => value,
+        Err(error) => return finish_error(&args, &command, Some(&resolution), *error),
+    };
+    match supervise(SupervisorRequest {
+        policy: resolution.policy.clone(),
+        restart: resolution.restart.clone(),
+        command: command.clone(),
+        memcordon_executable: helper,
+    }) {
+        Ok(execution) => finish_execution(&args, &command, &resolution, execution),
+        Err(error) => finish_error(&args, &command, Some(&resolution), error),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn helper_path() -> Result<Option<std::path::PathBuf>, Box<Error>> {
+    std::env::current_exe().map(Some).map_err(|error| {
+        Box::new(
+            Error::new(
+                ErrorCategory::Setup,
+                "MCSETUP-MEMCORDON-EXECUTABLE",
+                format!("could not resolve the installed MemCordon executable: {error}"),
+            )
+            .with_os_error(&error),
+        )
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn helper_path() -> Result<Option<std::path::PathBuf>, Box<Error>> {
+    Ok(None)
+}
+
+fn finish_execution(
+    args: &ExecutionArgs,
+    command: &CommandSpec,
+    resolution: &Resolution,
+    execution: SupervisionExecution,
+) -> i32 {
+    let exit_code = execution.wrapper_exit_code();
+    if args.output.summary || exit_code == 123 || exit_code == 124 || exit_code == 125 {
+        eprintln!("{}", outcome_line(&execution));
+    }
+    if let Some(path) = &args.output.report_path {
+        let report = match report(
+            args,
+            command,
+            &resolution.report,
+            Some(resolution.backend.clone()),
+            Some(execution),
+            None,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("memcordon: could not construct execution report: {error}");
+                return 125;
+            }
+        };
+        if let Err(error) = write_report_atomic(path, &report) {
+            eprintln!("memcordon: {error}");
+            return 125;
+        }
+    }
+    exit_code
+}
+
+fn finish_error(
+    args: &ExecutionArgs,
+    command: &CommandSpec,
+    resolution: Option<&Resolution>,
+    error: Error,
+) -> i32 {
+    let exit_code = error_exit_code(&error);
+    eprintln!("memcordon: {error}");
+    if let Some(path) = &args.output.report_path {
+        let policy = resolution
+            .map(|value| value.report.clone())
+            .unwrap_or_else(|| unresolved_report(&args.policy, &args.budgets));
+        let error_report = ExecutionErrorReport {
+            category: category_name(error.category).to_owned(),
+            code: error.code.to_owned(),
+            message: error.message.clone(),
+            os_code: error.os_code,
+            attempt_number: None,
+            supervision_phase: Some("initial-setup".to_owned()),
+            launch_phase: error.launch_phase.map(str::to_owned),
+            target_released: error.target_released,
+            workload_may_be_alive: error.workload_may_be_alive,
+        };
+        match report(
+            args,
+            command,
+            &policy,
+            resolution.map(|value| value.backend.clone()),
+            None,
+            Some(error_report),
+        ) {
+            Ok(report) => {
+                if let Err(report_error) = write_report_atomic(path, &report) {
+                    eprintln!("memcordon: {report_error}");
+                    return 125;
+                }
+            }
+            Err(report_error) => {
+                eprintln!("memcordon: could not construct failure report: {report_error}");
+                return 125;
+            }
+        }
+    }
+    exit_code
+}
+
+fn report(
+    args: &ExecutionArgs,
+    command: &CommandSpec,
+    policy: &PolicyEnvelopeReport,
+    backend: Option<BackendCapabilityReport>,
+    supervision: Option<SupervisionExecution>,
+    error: Option<ExecutionErrorReport>,
+) -> Result<MemcordonReport, memcordon_core::ReportModelError> {
+    let mut argv = Vec::with_capacity(command.arguments().len() + 1);
+    argv.push(memcordon_core::NativeArgument::from_os(command.program()));
+    argv.extend(
+        command
+            .arguments()
+            .iter()
+            .map(|value| memcordon_core::NativeArgument::from_os(value)),
+    );
+    MemcordonReport::schema3(
+        tool_report(),
+        InvocationReport {
+            syntax: "plus-budgets-v1".to_owned(),
+            budget_tokens: budget_tokens(&args.budgets),
+            memory_token: args.budgets.memory_token().map(str::to_owned),
+            deadline_token: deadline_token(&args.budgets).map(str::to_owned),
+            argv,
+        },
+        policy.clone(),
+        backend,
+        supervision,
+        error,
+    )
+}
+
+fn outcome_line(execution: &SupervisionExecution) -> String {
+    let outcome = match execution.terminal() {
+        SupervisionTerminal::AttemptOutcome { outcome, .. } => match outcome {
+            memcordon_core::RunOutcome::Exited { .. } => "child exited",
+            memcordon_core::RunOutcome::LimitExceeded { .. } => "memory limit exceeded",
+            memcordon_core::RunOutcome::DeadlineExceeded { .. } => "deadline exceeded",
+            memcordon_core::RunOutcome::Interrupted { .. } => "interrupted",
+            memcordon_core::RunOutcome::MonitorFailed { .. } => "monitor failed",
+        },
+        SupervisionTerminal::DeadlineOutsideAttempt { .. } => "supervision deadline exceeded",
+        SupervisionTerminal::Error { .. } => "supervision failed",
+    };
+    format!(
+        "memcordon: {outcome} {}; backend {}; attempts {}; restarts {}",
+        execution.wrapper_exit_code(),
+        execution.backend().name,
+        execution.attempts().total,
+        execution.restart().restarts_launched()
+    )
+}
+
+fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, Box<Error>> {
+    let policy = policy_args.policy(budgets);
+    let probe = probe();
+    let backend = probe.selected.ok_or_else(|| {
+        Box::new(Error::new(
+            ErrorCategory::Unsupported,
+            "MCUNSUPPORTED-BACKEND",
+            format!(
+                "no supported backend is available: {}",
+                probe
+                    .unavailable
+                    .iter()
+                    .map(|value| format!("{}: {}", value.name, value.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        ))
+    })?;
+    if policy.enforcement == Enforcement::Hard && !backend.hard_limit {
+        return Err(Box::new(Error::new(
+            ErrorCategory::Unsupported,
+            "MCUNSUPPORTED-HARD",
+            "hard enforcement is unavailable on the selected backend",
+        )));
+    }
+    if policy.enforcement == Enforcement::Watchdog && backend.class != "watchdog" {
+        return Err(Box::new(Error::new(
+            ErrorCategory::Unsupported,
+            "MCUNSUPPORTED-WATCHDOG",
+            "watchdog enforcement is unavailable on the selected backend",
+        )));
+    }
+    let capability = capabilities(&backend);
+    let configured = if policy_args.restart || policy_args.restart_on.is_some() {
+        policy_args.restart_on.unwrap_or(RestartConditions::BOTH)
+    } else {
+        RestartConditions::NONE
+    };
+    let mut effective = RestartConditions::NONE;
+    let mut dormant = Vec::new();
+    for condition in [RestartCondition::MemoryLimit, RestartCondition::Deadline] {
+        if !configured.contains(condition) {
+            continue;
+        }
+        let active = match condition {
+            RestartCondition::MemoryLimit => {
+                budgets.memory.is_some() && capability.restart_conditions.contains(condition)
+            }
+            RestartCondition::Deadline => {
+                budgets.deadline.is_some()
+                    && policy_args.deadline_scope == DeadlineScope::Attempt
+                    && capability.restart_conditions.contains(condition)
+            }
+        };
+        if active {
+            effective = add_condition(effective, condition);
+        } else {
+            dormant.push(DormantRestartCondition {
+                condition,
+                reason: match condition {
+                    RestartCondition::MemoryLimit => {
+                        "no effective memory-limit condition".to_owned()
+                    }
+                    RestartCondition::Deadline => {
+                        "deadline is absent, supervision-scoped, or unsupported".to_owned()
+                    }
+                },
+            });
+        }
+    }
+    let restart = if configured.is_empty() {
+        RestartPolicy::Never
+    } else {
+        RestartPolicy::OnLimits(
+            RestartSettings::new(
+                configured,
+                effective,
+                dormant.clone(),
+                policy_args.restart_limit,
+                policy_args.backoff,
+                policy_args.circuit_breaker,
+            )
+            .map_err(|error| {
+                Box::new(Error::new(
+                    ErrorCategory::Usage,
+                    "MCUSAGE-RESTART",
+                    error.to_string(),
+                ))
+            })?,
+        )
+    };
+    let restart = memcordon::resolve_restart_policy(&policy, restart).map_err(Box::new)?;
+    let report = policy_report(
+        policy_args,
+        budgets,
+        &policy,
+        &backend,
+        configured,
+        effective,
+        dormant,
+    );
+    Ok(Resolution {
+        backend: capability,
+        policy,
+        restart,
+        report,
+    })
+}
+
+fn add_condition(value: RestartConditions, condition: RestartCondition) -> RestartConditions {
+    match (value, condition) {
+        (RestartConditions::NONE, RestartCondition::MemoryLimit) => RestartConditions::MEMORY_LIMIT,
+        (RestartConditions::NONE, RestartCondition::Deadline) => RestartConditions::DEADLINE,
+        (RestartConditions::MEMORY_LIMIT, RestartCondition::Deadline)
+        | (RestartConditions::DEADLINE, RestartCondition::MemoryLimit) => RestartConditions::BOTH,
+        _ => value,
+    }
+}
+
+fn policy_report(
+    args: &PolicyArgs,
+    budgets: &BudgetSet,
+    policy: &Policy,
+    backend: &memcordon_platform::BackendInfo,
+    configured: RestartConditions,
+    effective_conditions: RestartConditions,
+    dormant_conditions: Vec<DormantRestartCondition>,
+) -> PolicyEnvelopeReport {
+    let effective_enforcement = if backend.hard_limit {
+        "hard"
+    } else {
+        "watchdog"
+    };
+    let effective_wait =
+        if backend.name == "windows-job-object" && policy.lifetime == Lifetime::Workload {
+            "command"
+        } else {
+            wait_name(policy.lifetime)
+        };
+    let effective_metric = if policy.metric == Metric::Native || backend.class != "watchdog" {
+        backend.metric
+    } else {
+        metric_name(policy.metric)
+    };
+    let mut effects = Vec::new();
+    if policy.enforcement == Enforcement::Auto {
+        effects.push(OptionEffectReport::Adjusted {
+            option: "enforcement".to_owned(),
+            requested: "auto".to_owned(),
+            effective: effective_enforcement.to_owned(),
+            reason: format!("auto selected backend {}", backend.name),
+        });
+    } else {
+        effects.push(OptionEffectReport::Applied {
+            option: "enforcement".to_owned(),
+        });
+    }
+    if backend.name == "windows-job-object" && policy.lifetime == Lifetime::Workload {
+        effects.push(OptionEffectReport::Ignored {
+            option: "wait-for".to_owned(),
+            requested: "workload".to_owned(),
+            reason: "the Windows backend uses command-style completion".to_owned(),
+        });
+    } else {
+        effects.push(OptionEffectReport::Applied {
+            option: "wait-for".to_owned(),
+        });
+    }
+    if policy.metric != Metric::Native && backend.class != "watchdog" {
+        effects.push(OptionEffectReport::Ignored {
+            option: "metric".to_owned(),
+            requested: metric_name(policy.metric).to_owned(),
+            reason: format!("{} uses its native kernel metric", backend.name),
+        });
+    } else {
+        effects.push(OptionEffectReport::Applied {
+            option: "metric".to_owned(),
+        });
+    }
+    effects.push(OptionEffectReport::Applied {
+        option: "poll-interval".to_owned(),
+    });
+    if backend.name == "linux-cgroup-v2" {
+        effects.push(OptionEffectReport::Applied {
+            option: "swap".to_owned(),
+        });
+    } else if policy.memory.is_some() {
+        effects.push(OptionEffectReport::Ignored {
+            option: "swap".to_owned(),
+            requested: swap_name(policy.swap),
+            reason: format!(
+                "{} has no separately configurable swap policy",
+                backend.name
+            ),
+        });
+    }
+    if let Some(deadline) = policy.deadline {
+        effects.push(OptionEffectReport::Applied {
+            option: "deadline-scope".to_owned(),
+        });
+        effects.push(OptionEffectReport::Adjusted {
+            option: "deadline-origin".to_owned(),
+            requested: "platform-authorization".to_owned(),
+            effective: deadline_origin(backend.name).to_owned(),
+            reason: format!(
+                "the {:?} deadline clock starts at the backend authorization boundary",
+                deadline.scope()
+            ),
+        });
+    }
+    if policy.memory.is_some() || policy.deadline.is_some() {
+        effects.push(OptionEffectReport::Applied {
+            option: "limit-grace".to_owned(),
+        });
+    }
+    for dormant in &dormant_conditions {
+        effects.push(OptionEffectReport::Ignored {
+            option: "restart-on".to_owned(),
+            requested: restart_condition_name(dormant.condition).to_owned(),
+            reason: dormant.reason.clone(),
+        });
+    }
+    let requested = requested_report(args, budgets, configured);
+    PolicyEnvelopeReport {
+        requested,
+        effective: EffectivePolicyReport {
+            memory: policy.memory.map(|memory| EffectiveMemoryPolicyReport {
+                limit_bytes: memory.bytes(),
+                enforcement: effective_enforcement.to_owned(),
+                metric: effective_metric.to_owned(),
+                poll_interval_ms: Some(milliseconds(policy.poll_interval)),
+                swap: (backend.name == "linux-cgroup-v2").then(|| swap_report(policy.swap)),
+            }),
+            deadline: policy.deadline.map(|deadline| DeadlinePolicyReport {
+                duration_ms: milliseconds(deadline.duration()),
+                scope: deadline.scope(),
+                origin: Some(deadline_origin(backend.name).to_owned()),
+                clock: "rust-instant".to_owned(),
+            }),
+            wait_for: effective_wait.to_owned(),
+            signal_grace_ms: milliseconds(policy.signal_grace),
+            limit_grace_ms: milliseconds(policy.limit_grace),
+            restart: EffectiveRestartPolicyReport {
+                enabled: !configured.is_empty(),
+                conditions: effective_conditions,
+                dormant_conditions,
+                cleanup_proof_required: !configured.is_empty(),
+            },
+        },
+        effects,
+    }
+}
+
+fn requested_report(
+    args: &PolicyArgs,
+    budgets: &BudgetSet,
+    configured: RestartConditions,
+) -> RequestedPolicyReport {
+    RequestedPolicyReport {
+        memory: budgets.memory.map(|memory| RequestedMemoryPolicyReport {
+            limit_bytes: memory.bytes(),
+            enforcement: enforcement_name(args.enforcement).to_owned(),
+            metric: metric_name(args.metric).to_owned(),
+            poll_interval_ms: milliseconds(args.poll_interval),
+            swap: swap_report(args.swap),
+        }),
+        deadline: budgets.deadline.map(|duration| DeadlinePolicyReport {
+            duration_ms: milliseconds(duration),
+            scope: args.deadline_scope,
+            origin: None,
+            clock: "rust-instant".to_owned(),
+        }),
+        wait_for: wait_name(args.wait_for).to_owned(),
+        signal_grace_ms: milliseconds(args.signal_grace),
+        limit_grace_ms: milliseconds(args.limit_grace),
+        restart: RequestedRestartPolicyReport {
+            enabled: !configured.is_empty(),
+            enablement_source: if args.restart_on.is_some() {
+                Some("restart-on".to_owned())
+            } else if args.restart {
+                Some("restart".to_owned())
+            } else {
+                None
+            },
+            configured_conditions: configured,
+            limit: args.restart_limit,
+            backoff: (!configured.is_empty()).then(|| BackoffPolicyReport {
+                model: LOGISTIC_MODEL.to_owned(),
+                initial_ms: milliseconds(args.backoff.initial()),
+                multiplier_numerator: args.backoff.multiplier().numerator(),
+                multiplier_denominator: args.backoff.multiplier().denominator(),
+                maximum_ms: milliseconds(args.backoff.maximum()),
+                quantization: "ceil-whole-milliseconds".to_owned(),
+            }),
+            circuit_breaker: args
+                .circuit_breaker
+                .map(|value| CircuitBreakerPolicyReport {
+                    burst: value.burst().get(),
+                    window_ms: milliseconds(value.window()),
+                    cooldown_ms: milliseconds(value.cooldown()),
+                }),
+        },
+    }
+}
+
+fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeReport {
+    let configured = if args.restart || args.restart_on.is_some() {
+        args.restart_on.unwrap_or(RestartConditions::BOTH)
+    } else {
+        RestartConditions::NONE
+    };
+    let dormant = [RestartCondition::MemoryLimit, RestartCondition::Deadline]
+        .into_iter()
+        .filter(|condition| configured.contains(*condition))
+        .map(|condition| DormantRestartCondition {
+            condition,
+            reason: "backend resolution failed".to_owned(),
+        })
+        .collect();
+    PolicyEnvelopeReport {
+        requested: requested_report(args, budgets, configured),
+        effective: EffectivePolicyReport {
+            memory: budgets.memory.map(|memory| EffectiveMemoryPolicyReport {
+                limit_bytes: memory.bytes(),
+                enforcement: "unresolved".to_owned(),
+                metric: "unresolved".to_owned(),
+                poll_interval_ms: None,
+                swap: None,
+            }),
+            deadline: budgets.deadline.map(|duration| DeadlinePolicyReport {
+                duration_ms: milliseconds(duration),
+                scope: args.deadline_scope,
+                origin: None,
+                clock: "rust-instant".to_owned(),
+            }),
+            wait_for: wait_name(args.wait_for).to_owned(),
+            signal_grace_ms: milliseconds(args.signal_grace),
+            limit_grace_ms: milliseconds(args.limit_grace),
+            restart: EffectiveRestartPolicyReport {
+                enabled: !configured.is_empty(),
+                conditions: RestartConditions::NONE,
+                dormant_conditions: dormant,
+                cleanup_proof_required: !configured.is_empty(),
+            },
+        },
+        effects: Vec::new(),
+    }
+}
+
+pub fn plan(args: PlanArgs) -> i32 {
+    let resolution = match resolve(&args.policy, &args.budgets) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("memcordon: {error}");
+            return 125;
+        }
+    };
+    let limitations = resolution.backend.limitations.clone();
+    let plan = PlanReport {
+        schema_version: PLAN_REPORT_SCHEMA_VERSION,
+        tool: tool_report(),
+        budget_tokens: budget_tokens(&args.budgets),
+        request: resolution.report.requested.clone(),
+        resolution: PlanResolutionReport {
+            backend: resolution.backend,
+            effective: resolution.report.effective,
+            effects: resolution.report.effects,
+            limitations,
+            launch_proof: false,
+            backoff_sample_ms: if args.policy.restart || args.policy.restart_on.is_some() {
+                vec![milliseconds(args.policy.backoff.initial())]
+            } else {
+                Vec::new()
+            },
+        },
+    };
+    if args.json {
+        print_json(&plan, "plan")
+    } else {
+        println!("selected backend: {}", plan.resolution.backend.name);
+        println!("launch proof: false");
+        0
+    }
+}
+
+pub fn doctor(args: DoctorArgs) -> i32 {
+    let probe = probe();
+    let selected = probe.selected.as_ref().map(capabilities);
+    let available = probe.available.iter().map(capabilities).collect::<Vec<_>>();
+    let met = args.requirement.is_none_or(|required| {
+        selected.as_ref().is_some_and(|backend| match required {
+            Requirement::Hard => backend
+                .memory
+                .as_ref()
+                .is_some_and(|memory| memory.class == "hard"),
+            Requirement::Watchdog => backend
+                .memory
+                .as_ref()
+                .is_some_and(|memory| memory.class == "watchdog"),
+        })
+    });
+    let report = DoctorReport {
+        schema_version: DOCTOR_REPORT_SCHEMA_VERSION,
+        tool: tool_report(),
+        host: HostReport {
+            os: std::env::consts::OS.to_owned(),
+            architecture: std::env::consts::ARCH.to_owned(),
+        },
+        selected,
+        available,
+        unavailable: probe
+            .unavailable
+            .into_iter()
+            .map(|value| UnavailableCapabilityReport {
+                name: value.name.to_owned(),
+                reason: value.reason,
+            })
+            .collect(),
+        requirement: RequirementReport {
+            kind: args.requirement.map(|value| match value {
+                Requirement::Hard => "hard".to_owned(),
+                Requirement::Watchdog => "watchdog".to_owned(),
+            }),
+            met,
+            reason: (!met)
+                .then(|| "selected backend does not satisfy the requested enforcement".to_owned()),
+        },
+    };
+    if args.json {
+        let code = print_json(&report, "doctor");
+        if code != 0 {
+            return code;
+        }
+    } else {
+        println!("memcordon {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "selected backend: {}",
+            report
+                .selected
+                .as_ref()
+                .map_or("none", |value| value.name.as_str())
+        );
+    }
+    if met { 0 } else { 125 }
+}
+
+pub fn clean(args: CleanArgs) -> i32 {
+    match cleanup_stale(args.dry_run) {
+        Ok(cleaned) => {
+            if args.json {
+                print_json(
+                    &CleanReport {
+                        schema_version: CLEAN_REPORT_SCHEMA_VERSION,
+                        dry_run: args.dry_run,
+                        cleaned,
+                    },
+                    "clean",
+                )
+            } else {
+                for value in cleaned {
+                    println!(
+                        "{} {value}",
+                        if args.dry_run {
+                            "would remove"
+                        } else {
+                            "removed"
+                        }
+                    );
+                }
+                0
+            }
+        }
+        Err(error) => {
+            if args.json {
+                let failure = clean_failure_report(args.dry_run, &error);
+                let _ = print_json(&failure, "clean error");
+            }
+            eprintln!("memcordon: {error}");
+            125
+        }
+    }
+}
+
+fn clean_failure_report(dry_run: bool, error: &Error) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": CLEAN_REPORT_SCHEMA_VERSION,
+        "platform": std::env::consts::OS,
+        "dry_run": dry_run,
+        "objects_examined": 0,
+        "stale_objects_selected": [],
+        "objects_removed": [],
+        "skipped": [],
+        "errors": [{
+            "code": error.code,
+            "message": error.message,
+        }],
+    })
+}
+
+fn budget_tokens(budgets: &BudgetSet) -> Vec<BudgetTokenReport> {
+    budgets
+        .source_order
+        .iter()
+        .map(|value| match value {
+            BudgetToken::Memory { raw, .. } => BudgetTokenReport {
+                kind: BudgetKindReport::Memory,
+                token: raw.to_string_lossy().into_owned(),
+            },
+            BudgetToken::Time { raw, .. } => BudgetTokenReport {
+                kind: BudgetKindReport::Time,
+                token: raw.to_string_lossy().into_owned(),
+            },
+        })
+        .collect()
+}
+fn deadline_token(budgets: &BudgetSet) -> Option<&str> {
+    budgets.source_order.iter().find_map(|value| match value {
+        BudgetToken::Time { raw, .. } => raw.to_str(),
+        BudgetToken::Memory { .. } => None,
+    })
+}
+fn tool_report() -> ToolReport {
+    ToolReport {
+        name: "memcordon".to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    }
+}
+fn print_json(value: &impl serde::Serialize, name: &str) -> i32 {
+    match serde_json::to_string_pretty(value) {
+        Ok(value) => {
+            println!("{value}");
+            0
+        }
+        Err(error) => {
+            eprintln!("memcordon: could not serialize {name}: {error}");
+            125
+        }
+    }
+}
+fn milliseconds(value: std::time::Duration) -> u64 {
+    value.as_millis().try_into().unwrap_or(u64::MAX)
+}
+fn enforcement_name(value: Enforcement) -> &'static str {
+    match value {
+        Enforcement::Auto => "auto",
+        Enforcement::Hard => "hard",
+        Enforcement::Watchdog => "watchdog",
+    }
+}
+fn wait_name(value: Lifetime) -> &'static str {
+    match value {
+        Lifetime::Command => "command",
+        Lifetime::Workload => "workload",
+    }
+}
+fn metric_name(value: Metric) -> &'static str {
+    match value {
+        Metric::Native => "native",
+        Metric::PhysicalFootprint => "physical-footprint",
+        Metric::Rss => "rss",
+        Metric::Virtual => "virtual",
+    }
+}
+fn swap_report(value: SwapPolicy) -> SwapReport {
+    match value {
+        SwapPolicy::Bytes(bytes) => SwapReport::Bytes {
+            bytes: bytes.bytes(),
+        },
+        SwapPolicy::Unlimited => SwapReport::Unlimited,
+        SwapPolicy::Host => SwapReport::Host,
+    }
+}
+fn swap_name(value: SwapPolicy) -> String {
+    match value {
+        SwapPolicy::Bytes(bytes) => format!("{}B", bytes.bytes()),
+        SwapPolicy::Unlimited => "unlimited".to_owned(),
+        SwapPolicy::Host => "host".to_owned(),
+    }
+}
+fn restart_condition_name(value: RestartCondition) -> &'static str {
+    match value {
+        RestartCondition::MemoryLimit => "memory-limit",
+        RestartCondition::Deadline => "deadline",
+    }
+}
+fn deadline_origin(backend: &str) -> &'static str {
+    match backend {
+        "linux-cgroup-v2" => "installed-cli-release-byte",
+        "windows-job-object" => "suspended-thread-resume",
+        "macos-watchdog" => "pre-spawn",
+        _ => "platform-authorization",
+    }
+}
+fn category_name(value: ErrorCategory) -> &'static str {
+    match value {
+        ErrorCategory::Usage => "usage",
+        ErrorCategory::Unsupported => "unsupported",
+        ErrorCategory::Setup => "setup",
+        ErrorCategory::Spawn => "spawn",
+        ErrorCategory::Monitor => "monitor",
+        ErrorCategory::Wait => "wait",
+        ErrorCategory::Termination => "termination",
+        ErrorCategory::Cleanup => "cleanup",
+        ErrorCategory::Report => "report",
+    }
+}
+fn render_effect_warnings(effects: &[OptionEffectReport]) {
+    for effect in effects {
+        if let OptionEffectReport::Ignored {
+            option,
+            requested,
+            reason,
+        } = effect
+        {
+            eprintln!("memcordon: warning: --{option} {requested} is ineffective: {reason}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn clean_failure_json_is_schema_one_and_machine_readable() {
+        let error = memcordon_core::Error::new(
+            memcordon_core::ErrorCategory::Cleanup,
+            "MCCLEANUP-TEST",
+            "fixture failure",
+        );
+        let value = super::clean_failure_report(true, &error);
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["dry_run"], true);
+        assert_eq!(value["errors"][0]["code"], "MCCLEANUP-TEST");
+    }
+}

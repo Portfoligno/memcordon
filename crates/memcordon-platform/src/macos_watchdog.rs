@@ -3,16 +3,15 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use memcordon_core::{
-    ByteSize, ChildTermination, CleanupErrorRecord, CleanupSummary, CommandSpec, Enforcement,
-    Error, ErrorCategory, Interruption, Lifetime, LimitEvidence, Metric, Policy, RunOutcome,
-    RunState, StateMachine,
+    ByteSize, ChildTermination, CleanupErrorRecord, CleanupSummary, CommandSpec, DeadlineEvidence,
+    Enforcement, Error, ErrorCategory, InitialSpawnFailure, Interruption, Lifetime, LimitEvidence,
+    Metric, Policy, RunOutcome, RunState, StateMachine,
 };
 
-use crate::backend::{BackendInfo, Execution};
+use crate::backend::{BackendCleanupFacts, BackendInfo, Execution};
 use crate::guardian::Guardian;
 use crate::signal::SignalSource;
 
@@ -20,7 +19,16 @@ const PROC_PIDTBSDINFO: i32 = 3;
 const PROC_PIDTASKINFO: i32 = 4;
 const RUSAGE_INFO_V2: i32 = 2;
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(3);
-const WORKLOAD_DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+fn millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn bounded_pause(duration: Duration) {
+    let timeout = duration.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: zero-descriptor poll is a bounded kernel wait and remains signal-interruptible.
+    unsafe { libc::poll(std::ptr::null_mut(), 0, timeout) };
+}
 
 #[link(name = "proc")]
 unsafe extern "C" {
@@ -210,6 +218,8 @@ impl Drop for ExitWatcher {
 pub fn info() -> BackendInfo {
     BackendInfo {
         name: "macos-watchdog",
+        containment_supported: true,
+        memory_supported: true,
         class: "watchdog",
         metric: "physical-footprint-sum",
         hard_limit: false,
@@ -222,7 +232,17 @@ pub fn info() -> BackendInfo {
     }
 }
 
-pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
+#[allow(
+    clippy::result_large_err,
+    reason = "execution propagates the categorized Error unchanged through the public boundary"
+)]
+pub fn run_attempt(
+    policy: Policy,
+    command: &CommandSpec,
+    memcordon_executable: &std::path::Path,
+    signal_source: &SignalSource,
+    context: crate::supervisor::AttemptContext,
+) -> Result<Execution, Error> {
     if policy.enforcement == Enforcement::Hard {
         return Err(Error::new(
             ErrorCategory::Unsupported,
@@ -235,14 +255,7 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
     state
         .transition(RunState::Prepared)
         .map_err(|error| Error::new(ErrorCategory::Setup, "MCSETUP-STATE", error.to_string()))?;
-    let signal_source = SignalSource::install().map_err(|error| {
-        Error::new(
-            ErrorCategory::Setup,
-            "MCSETUP-SIGNAL",
-            format!("could not install signal handlers: {error}"),
-        )
-        .with_os_error(&error)
-    })?;
+    let authorized = Instant::now();
     let mut child = spawn_contained(command)?;
     state
         .transition(RunState::SpawnedGated)
@@ -258,20 +271,48 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
             "child PID cannot be represented by native process APIs",
         )
     })?;
-    let guardian = match Guardian::spawn(root_pid) {
+    let guardian = match Guardian::spawn(root_pid, memcordon_executable) {
         Ok(guardian) => guardian,
         Err(error) => {
             // SAFETY: the direct child owns a process group whose ID is `root_pid`.
             unsafe {
                 libc::kill(-root_pid, libc::SIGKILL);
             }
-            let _ = child.wait();
-            return Err(Error::new(
+            let cleanup_deadline = context.clamp_deadline(started, CLEANUP_DEADLINE);
+            let direct_child_reaped = loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break true,
+                    Ok(None) if Instant::now() < cleanup_deadline => {
+                        bounded_pause(
+                            Duration::from_millis(10)
+                                .min(cleanup_deadline.saturating_duration_since(Instant::now())),
+                        );
+                    }
+                    Ok(None) | Err(_) => break false,
+                }
+            };
+            let mut failure = Error::new(
                 ErrorCategory::Setup,
                 "MCSETUP-GUARDIAN",
                 format!("could not start workload guardian: {error}"),
             )
-            .with_os_error(&error));
+            .with_os_error(&error)
+            .with_restart_safety(memcordon_core::RestartSafetyProof {
+                direct_child_reaped,
+                workload_empty: None,
+                helpers_reaped: true,
+                containment_removed: false,
+                containment_incapable_of_live_members: false,
+                errors: (!direct_child_reaped)
+                    .then(|| {
+                        "direct child could not be reaped after guardian setup failure".to_owned()
+                    })
+                    .into_iter()
+                    .collect(),
+            });
+            failure =
+                failure.with_authorization_offset(authorized.saturating_duration_since(started));
+            return Err(failure);
         }
     };
     let exit_watcher = ExitWatcher::new(root_pid).ok();
@@ -282,55 +323,20 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
     let mut stored_status = None;
     let mut peak = 0_u64;
 
+    let mut pending_signal = None;
     let mut outcome = loop {
+        let mut cycle_error = None;
+        let mut completion = None;
         match try_reap(&mut child, &mut stored_status) {
             Ok(Some(status)) => {
                 if policy.lifetime == Lifetime::Command {
-                    let cleanup = cleanup_after_direct_exit(
-                        &mut child,
-                        &mut stored_status,
-                        root_pid,
-                        &mut known,
-                    );
-                    break RunOutcome::Exited {
-                        child: status,
-                        peak: Some(ByteSize::from_bytes(peak)),
-                        cleanup,
-                    };
+                    completion = Some(status);
                 }
             }
             Ok(None) => {}
             Err(error) => {
-                let cleanup = terminate_and_cleanup(
-                    &mut child,
-                    &mut stored_status,
-                    root_pid,
-                    &mut known,
-                    libc::SIGKILL,
-                    Duration::ZERO,
-                );
-                break RunOutcome::MonitorFailed {
-                    error,
-                    child_after_termination: stored_status.clone(),
-                    cleanup,
-                };
+                cycle_error = Some(error);
             }
-        }
-
-        if let Some(signal) = signal_source.take() {
-            let cleanup = terminate_and_cleanup(
-                &mut child,
-                &mut stored_status,
-                root_pid,
-                &mut known,
-                signal,
-                policy.signal_grace,
-            );
-            break RunOutcome::Interrupted {
-                signal: Interruption { signal },
-                child_after_termination: stored_status.clone(),
-                cleanup,
-            };
         }
 
         match discover(root_pid, &mut known) {
@@ -339,86 +345,113 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
                     && stored_status.is_some()
                     && snapshots.is_empty()
                 {
-                    break RunOutcome::Exited {
-                        child: stored_status
+                    completion = Some(
+                        stored_status
                             .clone()
                             .unwrap_or(ChildTermination::Unavailable),
-                        peak: Some(ByteSize::from_bytes(peak)),
-                        cleanup: CleanupSummary {
-                            direct_child_reaped: true,
-                            workload_empty: Some(true),
-                            ..CleanupSummary::default()
-                        },
-                    };
+                    );
                 }
-                match sample(&snapshots, policy.metric) {
-                    Ok(usage) => {
-                        peak = peak.max(usage);
-                        if usage >= policy.memory.bytes() {
-                            let cleanup = terminate_and_cleanup(
-                                &mut child,
-                                &mut stored_status,
-                                root_pid,
-                                &mut known,
-                                if policy.limit_grace.is_zero() {
-                                    libc::SIGKILL
-                                } else {
-                                    libc::SIGTERM
-                                },
-                                policy.limit_grace,
-                            );
-                            break RunOutcome::LimitExceeded {
-                                limit: policy.memory,
-                                observed: Some(ByteSize::from_bytes(usage)),
-                                peak: Some(ByteSize::from_bytes(peak)),
-                                evidence: LimitEvidence {
-                                    backend: "macos-watchdog".to_owned(),
-                                    metric: metric_name(policy.metric).to_owned(),
-                                    detail: "sampled aggregate reached configured limit".to_owned(),
-                                },
-                                child_after_termination: stored_status.clone(),
-                                cleanup,
-                            };
+                if let Some(limit) = policy.memory {
+                    match sample(&snapshots, policy.metric) {
+                        Ok(usage) => {
+                            peak = peak.max(usage);
+                            if usage >= limit.bytes() {
+                                let cleanup = terminate_and_cleanup(
+                                    &mut child,
+                                    &mut stored_status,
+                                    root_pid,
+                                    &mut known,
+                                    if policy.limit_grace.is_zero() {
+                                        libc::SIGKILL
+                                    } else {
+                                        libc::SIGTERM
+                                    },
+                                    policy.limit_grace,
+                                    context.supervision_deadline(started),
+                                );
+                                break RunOutcome::LimitExceeded {
+                                    limit,
+                                    observed: Some(ByteSize::from_bytes(usage)),
+                                    peak: Some(ByteSize::from_bytes(peak)),
+                                    evidence: LimitEvidence {
+                                        backend: "macos-watchdog".to_owned(),
+                                        metric: metric_name(policy.metric).to_owned(),
+                                        detail: "sampled aggregate reached configured limit"
+                                            .to_owned(),
+                                    },
+                                    child_after_termination: stored_status.clone(),
+                                    cleanup,
+                                };
+                            }
                         }
-                    }
-                    Err(error) => {
-                        let cleanup = terminate_and_cleanup(
-                            &mut child,
-                            &mut stored_status,
-                            root_pid,
-                            &mut known,
-                            libc::SIGKILL,
-                            Duration::ZERO,
-                        );
-                        break RunOutcome::MonitorFailed {
-                            error,
-                            child_after_termination: stored_status.clone(),
-                            cleanup,
-                        };
+                        Err(error) => {
+                            cycle_error = Some(error);
+                        }
                     }
                 }
             }
             Err(error) => {
+                if cycle_error.is_none() {
+                    cycle_error = Some(error);
+                }
+            }
+        }
+
+        if let Some(deadline) = policy.deadline {
+            let active_duration = context
+                .supervision_deadline_remaining
+                .unwrap_or_else(|| deadline.duration());
+            if authorized.elapsed() >= active_duration {
+                let grace_started = Instant::now();
+                let effective_grace =
+                    context
+                        .supervision_deadline(started)
+                        .map_or(policy.limit_grace, |deadline| {
+                            policy
+                                .limit_grace
+                                .min(deadline.saturating_duration_since(Instant::now()))
+                        });
                 let cleanup = terminate_and_cleanup(
                     &mut child,
                     &mut stored_status,
                     root_pid,
                     &mut known,
-                    libc::SIGKILL,
-                    Duration::ZERO,
+                    if effective_grace.is_zero() {
+                        libc::SIGKILL
+                    } else {
+                        libc::SIGTERM
+                    },
+                    effective_grace,
+                    context.supervision_deadline(started),
                 );
-                break RunOutcome::MonitorFailed {
-                    error,
+                let observed = authorized.elapsed();
+                break RunOutcome::DeadlineExceeded {
+                    deadline: DeadlineEvidence::new(
+                        millis(deadline.duration()),
+                        deadline.scope(),
+                        "pre-spawn".to_owned(),
+                        millis(context.supervision_offset + active_duration),
+                        millis(context.supervision_offset + observed),
+                        millis(policy.limit_grace),
+                        millis(grace_started.elapsed().min(effective_grace)),
+                        (!policy.limit_grace.is_zero()).then(|| "sigterm-process-group".to_owned()),
+                        Some("sigkill-process-group".to_owned()),
+                    )
+                    .map_err(|_| {
+                        Error::new(
+                            ErrorCategory::Monitor,
+                            "MCLIMIT-DEADLINE-EVIDENCE",
+                            "deadline evidence is inconsistent",
+                        )
+                    })?,
                     child_after_termination: stored_status.clone(),
+                    peak: policy.memory.map(|_| ByteSize::from_bytes(peak)),
                     cleanup,
                 };
             }
         }
 
-        if policy.lifetime == Lifetime::Workload
-            && stored_status.is_some()
-            && started.elapsed() > WORKLOAD_DRAIN_DEADLINE
-        {
+        if let Some(error) = cycle_error {
             let cleanup = terminate_and_cleanup(
                 &mut child,
                 &mut stored_status,
@@ -426,13 +459,55 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
                 &mut known,
                 libc::SIGKILL,
                 Duration::ZERO,
+                context.supervision_deadline(started),
             );
             break RunOutcome::MonitorFailed {
-                error: "workload lifetime drain deadline expired".to_owned(),
+                error,
                 child_after_termination: stored_status.clone(),
                 cleanup,
             };
         }
+
+        if let Some(signal) = pending_signal.take().or_else(|| signal_source.take()) {
+            let cleanup = terminate_and_cleanup(
+                &mut child,
+                &mut stored_status,
+                root_pid,
+                &mut known,
+                signal,
+                policy.signal_grace,
+                context.supervision_deadline(started),
+            );
+            break RunOutcome::Interrupted {
+                signal: Interruption { signal },
+                child_after_termination: stored_status.clone(),
+                cleanup,
+            };
+        }
+
+        if let Some(status) = completion {
+            let cleanup = if policy.lifetime == Lifetime::Workload {
+                CleanupSummary {
+                    direct_child_reaped: true,
+                    workload_empty: Some(true),
+                    ..CleanupSummary::default()
+                }
+            } else {
+                cleanup_after_direct_exit(
+                    &mut child,
+                    &mut stored_status,
+                    root_pid,
+                    &mut known,
+                    context.supervision_deadline(started),
+                )
+            };
+            break RunOutcome::Exited {
+                child: status,
+                peak: policy.memory.map(|_| ByteSize::from_bytes(peak)),
+                cleanup,
+            };
+        }
+
         if let Some(watcher) = &exit_watcher {
             if let Err(error) = watcher.wait(policy.poll_interval) {
                 let cleanup = terminate_and_cleanup(
@@ -442,6 +517,7 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
                     &mut known,
                     libc::SIGKILL,
                     Duration::ZERO,
+                    context.supervision_deadline(started),
                 );
                 break RunOutcome::MonitorFailed {
                     error: format!("kqueue wait failed: {error}"),
@@ -450,11 +526,13 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
                 };
             }
         } else {
-            thread::sleep(policy.poll_interval);
+            pending_signal = signal_source.wait(policy.poll_interval).ok().flatten();
         }
     };
 
-    if let Err(error) = guardian.disarm() {
+    let mut helpers_reaped = true;
+    if let Err(error) = guardian.disarm(context.clamp_deadline(started, CLEANUP_DEADLINE)) {
+        helpers_reaped = false;
         outcome.cleanup_mut().errors.push(CleanupErrorRecord {
             operation: "guardian-disarm".to_owned(),
             message: error.to_string(),
@@ -468,14 +546,33 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
     })?;
     let mut backend = info();
     backend.metric = metric_name(policy.metric);
+    let cleanup = outcome.cleanup();
+    let cleanup_facts = BackendCleanupFacts {
+        direct_child_reaped: cleanup.direct_child_reaped,
+        workload_empty: cleanup.workload_empty,
+        helpers_reaped,
+        containment_removed: false,
+        containment_incapable_of_live_members: cleanup.workload_empty == Some(true),
+        errors: cleanup
+            .errors
+            .iter()
+            .map(|error| format!("{}: {}", error.operation, error.message))
+            .collect(),
+    };
     Ok(Execution {
         outcome,
         backend,
         child_pid,
         duration: started.elapsed(),
+        authorization_offset: Some(authorized.saturating_duration_since(started)),
+        cleanup_facts,
     })
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the launch layer preserves one categorized Error representation through execution"
+)]
 fn spawn_contained(command: &CommandSpec) -> Result<Child, Error> {
     let mut builder = Command::new(command.program());
     builder.args(command.arguments()).process_group(0);
@@ -487,7 +584,12 @@ fn spawn_contained(command: &CommandSpec) -> Result<Child, Error> {
         } else {
             "MCSPAWN-FAILED"
         };
-        Error::new(
+        let failure = match code {
+            "MCSPAWN-NOT-FOUND" => Some(InitialSpawnFailure::NotFound),
+            "MCSPAWN-NOT-EXECUTABLE" => Some(InitialSpawnFailure::NotExecutable),
+            _ => None,
+        };
+        let mut result = Error::new(
             ErrorCategory::Spawn,
             code,
             format!(
@@ -495,7 +597,11 @@ fn spawn_contained(command: &CommandSpec) -> Result<Child, Error> {
                 command.program().to_string_lossy()
             ),
         )
-        .with_os_error(&error)
+        .with_os_error(&error);
+        result.launch_phase = Some("target-spawn-failed");
+        failure.map_or(result.clone(), |failure| {
+            result.with_initial_spawn_failure(failure)
+        })
     })
 }
 
@@ -534,6 +640,7 @@ fn terminate_and_cleanup(
     known: &mut HashSet<ProcessIdentity>,
     initial_signal: i32,
     grace: Duration,
+    supervision_deadline: Option<Instant>,
 ) -> CleanupSummary {
     let mut summary = CleanupSummary {
         graceful_attempted: initial_signal != libc::SIGKILL,
@@ -541,32 +648,40 @@ fn terminate_and_cleanup(
         ..CleanupSummary::default()
     };
     signal_workload(root_pid, known, initial_signal, &mut summary);
-    if !grace.is_zero() {
-        let grace_deadline = Instant::now() + grace;
+    if initial_signal != libc::SIGKILL && !grace.is_zero() {
+        let grace_deadline = Instant::now()
+            .checked_add(grace)
+            .unwrap_or_else(Instant::now);
+        let grace_deadline =
+            supervision_deadline.map_or(grace_deadline, |deadline| grace_deadline.min(deadline));
         while Instant::now() < grace_deadline {
             if try_reap(child, stored).ok().flatten().is_some() {
                 break;
             }
-            thread::sleep(Duration::from_millis(10));
+            bounded_pause(
+                Duration::from_millis(10)
+                    .min(grace_deadline.saturating_duration_since(Instant::now())),
+            );
         }
+    }
+    if initial_signal != libc::SIGKILL {
         summary.force_attempted = true;
         signal_workload(root_pid, known, libc::SIGKILL, &mut summary);
     }
 
-    let deadline = Instant::now() + CLEANUP_DEADLINE;
+    let deadline = Instant::now()
+        .checked_add(CLEANUP_DEADLINE)
+        .unwrap_or_else(Instant::now);
+    let deadline = supervision_deadline.map_or(deadline, |supervision| deadline.min(supervision));
     let mut empty = false;
     while Instant::now() < deadline {
         match discover(root_pid, known) {
             Ok(snapshots) => {
-                let survivors: Vec<_> = snapshots
-                    .into_iter()
-                    .filter(|snapshot| snapshot.identity.pid != root_pid)
-                    .collect();
-                if survivors.is_empty() {
+                if snapshots.is_empty() {
                     empty = true;
                     break;
                 }
-                for survivor in survivors {
+                for survivor in snapshots {
                     kill_pid(survivor.identity.pid, libc::SIGKILL, &mut summary);
                 }
             }
@@ -578,18 +693,32 @@ fn terminate_and_cleanup(
                 break;
             }
         }
-        thread::sleep(Duration::from_millis(20));
+        bounded_pause(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
     summary.workload_empty = Some(empty);
 
-    if stored.is_none() {
-        match child.wait() {
-            Ok(status) => *stored = Some(termination_from_status(status)),
-            Err(error) => summary.errors.push(CleanupErrorRecord {
-                operation: "reap-direct-child".to_owned(),
-                message: error.to_string(),
-            }),
+    while stored.is_none() && Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => *stored = Some(termination_from_status(status)),
+            Ok(None) => bounded_pause(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            ),
+            Err(error) => {
+                summary.errors.push(CleanupErrorRecord {
+                    operation: "reap-direct-child".to_owned(),
+                    message: error.to_string(),
+                });
+                break;
+            }
         }
+    }
+    if stored.is_none() {
+        summary.errors.push(CleanupErrorRecord {
+            operation: "reap-direct-child".to_owned(),
+            message: "cleanup deadline expired".to_owned(),
+        });
     }
     summary.direct_child_reaped = stored.is_some();
     summary
@@ -600,6 +729,7 @@ fn cleanup_after_direct_exit(
     stored: &mut Option<ChildTermination>,
     root_pid: i32,
     known: &mut HashSet<ProcessIdentity>,
+    supervision_deadline: Option<Instant>,
 ) -> CleanupSummary {
     match discover(root_pid, known) {
         Ok(snapshots)
@@ -620,6 +750,7 @@ fn cleanup_after_direct_exit(
             known,
             libc::SIGKILL,
             Duration::ZERO,
+            supervision_deadline,
         ),
         Err(error) => {
             let mut summary = terminate_and_cleanup(
@@ -629,6 +760,7 @@ fn cleanup_after_direct_exit(
                 known,
                 libc::SIGKILL,
                 Duration::ZERO,
+                supervision_deadline,
             );
             summary.errors.push(CleanupErrorRecord {
                 operation: "normal-exit-discovery".to_owned(),

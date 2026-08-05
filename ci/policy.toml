@@ -53,15 +53,33 @@ steps = ["Stage GitHub draft and assets", "Finalize GitHub release"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
+variable = "CARGO_HOME"
+source = "target/ci/cargo-publish-home/slot-1"
+steps = ["Publish next crate in slot 1"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
 variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
 source = "${{ steps.crates_auth_1.outputs.token }}"
 steps = ["Publish next crate in slot 1"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
+variable = "CARGO_HOME"
+source = "target/ci/cargo-publish-home/slot-2"
+steps = ["Publish next crate in slot 2"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
 variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
 source = "${{ steps.crates_auth_2.outputs.token }}"
 steps = ["Publish next crate in slot 2"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_HOME"
+source = "target/ci/cargo-publish-home/slot-3"
+steps = ["Publish next crate in slot 3"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"

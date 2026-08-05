@@ -9,7 +9,7 @@ use memcordon_testkit::{assert_stdout_empty, run_with_deadline};
 
 fn require_backend() {
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
-        .args(["probe", "--json"])
+        .args(["doctor", "--json"])
         .output()
         .expect("probe should run");
     let value: serde_json::Value =
@@ -71,15 +71,13 @@ fn short_child_stress(iteration_key: &str) {
         };
         let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
         command.args([
-            "run",
             "--enforcement",
             if cfg!(target_os = "macos") {
                 "watchdog"
             } else {
                 "hard"
             },
-            "--memory",
-            "8GiB",
+            "+8GiB",
             "--",
             env!("CARGO_BIN_EXE_memcordon-test-fixture"),
             "exit",
@@ -93,9 +91,7 @@ fn short_child_stress(iteration_key: &str) {
     }
     let mut tree = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     tree.args([
-        "run",
-        "--memory",
-        "96MiB",
+        "+96MiB",
         "--",
         env!("CARGO_BIN_EXE_memcordon-test-fixture"),
         "spawn-tree",
@@ -113,9 +109,7 @@ fn short_child_stress(iteration_key: &str) {
 
     let mut burst = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     burst.args([
-        "run",
-        "--memory",
-        "256MiB",
+        "+256MiB",
         "--",
         env!("CARGO_BIN_EXE_memcordon-test-fixture"),
         "burst",

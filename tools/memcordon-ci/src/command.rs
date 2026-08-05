@@ -11,9 +11,15 @@ use crate::{CiError, Result};
 pub struct CommandSpec {
     program: PathBuf,
     arguments: Vec<OsString>,
-    environment: Vec<(OsString, OsString)>,
+    credential_policy: CredentialPolicy,
     current_dir: PathBuf,
     deadline: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CredentialPolicy {
+    RemoveInherited,
+    InheritWorkflow,
 }
 
 impl CommandSpec {
@@ -21,7 +27,7 @@ impl CommandSpec {
         Self {
             program: program.into(),
             arguments: Vec::new(),
-            environment: Vec::new(),
+            credential_policy: CredentialPolicy::RemoveInherited,
             current_dir: current_dir.to_path_buf(),
             deadline,
         }
@@ -41,12 +47,8 @@ impl CommandSpec {
         self
     }
 
-    pub fn environment_variable(
-        mut self,
-        name: impl Into<OsString>,
-        value: impl Into<OsString>,
-    ) -> Self {
-        self.environment.push((name.into(), value.into()));
+    pub fn inherit_workflow_registry_credentials(mut self) -> Self {
+        self.credential_policy = CredentialPolicy::InheritWorkflow;
         self
     }
 
@@ -57,12 +59,12 @@ impl CommandSpec {
         }
         eprintln!("ci subprocess deadline: {:?}", self.deadline);
         let mut command = Command::new(&self.program);
-        command
-            .args(&self.arguments)
-            .env_remove("CARGO_REGISTRY_TOKEN")
-            .env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN")
-            .envs(self.environment.iter().map(|(name, value)| (name, value)))
-            .current_dir(&self.current_dir);
+        command.args(&self.arguments).current_dir(&self.current_dir);
+        if self.credential_policy == CredentialPolicy::RemoveInherited {
+            command
+                .env_remove("CARGO_REGISTRY_TOKEN")
+                .env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
+        }
         let output = run_with_deadline(&mut command, self.deadline)?;
         if output.status.success() {
             if !output.stdout.is_empty() {

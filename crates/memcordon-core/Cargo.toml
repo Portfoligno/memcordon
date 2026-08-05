@@ -11,10 +11,23 @@ keywords = ["memory", "process", "containment", "limits"]
 categories = ["development-tools"]
 publish = ["crates-io"]
 
+[features]
+test-support = []
+
 [dependencies]
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "restart"
+required-features = ["test-support"]
+
+[[test]]
+name = "restart_supervision"
+required-features = ["test-support"]

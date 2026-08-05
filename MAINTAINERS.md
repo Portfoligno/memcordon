@@ -17,10 +17,23 @@ The workspace separates platform-neutral contracts from native execution:
 - `tools/memcordon-ci` owns repository policy, certification, and release checks.
 
 Every supported launch path establishes containment before allowing target code
-to run. Linux assigns a gated launcher to a cgroup; Windows creates the target
-suspended and assigns it to a Job Object; macOS establishes a process group
-before `exec`. The supervisor retains the direct-child handle until it has been
-reaped. Process-table presence is never the authority for direct-child liveness.
+to run. Linux starts an installed MemCordon CLI as a process-group leader and
+uses its binary-private launcher mode. The supervisor assigns and verifies the
+launcher in the cgroup, validates a versioned READY record, starts a crash
+guardian, and only then releases the launcher to execute the typed target.
+Windows creates the target suspended and assigns it to a Job Object; macOS
+establishes a process group before execution. The supervisor retains the
+direct-child handle until it has been reaped. Process-table presence is never
+the authority for direct-child liveness.
+
+The launcher and guardian routes are binary-private and absent from public help
+and the Rust facade. Direct CLI execution resolves its current executable;
+Linux `Limiter::run` instead requires an explicit absolute path to an installed
+MemCordon CLI, which must remain available for the run. Versioned native READY
+and exec-status records validate compatible launcher state and preserve
+target-exec errors; a separate inherited descriptor capability carries the
+one-byte release record. Protocol descriptors close on target exec, and no
+custom environment variable reaches target code.
 
 Changes to public behavior must update the owning source, generated help or API
 documentation, the contract reference, and any affected README recipe together.

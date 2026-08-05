@@ -38,6 +38,23 @@ mod unix {
             let signal = LAST_SIGNAL.swap(0, Ordering::SeqCst);
             (signal != 0).then_some(signal)
         }
+
+        pub fn wait(&self, duration: std::time::Duration) -> io::Result<Option<i32>> {
+            if let Some(signal) = self.take() {
+                return Ok(Some(signal));
+            }
+            let timeout = duration.as_millis().min(i32::MAX as u128) as i32;
+            // SAFETY: a null pollfd pointer with zero descriptors is valid; signals interrupt the
+            // bounded kernel wait without requiring shell or environment coordination.
+            let result = unsafe { libc::poll(std::ptr::null_mut(), 0, timeout) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            Ok(self.take())
+        }
     }
 
     impl Drop for SignalSource {

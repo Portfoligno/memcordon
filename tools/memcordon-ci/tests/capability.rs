@@ -17,7 +17,10 @@ fn backend_selection_distinguishes_available_and_unavailable_probes() {
     let available = json!({
         "selected": {
             "name": "macos-watchdog",
-            "hard_limit": false
+            "memory": {
+                "supported": true,
+                "class": "watchdog"
+            }
         }
     });
     assert_eq!(
@@ -46,4 +49,57 @@ fn exact_test_success_requires_one_executed_test() {
     ] {
         assert!(capability::require_single_test_success(output, "example").is_err());
     }
+}
+
+#[test]
+fn certification_consumes_typed_doctor_schema() {
+    let mut probe = json!({
+        "schema_version": 2,
+        "tool": { "name": "memcordon", "version": "0.3.0" },
+        "host": { "os": "linux", "architecture": "x86_64" },
+        "selected": backend_capability("linux-cgroup-v2", true, "hard"),
+        "available": [backend_capability("linux-cgroup-v2", true, "hard")],
+        "unavailable": [],
+        "requirement": { "kind": null, "met": true, "reason": null }
+    });
+    assert!(capability::require_certified_hard_backend(&probe, "linux-cgroup-v2").is_ok());
+
+    probe["selected"]["memory"]["supported"] = json!(false);
+    assert!(capability::require_certified_hard_backend(&probe, "linux-cgroup-v2").is_err());
+
+    probe["selected"] = backend_capability("linux-cgroup-v2", true, "watchdog");
+    assert!(capability::require_certified_hard_backend(&probe, "linux-cgroup-v2").is_err());
+
+    probe["selected"] = backend_capability("unsupported-backend", true, "hard");
+    assert!(capability::require_certified_hard_backend(&probe, "linux-cgroup-v2").is_err());
+
+    probe["selected"] = backend_capability("linux-cgroup-v2", true, "hard");
+    probe["selected"]["containment"]["supported"] = json!(false);
+    assert!(capability::require_certified_hard_backend(&probe, "linux-cgroup-v2").is_err());
+
+    probe["selected"] = backend_capability("linux-cgroup-v2", true, "hard");
+    probe["schema_version"] = json!(1);
+    assert!(capability::require_certified_hard_backend(&probe, "linux-cgroup-v2").is_err());
+}
+
+fn backend_capability(name: &str, memory_supported: bool, memory_class: &str) -> serde_json::Value {
+    json!({
+        "name": name,
+        "containment": { "supported": true, "reason": null },
+        "memory": {
+            "supported": memory_supported,
+            "class": memory_class,
+            "metric": "linux-cgroup-memory",
+            "reason": null
+        },
+        "deadline": { "supported": true, "reason": null },
+        "restart": { "supported": true, "reason": null },
+        "deadline_scopes": ["attempt", "supervision"],
+        "deadline_origin": "installed-cli-release-byte",
+        "restart_conditions": ["memory-limit", "deadline"],
+        "persistent_restart_state": false,
+        "startup_containment": "gated launcher assigned before exec",
+        "restart_cleanup_condition": "workload empty",
+        "limitations": []
+    })
 }

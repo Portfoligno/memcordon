@@ -58,6 +58,12 @@ passed on an argument, written by `cargo login`, persisted, cached, uploaded, or
 logged. Any missing OIDC capability, identity mismatch, or failed publication
 blocks finalization.
 
+Each publication step also defines its own exact, isolated `CARGO_HOME`; Rust
+release tooling neither defines nor reinjects it or the registry capability.
+The non-secret credential-provider configuration is supplied to Cargo as a
+typed `--config PATH` argument. Publication homes and credentials are never
+cached.
+
 The retired first-release singular Cargo registry-token credential is revoked,
 and no repository, organization, or GitHub Environment secret may replace
 trusted publishing. Do not configure or pass the retired variable

@@ -7,7 +7,7 @@ use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 
-use memcordon_core::ByteSize;
+use memcordon_core::{ByteSize, NativeArgument};
 
 fn fail(message: impl AsRef<str>) -> ! {
     eprintln!("memcordon-test-fixture: {}", message.as_ref());
@@ -46,9 +46,9 @@ fn assert_native_containment(mut args: impl Iterator<Item = OsString>) {
     let mut memory = None;
     while let Some(argument) = args.next() {
         match argument.to_str() {
-            Some("--memory") => {
+            Some("--limit") => {
                 memory = Some(
-                    take_value(&mut args, "--memory")
+                    take_value(&mut args, "--limit")
                         .to_str()
                         .and_then(|text| ByteSize::from_str(text).ok())
                         .unwrap_or_else(|| fail("invalid containment memory size"))
@@ -59,7 +59,7 @@ fn assert_native_containment(mut args: impl Iterator<Item = OsString>) {
         }
     }
     memcordon_platform::test_support::assert_native_containment(
-        memory.unwrap_or_else(|| fail("assert-native-containment requires --memory")),
+        memory.unwrap_or_else(|| fail("assert-native-containment requires --limit")),
     )
     .unwrap_or_else(|error| fail(error.to_string()));
 }
@@ -73,6 +73,60 @@ fn write_pid(path: Option<&Path>) {
         fs::write(path, bytes)
             .unwrap_or_else(|error| fail(format!("cannot write PID file: {error}")));
     }
+}
+
+fn record_argv(mut args: impl Iterator<Item = OsString>) {
+    let output = PathBuf::from(take_value(&mut args, "record-argv output path"));
+    let arguments: Vec<NativeArgument> = args
+        .map(|argument| NativeArgument::from_os(&argument))
+        .collect();
+    let mut bytes = serde_json::to_vec_pretty(&arguments)
+        .unwrap_or_else(|error| fail(format!("cannot serialize argv: {error}")));
+    bytes.push(b'\n');
+    fs::write(output, bytes).unwrap_or_else(|error| fail(format!("cannot write argv: {error}")));
+}
+
+fn assert_no_memcordon_environment(args: impl Iterator<Item = OsString>) {
+    if args.count() != 0 {
+        fail("assert-no-memcordon-environment accepts no arguments");
+    }
+    if let Some((name, _)) = std::env::vars_os().find(|(name, _)| {
+        name.to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("MEMCORDON_")
+    }) {
+        fail(format!(
+            "target inherited unexpected MemCordon environment key {}",
+            name.to_string_lossy()
+        ));
+    }
+}
+
+fn gate_marker(mut args: impl Iterator<Item = OsString>) {
+    let path = PathBuf::from(take_value(&mut args, "gate-marker path"));
+    if args.next().is_some() {
+        fail("gate-marker accepts exactly one path");
+    }
+    fs::write(path, b"target-executed\n")
+        .unwrap_or_else(|error| fail(format!("cannot write gate marker: {error}")));
+}
+
+fn gate_failure(mut args: impl Iterator<Item = OsString>) {
+    let mut phase = None;
+    let mut marker = None;
+    while let Some(argument) = args.next() {
+        match argument.to_str() {
+            Some("--phase") => phase = Some(take_value(&mut args, "--phase")),
+            Some("--marker") => marker = Some(PathBuf::from(take_value(&mut args, "--marker"))),
+            _ => fail("unexpected gate-failure argument"),
+        }
+    }
+    if phase.is_none() {
+        fail("gate-failure requires --phase");
+    }
+    let marker = marker.unwrap_or_else(|| fail("gate-failure requires --marker"));
+    fs::write(marker, b"target-executed\n")
+        .unwrap_or_else(|error| fail(format!("cannot write gate-failure marker: {error}")));
 }
 
 fn touch_allocation(bytes: u64) -> Vec<u8> {
@@ -391,6 +445,22 @@ fn main() {
         }
         "assert-native-containment" => {
             assert_native_containment(args);
+            0
+        }
+        "record-argv" => {
+            record_argv(args);
+            0
+        }
+        "assert-no-memcordon-environment" => {
+            assert_no_memcordon_environment(args);
+            0
+        }
+        "gate-marker" => {
+            gate_marker(args);
+            0
+        }
+        "gate-failure" => {
+            gate_failure(args);
             0
         }
         "attempt-job-breakaway" => {
