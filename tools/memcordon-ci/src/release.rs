@@ -31,20 +31,40 @@ const GITHUB_RELEASES_PER_PAGE: usize = 100;
 const CRATES_IO_TOKEN_VARIABLE: &str = "CARGO_REGISTRIES_CRATES_IO_TOKEN";
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CredentialRequest {
     v: u32,
-    kind: String,
-    operation: String,
-    name: String,
-    vers: String,
-    cksum: String,
     registry: CredentialRegistry,
+    #[serde(default)]
     args: Vec<String>,
+    #[serde(flatten)]
+    action: CredentialAction,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum CredentialAction {
+    Get {
+        #[serde(flatten)]
+        operation: CredentialOperation,
+    },
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "kebab-case")]
+enum CredentialOperation {
+    Read,
+    Publish {
+        name: String,
+        vers: String,
+        cksum: String,
+    },
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct CredentialRegistry {
     #[serde(rename = "index-url")]
     index_url: String,
@@ -2609,34 +2629,62 @@ fn credential_request_error(message: impl Into<String>) -> serde_json::Value {
     })
 }
 
+fn credential_operation_unsupported() -> serde_json::Value {
+    serde_json::json!({
+        "Err": {
+            "kind": "operation-not-supported",
+        }
+    })
+}
+
 fn validate_credential_request(root: &Path, request: &CredentialRequest) -> Result<CrateRecord> {
     if request.v != 1
-        || request.kind != "get"
-        || request.operation != "publish"
         || request.registry.name.as_deref() != Some("crates-io")
         || !matches!(
             request.registry.index_url.as_str(),
             "https://github.com/rust-lang/crates.io-index" | "sparse+https://index.crates.io/"
         )
-        || request.cksum.is_empty()
-        || request.args.len() != 3
     {
         return Err(failure("Cargo credential request identity is invalid"));
     }
+    let [requested_name, requested_version, requested_archive_sha256] = request.args.as_slice()
+    else {
+        return Err(failure("Cargo credential request identity is invalid"));
+    };
     let (_, manifest, _) = bundle_manifest(root)?;
     let record = manifest
         .crates
         .into_iter()
-        .find(|record| record.name == request.name && record.version == request.vers)
+        .find(|record| {
+            record.name == requested_name.as_str() && record.version == requested_version.as_str()
+        })
         .ok_or_else(|| failure("Cargo credential request is absent from the release manifest"))?;
-    if request.args.first().map(String::as_str) != Some(record.name.as_str())
-        || request.args.get(1).map(String::as_str) != Some(record.version.as_str())
-        || request.args.get(2).map(String::as_str) != Some(record.archive_sha256.as_str())
-        || request.cksum != record.archive_sha256
-    {
+    if requested_archive_sha256.as_str() != record.archive_sha256 {
         return Err(failure(
             "Cargo credential request differs from the selected release artifact",
         ));
+    }
+    match &request.action {
+        CredentialAction::Get {
+            operation: CredentialOperation::Read,
+        } => {}
+        CredentialAction::Get {
+            operation: CredentialOperation::Publish { name, vers, cksum },
+        } if name == &record.name && vers == &record.version && cksum == &record.archive_sha256 => {
+        }
+        CredentialAction::Get {
+            operation: CredentialOperation::Publish { .. },
+        } => {
+            return Err(failure(
+                "Cargo credential request differs from the selected release artifact",
+            ));
+        }
+        CredentialAction::Get {
+            operation: CredentialOperation::Unsupported,
+        }
+        | CredentialAction::Unsupported => {
+            return Err(failure("Cargo credential operation is unsupported"));
+        }
     }
     Ok(record)
 }
@@ -2647,6 +2695,16 @@ fn credential_response(
     token: Option<&str>,
 ) -> serde_json::Value {
     match request {
+        Ok(request)
+            if matches!(
+                &request.action,
+                CredentialAction::Get {
+                    operation: CredentialOperation::Unsupported
+                } | CredentialAction::Unsupported
+            ) =>
+        {
+            credential_operation_unsupported()
+        }
         Ok(request) => match validate_credential_request(root, &request) {
             Ok(_) => match token {
                 Some(token) if !token.is_empty() => serde_json::json!({
@@ -2665,26 +2723,37 @@ fn credential_response(
     }
 }
 
-pub fn cargo_credential_provider(root: &Path) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut output = stdout.lock();
+fn cargo_credential_provider_io(
+    root: &Path,
+    input: impl BufRead,
+    mut output: impl Write,
+    token: Option<&str>,
+) -> Result<()> {
     serde_json::to_writer(&mut output, &serde_json::json!({ "v": [1] }))?;
     writeln!(output)?;
     output.flush()?;
 
-    let stdin = std::io::stdin();
-    let mut input = BufReader::new(stdin.lock());
+    let mut input = input;
     let mut line = String::new();
     if input.read_line(&mut line)? == 0 {
         return Err(failure("Cargo credential provider received no request"));
     }
     let request = serde_json::from_str::<CredentialRequest>(line.trim_end());
-    let token = std::env::var(CRATES_IO_TOKEN_VARIABLE).ok();
-    let response = credential_response(root, request, token.as_deref());
+    let response = credential_response(root, request, token);
     serde_json::to_writer(&mut output, &response)?;
     writeln!(output)?;
     output.flush()?;
     Ok(())
+}
+
+pub fn cargo_credential_provider(root: &Path) -> Result<()> {
+    let token = std::env::var(CRATES_IO_TOKEN_VARIABLE).ok();
+    cargo_credential_provider_io(
+        root,
+        BufReader::new(std::io::stdin().lock()),
+        std::io::stdout().lock(),
+        token.as_deref(),
+    )
 }
 
 fn reconcile_publication_result(
@@ -3055,7 +3124,7 @@ pub fn run(root: &Path, phase: ReleasePhase) -> Result<()> {
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Cursor};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
 
@@ -3381,7 +3450,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_request_is_bound_to_the_release_artifact() {
+    fn credential_provider_accepts_bound_read_and_publish_requests() {
         let (temporary, release) = release_fixture();
         let manifest_path = temporary
             .path()
@@ -3400,37 +3469,123 @@ mod tests {
         };
         manifest.crates.push(record.clone());
         write_json(&manifest_path, &manifest).expect("manifest should update");
-        let request = CredentialRequest {
-            v: 1,
-            kind: "get".to_owned(),
-            operation: "publish".to_owned(),
-            name: record.name.clone(),
-            vers: record.version.clone(),
-            cksum: record.archive_sha256.clone(),
-            registry: CredentialRegistry {
-                index_url: "sparse+https://index.crates.io/".to_owned(),
-                name: Some("crates-io".to_owned()),
-                _headers: Vec::new(),
+        let arguments = serde_json::json!([
+            record.name.clone(),
+            record.version.clone(),
+            record.archive_sha256.clone(),
+        ]);
+        let read_message = serde_json::json!({
+            "v": 1,
+            "registry": {
+                "index-url": "sparse+https://index.crates.io/",
+                "name": "crates-io",
+                "headers": ["WWW-Authenticate: Cargo login_url=https://crates.io/me"],
             },
-            args: vec![
-                record.name.clone(),
-                record.version.clone(),
-                record.archive_sha256.clone(),
-            ],
-        };
-        validate_credential_request(temporary.path(), &request)
+            "kind": "get",
+            "operation": "read",
+            "args": arguments.clone(),
+        });
+        let read_request: CredentialRequest = serde_json::from_value(read_message.clone())
+            .expect("Cargo read request without publish fields should parse");
+        validate_credential_request(temporary.path(), &read_request)
+            .expect("bound read request should pass");
+
+        let mut read_output = Vec::new();
+        let mut read_wire = serde_json::to_vec(&read_message).expect("read request should encode");
+        read_wire.push(b'\n');
+        cargo_credential_provider_io(
+            temporary.path(),
+            Cursor::new(read_wire),
+            &mut read_output,
+            Some("opaque-test-capability"),
+        )
+        .expect("Cargo read transcript should complete");
+        let read_lines: Vec<serde_json::Value> = read_output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("provider output should be JSON"))
+            .collect();
+        assert_eq!(read_lines[0], serde_json::json!({ "v": [1] }));
+        assert_eq!(read_lines[1]["Ok"]["kind"], "get");
+        assert_eq!(read_lines[1]["Ok"]["cache"], "never");
+        assert_eq!(read_lines[1]["Ok"]["operation_independent"], false);
+        assert_eq!(read_lines[1]["Ok"]["token"], "opaque-test-capability");
+
+        let publish_message = serde_json::json!({
+            "v": 1,
+            "registry": {
+                "index-url": "sparse+https://index.crates.io/",
+                "name": "crates-io",
+            },
+            "kind": "get",
+            "operation": "publish",
+            "name": record.name.clone(),
+            "vers": record.version.clone(),
+            "cksum": record.archive_sha256.clone(),
+            "args": arguments.clone(),
+        });
+        let publish_request: CredentialRequest =
+            serde_json::from_value(publish_message).expect("Cargo publish request should parse");
+        validate_credential_request(temporary.path(), &publish_request)
             .expect("exact publish request should pass");
         let accepted = credential_response(
             temporary.path(),
-            Ok(request.clone()),
+            Ok(publish_request.clone()),
             Some("opaque-test-capability"),
         );
         assert_eq!(accepted["Ok"]["kind"], "get");
         assert_eq!(accepted["Ok"]["cache"], "never");
         assert_eq!(accepted["Ok"]["operation_independent"], false);
         assert_eq!(accepted["Ok"]["token"], "opaque-test-capability");
-        let missing = credential_response(temporary.path(), Ok(request.clone()), None);
+        let missing = credential_response(temporary.path(), Ok(publish_request.clone()), None);
         assert_eq!(missing["Err"]["kind"], "other");
+
+        let mut missing_args = read_message;
+        missing_args
+            .as_object_mut()
+            .expect("request should be an object")
+            .remove("args");
+        let missing_args = serde_json::from_value::<CredentialRequest>(missing_args)
+            .expect("Cargo request may omit empty args");
+        let missing_args = credential_response(
+            temporary.path(),
+            Ok(missing_args),
+            Some("opaque-test-capability"),
+        );
+        assert_eq!(missing_args["Err"]["kind"], "other");
+        assert_eq!(
+            missing_args["Err"]["message"],
+            "Cargo credential request identity is invalid"
+        );
+
+        let unsupported: CredentialRequest = serde_json::from_value(serde_json::json!({
+            "v": 1,
+            "registry": {
+                "index-url": "sparse+https://index.crates.io/",
+                "name": "crates-io",
+            },
+            "kind": "get",
+            "operation": "yank",
+            "args": arguments,
+        }))
+        .expect("unsupported Cargo operation should still parse");
+        let unsupported = credential_response(
+            temporary.path(),
+            Ok(unsupported),
+            Some("opaque-test-capability"),
+        );
+        assert_eq!(unsupported["Err"]["kind"], "operation-not-supported");
+
+        let malformed = credential_response(
+            temporary.path(),
+            serde_json::from_str::<CredentialRequest>("not JSON"),
+            Some("opaque-test-capability"),
+        );
+        assert_eq!(malformed["Err"]["kind"], "other");
+        assert_eq!(
+            malformed["Err"]["message"],
+            "Cargo credential request is malformed"
+        );
 
         let cargo_config = cargo_publish_config(temporary.path(), &record)
             .expect("isolated Cargo configuration should be prepared");
@@ -3446,8 +3601,14 @@ mod tests {
         assert_eq!(provider[2].as_str(), Some(record.version.as_str()));
         assert_eq!(provider[3].as_str(), Some(record.archive_sha256.as_str()));
 
-        let mut wrong_checksum = request;
-        wrong_checksum.cksum = "00".repeat(32);
+        let mut wrong_checksum = publish_request;
+        let CredentialAction::Get {
+            operation: CredentialOperation::Publish { cksum, .. },
+        } = &mut wrong_checksum.action
+        else {
+            panic!("publish request should retain its operation");
+        };
+        *cksum = "00".repeat(32);
         assert!(validate_credential_request(temporary.path(), &wrong_checksum).is_err());
     }
 
