@@ -37,7 +37,7 @@ Policy options (value; default):
   --wait-for command|workload            Return after the command or workload; command
   --metric native|physical-footprint|rss|virtual
                                          Memory metric; native
-  --poll-interval DURATION               Watchdog sampling interval, at least 10ms; 50ms
+  --poll-interval DURATION               Watchdog sampling interval; 50ms
   --signal-grace DURATION                Grace after external interruption; 2s
   --limit-grace DURATION                 Grace after a configured limit; 0s
   --swap SIZE|unlimited|host             Swap policy; 0B
@@ -66,9 +66,7 @@ Rules:
   then COMMAND. Use -- before a command beginning with + or -.
   --enforcement, --metric, --poll-interval, and --swap need +MEMORY;
   --deadline-scope needs +TIME; --limit-grace needs either budget. Restart tuning
-  needs --restart or --restart-on. Backoff base, asymptote, and half-life must be >=1ms.
-  Set circuit threshold and cooldown together. Circuit cooldown may be zero;
-  circuit half-life must be >=1ms, and threshold must be a positive finite number.
+  needs --restart or --restart-on. Set circuit threshold and cooldown together.
   --summary conflicts with --quiet. --report needs an existing parent and cannot
   use stdout. Command arguments pass unchanged.
 
@@ -101,7 +99,7 @@ Policy options (value; default):
   --wait-for command|workload            Return after the command or workload; command
   --metric native|physical-footprint|rss|virtual
                                          Memory metric; native
-  --poll-interval DURATION               Sampling interval, at least 10ms; 50ms
+  --poll-interval DURATION               Sampling interval; 50ms
   --signal-grace DURATION                External-interruption grace; 2s
   --limit-grace DURATION                 Configured-limit grace; 0s
   --swap SIZE|unlimited|host             Swap policy; 0B
@@ -124,9 +122,7 @@ Rules:
   Options come first, then up to two budgets (one each, either order). COMMAND and
   -- are invalid. --enforcement, --metric, --poll-interval, and --swap need +MEMORY;
   --deadline-scope needs +TIME; --limit-grace needs either budget. Restart tuning
-  needs --restart or --restart-on. Backoff base, asymptote, and half-life must be >=1ms.
-  Set circuit threshold and cooldown together. Circuit cooldown may be zero;
-  circuit half-life must be >=1ms, and threshold must be a positive finite number.
+  needs --restart or --restart-on. Set circuit threshold and cooldown together.
 
 Reference:
   https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#;
