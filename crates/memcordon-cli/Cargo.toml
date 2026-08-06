@@ -27,8 +27,8 @@ required-features = ["test-fixtures"]
 [dependencies]
 clap.workspace = true
 libc.workspace = true
-memcordon-core = { path = "../memcordon-core", version = "=0.3.4" }
-memcordon-platform = { path = "../memcordon-platform", version = "=0.3.4" }
+memcordon-core = { path = "../memcordon-core", version = "=0.3.5-dev" }
+memcordon-platform = { path = "../memcordon-platform", version = "=0.3.5-dev" }
 serde.workspace = true
 serde_json.workspace = true
 
