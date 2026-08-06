@@ -113,8 +113,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "logistic_recurrence"
-path = "fuzz_targets/logistic_recurrence.rs"
+name = "half_life_logistic_recurrence"
+path = "fuzz_targets/half_life_logistic_recurrence.rs"
 test = false
 doc = false
 bench = false
@@ -134,8 +134,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "schema_three"
-path = "fuzz_targets/schema_three.rs"
+name = "schema_four"
+path = "fuzz_targets/schema_four.rs"
 test = false
 doc = false
 bench = false

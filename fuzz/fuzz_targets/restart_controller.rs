@@ -6,7 +6,7 @@ fuzz_target!(|data: &[u8]| {
     use std::time::Duration;
 
     use memcordon_core::{
-        LogisticBackoffPolicy, RestartAction, RestartCondition, RestartConditions,
+        HalfLifeLogisticBackoffPolicy, RestartAction, RestartCondition, RestartConditions,
         RestartCoordinator, RestartDecisionRecord, RestartLimit, RestartSafetyProof,
         RestartSettings, WaitCompletion,
     };
@@ -17,7 +17,7 @@ fuzz_target!(|data: &[u8]| {
             RestartConditions::BOTH,
             Vec::new(),
             RestartLimit::Unlimited,
-            LogisticBackoffPolicy::default(),
+            HalfLifeLogisticBackoffPolicy::default(),
             None,
         )
         .expect("fixed settings are valid");

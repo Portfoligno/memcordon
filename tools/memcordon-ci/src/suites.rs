@@ -222,7 +222,7 @@ fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
         "cleanup_json",
         "duration",
         "invocation_router",
-        "logistic_recurrence",
+        "half_life_logistic_recurrence",
         "limit_token",
         "native_argument",
         "outcome_json",
@@ -230,7 +230,7 @@ fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
         "policy_parser",
         "report_json",
         "restart_controller",
-        "schema_three",
+        "schema_four",
         "state_machine",
         "workflow_parser",
     ];

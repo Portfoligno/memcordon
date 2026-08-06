@@ -5,9 +5,9 @@ use std::time::Duration;
 use memcordon_core::{
     AttemptHistory, AttemptKind, AttemptPhase, AttemptRecord, BackendCapabilityReport, ByteSize,
     ChildTermination, CleanupSummary, DETAILED_ATTEMPT_CAPACITY, DeadlineEvidence,
-    InitialSpawnFailure, LaunchEvidence, LogisticBackoffPolicy, RestartAction, RestartCoordinator,
-    RestartDecisionRecord, RestartSafetyProof, RestartSettings, RestartSummary, RunOutcome,
-    SupervisionAggregates, SupervisionDeadlineEvidence, SupervisionErrorRecord,
+    HalfLifeLogisticBackoffPolicy, InitialSpawnFailure, LaunchEvidence, RestartAction,
+    RestartCoordinator, RestartDecisionRecord, RestartSafetyProof, RestartSettings, RestartSummary,
+    RunOutcome, SupervisionAggregates, SupervisionDeadlineEvidence, SupervisionErrorRecord,
     SupervisionExecution, SupervisionPhase, SupervisionTerminal, WaitCompletion,
 };
 use memcordon_core::{
@@ -21,7 +21,7 @@ use memcordon_core::{
 };
 
 fn report() -> MemcordonReport {
-    MemcordonReport::schema3(
+    MemcordonReport::schema4(
         ToolReport {
             name: "memcordon".to_owned(),
             version: "test".to_owned(),
@@ -109,7 +109,7 @@ fn atomic_report_replaces_existing_relative_destination_and_ends_in_newline() {
     assert_ne!(bytes.get(bytes.len().saturating_sub(2)), Some(&b'\n'));
     let decoded: MemcordonReport =
         serde_json::from_slice(&bytes).expect("typed schema should read");
-    assert_eq!(decoded.schema_version, 3);
+    assert_eq!(decoded.schema_version, 4);
     assert!(decoded.policy.requested.memory.is_none());
     assert!(decoded.invocation.memory_token.is_none());
 }
@@ -172,7 +172,7 @@ fn circuit_state_is_typed_in_schema_models() {
 }
 
 #[test]
-fn schema_three_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
+fn schema_four_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
     let cases = [
         (Vec::new(), None, None),
         (
@@ -276,11 +276,12 @@ fn schema_three_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
             },
             limit: RestartLimit::Count(std::num::NonZeroU64::new(3).expect("nonzero")),
             backoff: restart_enabled.then_some(BackoffPolicyReport {
-                model: "logistic-odds-v1".to_owned(),
-                initial_ms: 1000,
+                model: "half-life-logistic-v1".to_owned(),
+                base_interval_ms: 1000,
                 multiplier_numerator: 3,
                 multiplier_denominator: 2,
-                maximum_ms: 30000,
+                asymptote_interval_ms: 30000,
+                recovery_half_life_ms: 30000,
                 quantization: "ceil-whole-milliseconds".to_owned(),
             }),
             circuit_breaker: restart_enabled.then_some(CircuitBreakerPolicyReport {
@@ -335,7 +336,7 @@ fn schema_three_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
         );
         if restart_enabled {
             assert_eq!(
-                value["policy"]["requested"]["restart"]["backoff"]["initial_ms"],
+                value["policy"]["requested"]["restart"]["backoff"]["base_interval_ms"],
                 1000
             );
             assert_eq!(
@@ -356,7 +357,7 @@ fn schema_three_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
 }
 
 #[test]
-fn schema_three_rejects_envelope_history_and_budget_contradictions() {
+fn schema_four_rejects_envelope_history_and_budget_contradictions() {
     let mut value = serde_json::to_value(report()).expect("schema JSON");
     value["schema_version"] = serde_json::json!(2);
     assert!(serde_json::from_value::<MemcordonReport>(value).is_err());
@@ -463,11 +464,12 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         },
         limit: RestartLimit::Unlimited,
         backoff: restart_enabled.then_some(BackoffPolicyReport {
-            model: "logistic-odds-v1".to_owned(),
-            initial_ms: 1000,
-            multiplier_numerator: 2,
+            model: "half-life-logistic-v1".to_owned(),
+            base_interval_ms: 250,
+            multiplier_numerator: 4,
             multiplier_denominator: 1,
-            maximum_ms: 30000,
+            asymptote_interval_ms: 900000,
+            recovery_half_life_ms: 900000,
             quantization: "ceil-whole-milliseconds".to_owned(),
         }),
         circuit_breaker: None,
@@ -479,7 +481,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         RestartConditions::NONE
     };
     base.policy.effective.restart.dormant_conditions.clear();
-    MemcordonReport::schema3(
+    MemcordonReport::schema4(
         base.tool,
         base.invocation,
         base.policy,
@@ -487,7 +489,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         Some(execution),
         None,
     )
-    .expect("schema3")
+    .expect("schema4")
 }
 
 fn coordinator() -> RestartCoordinator {
@@ -497,7 +499,7 @@ fn coordinator() -> RestartCoordinator {
             RestartConditions::BOTH,
             Vec::new(),
             RestartLimit::Unlimited,
-            LogisticBackoffPolicy::default(),
+            HalfLifeLogisticBackoffPolicy::default(),
             None,
         )
         .expect("settings"),
@@ -525,8 +527,64 @@ fn schedule_launch(coordinator: &mut RestartCoordinator, record: &mut RestartDec
     ));
 }
 
+fn deadline_report_value(attempts: u64) -> serde_json::Value {
+    assert!(attempts > 0, "deadline report fixture requires an attempt");
+    let mut history = AttemptHistory::default();
+    let mut aggregates = SupervisionAggregates::default();
+    let mut coordinator = coordinator();
+    for number in 1..=attempts {
+        let outcome = RunOutcome::DeadlineExceeded {
+            deadline: DeadlineEvidence::new(
+                10,
+                DeadlineScope::Attempt,
+                "test-origin".to_owned(),
+                number,
+                number,
+                0,
+                0,
+                None,
+                None,
+            )
+            .expect("evidence"),
+            child_after_termination: None,
+            peak: None,
+            cleanup: cleanup(),
+        };
+        history
+            .append(
+                attempt_record(number, Some(outcome.clone()), None),
+                &mut aggregates,
+            )
+            .expect("append");
+        if number < attempts {
+            let mut decision = RestartDecisionRecord::default();
+            schedule_launch(&mut coordinator, &mut decision);
+        }
+    }
+    let terminal = history
+        .recent
+        .back()
+        .and_then(|record| record.outcome.clone())
+        .expect("terminal");
+    let execution = SupervisionExecution::new(
+        BackendCapabilityReport::default(),
+        SupervisionTerminal::AttemptOutcome {
+            attempt_number: attempts,
+            outcome: terminal,
+        },
+        history,
+        aggregates,
+        coordinator.summary().clone(),
+        None,
+        10_000,
+        attempts,
+    )
+    .expect("execution");
+    serde_json::to_value(report_from_execution(execution)).expect("json")
+}
+
 #[test]
-fn schema_three_active_attempt_success_is_exact_and_round_trips() {
+fn schema_four_active_attempt_success_is_exact_and_round_trips() {
     let evidence = DeadlineEvidence::new(
         1_000,
         DeadlineScope::Attempt,
@@ -580,7 +638,7 @@ fn schema_three_active_attempt_success_is_exact_and_round_trips() {
 }
 
 #[test]
-fn schema_three_outside_attempt_deadline_is_terminal_and_round_trips() {
+fn schema_four_outside_attempt_deadline_is_terminal_and_round_trips() {
     let outcome = RunOutcome::LimitExceeded {
         limit: ByteSize::from_bytes(1),
         observed: None,
@@ -657,7 +715,7 @@ fn schema_three_outside_attempt_deadline_is_terminal_and_round_trips() {
 }
 
 #[test]
-fn schema_three_later_helper_error_preserves_prior_attempt() {
+fn schema_four_later_helper_error_preserves_prior_attempt() {
     let first = RunOutcome::LimitExceeded {
         limit: ByteSize::from_bytes(1),
         observed: None,
@@ -719,7 +777,7 @@ fn schema_three_later_helper_error_preserves_prior_attempt() {
 }
 
 #[test]
-fn schema_three_initial_spawn_status_round_trips_typed_provenance() {
+fn schema_four_initial_spawn_status_round_trips_typed_provenance() {
     for (failure, status) in [
         (InitialSpawnFailure::NotExecutable, 126),
         (InitialSpawnFailure::NotFound, 127),
@@ -909,59 +967,8 @@ fn supervision_constructor_rejects_embedded_error_attempt_mismatch() {
 }
 
 #[test]
-fn schema_three_truncates_three_hundred_attempts_but_aggregates_all() {
-    let mut history = AttemptHistory::default();
-    let mut aggregates = SupervisionAggregates::default();
-    let mut coordinator = coordinator();
-    for number in 1..=300 {
-        let outcome = RunOutcome::DeadlineExceeded {
-            deadline: DeadlineEvidence::new(
-                10,
-                DeadlineScope::Attempt,
-                "test-origin".to_owned(),
-                number,
-                number,
-                0,
-                0,
-                None,
-                None,
-            )
-            .expect("evidence"),
-            child_after_termination: None,
-            peak: None,
-            cleanup: cleanup(),
-        };
-        history
-            .append(
-                attempt_record(number, Some(outcome.clone()), None),
-                &mut aggregates,
-            )
-            .expect("append");
-        if number < 300 {
-            let mut decision = RestartDecisionRecord::default();
-            schedule_launch(&mut coordinator, &mut decision);
-        }
-    }
-    let terminal = history
-        .recent
-        .back()
-        .and_then(|record| record.outcome.clone())
-        .expect("terminal");
-    let execution = SupervisionExecution::new(
-        BackendCapabilityReport::default(),
-        SupervisionTerminal::AttemptOutcome {
-            attempt_number: 300,
-            outcome: terminal,
-        },
-        history,
-        aggregates,
-        coordinator.summary().clone(),
-        None,
-        10_000,
-        300,
-    )
-    .expect("execution");
-    let value = serde_json::to_value(report_from_execution(execution)).expect("json");
+fn schema_four_truncates_three_hundred_attempts_but_aggregates_all() {
+    let value = deadline_report_value(300);
     assert_eq!(value["supervision"]["attempt_history"]["retained"], 256);
     assert_eq!(value["supervision"]["attempt_history"]["omitted"], 44);
     assert_eq!(value["supervision"]["aggregate"]["deadlines"], 300);
@@ -982,24 +989,27 @@ fn schema_three_truncates_three_hundred_attempts_but_aggregates_all() {
     oversized["supervision"]["attempt_records_created"] = serde_json::json!(301);
     assert!(serde_json::from_value::<MemcordonReport>(oversized).is_err());
 
+    let value = deadline_report_value(3);
+    let _: MemcordonReport = serde_json::from_value(value.clone()).expect("compact valid report");
+
     let mut missing_first = value.clone();
     missing_first["attempts"][0]["number"] = serde_json::json!(45);
     assert!(serde_json::from_value::<MemcordonReport>(missing_first).is_err());
 
     let mut gapped_tail = value.clone();
-    gapped_tail["attempts"][100]["number"] = serde_json::json!(999);
+    gapped_tail["attempts"][1]["number"] = serde_json::json!(999);
     assert!(serde_json::from_value::<MemcordonReport>(gapped_tail).is_err());
 
     let mut stale_tail = value.clone();
-    stale_tail["attempts"][255]["number"] = serde_json::json!(299);
+    stale_tail["attempts"][2]["number"] = serde_json::json!(2);
     assert!(serde_json::from_value::<MemcordonReport>(stale_tail).is_err());
 
     let mut terminal_mismatch = value.clone();
-    terminal_mismatch["supervision"]["terminal"]["attempt_number"] = serde_json::json!(299);
+    terminal_mismatch["supervision"]["terminal"]["attempt_number"] = serde_json::json!(2);
     assert!(serde_json::from_value::<MemcordonReport>(terminal_mismatch).is_err());
 
     let mut aggregate_mismatch = value;
-    aggregate_mismatch["supervision"]["aggregate"]["deadlines"] = serde_json::json!(301);
+    aggregate_mismatch["supervision"]["aggregate"]["deadlines"] = serde_json::json!(4);
     assert!(serde_json::from_value::<MemcordonReport>(aggregate_mismatch).is_err());
 
     let valid = serde_json::to_value(report_from_execution({

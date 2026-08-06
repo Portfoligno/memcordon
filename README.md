@@ -36,13 +36,13 @@ preserves the workload's exit status unless a limit or supervision failure occur
 | `125` | Wrapper or cleanup failure |
 
 `--restart` can relaunch the workload after configured limits; its
-[conditions and backoff](docs/reference.md#deadline-and-restart-policy) are configurable.
+[conditions and delays](docs/reference.md#deadline-and-restart-policy) are configurable.
 
 ## Platform support
 
 Linux and Windows use cgroup v2 or Job Objects for hard memory enforcement when
 the host permits it. macOS uses sampled watchdog monitoring, which can overshoot
-or miss short bursts. `memcordon doctor` reports the selected backend and any
+or miss short bursts. `memcordon doctor --json` reports backend capabilities and
 host limitations without launching a workload.
 
 ## Reference

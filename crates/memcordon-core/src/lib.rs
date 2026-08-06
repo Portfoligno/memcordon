@@ -33,10 +33,11 @@ pub use report::{
     UnavailableCapabilityReport, write_report_atomic,
 };
 pub use restart::{
-    BackoffMultiplier, CircuitBreakerPolicy, CircuitState, DormantRestartCondition, LOGISTIC_MODEL,
-    LogisticBackoffPolicy, RestartAction, RestartCondition, RestartConditions,
-    RestartControllerError, RestartCoordinator, RestartLimit, RestartPolicy, RestartSettings,
-    RestartWaitKind, WaitCompletion,
+    BackoffMultiplier, CircuitBreakerPolicy, CircuitState, DormantRestartCondition,
+    HALF_LIFE_LOGISTIC_MODEL, HalfLifeLogisticBackoffPolicy, HalfLifeLogisticBackoffState,
+    RestartAction, RestartCondition, RestartConditions, RestartControllerError, RestartCoordinator,
+    RestartLimit, RestartPolicy, RestartSettings, RestartWaitKind, WaitCompletion,
+    half_life_logistic_next_millis,
 };
 pub use state_machine::{RunState, StateMachine, StateTransitionError};
 pub use supervision::{

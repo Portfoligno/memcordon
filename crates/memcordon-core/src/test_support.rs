@@ -8,7 +8,7 @@ use std::num::NonZeroU64;
 
 use crate::restart::{RestartController, RestartDecision, WaitCompletion, WaitResult};
 use crate::{
-    AttemptEventKind, BackoffMultiplier, CircuitBreakerPolicy, LogisticBackoffPolicy,
+    AttemptEventKind, BackoffMultiplier, CircuitBreakerPolicy, HalfLifeLogisticBackoffPolicy,
     RestartCondition, RestartConditions, RestartDecisionRecord, RestartLimit, RestartSafetyProof,
     RestartSettings, RestartSummary,
 };
@@ -35,36 +35,45 @@ impl crate::restart::MonotonicClock for FakeClock {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LogisticScenario {
+pub struct HalfLifeLogisticScenario {
     pub scheduled_millis: Vec<u64>,
 }
 
-pub fn logistic_scenario(
-    initial_ms: u64,
+pub fn half_life_logistic_scenario(
+    base_interval_ms: u64,
     multiplier: BackoffMultiplier,
-    maximum_ms: u64,
-    steps: usize,
-) -> Result<LogisticScenario, String> {
-    let policy = LogisticBackoffPolicy::new(
-        Duration::from_millis(initial_ms),
+    asymptote_interval_ms: u64,
+    recovery_half_life_ms: u64,
+    event_times_ms: &[u64],
+) -> Result<HalfLifeLogisticScenario, String> {
+    let policy = HalfLifeLogisticBackoffPolicy::new(
+        Duration::from_millis(base_interval_ms),
         multiplier,
-        Duration::from_millis(maximum_ms),
+        Duration::from_millis(asymptote_interval_ms),
+        Duration::from_millis(recovery_half_life_ms),
     )
     .map_err(|error| error.to_string())?;
-    let mut state =
-        crate::restart::LogisticBackoffState::new(policy).map_err(|error| error.to_string())?;
-    let mut scheduled_millis = Vec::with_capacity(steps);
-    for _ in 0..steps {
-        scheduled_millis.push(state.current_millis());
-        state.advance().map_err(|error| error.to_string())?;
+    let mut state = crate::restart::HalfLifeLogisticBackoffState::new(policy)
+        .map_err(|error| error.to_string())?;
+    let mut scheduled_millis = Vec::with_capacity(event_times_ms.len());
+    for event_time_ms in event_times_ms {
+        let interval = state
+            .on_backoff(Duration::from_millis(*event_time_ms))
+            .map_err(|error| error.to_string())?;
+        scheduled_millis.push(
+            interval
+                .as_millis()
+                .try_into()
+                .map_err(|_| "backoff range overflow".to_owned())?,
+        );
     }
-    Ok(LogisticScenario { scheduled_millis })
+    Ok(HalfLifeLogisticScenario { scheduled_millis })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControllerScenario {
     pub launches: u64,
-    pub logistic_waits: u64,
+    pub half_life_logistic_waits: u64,
     pub cooldowns: u64,
     pub circuit_opens: u64,
     pub finite_exhausted: bool,
@@ -85,7 +94,7 @@ fn settings(
         RestartConditions::BOTH,
         Vec::new(),
         limit,
-        LogisticBackoffPolicy::default(),
+        HalfLifeLogisticBackoffPolicy::default(),
         circuit,
     )
     .map_err(|error| error.to_string())
@@ -161,7 +170,7 @@ pub fn controller_scenario() -> Result<ControllerScenario, String> {
             now: Duration::ZERO,
             cleanup: &safe_cleanup(false),
             completion: WaitCompletion::Completed,
-            elapsed: Duration::from_secs(1),
+            elapsed: Duration::from_secs(2),
         },
         &mut first,
         &mut summary,
@@ -248,7 +257,7 @@ pub fn controller_scenario() -> Result<ControllerScenario, String> {
             now: Duration::ZERO,
             cleanup: &safe_cleanup(false),
             completion: WaitCompletion::Completed,
-            elapsed: Duration::from_secs(1),
+            elapsed: Duration::from_secs(2),
         },
         &mut completed,
         &mut finite_summary,
@@ -314,7 +323,7 @@ pub fn controller_scenario() -> Result<ControllerScenario, String> {
 
     Ok(ControllerScenario {
         launches: summary.restarts_launched(),
-        logistic_waits: summary.logistic_waits(),
+        half_life_logistic_waits: summary.half_life_logistic_waits(),
         cooldowns: summary.cooldowns(),
         circuit_opens: summary.circuit_open_count(),
         finite_exhausted,

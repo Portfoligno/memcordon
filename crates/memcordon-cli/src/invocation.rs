@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use memcordon_core::{
     BackoffMultiplier, ByteSize, CircuitBreakerPolicy, DeadlinePolicy, DeadlineScope, Enforcement,
-    Lifetime, LogisticBackoffPolicy, Metric, Policy, RestartConditions, RestartLimit, SwapPolicy,
+    HalfLifeLogisticBackoffPolicy, Lifetime, Metric, Policy, RestartConditions, RestartLimit,
+    SwapPolicy,
 };
 use std::num::NonZeroU64;
 
@@ -13,13 +14,122 @@ use crate::parse_duration;
 pub const REFERENCE_URL: &str =
     "https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md";
 
-pub const ROOT_USAGE: &str = "Run a command and its descendants with optional memory and elapsed-time limits.\n\nUsage:\n  memcordon [OPTIONS] [BUDGET]... [--] COMMAND [ARGUMENT]...\n  memcordon doctor [OPTIONS]\n  memcordon plan [OPTIONS] [BUDGET]...\n  memcordon clean [OPTIONS]\n\nExamples:\n  memcordon cargo check\n  memcordon +1GiB -- cargo check\n  memcordon +10m +1GiB -- cargo test --workspace\n\nIf no limit or wrapper failure occurs, MemCordon returns the command's exit status.\n\nBudgets:\n  +MEMORY    Workload memory ceiling; accepts bytes, KB..EB, or KiB..EiB\n  +TIME      Elapsed-time deadline; accepts decimal ms, s, or m\n\nPolicy options (value; default):\n  --enforcement auto|hard|watchdog       Backend requirement; auto\n  --wait-for command|workload            Return after the command or workload; command\n  --metric native|physical-footprint|rss|virtual\n                                         Memory metric; native\n  --poll-interval DURATION               Watchdog sampling interval, at least 10ms; 50ms\n  --signal-grace DURATION                Grace after external interruption; 2s\n  --limit-grace DURATION                 Grace after a configured limit; 0s\n  --swap SIZE|unlimited|host             Swap policy; 0B\n  --deadline-scope attempt|supervision   Deadline scope; attempt\n  --restart                              Restart on applicable configured limits; off\n  --restart-on both|memory-limit|deadline\n                                         Enable restart for selected conditions; unset\n  --restart-limit COUNT|unlimited        Additional launches; unlimited\n  --backoff-initial DURATION             Logistic backoff initial delay; 1s\n  --backoff-multiplier DECIMAL           Logistic multiplier, >1 and <=100; 2\n  --backoff-max DURATION                 Logistic backoff upper bound; 30s\n  --restart-burst COUNT                  Circuit-breaker burst count; unset\n  --restart-window DURATION              Circuit-breaker window; unset\n  --cooldown DURATION                    Circuit-breaker cooldown; unset\n\nOutput options:\n  --report PATH                          Write a schema-3 JSON report to PATH; unset\n  --summary                              Write one final summary line to stderr; off\n  --quiet                                Suppress optional wrapper output; off\n  -h, --help                             Print this help\n  -V, --version                          Print the version\n\nConstraints:\n  Options precede the optional contiguous, order-independent budget block.\n  At most one memory and one time budget are accepted. After the program, native\n  arguments are passed unchanged. Use -- before programs beginning with + or -.\n  Memory policy options require +MEMORY; deadline scope requires +TIME. Restart\n  tuning requires restart to be enabled. --restart-burst, --restart-window, and\n  --cooldown must be supplied together. --summary conflicts with --quiet.\n  A report path must have an existing parent; reports never use stdout.\n\nExit status:\n  Deadlines return 123, confirmed memory limits 124, wrapper failures 125, a\n  non-executable command 126, and a missing command 127.\n\nReference:\n  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md";
+pub const ROOT_USAGE: &str = r#"Run a command and its descendants with optional memory and elapsed-time limits.
 
-pub const DOCTOR_USAGE: &str = "Inspect backend availability without launching a workload.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog]\n\nThe default text report identifies the selected, available, and unavailable\nbackends and their capabilities, policies, and limitations.\n\nOptions (default):\n  --json                         Write the schema-2 report to stdout; off\n  --require hard|watchdog        Return 125 unless the backend satisfies it; unset\n  -h, --help                     Print this help\n\nReference:\n  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md";
+Usage:
+  memcordon [OPTIONS] [BUDGET]... [--] COMMAND [ARGUMENT]...
+  memcordon doctor [OPTIONS]
+  memcordon plan [OPTIONS] [BUDGET]...
+  memcordon clean [OPTIONS]
 
-pub const PLAN_USAGE: &str = "Resolve budgets and policy without launching a target.\n\nUsage:\n  memcordon plan [POLICY OPTIONS] [--json] [BUDGET]...\n\nExample:\n  memcordon plan +8GiB +10m\n\nThe default text report distinguishes requested, effective, dormant, ignored,\nand adjusted policy. No workload is launched.\n\nBudgets:\n  +MEMORY    Workload memory ceiling; accepts bytes, KB..EB, or KiB..EiB\n  +TIME      Elapsed-time deadline; accepts decimal ms, s, or m\n\nPolicy options (value; default):\n  --enforcement auto|hard|watchdog       Backend requirement; auto\n  --wait-for command|workload            Return after the command or workload; command\n  --metric native|physical-footprint|rss|virtual\n                                         Memory metric; native\n  --poll-interval DURATION               Sampling interval, at least 10ms; 50ms\n  --signal-grace DURATION                External-interruption grace; 2s\n  --limit-grace DURATION                 Configured-limit grace; 0s\n  --swap SIZE|unlimited|host             Swap policy; 0B\n  --deadline-scope attempt|supervision   Deadline scope; attempt\n  --restart                              Enable applicable limit restarts; off\n  --restart-on both|memory-limit|deadline\n                                         Enable selected restarts; unset\n  --restart-limit COUNT|unlimited        Additional launches; unlimited\n  --backoff-initial DURATION             Logistic backoff initial delay; 1s\n  --backoff-multiplier DECIMAL           Logistic multiplier, >1 and <=100; 2\n  --backoff-max DURATION                 Logistic backoff upper bound; 30s\n  --restart-burst COUNT                  Circuit-breaker burst count; unset\n  --restart-window DURATION              Circuit-breaker window; unset\n  --cooldown DURATION                    Circuit-breaker cooldown; unset\n  --json                                 Write the schema-2 report to stdout; off\n  -h, --help                             Print this help\n\nConstraints:\n  Options precede the optional budget block. At most one memory and one time budget\n  are accepted. A command and -- delimiter are not accepted. Memory policy options\n  require +MEMORY; deadline scope requires +TIME. Restart tuning requires restart\n  to be enabled. The three circuit-breaker options must be supplied together.\n\nReference:\n  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md";
+Examples:
+  memcordon cargo check
+  memcordon +10m +1GiB -- cargo test --workspace
 
-pub const CLEAN_USAGE: &str = "Inspect or remove stale MemCordon-owned backend artifacts.\n\nUsage:\n  memcordon clean [--dry-run] [--json]\n\nExample:\n  memcordon clean --dry-run\n\nWithout --dry-run, this removes the reported stale artifacts. Incomplete cleanup\nreturns 125.\n\nOptions (default):\n  --dry-run                      Report candidates without changing the host; off\n  --json                         Write the schema-1 result to stdout; off\n  -h, --help                     Print this help\n\nReference:\n  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md";
+Returns the command's exit status unless a limit or wrapper failure occurs.
+
+Budgets:
+  +MEMORY    Memory ceiling; bytes, KB..EB, or KiB..EiB
+  +TIME      Elapsed-time deadline; decimal ms, s, or m
+
+Policy options (value; default):
+  --enforcement auto|hard|watchdog       Backend requirement; auto
+  --wait-for command|workload            Return after the command or workload; command
+  --metric native|physical-footprint|rss|virtual
+                                         Memory metric; native
+  --poll-interval DURATION               Watchdog sampling interval, at least 10ms; 50ms
+  --signal-grace DURATION                Grace after external interruption; 2s
+  --limit-grace DURATION                 Grace after a configured limit; 0s
+  --swap SIZE|unlimited|host             Swap policy; 0B
+  --deadline-scope attempt|supervision   Deadline scope; attempt
+  --restart                              Restart on applicable configured limits; off
+  --restart-on both|memory-limit|deadline
+                                         Enable restart for selected conditions; unset
+  --restart-limit COUNT|unlimited        Additional launches; unlimited
+  --backoff-base DURATION                Recovery baseline; 250ms
+  --backoff-multiplier DECIMAL           Delay growth control, >1 and <=100; 4
+  --backoff-asymptote DURATION           Logistic asymptote; 15m
+  --backoff-recovery-half-life DURATION  Quiet-time half-life of distance from base; 15m
+  --restart-burst COUNT                  Circuit-breaker burst count; unset
+  --restart-window DURATION              Circuit-breaker window; unset
+  --cooldown DURATION                    Circuit-breaker cooldown; unset
+
+Output options:
+  --report PATH                          Write schema-4 JSON to PATH; unset
+  --summary                              Write one final summary line to stderr; off
+  --quiet                                Suppress optional wrapper output; off
+  -h, --help                             Print this help
+  -V, --version                          Print the version
+
+Rules:
+  Options come first, then up to two contiguous budgets (one each, either order),
+  then COMMAND. Use -- before a command beginning with + or -.
+  --enforcement, --metric, --poll-interval, and --swap need +MEMORY;
+  --deadline-scope needs +TIME; --limit-grace needs either budget. Restart tuning
+  needs --restart or --restart-on. Backoff base, asymptote, and half-life must be >=1ms.
+  Set all three circuit-breaker options; window and cooldown must be >=10ms.
+  --summary conflicts with --quiet. --report needs an existing parent and cannot
+  use stdout. Command arguments pass unchanged.
+
+Exit status:
+  123 deadline; 124 confirmed memory limit; 125 wrapper failure;
+  126 command not executable; 127 command not found.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#;
+
+pub const DOCTOR_USAGE: &str = "Inspect backend availability without launching a workload.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog]\n\nText prints the version and selected backend; --json prints full capabilities\nand limitations.\n\nOptions (default):\n  --json                         Write schema-2 JSON to stdout; off\n  --require hard|watchdog        Return 125 unless the backend matches; unset\n  -h, --help                     Print this help\n\nReference:\n  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md";
+
+pub const PLAN_USAGE: &str = r#"Resolve budgets and policy without launching a target.
+
+Usage:
+  memcordon plan [POLICY OPTIONS] [--json] [BUDGET]...
+
+Example:
+  memcordon plan +8GiB +10m
+
+Text prints the selected backend and "launch proof: false"; --json prints the
+full policy resolution.
+
+Budgets:
+  +MEMORY    Memory ceiling; bytes, KB..EB, or KiB..EiB
+  +TIME      Elapsed-time deadline; decimal ms, s, or m
+
+Policy options (value; default):
+  --enforcement auto|hard|watchdog       Backend requirement; auto
+  --wait-for command|workload            Return after the command or workload; command
+  --metric native|physical-footprint|rss|virtual
+                                         Memory metric; native
+  --poll-interval DURATION               Sampling interval, at least 10ms; 50ms
+  --signal-grace DURATION                External-interruption grace; 2s
+  --limit-grace DURATION                 Configured-limit grace; 0s
+  --swap SIZE|unlimited|host             Swap policy; 0B
+  --deadline-scope attempt|supervision   Deadline scope; attempt
+  --restart                              Enable applicable limit restarts; off
+  --restart-on both|memory-limit|deadline
+                                         Enable selected restarts; unset
+  --restart-limit COUNT|unlimited        Additional launches; unlimited
+  --backoff-base DURATION                Recovery baseline; 250ms
+  --backoff-multiplier DECIMAL           Delay growth control, >1 and <=100; 4
+  --backoff-asymptote DURATION           Logistic asymptote; 15m
+  --backoff-recovery-half-life DURATION  Quiet-time half-life of distance from base; 15m
+  --restart-burst COUNT                  Circuit-breaker burst count; unset
+  --restart-window DURATION              Circuit-breaker window; unset
+  --cooldown DURATION                    Circuit-breaker cooldown; unset
+  --json                                 Write schema-3 JSON to stdout; off
+  -h, --help                             Print this help
+
+Rules:
+  Options come first, then up to two budgets (one each, either order). COMMAND and
+  -- are invalid. --enforcement, --metric, --poll-interval, and --swap need +MEMORY;
+  --deadline-scope needs +TIME; --limit-grace needs either budget. Restart tuning
+  needs --restart or --restart-on. Backoff base, asymptote, and half-life must be >=1ms.
+  Set all three circuit-breaker options; window and cooldown must be >=10ms.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#;
+
+pub const CLEAN_USAGE: &str = "Inspect or remove stale MemCordon-owned backend artifacts.\n\nUsage:\n  memcordon clean [--dry-run] [--json]\n\nExample:\n  memcordon clean --dry-run\n\nWithout --dry-run, removes listed artifacts; incomplete cleanup returns 125.\n\nOptions (default):\n  --dry-run                      List candidates without changing the host; off\n  --json                         Write schema-1 JSON to stdout; off\n  -h, --help                     Print this help\n\nReference:\n  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md";
 
 pub const PUBLIC_POLICY_OPTIONS: &[&str] = &[
     "--enforcement",
@@ -33,9 +143,10 @@ pub const PUBLIC_POLICY_OPTIONS: &[&str] = &[
     "--restart",
     "--restart-on",
     "--restart-limit",
-    "--backoff-initial",
+    "--backoff-base",
     "--backoff-multiplier",
-    "--backoff-max",
+    "--backoff-asymptote",
+    "--backoff-recovery-half-life",
     "--restart-burst",
     "--restart-window",
     "--cooldown",
@@ -186,11 +297,12 @@ pub struct PolicyArgs {
     pub restart: bool,
     pub restart_on: Option<RestartConditions>,
     pub restart_limit: RestartLimit,
-    pub backoff: LogisticBackoffPolicy,
+    pub backoff: HalfLifeLogisticBackoffPolicy,
     pub circuit_breaker: Option<CircuitBreakerPolicy>,
-    backoff_initial: Option<Duration>,
+    backoff_base_interval: Option<Duration>,
     backoff_multiplier: Option<BackoffMultiplier>,
-    backoff_maximum: Option<Duration>,
+    backoff_asymptote_interval: Option<Duration>,
+    backoff_recovery_half_life: Option<Duration>,
     restart_burst: Option<NonZeroU64>,
     restart_window: Option<Duration>,
     cooldown: Option<Duration>,
@@ -222,11 +334,12 @@ impl Default for PolicyArgs {
             restart: false,
             restart_on: None,
             restart_limit: RestartLimit::Unlimited,
-            backoff: LogisticBackoffPolicy::default(),
+            backoff: HalfLifeLogisticBackoffPolicy::default(),
             circuit_breaker: None,
-            backoff_initial: None,
+            backoff_base_interval: None,
             backoff_multiplier: None,
-            backoff_maximum: None,
+            backoff_asymptote_interval: None,
+            backoff_recovery_half_life: None,
             restart_burst: None,
             restart_window: None,
             cooldown: None,
@@ -610,13 +723,25 @@ fn validate_policy_dependencies(
             ));
         }
     }
-    let defaults = LogisticBackoffPolicy::default();
-    policy.backoff = LogisticBackoffPolicy::new(
-        policy.backoff_initial.unwrap_or(defaults.initial()),
+    let defaults = HalfLifeLogisticBackoffPolicy::default();
+    policy.backoff = HalfLifeLogisticBackoffPolicy::new(
+        policy
+            .backoff_base_interval
+            .unwrap_or(defaults.base_interval()),
         policy.backoff_multiplier.unwrap_or(defaults.multiplier()),
-        policy.backoff_maximum.unwrap_or(defaults.maximum()),
+        policy
+            .backoff_asymptote_interval
+            .unwrap_or(defaults.asymptote_interval()),
+        policy
+            .backoff_recovery_half_life
+            .unwrap_or(defaults.recovery_half_life()),
     )
-    .map_err(|error| CliError::new("MCUSAGE-BACKOFF", error.to_string()))?;
+    .map_err(|_| {
+        CliError::new(
+            "MCUSAGE-BACKOFF",
+            "--backoff-base, --backoff-asymptote, and --backoff-recovery-half-life must be >=1ms",
+        )
+    })?;
     policy.circuit_breaker = match (policy.restart_burst, policy.restart_window, policy.cooldown) {
         (None, None, None) => None,
         (Some(burst), Some(window), Some(cooldown))
@@ -695,9 +820,10 @@ fn parse_policy_option(
             | "--deadline-scope"
             | "--restart-on"
             | "--restart-limit"
-            | "--backoff-initial"
+            | "--backoff-base"
             | "--backoff-multiplier"
-            | "--backoff-max"
+            | "--backoff-asymptote"
+            | "--backoff-recovery-half-life"
             | "--restart-burst"
             | "--restart-window"
             | "--cooldown"
@@ -800,9 +926,9 @@ fn parse_policy_option(
                 })?)
             }
         }
-        "--backoff-initial" => {
+        "--backoff-base" => {
             policy.explicit.restart_tuning = true;
-            policy.backoff_initial = Some(
+            policy.backoff_base_interval = Some(
                 parse_duration(text).map_err(|message| CliError::new("MCCLI-DURATION", message))?,
             )
         }
@@ -813,9 +939,15 @@ fn parse_policy_option(
                     .map_err(|error| CliError::new("MCUSAGE-BACKOFF", error.to_string()))?,
             )
         }
-        "--backoff-max" => {
+        "--backoff-asymptote" => {
             policy.explicit.restart_tuning = true;
-            policy.backoff_maximum = Some(
+            policy.backoff_asymptote_interval = Some(
+                parse_duration(text).map_err(|message| CliError::new("MCCLI-DURATION", message))?,
+            )
+        }
+        "--backoff-recovery-half-life" => {
+            policy.explicit.restart_tuning = true;
+            policy.backoff_recovery_half_life = Some(
                 parse_duration(text).map_err(|message| CliError::new("MCCLI-DURATION", message))?,
             )
         }

@@ -124,7 +124,7 @@ pub enum RestartDecisionKind {
     NoneLimitExhausted,
     NoneCleanupUnsafe,
     NoneTerminalDeadline,
-    LogisticBackoff,
+    HalfLifeLogisticBackoff,
     CircuitCooldown,
     HalfOpenLaunch,
     AbortedByInterruption,
@@ -135,7 +135,7 @@ pub struct RestartDecisionRecord {
     pub trigger: Option<RestartCondition>,
     pub decision: RestartDecisionKind,
     pub restart_number: Option<u64>,
-    pub logistic_sequence_index: Option<u64>,
+    pub half_life_logistic_sequence_index: Option<u64>,
     pub configured_wait_ms: Option<u64>,
     pub actual_wait_ms: Option<u64>,
     pub wait_kind: Option<RestartWaitKind>,
@@ -149,7 +149,7 @@ impl Default for RestartDecisionRecord {
             trigger: None,
             decision: RestartDecisionKind::NoneDisabled,
             restart_number: None,
-            logistic_sequence_index: None,
+            half_life_logistic_sequence_index: None,
             configured_wait_ms: None,
             actual_wait_ms: None,
             wait_kind: None,
@@ -429,7 +429,7 @@ pub struct RestartSummary {
     pub(crate) enabled: bool,
     pub(crate) restarts_launched: u64,
     pub(crate) restart_limit_exhausted: bool,
-    pub(crate) logistic_waits: u64,
+    pub(crate) half_life_logistic_waits: u64,
     pub(crate) cooldowns: u64,
     pub(crate) circuit_open_count: u64,
     pub(crate) final_circuit_state: CircuitState,
@@ -445,8 +445,8 @@ impl RestartSummary {
     pub const fn restart_limit_exhausted(&self) -> bool {
         self.restart_limit_exhausted
     }
-    pub const fn logistic_waits(&self) -> u64 {
-        self.logistic_waits
+    pub const fn half_life_logistic_waits(&self) -> u64 {
+        self.half_life_logistic_waits
     }
     pub const fn cooldowns(&self) -> u64 {
         self.cooldowns
@@ -467,7 +467,7 @@ impl RestartSummary {
             && (self.enabled
                 || (self.restarts_launched == 0
                     && !self.restart_limit_exhausted
-                    && self.logistic_waits == 0
+                    && self.half_life_logistic_waits == 0
                     && self.cooldowns == 0
                     && self.circuit_open_count == 0
                     && self.final_circuit_state == CircuitState::Closed))
@@ -484,7 +484,7 @@ impl<'de> Deserialize<'de> for RestartSummary {
             enabled: bool,
             restarts_launched: u64,
             restart_limit_exhausted: bool,
-            logistic_waits: u64,
+            half_life_logistic_waits: u64,
             cooldowns: u64,
             circuit_open_count: u64,
             final_circuit_state: CircuitState,
@@ -494,7 +494,7 @@ impl<'de> Deserialize<'de> for RestartSummary {
             enabled: wire.enabled,
             restarts_launched: wire.restarts_launched,
             restart_limit_exhausted: wire.restart_limit_exhausted,
-            logistic_waits: wire.logistic_waits,
+            half_life_logistic_waits: wire.half_life_logistic_waits,
             cooldowns: wire.cooldowns,
             circuit_open_count: wire.circuit_open_count,
             final_circuit_state: wire.final_circuit_state,
@@ -512,7 +512,7 @@ impl Default for RestartSummary {
             enabled: false,
             restarts_launched: 0,
             restart_limit_exhausted: false,
-            logistic_waits: 0,
+            half_life_logistic_waits: 0,
             cooldowns: 0,
             circuit_open_count: 0,
             final_circuit_state: CircuitState::Closed,

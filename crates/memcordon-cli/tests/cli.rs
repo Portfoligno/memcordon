@@ -2,6 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::process::Command;
 
 use memcordon::invocation::{HelpKind, Invocation, LimitToken, route};
+use memcordon_core::{DOCTOR_REPORT_SCHEMA_VERSION, PLAN_REPORT_SCHEMA_VERSION};
 
 fn native(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
@@ -57,13 +58,15 @@ fn optional_and_order_independent_budgets_preserve_native_boundary() {
 }
 
 #[test]
-fn backoff_scalars_are_validated_after_order_independent_collection() {
+fn half_life_backoff_scalars_are_validated_after_order_independent_collection() {
     let first = execution(&[
         "--restart",
-        "--backoff-max",
+        "--backoff-asymptote",
         "2s",
-        "--backoff-initial",
+        "--backoff-base",
         "1500ms",
+        "--backoff-recovery-half-life",
+        "4s",
         "--backoff-multiplier",
         "2.5",
         "+1GiB",
@@ -73,14 +76,109 @@ fn backoff_scalars_are_validated_after_order_independent_collection() {
         "--restart",
         "--backoff-multiplier",
         "2.5",
-        "--backoff-initial",
+        "--backoff-recovery-half-life",
+        "4s",
+        "--backoff-base",
         "1500ms",
-        "--backoff-max",
+        "--backoff-asymptote",
         "2s",
         "+1GiB",
         "program",
     ]);
     assert_eq!(first.policy.backoff, second.policy.backoff);
+
+    let partial = execution(&["--restart", "--backoff-base", "500ms", "+1GiB", "program"]);
+    assert_eq!(
+        partial.policy.backoff.base_interval(),
+        std::time::Duration::from_millis(500)
+    );
+    assert_eq!(partial.policy.backoff.multiplier().numerator(), 4);
+    assert_eq!(partial.policy.backoff.multiplier().denominator(), 1);
+    assert_eq!(
+        partial.policy.backoff.asymptote_interval(),
+        std::time::Duration::from_secs(15 * 60)
+    );
+    assert_eq!(
+        partial.policy.backoff.recovery_half_life(),
+        std::time::Duration::from_secs(15 * 60)
+    );
+
+    let removed = route(&native(&[
+        "--restart",
+        "--backoff-initial",
+        "1s",
+        "+1GiB",
+        "program",
+    ]))
+    .expect_err("the replaced backoff option must not coexist with the new grammar");
+    assert_eq!(removed.code, "MCCLI-UNKNOWN-OPTION");
+    let removed = route(&native(&[
+        "--restart",
+        "--backoff-max",
+        "1s",
+        "+1GiB",
+        "program",
+    ]))
+    .expect_err("the renamed asymptote option must reject its old spelling");
+    assert_eq!(removed.code, "MCCLI-UNKNOWN-OPTION");
+
+    for (base, asymptote, expected_base, expected_asymptote) in [
+        (
+            "1s",
+            "1s",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        ),
+        (
+            "2s",
+            "1s",
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(1),
+        ),
+    ] {
+        let parsed = execution(&[
+            "--restart",
+            "--backoff-base",
+            base,
+            "--backoff-asymptote",
+            asymptote,
+            "+1GiB",
+            "program",
+        ]);
+        assert_eq!(parsed.policy.backoff.base_interval(), expected_base);
+        assert_eq!(
+            parsed.policy.backoff.asymptote_interval(),
+            expected_asymptote
+        );
+    }
+
+    for values in [
+        &["--restart", "--backoff-base", "0ms", "+1GiB", "program"][..],
+        &[
+            "--restart",
+            "--backoff-asymptote",
+            "0ms",
+            "+1GiB",
+            "program",
+        ][..],
+        &[
+            "--restart",
+            "--backoff-recovery-half-life",
+            "0ms",
+            "+1GiB",
+            "program",
+        ][..],
+    ] {
+        let error = route(&native(values)).expect_err("invalid backoff must fail");
+        assert_eq!(error.code, "MCUSAGE-BACKOFF");
+        for option in [
+            "--backoff-base",
+            "--backoff-asymptote",
+            "--backoff-recovery-half-life",
+        ] {
+            assert!(error.message.contains(option));
+        }
+    }
 }
 
 #[test]
@@ -241,27 +339,96 @@ fn non_utf8_limit_is_rejected_without_altering_later_child_tokens() {
 }
 
 #[test]
-fn doctor_json_is_versioned_and_machine_readable() {
+fn doctor_text_and_json_have_distinct_complete_shapes() {
+    let text = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .arg("doctor")
+        .output()
+        .expect("doctor should run");
+    assert!(text.status.success());
+    assert!(text.stderr.is_empty());
+    let lines = String::from_utf8(text.stdout)
+        .expect("doctor text must be UTF-8")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].starts_with("memcordon "));
+    assert!(lines[1].starts_with("selected backend: "));
+
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args(["doctor", "--json"])
         .output()
         .expect("doctor should run");
     assert!(output.status.success());
+    assert!(output.stderr.is_empty());
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("doctor must emit JSON");
-    assert_eq!(value["schema_version"], 2);
+    assert_eq!(value["schema_version"], DOCTOR_REPORT_SCHEMA_VERSION);
     assert_eq!(value["tool"]["name"], "memcordon");
-    assert!(value.get("available").is_some());
-    if !value["available"].as_array().is_none_or(Vec::is_empty) {
-        assert!(value["available"][0]["deadline"]["supported"].is_boolean());
-        assert!(value["available"][0]["restart"]["supported"].is_boolean());
-        assert!(value["available"][0]["deadline_scopes"].is_array());
+    assert!(value.get("selected").is_some());
+    assert!(value["available"].is_array());
+    assert!(value["unavailable"].is_array());
+    for backend in value["available"].as_array().expect("available array") {
+        assert!(backend["memory"]["supported"].is_boolean());
+        assert!(backend["deadline"]["supported"].is_boolean());
+        assert!(backend["restart"]["supported"].is_boolean());
+        assert!(backend["deadline_scopes"].is_array());
+        assert!(backend["limitations"].is_array());
     }
+}
+
+#[test]
+fn plan_text_and_json_have_distinct_resolution_shapes_when_backend_is_available() {
+    let doctor = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor should run");
+    assert!(doctor.status.success());
+    let doctor: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor must emit JSON");
+
+    let text = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .arg("plan")
+        .output()
+        .expect("plan text should run");
+    let json = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .args(["plan", "--json"])
+        .output()
+        .expect("plan JSON should run");
+
+    if doctor["selected"].is_null() {
+        assert_eq!(text.status.code(), Some(125));
+        assert_eq!(json.status.code(), Some(125));
+        return;
+    }
+
+    assert!(text.status.success());
+    assert!(text.stderr.is_empty());
+    let lines = String::from_utf8(text.stdout)
+        .expect("plan text must be UTF-8")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].starts_with("selected backend: "));
+    assert_eq!(lines[1], "launch proof: false");
+
+    assert!(json.status.success());
+    assert!(json.stderr.is_empty());
+    let value: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("plan must emit JSON");
+    assert_eq!(value["schema_version"], PLAN_REPORT_SCHEMA_VERSION);
+    assert!(value["request"].is_object());
+    assert!(value["resolution"]["backend"].is_object());
+    assert!(value["resolution"]["effective"].is_object());
+    assert!(value["resolution"]["effects"].is_array());
+    assert!(value["resolution"]["limitations"].is_array());
+    assert_eq!(value["resolution"]["launch_proof"], false);
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-fn plan_schema_two_carries_effects_limitations_and_source_order() {
+fn plan_restart_json_carries_half_life_defaults_and_source_order() {
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args(["plan", "--json", "--restart", "+1s", "+1GiB"])
         .output()
@@ -269,16 +436,37 @@ fn plan_schema_two_carries_effects_limitations_and_source_order() {
     assert!(output.status.success());
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("plan must emit JSON");
-    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["budget_tokens"][0]["kind"], "time");
     assert_eq!(value["budget_tokens"][1]["kind"], "memory");
-    assert!(
-        value["resolution"]["effects"]
-            .as_array()
-            .is_some_and(|items| items.len() >= 6)
-    );
-    assert!(value["resolution"]["limitations"].is_array());
     assert_eq!(value["request"]["restart"]["enabled"], true);
+    assert_eq!(
+        value["request"]["restart"]["backoff"]["model"],
+        "half-life-logistic-v1"
+    );
+    assert_eq!(
+        value["request"]["restart"]["backoff"]["base_interval_ms"],
+        250
+    );
+    assert_eq!(
+        value["request"]["restart"]["backoff"]["multiplier_numerator"],
+        4
+    );
+    assert_eq!(
+        value["request"]["restart"]["backoff"]["multiplier_denominator"],
+        1
+    );
+    assert_eq!(
+        value["request"]["restart"]["backoff"]["asymptote_interval_ms"],
+        900_000
+    );
+    assert_eq!(
+        value["request"]["restart"]["backoff"]["recovery_half_life_ms"],
+        900_000
+    );
+    assert_eq!(
+        value["resolution"]["backoff_sample_ms"],
+        serde_json::json!([1_000])
+    );
     assert_eq!(value["resolution"]["effective"]["restart"]["enabled"], true);
 }
 
@@ -294,7 +482,7 @@ fn removed_run_binary_path_never_launches() {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-fn command_not_found_maps_to_127_and_produces_schema_three_failure_report() {
+fn command_not_found_maps_to_127_and_produces_schema_four_failure_report() {
     let temporary = tempfile::tempdir().expect("temporary directory should exist");
     let report = temporary.path().join("failure.json");
     let missing = temporary.path().join("command-that-does-not-exist");
@@ -309,7 +497,7 @@ fn command_not_found_maps_to_127_and_produces_schema_three_failure_report() {
     let value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(report).expect("failure report should be written"))
             .expect("failure report should be JSON");
-    assert_eq!(value["schema_version"], 3);
+    assert_eq!(value["schema_version"], 4);
     assert_eq!(value["supervision"]["wrapper_exit_code"], 127);
     assert_eq!(value["attempts"][0]["error"]["code"], "MCSPAWN-NOT-FOUND");
     assert_eq!(
@@ -362,7 +550,7 @@ fn clean_json_uses_schema_one() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn schema_three_success_report_uses_plus_memory_invocation() {
+fn schema_four_success_report_uses_plus_memory_invocation() {
     let temporary = tempfile::tempdir().expect("temporary directory should exist");
     let report = temporary.path().join("success.json");
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
@@ -375,7 +563,7 @@ fn schema_three_success_report_uses_plus_memory_invocation() {
     let bytes = std::fs::read(report).expect("report should exist");
     assert_eq!(bytes.last(), Some(&b'\n'));
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("report should be JSON");
-    assert_eq!(value["schema_version"], 3);
+    assert_eq!(value["schema_version"], 4);
     assert_eq!(value["invocation"]["syntax"], "plus-budgets-v1");
     assert_eq!(value["supervision"]["wrapper_exit_code"], 0);
     assert_eq!(

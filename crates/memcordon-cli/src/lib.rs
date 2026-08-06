@@ -30,8 +30,8 @@ pub mod invocation;
 
 pub use memcordon_core::{
     ByteSize, ChildTermination, CircuitBreakerPolicy, CleanupSummary, CommandSpec, Enforcement,
-    Error, Lifetime, LogisticBackoffPolicy, Metric, Policy, RestartConditions, RestartLimit,
-    RestartPolicy, RestartSettings, RunOutcome, SupervisionExecution,
+    Error, HalfLifeLogisticBackoffPolicy, Lifetime, Metric, Policy, RestartConditions,
+    RestartLimit, RestartPolicy, RestartSettings, RunOutcome, SupervisionExecution,
 };
 pub use memcordon_platform::{BackendInfo, ProbeReport, probe};
 
@@ -175,7 +175,7 @@ impl Supervisor {
         }
         self
     }
-    pub fn logistic_backoff(mut self, backoff: LogisticBackoffPolicy) -> Self {
+    pub fn half_life_logistic_backoff(mut self, backoff: HalfLifeLogisticBackoffPolicy) -> Self {
         if let RestartPolicy::OnLimits(settings) = &mut self.restart {
             *settings = rebuild_settings(settings, None, Some(backoff), None);
         } else {
@@ -296,7 +296,7 @@ fn default_restart_settings(conditions: RestartConditions) -> RestartSettings {
         conditions,
         Vec::new(),
         RestartLimit::Unlimited,
-        LogisticBackoffPolicy::default(),
+        HalfLifeLogisticBackoffPolicy::default(),
         None,
     )
     .unwrap_or_else(|error| panic!("invalid built-in restart defaults: {error}"))
@@ -305,7 +305,7 @@ fn default_restart_settings(conditions: RestartConditions) -> RestartSettings {
 fn rebuild_settings(
     settings: &RestartSettings,
     limit: Option<RestartLimit>,
-    backoff: Option<LogisticBackoffPolicy>,
+    backoff: Option<HalfLifeLogisticBackoffPolicy>,
     circuit: Option<Option<CircuitBreakerPolicy>>,
 ) -> RestartSettings {
     RestartSettings::new(

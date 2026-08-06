@@ -10,12 +10,12 @@ use memcordon_core::{
     DOCTOR_REPORT_SCHEMA_VERSION, DeadlinePolicyReport, DeadlineScope, DoctorReport,
     DormantRestartCondition, EffectiveMemoryPolicyReport, EffectivePolicyReport,
     EffectiveRestartPolicyReport, Enforcement, Error, ErrorCategory, ExecutionErrorReport,
-    HostReport, InvocationReport, LOGISTIC_MODEL, Lifetime, MemcordonReport, Metric,
-    OptionEffectReport, PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanResolutionReport, Policy,
-    PolicyEnvelopeReport, RequestedMemoryPolicyReport, RequestedPolicyReport,
-    RequestedRestartPolicyReport, RequirementReport, RestartCondition, RestartConditions,
-    RestartPolicy, RestartSettings, SupervisionExecution, SupervisionTerminal, SwapPolicy,
-    SwapReport, ToolReport, UnavailableCapabilityReport, write_report_atomic,
+    HALF_LIFE_LOGISTIC_MODEL, HalfLifeLogisticBackoffState, HostReport, InvocationReport, Lifetime,
+    MemcordonReport, Metric, OptionEffectReport, PLAN_REPORT_SCHEMA_VERSION, PlanReport,
+    PlanResolutionReport, Policy, PolicyEnvelopeReport, RequestedMemoryPolicyReport,
+    RequestedPolicyReport, RequestedRestartPolicyReport, RequirementReport, RestartCondition,
+    RestartConditions, RestartPolicy, RestartSettings, SupervisionExecution, SupervisionTerminal,
+    SwapPolicy, SwapReport, ToolReport, UnavailableCapabilityReport, write_report_atomic,
 };
 use memcordon_platform::{SupervisorRequest, capabilities, cleanup_stale, probe, supervise};
 
@@ -179,7 +179,7 @@ fn report(
             .iter()
             .map(|value| memcordon_core::NativeArgument::from_os(value)),
     );
-    MemcordonReport::schema3(
+    MemcordonReport::schema4(
         tool_report(),
         InvocationReport {
             syntax: "plus-budgets-v1".to_owned(),
@@ -503,11 +503,12 @@ fn requested_report(
             configured_conditions: configured,
             limit: args.restart_limit,
             backoff: (!configured.is_empty()).then(|| BackoffPolicyReport {
-                model: LOGISTIC_MODEL.to_owned(),
-                initial_ms: milliseconds(args.backoff.initial()),
+                model: HALF_LIFE_LOGISTIC_MODEL.to_owned(),
+                base_interval_ms: milliseconds(args.backoff.base_interval()),
                 multiplier_numerator: args.backoff.multiplier().numerator(),
                 multiplier_denominator: args.backoff.multiplier().denominator(),
-                maximum_ms: milliseconds(args.backoff.maximum()),
+                asymptote_interval_ms: milliseconds(args.backoff.asymptote_interval()),
+                recovery_half_life_ms: milliseconds(args.backoff.recovery_half_life()),
                 quantization: "ceil-whole-milliseconds".to_owned(),
             }),
             circuit_breaker: args
@@ -586,7 +587,15 @@ pub fn plan(args: PlanArgs) -> i32 {
             limitations,
             launch_proof: false,
             backoff_sample_ms: if args.policy.restart || args.policy.restart_on.is_some() {
-                vec![milliseconds(args.policy.backoff.initial())]
+                let mut backoff = HalfLifeLogisticBackoffState::new(args.policy.backoff)
+                    .unwrap_or_else(|error| panic!("validated backoff became invalid: {error}"));
+                vec![milliseconds(
+                    backoff
+                        .on_backoff(std::time::Duration::ZERO)
+                        .unwrap_or_else(|error| {
+                            panic!("validated first backoff became invalid: {error}")
+                        }),
+                )]
             } else {
                 Vec::new()
             },

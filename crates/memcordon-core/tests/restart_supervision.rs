@@ -1,5 +1,7 @@
 use memcordon_core::BackoffMultiplier;
-use memcordon_core::test_support::{controller_scenario, deadline_scenario, logistic_scenario};
+use memcordon_core::test_support::{
+    controller_scenario, deadline_scenario, half_life_logistic_scenario,
+};
 
 #[test]
 fn controller_certification_covers_limits_circuit_waits_and_cleanup() {
@@ -12,7 +14,7 @@ fn controller_certification_covers_limits_circuit_waits_and_cleanup() {
     assert_eq!(result.interrupted_launches, 0);
     assert_eq!(result.deadline_launches, 0);
     assert!(result.launches >= 2);
-    assert!(result.logistic_waits >= 1);
+    assert!(result.half_life_logistic_waits >= 1);
     assert!(result.cooldowns >= 1);
     assert!(result.circuit_opens >= 1);
 }
@@ -33,19 +35,28 @@ fn deadline_tracker_certifies_attempt_reset_total_scope_and_precedence() {
 }
 
 #[test]
-fn logistic_facade_preserves_exact_bounded_sequence() {
-    let result = logistic_scenario(
+fn half_life_logistic_facade_preserves_event_convergence_and_time_recovery() {
+    let rapid = half_life_logistic_scenario(
         1_000,
         "2".parse::<BackoffMultiplier>().expect("multiplier"),
         30_000,
-        12,
+        30_000,
+        &[0, 0, 0, 0, 0],
     )
-    .expect("logistic scenario");
+    .expect("rapid half-life logistic scenario");
     assert_eq!(
-        result.scheduled_millis,
-        [
-            1_000, 1_936, 3_638, 6_490, 10_672, 15_744, 20_651, 24_463, 26_951, 28_394, 29_175,
-            29_582
-        ]
+        rapid.scheduled_millis,
+        [1_936, 3_638, 6_490, 10_672, 15_744]
     );
+
+    let recovered = half_life_logistic_scenario(
+        1_000,
+        "2".parse::<BackoffMultiplier>().expect("multiplier"),
+        30_000,
+        30_000,
+        &[0, 0, 300_000],
+    )
+    .expect("recovered half-life logistic scenario");
+    assert!(recovered.scheduled_millis[2] < recovered.scheduled_millis[1]);
+    assert!(recovered.scheduled_millis[2] >= recovered.scheduled_millis[0]);
 }

@@ -49,9 +49,10 @@ policies are typed separately.
 | `--restart` | flag | false |
 | `--restart-on` | `both`, `memory-limit`, `deadline` | unset |
 | `--restart-limit` | additional-launch count or `unlimited` | `unlimited` |
-| `--backoff-initial` | duration | `1s` |
-| `--backoff-multiplier` | exact decimal greater than 1 and at most 100 | `2` |
-| `--backoff-max` | duration | `30s` |
+| `--backoff-base` | duration of at least 1 ms | `250ms` |
+| `--backoff-multiplier` | exact decimal greater than 1 and at most 100 | `4` |
+| `--backoff-asymptote` | duration of at least 1 ms | `15m` |
+| `--backoff-recovery-half-life` | duration of at least 1 ms | `15m` |
 | `--restart-burst` | positive count | unset |
 | `--restart-window` | duration | unset |
 | `--cooldown` | duration | unset |
@@ -71,19 +72,20 @@ corresponding budget is recorded as dormant rather than treated as effective.
 
 ## Utilities
 
-`doctor` reports tool and host identity, selected, available, and unavailable
-backends, lifecycle and memory capabilities, startup containment, supported
-deadline scopes and restart conditions, and limitations. `--require hard` or
-`--require watchdog` returns 125 when the selected backend does not satisfy the
-predicate. Doctor JSON uses schema 2.
+`doctor` prints the version and selected backend. `doctor --json` emits
+schema-2 tool and host identity, selected/available/unavailable backend
+capabilities and limitations, and the requirement result. An unmet
+`--require hard|watchdog` returns 125.
 
-`plan` applies the same qualification and policy resolver as execution without
-launching a target. It reports ordered budget tokens, requested and effective
-memory/deadline/restart policy, dormant conditions, option effects,
-limitations, and `launch_proof: false`. Plan JSON uses schema 2.
+`plan` resolves policy without launching a target. Text output prints the
+selected backend and `launch proof: false`; `plan --json` emits the
+schema-3 request and resolution: ordered budgets, requested/effective policy,
+dormant restart conditions, effects, and limitations. Backoff configuration is
+at `request.restart.backoff`; `resolution.backoff_sample_ms` holds the first
+calculated wait when restart is enabled, otherwise `[]`.
 
 `clean` removes only stale MemCordon-owned backend artifacts. `--dry-run`
-reports candidates without changing the host. Clean JSON remains schema 1;
+reports candidates without changing the host. Clean JSON remains schema-1;
 incomplete cleanup returns 125.
 
 Machine-readable consumers must inspect `schema_version`.
@@ -187,24 +189,36 @@ after the direct child exits; it does not alter startup membership.
 
 ## Deadline and restart policy
 
-Attempt deadlines reset at the platform authorization point: Linux release-byte write, Windows suspended-thread resume, or macOS pre-spawn. A supervision deadline starts with the first authorization and includes later cleanup, setup, backoff, and cooldown. It is terminal and cannot trigger restart. Confirmed memory evidence wins a same-cycle deadline race.
-
 Execution is one-shot unless `--restart` or `--restart-on both|memory-limit|deadline` is supplied. `--restart-on` independently enables restart. Enabled restart defaults to both applicable conditions and unlimited additional launches. A finite `--restart-limit N` counts additional launches. Only selected MemCordon limits restart, and only after the child and helpers are reaped, the workload is proven empty, and containment is removed or incapable of retaining members.
 
-Restart delays use logistic backoff, increasing smoothly from
-`--backoff-initial` toward `--backoff-max`:
+Attempt deadlines reset at the platform authorization point: Linux release-byte write, Windows suspended-thread resume, or macOS pre-spawn. A supervision deadline starts with the first authorization and includes later cleanup, setup, backoff, and cooldown. It is terminal and cannot trigger restart. Confirmed memory evidence wins a same-cycle deadline race.
+
+Each retry delay first recovers the stored interval toward `--backoff-base`, then
+applies a logistic adjustment relative to `--backoff-asymptote`:
 
 ```text
-next = max * multiplier * current / (max + (multiplier - 1) * current)
+decay = 2 ** (-elapsed_since_last_backoff / recovery_half_life)
+recovered = base + (current - base) * decay
+next = asymptote * multiplier * recovered
+       / (asymptote + (multiplier - 1) * recovered)
 ```
 
-Calculations use exact rational arithmetic and round upward to whole
-milliseconds. Reports identify the schedule as `logistic-odds-v1`. Defaults are
-1s initial, multiplier 2, and 30s maximum. Circuit breaker options
-`--restart-burst`, `--restart-window`, and `--cooldown` are all-or-none.
-Cooldown replaces a logistic wait and does not advance its sequence.
+`base` is the pre-event resting state and `asymptote` is the interval approached
+through repeated restart events. They are independently positive: either may be
+larger, or they may be equal. The returned wait can lie on either side of either
+configured interval.
+Recovery uses all time since the previous backoff, including its scheduled wait,
+without requiring success or a reset. By default, the first wait is 1s,
+immediate failures converge near 11m30s, and quiet periods move the next wait
+toward 1s.
 
-## Execution report schema 3
+Returned durations round upward to whole milliseconds. Reports identify the
+schedule as `half-life-logistic-v1` and expose `base_interval_ms`,
+`multiplier_numerator`, `multiplier_denominator`, `asymptote_interval_ms`, and
+`recovery_half_life_ms`. Cooldown replaces the calculated wait without changing
+backoff state.
+
+## Execution report schema-4
 
 `--report PATH` requests a mandatory pretty-printed JSON document ending in
 exactly one newline. It is written through a same-directory temporary file,
@@ -231,8 +245,13 @@ omitted, total, aggregate, authorization, restart, terminal-attempt, phase, and
 wrapper-status fields are mutually checked when reports are deserialized. Each
 attempt records its number, kind, phase, offsets, target PID, launch evidence,
 outcome or error provenance, cleanup proof, and restart decision. Aggregates
-include omitted attempts. A deadline reached during backoff, cooldown, or later
-setup is a top-level outside-attempt terminal. Initial spawn errors use typed
+include omitted attempts. Half-life waits set
+`attempts[].restart_decision.decision` and
+`attempts[].restart_decision.wait_kind` to `half-life-logistic-backoff`;
+`attempts[].restart_decision.half_life_logistic_sequence_index` is zero-based,
+and `supervision.restart.half_life_logistic_waits` counts all such waits. A
+deadline reached during backoff, cooldown, or later setup is a top-level
+outside-attempt terminal. Initial spawn errors use typed
 `initial_spawn_failure` provenance; statuses 126 and 127 derive exclusively
 from `not-executable` and `not-found`. Consumers must reject unsupported schema
 versions.

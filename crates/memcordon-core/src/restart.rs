@@ -48,7 +48,7 @@ pub(crate) fn clock_deadline<C: MonotonicClock>(
     Ok((deadline, clock.duration_since(clock.now(), origin)))
 }
 
-pub const LOGISTIC_MODEL: &str = "logistic-odds-v1";
+pub const HALF_LIFE_LOGISTIC_MODEL: &str = "half-life-logistic-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RestartConditions(u8);
@@ -257,158 +257,203 @@ const fn gcd(mut left: u64, mut right: u64) -> u64 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LogisticBackoffPolicy {
-    initial: Duration,
+pub struct HalfLifeLogisticBackoffPolicy {
+    base_interval: Duration,
     multiplier: BackoffMultiplier,
-    maximum: Duration,
+    asymptote_interval: Duration,
+    recovery_half_life: Duration,
 }
 
-impl Serialize for LogisticBackoffPolicy {
+impl Serialize for HalfLifeLogisticBackoffPolicy {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("LogisticBackoffPolicy", 3)?;
+        let mut state = serializer.serialize_struct("HalfLifeLogisticBackoffPolicy", 4)?;
         state.serialize_field(
-            "initial_ms",
-            &duration_millis(self.initial).map_err(serde::ser::Error::custom)?,
+            "base_interval_ms",
+            &duration_millis(self.base_interval).map_err(serde::ser::Error::custom)?,
         )?;
         state.serialize_field("multiplier", &self.multiplier)?;
         state.serialize_field(
-            "maximum_ms",
-            &duration_millis(self.maximum).map_err(serde::ser::Error::custom)?,
+            "asymptote_interval_ms",
+            &duration_millis(self.asymptote_interval).map_err(serde::ser::Error::custom)?,
+        )?;
+        state.serialize_field(
+            "recovery_half_life_ms",
+            &duration_millis(self.recovery_half_life).map_err(serde::ser::Error::custom)?,
         )?;
         state.end()
     }
 }
 
-impl Default for LogisticBackoffPolicy {
+impl Default for HalfLifeLogisticBackoffPolicy {
     fn default() -> Self {
         Self {
-            initial: Duration::from_secs(1),
-            multiplier: BackoffMultiplier::two(),
-            maximum: Duration::from_secs(30),
+            base_interval: Duration::from_millis(250),
+            multiplier: BackoffMultiplier {
+                numerator: 4,
+                denominator: 1,
+            },
+            asymptote_interval: Duration::from_secs(900),
+            recovery_half_life: Duration::from_secs(900),
         }
     }
 }
 
-impl LogisticBackoffPolicy {
+impl HalfLifeLogisticBackoffPolicy {
     pub fn new(
-        initial: Duration,
+        base_interval: Duration,
         multiplier: BackoffMultiplier,
-        maximum: Duration,
+        asymptote_interval: Duration,
+        recovery_half_life: Duration,
     ) -> Result<Self, RestartControllerError> {
         let value = Self {
-            initial,
+            base_interval,
             multiplier,
-            maximum,
+            asymptote_interval,
+            recovery_half_life,
         };
         value.validate()?;
         Ok(value)
     }
-    pub const fn initial(self) -> Duration {
-        self.initial
+    pub const fn base_interval(self) -> Duration {
+        self.base_interval
     }
     pub const fn multiplier(self) -> BackoffMultiplier {
         self.multiplier
     }
-    pub const fn maximum(self) -> Duration {
-        self.maximum
+    pub const fn asymptote_interval(self) -> Duration {
+        self.asymptote_interval
+    }
+    pub const fn recovery_half_life(self) -> Duration {
+        self.recovery_half_life
     }
     pub fn validate(self) -> Result<(), RestartControllerError> {
-        if self.initial < Duration::from_millis(10) || self.maximum < self.initial {
+        let base_interval = duration_millis(self.base_interval)?;
+        let asymptote_interval = duration_millis(self.asymptote_interval)?;
+        let recovery_half_life = duration_millis(self.recovery_half_life)?;
+        if base_interval == 0 || asymptote_interval == 0 || recovery_half_life == 0 {
             return Err(RestartControllerError::InvalidBackoff);
         }
-        let current = duration_millis(self.initial)?;
-        let maximum = duration_millis(self.maximum)?;
-        let _ = logistic_next_millis(current, maximum, self.multiplier)?;
+        let _ = half_life_logistic_next_millis(
+            base_interval,
+            base_interval,
+            asymptote_interval,
+            self.multiplier,
+            recovery_half_life,
+            0,
+        )?;
         Ok(())
     }
 }
 
-impl<'de> Deserialize<'de> for LogisticBackoffPolicy {
+impl<'de> Deserialize<'de> for HalfLifeLogisticBackoffPolicy {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
         struct Wire {
-            initial_ms: u64,
+            base_interval_ms: u64,
             multiplier: BackoffMultiplier,
-            maximum_ms: u64,
+            asymptote_interval_ms: u64,
+            recovery_half_life_ms: u64,
         }
         let wire = Wire::deserialize(deserializer)?;
         Self::new(
-            Duration::from_millis(wire.initial_ms),
+            Duration::from_millis(wire.base_interval_ms),
             wire.multiplier,
-            Duration::from_millis(wire.maximum_ms),
+            Duration::from_millis(wire.asymptote_interval_ms),
+            Duration::from_millis(wire.recovery_half_life_ms),
         )
         .map_err(serde::de::Error::custom)
     }
 }
 
-pub fn logistic_next_millis(
-    current: u64,
-    maximum: u64,
+pub fn half_life_logistic_next_millis(
+    base_interval: u64,
+    current_interval: u64,
+    asymptote_interval: u64,
     multiplier: BackoffMultiplier,
+    recovery_half_life: u64,
+    elapsed_since_last_backoff: u64,
 ) -> Result<u64, RestartControllerError> {
-    if current == 0 || maximum == 0 || current > maximum {
+    if base_interval == 0 || asymptote_interval == 0 || recovery_half_life == 0 {
         return Err(RestartControllerError::InvalidBackoff);
     }
-    let carrying = u128::from(maximum);
-    let p = u128::from(multiplier.numerator());
-    let q = u128::from(multiplier.denominator());
-    let numerator = carrying
-        .checked_mul(p)
-        .and_then(|value| value.checked_mul(u128::from(current)))
-        .ok_or(RestartControllerError::BackoffRange)?;
-    let denominator = carrying
-        .checked_mul(q)
-        .and_then(|value| {
-            p.checked_sub(q)
-                .and_then(|difference| difference.checked_mul(u128::from(current)))
-                .and_then(|addition| value.checked_add(addition))
-        })
-        .ok_or(RestartControllerError::BackoffRange)?;
-    let rounded = numerator
-        .checked_add(
-            denominator
-                .checked_sub(1)
-                .ok_or(RestartControllerError::BackoffRange)?,
-        )
-        .ok_or(RestartControllerError::BackoffRange)?
-        / denominator;
-    let bounded = rounded.max(u128::from(current)).min(carrying);
-    u64::try_from(bounded).map_err(|_| RestartControllerError::BackoffRange)
+    let decay_factor = (-(elapsed_since_last_backoff as f64 / recovery_half_life as f64)).exp2();
+    let interval_delta = i128::from(current_interval) - i128::from(base_interval);
+    let recovered_interval = base_interval as f64 + interval_delta as f64 * decay_factor;
+    let normalized_recovered = recovered_interval / asymptote_interval as f64;
+    let multiplier = multiplier.numerator() as f64 / multiplier.denominator() as f64;
+    // The reciprocal form stays monotone from zero through the horizontal limit.
+    let normalized_denominator = normalized_recovered.recip() + (multiplier - 1.0);
+    let normalized_next = multiplier / normalized_denominator;
+    let next_interval = (asymptote_interval as f64 * normalized_next).ceil();
+    Ok(next_interval as u64)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LogisticBackoffState {
-    policy: LogisticBackoffPolicy,
-    current_ms: u64,
+pub struct HalfLifeLogisticBackoffState {
+    policy: HalfLifeLogisticBackoffPolicy,
+    current_interval: Duration,
+    last_backoff_at: Option<Duration>,
 }
 
-impl LogisticBackoffState {
-    pub fn new(policy: LogisticBackoffPolicy) -> Result<Self, RestartControllerError> {
+impl HalfLifeLogisticBackoffState {
+    pub fn new(policy: HalfLifeLogisticBackoffPolicy) -> Result<Self, RestartControllerError> {
         policy.validate()?;
         Ok(Self {
-            current_ms: duration_millis(policy.initial)?,
+            current_interval: policy.base_interval,
+            last_backoff_at: None,
             policy,
         })
     }
 
-    pub const fn current_millis(&self) -> u64 {
-        self.current_ms
+    pub const fn current_interval(&self) -> Duration {
+        self.current_interval
     }
 
-    pub fn advance(&mut self) -> Result<(), RestartControllerError> {
-        self.current_ms = logistic_next_millis(
-            self.current_ms,
-            duration_millis(self.policy.maximum)?,
+    pub const fn last_backoff_at(&self) -> Option<Duration> {
+        self.last_backoff_at
+    }
+
+    pub fn effective_interval(&self, now: Duration) -> Result<Duration, RestartControllerError> {
+        let Some(last_backoff_at) = self.last_backoff_at else {
+            return Ok(self.policy.base_interval);
+        };
+        let elapsed = now
+            .checked_sub(last_backoff_at)
+            .ok_or(RestartControllerError::BackoffTimeReversed)?;
+        let base_interval = duration_millis(self.policy.base_interval)?;
+        let current_interval = duration_millis(self.current_interval)?;
+        let recovery_half_life = duration_millis(self.policy.recovery_half_life)?;
+        let decay_factor = (-(duration_millis(elapsed)? as f64 / recovery_half_life as f64)).exp2();
+        let interval_delta = i128::from(current_interval) - i128::from(base_interval);
+        let recovered = base_interval as f64 + interval_delta as f64 * decay_factor;
+        Ok(Duration::from_millis(recovered.ceil() as u64))
+    }
+
+    pub fn on_backoff(&mut self, now: Duration) -> Result<Duration, RestartControllerError> {
+        let elapsed = match self.last_backoff_at {
+            Some(last_backoff_at) => now
+                .checked_sub(last_backoff_at)
+                .ok_or(RestartControllerError::BackoffTimeReversed)?,
+            None => Duration::ZERO,
+        };
+        let next_interval = half_life_logistic_next_millis(
+            duration_millis(self.policy.base_interval)?,
+            duration_millis(self.current_interval)?,
+            duration_millis(self.policy.asymptote_interval)?,
             self.policy.multiplier,
+            duration_millis(self.policy.recovery_half_life)?,
+            duration_millis(elapsed)?,
         )?;
-        Ok(())
+        self.current_interval = Duration::from_millis(next_interval);
+        self.last_backoff_at = Some(now);
+        Ok(self.current_interval)
     }
 }
 
@@ -511,7 +556,7 @@ pub struct RestartSettings {
     effective_conditions: RestartConditions,
     dormant_conditions: Vec<DormantRestartCondition>,
     limit: RestartLimit,
-    backoff: LogisticBackoffPolicy,
+    backoff: HalfLifeLogisticBackoffPolicy,
     circuit_breaker: Option<CircuitBreakerPolicy>,
 }
 
@@ -521,7 +566,7 @@ impl RestartSettings {
         effective_conditions: RestartConditions,
         dormant_conditions: Vec<DormantRestartCondition>,
         limit: RestartLimit,
-        backoff: LogisticBackoffPolicy,
+        backoff: HalfLifeLogisticBackoffPolicy,
         circuit_breaker: Option<CircuitBreakerPolicy>,
     ) -> Result<Self, RestartControllerError> {
         let value = Self {
@@ -547,7 +592,7 @@ impl RestartSettings {
     pub const fn limit(&self) -> RestartLimit {
         self.limit
     }
-    pub const fn backoff(&self) -> LogisticBackoffPolicy {
+    pub const fn backoff(&self) -> HalfLifeLogisticBackoffPolicy {
         self.backoff
     }
     pub const fn circuit_breaker(&self) -> Option<CircuitBreakerPolicy> {
@@ -590,7 +635,7 @@ impl<'de> Deserialize<'de> for RestartSettings {
             effective_conditions: RestartConditions,
             dormant_conditions: Vec<DormantRestartCondition>,
             limit: RestartLimit,
-            backoff: LogisticBackoffPolicy,
+            backoff: HalfLifeLogisticBackoffPolicy,
             circuit_breaker: Option<CircuitBreakerPolicy>,
         }
         let wire = Wire::deserialize(deserializer)?;
@@ -623,7 +668,7 @@ pub enum CircuitState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartWaitKind {
-    LogisticBackoff,
+    HalfLifeLogisticBackoff,
     CircuitCooldown,
 }
 
@@ -632,7 +677,7 @@ pub struct ScheduledRestart {
     pub kind: RestartWaitKind,
     pub duration: Duration,
     pub restart_number: u64,
-    pub logistic_sequence_index: Option<u64>,
+    pub half_life_logistic_sequence_index: Option<u64>,
     pub circuit_state: CircuitState,
 }
 
@@ -670,10 +715,12 @@ pub enum RestartControllerError {
     NoEffectiveCondition,
     #[error("restart configured, effective, and dormant conditions are inconsistent")]
     InvalidConditions,
-    #[error("invalid logistic backoff policy")]
+    #[error("invalid half-life logistic backoff policy")]
     InvalidBackoff,
-    #[error("logistic backoff arithmetic is out of range")]
+    #[error("half-life logistic backoff arithmetic is out of range")]
     BackoffRange,
+    #[error("backoff event time moved backward")]
+    BackoffTimeReversed,
     #[error("invalid circuit breaker policy")]
     InvalidCircuit,
     #[error("restart counter is out of range")]
@@ -772,8 +819,8 @@ fn action(decision: RestartDecision, stop: RestartDecisionKind) -> RestartAction
 pub struct RestartController {
     settings: RestartSettings,
     restarts_launched: u64,
-    logistic_current_ms: u64,
-    logistic_sequence_index: u64,
+    backoff: HalfLifeLogisticBackoffState,
+    half_life_logistic_sequence_index: u64,
     eligible_events: VecDeque<Duration>,
     circuit_state: CircuitState,
     pending: Option<ScheduledRestart>,
@@ -783,10 +830,10 @@ impl RestartController {
     pub fn new(settings: RestartSettings) -> Result<Self, RestartControllerError> {
         settings.validate()?;
         Ok(Self {
-            logistic_current_ms: duration_millis(settings.backoff.initial)?,
+            backoff: HalfLifeLogisticBackoffState::new(settings.backoff)?,
             settings,
             restarts_launched: 0,
-            logistic_sequence_index: 0,
+            half_life_logistic_sequence_index: 0,
             eligible_events: VecDeque::new(),
             circuit_state: CircuitState::Closed,
             pending: None,
@@ -839,43 +886,40 @@ impl RestartController {
                     .ok_or(RestartControllerError::InvalidCircuit)?
                     .cooldown,
                 restart_number: self.next_restart_number()?,
-                logistic_sequence_index: None,
+                half_life_logistic_sequence_index: None,
                 circuit_state: CircuitState::Open,
             }
         } else {
-            let sequence_index = self.logistic_sequence_index;
-            let wait = Duration::from_millis(self.logistic_current_ms);
-            self.logistic_current_ms = logistic_next_millis(
-                self.logistic_current_ms,
-                duration_millis(self.settings.backoff.maximum)?,
-                self.settings.backoff.multiplier,
-            )?;
-            self.logistic_sequence_index = self
-                .logistic_sequence_index
+            let sequence_index = self.half_life_logistic_sequence_index;
+            let wait = self.backoff.on_backoff(now)?;
+            self.half_life_logistic_sequence_index = self
+                .half_life_logistic_sequence_index
                 .checked_add(1)
                 .ok_or(RestartControllerError::CounterRange)?;
             ScheduledRestart {
-                kind: RestartWaitKind::LogisticBackoff,
+                kind: RestartWaitKind::HalfLifeLogisticBackoff,
                 duration: wait,
                 restart_number: self.next_restart_number()?,
-                logistic_sequence_index: Some(sequence_index),
+                half_life_logistic_sequence_index: Some(sequence_index),
                 circuit_state: CircuitState::Closed,
             }
         };
         self.pending = Some(scheduled);
         record.decision = match scheduled.kind {
-            RestartWaitKind::LogisticBackoff => RestartDecisionKind::LogisticBackoff,
+            RestartWaitKind::HalfLifeLogisticBackoff => {
+                RestartDecisionKind::HalfLifeLogisticBackoff
+            }
             RestartWaitKind::CircuitCooldown => RestartDecisionKind::CircuitCooldown,
         };
         record.restart_number = Some(scheduled.restart_number);
-        record.logistic_sequence_index = scheduled.logistic_sequence_index;
+        record.half_life_logistic_sequence_index = scheduled.half_life_logistic_sequence_index;
         record.configured_wait_ms = Some(duration_millis(scheduled.duration)?);
         record.wait_kind = Some(scheduled.kind);
         record.circuit_state = scheduled.circuit_state;
         match scheduled.kind {
-            RestartWaitKind::LogisticBackoff => {
-                summary.logistic_waits = summary
-                    .logistic_waits
+            RestartWaitKind::HalfLifeLogisticBackoff => {
+                summary.half_life_logistic_waits = summary
+                    .half_life_logistic_waits
                     .checked_add(1)
                     .ok_or(RestartControllerError::CounterRange)?
             }
