@@ -160,8 +160,8 @@ fn named_github_environments_are_rejected() {
     let root = repository_root();
     let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
     let invalid = exact.replacen(
-        "    runs-on: ubuntu-24.04\n    timeout-minutes: 60\n",
-        "    runs-on: ubuntu-24.04\n    environment: release\n    timeout-minutes: 60\n",
+        "  preflight:\n    name: Release / preflight\n    runs-on: blacksmith-4vcpu-ubuntu-2404\n    timeout-minutes: 60\n",
+        "  preflight:\n    name: Release / preflight\n    runs-on: blacksmith-4vcpu-ubuntu-2404\n    environment: release\n    timeout-minutes: 60\n",
         1,
     );
     assert_ne!(invalid, exact, "environment fixture mutation must apply");
