@@ -19,6 +19,8 @@ use memcordon_core::{
 };
 use memcordon_platform::{SupervisorRequest, capabilities, cleanup_stale, probe, supervise};
 
+use crate::presentation::{self, ExecutionSummary, Presentation, SummaryTone};
+
 #[derive(Clone, Debug)]
 struct Resolution {
     backend: BackendCapabilityReport,
@@ -27,17 +29,22 @@ struct Resolution {
     report: PolicyEnvelopeReport,
 }
 
-pub fn execute(args: ExecutionArgs) -> i32 {
+pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
     if let Some(path) = &args.output.report_path {
         let parent = path
             .parent()
             .filter(|value| !value.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         if !parent.is_dir() {
-            eprintln!(
-                "memcordon: report parent directory does not exist: {}",
-                parent.display()
-            );
+            let mut out = presentation.stderr();
+            presentation::write_runtime_error(
+                &mut out,
+                format_args!(
+                    "report parent directory does not exist: {}",
+                    parent.display()
+                ),
+            )
+            .expect("report diagnostic should be writable");
             return 125;
         }
     }
@@ -45,14 +52,16 @@ pub fn execute(args: ExecutionArgs) -> i32 {
     let command = CommandSpec::new(program.clone()).args(arguments.iter().cloned());
     let resolution = match resolve(&args.policy, &args.budgets) {
         Ok(value) => value,
-        Err(error) => return finish_error(&args, &command, None, *error),
+        Err(error) => return finish_error(&args, &command, None, *error, presentation),
     };
     if !args.output.quiet {
-        render_effect_warnings(&resolution.report.effects);
+        render_effect_warnings(&resolution.report.effects, presentation);
     }
     let helper = match helper_path() {
         Ok(value) => value,
-        Err(error) => return finish_error(&args, &command, Some(&resolution), *error),
+        Err(error) => {
+            return finish_error(&args, &command, Some(&resolution), *error, presentation);
+        }
     };
     match supervise(SupervisorRequest {
         policy: resolution.policy.clone(),
@@ -60,8 +69,8 @@ pub fn execute(args: ExecutionArgs) -> i32 {
         command: command.clone(),
         memcordon_executable: helper,
     }) {
-        Ok(execution) => finish_execution(&args, &command, &resolution, execution),
-        Err(error) => finish_error(&args, &command, Some(&resolution), error),
+        Ok(execution) => finish_execution(&args, &command, &resolution, execution, presentation),
+        Err(error) => finish_error(&args, &command, Some(&resolution), error, presentation),
     }
 }
 
@@ -89,10 +98,13 @@ fn finish_execution(
     command: &CommandSpec,
     resolution: &Resolution,
     execution: SupervisionExecution,
+    presentation: &Presentation,
 ) -> i32 {
     let exit_code = execution.wrapper_exit_code();
     if args.output.summary || exit_code == 123 || exit_code == 124 || exit_code == 125 {
-        eprintln!("{}", outcome_line(&execution));
+        let mut out = presentation.stderr();
+        presentation::write_summary(&mut out, execution_summary(&execution))
+            .expect("execution summary should be writable");
     }
     if let Some(path) = &args.output.report_path {
         let report = match report(
@@ -105,12 +117,19 @@ fn finish_execution(
         ) {
             Ok(value) => value,
             Err(error) => {
-                eprintln!("memcordon: could not construct execution report: {error}");
+                let mut out = presentation.stderr();
+                presentation::write_runtime_error(
+                    &mut out,
+                    format_args!("could not construct execution report: {error}"),
+                )
+                .expect("report diagnostic should be writable");
                 return 125;
             }
         };
         if let Err(error) = write_report_atomic(path, &report) {
-            eprintln!("memcordon: {error}");
+            let mut out = presentation.stderr();
+            presentation::write_runtime_error(&mut out, error)
+                .expect("report diagnostic should be writable");
             return 125;
         }
     }
@@ -122,9 +141,12 @@ fn finish_error(
     command: &CommandSpec,
     resolution: Option<&Resolution>,
     error: Error,
+    presentation: &Presentation,
 ) -> i32 {
     let exit_code = error_exit_code(&error);
-    eprintln!("memcordon: {error}");
+    let mut out = presentation.stderr();
+    presentation::write_runtime_error(&mut out, &error)
+        .expect("runtime diagnostic should be writable");
     if let Some(path) = &args.output.report_path {
         let policy = resolution
             .map(|value| value.report.clone())
@@ -150,12 +172,19 @@ fn finish_error(
         ) {
             Ok(report) => {
                 if let Err(report_error) = write_report_atomic(path, &report) {
-                    eprintln!("memcordon: {report_error}");
+                    let mut out = presentation.stderr();
+                    presentation::write_runtime_error(&mut out, report_error)
+                        .expect("report diagnostic should be writable");
                     return 125;
                 }
             }
             Err(report_error) => {
-                eprintln!("memcordon: could not construct failure report: {report_error}");
+                let mut out = presentation.stderr();
+                presentation::write_runtime_error(
+                    &mut out,
+                    format_args!("could not construct failure report: {report_error}"),
+                )
+                .expect("report diagnostic should be writable");
                 return 125;
             }
         }
@@ -195,25 +224,52 @@ fn report(
     )
 }
 
-fn outcome_line(execution: &SupervisionExecution) -> String {
-    let outcome = match execution.terminal() {
+fn execution_summary(execution: &SupervisionExecution) -> ExecutionSummary<'_> {
+    let (outcome, tone) = match execution.terminal() {
         SupervisionTerminal::AttemptOutcome { outcome, .. } => match outcome {
-            memcordon_core::RunOutcome::Exited { .. } => "child exited",
-            memcordon_core::RunOutcome::LimitExceeded { .. } => "memory limit exceeded",
-            memcordon_core::RunOutcome::DeadlineExceeded { .. } => "deadline exceeded",
-            memcordon_core::RunOutcome::Interrupted { .. } => "interrupted",
-            memcordon_core::RunOutcome::MonitorFailed { .. } => "monitor failed",
+            memcordon_core::RunOutcome::Exited { cleanup, .. }
+                if !cleanup.errors.is_empty()
+                    || !cleanup.direct_child_reaped
+                    || cleanup.workload_empty == Some(false) =>
+            {
+                ("child exited", SummaryTone::Error)
+            }
+            memcordon_core::RunOutcome::Exited {
+                child: memcordon_core::ChildTermination::Unavailable,
+                ..
+            } => ("child exited", SummaryTone::Error),
+            memcordon_core::RunOutcome::Exited {
+                child: memcordon_core::ChildTermination::WindowsStatus { status },
+                ..
+            } if i32::try_from(*status).is_err() => ("child exited", SummaryTone::Error),
+            memcordon_core::RunOutcome::Exited { .. } if execution.wrapper_exit_code() == 0 => {
+                ("child exited", SummaryTone::Success)
+            }
+            memcordon_core::RunOutcome::Exited { .. } => ("child exited", SummaryTone::Warning),
+            memcordon_core::RunOutcome::LimitExceeded { .. } => {
+                ("memory limit exceeded", SummaryTone::Error)
+            }
+            memcordon_core::RunOutcome::DeadlineExceeded { .. } => {
+                ("deadline exceeded", SummaryTone::Error)
+            }
+            memcordon_core::RunOutcome::Interrupted { .. } => ("interrupted", SummaryTone::Warning),
+            memcordon_core::RunOutcome::MonitorFailed { .. } => {
+                ("monitor failed", SummaryTone::Error)
+            }
         },
-        SupervisionTerminal::DeadlineOutsideAttempt { .. } => "supervision deadline exceeded",
-        SupervisionTerminal::Error { .. } => "supervision failed",
+        SupervisionTerminal::DeadlineOutsideAttempt { .. } => {
+            ("supervision deadline exceeded", SummaryTone::Error)
+        }
+        SupervisionTerminal::Error { .. } => ("supervision failed", SummaryTone::Error),
     };
-    format!(
-        "memcordon: {outcome} {}; backend {}; attempts {}; restarts {}",
-        execution.wrapper_exit_code(),
-        execution.backend().name,
-        execution.attempts().total,
-        execution.restart().restarts_launched()
-    )
+    ExecutionSummary {
+        outcome,
+        tone,
+        status: execution.wrapper_exit_code(),
+        backend: &execution.backend().name,
+        attempts: execution.attempts().total,
+        restarts: execution.restart().restarts_launched(),
+    }
 }
 
 fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, Box<Error>> {
@@ -566,11 +622,13 @@ fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeRe
     }
 }
 
-pub fn plan(args: PlanArgs) -> i32 {
+pub(crate) fn plan(args: PlanArgs, presentation: &Presentation) -> i32 {
     let resolution = match resolve(&args.policy, &args.budgets) {
         Ok(value) => value,
         Err(error) => {
-            eprintln!("memcordon: {error}");
+            let mut out = presentation.stderr();
+            presentation::write_runtime_error(&mut out, error)
+                .expect("plan diagnostic should be writable");
             return 125;
         }
     };
@@ -602,15 +660,18 @@ pub fn plan(args: PlanArgs) -> i32 {
         },
     };
     if args.json {
-        print_json(&plan, "plan")
+        print_json(&plan, "plan", presentation)
     } else {
-        println!("selected backend: {}", plan.resolution.backend.name);
-        println!("launch proof: false");
+        let mut out = presentation.stdout();
+        presentation::write_selected_backend(&mut out, &plan.resolution.backend.name)
+            .expect("plan output should be writable");
+        presentation::write_label_value(&mut out, "launch proof", false)
+            .expect("plan output should be writable");
         0
     }
 }
 
-pub fn doctor(args: DoctorArgs) -> i32 {
+pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
     let probe = probe();
     let selected = probe.selected.as_ref().map(capabilities);
     let available = probe.available.iter().map(capabilities).collect::<Vec<_>>();
@@ -654,24 +715,27 @@ pub fn doctor(args: DoctorArgs) -> i32 {
         },
     };
     if args.json {
-        let code = print_json(&report, "doctor");
+        let code = print_json(&report, "doctor", presentation);
         if code != 0 {
             return code;
         }
     } else {
-        println!("memcordon {}", env!("CARGO_PKG_VERSION"));
-        println!(
-            "selected backend: {}",
+        let mut out = presentation.stdout();
+        presentation::write_version(&mut out, env!("CARGO_PKG_VERSION"))
+            .expect("doctor output should be writable");
+        presentation::write_selected_backend(
+            &mut out,
             report
                 .selected
                 .as_ref()
-                .map_or("none", |value| value.name.as_str())
-        );
+                .map_or("none", |value| value.name.as_str()),
+        )
+        .expect("doctor output should be writable");
     }
     if met { 0 } else { 125 }
 }
 
-pub fn clean(args: CleanArgs) -> i32 {
+pub(crate) fn clean(args: CleanArgs, presentation: &Presentation) -> i32 {
     match cleanup_stale(args.dry_run) {
         Ok(cleaned) => {
             if args.json {
@@ -682,17 +746,13 @@ pub fn clean(args: CleanArgs) -> i32 {
                         cleaned,
                     },
                     "clean",
+                    presentation,
                 )
             } else {
+                let mut out = presentation.stdout();
                 for value in cleaned {
-                    println!(
-                        "{} {value}",
-                        if args.dry_run {
-                            "would remove"
-                        } else {
-                            "removed"
-                        }
-                    );
+                    presentation::write_clean_action(&mut out, args.dry_run, value)
+                        .expect("clean output should be writable");
                 }
                 0
             }
@@ -700,9 +760,11 @@ pub fn clean(args: CleanArgs) -> i32 {
         Err(error) => {
             if args.json {
                 let failure = clean_failure_report(args.dry_run, &error);
-                let _ = print_json(&failure, "clean error");
+                let _ = print_json(&failure, "clean error", presentation);
             }
-            eprintln!("memcordon: {error}");
+            let mut out = presentation.stderr();
+            presentation::write_runtime_error(&mut out, error)
+                .expect("clean diagnostic should be writable");
             125
         }
     }
@@ -752,14 +814,19 @@ fn tool_report() -> ToolReport {
         version: env!("CARGO_PKG_VERSION").to_owned(),
     }
 }
-fn print_json(value: &impl serde::Serialize, name: &str) -> i32 {
+fn print_json(value: &impl serde::Serialize, name: &str, presentation: &Presentation) -> i32 {
     match serde_json::to_string_pretty(value) {
         Ok(value) => {
             println!("{value}");
             0
         }
         Err(error) => {
-            eprintln!("memcordon: could not serialize {name}: {error}");
+            let mut out = presentation.stderr();
+            presentation::write_runtime_error(
+                &mut out,
+                format_args!("could not serialize {name}: {error}"),
+            )
+            .expect("serialization diagnostic should be writable");
             125
         }
     }
@@ -831,7 +898,8 @@ fn category_name(value: ErrorCategory) -> &'static str {
         ErrorCategory::Report => "report",
     }
 }
-fn render_effect_warnings(effects: &[OptionEffectReport]) {
+fn render_effect_warnings(effects: &[OptionEffectReport], presentation: &Presentation) {
+    let mut out = presentation.stderr();
     for effect in effects {
         if let OptionEffectReport::Ignored {
             option,
@@ -839,7 +907,8 @@ fn render_effect_warnings(effects: &[OptionEffectReport]) {
             reason,
         } = effect
         {
-            eprintln!("memcordon: warning: --{option} {requested} is ineffective: {reason}");
+            presentation::write_warning(&mut out, option, requested, reason)
+                .expect("warning output should be writable");
         }
     }
 }

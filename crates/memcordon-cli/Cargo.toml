@@ -25,6 +25,8 @@ path = "src/bin/memcordon-embedding-fixture.rs"
 required-features = ["test-fixtures"]
 
 [dependencies]
+anstream.workspace = true
+anstyle.workspace = true
 clap.workspace = true
 libc.workspace = true
 memcordon-core = { path = "../memcordon-core", version = "=0.3.5-dev" }

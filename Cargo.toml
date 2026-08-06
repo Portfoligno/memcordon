@@ -17,6 +17,8 @@ repository = "https://github.com/Portfoligno/memcordon"
 readme = "README.md"
 
 [workspace.dependencies]
+anstream = "1.0.0"
+anstyle = "1.0.14"
 base64 = "0.22.1"
 clap = { version = "4.5.53", features = ["derive"] }
 libc = "0.2.178"

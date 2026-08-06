@@ -1,8 +1,10 @@
 mod commands;
+mod presentation;
 
 use memcordon::invocation::{
     CLEAN_USAGE, DOCTOR_USAGE, HelpKind, Invocation, PLAN_USAGE, ROOT_USAGE, route,
 };
+use presentation::Presentation;
 
 fn main() {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
@@ -16,33 +18,39 @@ fn main() {
         };
         std::process::exit(code);
     }
+    let presentation = Presentation::automatic();
     let code = match route(&argv) {
-        Ok(Invocation::Execute(args)) => commands::execute(args),
-        Ok(Invocation::Doctor(args)) => commands::doctor(args),
-        Ok(Invocation::Plan(args)) => commands::plan(args),
-        Ok(Invocation::Clean(args)) => commands::clean(args),
+        Ok(Invocation::Execute(args)) => commands::execute(args, &presentation),
+        Ok(Invocation::Doctor(args)) => commands::doctor(args, &presentation),
+        Ok(Invocation::Plan(args)) => commands::plan(args, &presentation),
+        Ok(Invocation::Clean(args)) => commands::clean(args, &presentation),
         Ok(Invocation::Version) => {
-            println!("memcordon {}", env!("CARGO_PKG_VERSION"));
+            let mut out = presentation.stdout();
+            presentation::write_version(&mut out, env!("CARGO_PKG_VERSION"))
+                .expect("version output should be writable");
             0
         }
         Ok(Invocation::Help(kind)) => {
-            println!(
-                "{}",
-                match kind {
-                    HelpKind::Root => ROOT_USAGE,
-                    HelpKind::Doctor => DOCTOR_USAGE,
-                    HelpKind::Plan => PLAN_USAGE,
-                    HelpKind::Clean => CLEAN_USAGE,
-                }
-            );
+            let help = match kind {
+                HelpKind::Root => ROOT_USAGE,
+                HelpKind::Doctor => DOCTOR_USAGE,
+                HelpKind::Plan => PLAN_USAGE,
+                HelpKind::Clean => CLEAN_USAGE,
+            };
+            let mut out = presentation.stdout();
+            presentation::write_help(&mut out, help).expect("help output should be writable");
             0
         }
         Err(error) if error.code == "MCCLI-HELP" => {
-            println!("{}", error.message);
+            let mut out = presentation.stdout();
+            presentation::write_help(&mut out, &error.message)
+                .expect("topic help output should be writable");
             0
         }
         Err(error) => {
-            eprintln!("error[{}]: {}", error.code, error.message);
+            let mut out = presentation.stderr();
+            presentation::write_usage_error(&mut out, error.code, error.message)
+                .expect("usage diagnostic should be writable");
             2
         }
     };

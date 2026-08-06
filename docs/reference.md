@@ -100,6 +100,11 @@ incomplete cleanup returns 125.
 
 Machine-readable consumers must inspect `schema_version`.
 
+Human-readable output uses adaptive terminal styling and is plain when
+redirected or captured by default. Standard terminal conventions, including
+`NO_COLOR`, control decoration only; JSON output, report files, child streams,
+and private process-control traffic are never decorated by MemCordon.
+
 Root `--version` prints one line. Private launcher and guardian routes do not
 appear in public help or the Rust facade.
 

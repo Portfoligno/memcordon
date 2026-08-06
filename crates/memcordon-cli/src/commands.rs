@@ -1,5 +1,5 @@
 mod application;
-pub use application::{clean, doctor, execute, plan};
+pub(crate) use application::{clean, doctor, execute, plan};
 
 #[cfg(unix)]
 const LAUNCHER_STATUS_MAGIC: &[u8; 4] = b"MCLS";

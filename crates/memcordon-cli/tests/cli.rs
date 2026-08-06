@@ -548,6 +548,7 @@ fn doctor_text_and_json_have_distinct_complete_shapes() {
     assert!(output.stderr.is_empty());
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("doctor must emit JSON");
+    assert!(!output.stdout.contains(&0x1b));
     assert_eq!(value["schema_version"], DOCTOR_REPORT_SCHEMA_VERSION);
     assert_eq!(value["tool"]["name"], "memcordon");
     assert!(value.get("selected").is_some());
@@ -602,6 +603,7 @@ fn plan_text_and_json_have_distinct_resolution_shapes_when_backend_is_available(
     assert!(json.stderr.is_empty());
     let value: serde_json::Value =
         serde_json::from_slice(&json.stdout).expect("plan must emit JSON");
+    assert!(!json.stdout.contains(&0x1b));
     assert_eq!(value["schema_version"], PLAN_REPORT_SCHEMA_VERSION);
     assert!(value["request"].is_object());
     assert!(value["resolution"]["backend"].is_object());
@@ -787,6 +789,7 @@ fn clean_json_uses_schema_one() {
     assert!(output.status.success());
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("clean must emit JSON");
+    assert!(!output.stdout.contains(&0x1b));
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["dry_run"], true);
 }
@@ -805,6 +808,7 @@ fn schema_four_success_report_uses_plus_memory_invocation() {
     assert_eq!(output.status.code(), Some(0));
     let bytes = std::fs::read(report).expect("report should exist");
     assert_eq!(bytes.last(), Some(&b'\n'));
+    assert!(!bytes.contains(&0x1b));
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("report should be JSON");
     assert_eq!(value["schema_version"], 4);
     assert_eq!(value["invocation"]["syntax"], "plus-budgets-v1");
