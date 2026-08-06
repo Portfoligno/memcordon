@@ -6,8 +6,9 @@ use memcordon_core::test_support::{
 #[test]
 fn controller_certification_covers_limits_circuit_waits_and_cleanup() {
     let result = controller_scenario().expect("deterministic controller scenario");
-    assert!(result.window_equality_opened);
-    assert!(result.burst_one_half_opened);
+    assert!(result.decayed_threshold_opened);
+    assert!(result.threshold_one_half_opened);
+    assert!(result.cooldown_preserved_backoff);
     assert!(result.noneligible_stopped);
     assert!(result.finite_exhausted);
     assert!(result.unsafe_cleanup_stopped);

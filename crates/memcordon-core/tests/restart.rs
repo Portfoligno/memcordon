@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use memcordon_core::test_support::half_life_logistic_scenario;
 use memcordon_core::{
-    BackoffMultiplier, HalfLifeLogisticBackoffPolicy, HalfLifeLogisticBackoffState,
-    half_life_logistic_next_millis,
+    BackoffMultiplier, CircuitBreakerPolicy, HalfLifeLogisticBackoffPolicy,
+    HalfLifeLogisticBackoffState, half_life_logistic_next_millis,
 };
 
 #[test]
@@ -62,6 +62,50 @@ fn default_policy_is_exact_serialized_and_backward_compatible() {
         serde_json::to_value(explicit_legacy).expect("serialize explicit legacy policy"),
         legacy
     );
+}
+
+#[test]
+fn circuit_policy_serializes_the_decayed_score_contract_exactly() {
+    let policy =
+        CircuitBreakerPolicy::new(2.5, Duration::from_secs(30), Duration::from_secs(5 * 60))
+            .expect("valid circuit policy");
+    assert_eq!(policy.threshold(), 2.5);
+    assert_eq!(policy.half_life(), Duration::from_secs(30));
+    assert_eq!(policy.cooldown(), Duration::from_secs(5 * 60));
+
+    let value = serde_json::to_value(policy).expect("serialize circuit policy");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "threshold": 2.5,
+            "half_life_ms": 30_000,
+            "cooldown_ms": 300_000
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<CircuitBreakerPolicy>(value).expect("deserialize circuit policy"),
+        policy
+    );
+}
+
+#[test]
+fn circuit_policy_rejects_invalid_thresholds_and_durations() {
+    for threshold in [0.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+        assert!(
+            CircuitBreakerPolicy::new(threshold, Duration::from_secs(1), Duration::from_secs(1),)
+                .is_err(),
+            "threshold={threshold}"
+        );
+    }
+    assert!(CircuitBreakerPolicy::new(2.0, Duration::ZERO, Duration::ZERO).is_err());
+}
+
+#[test]
+fn circuit_policy_accepts_one_millisecond_half_life_and_zero_cooldown() {
+    let policy = CircuitBreakerPolicy::new(2.0, Duration::from_millis(1), Duration::ZERO)
+        .expect("duration boundaries are valid");
+    assert_eq!(policy.half_life(), Duration::from_millis(1));
+    assert_eq!(policy.cooldown(), Duration::ZERO);
 }
 
 #[test]

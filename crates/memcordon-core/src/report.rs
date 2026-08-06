@@ -509,10 +509,10 @@ pub struct BackoffPolicyReport {
     pub quantization: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CircuitBreakerPolicyReport {
-    pub burst: u64,
-    pub window_ms: u64,
+    pub threshold: f64,
+    pub half_life_ms: u64,
     pub cooldown_ms: u64,
 }
 

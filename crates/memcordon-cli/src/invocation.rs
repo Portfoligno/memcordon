@@ -50,9 +50,9 @@ Policy options (value; default):
   --backoff-multiplier DECIMAL           Delay growth control, >1 and <=100; 4
   --backoff-asymptote DURATION           Logistic asymptote; 15m
   --backoff-recovery-half-life DURATION  Quiet-time half-life of distance from base; 15m
-  --restart-burst COUNT                  Circuit-breaker burst count; unset
-  --restart-window DURATION              Circuit-breaker window; unset
-  --cooldown DURATION                    Circuit-breaker cooldown; unset
+  --circuit-threshold SCORE              Decayed failure pressure to open; unset
+  --circuit-cooldown DURATION            Minimum circuit quarantine; unset
+  --circuit-half-life DURATION           Failure-pressure half-life; backoff half-life
 
 Output options:
   --report PATH                          Write schema-4 JSON to PATH; unset
@@ -67,7 +67,8 @@ Rules:
   --enforcement, --metric, --poll-interval, and --swap need +MEMORY;
   --deadline-scope needs +TIME; --limit-grace needs either budget. Restart tuning
   needs --restart or --restart-on. Backoff base, asymptote, and half-life must be >=1ms.
-  Set all three circuit-breaker options; window and cooldown must be >=10ms.
+  Set circuit threshold and cooldown together. Circuit cooldown may be zero;
+  circuit half-life must be >=1ms, and threshold must be a positive finite number.
   --summary conflicts with --quiet. --report needs an existing parent and cannot
   use stdout. Command arguments pass unchanged.
 
@@ -113,9 +114,9 @@ Policy options (value; default):
   --backoff-multiplier DECIMAL           Delay growth control, >1 and <=100; 4
   --backoff-asymptote DURATION           Logistic asymptote; 15m
   --backoff-recovery-half-life DURATION  Quiet-time half-life of distance from base; 15m
-  --restart-burst COUNT                  Circuit-breaker burst count; unset
-  --restart-window DURATION              Circuit-breaker window; unset
-  --cooldown DURATION                    Circuit-breaker cooldown; unset
+  --circuit-threshold SCORE              Decayed failure pressure to open; unset
+  --circuit-cooldown DURATION            Minimum circuit quarantine; unset
+  --circuit-half-life DURATION           Failure-pressure half-life; backoff half-life
   --json                                 Write schema-3 JSON to stdout; off
   -h, --help                             Print this help
 
@@ -124,7 +125,8 @@ Rules:
   -- are invalid. --enforcement, --metric, --poll-interval, and --swap need +MEMORY;
   --deadline-scope needs +TIME; --limit-grace needs either budget. Restart tuning
   needs --restart or --restart-on. Backoff base, asymptote, and half-life must be >=1ms.
-  Set all three circuit-breaker options; window and cooldown must be >=10ms.
+  Set circuit threshold and cooldown together. Circuit cooldown may be zero;
+  circuit half-life must be >=1ms, and threshold must be a positive finite number.
 
 Reference:
   https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#;
@@ -147,9 +149,9 @@ pub const PUBLIC_POLICY_OPTIONS: &[&str] = &[
     "--backoff-multiplier",
     "--backoff-asymptote",
     "--backoff-recovery-half-life",
-    "--restart-burst",
-    "--restart-window",
-    "--cooldown",
+    "--circuit-threshold",
+    "--circuit-cooldown",
+    "--circuit-half-life",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -284,7 +286,7 @@ impl LimitToken {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PolicyArgs {
     pub enforcement: Enforcement,
     pub wait_for: Lifetime,
@@ -303,11 +305,13 @@ pub struct PolicyArgs {
     backoff_multiplier: Option<BackoffMultiplier>,
     backoff_asymptote_interval: Option<Duration>,
     backoff_recovery_half_life: Option<Duration>,
-    restart_burst: Option<NonZeroU64>,
-    restart_window: Option<Duration>,
-    cooldown: Option<Duration>,
+    circuit_threshold: Option<f64>,
+    circuit_cooldown: Option<Duration>,
+    circuit_half_life: Option<Duration>,
     pub explicit: ExplicitPolicyOptions,
 }
+
+impl Eq for PolicyArgs {}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExplicitPolicyOptions {
@@ -340,9 +344,9 @@ impl Default for PolicyArgs {
             backoff_multiplier: None,
             backoff_asymptote_interval: None,
             backoff_recovery_half_life: None,
-            restart_burst: None,
-            restart_window: None,
-            cooldown: None,
+            circuit_threshold: None,
+            circuit_cooldown: None,
+            circuit_half_life: None,
             explicit: ExplicitPolicyOptions::default(),
         }
     }
@@ -742,21 +746,27 @@ fn validate_policy_dependencies(
             "--backoff-base, --backoff-asymptote, and --backoff-recovery-half-life must be >=1ms",
         )
     })?;
-    policy.circuit_breaker = match (policy.restart_burst, policy.restart_window, policy.cooldown) {
-        (None, None, None) => None,
-        (Some(burst), Some(window), Some(cooldown))
-            if window >= Duration::from_millis(10) && cooldown >= Duration::from_millis(10) =>
-        {
-            Some(
-                CircuitBreakerPolicy::new(burst, window, cooldown).map_err(|error| {
-                    CliError::new("MCUSAGE-CIRCUIT-INCOMPLETE", error.to_string())
-                })?,
+    policy.circuit_breaker = match (policy.circuit_threshold, policy.circuit_cooldown) {
+        (None, None) if policy.circuit_half_life.is_none() => None,
+        (Some(threshold), Some(cooldown)) => Some(
+            CircuitBreakerPolicy::new(
+                threshold,
+                policy
+                    .circuit_half_life
+                    .unwrap_or(policy.backoff.recovery_half_life()),
+                cooldown,
             )
-        }
+            .map_err(|_| {
+                CliError::new(
+                    "MCUSAGE-CIRCUIT-INCOMPLETE",
+                    "circuit threshold must be a positive finite number, circuit cooldown may be zero, and circuit half-life must be at least 1ms",
+                )
+            })?,
+        ),
         _ => {
             return Err(CliError::new(
                 "MCUSAGE-CIRCUIT-INCOMPLETE",
-                "--restart-burst, --restart-window, and --cooldown must be supplied together and durations must be at least 10ms",
+                "--circuit-threshold and --circuit-cooldown must be supplied together; circuit cooldown may be zero and circuit half-life must be at least 1ms",
             ));
         }
     };
@@ -824,9 +834,9 @@ fn parse_policy_option(
             | "--backoff-multiplier"
             | "--backoff-asymptote"
             | "--backoff-recovery-half-life"
-            | "--restart-burst"
-            | "--restart-window"
-            | "--cooldown"
+            | "--circuit-threshold"
+            | "--circuit-cooldown"
+            | "--circuit-half-life"
     ) {
         return Err(unknown_option(name));
     }
@@ -951,24 +961,31 @@ fn parse_policy_option(
                 parse_duration(text).map_err(|message| CliError::new("MCCLI-DURATION", message))?,
             )
         }
-        "--restart-burst" => {
+        "--circuit-threshold" => {
             policy.explicit.restart_tuning = true;
-            policy.restart_burst = Some(text.parse::<NonZeroU64>().map_err(|_| {
+            let threshold = text.parse::<f64>().map_err(|_| {
                 CliError::new(
                     "MCUSAGE-CIRCUIT-INCOMPLETE",
-                    "restart burst must be positive",
+                    "circuit threshold must be a positive finite number",
                 )
-            })?)
+            })?;
+            if !threshold.is_finite() || threshold <= 0.0 {
+                return Err(CliError::new(
+                    "MCUSAGE-CIRCUIT-INCOMPLETE",
+                    "circuit threshold must be a positive finite number",
+                ));
+            }
+            policy.circuit_threshold = Some(threshold)
         }
-        "--restart-window" => {
+        "--circuit-cooldown" => {
             policy.explicit.restart_tuning = true;
-            policy.restart_window = Some(
+            policy.circuit_cooldown = Some(
                 parse_duration(text).map_err(|message| CliError::new("MCCLI-DURATION", message))?,
             )
         }
-        "--cooldown" => {
+        "--circuit-half-life" => {
             policy.explicit.restart_tuning = true;
-            policy.cooldown = Some(
+            policy.circuit_half_life = Some(
                 parse_duration(text).map_err(|message| CliError::new("MCCLI-DURATION", message))?,
             )
         }

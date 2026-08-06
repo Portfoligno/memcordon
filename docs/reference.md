@@ -53,9 +53,9 @@ policies are typed separately.
 | `--backoff-multiplier` | exact decimal greater than 1 and at most 100 | `4` |
 | `--backoff-asymptote` | duration of at least 1 ms | `15m` |
 | `--backoff-recovery-half-life` | duration of at least 1 ms | `15m` |
-| `--restart-burst` | positive count | unset |
-| `--restart-window` | duration | unset |
-| `--cooldown` | duration | unset |
+| `--circuit-threshold` | positive decayed failure score | unset |
+| `--circuit-cooldown` | nonnegative duration | unset |
+| `--circuit-half-life` | duration of at least 1 ms | backoff recovery half-life |
 | `--report` | existing-parent filesystem path | unset |
 | `--summary` | flag | false |
 | `--quiet` | flag | false |
@@ -66,9 +66,11 @@ with `--quiet`. Quiet mode never suppresses required diagnostics, cleanup
 errors, child streams, or a required report. Execution reports never use
 stdout, and `-` is not a report path.
 
-Restart tuning is valid only when restart is enabled. The three circuit-breaker
-options are an atomic group. A requested restart condition without its
-corresponding budget is recorded as dormant rather than treated as effective.
+Restart tuning is valid only when restart is enabled. Circuit threshold and
+circuit cooldown must be supplied together; the circuit half-life is an
+optional override that is valid only with that pair. A requested restart
+condition without its corresponding budget is recorded as dormant rather than
+treated as effective.
 
 ## Utilities
 
@@ -212,11 +214,25 @@ without requiring success or a reset. By default, the first wait is 1s,
 immediate failures converge near 11m30s, and quiet periods move the next wait
 toward 1s.
 
+When the circuit breaker is configured, each limit failure updates an
+exponentially decayed pressure score:
+
+```text
+score = 1 + previous_score * 2 ** (-elapsed_since_previous_failure / circuit_half_life)
+```
+
+The circuit opens when this score reaches `--circuit-threshold`. Its half-life
+defaults to `--backoff-recovery-half-life`; `--circuit-half-life` selects an
+independent timescale. This is continuous decay, not a rolling-window count.
+Opening the circuit, or failing a half-open probe, schedules the greater of the
+calculated logistic wait and `--circuit-cooldown`. The logistic backoff always
+advances, so enabling the circuit never shortens the normal retry wait.
+
 Returned durations round upward to whole milliseconds. Reports identify the
 schedule as `half-life-logistic-v1` and expose `base_interval_ms`,
 `multiplier_numerator`, `multiplier_denominator`, `asymptote_interval_ms`, and
-`recovery_half_life_ms`. Cooldown replaces the calculated wait without changing
-backoff state.
+`recovery_half_life_ms`. Circuit policy reports expose `threshold`,
+`half_life_ms`, and `cooldown_ms`.
 
 ## Execution report schema-4
 

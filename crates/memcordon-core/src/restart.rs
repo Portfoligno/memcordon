@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::str::FromStr;
 use std::time::Duration;
@@ -464,12 +463,22 @@ fn duration_millis(duration: Duration) -> Result<u64, RestartControllerError> {
         .map_err(|_| RestartControllerError::BackoffRange)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct CircuitBreakerPolicy {
-    burst: NonZeroU64,
-    window: Duration,
+    threshold: f64,
+    half_life: Duration,
     cooldown: Duration,
 }
+
+impl PartialEq for CircuitBreakerPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.threshold == other.threshold
+            && self.half_life == other.half_life
+            && self.cooldown == other.cooldown
+    }
+}
+
+impl Eq for CircuitBreakerPolicy {}
 
 impl Serialize for CircuitBreakerPolicy {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -478,10 +487,10 @@ impl Serialize for CircuitBreakerPolicy {
     {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("CircuitBreakerPolicy", 3)?;
-        state.serialize_field("burst", &self.burst)?;
+        state.serialize_field("threshold", &self.threshold)?;
         state.serialize_field(
-            "window_ms",
-            &duration_millis(self.window).map_err(serde::ser::Error::custom)?,
+            "half_life_ms",
+            &duration_millis(self.half_life).map_err(serde::ser::Error::custom)?,
         )?;
         state.serialize_field(
             "cooldown_ms",
@@ -493,32 +502,34 @@ impl Serialize for CircuitBreakerPolicy {
 
 impl CircuitBreakerPolicy {
     pub fn new(
-        burst: NonZeroU64,
-        window: Duration,
+        threshold: f64,
+        half_life: Duration,
         cooldown: Duration,
     ) -> Result<Self, RestartControllerError> {
         let value = Self {
-            burst,
-            window,
+            threshold,
+            half_life,
             cooldown,
         };
         value.validate()?;
         Ok(value)
     }
-    pub const fn burst(self) -> NonZeroU64 {
-        self.burst
+    pub const fn threshold(self) -> f64 {
+        self.threshold
     }
-    pub const fn window(self) -> Duration {
-        self.window
+    pub const fn half_life(self) -> Duration {
+        self.half_life
     }
     pub const fn cooldown(self) -> Duration {
         self.cooldown
     }
     pub fn validate(self) -> Result<(), RestartControllerError> {
-        if self.window < Duration::from_millis(10) || self.cooldown < Duration::from_millis(10) {
+        if !self.threshold.is_finite()
+            || self.threshold <= 0.0
+            || self.half_life < Duration::from_millis(1)
+        {
             return Err(RestartControllerError::InvalidCircuit);
         }
-        usize::try_from(self.burst.get()).map_err(|_| RestartControllerError::CounterRange)?;
         Ok(())
     }
 }
@@ -530,14 +541,14 @@ impl<'de> Deserialize<'de> for CircuitBreakerPolicy {
     {
         #[derive(Deserialize)]
         struct Wire {
-            burst: NonZeroU64,
-            window_ms: u64,
+            threshold: f64,
+            half_life_ms: u64,
             cooldown_ms: u64,
         }
         let wire = Wire::deserialize(deserializer)?;
         Self::new(
-            wire.burst,
-            Duration::from_millis(wire.window_ms),
+            wire.threshold,
+            Duration::from_millis(wire.half_life_ms),
             Duration::from_millis(wire.cooldown_ms),
         )
         .map_err(serde::de::Error::custom)
@@ -821,7 +832,8 @@ pub struct RestartController {
     restarts_launched: u64,
     backoff: HalfLifeLogisticBackoffState,
     half_life_logistic_sequence_index: u64,
-    eligible_events: VecDeque<Duration>,
+    circuit_pressure: f64,
+    last_circuit_event_at: Option<Duration>,
     circuit_state: CircuitState,
     pending: Option<ScheduledRestart>,
 }
@@ -834,7 +846,8 @@ impl RestartController {
             settings,
             restarts_launched: 0,
             half_life_logistic_sequence_index: 0,
-            eligible_events: VecDeque::new(),
+            circuit_pressure: 0.0,
+            last_circuit_event_at: None,
             circuit_state: CircuitState::Closed,
             pending: None,
         })
@@ -874,31 +887,32 @@ impl RestartController {
             return Err(RestartControllerError::InvalidTransition);
         }
 
+        let sequence_index = self.half_life_logistic_sequence_index;
+        let logistic_wait = self.backoff.on_backoff(now)?;
+        self.half_life_logistic_sequence_index = self
+            .half_life_logistic_sequence_index
+            .checked_add(1)
+            .ok_or(RestartControllerError::CounterRange)?;
         let opens = self.record_eligible_event(now)?;
         let half_open_failed = self.circuit_state == CircuitState::HalfOpen;
         let scheduled = if opens || half_open_failed {
             self.circuit_state = CircuitState::Open;
+            let cooldown = self
+                .settings
+                .circuit_breaker
+                .ok_or(RestartControllerError::InvalidCircuit)?
+                .cooldown;
             ScheduledRestart {
                 kind: RestartWaitKind::CircuitCooldown,
-                duration: self
-                    .settings
-                    .circuit_breaker
-                    .ok_or(RestartControllerError::InvalidCircuit)?
-                    .cooldown,
+                duration: logistic_wait.max(cooldown),
                 restart_number: self.next_restart_number()?,
-                half_life_logistic_sequence_index: None,
+                half_life_logistic_sequence_index: Some(sequence_index),
                 circuit_state: CircuitState::Open,
             }
         } else {
-            let sequence_index = self.half_life_logistic_sequence_index;
-            let wait = self.backoff.on_backoff(now)?;
-            self.half_life_logistic_sequence_index = self
-                .half_life_logistic_sequence_index
-                .checked_add(1)
-                .ok_or(RestartControllerError::CounterRange)?;
             ScheduledRestart {
                 kind: RestartWaitKind::HalfLifeLogisticBackoff,
-                duration: wait,
+                duration: logistic_wait,
                 restart_number: self.next_restart_number()?,
                 half_life_logistic_sequence_index: Some(sequence_index),
                 circuit_state: CircuitState::Closed,
@@ -1018,19 +1032,19 @@ impl RestartController {
         let Some(circuit) = self.settings.circuit_breaker else {
             return Ok(false);
         };
-        while self
-            .eligible_events
-            .front()
-            .is_some_and(|old| now.saturating_sub(*old) > circuit.window)
-        {
-            self.eligible_events.pop_front();
-        }
-        self.eligible_events.push_back(now);
-        let capacity = usize::try_from(circuit.burst.get())
-            .map_err(|_| RestartControllerError::CounterRange)?;
-        while self.eligible_events.len() > capacity {
-            self.eligible_events.pop_front();
-        }
-        Ok(self.eligible_events.len() >= capacity)
+        let decay = match self.last_circuit_event_at {
+            Some(previous) => {
+                let elapsed = now
+                    .checked_sub(previous)
+                    .ok_or(RestartControllerError::BackoffTimeReversed)?;
+                let elapsed_ms = duration_millis(elapsed)? as f64;
+                let half_life_ms = duration_millis(circuit.half_life)? as f64;
+                (-(elapsed_ms / half_life_ms)).exp2()
+            }
+            None => 0.0,
+        };
+        self.circuit_pressure = 1.0 + self.circuit_pressure * decay;
+        self.last_circuit_event_at = Some(now);
+        Ok(self.circuit_pressure >= circuit.threshold)
     }
 }

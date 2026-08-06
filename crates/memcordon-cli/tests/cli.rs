@@ -182,6 +182,117 @@ fn half_life_backoff_scalars_are_validated_after_order_independent_collection() 
 }
 
 #[test]
+fn circuit_breaker_uses_a_decayed_score_and_inherits_the_backoff_half_life() {
+    let inherited = execution(&[
+        "--restart",
+        "--backoff-recovery-half-life",
+        "4s",
+        "--circuit-threshold",
+        "2.5",
+        "--circuit-cooldown",
+        "3s",
+        "+1GiB",
+        "program",
+    ]);
+    let inherited_circuit = inherited
+        .policy
+        .circuit_breaker
+        .expect("complete circuit policy");
+    assert_eq!(inherited_circuit.threshold(), 2.5);
+    assert_eq!(
+        inherited_circuit.half_life(),
+        inherited.policy.backoff.recovery_half_life()
+    );
+    assert_eq!(
+        inherited_circuit.cooldown(),
+        std::time::Duration::from_secs(3)
+    );
+
+    let explicit = execution(&[
+        "--circuit-half-life",
+        "1ms",
+        "--circuit-cooldown",
+        "0ms",
+        "--circuit-threshold",
+        "2.5",
+        "--restart",
+        "+1GiB",
+        "program",
+    ]);
+    let explicit_circuit = explicit
+        .policy
+        .circuit_breaker
+        .expect("complete circuit policy with override");
+    assert_eq!(explicit_circuit.threshold(), 2.5);
+    assert_eq!(
+        explicit_circuit.half_life(),
+        std::time::Duration::from_millis(1)
+    );
+    assert_eq!(explicit_circuit.cooldown(), std::time::Duration::ZERO);
+}
+
+#[test]
+fn circuit_breaker_rejects_incomplete_invalid_and_removed_options() {
+    for values in [
+        &["--restart", "--circuit-threshold", "2", "+1GiB", "program"][..],
+        &["--restart", "--circuit-cooldown", "1s", "+1GiB", "program"][..],
+        &["--restart", "--circuit-half-life", "1s", "+1GiB", "program"][..],
+    ] {
+        assert_eq!(
+            route(&native(values))
+                .expect_err("invalid circuit policy must fail")
+                .code,
+            "MCUSAGE-CIRCUIT-INCOMPLETE"
+        );
+    }
+
+    let zero_half_life = route(&native(&[
+        "--restart",
+        "--circuit-threshold",
+        "2",
+        "--circuit-cooldown",
+        "0ms",
+        "--circuit-half-life",
+        "0ms",
+        "+1GiB",
+        "program",
+    ]))
+    .expect_err("zero circuit half-life must fail");
+    assert_eq!(zero_half_life.code, "MCUSAGE-CIRCUIT-INCOMPLETE");
+    assert!(zero_half_life.message.contains("at least 1ms"));
+
+    let invalid_threshold = route(&native(&[
+        "--restart",
+        "--circuit-threshold",
+        "0",
+        "--circuit-cooldown",
+        "0ms",
+        "+1GiB",
+        "program",
+    ]))
+    .expect_err("non-positive circuit threshold must fail");
+    assert_eq!(invalid_threshold.code, "MCUSAGE-CIRCUIT-INCOMPLETE");
+    assert!(invalid_threshold.message.contains("positive finite number"));
+
+    let without_restart = route(&native(&[
+        "--circuit-threshold",
+        "2",
+        "--circuit-cooldown",
+        "1s",
+        "+1GiB",
+        "program",
+    ]))
+    .expect_err("circuit tuning without restart must fail");
+    assert_eq!(without_restart.code, "MCUSAGE-RESTART-CONDITION");
+
+    for removed in ["--restart-burst", "--restart-window", "--cooldown"] {
+        let error = route(&native(&["--restart", removed, "1", "+1GiB", "program"]))
+            .expect_err("removed circuit option must stay rejected");
+        assert_eq!(error.code, "MCCLI-UNKNOWN-OPTION", "option={removed}");
+    }
+}
+
+#[test]
 fn wrapper_options_stop_at_the_limit() {
     let parsed = execution(&[
         "--enforcement=hard",
@@ -430,7 +541,17 @@ fn plan_text_and_json_have_distinct_resolution_shapes_when_backend_is_available(
 #[test]
 fn plan_restart_json_carries_half_life_defaults_and_source_order() {
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
-        .args(["plan", "--json", "--restart", "+1s", "+1GiB"])
+        .args([
+            "plan",
+            "--json",
+            "--restart",
+            "--circuit-threshold",
+            "2.5",
+            "--circuit-cooldown",
+            "5m",
+            "+1s",
+            "+1GiB",
+        ])
         .output()
         .expect("plan should run");
     assert!(output.status.success());
@@ -462,6 +583,28 @@ fn plan_restart_json_carries_half_life_defaults_and_source_order() {
     assert_eq!(
         value["request"]["restart"]["backoff"]["recovery_half_life_ms"],
         900_000
+    );
+    assert_eq!(
+        value["request"]["restart"]["circuit_breaker"]["threshold"],
+        2.5
+    );
+    assert_eq!(
+        value["request"]["restart"]["circuit_breaker"]["half_life_ms"],
+        900_000
+    );
+    assert_eq!(
+        value["request"]["restart"]["circuit_breaker"]["cooldown_ms"],
+        300_000
+    );
+    assert!(
+        value["request"]["restart"]["circuit_breaker"]
+            .get("burst")
+            .is_none()
+    );
+    assert!(
+        value["request"]["restart"]["circuit_breaker"]
+            .get("window_ms")
+            .is_none()
     );
     assert_eq!(
         value["resolution"]["backoff_sample_ms"],

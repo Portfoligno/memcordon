@@ -514,8 +514,8 @@ fn requested_report(
             circuit_breaker: args
                 .circuit_breaker
                 .map(|value| CircuitBreakerPolicyReport {
-                    burst: value.burst().get(),
-                    window_ms: milliseconds(value.window()),
+                    threshold: value.threshold(),
+                    half_life_ms: milliseconds(value.half_life()),
                     cooldown_ms: milliseconds(value.cooldown()),
                 }),
         },

@@ -285,8 +285,8 @@ fn schema_four_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
                 quantization: "ceil-whole-milliseconds".to_owned(),
             }),
             circuit_breaker: restart_enabled.then_some(CircuitBreakerPolicyReport {
-                burst: 2,
-                window_ms: 10000,
+                threshold: 2.5,
+                half_life_ms: 10000,
                 cooldown_ms: 3000,
             }),
         };
@@ -340,8 +340,22 @@ fn schema_four_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
                 1000
             );
             assert_eq!(
-                value["policy"]["requested"]["restart"]["circuit_breaker"]["window_ms"],
+                value["policy"]["requested"]["restart"]["circuit_breaker"]["threshold"],
+                2.5
+            );
+            assert_eq!(
+                value["policy"]["requested"]["restart"]["circuit_breaker"]["half_life_ms"],
                 10000
+            );
+            assert!(
+                value["policy"]["requested"]["restart"]["circuit_breaker"]
+                    .get("burst")
+                    .is_none()
+            );
+            assert!(
+                value["policy"]["requested"]["restart"]["circuit_breaker"]
+                    .get("window_ms")
+                    .is_none()
             );
         } else {
             assert!(value["policy"]["requested"]["restart"]["backoff"].is_null());

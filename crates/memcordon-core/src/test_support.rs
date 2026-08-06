@@ -79,8 +79,9 @@ pub struct ControllerScenario {
     pub finite_exhausted: bool,
     pub interrupted_launches: u64,
     pub deadline_launches: u64,
-    pub window_equality_opened: bool,
-    pub burst_one_half_opened: bool,
+    pub decayed_threshold_opened: bool,
+    pub threshold_one_half_opened: bool,
+    pub cooldown_preserved_backoff: bool,
     pub noneligible_stopped: bool,
     pub unsafe_cleanup_stopped: bool,
 }
@@ -153,12 +154,8 @@ fn transition(
 }
 
 pub fn controller_scenario() -> Result<ControllerScenario, String> {
-    let circuit = CircuitBreakerPolicy::new(
-        NonZeroU64::new(2).expect("constant nonzero"),
-        Duration::from_secs(10),
-        Duration::from_secs(3),
-    )
-    .map_err(|error| error.to_string())?;
+    let circuit = CircuitBreakerPolicy::new(1.5, Duration::from_secs(10), Duration::from_secs(3))
+        .map_err(|error| error.to_string())?;
     let mut controller = RestartController::new(settings(RestartLimit::Unlimited, Some(circuit))?)
         .map_err(|error| error.to_string())?;
     let mut summary = RestartSummary::default();
@@ -185,13 +182,18 @@ pub fn controller_scenario() -> Result<ControllerScenario, String> {
             &mut summary,
         )
         .map_err(|error| error.to_string())?;
-    let window_equality_opened = matches!(equality_decision, RestartDecision::Wait(wait)
-        if wait.kind == crate::RestartWaitKind::CircuitCooldown);
+    let (decayed_threshold_opened, equality_wait) = match equality_decision {
+        RestartDecision::Wait(wait) => (
+            wait.kind == crate::RestartWaitKind::CircuitCooldown,
+            wait.duration,
+        ),
+        _ => (false, Duration::ZERO),
+    };
     let _ = controller
         .authorize_after_wait_recorded(
             WaitResult {
                 completion: WaitCompletion::Completed,
-                actual_elapsed: Duration::from_secs(3),
+                actual_elapsed: equality_wait,
                 supervision_deadline_remaining: None,
             },
             &mut equality,
@@ -213,33 +215,32 @@ pub fn controller_scenario() -> Result<ControllerScenario, String> {
         return Err("eligible half-open attempt did not reopen".to_owned());
     }
 
-    let burst_one = CircuitBreakerPolicy::new(
-        NonZeroU64::new(1).expect("constant nonzero"),
-        Duration::from_millis(10),
-        Duration::from_millis(10),
-    )
-    .map_err(|error| error.to_string())?;
-    let mut one = RestartController::new(settings(RestartLimit::Unlimited, Some(burst_one))?)
+    let threshold_one =
+        CircuitBreakerPolicy::new(1.0, Duration::from_millis(10), Duration::from_millis(10))
+            .map_err(|error| error.to_string())?;
+    let mut one = RestartController::new(settings(RestartLimit::Unlimited, Some(threshold_one))?)
         .map_err(|error| error.to_string())?;
     let mut one_record = RestartDecisionRecord::default();
-    let burst_one_half_opened = matches!(
-        transition(
-            &mut one,
-            TransitionScenario {
-                condition: RestartCondition::Deadline,
-                now: Duration::ZERO,
-                cleanup: &safe_cleanup(false),
-                completion: WaitCompletion::Completed,
-                elapsed: Duration::from_millis(10),
-            },
-            &mut one_record,
-            &mut RestartSummary::default()
-        )?,
+    let one_decision = transition(
+        &mut one,
+        TransitionScenario {
+            condition: RestartCondition::Deadline,
+            now: Duration::ZERO,
+            cleanup: &safe_cleanup(false),
+            completion: WaitCompletion::Completed,
+            elapsed: Duration::from_secs(2),
+        },
+        &mut one_record,
+        &mut RestartSummary::default(),
+    )?;
+    let threshold_one_half_opened = matches!(
+        one_decision,
         RestartDecision::Launch {
             half_open: true,
             ..
         }
     );
+    let cooldown_preserved_backoff = one_record.configured_wait_ms.is_some_and(|wait| wait > 10);
     // Ordinary exit/monitor/interruption outcomes are deliberately not accepted by the
     // limit-only controller, so a half-open non-limit outcome terminates without a transition.
     let launches_before_noneligible = one.restarts_launched();
@@ -329,8 +330,9 @@ pub fn controller_scenario() -> Result<ControllerScenario, String> {
         finite_exhausted,
         interrupted_launches,
         deadline_launches,
-        window_equality_opened,
-        burst_one_half_opened,
+        decayed_threshold_opened,
+        threshold_one_half_opened,
+        cooldown_preserved_backoff,
         noneligible_stopped,
         unsafe_cleanup_stopped,
     })

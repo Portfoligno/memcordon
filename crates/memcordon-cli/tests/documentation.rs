@@ -78,6 +78,10 @@ fn generated_public_help_is_exact_complete_and_keeps_private_routes_hidden() {
         assert!(ROOT_USAGE.contains(option), "root help omits {option}");
         assert!(PLAN_USAGE.contains(option), "plan help omits {option}");
     }
+    for removed in ["--restart-burst", "--restart-window", "--cooldown"] {
+        assert!(!ROOT_USAGE.contains(removed), "root help retains {removed}");
+        assert!(!PLAN_USAGE.contains(removed), "plan help retains {removed}");
+    }
 
     for (help, option, version) in [
         (ROOT_USAGE, "--report", EXECUTION_REPORT_SCHEMA_VERSION),
@@ -106,6 +110,9 @@ fn reference_and_generated_help_cover_the_same_public_interface() {
     }
     for option in PUBLIC_POLICY_OPTIONS {
         assert!(reference.contains(option), "reference omits {option}");
+    }
+    for removed in ["--restart-burst", "--restart-window", "--cooldown"] {
+        assert!(!reference.contains(removed), "reference retains {removed}");
     }
     let backoff = HalfLifeLogisticBackoffPolicy::default();
     for (option, default) in [
