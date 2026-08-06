@@ -886,8 +886,25 @@ fn canonical_source_tree(root: &Path, package: &str, inventory: &str) -> Result<
             package.manifest_path.as_std_path().to_path_buf()
         } else if package_path.is_file() {
             package_path
+        } else if let Some(source) = relocated_manifest_source(
+            package_root.as_std_path(),
+            &relative,
+            [
+                (
+                    "README",
+                    package.readme.as_ref().map(|path| path.as_std_path()),
+                ),
+                (
+                    "license file",
+                    package.license_file.as_ref().map(|path| path.as_std_path()),
+                ),
+            ],
+        )? {
+            source
         } else {
-            root.join(&relative)
+            return Err(failure(format!(
+                "Cargo package inventory source is missing: {relative:?}"
+            )));
         };
         if !source.is_file() {
             return Err(failure(format!(
@@ -905,6 +922,39 @@ fn canonical_source_tree(root: &Path, package: &str, inventory: &str) -> Result<
         hash.update(bytes);
     }
     Ok(hex::encode(hash.finalize()))
+}
+
+fn relocated_manifest_source<const N: usize>(
+    package_root: &Path,
+    inventory_path: &Path,
+    declared_sources: [(&str, Option<&Path>); N],
+) -> Result<Option<PathBuf>> {
+    let mut resolved = None;
+    for (description, declared_source) in declared_sources {
+        let Some(declared_source) = declared_source else {
+            continue;
+        };
+        let filename = declared_source.file_name().ok_or_else(|| {
+            failure(format!(
+                "package {description} path has no filename: {declared_source:?}"
+            ))
+        })?;
+        if inventory_path != Path::new(filename) {
+            continue;
+        }
+        let source = package_root.join(declared_source);
+        if !source.is_file() {
+            return Err(failure(format!(
+                "package {description} source is missing: {declared_source:?}"
+            )));
+        }
+        if resolved.replace(source).is_some() {
+            return Err(failure(format!(
+                "package metadata has ambiguous sources for {inventory_path:?}"
+            )));
+        }
+    }
+    Ok(resolved)
 }
 
 fn package_crate(
@@ -3008,6 +3058,67 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn canonical_source_tree_resolves_relocated_manifest_readme() {
+        let temporary = TempDir::new().expect("temporary workspace should exist");
+        let root = temporary.path();
+        let package_root = root.join("crates/example");
+        let manifest = b"[package]\nname = \"example\"\nversion = \"0.1.0\"\nedition = \"2024\"\nreadme = \"../../docs/package-readme.md\"\n";
+        let readme = b"# Example package\n";
+        let source = b"pub fn example() {}\n";
+        fs::create_dir_all(package_root.join("src"))
+            .expect("package source directory should exist");
+        fs::create_dir_all(root.join("docs")).expect("documentation directory should exist");
+        fs::write(
+            root.join("Cargo.toml"),
+            b"[workspace]\nmembers = [\"crates/example\"]\nresolver = \"2\"\n",
+        )
+        .expect("workspace manifest should write");
+        fs::write(package_root.join("Cargo.toml"), manifest)
+            .expect("package manifest should write");
+        fs::write(root.join("docs/package-readme.md"), readme)
+            .expect("external package README should write");
+        fs::write(package_root.join("src/lib.rs"), source).expect("package source should write");
+
+        let inventory = "Cargo.toml\nCargo.toml.orig\npackage-readme.md\nsrc/lib.rs\n";
+        let actual = canonical_source_tree(root, "example", inventory)
+            .expect("relocated package README should resolve to its manifest source");
+        let expected_members = BTreeMap::from([
+            (PathBuf::from("Cargo.toml.orig"), manifest.as_slice()),
+            (PathBuf::from("package-readme.md"), readme.as_slice()),
+            (PathBuf::from("src/lib.rs"), source.as_slice()),
+        ]);
+        let mut expected = Sha256::new();
+        for (path, bytes) in expected_members {
+            expected.update(path.to_string_lossy().as_bytes());
+            expected.update([0]);
+            expected.update(0o644_u32.to_le_bytes());
+            expected.update((bytes.len() as u64).to_le_bytes());
+            expected.update(bytes);
+        }
+        assert_eq!(actual, hex::encode(expected.finalize()));
+
+        let missing = canonical_source_tree(root, "example", "unrelated.md\n")
+            .expect_err("unrelated inventory paths must not use workspace-root files");
+        assert_eq!(
+            missing.to_string(),
+            "Cargo package inventory source is missing: \"unrelated.md\""
+        );
+
+        fs::remove_file(root.join("docs/package-readme.md"))
+            .expect("external package README should be removable");
+        let missing_readme = relocated_manifest_source(
+            &package_root,
+            Path::new("package-readme.md"),
+            [("README", Some(Path::new("../../docs/package-readme.md")))],
+        )
+        .expect_err("missing declared README source must fail closed");
+        assert_eq!(
+            missing_readme.to_string(),
+            "package README source is missing: \"../../docs/package-readme.md\""
+        );
+    }
 
     #[test]
     fn markdown_validation_accepts_packaged_relative_targets_and_anchors() {
