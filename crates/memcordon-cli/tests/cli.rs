@@ -1,7 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::process::Command;
 
-use memcordon::invocation::{HelpKind, Invocation, LimitToken, route};
+use memcordon::invocation::{HELP_TOPIC_USAGE, HelpKind, Invocation, LimitToken, route};
 use memcordon_core::{DOCTOR_REPORT_SCHEMA_VERSION, PLAN_REPORT_SCHEMA_VERSION};
 
 fn native(values: &[&str]) -> Vec<OsString> {
@@ -401,6 +401,11 @@ fn utilities_help_and_version_have_exact_root_routing() {
         Ok(Invocation::Help(HelpKind::Root))
     );
     assert_eq!(route(&native(&["--version"])), Ok(Invocation::Version));
+    for (topic, expected) in HELP_TOPIC_USAGE {
+        let error = route(&native(&["help", topic])).expect_err("topic help uses help output path");
+        assert_eq!(error.code, "MCCLI-HELP");
+        assert_eq!(error.message, *expected);
+    }
     assert!(matches!(
         route(&native(&["doctor", "--json", "--require", "hard"])),
         Ok(Invocation::Doctor(_))
@@ -413,6 +418,55 @@ fn utilities_help_and_version_have_exact_root_routing() {
         route(&native(&["clean", "--dry-run", "--json"])),
         Ok(Invocation::Clean(_))
     ));
+}
+
+#[test]
+fn topic_help_is_reserved_only_at_the_first_token() {
+    for values in [
+        &["--", "help", "restart"][..],
+        &["+1GiB", "help", "restart"][..],
+        &["--quiet", "help", "restart"][..],
+    ] {
+        let parsed = execution(values);
+        assert_eq!(parsed.command, native(&["help", "restart"]));
+    }
+    let parsed = execution(&["program", "help", "restart"]);
+    assert_eq!(parsed.command, native(&["program", "help", "restart"]));
+
+    for values in [
+        &["help"][..],
+        &["help", "restart", "extra"][..],
+        &["help", "+1GiB", "program"][..],
+        &["help", "--", "restart"][..],
+    ] {
+        let error = route(&native(values)).expect_err("help shape should fail");
+        assert_eq!(error.code, "MCCLI-HELP-TOPIC-COUNT", "values={values:?}");
+    }
+    let unknown = route(&native(&["help", "run"])).expect_err("unknown topic should fail");
+    assert_eq!(unknown.code, "MCCLI-HELP-TOPIC");
+    assert!(unknown.message.contains("usage, budgets, memory"));
+    assert_eq!(
+        route(&native(&["run"]))
+            .expect_err("legacy route should remain")
+            .code,
+        "MCCLI-LEGACY-RUN"
+    );
+    assert_eq!(
+        route(&native(&["help", "__memcordon-launch"]))
+            .expect_err("private route is not a topic")
+            .code,
+        "MCCLI-HELP-TOPIC"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_help_topic_has_a_stable_error() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let argv = vec![OsString::from("help"), OsString::from_vec(vec![0xff])];
+    let error = route(&argv).expect_err("non-UTF-8 topic should fail");
+    assert_eq!(error.code, "MCCLI-HELP-TOPIC-ENCODING");
 }
 
 #[test]

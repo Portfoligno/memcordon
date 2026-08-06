@@ -18,12 +18,283 @@ pub const ROOT_USAGE: &str = r#"Run a command and its descendants with optional 
 
 Usage:
   memcordon [OPTIONS] [BUDGET]... [--] COMMAND [ARGUMENT]...
+  memcordon help TOPIC
   memcordon doctor [OPTIONS]
   memcordon plan [OPTIONS] [BUDGET]...
   memcordon clean [OPTIONS]
 
 Examples:
-  memcordon cargo check
+  memcordon ./workload
+  memcordon +10m +1GiB -- cargo test --workspace
+
+Budgets:
+  +MEMORY    Memory ceiling; bytes, KB..EB, or KiB..EiB
+  +TIME      Elapsed-time deadline; decimal ms, s, or m
+
+Common options:
+  --wait-for command|workload    Return after the command or workload; command
+  --report PATH                  Write schema-4 JSON to PATH; unset
+  --summary                      Write one final summary line to stderr; off
+  --quiet                        Suppress optional wrapper output; off
+  -h, --help                     Print this help
+  -V, --version                  Print the version
+
+Utilities:
+  doctor    Inspect backend availability
+  plan      Resolve budgets and policy without launching
+  clean     Inspect or remove stale owned artifacts
+
+Help topics:
+  usage        Invocation and argument boundaries
+  budgets      Memory and time budget grammar
+  memory       Memory policy
+  deadline     Deadline policy
+  lifecycle    Workload waiting and termination grace
+  restart      Restart conditions and limits
+  backoff      Restart delay policy
+  circuit      Circuit breaker policy
+  output       Reports and optional output
+  utilities    Doctor, plan, clean, and version
+  exit-status  Exit statuses and precedence
+  all          Complete option and rule reference
+
+Rules:
+  Options precede up to two contiguous budgets, then COMMAND. Use -- before a
+  command beginning with + or -. help is reserved only as the first token;
+  -- help explicitly runs a program named help. Command arguments pass unchanged.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#;
+
+pub const HELP_TOPIC_USAGE: &[(&str, &str)] = &[
+    (
+        "usage",
+        r#"Invoke workloads, utilities, and topic help without a shell.
+
+Usage:
+  memcordon [OPTIONS] [BUDGET]... [--] COMMAND [ARGUMENT]...
+  memcordon help TOPIC
+  memcordon doctor [OPTIONS]
+  memcordon plan [OPTIONS] [BUDGET]...
+  memcordon clean [OPTIONS]
+
+Examples:
+  memcordon ./workload
+  memcordon +1GiB +10m ./workload --verbose
+  memcordon -- help restart
+
+Rules:
+  Options come first, followed by up to two contiguous budgets and COMMAND.
+  One exact -- may separate budgets from a command beginning with + or -.
+  help, doctor, plan, and clean are utilities only as the first token. Every
+  argument after COMMAND is preserved as native argv and is not parsed.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+    (
+        "budgets",
+        r#"Configure optional memory and elapsed-time limits.
+
+Budgets:
+  +MEMORY    Memory ceiling; bytes, B, KB..EB, or KiB..EiB
+  +TIME      Elapsed-time deadline; decimal ms, s, or m
+
+Rules:
+  At most one budget of each kind is accepted, in either order. Budgets are
+  contiguous and preserve source order in reports. Decimal fractions round up;
+  explicit zero remains distinct from omission. Memory accepts one leading +;
+  ambiguous units such as G are invalid. Time does not accept h, signs, or
+  exponent notation.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+    (
+        "memory",
+        r#"Configure memory enforcement when +MEMORY is present.
+
+Memory options (value; default):
+  --enforcement auto|hard|watchdog       Backend requirement; auto
+  --metric native|physical-footprint|rss|virtual
+                                         Memory metric; native
+  --poll-interval DURATION               Watchdog sampling interval; 50ms
+  --swap SIZE|unlimited|host             Swap policy; 0B
+
+Rules:
+  Explicit memory options require +MEMORY. Polling must be at least 10ms.
+  Native metrics and enforcement capabilities are platform-specific. A
+  confirmed MemCordon memory-limit event returns 124.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+    (
+        "deadline",
+        r#"Configure elapsed-time enforcement when +TIME is present.
+
+Deadline options (value; default):
+  --deadline-scope attempt|supervision   Deadline scope; attempt
+
+Rules:
+  Explicit deadline scope requires +TIME. An attempt deadline restarts from
+  each launch authorization and may trigger restart. A supervision deadline
+  spans setup, cleanup, backoff, and cooldown and is terminal. A MemCordon
+  deadline returns 123.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+    (
+        "lifecycle",
+        r#"Control workload waiting and graceful termination.
+
+Lifecycle options (value; default):
+  --wait-for command|workload            Return after the command or workload; command
+  --signal-grace DURATION                Grace after external interruption; 2s
+  --limit-grace DURATION                 Grace after a configured limit; 0s
+
+Rules:
+  Descendants remain workload members regardless of --wait-for. Signal grace
+  applies to external interruption. Limit grace requires +MEMORY or +TIME and
+  applies after a configured limit before forced cleanup.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+    (
+        "restart",
+        r#"Restart workloads after selected MemCordon limits.
+
+Restart options (value; default):
+  --restart                              Restart on applicable configured limits; off
+  --restart-on both|memory-limit|deadline
+                                         Enable restart for selected conditions; unset
+  --restart-limit COUNT|unlimited        Additional launches; unlimited
+
+Rules:
+  --restart enables both applicable conditions; --restart-on independently
+  enables the selected conditions. A finite restart limit is a positive count
+  of additional launches. memory-limit requires +MEMORY; deadline requires an
+  attempt-scoped +TIME. At least one selected condition must be effective.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+    (
+        "backoff",
+        r#"Configure the half-life logistic delay between restarts.
+
+Backoff options (value; default):
+  --backoff-base DURATION                Recovery baseline; 250ms
+  --backoff-multiplier DECIMAL           Delay growth control; 4
+  --backoff-asymptote DURATION           Logistic asymptote; 15m
+  --backoff-recovery-half-life DURATION  Quiet-time half-life of distance from base; 15m
+
+Rules:
+  Backoff options require --restart or --restart-on. Durations must be at least
+  1ms. The multiplier is an exact decimal from 1 through 100. Quiet time moves
+  the stored interval toward the base before the next logistic adjustment.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+    (
+        "circuit",
+        r#"Quarantine repeated limit failures using decayed pressure.
+
+Circuit options (value; default):
+  --circuit-threshold SCORE              Decayed failure pressure to open; unset
+  --circuit-cooldown DURATION            Minimum circuit quarantine; unset
+  --circuit-half-life DURATION           Failure-pressure half-life; backoff half-life
+
+Rules:
+  Circuit options require --restart or --restart-on. Threshold must be positive
+  and finite; threshold and cooldown must be supplied together. Cooldown may be
+  zero. The optional half-life must be at least 1ms and cannot stand alone.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+    (
+        "output",
+        r#"Configure execution reports and optional wrapper output.
+
+Output options (value; default):
+  --report PATH                          Write schema-4 JSON to PATH; unset
+  --summary                              Write one final summary line to stderr; off
+  --quiet                                Suppress optional wrapper output; off
+
+Rules:
+  A report is mandatory when requested, needs an existing parent directory,
+  and cannot use - because stdout belongs to the child. --summary conflicts
+  with --quiet; quiet never suppresses required diagnostics or child streams.
+
+Utility JSON:
+  doctor --json    schema-2
+  plan --json      schema-3
+  clean --json     schema-1
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+    (
+        "utilities",
+        r#"Inspect MemCordon without launching a workload.
+
+Usage:
+  memcordon doctor [--json] [--require hard|watchdog]
+  memcordon plan [POLICY OPTIONS] [--json] [BUDGET]...
+  memcordon clean [--dry-run] [--json]
+  memcordon --version
+
+Utilities:
+  doctor    Print the version and selected backend; JSON uses schema-2
+  plan      Resolve policy with launch proof false; JSON uses schema-3
+  clean     Inspect or remove stale owned artifacts; JSON uses schema-1
+  --version Print one version line
+
+Each utility has exact -h and --help output. Incomplete clean or an unmet
+doctor requirement returns 125.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+    (
+        "exit-status",
+        r#"Map workload and wrapper outcomes to process status.
+
+Exit status:
+  child status    Ordinary direct-child exit when representable
+  123             MemCordon elapsed-time deadline
+  124             Confirmed workload memory-limit event
+  125             Backend, setup, monitoring, cleanup, report, or restart failure
+  126             Command found but not executable
+  127             Command not found
+  2               Usage diagnostic
+  128 + signal    Unix interruption or child signal when otherwise applicable
+
+Confirmed memory evidence precedes deadline, monitor failure, interruption,
+and ordinary completion in one observation cycle. Cleanup failure may replace
+an ordinary or interrupted result with 125. Reports establish provenance when
+a child independently returns a reserved number.
+
+Reference:
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+    (
+        "all",
+        r#"Run a command and its descendants with optional memory and elapsed-time limits.
+
+Usage:
+  memcordon [OPTIONS] [BUDGET]... [--] COMMAND [ARGUMENT]...
+  memcordon help TOPIC
+  memcordon doctor [OPTIONS]
+  memcordon plan [OPTIONS] [BUDGET]...
+  memcordon clean [OPTIONS]
+
+Examples:
+  memcordon ./workload
   memcordon +10m +1GiB -- cargo test --workspace
 
 Returns the command's exit status unless a limit or wrapper failure occurs.
@@ -32,38 +303,53 @@ Budgets:
   +MEMORY    Memory ceiling; bytes, KB..EB, or KiB..EiB
   +TIME      Elapsed-time deadline; decimal ms, s, or m
 
-Policy options (value; default):
+Memory options (value; default):
   --enforcement auto|hard|watchdog       Backend requirement; auto
-  --wait-for command|workload            Return after the command or workload; command
   --metric native|physical-footprint|rss|virtual
                                          Memory metric; native
   --poll-interval DURATION               Watchdog sampling interval; 50ms
+  --swap SIZE|unlimited|host             Swap policy; 0B
+
+Deadline options (value; default):
+  --deadline-scope attempt|supervision   Deadline scope; attempt
+
+Lifecycle options (value; default):
+  --wait-for command|workload            Return after the command or workload; command
   --signal-grace DURATION                Grace after external interruption; 2s
   --limit-grace DURATION                 Grace after a configured limit; 0s
-  --swap SIZE|unlimited|host             Swap policy; 0B
-  --deadline-scope attempt|supervision   Deadline scope; attempt
+
+Restart options (value; default):
   --restart                              Restart on applicable configured limits; off
   --restart-on both|memory-limit|deadline
                                          Enable restart for selected conditions; unset
   --restart-limit COUNT|unlimited        Additional launches; unlimited
+
+Backoff options (value; default):
   --backoff-base DURATION                Recovery baseline; 250ms
   --backoff-multiplier DECIMAL           Delay growth control; 4
   --backoff-asymptote DURATION           Logistic asymptote; 15m
   --backoff-recovery-half-life DURATION  Quiet-time half-life of distance from base; 15m
+
+Circuit options (value; default):
   --circuit-threshold SCORE              Decayed failure pressure to open; unset
   --circuit-cooldown DURATION            Minimum circuit quarantine; unset
   --circuit-half-life DURATION           Failure-pressure half-life; backoff half-life
 
-Output options:
+Output options (value; default):
   --report PATH                          Write schema-4 JSON to PATH; unset
   --summary                              Write one final summary line to stderr; off
   --quiet                                Suppress optional wrapper output; off
-  -h, --help                             Print this help
+  -h, --help                             Print concise root help
   -V, --version                          Print the version
+
+Help topics:
+  usage budgets memory deadline lifecycle restart backoff circuit output
+  utilities exit-status all
 
 Rules:
   Options come first, then up to two contiguous budgets (one each, either order),
-  then COMMAND. Use -- before a command beginning with + or -.
+  then COMMAND. Use -- before a command beginning with + or -. help is reserved
+  only as the first token; -- help explicitly runs a program named help.
   --enforcement, --metric, --poll-interval, and --swap need +MEMORY;
   --deadline-scope needs +TIME; --limit-grace needs either budget. Restart tuning
   needs --restart or --restart-on. Set circuit threshold and cooldown together.
@@ -75,7 +361,9 @@ Exit status:
   126 command not executable; 127 command not found.
 
 Reference:
-  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#;
+  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md"#,
+    ),
+];
 
 pub const DOCTOR_USAGE: &str = "Inspect backend availability without launching a workload.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog]\n\nText prints the version and selected backend; --json prints full capabilities\nand limitations.\n\nOptions (default):\n  --json                         Write schema-2 JSON to stdout; off\n  --require hard|watchdog        Return 125 unless the backend matches; unset\n  -h, --help                     Print this help\n\nReference:\n  https://github.com/Portfoligno/memcordon/blob/main/docs/reference.md";
 
@@ -449,6 +737,9 @@ pub fn route(argv: &[OsString]) -> Result<Invocation, CliError> {
     if first == "-V" || first == "--version" {
         return exact_root_flag(argv, Invocation::Version);
     }
+    if first == "help" {
+        return parse_help(&argv[1..]);
+    }
     if first == "doctor" {
         return parse_doctor(&argv[1..]);
     }
@@ -468,6 +759,33 @@ pub fn route(argv: &[OsString]) -> Result<Invocation, CliError> {
         ));
     }
     parse_execution(argv).map(Invocation::Execute)
+}
+
+fn parse_help(argv: &[OsString]) -> Result<Invocation, CliError> {
+    if argv.len() != 1 {
+        return Err(CliError::new(
+            "MCCLI-HELP-TOPIC-COUNT",
+            "help accepts exactly one topic: usage, budgets, memory, deadline, lifecycle, restart, backoff, circuit, output, utilities, exit-status, or all",
+        ));
+    }
+    let topic = argv[0].to_str().ok_or_else(|| {
+        CliError::new(
+            "MCCLI-HELP-TOPIC-ENCODING",
+            "help topic must be valid UTF-8",
+        )
+    })?;
+    let usage = HELP_TOPIC_USAGE
+        .iter()
+        .find_map(|(name, usage)| (*name == topic).then_some(*usage))
+        .ok_or_else(|| {
+            CliError::new(
+                "MCCLI-HELP-TOPIC",
+                format!(
+                    "unknown help topic `{topic}`; expected usage, budgets, memory, deadline, lifecycle, restart, backoff, circuit, output, utilities, exit-status, or all"
+                ),
+            )
+        })?;
+    Err(CliError::new("MCCLI-HELP", usage))
 }
 
 fn exact_root_flag(argv: &[OsString], invocation: Invocation) -> Result<Invocation, CliError> {

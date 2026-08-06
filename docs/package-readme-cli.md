@@ -28,6 +28,8 @@ The installed command provides offline help:
 
 ```console
 memcordon --help
+memcordon help memory
+memcordon help all
 memcordon doctor --help
 memcordon plan --help
 memcordon clean --help

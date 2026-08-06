@@ -47,7 +47,8 @@ host limitations without launching a workload.
 
 ## Reference
 
-- Run `memcordon --help` for command-line help.
+- Run `memcordon --help` for concise command-line help; `memcordon help TOPIC`
+  provides focused offline reference, and `memcordon help all` prints all options.
 - See the [contract reference](docs/reference.md) for policies, platform
   behavior, reports, and exit codes.
 - Review the [changelog](CHANGELOG.md) or [MIT license](LICENSE).

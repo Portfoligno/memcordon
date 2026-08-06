@@ -8,12 +8,19 @@ first run, see the [README](../README.md).
 
 ```text
 memcordon [EXECUTION OPTIONS] [BUDGET]... [--] COMMAND [ARGUMENT]...
+memcordon help TOPIC
 memcordon doctor [--json] [--require hard|watchdog]
 memcordon plan [POLICY OPTIONS] [--json] [BUDGET]...
 memcordon clean [--dry-run] [--json]
 ```
 
-Budgets are optional, contiguous, and order-independent. At most one `+MEMORY` and one `+TIME` are accepted. Time units are `ms`, `s`, and `m`; `h` is not accepted. The explicit `--` boundary is required for programs beginning with `+` or `-` and for utility-like program names. Every argument after the program is opaque native argv.
+Budgets are optional, contiguous, and order-independent. At most one `+MEMORY` and one `+TIME` are accepted. Time units are `ms`, `s`, and `m`; `h` is not accepted. The explicit `--` boundary is required for programs beginning with `+` or `-`, and for utility-like program names in the first position. Every argument after the program is opaque native argv.
+
+Topic help is available for `usage`, `budgets`, `memory`, `deadline`,
+`lifecycle`, `restart`, `backoff`, `circuit`, `output`, `utilities`,
+`exit-status`, and `all`. `help` selects this namespace only as the first token;
+after options or budgets it is a workload program, and `-- help` is the explicit
+boundary form.
 
 No memory budget installs or samples a MemCordon memory policy and cannot produce status 124. No time budget installs a deadline and cannot produce status 123. Containment remains active without either budget.
 

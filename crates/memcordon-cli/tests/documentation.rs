@@ -3,7 +3,8 @@ use std::path::Path;
 use std::process::Command;
 
 use memcordon::invocation::{
-    CLEAN_USAGE, DOCTOR_USAGE, PLAN_USAGE, PUBLIC_POLICY_OPTIONS, REFERENCE_URL, ROOT_USAGE,
+    CLEAN_USAGE, DOCTOR_USAGE, HELP_TOPIC_USAGE, PLAN_USAGE, PUBLIC_POLICY_OPTIONS, REFERENCE_URL,
+    ROOT_USAGE,
 };
 use memcordon_core::{
     CLEAN_REPORT_SCHEMA_VERSION, DOCTOR_REPORT_SCHEMA_VERSION, EXECUTION_REPORT_SCHEMA_VERSION,
@@ -74,17 +75,39 @@ fn generated_public_help_is_exact_complete_and_keeps_private_routes_hidden() {
             assert!(!expected.contains(private));
         }
     }
-    for option in PUBLIC_POLICY_OPTIONS {
-        assert!(ROOT_USAGE.contains(option), "root help omits {option}");
-        assert!(PLAN_USAGE.contains(option), "plan help omits {option}");
+    for (topic, expected) in HELP_TOPIC_USAGE {
+        assert_eq!(stdout(&["help", topic]), format!("{expected}\n"));
+        assert!(ROOT_USAGE.contains(topic), "root help omits topic {topic}");
+        assert!(expected.contains(REFERENCE_URL));
+        for private in ["__memcordon-launch", "__memcordon-guardian"] {
+            assert!(!expected.contains(private));
+        }
     }
+    let all = HELP_TOPIC_USAGE
+        .iter()
+        .find_map(|(topic, usage)| (*topic == "all").then_some(*usage))
+        .expect("all topic should exist");
+    for option in PUBLIC_POLICY_OPTIONS {
+        assert!(all.contains(option), "all help omits {option}");
+        assert!(PLAN_USAGE.contains(option), "plan help omits {option}");
+        assert!(
+            HELP_TOPIC_USAGE
+                .iter()
+                .any(|(topic, usage)| *topic != "all" && usage.contains(option)),
+            "focused help topics omit {option}"
+        );
+    }
+    assert!(!ROOT_USAGE.contains("--backoff-base"));
     for removed in ["--restart-burst", "--restart-window", "--cooldown"] {
-        assert!(!ROOT_USAGE.contains(removed), "root help retains {removed}");
+        assert!(!all.contains(removed), "all help retains {removed}");
         assert!(!PLAN_USAGE.contains(removed), "plan help retains {removed}");
+        for (topic, usage) in HELP_TOPIC_USAGE {
+            assert!(!usage.contains(removed), "{topic} help retains {removed}");
+        }
     }
 
     for (help, option, version) in [
-        (ROOT_USAGE, "--report", EXECUTION_REPORT_SCHEMA_VERSION),
+        (all, "--report", EXECUTION_REPORT_SCHEMA_VERSION),
         (DOCTOR_USAGE, "--json", DOCTOR_REPORT_SCHEMA_VERSION),
         (PLAN_USAGE, "--json", PLAN_REPORT_SCHEMA_VERSION),
         (CLEAN_USAGE, "--json", CLEAN_REPORT_SCHEMA_VERSION),
@@ -94,6 +117,18 @@ fn generated_public_help_is_exact_complete_and_keeps_private_routes_hidden() {
             "{option} should advertise schema-{version}"
         );
     }
+    let output = HELP_TOPIC_USAGE
+        .iter()
+        .find_map(|(topic, usage)| (*topic == "output").then_some(*usage))
+        .expect("output topic should exist");
+    for version in [
+        CLEAN_REPORT_SCHEMA_VERSION,
+        DOCTOR_REPORT_SCHEMA_VERSION,
+        PLAN_REPORT_SCHEMA_VERSION,
+        EXECUTION_REPORT_SCHEMA_VERSION,
+    ] {
+        assert!(output.contains(&format!("schema-{version}")));
+    }
 }
 
 #[test]
@@ -102,6 +137,7 @@ fn reference_and_generated_help_cover_the_same_public_interface() {
         .expect("reference should be readable");
     for syntax in [
         "memcordon [EXECUTION OPTIONS] [BUDGET]... [--] COMMAND [ARGUMENT]...",
+        "memcordon help TOPIC",
         "memcordon doctor [--json] [--require hard|watchdog]",
         "memcordon plan [POLICY OPTIONS] [--json] [BUDGET]...",
         "memcordon clean [--dry-run] [--json]",
@@ -115,6 +151,14 @@ fn reference_and_generated_help_cover_the_same_public_interface() {
         assert!(!reference.contains(removed), "reference retains {removed}");
     }
     let backoff = HalfLifeLogisticBackoffPolicy::default();
+    let all = HELP_TOPIC_USAGE
+        .iter()
+        .find_map(|(topic, usage)| (*topic == "all").then_some(*usage))
+        .expect("all topic should exist");
+    let backoff_help = HELP_TOPIC_USAGE
+        .iter()
+        .find_map(|(topic, usage)| (*topic == "backoff").then_some(*usage))
+        .expect("backoff topic should exist");
     for (option, default) in [
         ("--backoff-base", duration_default(backoff.base_interval())),
         ("--backoff-multiplier", multiplier_default(backoff)),
@@ -127,7 +171,8 @@ fn reference_and_generated_help_cover_the_same_public_interface() {
             duration_default(backoff.recovery_half_life()),
         ),
     ] {
-        assert_option_default(ROOT_USAGE, option, &default);
+        assert_option_default(all, option, &default);
+        assert_option_default(backoff_help, option, &default);
         assert_option_default(PLAN_USAGE, option, &default);
         let marker = format!("| `{option}` |");
         let line = reference
