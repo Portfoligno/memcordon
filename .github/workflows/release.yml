@@ -217,7 +217,7 @@ jobs:
   linux-certification:
     name: Release / Linux cgroup certification
     needs: preflight
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
       - name: Check out pushed tag
@@ -277,7 +277,7 @@ jobs:
   windows-certification:
     name: Release / Windows Job Object certification
     needs: preflight
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: windows-2025
     timeout-minutes: 75
     steps:
       - name: Check out pushed tag
