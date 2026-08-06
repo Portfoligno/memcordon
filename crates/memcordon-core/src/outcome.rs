@@ -51,8 +51,7 @@ impl DeadlineEvidence {
         graceful_action: Option<String>,
         force_action: Option<String>,
     ) -> Result<Self, DeadlineEvidenceError> {
-        if duration_ms == 0
-            || origin.is_empty()
+        if origin.is_empty()
             || observed_offset_ms < expires_offset_ms
             || grace_elapsed_ms > grace_requested_ms
             || (grace_elapsed_ms > 0 && graceful_action.is_none())

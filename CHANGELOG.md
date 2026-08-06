@@ -6,8 +6,8 @@ All notable user-visible changes to MemCordon are documented here.
 
 ### Added
 
-- Added optional `+MEMORY` and `+TIME` budgets, including workload containment
-  without a memory or time limit and deadline exit status `123`.
+- Added optional `+MEMORY` and `+TIME` budgets, workload containment without
+  either limit, and deadline exit status `123`.
 - Added attempt- and supervision-scoped deadlines, cleanup-gated restarts,
   half-life logistic backoff with quiet-time recovery, circuit breaking, and
   bounded per-attempt history.

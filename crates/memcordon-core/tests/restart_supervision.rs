@@ -36,6 +36,17 @@ fn deadline_tracker_certifies_attempt_reset_total_scope_and_precedence() {
 }
 
 #[test]
+fn zero_deadline_expires_at_each_scope_origin() {
+    let result = deadline_scenario(100, 0).expect("zero deadline scenario");
+    assert_eq!(result.attempt_one_expiry_ms, 100);
+    assert_eq!(result.attempt_two_expiry_ms, 125);
+    assert_eq!(result.supervision_expiry_ms, 100);
+    assert!(result.equality_expires);
+    assert!(result.backoff_charged_to_supervision);
+    assert!(result.setup_charged_to_supervision);
+}
+
+#[test]
 fn half_life_logistic_facade_preserves_event_convergence_and_time_recovery() {
     let rapid = half_life_logistic_scenario(
         1_000,

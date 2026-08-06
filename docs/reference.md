@@ -25,14 +25,15 @@ native values on every attempt.
 
 Memory budgets contain exactly one leading ASCII `+`. The remainder accepts
 bare bytes, `B`, decimal `KB` through `EB`, and binary `KiB` through `EiB`.
-Decimal fractions round upward. Zero, ambiguous units such as `G`, overflow,
-non-ASCII text, and repeated leading plus signs are rejected.
+Decimal fractions round upward. Ambiguous units such as `G`,
+overflow, non-ASCII text, and repeated leading plus signs are rejected.
 
 Time budgets use decimal `ms`, `s`, or `m` values and round upward to a whole
-millisecond. Zero, overflow, unsupported units (including `h`), signs, and
-exponent notation are rejected. When two budgets are present, their original
-order is retained in reports even though the effective memory and deadline
-policies are typed separately.
+millisecond. Overflow, unsupported units (including `h`), signs, and exponent
+notation are rejected. An explicit zero configures a zero ceiling or immediate
+deadline and remains distinct from omission. When two
+budgets are present, their original order is retained in reports even though
+the effective memory and deadline policies are typed separately.
 
 ## Execution options
 
@@ -50,7 +51,7 @@ policies are typed separately.
 | `--restart-on` | `both`, `memory-limit`, `deadline` | unset |
 | `--restart-limit` | additional-launch count or `unlimited` | `unlimited` |
 | `--backoff-base` | duration of at least 1 ms | `250ms` |
-| `--backoff-multiplier` | exact decimal greater than 1 and at most 100 | `4` |
+| `--backoff-multiplier` | exact decimal from 1 through 100 | `4` |
 | `--backoff-asymptote` | duration of at least 1 ms | `15m` |
 | `--backoff-recovery-half-life` | duration of at least 1 ms | `15m` |
 | `--circuit-threshold` | positive decayed failure score | unset |

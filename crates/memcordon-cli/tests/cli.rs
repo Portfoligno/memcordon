@@ -49,12 +49,16 @@ fn optional_and_order_independent_budgets_preserve_native_boundary() {
         memory_time.budgets.deadline,
         Some(std::time::Duration::from_millis(1_500))
     );
-    assert_eq!(
-        route(&native(&["+0ms", "program"]))
-            .expect_err("zero deadline must fail")
-            .code,
-        "MCCLI-BUDGET"
-    );
+
+    let zero = execution(&["+0B", "+0ms", "program"]);
+    assert_eq!(zero.budgets.memory.expect("memory").bytes(), 0);
+    assert_eq!(zero.budgets.deadline, Some(std::time::Duration::ZERO));
+    assert_eq!(zero.budgets.source_order.len(), 2);
+
+    let zero_memory = execution(&["--metric", "rss", "+0B", "program"]);
+    assert_eq!(zero_memory.budgets.memory.expect("memory").bytes(), 0);
+    let zero_time = execution(&["--deadline-scope", "supervision", "+0ms", "program"]);
+    assert_eq!(zero_time.budgets.deadline, Some(std::time::Duration::ZERO));
 }
 
 #[test]
@@ -102,6 +106,23 @@ fn half_life_backoff_scalars_are_validated_after_order_independent_collection() 
         partial.policy.backoff.recovery_half_life(),
         std::time::Duration::from_secs(15 * 60)
     );
+
+    let unit_multiplier =
+        execution(&["--restart", "--backoff-multiplier", "1", "+1GiB", "program"]);
+    assert_eq!(unit_multiplier.policy.backoff.multiplier().numerator(), 1);
+    assert_eq!(unit_multiplier.policy.backoff.multiplier().denominator(), 1);
+
+    for multiplier in ["0.999", "NaN", "inf"] {
+        let error = route(&native(&[
+            "--restart",
+            "--backoff-multiplier",
+            multiplier,
+            "+1GiB",
+            "program",
+        ]))
+        .expect_err("invalid multiplier must fail");
+        assert_eq!(error.code, "MCUSAGE-BACKOFF");
+    }
 
     let removed = route(&native(&[
         "--restart",
@@ -344,7 +365,6 @@ fn invalid_limits_and_boundaries_have_stable_codes() {
     for (values, code) in [
         (&["+", "cargo"][..], "MCCLI-BUDGET"),
         (&["++8GiB", "cargo"][..], "MCCLI-BUDGET"),
-        (&["+0B", "cargo"][..], "MCCLI-BUDGET"),
         (&["+8G", "cargo"][..], "MCCLI-BUDGET"),
         (&["+8GiB"][..], "MCCLI-MISSING-COMMAND"),
         (&["+8GiB", "--"][..], "MCCLI-MISSING-COMMAND"),
@@ -539,12 +559,38 @@ fn plan_text_and_json_have_distinct_resolution_shapes_when_backend_is_available(
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
+fn plan_json_preserves_explicit_zero_budgets() {
+    let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .args(["plan", "--json", "+0B", "+0ms"])
+        .output()
+        .expect("plan should run");
+    assert!(output.status.success());
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("plan must emit JSON");
+
+    assert_eq!(value["budget_tokens"][0]["kind"], "memory");
+    assert_eq!(value["budget_tokens"][0]["token"], "+0B");
+    assert_eq!(value["budget_tokens"][1]["kind"], "time");
+    assert_eq!(value["budget_tokens"][1]["token"], "+0ms");
+    assert_eq!(value["request"]["memory"]["limit_bytes"], 0);
+    assert_eq!(value["request"]["deadline"]["duration_ms"], 0);
+    assert_eq!(value["resolution"]["effective"]["memory"]["limit_bytes"], 0);
+    assert_eq!(
+        value["resolution"]["effective"]["deadline"]["duration_ms"],
+        0
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[test]
 fn plan_restart_json_carries_half_life_defaults_and_source_order() {
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args([
             "plan",
             "--json",
             "--restart",
+            "--backoff-multiplier",
+            "1",
             "--circuit-threshold",
             "2.5",
             "--circuit-cooldown",
@@ -570,7 +616,7 @@ fn plan_restart_json_carries_half_life_defaults_and_source_order() {
     );
     assert_eq!(
         value["request"]["restart"]["backoff"]["multiplier_numerator"],
-        4
+        1
     );
     assert_eq!(
         value["request"]["restart"]["backoff"]["multiplier_denominator"],
@@ -608,7 +654,7 @@ fn plan_restart_json_carries_half_life_defaults_and_source_order() {
     );
     assert_eq!(
         value["resolution"]["backoff_sample_ms"],
-        serde_json::json!([1_000])
+        serde_json::json!([250])
     );
     assert_eq!(value["resolution"]["effective"]["restart"]["enabled"], true);
 }

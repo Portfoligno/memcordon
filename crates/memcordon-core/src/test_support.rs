@@ -352,9 +352,6 @@ pub struct DeadlineScenario {
 }
 
 pub fn deadline_scenario(origin_ms: u64, duration_ms: u64) -> Result<DeadlineScenario, String> {
-    if duration_ms == 0 {
-        return Err("deadline duration is zero".to_owned());
-    }
     let origin = Duration::from_millis(origin_ms);
     let duration = Duration::from_millis(duration_ms);
     let first_clock = FakeClock { now: origin };

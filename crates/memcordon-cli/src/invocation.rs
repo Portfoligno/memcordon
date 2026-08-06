@@ -47,7 +47,7 @@ Policy options (value; default):
                                          Enable restart for selected conditions; unset
   --restart-limit COUNT|unlimited        Additional launches; unlimited
   --backoff-base DURATION                Recovery baseline; 250ms
-  --backoff-multiplier DECIMAL           Delay growth control, >1 and <=100; 4
+  --backoff-multiplier DECIMAL           Delay growth control; 4
   --backoff-asymptote DURATION           Logistic asymptote; 15m
   --backoff-recovery-half-life DURATION  Quiet-time half-life of distance from base; 15m
   --circuit-threshold SCORE              Decayed failure pressure to open; unset
@@ -109,7 +109,7 @@ Policy options (value; default):
                                          Enable selected restarts; unset
   --restart-limit COUNT|unlimited        Additional launches; unlimited
   --backoff-base DURATION                Recovery baseline; 250ms
-  --backoff-multiplier DECIMAL           Delay growth control, >1 and <=100; 4
+  --backoff-multiplier DECIMAL           Delay growth control; 4
   --backoff-asymptote DURATION           Logistic asymptote; 15m
   --backoff-recovery-half-life DURATION  Quiet-time half-life of distance from base; 15m
   --circuit-threshold SCORE              Decayed failure pressure to open; unset
@@ -224,11 +224,7 @@ pub fn parse_budget(raw: OsString) -> Result<BudgetToken, CliError> {
     let time = parse_duration(value);
     match (memory, time) {
         (Ok(bytes), Err(_)) => Ok(BudgetToken::Memory { raw, bytes }),
-        (Err(_), Ok(duration)) if !duration.is_zero() => Ok(BudgetToken::Time { raw, duration }),
-        (Err(memory), Ok(_)) => Err(CliError::new(
-            "MCCLI-BUDGET",
-            format!("invalid memory budget ({memory}); time budget must be greater than zero"),
-        )),
+        (Err(_), Ok(duration)) => Ok(BudgetToken::Time { raw, duration }),
         (Ok(_), Ok(_)) => Err(CliError::new(
             "MCCLI-BUDGET-AMBIGUOUS",
             "budget matches both memory and time grammars",

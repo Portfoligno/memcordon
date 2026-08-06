@@ -157,7 +157,7 @@ impl<'de> Deserialize<'de> for BackoffMultiplier {
 
 impl BackoffMultiplier {
     pub fn new(numerator: u32, denominator: u32) -> Result<Self, MultiplierParseError> {
-        if denominator == 0 || numerator <= denominator {
+        if denominator == 0 || numerator < denominator {
             return Err(MultiplierParseError::Syntax);
         }
         let upper = u64::from(denominator)
@@ -193,7 +193,7 @@ impl BackoffMultiplier {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum MultiplierParseError {
-    #[error("multiplier must be an unsigned decimal greater than one and at most 100")]
+    #[error("multiplier must be an unsigned decimal from one through 100")]
     Syntax,
     #[error("multiplier exceeds its supported exact range")]
     Range,

@@ -34,8 +34,6 @@ impl fmt::Display for ByteSize {
 pub enum ByteSizeParseError {
     #[error("memory size must include a number")]
     MissingNumber,
-    #[error("memory size must be greater than zero")]
-    Zero,
     #[error("ambiguous or unsupported memory unit `{0}`")]
     InvalidUnit(String),
     #[error("memory size has invalid decimal syntax")]
@@ -115,9 +113,6 @@ impl FromStr for ByteSize {
         } else {
             scaled_whole
         };
-        if bytes == 0 {
-            return Err(ByteSizeParseError::Zero);
-        }
         Ok(Self(
             bytes.try_into().map_err(|_| ByteSizeParseError::Overflow)?,
         ))
@@ -245,7 +240,7 @@ pub struct DeadlinePolicy {
 impl DeadlinePolicy {
     pub fn new(duration: Duration, scope: DeadlineScope) -> Result<Self, DeadlinePolicyError> {
         let milliseconds = duration.as_millis();
-        if milliseconds == 0 || u64::try_from(milliseconds).is_err() {
+        if (milliseconds == 0 && !duration.is_zero()) || u64::try_from(milliseconds).is_err() {
             return Err(DeadlinePolicyError);
         }
         Ok(Self { duration, scope })
@@ -293,7 +288,7 @@ impl<'de> Deserialize<'de> for DeadlinePolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("deadline must be positive and representable as u64 milliseconds")]
+#[error("deadline must be zero or at least one millisecond and representable as u64 milliseconds")]
 pub struct DeadlinePolicyError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

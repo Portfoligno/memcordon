@@ -371,6 +371,95 @@ fn schema_four_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
 }
 
 #[test]
+fn schema_four_preserves_explicit_zero_budgets() {
+    let mut report = report();
+    report.invocation.budget_tokens = vec![
+        BudgetTokenReport {
+            kind: BudgetKindReport::Memory,
+            token: "+0B".to_owned(),
+        },
+        BudgetTokenReport {
+            kind: BudgetKindReport::Time,
+            token: "+0ms".to_owned(),
+        },
+    ];
+    report.invocation.memory_token = Some("+0B".to_owned());
+    report.invocation.deadline_token = Some("+0ms".to_owned());
+    report.policy.requested.memory = Some(RequestedMemoryPolicyReport {
+        limit_bytes: 0,
+        enforcement: "auto".to_owned(),
+        metric: "native".to_owned(),
+        poll_interval_ms: 50,
+        swap: SwapReport::Bytes { bytes: 0 },
+    });
+    report.policy.effective.memory = Some(EffectiveMemoryPolicyReport {
+        limit_bytes: 0,
+        enforcement: "hard".to_owned(),
+        metric: "native".to_owned(),
+        poll_interval_ms: None,
+        swap: Some(SwapReport::Bytes { bytes: 0 }),
+    });
+    report
+        .policy
+        .requested
+        .deadline
+        .as_mut()
+        .expect("requested deadline")
+        .duration_ms = 0;
+    report
+        .policy
+        .effective
+        .deadline
+        .as_mut()
+        .expect("effective deadline")
+        .duration_ms = 0;
+
+    let value = serde_json::to_value(&report).expect("schema JSON");
+    let decoded: MemcordonReport =
+        serde_json::from_value(value).expect("validated zero-budget round trip");
+    assert_eq!(
+        decoded
+            .policy
+            .requested
+            .memory
+            .expect("explicit memory")
+            .limit_bytes,
+        0
+    );
+    assert_eq!(
+        decoded
+            .policy
+            .requested
+            .deadline
+            .expect("explicit deadline")
+            .duration_ms,
+        0
+    );
+}
+
+#[test]
+fn deadline_evidence_accepts_an_immediate_deadline() {
+    let evidence = DeadlineEvidence::new(
+        0,
+        DeadlineScope::Attempt,
+        "test-origin".to_owned(),
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+    )
+    .expect("zero-duration evidence");
+    assert_eq!(evidence.duration_ms(), 0);
+    assert_eq!(evidence.overshoot_ms(), 0);
+    let value = serde_json::to_value(&evidence).expect("deadline evidence JSON");
+    let decoded: DeadlineEvidence =
+        serde_json::from_value(value).expect("zero-duration evidence round trip");
+    assert_eq!(decoded, evidence);
+}
+
+#[test]
 fn schema_four_rejects_envelope_history_and_budget_contradictions() {
     let mut value = serde_json::to_value(report()).expect("schema JSON");
     value["schema_version"] = serde_json::json!(2);

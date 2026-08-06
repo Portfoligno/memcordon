@@ -11,10 +11,15 @@ fn multiplier_is_exact_reduced_and_bounded() {
     let multiplier: BackoffMultiplier = "2.50".parse().expect("valid multiplier");
     assert_eq!(multiplier.numerator(), 5);
     assert_eq!(multiplier.denominator(), 2);
-    for invalid in ["", "1", "0.9", "100.1", "2e1", "+2", "-2", "2."] {
+    let one: BackoffMultiplier = "1.0".parse().expect("lower-bound multiplier");
+    assert_eq!(one.numerator(), 1);
+    assert_eq!(one.denominator(), 1);
+    assert_eq!(BackoffMultiplier::new(7, 7).expect("equal ratio"), one);
+    for invalid in ["", "0", "0.9", "100.1", "2e1", "+2", "-2", "2."] {
         assert!(invalid.parse::<BackoffMultiplier>().is_err(), "{invalid}");
     }
     assert!(BackoffMultiplier::new(2, 0).is_err());
+    assert!(BackoffMultiplier::new(1, 2).is_err());
     assert_eq!(
         "100"
             .parse::<BackoffMultiplier>()
@@ -22,6 +27,41 @@ fn multiplier_is_exact_reduced_and_bounded() {
             .numerator(),
         100
     );
+}
+
+#[test]
+fn multiplier_one_recovers_without_increasing_the_backoff() {
+    let multiplier = "1".parse().expect("lower-bound multiplier");
+    assert_eq!(
+        half_life_logistic_next_millis(1_000, 40_000, 60_000, multiplier, 30_000, 0)
+            .expect("immediate event"),
+        40_000
+    );
+    assert_eq!(
+        half_life_logistic_next_millis(1_000, 40_000, 60_000, multiplier, 30_000, 30_000)
+            .expect("event after one half-life"),
+        20_500
+    );
+
+    let policy = HalfLifeLogisticBackoffPolicy::new(
+        Duration::from_secs(1),
+        multiplier,
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+    )
+    .expect("policy");
+    let mut state = HalfLifeLogisticBackoffState::new(policy).expect("state");
+
+    for event_time in [
+        Duration::ZERO,
+        Duration::from_secs(1),
+        Duration::from_secs(31),
+    ] {
+        assert_eq!(
+            state.on_backoff(event_time).expect("backoff event"),
+            Duration::from_secs(1)
+        );
+    }
 }
 
 #[test]
