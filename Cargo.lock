@@ -577,7 +577,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memcordon"
-version = "0.3.7"
+version = "0.3.8-dev"
 dependencies = [
  "anstream",
  "anstyle",
@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "memcordon-ci"
-version = "0.3.7"
+version = "0.3.8-dev"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "memcordon-core"
-version = "0.3.7"
+version = "0.3.8-dev"
 dependencies = [
  "base64",
  "serde",
@@ -630,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "memcordon-platform"
-version = "0.3.7"
+version = "0.3.8-dev"
 dependencies = [
  "libc",
  "memcordon-core",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "memcordon-testkit"
-version = "0.3.7"
+version = "0.3.8-dev"
 dependencies = [
  "libc",
  "memcordon-platform",

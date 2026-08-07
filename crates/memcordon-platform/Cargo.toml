@@ -16,7 +16,7 @@ test-support = ["dep:tempfile"]
 
 [dependencies]
 libc.workspace = true
-memcordon-core = { path = "../memcordon-core", version = "=0.3.7" }
+memcordon-core = { path = "../memcordon-core", version = "=0.3.8-dev" }
 serde.workspace = true
 tempfile = { workspace = true, optional = true }
 
