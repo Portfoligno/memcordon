@@ -26,14 +26,13 @@ described in [MAINTAINERS.md](MAINTAINERS.md). Record user-visible changes in
 Prepare a reviewed pull request that replaces the workspace development version
 with the exact SemVer release, updates exact internal dependency requirements,
 updates `Cargo.lock` and `fuzz/Cargo.lock`, and moves user-visible changes into
-one dated changelog section. From the release commit, run these reversible
-checks with the configured stable and MSRV toolchains:
+one dated changelog section. Push the release commit without a tag and require
+its CI, Deep CI, and Backend Certification workflows to pass. CI runs the
+repository policy, quality, MSRV, and supply-chain suites on that exact commit.
+
+From the release commit, create the public crate archives locally:
 
 ```console
-rustup run 1.97.1 cargo run --locked --package memcordon-ci -- suite policy
-rustup run 1.97.1 cargo run --locked --package memcordon-ci -- suite quality
-rustup run 1.97.1 cargo run --locked --package memcordon-ci -- suite msrv
-rustup run 1.97.1 cargo run --locked --package memcordon-ci -- suite supply-chain
 cargo package --locked --no-verify \
   --package memcordon-core \
   --package memcordon-platform \
@@ -41,12 +40,12 @@ cargo package --locked --no-verify \
 ```
 
 Inspect each archive under `target/package/` and require every public CI check
-on the release commit to pass. These are pre-tag checks, not backend
-certification for a release run. This step is complete when the commands and CI
-checks pass and the package graph, lockfiles, generated help, documentation,
+on the release commit to pass. These are pre-tag checks; tag-triggered release
+certification has not run yet. This step is complete when CI and archive
+inspection pass and the package graph, lockfiles, generated help, documentation,
 README rendering, and archive contents agree. Correct the release commit and
-repeat this section if they do not; do not defer a failure to the tag-triggered
-workflow.
+repeat its CI and archive checks if they do not; do not defer a failure to the
+tag-triggered workflow.
 
 ## 2. Verify immutable inputs
 
