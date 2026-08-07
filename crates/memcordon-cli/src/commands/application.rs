@@ -55,7 +55,11 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
         Err(error) => return finish_error(&args, &command, None, *error, presentation),
     };
     if !args.output.quiet {
-        render_effect_warnings(&resolution.report.effects, presentation);
+        render_effect_warnings(
+            &resolution.report.effects,
+            args.policy.restart_on.is_some(),
+            presentation,
+        );
     }
     let helper = match helper_path() {
         Ok(value) => value,
@@ -904,7 +908,11 @@ fn category_name(value: ErrorCategory) -> &'static str {
         ErrorCategory::Report => "report",
     }
 }
-fn render_effect_warnings(effects: &[OptionEffectReport], presentation: &Presentation) {
+fn render_effect_warnings(
+    effects: &[OptionEffectReport],
+    restart_conditions_explicit: bool,
+    presentation: &Presentation,
+) {
     let mut out = presentation.stderr();
     for effect in effects {
         if let OptionEffectReport::Ignored {
@@ -913,6 +921,9 @@ fn render_effect_warnings(effects: &[OptionEffectReport], presentation: &Present
             reason,
         } = effect
         {
+            if option == "restart-on" && !restart_conditions_explicit {
+                continue;
+            }
             presentation::write_warning(&mut out, option, requested, reason)
                 .expect("warning output should be writable");
         }

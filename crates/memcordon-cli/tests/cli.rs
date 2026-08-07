@@ -1008,6 +1008,78 @@ fn doctor_text_and_json_have_distinct_complete_shapes() {
 }
 
 #[test]
+fn inferred_restart_conditions_are_silent_but_remain_machine_readable() {
+    let doctor = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor should run");
+    assert!(doctor.status.success());
+    let doctor: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor must emit JSON");
+    if doctor["selected"].is_null() {
+        return;
+    }
+
+    for (budget, dormant_condition) in [("+1s", "memory-limit"), ("+1GiB", "deadline")] {
+        let missing_command = "memcordon-command-that-does-not-exist";
+        let inferred = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+            .args(["--restart", budget, missing_command])
+            .output()
+            .expect("inferred restart execution should run");
+        let inferred_stderr = String::from_utf8_lossy(&inferred.stderr);
+        let warning = format!("--restart-on {dormant_condition} is ineffective");
+        assert!(
+            !inferred_stderr.contains(&warning),
+            "inferred restart condition emitted `{warning}`: {inferred_stderr}"
+        );
+
+        let explicit = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+            .args([
+                "--restart-on",
+                "both",
+                budget,
+                "memcordon-command-that-does-not-exist",
+            ])
+            .output()
+            .expect("explicit restart execution should run");
+        let explicit_stderr = String::from_utf8_lossy(&explicit.stderr);
+        assert!(
+            explicit_stderr.contains(&warning),
+            "explicit restart condition omitted `{warning}`: {explicit_stderr}"
+        );
+
+        let plan = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+            .args(["plan", "--json", "--restart", budget])
+            .output()
+            .expect("plan should run");
+        assert!(plan.status.success());
+        let plan: serde_json::Value =
+            serde_json::from_slice(&plan.stdout).expect("plan must emit JSON");
+        assert_eq!(plan["request"]["restart"]["enablement_source"], "restart");
+        assert_eq!(
+            plan["request"]["restart"]["configured_conditions"],
+            serde_json::json!(["memory-limit", "deadline"])
+        );
+        assert!(
+            plan["resolution"]["effective"]["restart"]["dormant_conditions"]
+                .as_array()
+                .is_some_and(|conditions| conditions
+                    .iter()
+                    .any(|condition| condition["condition"] == dormant_condition))
+        );
+        assert!(
+            plan["resolution"]["effects"]
+                .as_array()
+                .is_some_and(|effects| effects.iter().any(|effect| {
+                    effect["option"] == "restart-on"
+                        && effect["requested"] == dormant_condition
+                        && effect["kind"] == "ignored"
+                }))
+        );
+    }
+}
+
+#[test]
 fn plan_text_and_json_have_distinct_resolution_shapes_when_backend_is_available() {
     let doctor = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args(["doctor", "--json"])
