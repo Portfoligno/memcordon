@@ -1080,6 +1080,101 @@ fn inferred_restart_conditions_are_silent_but_remain_machine_readable() {
 }
 
 #[test]
+fn inferred_swap_is_silent_but_remains_machine_readable() {
+    let doctor = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor should run");
+    assert!(doctor.status.success());
+    let doctor: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor must emit JSON");
+    let Some(backend) = doctor["selected"]["name"].as_str() else {
+        return;
+    };
+
+    let missing_command = "memcordon-command-that-does-not-exist";
+    let inferred = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .args(["+1GiB", missing_command])
+        .output()
+        .expect("inferred swap execution should run");
+    let inferred_stderr = String::from_utf8_lossy(&inferred.stderr);
+    let inferred_warning = "--swap 0B is ineffective";
+    assert!(
+        !inferred_stderr.contains(inferred_warning),
+        "inferred swap emitted `{inferred_warning}`: {inferred_stderr}"
+    );
+
+    for (swap, requested) in [
+        ("0B", "0B"),
+        ("host", "host"),
+        ("unlimited", "unlimited"),
+        ("1GiB", "1073741824B"),
+    ] {
+        let explicit = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+            .args(["--swap", swap, "+1GiB", missing_command])
+            .output()
+            .expect("explicit swap execution should run");
+        let explicit_stderr = String::from_utf8_lossy(&explicit.stderr);
+        let warning = format!("--swap {requested} is ineffective");
+        if backend == "linux-cgroup-v2" {
+            assert!(
+                !explicit_stderr.contains(&warning),
+                "applied swap emitted `{warning}`: {explicit_stderr}"
+            );
+        } else {
+            assert!(
+                explicit_stderr.contains(&warning),
+                "explicit swap omitted `{warning}`: {explicit_stderr}"
+            );
+        }
+    }
+
+    let implicit_plan = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .args(["plan", "--json", "+1GiB"])
+        .output()
+        .expect("implicit swap plan should run");
+    assert!(implicit_plan.status.success());
+    let implicit_plan: serde_json::Value =
+        serde_json::from_slice(&implicit_plan.stdout).expect("plan must emit JSON");
+    let explicit_plan = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .args(["plan", "--json", "--swap", "0B", "+1GiB"])
+        .output()
+        .expect("explicit swap plan should run");
+    assert!(explicit_plan.status.success());
+    let explicit_plan: serde_json::Value =
+        serde_json::from_slice(&explicit_plan.stdout).expect("plan must emit JSON");
+
+    assert_eq!(
+        implicit_plan["request"]["memory"]["swap"],
+        explicit_plan["request"]["memory"]["swap"]
+    );
+    assert_eq!(
+        implicit_plan["resolution"]["effective"]["memory"]["swap"],
+        explicit_plan["resolution"]["effective"]["memory"]["swap"]
+    );
+    let implicit_swap_effect = implicit_plan["resolution"]["effects"]
+        .as_array()
+        .and_then(|effects| effects.iter().find(|effect| effect["option"] == "swap"))
+        .expect("implicit swap effect should remain reported");
+    let explicit_swap_effect = explicit_plan["resolution"]["effects"]
+        .as_array()
+        .and_then(|effects| effects.iter().find(|effect| effect["option"] == "swap"))
+        .expect("explicit swap effect should remain reported");
+    assert_eq!(implicit_swap_effect, explicit_swap_effect);
+    assert_eq!(implicit_swap_effect["requested"], "0B");
+    if backend == "linux-cgroup-v2" {
+        assert_eq!(implicit_swap_effect["kind"], "applied");
+        assert_eq!(
+            implicit_plan["resolution"]["effective"]["memory"]["swap"]["bytes"],
+            0
+        );
+    } else {
+        assert_eq!(implicit_swap_effect["kind"], "ignored");
+        assert!(implicit_plan["resolution"]["effective"]["memory"]["swap"].is_null());
+    }
+}
+
+#[test]
 fn plan_text_and_json_have_distinct_resolution_shapes_when_backend_is_available() {
     let doctor = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args(["doctor", "--json"])

@@ -58,6 +58,7 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
         render_effect_warnings(
             &resolution.report.effects,
             args.policy.restart_on.is_some(),
+            args.policy.explicit.swap,
             presentation,
         );
     }
@@ -911,6 +912,7 @@ fn category_name(value: ErrorCategory) -> &'static str {
 fn render_effect_warnings(
     effects: &[OptionEffectReport],
     restart_conditions_explicit: bool,
+    swap_explicit: bool,
     presentation: &Presentation,
 ) {
     let mut out = presentation.stderr();
@@ -922,6 +924,9 @@ fn render_effect_warnings(
         } = effect
         {
             if option == "restart-on" && !restart_conditions_explicit {
+                continue;
+            }
+            if option == "swap" && !swap_explicit {
                 continue;
             }
             presentation::write_warning(&mut out, option, requested, reason)
