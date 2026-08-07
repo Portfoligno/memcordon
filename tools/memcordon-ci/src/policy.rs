@@ -446,7 +446,8 @@ fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Polic
         &["group", "cancel-in-progress"],
         "CI concurrency",
     )?;
-    if scalar(concurrency, "group") != Some("ci-${{ github.workflow }}-${{ github.ref }}")
+    if scalar(concurrency, "group")
+        != Some("ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}")
         || concurrency
             .get(key("cancel-in-progress"))
             .and_then(Value::as_bool)

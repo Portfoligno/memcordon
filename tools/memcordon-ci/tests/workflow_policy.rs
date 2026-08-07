@@ -427,3 +427,27 @@ fn deep_and_backend_workflows_require_unfiltered_push_and_manual_dispatch() {
             .expect_err("workflow concurrency regression must be rejected");
     }
 }
+
+#[test]
+fn ci_concurrency_separates_trigger_methods() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    let exact = include_str!("../../../.github/workflows/ci.yml").replace("\r\n", "\n");
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/ci.yml"),
+        exact.as_bytes(),
+        &repository_policy,
+    )
+    .expect("CI concurrency should separate trigger methods");
+
+    let invalid = exact.replacen("-${{ github.event_name }}", "", 1);
+    assert_ne!(invalid, exact, "CI concurrency fixture mutation must apply");
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/ci.yml"),
+        invalid.as_bytes(),
+        &repository_policy,
+    )
+    .expect_err("CI concurrency without the trigger method must be rejected");
+}
