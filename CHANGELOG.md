@@ -2,6 +2,19 @@
 
 All notable user-visible changes to MemCordon are documented here.
 
+## [0.3.7] - 2026-08-07
+
+### Added
+
+- Added topic-oriented offline CLI help through `memcordon help TOPIC`, with
+  concise root help and a complete `memcordon help all` reference.
+
+### Changed
+
+- Human-readable help, diagnostics, summaries, and utility output now use
+  adaptive terminal styling. Redirected output is plain by default, `NO_COLOR`
+  is respected, and machine-readable output and child streams remain unstyled.
+
 ## [0.3.4] - 2026-08-06
 
 ### Added

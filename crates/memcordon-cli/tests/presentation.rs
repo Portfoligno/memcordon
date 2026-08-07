@@ -43,8 +43,8 @@ fn every_help_document_is_exact_when_plain_and_styled_when_forced() {
 
 #[test]
 fn common_human_renderers_preserve_plain_visible_text() {
-    assert_renderer("memcordon 0.3.5-dev\n", |out| {
-        presentation::write_version(out, "0.3.5-dev")
+    assert_renderer("memcordon 0.3.7\n", |out| {
+        presentation::write_version(out, "0.3.7")
     });
     assert_renderer("error[MCCLI-TEST]: bad input\n", |out| {
         presentation::write_usage_error(out, "MCCLI-TEST", "bad input")
