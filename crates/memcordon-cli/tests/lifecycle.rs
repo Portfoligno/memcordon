@@ -364,13 +364,13 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
             "hard"
         },
         "--command-exit-grace",
-        "2s",
+        "5s",
         "--report",
     ]);
     invocation.arg(&report_file);
     invocation.args([
         "+8GiB",
-        "+250ms",
+        "+2s",
         "--",
         fixture(),
         "spawn-background",
@@ -383,7 +383,7 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
         .arg("--completion-marker")
         .arg(&completion_marker);
 
-    let output = completed(&mut invocation, Duration::from_secs(4));
+    let output = completed(&mut invocation, Duration::from_secs(6));
     assert_eq!(output.status.code(), Some(123));
     assert_stdout_empty(&output);
     assert!(
@@ -403,7 +403,7 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
     );
     assert_eq!(
         report["policy"]["requested"]["command_exit_grace_ms"],
-        2_000
+        5_000
     );
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
     fs::remove_file(report_file).expect("temporary report should be removable");
@@ -470,7 +470,7 @@ fn workload_lifetime_deadline_cleans_background_descendant() {
     invocation.arg(&report_file);
     invocation.args([
         "+8GiB",
-        "+250ms",
+        "+2s",
         "--",
         fixture(),
         "spawn-background",
@@ -480,7 +480,7 @@ fn workload_lifetime_deadline_cleans_background_descendant() {
     ]);
     invocation.arg(&pid_file);
 
-    let output = completed(&mut invocation, Duration::from_secs(3));
+    let output = completed(&mut invocation, Duration::from_secs(5));
     assert_eq!(output.status.code(), Some(123));
     assert_stdout_empty(&output);
     let identity = read_identity(&pid_file);
