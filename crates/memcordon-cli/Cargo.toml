@@ -30,8 +30,8 @@ anstyle.workspace = true
 anstyle-query.workspace = true
 clap.workspace = true
 libc.workspace = true
-memcordon-core = { path = "../memcordon-core", version = "=0.4.1" }
-memcordon-platform = { path = "../memcordon-platform", version = "=0.4.1" }
+memcordon-core = { path = "../memcordon-core", version = "=0.4.2-dev" }
+memcordon-platform = { path = "../memcordon-platform", version = "=0.4.2-dev" }
 serde.workspace = true
 serde_json.workspace = true
 
