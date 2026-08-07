@@ -74,6 +74,14 @@ appear between them.
 | `--summary` | flag | false |
 | `--quiet` | flag | false |
 
+With `+MEMORY`, Linux and Windows always enforce their backend-native kernel
+metric; non-native `--metric` selections are effective only on the macOS
+watchdog. A separate `--swap` policy is effective only on Linux cgroup v2;
+Windows and macOS have no separately configurable swap policy, so the default
+`--swap 0B` is retained only as a requested value there while effective swap
+remains unset. Plan and execution reports record the effective policy and any
+ignored effects.
+
 `--summary` writes one final line to stderr and conflicts with `--quiet`. Quiet
 mode never suppresses required diagnostics, cleanup errors, child streams, or a
 required report. Execution reports never use stdout, and `-` is not a report
@@ -81,10 +89,9 @@ path.
 
 Restart tuning is valid only when restart is enabled. Circuit threshold and
 circuit cooldown must be supplied together; the circuit half-life is an
-optional override that is valid only with that pair. A requested restart
-condition without its corresponding budget is recorded as dormant rather than
-treated as effective. An explicit `--command-exit-grace` requires
-`--wait-for command` but does not require a budget.
+optional override that is valid only with that pair. An explicit
+`--command-exit-grace` requires `--wait-for command` but does not require a
+budget.
 
 ## Completion and workload membership
 
@@ -262,11 +269,16 @@ but is no longer an exact peak.
 ### Restart eligibility
 
 Execution is one-shot unless `--restart` or
-`--restart-on both|memory-limit|deadline` is supplied. Restart defaults to both
-applicable conditions and unlimited additional launches; `--restart-limit N`
-counts additional launches. Only selected MemCordon limits restart, and only
-after the direct child and helpers are reaped, the workload is proven empty,
-and containment is removed or incapable of retaining members.
+`--restart-on both|memory-limit|deadline` is supplied. `--restart` and
+`--restart-on both` request both limit conditions. A memory-limit condition is
+effective only with `+MEMORY`; a deadline condition is effective only with an
+attempt-scoped `+TIME`, because a supervision deadline is terminal. If at least
+one condition is effective, any other requested condition is reported as
+dormant; requesting only an inapplicable condition is rejected. Restart allows
+unlimited additional launches by default; `--restart-limit N` counts additional
+launches. Only selected MemCordon limits restart, and only after the direct child
+and helpers are reaped, the workload is proven empty, and containment is removed
+or incapable of retaining members.
 
 ### Deadline scopes
 
