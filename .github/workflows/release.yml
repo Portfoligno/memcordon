@@ -337,7 +337,7 @@ jobs:
   macos-acceptance:
     name: Release / macOS arm64 acceptance
     needs: preflight
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Check out pushed tag
