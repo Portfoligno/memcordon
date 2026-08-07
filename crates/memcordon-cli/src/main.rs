@@ -49,8 +49,11 @@ fn main() {
         }
         Err(error) => {
             let mut out = presentation.stderr();
-            presentation::write_usage_error(&mut out, error.code, error.message)
+            presentation::write_usage_error(&mut out, error.code, &error.message)
                 .expect("usage diagnostic should be writable");
+            if let Some(help) = error.help {
+                presentation::write_help(&mut out, help).expect("usage help should be writable");
+            }
             2
         }
     };

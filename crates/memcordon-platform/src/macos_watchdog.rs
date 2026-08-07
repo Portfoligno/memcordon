@@ -324,9 +324,11 @@ pub fn run_attempt(
     let mut peak = 0_u64;
 
     let mut pending_signal = None;
+    let mut command_exit_grace_started = None;
     let mut outcome = loop {
         let mut cycle_error = None;
         let mut completion = None;
+        let mut workload_empty = false;
         match try_reap(&mut child, &mut stored_status) {
             Ok(Some(status)) => {
                 if policy.lifetime == Lifetime::Command {
@@ -341,9 +343,10 @@ pub fn run_attempt(
 
         match discover(root_pid, &mut known) {
             Ok(snapshots) => {
+                workload_empty = snapshots.is_empty();
                 if policy.lifetime == Lifetime::Workload
                     && stored_status.is_some()
-                    && snapshots.is_empty()
+                    && workload_empty
                 {
                     completion = Some(
                         stored_status
@@ -486,30 +489,49 @@ pub fn run_attempt(
         }
 
         if let Some(status) = completion {
-            let cleanup = if policy.lifetime == Lifetime::Workload {
-                CleanupSummary {
-                    direct_child_reaped: true,
-                    workload_empty: Some(true),
-                    ..CleanupSummary::default()
-                }
+            let completed = if policy.lifetime == Lifetime::Workload || workload_empty {
+                workload_empty
+            } else if policy.command_exit_grace.is_zero() {
+                true
             } else {
-                cleanup_after_direct_exit(
-                    &mut child,
-                    &mut stored_status,
-                    root_pid,
-                    &mut known,
-                    context.supervision_deadline(started),
-                )
+                let grace_started = command_exit_grace_started.get_or_insert_with(Instant::now);
+                grace_started.elapsed() >= policy.command_exit_grace
             };
-            break RunOutcome::Exited {
-                child: status,
-                peak: policy.memory.map(|_| ByteSize::from_bytes(peak)),
-                cleanup,
-            };
+            if completed {
+                let cleanup = if workload_empty {
+                    CleanupSummary {
+                        direct_child_reaped: true,
+                        workload_empty: Some(true),
+                        ..CleanupSummary::default()
+                    }
+                } else {
+                    cleanup_after_direct_exit(
+                        &mut child,
+                        &mut stored_status,
+                        root_pid,
+                        &mut known,
+                        context.supervision_deadline(started),
+                    )
+                };
+                break RunOutcome::Exited {
+                    child: status,
+                    peak: policy.memory.map(|_| ByteSize::from_bytes(peak)),
+                    cleanup,
+                };
+            }
         }
 
-        if let Some(watcher) = &exit_watcher {
-            if let Err(error) = watcher.wait(policy.poll_interval) {
+        let wait = command_exit_grace_started.map_or(policy.poll_interval, |grace_started| {
+            policy.poll_interval.min(
+                policy
+                    .command_exit_grace
+                    .saturating_sub(grace_started.elapsed()),
+            )
+        });
+        if stored_status.is_some() {
+            pending_signal = signal_source.wait(wait).ok().flatten();
+        } else if let Some(watcher) = &exit_watcher {
+            if let Err(error) = watcher.wait(wait) {
                 let cleanup = terminate_and_cleanup(
                     &mut child,
                     &mut stored_status,
@@ -526,7 +548,7 @@ pub fn run_attempt(
                 };
             }
         } else {
-            pending_signal = signal_source.wait(policy.poll_interval).ok().flatten();
+            pending_signal = signal_source.wait(wait).ok().flatten();
         }
     };
 

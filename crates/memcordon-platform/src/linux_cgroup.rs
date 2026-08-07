@@ -494,6 +494,7 @@ pub fn run_attempt(
     let mut stored = None;
     let mut peak = 0_u64;
     let mut pending_signal = None;
+    let mut command_exit_grace_started = None;
     let mut outcome = if let Some(outcome) = launcher_deadline_outcome {
         outcome
     } else {
@@ -720,28 +721,32 @@ pub fn run_attempt(
                 };
             }
             if let Some(status) = direct_status {
-                let completed = if policy.lifetime == Lifetime::Command {
-                    true
-                } else {
-                    match cgroup.populated() {
-                        Ok(populated) => !populated,
-                        Err(error) => {
-                            let cleanup = cgroup.cleanup_workload(
-                                &mut child,
-                                &mut stored,
-                                true,
-                                context.clamp_deadline(started, CLEANUP_DEADLINE),
-                            );
-                            break RunOutcome::MonitorFailed {
-                                error: format!("cgroup.events read failed: {error}"),
-                                child_after_termination: stored.clone(),
-                                cleanup,
-                            };
-                        }
+                let workload_empty = match cgroup.populated() {
+                    Ok(populated) => !populated,
+                    Err(error) => {
+                        let cleanup = cgroup.cleanup_workload(
+                            &mut child,
+                            &mut stored,
+                            true,
+                            context.clamp_deadline(started, CLEANUP_DEADLINE),
+                        );
+                        break RunOutcome::MonitorFailed {
+                            error: format!("cgroup.events read failed: {error}"),
+                            child_after_termination: stored.clone(),
+                            cleanup,
+                        };
                     }
                 };
+                let completed = if policy.lifetime == Lifetime::Workload || workload_empty {
+                    workload_empty
+                } else if policy.command_exit_grace.is_zero() {
+                    true
+                } else {
+                    let grace_started = command_exit_grace_started.get_or_insert_with(Instant::now);
+                    grace_started.elapsed() >= policy.command_exit_grace
+                };
                 if completed {
-                    let cleanup = if policy.lifetime == Lifetime::Workload {
+                    let cleanup = if workload_empty {
                         CleanupSummary {
                             direct_child_reaped: true,
                             workload_empty: Some(true),
@@ -764,7 +769,14 @@ pub fn run_attempt(
                     };
                 }
             }
-            pending_signal = signal_source.wait(policy.poll_interval).ok().flatten();
+            let wait = command_exit_grace_started.map_or(policy.poll_interval, |grace_started| {
+                policy.poll_interval.min(
+                    policy
+                        .command_exit_grace
+                        .saturating_sub(grace_started.elapsed()),
+                )
+            });
+            pending_signal = signal_source.wait(wait).ok().flatten();
         }
     };
 

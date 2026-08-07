@@ -2,6 +2,44 @@
 
 All notable user-visible changes to MemCordon are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Added `--command-exit-grace DURATION`, defaulting to zero, to let remaining
+  workload members drain naturally after the direct command exits before
+  command-mode cleanup force-cleans survivors.
+- Added lowercase decimal `h` support to time budgets and every duration-valued
+  policy option, with the existing upward whole-millisecond rounding.
+- Added a topic index when `memcordon help` is invoked without a topic.
+- Added Windows ARM64 native CI, stress, and release archive coverage.
+
+### Changed
+
+- Wrapper options and the optional memory and time budgets may now be
+  interleaved before the command and throughout `plan`; reports retain the
+  budgets' relative encounter order.
+- Lifecycle help now distinguishes direct-command status, command-mode cleanup,
+  workload-empty waiting, and the separate command-exit, interruption, and
+  configured-limit grace periods.
+- Terminal styling now honors `CLICOLOR` and `CLICOLOR_FORCE` alongside
+  `NO_COLOR`, while redirected output and machine-readable JSON remain plain.
+
+### Fixed
+
+- Windows command completion now fails closed when Job Object membership cannot
+  be queried, force-cleaning the job and reporting the cleanup error instead of
+  treating the workload as empty.
+
+### Breaking Changes
+
+- Execution reports advance from schema-4 to schema-5 and plan JSON advances
+  from schema-3 to schema-4. Both add requested and effective
+  `command_exit_grace_ms`; `MemcordonReport::schema4` is renamed to `schema5`.
+- The public Rust `Policy`, `RequestedPolicyReport`, and `EffectivePolicyReport`
+  structs add required command-exit-grace fields, so external struct literals
+  must be updated.
+
 ## [0.3.7] - 2026-08-07
 
 ### Added

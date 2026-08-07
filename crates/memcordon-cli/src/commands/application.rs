@@ -208,7 +208,7 @@ fn report(
             .iter()
             .map(|value| memcordon_core::NativeArgument::from_os(value)),
     );
-    MemcordonReport::schema4(
+    MemcordonReport::schema5(
         tool_report(),
         InvocationReport {
             syntax: "plus-budgets-v1".to_owned(),
@@ -454,6 +454,11 @@ fn policy_report(
     effects.push(OptionEffectReport::Applied {
         option: "poll-interval".to_owned(),
     });
+    if args.explicit.command_exit_grace {
+        effects.push(OptionEffectReport::Applied {
+            option: "command-exit-grace".to_owned(),
+        });
+    }
     if backend.name == "linux-cgroup-v2" {
         effects.push(OptionEffectReport::Applied {
             option: "swap".to_owned(),
@@ -513,6 +518,7 @@ fn policy_report(
             }),
             wait_for: effective_wait.to_owned(),
             signal_grace_ms: milliseconds(policy.signal_grace),
+            command_exit_grace_ms: milliseconds(policy.command_exit_grace),
             limit_grace_ms: milliseconds(policy.limit_grace),
             restart: EffectiveRestartPolicyReport {
                 enabled: !configured.is_empty(),
@@ -546,6 +552,7 @@ fn requested_report(
         }),
         wait_for: wait_name(args.wait_for).to_owned(),
         signal_grace_ms: milliseconds(args.signal_grace),
+        command_exit_grace_ms: milliseconds(args.command_exit_grace),
         limit_grace_ms: milliseconds(args.limit_grace),
         restart: RequestedRestartPolicyReport {
             enabled: !configured.is_empty(),
@@ -610,6 +617,7 @@ fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeRe
             }),
             wait_for: wait_name(args.wait_for).to_owned(),
             signal_grace_ms: milliseconds(args.signal_grace),
+            command_exit_grace_ms: milliseconds(args.command_exit_grace),
             limit_grace_ms: milliseconds(args.limit_grace),
             restart: EffectiveRestartPolicyReport {
                 enabled: !configured.is_empty(),
@@ -815,11 +823,9 @@ fn tool_report() -> ToolReport {
     }
 }
 fn print_json(value: &impl serde::Serialize, name: &str, presentation: &Presentation) -> i32 {
-    match serde_json::to_string_pretty(value) {
-        Ok(value) => {
-            println!("{value}");
-            0
-        }
+    let mut out = Presentation::machine_stdout();
+    match presentation::write_json(&mut out, value) {
+        Ok(()) => 0,
         Err(error) => {
             let mut out = presentation.stderr();
             presentation::write_runtime_error(

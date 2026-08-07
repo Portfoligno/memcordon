@@ -23,23 +23,7 @@ fn parse_duration(value: &OsStr) -> Duration {
     let value = value
         .to_str()
         .unwrap_or_else(|| fail("duration must be valid UTF-8"));
-    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
-        (number, 1_u64)
-    } else if let Some(number) = value.strip_suffix('s') {
-        (number, 1_000)
-    } else if let Some(number) = value.strip_suffix('m') {
-        (number, 60_000)
-    } else {
-        fail("duration must end in ms, s, or m")
-    };
-    let amount = number
-        .parse::<u64>()
-        .unwrap_or_else(|_| fail("duration must contain an unsigned integer"));
-    Duration::from_millis(
-        amount
-            .checked_mul(multiplier)
-            .unwrap_or_else(|| fail("duration is too large")),
-    )
+    memcordon::parse_duration(value).unwrap_or_else(|error| fail(error))
 }
 
 fn assert_native_containment(mut args: impl Iterator<Item = OsString>) {
@@ -137,11 +121,12 @@ fn touch_allocation(bytes: u64) -> Vec<u8> {
     memory
 }
 
-fn parse_pid_and_duration(
+fn parse_pid_duration_and_completion(
     mut args: impl Iterator<Item = OsString>,
-) -> (Option<PathBuf>, Option<Duration>) {
+) -> (Option<PathBuf>, Option<Duration>, Option<PathBuf>) {
     let mut pid_file = None;
     let mut duration = None;
+    let mut completion_marker = None;
     while let Some(argument) = args.next() {
         match argument.to_str() {
             Some("--pid-file") => {
@@ -150,16 +135,24 @@ fn parse_pid_and_duration(
             Some("--duration") | Some("--hold") => {
                 duration = Some(parse_duration(&take_value(&mut args, "--duration")))
             }
+            Some("--completion-marker") => {
+                completion_marker =
+                    Some(PathBuf::from(take_value(&mut args, "--completion-marker")))
+            }
             _ => fail("unexpected fixture argument"),
         }
     }
-    (pid_file, duration)
+    (pid_file, duration, completion_marker)
 }
 
 fn hold(args: impl Iterator<Item = OsString>) {
-    let (pid_file, duration) = parse_pid_and_duration(args);
+    let (pid_file, duration, completion_marker) = parse_pid_duration_and_completion(args);
     write_pid(pid_file.as_deref());
     thread::sleep(duration.unwrap_or(Duration::from_secs(30)));
+    if let Some(path) = completion_marker {
+        fs::write(path, b"completed\n")
+            .unwrap_or_else(|error| fail(format!("cannot write completion marker: {error}")));
+    }
 }
 
 fn exit_fixture(mut args: impl Iterator<Item = OsString>) -> i32 {
@@ -221,14 +214,29 @@ fn allocate(mut args: impl Iterator<Item = OsString>, release_before_hold: bool)
 }
 
 #[allow(clippy::zombie_processes)]
-fn spawn_background(mut args: impl Iterator<Item = OsString>) {
+fn spawn_background(mut args: impl Iterator<Item = OsString>) -> i32 {
     let mut duration = None;
     let mut pid_file = None;
+    let mut completion_marker = None;
+    let mut exit_code = None;
     while let Some(argument) = args.next() {
         match argument.to_str() {
             Some("--child-duration") => duration = Some(take_value(&mut args, "--child-duration")),
             Some("--pid-file") => {
                 pid_file = Some(PathBuf::from(take_value(&mut args, "--pid-file")))
+            }
+            Some("--completion-marker") => {
+                completion_marker =
+                    Some(PathBuf::from(take_value(&mut args, "--completion-marker")))
+            }
+            Some("--exit-code") => {
+                let value = take_value(&mut args, "--exit-code");
+                exit_code = Some(
+                    value
+                        .to_str()
+                        .and_then(|value| value.parse::<u8>().ok())
+                        .unwrap_or_else(|| fail("exit code must be in 0..=255")),
+                )
             }
             _ => fail("unexpected spawn-background argument"),
         }
@@ -241,6 +249,9 @@ fn spawn_background(mut args: impl Iterator<Item = OsString>) {
         .arg(duration.unwrap_or_else(|| OsString::from("30s")))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(path) = completion_marker {
+        command.arg("--completion-marker").arg(path);
+    }
     // Deliberately do not wait: this fixture tests whether MemCordon owns and cleans a
     // descendant after its direct child exits. The outer test session remains the safety net.
     let child = command
@@ -252,6 +263,7 @@ fn spawn_background(mut args: impl Iterator<Item = OsString>) {
     identity
         .publish_to(&path)
         .unwrap_or_else(|error| fail(format!("cannot write child PID file: {error}")));
+    i32::from(exit_code.unwrap_or(0))
 }
 
 #[allow(clippy::zombie_processes)]
@@ -400,7 +412,7 @@ fn main() {
             0
         }
         "spin" => {
-            let (pid_file, _) = parse_pid_and_duration(args);
+            let (pid_file, _, _) = parse_pid_duration_and_completion(args);
             write_pid(pid_file.as_deref());
             loop {
                 std::hint::spin_loop();
@@ -414,10 +426,7 @@ fn main() {
             allocate(args, true);
             0
         }
-        "spawn-background" => {
-            spawn_background(args);
-            0
-        }
+        "spawn-background" => spawn_background(args),
         "fork-continually" => {
             fork_continually(args);
             0

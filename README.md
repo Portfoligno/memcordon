@@ -27,7 +27,8 @@ memcordon +1GiB +10m ./workload
 ```
 
 `./workload` and any following arguments are passed through unchanged. MemCordon
-preserves the workload's exit status unless a limit or supervision failure occurs.
+returns the direct command's exit status after required cleanup succeeds, unless
+a higher-precedence limit or supervision failure occurs.
 
 | Status | Meaning |
 | ---: | --- |
@@ -47,8 +48,7 @@ host limitations without launching a workload.
 
 ## Reference
 
-- Run `memcordon --help` for concise command-line help; `memcordon help TOPIC`
-  provides focused offline reference, and `memcordon help all` prints all options.
+- Run `memcordon --help` or `memcordon help` for command-line reference.
 - See the [contract reference](docs/reference.md) for policies, platform
   behavior, reports, and exit codes.
 - Review the [changelog](CHANGELOG.md) or [MIT license](LICENSE).

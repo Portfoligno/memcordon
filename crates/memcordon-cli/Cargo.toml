@@ -27,6 +27,7 @@ required-features = ["test-fixtures"]
 [dependencies]
 anstream.workspace = true
 anstyle.workspace = true
+anstyle-query.workspace = true
 clap.workspace = true
 libc.workspace = true
 memcordon-core = { path = "../memcordon-core", version = "=0.3.8-dev" }

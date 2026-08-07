@@ -196,6 +196,7 @@ pub fn run_attempt(
 
     let child_pid = process.id;
     let mut peak = 0_u64;
+    let mut command_exit_grace_started = None;
     let outcome = loop {
         let mut memory_due = false;
         let mut drain_error = None;
@@ -295,33 +296,57 @@ pub fn run_attempt(
             let child = process
                 .exit_status()
                 .unwrap_or(ChildTermination::Unavailable);
-            let mut cleanup = CleanupSummary {
-                direct_child_reaped: true,
-                ..CleanupSummary::default()
-            };
-            let active = job.active_processes().unwrap_or(0);
-            if active > 0 {
-                cleanup.force_attempted = true;
-                if let Err(error) = job.terminate(INTERRUPT_TERMINATION_STATUS) {
+            let active = match job.active_processes() {
+                Ok(active) => active,
+                Err(error) => {
+                    let mut cleanup = job.force_cleanup(
+                        &process,
+                        INTERRUPT_TERMINATION_STATUS,
+                        context.clamp_deadline(started, Duration::from_secs(5)),
+                    );
                     cleanup
                         .errors
-                        .push(cleanup_error("TerminateJobObject", error));
+                        .push(cleanup_error("QueryInformationJobObject", error));
+                    break RunOutcome::Exited {
+                        child,
+                        peak: policy.memory.map(|_| ByteSize::from_bytes(peak)),
+                        cleanup,
+                    };
                 }
-                cleanup.workload_empty = Some(
-                    job.wait_empty(context.clamp_deadline(started, Duration::from_secs(5)))
-                        .unwrap_or(false),
-                );
-            } else {
-                cleanup.workload_empty = Some(true);
-            }
-            peak = peak.max(job.peak_commit().unwrap_or(0));
-            break RunOutcome::Exited {
-                child,
-                peak: policy.memory.map(|_| ByteSize::from_bytes(peak)),
-                cleanup,
             };
+            if active == 0 {
+                peak = peak.max(job.peak_commit().unwrap_or(0));
+                break RunOutcome::Exited {
+                    child,
+                    peak: policy.memory.map(|_| ByteSize::from_bytes(peak)),
+                    cleanup: CleanupSummary {
+                        direct_child_reaped: true,
+                        workload_empty: Some(true),
+                        ..CleanupSummary::default()
+                    },
+                };
+            }
+            let grace_expired = if policy.command_exit_grace.is_zero() {
+                true
+            } else {
+                let grace_started = command_exit_grace_started.get_or_insert_with(Instant::now);
+                grace_started.elapsed() >= policy.command_exit_grace
+            };
+            if grace_expired {
+                let cleanup = job.force_cleanup(
+                    &process,
+                    INTERRUPT_TERMINATION_STATUS,
+                    context.clamp_deadline(started, Duration::from_secs(5)),
+                );
+                peak = peak.max(job.peak_commit().unwrap_or(0));
+                break RunOutcome::Exited {
+                    child,
+                    peak: policy.memory.map(|_| ByteSize::from_bytes(peak)),
+                    cleanup,
+                };
+            }
         }
-        if wait != WAIT_TIMEOUT {
+        if wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT {
             let error = io::Error::last_os_error();
             let cleanup = job.force_cleanup(
                 &process,
@@ -357,7 +382,14 @@ pub fn run_attempt(
             };
         }
 
-        match job.wait_message(bounded_wait(context, started, policy.poll_interval)) {
+        let wait = command_exit_grace_started.map_or(policy.poll_interval, |grace_started| {
+            policy.poll_interval.min(
+                policy
+                    .command_exit_grace
+                    .saturating_sub(grace_started.elapsed()),
+            )
+        });
+        match job.wait_message(bounded_wait(context, started, wait)) {
             Ok(Some(message)) if message == JOB_OBJECT_MSG_JOB_MEMORY_LIMIT => {
                 let Some(limit) = policy.memory else {
                     continue;

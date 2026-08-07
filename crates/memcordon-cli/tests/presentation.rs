@@ -1,7 +1,9 @@
 use std::io;
 
 use anstream::{AutoStream, ColorChoice};
-use memcordon::invocation::{CLEAN_USAGE, DOCTOR_USAGE, HELP_TOPIC_USAGE, PLAN_USAGE, ROOT_USAGE};
+use memcordon::invocation::{
+    CLEAN_USAGE, DOCTOR_USAGE, HELP_TOPIC_USAGE, HELP_USAGE, PLAN_USAGE, ROOT_USAGE,
+};
 
 #[allow(dead_code)]
 #[path = "../src/presentation.rs"]
@@ -30,7 +32,13 @@ fn assert_renderer(expected: &str, writer: impl Fn(&mut Buffer) -> io::Result<()
 
 #[test]
 fn every_help_document_is_exact_when_plain_and_styled_when_forced() {
-    let command_help = [ROOT_USAGE, DOCTOR_USAGE, PLAN_USAGE, CLEAN_USAGE];
+    let command_help = [
+        ROOT_USAGE,
+        HELP_USAGE,
+        DOCTOR_USAGE,
+        PLAN_USAGE,
+        CLEAN_USAGE,
+    ];
     for help in command_help
         .into_iter()
         .chain(HELP_TOPIC_USAGE.iter().map(|(_, help)| *help))
@@ -38,6 +46,33 @@ fn every_help_document_is_exact_when_plain_and_styled_when_forced() {
         assert_renderer(&format!("{help}\n"), |out| {
             presentation::write_help(out, help)
         });
+    }
+}
+
+#[test]
+fn multiline_leads_and_wrapped_option_terms_are_styled() {
+    let all = HELP_TOPIC_USAGE
+        .iter()
+        .find_map(|(topic, help)| (*topic == "all").then_some(*help))
+        .expect("all help topic");
+    let coloured = String::from_utf8(render(ColorChoice::AlwaysAnsi, &|out| {
+        presentation::write_help(out, all)
+    }))
+    .expect("coloured help output");
+
+    for visible in [
+        "optional memory and elapsed-time limits.",
+        "--metric native|physical-footprint|rss|virtual",
+        "--restart-on both|memory-limit|deadline",
+    ] {
+        let line = coloured
+            .lines()
+            .find(|line| line.contains(visible))
+            .expect("expected help line");
+        assert!(
+            line.contains('\x1b'),
+            "expected `{visible}` to be styled in help all"
+        );
     }
 }
 

@@ -581,6 +581,7 @@ version = "0.3.8-dev"
 dependencies = [
  "anstream",
  "anstyle",
+ "anstyle-query",
  "clap",
  "libc",
  "memcordon-core",

@@ -32,6 +32,12 @@ fn policy_constructors_preserve_one_shot_defaults_and_validate_deadlines() {
     );
     assert!(Policy::unbounded().memory.is_none());
     assert!(Policy::unbounded().deadline.is_none());
+    assert_eq!(Policy::default().command_exit_grace, Duration::ZERO);
+    assert_eq!(
+        Policy::new(ByteSize::from_bytes(7)).command_exit_grace,
+        Duration::ZERO
+    );
+    assert_eq!(Policy::unbounded().command_exit_grace, Duration::ZERO);
     let immediate = DeadlinePolicy::new(Duration::ZERO, DeadlineScope::Attempt)
         .expect("zero is an immediate deadline");
     assert_eq!(immediate.duration(), Duration::ZERO);

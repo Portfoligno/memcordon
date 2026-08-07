@@ -1,8 +1,13 @@
 use std::ffi::{OsStr, OsString};
 use std::process::Command;
 
-use memcordon::invocation::{HELP_TOPIC_USAGE, HelpKind, Invocation, LimitToken, route};
-use memcordon_core::{DOCTOR_REPORT_SCHEMA_VERSION, PLAN_REPORT_SCHEMA_VERSION};
+use memcordon::invocation::{
+    BudgetToken, HELP_TOPIC_USAGE, HELP_USAGE, HelpKind, Invocation, LimitToken, route,
+};
+use memcordon::parse_duration;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION;
+use memcordon_core::{DOCTOR_REPORT_SCHEMA_VERSION, Lifetime, PLAN_REPORT_SCHEMA_VERSION};
 
 fn native(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
@@ -12,6 +17,13 @@ fn execution(values: &[&str]) -> memcordon::invocation::ExecutionArgs {
     match route(&native(values)).expect("invocation should parse") {
         Invocation::Execute(args) => args,
         other => panic!("expected execution, received {other:?}"),
+    }
+}
+
+fn plan(values: &[&str]) -> memcordon::invocation::PlanArgs {
+    match route(&native(values)).expect("plan should parse") {
+        Invocation::Plan(args) => args,
+        other => panic!("expected plan, received {other:?}"),
     }
 }
 
@@ -59,6 +71,436 @@ fn optional_and_order_independent_budgets_preserve_native_boundary() {
     assert_eq!(zero_memory.budgets.memory.expect("memory").bytes(), 0);
     let zero_time = execution(&["--deadline-scope", "supervision", "+0ms", "program"]);
     assert_eq!(zero_time.budgets.deadline, Some(std::time::Duration::ZERO));
+}
+
+#[test]
+fn execution_options_and_budgets_are_fully_interleavable() {
+    let layouts = [
+        &[
+            "--metric",
+            "rss",
+            "--deadline-scope",
+            "attempt",
+            "+1GiB",
+            "+1h",
+            "program",
+            "arg",
+        ][..],
+        &[
+            "+1GiB",
+            "+1h",
+            "--metric",
+            "rss",
+            "--deadline-scope",
+            "attempt",
+            "program",
+            "arg",
+        ][..],
+        &[
+            "+1GiB",
+            "--metric",
+            "rss",
+            "+1h",
+            "--deadline-scope",
+            "attempt",
+            "program",
+            "arg",
+        ][..],
+        &[
+            "--metric",
+            "rss",
+            "+1GiB",
+            "--deadline-scope",
+            "attempt",
+            "+1h",
+            "program",
+            "arg",
+        ][..],
+    ];
+    let expected = execution(layouts[0]);
+    for layout in &layouts[1..] {
+        assert_eq!(execution(layout), expected, "layout={layout:?}");
+    }
+
+    let time_first = execution(&["+1h", "--summary", "+1GiB", "program"]);
+    assert!(matches!(
+        &time_first.budgets.source_order[..],
+        [BudgetToken::Time { .. }, BudgetToken::Memory { .. }]
+    ));
+    let memory_first = execution(&["+1GiB", "--summary", "+1h", "program"]);
+    assert!(matches!(
+        &memory_first.budgets.source_order[..],
+        [BudgetToken::Memory { .. }, BudgetToken::Time { .. }]
+    ));
+    assert_eq!(time_first.budgets.memory, memory_first.budgets.memory);
+    assert_eq!(time_first.budgets.deadline, memory_first.budgets.deadline);
+}
+
+#[test]
+fn interleaved_execution_preserves_option_values_and_command_opacity() {
+    let separate_report = execution(&["+1GiB", "--report", "+artifact.json", "program"]);
+    let inline_report = execution(&["+1GiB", "--report=+artifact.json", "program"]);
+    assert_eq!(separate_report, inline_report);
+
+    let opaque = execution(&[
+        "+1GiB",
+        "--summary",
+        "+1h",
+        "--wait-for",
+        "workload",
+        "program",
+        "--wait-for",
+        "command",
+        "+2GiB",
+        "--",
+        "plan",
+    ]);
+    assert!(opaque.output.summary);
+    assert_eq!(opaque.policy.wait_for, Lifetime::Workload);
+    assert_eq!(
+        opaque.command,
+        native(&["program", "--wait-for", "command", "+2GiB", "--", "plan",])
+    );
+
+    let dash_command = execution(&[
+        "+1GiB",
+        "--metric",
+        "rss",
+        "--",
+        "--program",
+        "--metric",
+        "watchdog",
+        "+1h",
+    ]);
+    assert_eq!(
+        dash_command.command,
+        native(&["--program", "--metric", "watchdog", "+1h"])
+    );
+    let plus_command = execution(&["--", "+1GiB", "--metric", "rss"]);
+    assert!(plus_command.budgets.source_order.is_empty());
+    assert_eq!(plus_command.command, native(&["+1GiB", "--metric", "rss"]));
+    assert_eq!(execution(&["+1GiB", "--", "--"]).command, native(&["--"]));
+
+    for name in ["help", "doctor", "plan", "clean", "run"] {
+        let utility_name = execution(&["+1GiB", "--quiet", name, "--json"]);
+        assert!(utility_name.output.quiet);
+        assert_eq!(utility_name.command, native(&[name, "--json"]));
+    }
+    let last_wait_for = execution(&[
+        "--wait-for",
+        "command",
+        "+1GiB",
+        "--wait-for",
+        "workload",
+        "program",
+    ]);
+    assert_eq!(last_wait_for.policy.wait_for, Lifetime::Workload);
+    let opaque_budget = execution(&["program", "+bogus", "--summary"]);
+    assert_eq!(
+        opaque_budget.command,
+        native(&["program", "+bogus", "--summary"])
+    );
+}
+
+#[test]
+fn interleaved_execution_keeps_validation_codes_and_explicit_boundaries() {
+    for (values, code) in [
+        (
+            &["+1GiB", "--quiet", "+2GiB", "program"][..],
+            "MCCLI-BUDGET-DUPLICATE-MEMORY",
+        ),
+        (
+            &["+1s", "--summary", "+2s", "program"][..],
+            "MCCLI-BUDGET-DUPLICATE-TIME",
+        ),
+        (
+            &["+1GiB", "--quiet", "+1s", "--summary", "+2GiB", "program"][..],
+            "MCCLI-BUDGET-COUNT",
+        ),
+        (
+            &["--summary", "+1GiB", "--quiet", "program"][..],
+            "MCCLI-OUTPUT-CONFLICT",
+        ),
+        (&["--metric", "+1GiB", "program"][..], "MCCLI-OPTION-VALUE"),
+        (&["--signal-grace", "+1s", "program"][..], "MCCLI-DURATION"),
+        (&["+1GiB", "--metric"][..], "MCCLI-MISSING-OPTION-VALUE"),
+        (&["+bogus", "program"][..], "MCCLI-BUDGET"),
+        (&["+1GiB", "--program"][..], "MCCLI-UNKNOWN-OPTION"),
+    ] {
+        assert_eq!(
+            route(&native(values))
+                .expect_err("invalid interleaving should fail")
+                .code,
+            code,
+            "values={values:?}"
+        );
+    }
+    assert_eq!(
+        execution(&["+1GiB", "--", "--program"]).command,
+        native(&["--program"])
+    );
+    assert_eq!(
+        route(&native(&["+1GiB", "--help"]))
+            .expect_err("help remains a wrapper option before the boundary")
+            .code,
+        "MCCLI-HELP"
+    );
+    assert_eq!(execution(&["--", "--help"]).command, native(&["--help"]));
+}
+
+#[test]
+fn plan_options_and_budgets_are_fully_interleavable() {
+    let layouts = [
+        &[
+            "plan",
+            "--json",
+            "--metric",
+            "rss",
+            "+1GiB",
+            "--deadline-scope",
+            "attempt",
+            "+1h",
+        ][..],
+        &[
+            "plan",
+            "+1GiB",
+            "--metric",
+            "rss",
+            "+1h",
+            "--json",
+            "--deadline-scope",
+            "attempt",
+        ][..],
+        &[
+            "plan",
+            "--metric",
+            "rss",
+            "+1GiB",
+            "--deadline-scope",
+            "attempt",
+            "+1h",
+            "--json",
+        ][..],
+    ];
+    let expected = plan(layouts[0]);
+    for layout in &layouts[1..] {
+        assert_eq!(plan(layout), expected, "layout={layout:?}");
+    }
+
+    let time_first = plan(&["plan", "+1h", "--json", "+1GiB", "--metric", "rss"]);
+    assert!(matches!(
+        &time_first.budgets.source_order[..],
+        [BudgetToken::Time { .. }, BudgetToken::Memory { .. }]
+    ));
+
+    for (values, code) in [
+        (
+            &["plan", "+1GiB", "--json", "+2GiB"][..],
+            "MCCLI-BUDGET-DUPLICATE-MEMORY",
+        ),
+        (
+            &["plan", "+1s", "--json", "+2s"][..],
+            "MCCLI-BUDGET-DUPLICATE-TIME",
+        ),
+        (
+            &["plan", "+1GiB", "--", "+1h"][..],
+            "MCCLI-DELIMITER-POSITION",
+        ),
+        (&["plan", "+1GiB", "program"][..], "MCCLI-UNKNOWN-OPTION"),
+        (
+            &["plan", "--metric", "--", "+1GiB"][..],
+            "MCCLI-OPTION-VALUE",
+        ),
+    ] {
+        assert_eq!(
+            route(&native(values))
+                .expect_err("invalid plan interleaving should fail")
+                .code,
+            code,
+            "values={values:?}"
+        );
+    }
+}
+
+#[test]
+fn duration_parser_accepts_decimal_hours_with_bounded_millisecond_semantics() {
+    for (value, millis) in [
+        ("0h", 0),
+        ("1ms", 1),
+        ("1s", 1_000),
+        ("1m", 60_000),
+        ("1h", 3_600_000),
+        ("1.5h", 5_400_000),
+        ("0.0000001h", 1),
+        ("5124095576030h", 18_446_744_073_708_000_000),
+        ("5124095576030.4h", 18_446_744_073_709_440_000),
+    ] {
+        assert_eq!(
+            parse_duration(value),
+            Ok(std::time::Duration::from_millis(millis)),
+            "value={value}"
+        );
+    }
+
+    for value in [
+        "h", "1H", "1hr", "1hour", "1d", ".5h", "1.h", "1.2.3h", "-1h", "+1h", "1e2h", "1 h", "1",
+        "",
+    ] {
+        assert!(parse_duration(value).is_err(), "value={value}");
+    }
+
+    for value in [
+        "5124095576030.5h",
+        "5124095576031h",
+        "340282366920938463463374607431768211455h",
+        "340282366920938463463374607431768211456h",
+    ] {
+        assert_eq!(
+            parse_duration(value),
+            Err("duration is too large".to_owned()),
+            "value={value}"
+        );
+    }
+    assert_eq!(
+        parse_duration("1H"),
+        Err("unsupported duration unit `H`".to_owned())
+    );
+}
+
+#[test]
+fn hour_unit_is_shared_by_time_budget_and_every_duration_option() {
+    let parsed = execution(&[
+        "--poll-interval",
+        "1h",
+        "--signal-grace",
+        "1h",
+        "--command-exit-grace",
+        "1h",
+        "--limit-grace",
+        "1h",
+        "--restart",
+        "--backoff-base",
+        "1h",
+        "--backoff-asymptote",
+        "1h",
+        "--backoff-recovery-half-life",
+        "1h",
+        "--circuit-threshold",
+        "2",
+        "--circuit-cooldown",
+        "1h",
+        "--circuit-half-life",
+        "1h",
+        "+1h",
+        "+1GiB",
+        "program",
+    ]);
+    let hour = std::time::Duration::from_secs(60 * 60);
+    assert_eq!(parsed.budgets.deadline, Some(hour));
+    assert!(matches!(
+        &parsed.budgets.source_order[0],
+        BudgetToken::Time { raw, duration }
+            if raw == OsStr::new("+1h") && *duration == hour
+    ));
+    assert_eq!(parsed.policy.poll_interval, hour);
+    assert_eq!(parsed.policy.signal_grace, hour);
+    assert_eq!(parsed.policy.command_exit_grace, hour);
+    assert_eq!(parsed.policy.limit_grace, hour);
+    assert_eq!(
+        parsed.policy.policy(&parsed.budgets).command_exit_grace,
+        hour
+    );
+    assert_eq!(parsed.policy.backoff.base_interval(), hour);
+    assert_eq!(parsed.policy.backoff.asymptote_interval(), hour);
+    assert_eq!(parsed.policy.backoff.recovery_half_life(), hour);
+    let circuit = parsed
+        .policy
+        .circuit_breaker
+        .expect("complete circuit policy");
+    assert_eq!(circuit.cooldown(), hour);
+    assert_eq!(circuit.half_life(), hour);
+
+    for values in [&["+1H", "program"][..], &["+1d", "program"][..]] {
+        assert_eq!(
+            route(&native(values))
+                .expect_err("unsupported time budget must fail")
+                .code,
+            "MCCLI-BUDGET"
+        );
+    }
+    assert_eq!(
+        route(&native(&["--signal-grace", "1H", "program"]))
+            .expect_err("unsupported option duration must fail")
+            .code,
+        "MCCLI-DURATION"
+    );
+    assert_eq!(
+        route(&native(&[
+            "--command-exit-grace",
+            "5124095576031h",
+            "program"
+        ]))
+        .expect_err("overflowing command-exit grace must fail")
+        .code,
+        "MCCLI-DURATION"
+    );
+}
+
+#[test]
+fn command_exit_grace_is_command_only_and_last_value_wins() {
+    assert_eq!(
+        memcordon::invocation::PolicyArgs::default().command_exit_grace,
+        std::time::Duration::ZERO
+    );
+    let parsed = execution(&[
+        "--command-exit-grace",
+        "0ms",
+        "+1GiB",
+        "--command-exit-grace",
+        "250ms",
+        "program",
+    ]);
+    assert_eq!(
+        parsed.policy.command_exit_grace,
+        std::time::Duration::from_millis(250)
+    );
+    let planned = plan(&["plan", "+1GiB", "--command-exit-grace", "250ms"]);
+    assert_eq!(
+        planned.policy.command_exit_grace,
+        std::time::Duration::from_millis(250)
+    );
+
+    for values in [
+        &[
+            "--command-exit-grace",
+            "0ms",
+            "--wait-for",
+            "workload",
+            "program",
+        ][..],
+        &[
+            "--wait-for",
+            "workload",
+            "--command-exit-grace",
+            "1ms",
+            "program",
+        ][..],
+    ] {
+        assert_eq!(
+            route(&native(values))
+                .expect_err("workload completion conflicts with command-exit grace")
+                .code,
+            "MCUSAGE-COMMAND-EXIT-GRACE"
+        );
+    }
+    for name in ["--command-grace", "--completion-grace", "--exit-grace"] {
+        assert_eq!(
+            route(&native(&[name, "1s", "program"]))
+                .expect_err("noncanonical option name must fail")
+                .code,
+            "MCCLI-UNKNOWN-OPTION"
+        );
+    }
 }
 
 #[test]
@@ -377,7 +819,7 @@ fn invalid_limits_and_boundaries_have_stable_codes() {
 #[test]
 fn compatibility_routes_return_stable_actionable_diagnostics() {
     for (command, code, replacement) in [
-        ("run", "MCCLI-LEGACY-RUN", "memcordon [OPTIONS] [BUDGET]..."),
+        ("run", "MCCLI-LEGACY-RUN", "memcordon [OPTION|BUDGET]..."),
         ("probe", "MCCLI-LEGACY-PROBE", "memcordon doctor"),
         ("explain", "MCCLI-LEGACY-EXPLAIN", "memcordon plan +MEMORY"),
         ("cleanup", "MCCLI-LEGACY-CLEANUP", "memcordon clean"),
@@ -401,6 +843,9 @@ fn utilities_help_and_version_have_exact_root_routing() {
         Ok(Invocation::Help(HelpKind::Root))
     );
     assert_eq!(route(&native(&["--version"])), Ok(Invocation::Version));
+    let help = route(&native(&["help"])).expect_err("bare help uses help output path");
+    assert_eq!(help.code, "MCCLI-HELP");
+    assert_eq!(help.message, HELP_USAGE);
     for (topic, expected) in HELP_TOPIC_USAGE {
         let error = route(&native(&["help", topic])).expect_err("topic help uses help output path");
         assert_eq!(error.code, "MCCLI-HELP");
@@ -434,7 +879,6 @@ fn topic_help_is_reserved_only_at_the_first_token() {
     assert_eq!(parsed.command, native(&["program", "help", "restart"]));
 
     for values in [
-        &["help"][..],
         &["help", "restart", "extra"][..],
         &["help", "+1GiB", "program"][..],
         &["help", "--", "restart"][..],
@@ -578,7 +1022,7 @@ fn plan_text_and_json_have_distinct_resolution_shapes_when_backend_is_available(
         .output()
         .expect("plan text should run");
     let json = Command::new(env!("CARGO_BIN_EXE_memcordon"))
-        .args(["plan", "--json"])
+        .args(["plan", "--json", "--command-exit-grace", "250ms"])
         .output()
         .expect("plan JSON should run");
 
@@ -611,6 +1055,20 @@ fn plan_text_and_json_have_distinct_resolution_shapes_when_backend_is_available(
     assert!(value["resolution"]["effects"].is_array());
     assert!(value["resolution"]["limitations"].is_array());
     assert_eq!(value["resolution"]["launch_proof"], false);
+    assert_eq!(value["request"]["command_exit_grace_ms"], 250);
+    assert_eq!(
+        value["resolution"]["effective"]["command_exit_grace_ms"],
+        250
+    );
+    assert!(
+        value["resolution"]["effects"]
+            .as_array()
+            .is_some_and(|effects| {
+                effects
+                    .iter()
+                    .any(|effect| effect["option"] == "command-exit-grace")
+            })
+    );
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -643,16 +1101,16 @@ fn plan_restart_json_carries_half_life_defaults_and_source_order() {
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args([
             "plan",
+            "+1s",
             "--json",
             "--restart",
             "--backoff-multiplier",
             "1",
             "--circuit-threshold",
             "2.5",
+            "+1GiB",
             "--circuit-cooldown",
             "5m",
-            "+1s",
-            "+1GiB",
         ])
         .output()
         .expect("plan should run");
@@ -660,7 +1118,9 @@ fn plan_restart_json_carries_half_life_defaults_and_source_order() {
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("plan must emit JSON");
     assert_eq!(value["budget_tokens"][0]["kind"], "time");
+    assert_eq!(value["budget_tokens"][0]["token"], "+1s");
     assert_eq!(value["budget_tokens"][1]["kind"], "memory");
+    assert_eq!(value["budget_tokens"][1]["token"], "+1GiB");
     assert_eq!(value["request"]["restart"]["enabled"], true);
     assert_eq!(
         value["request"]["restart"]["backoff"]["model"],
@@ -727,7 +1187,7 @@ fn removed_run_binary_path_never_launches() {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-fn command_not_found_maps_to_127_and_produces_schema_four_failure_report() {
+fn command_not_found_maps_to_127_and_produces_schema_five_failure_report() {
     let temporary = tempfile::tempdir().expect("temporary directory should exist");
     let report = temporary.path().join("failure.json");
     let missing = temporary.path().join("command-that-does-not-exist");
@@ -742,7 +1202,7 @@ fn command_not_found_maps_to_127_and_produces_schema_four_failure_report() {
     let value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(report).expect("failure report should be written"))
             .expect("failure report should be JSON");
-    assert_eq!(value["schema_version"], 4);
+    assert_eq!(value["schema_version"], EXECUTION_REPORT_SCHEMA_VERSION);
     assert_eq!(value["supervision"]["wrapper_exit_code"], 127);
     assert_eq!(value["attempts"][0]["error"]["code"], "MCSPAWN-NOT-FOUND");
     assert_eq!(
@@ -796,7 +1256,7 @@ fn clean_json_uses_schema_one() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn schema_four_success_report_uses_plus_memory_invocation() {
+fn schema_five_success_report_uses_plus_memory_invocation() {
     let temporary = tempfile::tempdir().expect("temporary directory should exist");
     let report = temporary.path().join("success.json");
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
@@ -810,7 +1270,7 @@ fn schema_four_success_report_uses_plus_memory_invocation() {
     assert_eq!(bytes.last(), Some(&b'\n'));
     assert!(!bytes.contains(&0x1b));
     let value: serde_json::Value = serde_json::from_slice(&bytes).expect("report should be JSON");
-    assert_eq!(value["schema_version"], 4);
+    assert_eq!(value["schema_version"], EXECUTION_REPORT_SCHEMA_VERSION);
     assert_eq!(value["invocation"]["syntax"], "plus-budgets-v1");
     assert_eq!(value["supervision"]["wrapper_exit_code"], 0);
     assert_eq!(

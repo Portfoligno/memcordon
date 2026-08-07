@@ -13,15 +13,15 @@ use memcordon_core::{
 use memcordon_core::{
     BackoffPolicyReport, BudgetKindReport, BudgetTokenReport, CircuitBreakerPolicyReport,
     CircuitState, DeadlinePolicyReport, DeadlineScope, DormantRestartCondition,
-    EffectiveMemoryPolicyReport, EffectivePolicyReport, EffectiveRestartPolicyReport,
-    ErrorCategory, ExecutionErrorReport, InvocationReport, MemcordonReport, NativeArgument,
-    PolicyEnvelopeReport, RequestedMemoryPolicyReport, RequestedPolicyReport,
-    RequestedRestartPolicyReport, RestartCondition, RestartConditions, RestartLimit, SwapReport,
-    ToolReport, write_report_atomic,
+    EXECUTION_REPORT_SCHEMA_VERSION, EffectiveMemoryPolicyReport, EffectivePolicyReport,
+    EffectiveRestartPolicyReport, ErrorCategory, ExecutionErrorReport, InvocationReport,
+    MemcordonReport, NativeArgument, PolicyEnvelopeReport, RequestedMemoryPolicyReport,
+    RequestedPolicyReport, RequestedRestartPolicyReport, RestartCondition, RestartConditions,
+    RestartLimit, SwapReport, ToolReport, write_report_atomic,
 };
 
 fn report() -> MemcordonReport {
-    MemcordonReport::schema4(
+    MemcordonReport::schema5(
         ToolReport {
             name: "memcordon".to_owned(),
             version: "test".to_owned(),
@@ -47,6 +47,7 @@ fn report() -> MemcordonReport {
                 }),
                 wait_for: "command".to_owned(),
                 signal_grace_ms: 2_000,
+                command_exit_grace_ms: 0,
                 limit_grace_ms: 0,
                 restart: RequestedRestartPolicyReport {
                     enabled: false,
@@ -67,6 +68,7 @@ fn report() -> MemcordonReport {
                 }),
                 wait_for: "command".to_owned(),
                 signal_grace_ms: 2_000,
+                command_exit_grace_ms: 0,
                 limit_grace_ms: 0,
                 restart: EffectiveRestartPolicyReport {
                     enabled: false,
@@ -109,7 +111,7 @@ fn atomic_report_replaces_existing_relative_destination_and_ends_in_newline() {
     assert_ne!(bytes.get(bytes.len().saturating_sub(2)), Some(&b'\n'));
     let decoded: MemcordonReport =
         serde_json::from_slice(&bytes).expect("typed schema should read");
-    assert_eq!(decoded.schema_version, 4);
+    assert_eq!(decoded.schema_version, EXECUTION_REPORT_SCHEMA_VERSION);
     assert!(decoded.policy.requested.memory.is_none());
     assert!(decoded.invocation.memory_token.is_none());
 }
@@ -172,7 +174,7 @@ fn circuit_state_is_typed_in_schema_models() {
 }
 
 #[test]
-fn schema_four_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
+fn schema_five_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
     let cases = [
         (Vec::new(), None, None),
         (
@@ -371,7 +373,7 @@ fn schema_four_budget_orders_restart_numbers_and_nulls_round_trip_exactly() {
 }
 
 #[test]
-fn schema_four_preserves_explicit_zero_budgets() {
+fn schema_five_preserves_explicit_zero_budgets() {
     let mut report = report();
     report.invocation.budget_tokens = vec![
         BudgetTokenReport {
@@ -460,7 +462,7 @@ fn deadline_evidence_accepts_an_immediate_deadline() {
 }
 
 #[test]
-fn schema_four_rejects_envelope_history_and_budget_contradictions() {
+fn schema_five_rejects_envelope_history_and_budget_contradictions() {
     let mut value = serde_json::to_value(report()).expect("schema JSON");
     value["schema_version"] = serde_json::json!(2);
     assert!(serde_json::from_value::<MemcordonReport>(value).is_err());
@@ -584,7 +586,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         RestartConditions::NONE
     };
     base.policy.effective.restart.dormant_conditions.clear();
-    MemcordonReport::schema4(
+    MemcordonReport::schema5(
         base.tool,
         base.invocation,
         base.policy,
@@ -592,7 +594,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         Some(execution),
         None,
     )
-    .expect("schema4")
+    .expect("schema5")
 }
 
 fn coordinator() -> RestartCoordinator {
@@ -687,7 +689,7 @@ fn deadline_report_value(attempts: u64) -> serde_json::Value {
 }
 
 #[test]
-fn schema_four_active_attempt_success_is_exact_and_round_trips() {
+fn schema_five_active_attempt_success_is_exact_and_round_trips() {
     let evidence = DeadlineEvidence::new(
         1_000,
         DeadlineScope::Attempt,
@@ -741,7 +743,7 @@ fn schema_four_active_attempt_success_is_exact_and_round_trips() {
 }
 
 #[test]
-fn schema_four_outside_attempt_deadline_is_terminal_and_round_trips() {
+fn schema_five_outside_attempt_deadline_is_terminal_and_round_trips() {
     let outcome = RunOutcome::LimitExceeded {
         limit: ByteSize::from_bytes(1),
         observed: None,
@@ -818,7 +820,7 @@ fn schema_four_outside_attempt_deadline_is_terminal_and_round_trips() {
 }
 
 #[test]
-fn schema_four_later_helper_error_preserves_prior_attempt() {
+fn schema_five_later_helper_error_preserves_prior_attempt() {
     let first = RunOutcome::LimitExceeded {
         limit: ByteSize::from_bytes(1),
         observed: None,
@@ -880,7 +882,7 @@ fn schema_four_later_helper_error_preserves_prior_attempt() {
 }
 
 #[test]
-fn schema_four_initial_spawn_status_round_trips_typed_provenance() {
+fn schema_five_initial_spawn_status_round_trips_typed_provenance() {
     for (failure, status) in [
         (InitialSpawnFailure::NotExecutable, 126),
         (InitialSpawnFailure::NotFound, 127),
@@ -1070,7 +1072,7 @@ fn supervision_constructor_rejects_embedded_error_attempt_mismatch() {
 }
 
 #[test]
-fn schema_four_truncates_three_hundred_attempts_but_aggregates_all() {
+fn schema_five_truncates_three_hundred_attempts_but_aggregates_all() {
     let value = deadline_report_value(300);
     assert_eq!(value["supervision"]["attempt_history"]["retained"], 256);
     assert_eq!(value["supervision"]["attempt_history"]["omitted"], 44);

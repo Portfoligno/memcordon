@@ -129,8 +129,18 @@ pub enum Enforcement {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// Selects attempt completion behavior after the direct command exits.
 pub enum Lifetime {
+    /// Finish on direct-command exit after forcibly cleaning any remaining
+    /// contained workload members. The direct command's status is eligible to
+    /// be returned only after required cleanup succeeds.
     Command,
+    /// Continue supervising after direct-command exit until the contained
+    /// workload is empty or another terminal event occurs.
+    ///
+    /// Without a deadline, this may wait indefinitely on backends that support
+    /// workload-style completion. A backend may report or apply an effective
+    /// adjustment when this mode is unsupported.
     Workload,
 }
 
@@ -188,10 +198,16 @@ pub struct Policy {
     pub memory: Option<ByteSize>,
     pub deadline: Option<DeadlinePolicy>,
     pub enforcement: Enforcement,
+    /// Completion behavior after the direct command exits. Defaults to
+    /// [`Lifetime::Command`].
     pub lifetime: Lifetime,
     pub metric: Metric,
     pub poll_interval: Duration,
     pub signal_grace: Duration,
+    /// Time allowed for remaining workload members to exit naturally after the
+    /// direct command exits in [`Lifetime::Command`] mode. No termination
+    /// signal is sent during this interval. Defaults to zero.
+    pub command_exit_grace: Duration,
     pub limit_grace: Duration,
     pub swap: SwapPolicy,
 }
@@ -206,6 +222,7 @@ impl Policy {
             metric: Metric::Native,
             poll_interval: Duration::from_millis(50),
             signal_grace: Duration::from_secs(2),
+            command_exit_grace: Duration::ZERO,
             limit_grace: Duration::ZERO,
             swap: SwapPolicy::Bytes(ByteSize::from_bytes(0)),
         }
@@ -220,6 +237,7 @@ impl Policy {
             metric: Metric::Native,
             poll_interval: Duration::from_millis(50),
             signal_grace: Duration::from_secs(2),
+            command_exit_grace: Duration::ZERO,
             limit_grace: Duration::ZERO,
             swap: SwapPolicy::Bytes(ByteSize::from_bytes(0)),
         }

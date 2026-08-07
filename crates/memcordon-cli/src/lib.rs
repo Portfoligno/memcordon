@@ -35,6 +35,11 @@ pub use memcordon_core::{
 };
 pub use memcordon_platform::{BackendInfo, ProbeReport, probe};
 
+/// Parses a nonnegative decimal duration with an exact lowercase `ms`, `s`,
+/// `m`, or `h` suffix.
+///
+/// Fractional values round upward to the next whole millisecond. Values whose
+/// millisecond representation does not fit in `u64` are rejected.
 pub fn parse_duration(input: &str) -> Result<Duration, String> {
     let split = input
         .find(|character: char| !character.is_ascii_digit() && character != '.')
@@ -44,6 +49,7 @@ pub fn parse_duration(input: &str) -> Result<Duration, String> {
         "ms" => 1_u128,
         "s" => 1_000,
         "m" => 60_000,
+        "h" => 3_600_000,
         _ => return Err(format!("unsupported duration unit `{unit}`")),
     };
     let mut parts = number.split('.');

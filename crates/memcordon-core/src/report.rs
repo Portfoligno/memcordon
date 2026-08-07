@@ -14,8 +14,8 @@ use crate::{
     SupervisionAggregates, SupervisionExecution, SupervisionPhase, SupervisionTerminal,
 };
 
-pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 4;
-pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 3;
+pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 5;
+pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 4;
 pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 2;
 pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 1;
 
@@ -32,7 +32,7 @@ pub struct MemcordonReport {
 }
 
 impl MemcordonReport {
-    pub fn schema4(
+    pub fn schema5(
         tool: ToolReport,
         invocation: InvocationReport,
         policy: PolicyEnvelopeReport,
@@ -467,6 +467,7 @@ pub struct RequestedPolicyReport {
     pub deadline: Option<DeadlinePolicyReport>,
     pub wait_for: String,
     pub signal_grace_ms: u64,
+    pub command_exit_grace_ms: u64,
     pub limit_grace_ms: u64,
     pub restart: RequestedRestartPolicyReport,
 }
@@ -522,6 +523,7 @@ pub struct EffectivePolicyReport {
     pub deadline: Option<DeadlinePolicyReport>,
     pub wait_for: String,
     pub signal_grace_ms: u64,
+    pub command_exit_grace_ms: u64,
     pub limit_grace_ms: u64,
     pub restart: EffectiveRestartPolicyReport,
 }

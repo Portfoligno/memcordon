@@ -53,6 +53,10 @@ fn configured_iterations(name: &str) -> u32 {
 }
 
 fn wrapped(command: impl AsRef<OsStr>, args: &[&str]) -> Command {
+    wrapped_with_options(&[], command, args)
+}
+
+fn wrapped_with_options(options: &[&str], command: impl AsRef<OsStr>, args: &[&str]) -> Command {
     let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     invocation.args([
         "--enforcement",
@@ -61,9 +65,9 @@ fn wrapped(command: impl AsRef<OsStr>, args: &[&str]) -> Command {
         } else {
             "hard"
         },
-        "+8GiB",
-        "--",
     ]);
+    invocation.args(options);
+    invocation.args(["+8GiB", "--"]);
     invocation.arg(command);
     invocation.args(args);
     invocation
@@ -202,7 +206,7 @@ fn confirmed_limit_has_dedicated_status() {
 }
 
 #[test]
-fn command_lifetime_kills_background_descendant_by_birth_identity() {
+fn default_command_lifetime_kills_background_descendant_before_return() {
     if !backend_available() {
         return;
     }
@@ -215,6 +219,282 @@ fn command_lifetime_kills_background_descendant_by_birth_identity() {
     let identity = read_identity(&pid_file);
     assert_process_gone(identity);
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
+}
+
+#[test]
+fn command_exit_grace_allows_remaining_workload_to_drain_naturally() {
+    if !backend_available() {
+        return;
+    }
+    let pid_file = temporary_pid_file();
+    let completion_marker = pid_file.with_extension("completed");
+    let report_file = pid_file.with_extension("json");
+    let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    invocation.args([
+        "--enforcement",
+        if cfg!(target_os = "macos") {
+            "watchdog"
+        } else {
+            "hard"
+        },
+        "--command-exit-grace",
+        "2s",
+        "--report",
+    ]);
+    invocation.arg(&report_file);
+    invocation.args([
+        "+8GiB",
+        "--",
+        fixture(),
+        "spawn-background",
+        "--child-duration",
+        "100ms",
+        "--exit-code",
+        "37",
+        "--pid-file",
+    ]);
+    invocation
+        .arg(&pid_file)
+        .arg("--completion-marker")
+        .arg(&completion_marker);
+
+    let output = completed(&mut invocation, Duration::from_secs(4));
+    assert_eq!(output.status.code(), Some(37));
+    assert_stdout_empty(&output);
+    assert!(
+        completion_marker.exists(),
+        "command-exit grace returned before natural completion"
+    );
+    let identity = read_identity(&pid_file);
+    assert_process_gone(identity);
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&report_file).expect("execution report should be readable"),
+    )
+    .expect("execution report should be valid JSON");
+    assert_eq!(
+        report["policy"]["requested"]["command_exit_grace_ms"],
+        2_000
+    );
+    assert_eq!(
+        report["policy"]["effective"]["command_exit_grace_ms"],
+        2_000
+    );
+    let cleanup = &report["attempts"][0]["outcome"]["cleanup"];
+    assert_eq!(cleanup["direct_child_reaped"], true);
+    assert_eq!(cleanup["workload_empty"], true);
+    assert_eq!(cleanup["graceful_attempted"], false);
+    assert_eq!(cleanup["force_attempted"], false);
+    assert_eq!(cleanup["errors"], serde_json::json!([]));
+    fs::remove_file(pid_file).expect("temporary PID file should be removable");
+    fs::remove_file(completion_marker).expect("completion marker should be removable");
+    fs::remove_file(report_file).expect("temporary report should be removable");
+}
+
+#[test]
+fn command_exit_grace_force_cleans_survivors_after_expiry() {
+    if !backend_available() {
+        return;
+    }
+    let pid_file = temporary_pid_file();
+    let completion_marker = pid_file.with_extension("completed");
+    let report_file = pid_file.with_extension("json");
+    let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    invocation.args([
+        "--enforcement",
+        if cfg!(target_os = "macos") {
+            "watchdog"
+        } else {
+            "hard"
+        },
+        "--command-exit-grace",
+        "100ms",
+        "--report",
+    ]);
+    invocation.arg(&report_file);
+    invocation.args([
+        "+8GiB",
+        "--",
+        fixture(),
+        "spawn-background",
+        "--child-duration",
+        "30s",
+        "--exit-code",
+        "37",
+        "--pid-file",
+    ]);
+    invocation
+        .arg(&pid_file)
+        .arg("--completion-marker")
+        .arg(&completion_marker);
+
+    let output = completed(&mut invocation, Duration::from_secs(4));
+    assert_eq!(output.status.code(), Some(37));
+    assert_stdout_empty(&output);
+    assert!(!completion_marker.exists(), "survivor completed naturally");
+    let identity = read_identity(&pid_file);
+    assert_process_gone(identity);
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&report_file).expect("execution report should be readable"),
+    )
+    .expect("execution report should be valid JSON");
+    let cleanup = &report["attempts"][0]["outcome"]["cleanup"];
+    assert_eq!(cleanup["direct_child_reaped"], true);
+    assert_eq!(cleanup["workload_empty"], true);
+    assert_eq!(cleanup["graceful_attempted"], false);
+    assert_eq!(cleanup["force_attempted"], true);
+    assert_eq!(cleanup["errors"], serde_json::json!([]));
+    fs::remove_file(pid_file).expect("temporary PID file should be removable");
+    fs::remove_file(report_file).expect("temporary report should be removable");
+}
+
+#[test]
+fn deadline_remains_authoritative_during_command_exit_grace() {
+    if !backend_available() {
+        return;
+    }
+    let pid_file = temporary_pid_file();
+    let completion_marker = pid_file.with_extension("completed");
+    let report_file = pid_file.with_extension("json");
+    let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    invocation.args([
+        "--enforcement",
+        if cfg!(target_os = "macos") {
+            "watchdog"
+        } else {
+            "hard"
+        },
+        "--command-exit-grace",
+        "2s",
+        "--report",
+    ]);
+    invocation.arg(&report_file);
+    invocation.args([
+        "+8GiB",
+        "+250ms",
+        "--",
+        fixture(),
+        "spawn-background",
+        "--child-duration",
+        "30s",
+        "--pid-file",
+    ]);
+    invocation
+        .arg(&pid_file)
+        .arg("--completion-marker")
+        .arg(&completion_marker);
+
+    let output = completed(&mut invocation, Duration::from_secs(4));
+    assert_eq!(output.status.code(), Some(123));
+    assert_stdout_empty(&output);
+    assert!(
+        !completion_marker.exists(),
+        "descendant completed naturally"
+    );
+    let identity = read_identity(&pid_file);
+    assert_process_gone(identity);
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&report_file).expect("execution report should be readable"),
+    )
+    .expect("execution report should be valid JSON");
+    assert_eq!(report["supervision"]["terminal"]["kind"], "attempt-outcome");
+    assert_eq!(
+        report["attempts"][0]["outcome"]["outcome"],
+        "deadline-exceeded"
+    );
+    assert_eq!(
+        report["policy"]["requested"]["command_exit_grace_ms"],
+        2_000
+    );
+    fs::remove_file(pid_file).expect("temporary PID file should be removable");
+    fs::remove_file(report_file).expect("temporary report should be removable");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn workload_lifetime_waits_for_background_descendant_to_finish_naturally() {
+    if !backend_available() {
+        return;
+    }
+    let pid_file = temporary_pid_file();
+    let completion_marker = pid_file.with_extension("completed");
+    let mut invocation = wrapped_with_options(
+        &["--wait-for", "workload"],
+        fixture(),
+        &[
+            "spawn-background",
+            "--child-duration",
+            "100ms",
+            "--exit-code",
+            "37",
+        ],
+    );
+    invocation
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .arg("--completion-marker")
+        .arg(&completion_marker);
+
+    let output = completed(&mut invocation, Duration::from_secs(3));
+    assert_eq!(output.status.code(), Some(37));
+    assert_stdout_empty(&output);
+    assert!(
+        completion_marker.exists(),
+        "workload completion returned before the descendant's natural completion marker"
+    );
+    let identity = read_identity(&pid_file);
+    assert_process_gone(identity);
+    fs::remove_file(pid_file).expect("temporary PID file should be removable");
+    fs::remove_file(completion_marker).expect("completion marker should be removable");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn workload_lifetime_deadline_cleans_background_descendant() {
+    if !backend_available() {
+        return;
+    }
+    let pid_file = temporary_pid_file();
+    let report_file = pid_file.with_extension("json");
+    let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    invocation.args([
+        "--enforcement",
+        if cfg!(target_os = "macos") {
+            "watchdog"
+        } else {
+            "hard"
+        },
+        "--wait-for",
+        "workload",
+        "--report",
+    ]);
+    invocation.arg(&report_file);
+    invocation.args([
+        "+8GiB",
+        "+250ms",
+        "--",
+        fixture(),
+        "spawn-background",
+        "--child-duration",
+        "30s",
+        "--pid-file",
+    ]);
+    invocation.arg(&pid_file);
+
+    let output = completed(&mut invocation, Duration::from_secs(3));
+    assert_eq!(output.status.code(), Some(123));
+    assert_stdout_empty(&output);
+    let identity = read_identity(&pid_file);
+    assert_process_gone(identity);
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&report_file).expect("execution report should be readable"),
+    )
+    .expect("execution report should be valid JSON");
+    let cleanup = &report["attempts"][0]["outcome"]["cleanup"];
+    assert_eq!(cleanup["direct_child_reaped"], true);
+    assert_eq!(cleanup["workload_empty"], true);
+    assert_eq!(cleanup["errors"], serde_json::json!([]));
+    fs::remove_file(pid_file).expect("temporary PID file should be removable");
+    fs::remove_file(report_file).expect("temporary report should be removable");
 }
 
 #[cfg(unix)]
