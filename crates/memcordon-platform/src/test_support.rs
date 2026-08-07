@@ -1,6 +1,7 @@
 //! Native containment used only by black-box process tests.
 
-use std::io;
+use std::io::{self, Write};
+use std::path::Path;
 use std::process::{Child, Command};
 
 #[cfg(target_os = "linux")]
@@ -86,6 +87,20 @@ impl ProcessIdentity {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
+    }
+
+    pub fn publish_to(self, path: &Path) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        writeln!(temporary, "{} {}", self.pid, self.birth)?;
+        temporary.flush()?;
+        temporary
+            .persist(path)
+            .map(|_| ())
+            .map_err(|error| error.error)
     }
 }
 

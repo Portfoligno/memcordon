@@ -68,9 +68,8 @@ fn write_pid(path: Option<&Path>) {
     if let Some(path) = path {
         let identity = memcordon_platform::test_support::ProcessIdentity::current()
             .unwrap_or_else(|error| fail(format!("cannot observe process identity: {error}")));
-        let mut bytes = format!("{} {}", identity.pid, identity.birth).into_bytes();
-        bytes.push(b'\n');
-        fs::write(path, bytes)
+        identity
+            .publish_to(path)
             .unwrap_or_else(|error| fail(format!("cannot write PID file: {error}")));
     }
 }
@@ -250,9 +249,9 @@ fn spawn_background(mut args: impl Iterator<Item = OsString>) {
     let path = pid_file.unwrap_or_else(|| fail("spawn-background requires --pid-file"));
     let identity = memcordon_platform::test_support::ProcessIdentity::for_pid(child.id())
         .unwrap_or_else(|error| fail(format!("cannot observe child identity: {error}")));
-    let mut bytes = format!("{} {}", identity.pid, identity.birth).into_bytes();
-    bytes.push(b'\n');
-    fs::write(path, bytes).unwrap_or_else(|error| fail(error.to_string()));
+    identity
+        .publish_to(&path)
+        .unwrap_or_else(|error| fail(format!("cannot write child PID file: {error}")));
 }
 
 #[allow(clippy::zombie_processes)]

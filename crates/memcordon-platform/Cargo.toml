@@ -12,12 +12,13 @@ categories = ["os", "development-tools"]
 publish = ["crates-io"]
 
 [features]
-test-support = []
+test-support = ["dep:tempfile"]
 
 [dependencies]
 libc.workspace = true
 memcordon-core = { path = "../memcordon-core", version = "=0.3.5-dev" }
 serde.workspace = true
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -34,6 +35,10 @@ windows-sys = { workspace = true, features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
+
+[[test]]
+name = "test_support"
+required-features = ["test-support"]
 
 [lints]
 workspace = true
