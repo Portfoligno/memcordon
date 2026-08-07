@@ -259,14 +259,6 @@ but is no longer an exact peak.
 
 ## Deadline and restart policy
 
-### Deadline scopes
-
-An attempt deadline resets when each target is authorized to run: at the Linux
-release-byte write, Windows suspended-thread resume, or macOS pre-spawn. It may
-trigger a configured restart. A supervision deadline starts with the first
-authorization, includes later cleanup, setup, backoff, and cooldown, and is
-terminal. Confirmed memory evidence wins a same-cycle deadline race.
-
 ### Restart eligibility
 
 Execution is one-shot unless `--restart` or
@@ -275,6 +267,14 @@ applicable conditions and unlimited additional launches; `--restart-limit N`
 counts additional launches. Only selected MemCordon limits restart, and only
 after the direct child and helpers are reaped, the workload is proven empty,
 and containment is removed or incapable of retaining members.
+
+### Deadline scopes
+
+An attempt deadline resets when each target is authorized to run: at the Linux
+release-byte write, Windows suspended-thread resume, or macOS pre-spawn. It may
+trigger a configured restart. A supervision deadline starts with the first
+authorization, includes later cleanup, setup, backoff, and cooldown, and is
+terminal. Confirmed memory evidence wins a same-cycle deadline race.
 
 ### Backoff
 
@@ -298,6 +298,11 @@ without requiring success or a reset. By default, the first wait is 1s,
 immediate failures converge near 11m30s, and quiet periods move the next wait
 toward 1s.
 
+Returned durations round upward to whole milliseconds. Reports identify the
+schedule as `half-life-logistic-v1` and expose `base_interval_ms`,
+`multiplier_numerator`, `multiplier_denominator`, `asymptote_interval_ms`, and
+`recovery_half_life_ms`.
+
 ### Circuit breaker
 
 When the circuit breaker is configured, each limit failure updates an
@@ -314,11 +319,7 @@ Opening the circuit, or failing a half-open probe, schedules the greater of the
 calculated logistic wait and `--circuit-cooldown`. The logistic backoff always
 advances, so enabling the circuit never shortens the normal retry wait.
 
-Returned durations round upward to whole milliseconds. Reports identify the
-schedule as `half-life-logistic-v1` and expose `base_interval_ms`,
-`multiplier_numerator`, `multiplier_denominator`, `asymptote_interval_ms`, and
-`recovery_half_life_ms`. Circuit policy reports expose `threshold`,
-`half_life_ms`, and `cooldown_ms`.
+Circuit policy reports expose `threshold`, `half_life_ms`, and `cooldown_ms`.
 
 ## Execution reports
 
