@@ -2,6 +2,14 @@
 
 All notable user-visible changes to MemCordon are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Stopped warning about inapplicable restart conditions inferred by `--restart`
+  and the implicit default `--swap 0B` on platforms without a separate swap
+  policy. Explicit ineffective requests still warn.
+
 ## [0.4.0] - 2026-08-07
 
 ### Added
