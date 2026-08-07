@@ -296,7 +296,77 @@ fn check_push_and_dispatch_events(workflow: &Mapping, context: &str) -> Result<(
     Ok(())
 }
 
-fn check_deep_ci_structure(workflow: &Mapping) -> Result<()> {
+const NATIVE_MATRIX: [(&str, &str); 6] = [
+    ("linux-x64", "ubuntu-24.04"),
+    ("linux-arm64", "blacksmith-4vcpu-ubuntu-2404-arm"),
+    ("macos-arm64", "macos-15"),
+    ("macos-x64", "macos-15-intel"),
+    ("windows-x64", "windows-2025"),
+    ("windows-arm64", "windows-11-arm"),
+];
+
+const STRESS_MATRIX: [(&str, &str); 5] = [
+    ("linux-x64", "ubuntu-24.04"),
+    ("macos-arm64", "macos-15"),
+    ("macos-x64", "macos-15-intel"),
+    ("windows-x64", "windows-2025"),
+    ("windows-arm64", "windows-11-arm"),
+];
+
+fn check_runner_matrix(
+    jobs: &Mapping,
+    job_name: &str,
+    expected: &[(&str, &str)],
+    context: &str,
+) -> Result<()> {
+    let job = mapping(
+        jobs.get(key(job_name))
+            .ok_or_else(|| failure(format!("{context} job is absent")))?,
+        context,
+    )?;
+    let strategy = mapping(
+        job.get(key("strategy"))
+            .ok_or_else(|| failure(format!("{context} strategy is absent")))?,
+        context,
+    )?;
+    exact_mapping_keys(strategy, &["fail-fast", "matrix"], context)?;
+    if strategy.get(key("fail-fast")).and_then(Value::as_bool) != Some(false) {
+        return Err(failure(format!("{context} fail-fast policy differs")));
+    }
+    let matrix = mapping(
+        strategy
+            .get(key("matrix"))
+            .ok_or_else(|| failure(format!("{context} matrix is absent")))?,
+        context,
+    )?;
+    exact_mapping_keys(matrix, &["include"], context)?;
+    let include = matrix
+        .get(key("include"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure(format!("{context} matrix include is absent")))?;
+    let actual: Vec<(&str, &str)> = include
+        .iter()
+        .map(|entry| {
+            let entry = mapping(entry, context)?;
+            exact_mapping_keys(entry, &["id", "runner"], context)?;
+            Ok((
+                scalar(entry, "id")
+                    .ok_or_else(|| failure(format!("{context} matrix id is absent")))?,
+                scalar(entry, "runner")
+                    .ok_or_else(|| failure(format!("{context} matrix runner is absent")))?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    if actual != expected {
+        return Err(failure(format!("{context} matrix entries differ")));
+    }
+    if scalar(job, "runs-on") != Some("${{ matrix.runner }}") {
+        return Err(failure(format!("{context} runner selection differs")));
+    }
+    Ok(())
+}
+
+fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
     check_push_and_dispatch_events(workflow, "deep CI")?;
     check_top_level_permissions(workflow)?;
     let concurrency = mapping(
@@ -318,6 +388,7 @@ fn check_deep_ci_structure(workflow: &Mapping) -> Result<()> {
     {
         return Err(failure("deep CI concurrency differs"));
     }
+    check_runner_matrix(jobs, "stress", &STRESS_MATRIX, "deep CI stress")?;
     Ok(())
 }
 
@@ -383,11 +454,16 @@ fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Polic
     {
         return Err(failure("CI concurrency policy differs"));
     }
-    let rendered = serde_yaml::to_string(jobs)?;
-    for matrix in &policy.workflow.required_public_matrix {
-        if !rendered.contains(matrix) {
-            return Err(failure(format!("CI workflow lacks matrix member {matrix}")));
-        }
+    check_runner_matrix(jobs, "native", &NATIVE_MATRIX, "CI native")?;
+    let configured_matrix: Vec<&str> = policy
+        .workflow
+        .required_public_matrix
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let expected_matrix: Vec<&str> = NATIVE_MATRIX.iter().map(|(id, _)| *id).collect();
+    if configured_matrix != expected_matrix {
+        return Err(failure("public native matrix policy differs"));
     }
     Ok(())
 }
@@ -939,6 +1015,8 @@ fn check_release_structure(
     {
         return Err(failure("release publication must be globally serialized"));
     }
+    config::validate_release_configuration_identity(release)?;
+    check_runner_matrix(jobs, "native", &NATIVE_MATRIX, "release native")?;
     let preflight = mapping(
         jobs.get(key("preflight"))
             .ok_or_else(|| failure("release preflight job is absent"))?,
@@ -1366,7 +1444,7 @@ fn validate_workflow_bytes_into(
         }
     }
     if relative == Path::new(".github/workflows/deep-ci.yml") {
-        check_deep_ci_structure(workflow)?;
+        check_deep_ci_structure(workflow, jobs)?;
     }
     if relative == Path::new(".github/workflows/backend-certification.yml") {
         check_backend_certification_structure(workflow, jobs)?;

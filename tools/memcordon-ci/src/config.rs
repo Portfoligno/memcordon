@@ -174,7 +174,63 @@ pub fn release(root: &Path) -> Result<Release> {
     read(&root.join("ci").join("release.toml"))
 }
 
+pub fn release_target_id_for_host(os: &str, arch: &str) -> Result<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Ok("linux-x64"),
+        ("linux", "aarch64") => Ok("linux-arm64"),
+        ("macos", "aarch64") => Ok("macos-arm64"),
+        ("macos", "x86_64") => Ok("macos-x64"),
+        ("windows", "x86_64") => Ok("windows-x64"),
+        ("windows", "aarch64") => Ok("windows-arm64"),
+        _ => Err(crate::CiError::Message(
+            "host is not a configured release target".to_owned(),
+        )),
+    }
+}
+
 pub fn validate_release_configuration_identity(release: &Release) -> Result<()> {
+    let expected_targets = [
+        (
+            "linux-x64",
+            "x86_64-unknown-linux-gnu",
+            "tar-gz",
+            "memcordon",
+        ),
+        (
+            "linux-arm64",
+            "aarch64-unknown-linux-gnu",
+            "tar-gz",
+            "memcordon",
+        ),
+        ("macos-arm64", "aarch64-apple-darwin", "tar-gz", "memcordon"),
+        ("macos-x64", "x86_64-apple-darwin", "tar-gz", "memcordon"),
+        (
+            "windows-x64",
+            "x86_64-pc-windows-msvc",
+            "zip",
+            "memcordon.exe",
+        ),
+        (
+            "windows-arm64",
+            "aarch64-pc-windows-msvc",
+            "zip",
+            "memcordon.exe",
+        ),
+    ];
+    let targets_match = release.assets.target.len() == expected_targets.len()
+        && release
+            .assets
+            .target
+            .iter()
+            .zip(expected_targets)
+            .all(|(actual, expected)| {
+                (
+                    actual.id.as_str(),
+                    actual.rust_target.as_str(),
+                    actual.archive.as_str(),
+                    actual.executable.as_str(),
+                ) == expected
+            });
     if release.schema_version != RELEASE_SCHEMA_VERSION
         || release.registry != "crates-io"
         || release.workflow != "release.yml"
@@ -185,6 +241,7 @@ pub fn validate_release_configuration_identity(release: &Release) -> Result<()> 
         || release.registry_wait.maximum_milliseconds < release.registry_wait.initial_milliseconds
         || release.network_retry.initial_milliseconds == 0
         || release.network_retry.maximum_milliseconds < release.network_retry.initial_milliseconds
+        || !targets_match
     {
         return Err(crate::CiError::Message(
             "release configuration identity is invalid".to_owned(),

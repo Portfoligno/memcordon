@@ -114,6 +114,8 @@ jobs:
             runner: macos-15-intel
           - id: windows-x64
             runner: windows-2025
+          - id: windows-arm64
+            runner: windows-11-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:

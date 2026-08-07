@@ -112,6 +112,94 @@ fn release_preflight_binds_provisioning_and_cache_to_toolchain_config() {
 }
 
 #[test]
+fn windows_arm_native_matrix_entries_are_structurally_required() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    for (relative, job, fixture) in [
+        (
+            ".github/workflows/ci.yml",
+            "CI native",
+            include_str!("../../../.github/workflows/ci.yml"),
+        ),
+        (
+            ".github/workflows/deep-ci.yml",
+            "deep CI stress",
+            include_str!("../../../.github/workflows/deep-ci.yml"),
+        ),
+        (
+            ".github/workflows/release.yml",
+            "release native",
+            include_str!("../../../.github/workflows/release.yml"),
+        ),
+    ] {
+        let exact = fixture.replace("\r\n", "\n");
+        let windows_rows = "          - id: windows-x64\n            runner: windows-2025\n          - id: windows-arm64\n            runner: windows-11-arm\n";
+        for replacement in [
+            "          - id: windows-x64\n            runner: windows-2025\n",
+            "          - id: windows-x64\n            runner: windows-2025\n          - id: windows-arm64\n            runner: windows-2025\n",
+            "          - id: windows-arm64\n            runner: windows-11-arm\n",
+            "          - id: windows-x64\n            runner: windows-11-arm\n          - id: windows-arm64\n            runner: windows-2025\n",
+            "          - id: windows-x64\n            runner: windows-2025\n          - id: windows-x64\n            runner: windows-11-arm\n",
+            "          - id: windows-x64\n            runner: windows-2025\n          - id: windows-other\n            runner: windows-11-arm\n",
+        ] {
+            let invalid = exact.replacen(windows_rows, replacement, 1);
+            assert_ne!(invalid, exact, "{job} mutation must apply");
+            let error = policy::validate_workflow_bytes(
+                &root,
+                Path::new(relative),
+                invalid.as_bytes(),
+                &repository_policy,
+            )
+            .expect_err("Windows ARM matrix regression must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{job} matrix entries differ")),
+                "unexpected {job} policy error: {error}"
+            );
+        }
+        let planted = exact
+            .replacen(
+                windows_rows,
+                "          - id: windows-x64\n            runner: windows-2025\n",
+                1,
+            )
+            .replacen("    name: ", "    name: windows-arm64 / ", 1);
+        let planted_error = policy::validate_workflow_bytes(
+            &root,
+            Path::new(relative),
+            planted.as_bytes(),
+            &repository_policy,
+        )
+        .expect_err("Windows ARM text outside the matrix must not satisfy policy");
+        assert!(
+            planted_error
+                .to_string()
+                .contains(&format!("{job} matrix entries differ")),
+            "unexpected planted {job} policy error: {planted_error}"
+        );
+        let direct_runner = exact.replacen(
+            "    runs-on: ${{ matrix.runner }}\n",
+            "    runs-on: windows-11-arm\n",
+            1,
+        );
+        let runner_error = policy::validate_workflow_bytes(
+            &root,
+            Path::new(relative),
+            direct_runner.as_bytes(),
+            &repository_policy,
+        )
+        .expect_err("matrix jobs must select the typed runner field");
+        assert!(
+            runner_error
+                .to_string()
+                .contains(&format!("{job} runner selection differs")),
+            "unexpected {job} runner policy error: {runner_error}"
+        );
+    }
+}
+
+#[test]
 fn action_input_boolean_value_selection_is_rejected() {
     let root = repository_root();
     let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");

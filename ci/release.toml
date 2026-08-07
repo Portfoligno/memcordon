@@ -47,6 +47,12 @@ rust_target = "x86_64-pc-windows-msvc"
 archive = "zip"
 executable = "memcordon.exe"
 
+[[assets.target]]
+id = "windows-arm64"
+rust_target = "aarch64-pc-windows-msvc"
+archive = "zip"
+executable = "memcordon.exe"
+
 [registry_wait]
 initial_milliseconds = 500
 maximum_milliseconds = 8000

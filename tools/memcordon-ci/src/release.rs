@@ -1050,19 +1050,7 @@ fn create_package_archives(root: &Path, stable: &str, packages: &[String]) -> Re
 }
 
 fn host_target(targets: &[AssetTarget]) -> Result<&AssetTarget> {
-    let wanted = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "linux-x64"
-    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        "linux-arm64"
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "macos-arm64"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "macos-x64"
-    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "windows-x64"
-    } else {
-        return Err(failure("host is not a configured release target"));
-    };
+    let wanted = config::release_target_id_for_host(std::env::consts::OS, std::env::consts::ARCH)?;
     targets
         .iter()
         .find(|target| target.id == wanted)

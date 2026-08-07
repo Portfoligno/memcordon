@@ -17,6 +17,7 @@ required_public_matrix = [
   "macos-arm64",
   "macos-x64",
   "windows-x64",
+  "windows-arm64",
 ]
 self_extracting_shell_allowlist = []
 allowed_run_commands = [
