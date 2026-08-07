@@ -87,11 +87,11 @@ pub(crate) fn write_help(out: &mut impl Write, help: &str) -> io::Result<()> {
             writeln!(out, "{indent}{token}{trimmed}{token:#}")?;
             continue;
         }
-        if !indent.is_empty()
-            && let Some((term, description)) = split_aligned_term(trimmed)
-        {
-            writeln!(out, "{indent}{token}{term}{token:#}{description}")?;
-            continue;
+        if !indent.is_empty() {
+            if let Some((term, description)) = split_aligned_term(trimmed) {
+                writeln!(out, "{indent}{token}{term}{token:#}{description}")?;
+                continue;
+            }
         }
         writeln!(out, "{line}")?;
     }
