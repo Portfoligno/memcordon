@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use memcordon_ci::release_evidence::collect_certification;
+use memcordon_ci::release_evidence::{LINUX_SEALED_TESTS as LINUX_TESTS, collect_certification};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -9,31 +9,6 @@ use tempfile::TempDir;
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 type ReportMutation = fn(&mut Value);
-
-const LINUX_TESTS: &[&str] = &[
-    "certified_backend_preserves_ordinary_status_and_reaps",
-    "certified_backend_reports_limit_and_removes_workload",
-    "certified_backend_cleans_background_descendant_by_birth_identity",
-    "certified_backend_allows_bounded_transient_burst",
-    "linux_cgroup_v2_contains_aggregate_tree",
-    "linux_cgroup_v2_handles_rapid_process_churn",
-    "linux_cgroup_controls_are_applied_before_target_observation",
-    "linux_embedding_limiter_blocks_target_until_containment_is_verified",
-    "linux_embedding_limiter_preserves_non_utf8_target_argv",
-    "linux_target_spawn_failures_preserve_native_provenance",
-    "linux_memory_events_produce_limit_evidence",
-    "linux_cleanup_evidence_confirms_empty_reaped_cgroup",
-    "linux_cgroup_identity_is_verified_before_exec",
-    "linux_report_pid_is_the_actual_target_pid",
-    "linux_gate_failures_kill_the_blocked_target_before_fixture_code",
-    "linux_guardian_kills_process_group_after_wrapper_crash",
-    "linux_cgroup_kill_reaps_continually_forking_workload",
-    "linux_supervisor_monitor_error_fails_closed_end_to_end",
-    "limit_evidence_requires_counter_delta",
-    "cgroup_controls_are_written_exactly",
-    "monitor_file_errors_are_reported_instead_of_treated_as_success",
-    "cgroup_identity_verification_rejects_the_wrong_process",
-];
 
 const WINDOWS_TESTS: &[&str] = &[
     "certified_backend_preserves_ordinary_status_and_reaps",
@@ -75,22 +50,10 @@ fn tests(names: &[&str]) -> Vec<Value> {
 
 fn linux_report() -> Value {
     json!({
-        "schema": 2,
-        "backend": "linux-cgroup-v2",
-        "certified": true,
+        "schema_version": 1,
+        "mechanism": "linux-pid-namespace-cgroup-v1",
         "commit": COMMIT,
-        "runner_class": "ephemeral-certified",
-        "runner_provider": "github-hosted",
-        "runner_label": "ubuntu-24.04",
-        "runtime": {
-            "unified_cgroup_v2": true,
-            "delegated_boundary": true,
-            "memory_controller": true,
-            "memory_max_round_trip": true,
-            "memory_swap_max": true,
-            "cgroup_kill": true
-        },
-        "tests": tests(LINUX_TESTS),
+        "scenarios": LINUX_TESTS.iter().map(|name| json!({"name": name, "class": "lifecycle", "result": "passed"})).collect::<Vec<_>>(),
         "tests_run": LINUX_TESTS.len(),
         "tests_skipped": 0
     })
@@ -149,8 +112,52 @@ fn fixture() -> (TempDir, Value, Value, Value) {
     write_report(
         &input
             .join("release-certification-linux")
-            .join("backend-linux-cgroup-v2.json"),
+            .join("sealed-scenario-report.json"),
         &linux,
+    );
+    let identity = json!({"schema_version": 1, "mechanism": "linux-pid-namespace-cgroup-v1", "provider_identity": "fixture", "receipt_digest": "digest"});
+    write_report(
+        &input.join("release-certification-linux/provider-identity.json"),
+        &identity,
+    );
+    let mut qualification = identity.clone();
+    for field in [
+        "unified_cgroup_v2",
+        "private_cgroup_subtree",
+        "clone3_into_cgroup",
+        "pid_namespace",
+        "mount_namespace",
+        "cgroup_namespace",
+        "pidfd",
+        "close_range",
+        "guardian_outside_boundary",
+        "target_gated",
+        "assignment_verified",
+        "inherited_descriptors_verified",
+        "frontend_loss_authority_verified",
+        "cgroup_kill",
+        "workload_empty",
+        "helpers_reaped",
+        "boundary_retired",
+    ] {
+        qualification[field] = json!(true);
+    }
+    write_report(
+        &input.join("release-certification-linux/qualification-receipt.json"),
+        &qualification,
+    );
+    let named = json!({"schema_version": 1, "mechanism": "linux-pid-namespace-cgroup-v1", "result": "passed", "tests": ["fixture"]});
+    write_report(
+        &input.join("release-certification-linux/fault-injection-report.json"),
+        &named,
+    );
+    write_report(
+        &input.join("release-certification-linux/cleanup-recovery-report.json"),
+        &named,
+    );
+    write_report(
+        &input.join("release-certification-linux/platform-environment.json"),
+        &json!({"schema_version": memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION, "selected": {"boundary": {"class": "sealed", "mechanism": "linux-pid-namespace-cgroup-v1"}}}),
     );
     write_report(
         &input
@@ -175,9 +182,12 @@ fn valid_reports_are_copied_and_digest_bound() {
     let records = collect_certification(&input, &output, COMMIT)
         .expect("valid certification reports should collect");
 
-    assert_eq!(records.len(), 3);
+    assert_eq!(records.len(), 8);
     for (backend, report_name) in [
-        ("linux-cgroup-v2", "backend-linux-cgroup-v2.json"),
+        (
+            "linux-pid-namespace-cgroup-v1",
+            "sealed-scenario-report.json",
+        ),
         ("windows-job-object", "backend-windows-job-object.json"),
         ("macos-watchdog", "backend-macos-watchdog.json"),
     ] {
@@ -187,35 +197,36 @@ fn valid_reports_are_copied_and_digest_bound() {
             .expect("copied evidence should be readable");
         assert_eq!(record.sha256, hex::encode(Sha256::digest(evidence)));
     }
+    for name in [
+        "provider-identity.json",
+        "qualification-receipt.json",
+        "fault-injection-report.json",
+        "cleanup-recovery-report.json",
+        "platform-environment.json",
+    ] {
+        let key = format!("linux-pid-namespace-cgroup-v1/{name}");
+        let record = records
+            .get(&key)
+            .expect("Linux evidence record should exist");
+        assert_eq!(
+            record.evidence_path,
+            format!("certification/linux-sealed/{name}")
+        );
+    }
 }
 
 #[test]
 fn hard_report_contract_mutations_fail_closed() {
     let cases: &[(&str, ReportMutation)] = &[
-        ("schema", |report| report["schema"] = json!(1)),
-        ("provider", |report| {
-            report["runner_provider"] = json!("self-hosted")
-        }),
-        ("label", |report| {
-            report["runner_label"] = json!("ubuntu-latest")
-        }),
-        ("class", |report| {
-            report["runner_class"] = json!("github-hosted-standard")
+        ("schema", |report| report["schema_version"] = json!(2)),
+        ("mechanism", |report| {
+            report["mechanism"] = json!("standard")
         }),
         ("commit", |report| report["commit"] = json!("wrong")),
-        ("runtime", |report| {
-            report["runtime"]["memory_swap_max"] = json!(false)
-        }),
-        ("count", |report| report["tests_run"] = json!(16)),
+        ("count", |report| report["tests_run"] = json!(2)),
         ("skips", |report| report["tests_skipped"] = json!(1)),
         ("result", |report| {
-            report["tests"][0]["result"] = json!("failed")
-        }),
-        ("order", |report| {
-            report["tests"]
-                .as_array_mut()
-                .expect("tests should be an array")
-                .swap(0, 1)
+            report["scenarios"][0]["result"] = json!("failed")
         }),
         ("unknown", |report| report["unexpected"] = json!(true)),
     ];
@@ -226,7 +237,7 @@ fn hard_report_contract_mutations_fail_closed() {
         write_report(
             &temporary
                 .path()
-                .join("input/release-certification-linux/backend-linux-cgroup-v2.json"),
+                .join("input/release-certification-linux/sealed-scenario-report.json"),
             &linux,
         );
         let result = collect_certification(
@@ -250,15 +261,12 @@ fn artifact_path_cardinality_and_size_fail_closed() {
     fs::remove_dir(input.join("release-certification-extra"))
         .expect("extra artifact directory should be removable");
 
-    write_report(
-        &input.join("duplicate/backend-linux-cgroup-v2.json"),
-        &linux,
-    );
+    write_report(&input.join("duplicate/sealed-scenario-report.json"), &linux);
     assert!(collect_certification(&input, &output, COMMIT).is_err());
     fs::remove_dir_all(input.join("duplicate")).expect("duplicate directory should be removable");
 
     fs::write(
-        input.join("release-certification-linux/backend-linux-cgroup-v2.json"),
+        input.join("release-certification-linux/sealed-scenario-report.json"),
         vec![b' '; 64 * 1024 + 1],
     )
     .expect("oversize report should write");

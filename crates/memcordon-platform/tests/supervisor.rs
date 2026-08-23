@@ -2,7 +2,7 @@ use memcordon_core::{
     BoundaryCapability, BoundaryClass, BoundaryRequirement, DeadlineScope, Error, ErrorCategory,
     RestartCondition, RestartSafetyProof,
 };
-use memcordon_platform::{BackendInfo, capabilities};
+use memcordon_platform::{BackendInfo, BoundarySupport, SealedAvailability, capabilities};
 use std::time::Duration;
 
 #[test]
@@ -16,6 +16,22 @@ fn capability_conversion_separates_lifecycle_and_memory_contracts() {
         hard_limit: true,
         startup_containment: "contained before authorization",
         limitations: vec!["fixture limitation"],
+        boundary_support: BoundarySupport {
+            standard: BoundaryCapability {
+                class: BoundaryClass::Standard,
+                mechanism: "fixture-standard".to_owned(),
+                target_gated: true,
+                boundary_verified_before_authorization: true,
+                target_can_reconfigure_boundary: true,
+                frontend_loss_cleanup_authority: false,
+                workload_empty_proof: true,
+                limitations: vec!["not sealed".to_owned()],
+            },
+            sealed: SealedAvailability::Unavailable {
+                reason: "fixture has no provider".to_owned(),
+                prerequisites: vec!["qualified provider".to_owned()],
+            },
+        },
     });
     assert!(report.containment.supported);
     assert!(

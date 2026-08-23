@@ -88,6 +88,18 @@ fn sealed_execution_plan_and_doctor_fail_closed() {
     assert_eq!(report["policy"]["requested"]["boundary"], "sealed");
     assert_eq!(report["policy"]["effective"]["boundary"], "unavailable");
     assert_eq!(report["error"]["code"], "MCBOUNDARY-UNSUPPORTED");
+    assert_eq!(
+        report["error"]["boundary_setup_failure"]["requested"],
+        "sealed"
+    );
+    assert_eq!(
+        report["error"]["boundary_setup_failure"]["target_created"],
+        false
+    );
+    assert_eq!(
+        report["error"]["boundary_setup_failure"]["target_released"],
+        false
+    );
 
     let plan = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args(["plan", "--sealed", "--json"])
@@ -98,6 +110,7 @@ fn sealed_execution_plan_and_doctor_fail_closed() {
     assert_eq!(plan["schema_version"], PLAN_REPORT_SCHEMA_VERSION);
     assert_eq!(plan["request"]["boundary"], "sealed");
     assert_eq!(plan["resolution"]["effective"]["boundary"], "unavailable");
+    assert!(plan["resolution"]["backend"]["sealed_unavailable"].is_object());
 
     let doctor = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args(["doctor", "--json", "--require", "sealed"])
@@ -108,6 +121,9 @@ fn sealed_execution_plan_and_doctor_fail_closed() {
     assert_eq!(doctor["schema_version"], DOCTOR_REPORT_SCHEMA_VERSION);
     assert_eq!(doctor["requirement"]["kind"], "sealed");
     assert_eq!(doctor["requirement"]["met"], false);
+    if doctor["selected"].is_object() {
+        assert!(doctor["selected"]["sealed_unavailable"].is_object());
+    }
 }
 
 #[test]
@@ -1479,7 +1495,7 @@ fn command_not_executable_maps_to_126_in_aggregate_report() {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
-fn clean_json_uses_schema_one() {
+fn clean_json_uses_current_schema() {
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args(["clean", "--dry-run", "--json"])
         .output()
@@ -1488,7 +1504,10 @@ fn clean_json_uses_schema_one() {
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("clean must emit JSON");
     assert!(!output.stdout.contains(&0x1b));
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(
+        value["schema_version"],
+        memcordon_core::CLEAN_REPORT_SCHEMA_VERSION
+    );
     assert_eq!(value["dry_run"], true);
 }
 

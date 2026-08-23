@@ -13,6 +13,8 @@ mod guardian;
 mod linux_cgroup;
 #[cfg(target_os = "macos")]
 mod macos_watchdog;
+#[cfg(target_os = "linux")]
+mod sealed;
 mod signal;
 mod supervisor;
 #[cfg(feature = "test-support")]
@@ -23,8 +25,9 @@ mod unix_watchdog;
 mod windows_job;
 
 pub use backend::{
-    BackendCleanupFacts, BackendInfo, Execution, ProbeReport, cleanup_stale, probe, run,
+    BackendCleanupFacts, BackendInfo, BoundaryQualification, BoundarySupport, Execution,
+    ProbeReport, SealedAvailability, cleanup_stale, probe, run,
 };
 pub use supervisor::{
-    AttemptContext, AttemptExecution, SupervisorRequest, capabilities, supervise,
+    AttemptContext, AttemptExecution, SupervisorRequest, capabilities, capabilities_for, supervise,
 };

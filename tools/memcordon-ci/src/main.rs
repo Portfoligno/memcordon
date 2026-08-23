@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod release;
+mod sealed_linux;
 mod suites;
 
 use std::path::{Path, PathBuf};
@@ -50,6 +51,7 @@ enum Suite {
     Fuzz,
     Stress,
     BackendLinuxCgroup,
+    BackendLinuxSealed,
     BackendWindowsJob,
     BackendMacosWatchdog,
     ReleasePreflight,

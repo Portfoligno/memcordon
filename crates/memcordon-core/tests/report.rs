@@ -21,7 +21,7 @@ use memcordon_core::{
 };
 
 fn report() -> MemcordonReport {
-    MemcordonReport::schema6(
+    MemcordonReport::schema7(
         ToolReport {
             name: "memcordon".to_owned(),
             version: "test".to_owned(),
@@ -93,6 +93,7 @@ fn report() -> MemcordonReport {
             launch_phase: None,
             target_released: false,
             workload_may_be_alive: false,
+            boundary_setup_failure: None,
         }),
     )
     .expect("valid report")
@@ -532,7 +533,41 @@ fn attempt_record(
             ..LaunchEvidence::default()
         },
         restart_safety: safe_proof(),
+        boundary_detail: memcordon_core::BoundaryMechanismEvidence::Standard {
+            backend: "fixture".to_owned(),
+        },
     }
+}
+
+#[test]
+fn attempt_deserialization_rejects_contradictory_boundary_evidence() {
+    let record = attempt_record(
+        1,
+        Some(RunOutcome::Exited {
+            child: ChildTermination::ExitCode { code: 0 },
+            peak: None,
+            cleanup: cleanup(),
+        }),
+        None,
+    );
+
+    let mut sealed_with_standard_detail = serde_json::to_value(&record).expect("attempt JSON");
+    sealed_with_standard_detail["launch"]["boundary_requested"] = serde_json::json!("sealed");
+    sealed_with_standard_detail["launch"]["boundary_effective"] = serde_json::json!("sealed");
+    sealed_with_standard_detail["restart_safety"]["sealed_boundary_retired"] =
+        serde_json::json!(true);
+    assert!(
+        serde_json::from_value::<AttemptRecord>(sealed_with_standard_detail).is_err(),
+        "sealed generic facts must not deserialize with standard mechanism evidence"
+    );
+
+    let mut standard_with_sealed_retirement = serde_json::to_value(record).expect("attempt JSON");
+    standard_with_sealed_retirement["restart_safety"]["sealed_boundary_retired"] =
+        serde_json::json!(true);
+    assert!(
+        serde_json::from_value::<AttemptRecord>(standard_with_sealed_retirement).is_err(),
+        "standard attempts must not claim sealed retirement authority"
+    );
 }
 
 fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
@@ -590,7 +625,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         RestartConditions::NONE
     };
     base.policy.effective.restart.dormant_conditions.clear();
-    MemcordonReport::schema6(
+    MemcordonReport::schema7(
         base.tool,
         base.invocation,
         base.policy,
@@ -598,7 +633,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         Some(execution),
         None,
     )
-    .expect("schema6")
+    .expect("schema7")
 }
 
 fn coordinator() -> RestartCoordinator {

@@ -2,13 +2,14 @@
 production_packages = [
   "memcordon-core",
   "memcordon-platform",
+  "memcordon-sealed-agent",
   "memcordon",
   "memcordon-testkit",
 ]
 ci_packages = ["memcordon-ci"]
 ci_package_rust_versions = { memcordon-ci = "1.88.0" }
 publish_packages = ["memcordon-core", "memcordon-platform", "memcordon"]
-non_publish_packages = ["memcordon-testkit", "memcordon-ci"]
+non_publish_packages = ["memcordon-sealed-agent", "memcordon-testkit", "memcordon-ci"]
 
 [workflow]
 required_public_matrix = [
@@ -32,7 +33,7 @@ allowed_run_commands = [
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite miri",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite fuzz",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite stress",
-  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-macos-watchdog",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite release-preflight",

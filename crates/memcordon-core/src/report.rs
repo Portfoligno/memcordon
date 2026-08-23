@@ -14,10 +14,10 @@ use crate::{
     SupervisionAggregates, SupervisionExecution, SupervisionPhase, SupervisionTerminal,
 };
 
-pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 6;
-pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 5;
-pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 3;
-pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 7;
+pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 6;
+pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 4;
+pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct MemcordonReport {
@@ -32,7 +32,7 @@ pub struct MemcordonReport {
 }
 
 impl MemcordonReport {
-    pub fn schema6(
+    pub fn schema7(
         tool: ToolReport,
         invocation: InvocationReport,
         policy: PolicyEnvelopeReport,
@@ -613,6 +613,7 @@ pub struct ExecutionErrorReport {
     pub launch_phase: Option<String>,
     pub target_released: bool,
     pub workload_may_be_alive: bool,
+    pub boundary_setup_failure: Option<crate::BoundarySetupFailure>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

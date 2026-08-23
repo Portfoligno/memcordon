@@ -166,6 +166,15 @@ fn info() -> BackendInfo {
             "nested host Job Object restrictions may prevent assignment",
             "console graceful termination is application-dependent",
         ],
+        boundary_support: crate::backend::standard_boundary_support(
+            "suspended-job-assignment-v1",
+            true,
+            "the LocalSystem sealed-agent service is unavailable or not qualified",
+            &[
+                "MemCordonSealedAgent LocalSystem service",
+                "creation-time Job-list and exact handle-list support",
+            ],
+        ),
     }
 }
 
@@ -496,13 +505,18 @@ pub fn run_attempt(
             .map(|error| format!("{}: {}", error.operation, error.message))
             .collect(),
     };
+    let backend = info();
+    let (launch, restart_safety, boundary_detail) =
+        crate::backend::standard_execution_evidence(&backend, cleanup_facts);
     Ok(Execution {
         outcome,
-        backend: info(),
+        backend,
         child_pid,
         duration: started.elapsed(),
         authorization_offset: Some(authorized.saturating_duration_since(started)),
-        cleanup_facts,
+        launch,
+        restart_safety,
+        boundary_detail,
     })
 }
 

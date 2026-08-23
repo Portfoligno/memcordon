@@ -203,7 +203,42 @@ pub fn cleanup_stale(dry_run: bool) -> Result<Vec<String>, Error> {
     Ok(cleaned)
 }
 
-fn info() -> BackendInfo {
+pub(crate) fn info() -> BackendInfo {
+    let provider = crate::sealed::client::probe();
+    let sealed_reason = provider
+        .as_ref()
+        .err()
+        .cloned()
+        .unwrap_or_else(|| "qualified provider available".to_owned());
+    let mut boundary_support = crate::backend::standard_boundary_support(
+        "gated-cgroup-v2-v1",
+        true,
+        &sealed_reason,
+        &[
+            "root-owned private cgroup v2 subtree",
+            "clone3 PID, mount, and cgroup namespaces",
+            "independent root guardian",
+        ],
+    );
+    if let Ok(receipt) = provider {
+        boundary_support.sealed = crate::backend::SealedAvailability::Available {
+            capability: memcordon_core::BoundaryCapability {
+                class: memcordon_core::BoundaryClass::Sealed,
+                mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+                target_gated: true,
+                boundary_verified_before_authorization: true,
+                target_can_reconfigure_boundary: false,
+                frontend_loss_cleanup_authority: true,
+                workload_empty_proof: true,
+                limitations: vec!["requires installed root MemCordon provider".to_owned()],
+            },
+            qualification: crate::backend::BoundaryQualification {
+                provider_identity: receipt.provider_identity,
+                receipt_digest: receipt.receipt_digest,
+                mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+            },
+        };
+    }
     BackendInfo {
         name: "linux-cgroup-v2",
         containment_supported: true,
@@ -217,6 +252,7 @@ fn info() -> BackendInfo {
             "kernel may temporarily report memory.current above memory.max",
             "swap accounting is a separate policy",
         ],
+        boundary_support,
     }
 }
 
@@ -809,13 +845,18 @@ pub fn run_attempt(
             .map(|error| format!("{}: {}", error.operation, error.message))
             .collect(),
     };
+    let backend = info();
+    let (launch, restart_safety, boundary_detail) =
+        crate::backend::standard_execution_evidence(&backend, cleanup_facts);
     Ok(Execution {
         outcome,
-        backend: info(),
+        backend,
         child_pid: u32::try_from(child_pid).unwrap_or_default(),
         duration: started.elapsed(),
         authorization_offset: Some(authorized.saturating_duration_since(started)),
-        cleanup_facts,
+        launch,
+        restart_safety,
+        boundary_detail,
     })
 }
 

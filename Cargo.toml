@@ -2,6 +2,7 @@
 members = [
     "crates/memcordon-core",
     "crates/memcordon-platform",
+    "crates/memcordon-sealed-agent",
     "crates/memcordon-cli",
     "crates/memcordon-testkit",
     "tools/memcordon-ci",

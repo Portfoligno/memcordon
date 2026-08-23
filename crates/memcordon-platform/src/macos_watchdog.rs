@@ -229,6 +229,15 @@ pub fn info() -> BackendInfo {
             "usage can overshoot before termination",
             "an undiscovered descendant can escape by creating a new session",
         ],
+        boundary_support: crate::backend::standard_boundary_support(
+            "process-group-pre-spawn",
+            true,
+            "a certified entitlement-backed process-event authority is not installed",
+            &[
+                "signed Endpoint Security system extension",
+                "root launch daemon",
+            ],
+        ),
     }
 }
 
@@ -582,13 +591,17 @@ pub fn run_attempt(
             .map(|error| format!("{}: {}", error.operation, error.message))
             .collect(),
     };
+    let (launch, restart_safety, boundary_detail) =
+        crate::backend::standard_execution_evidence(&backend, cleanup_facts);
     Ok(Execution {
         outcome,
         backend,
         child_pid,
         duration: started.elapsed(),
         authorization_offset: Some(authorized.saturating_duration_since(started)),
-        cleanup_facts,
+        launch,
+        restart_safety,
+        boundary_detail,
     })
 }
 

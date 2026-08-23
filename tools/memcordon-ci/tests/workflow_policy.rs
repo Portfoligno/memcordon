@@ -293,8 +293,8 @@ fn certification_runner_regressions_are_rejected_structurally() {
         (
             Path::new(".github/workflows/release.yml"),
             release.as_str(),
-            "  linux-certification:\n    name: Release / Linux cgroup certification\n    needs: preflight\n    runs-on: ubuntu-24.04\n",
-            "  linux-certification:\n    name: Release / Linux cgroup certification\n    needs: preflight\n    runs-on: [self-hosted, memcordon, linux, x64, cgroup-v2, ephemeral]\n",
+            "  linux-certification:\n    name: Release / Linux sealed certification\n    needs: preflight\n    runs-on: ubuntu-24.04\n",
+            "  linux-certification:\n    name: Release / Linux sealed certification\n    needs: preflight\n    runs-on: [self-hosted, memcordon, linux, x64, cgroup-v2, ephemeral]\n",
         ),
         (
             Path::new(".github/workflows/release.yml"),
@@ -317,8 +317,8 @@ fn certification_runner_regressions_are_rejected_structurally() {
         (
             Path::new(".github/workflows/release.yml"),
             release.as_str(),
-            "  linux-certification:\n    name: Release / Linux cgroup certification\n    needs: preflight\n    runs-on: ubuntu-24.04\n",
-            "  linux-certification:\n    name: Release / Linux cgroup certification\n    needs: preflight\n    runs-on: ubuntu-latest\n",
+            "  linux-certification:\n    name: Release / Linux sealed certification\n    needs: preflight\n    runs-on: ubuntu-24.04\n",
+            "  linux-certification:\n    name: Release / Linux sealed certification\n    needs: preflight\n    runs-on: ubuntu-latest\n",
         ),
         (
             Path::new(".github/workflows/release.yml"),

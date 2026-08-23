@@ -840,6 +840,7 @@ pub fn run(root: &Path, suite: Suite) -> Result<()> {
         Suite::Fuzz => fuzz(root, &toolchains.stable, &toolchains.miri),
         Suite::Stress => stress(root, &toolchains.stable),
         Suite::BackendLinuxCgroup => launch_delegated_linux_certification(root),
+        Suite::BackendLinuxSealed => crate::sealed_linux::certify(root, &toolchains.stable),
         Suite::BackendWindowsJob => certification(
             root,
             Path::new("rustup"),

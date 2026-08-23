@@ -108,6 +108,14 @@ permissions, pins, cache separation, and dependency-update coverage.
 
 ## Backend certification
 
+Linux sealed certification is owned by the typed `backend-linux-sealed` suite.
+It verifies provider package identity, ephemeral install/upgrade/uninstall,
+runtime qualification, adversarial lifecycle and escape scenarios, fault
+injection, recovery, and the exact six-file evidence inventory documented in
+`spec/sealed-linux-v1.md`. Missing provider prerequisites fail; they are never
+converted to skips or standard-backend success. The provider endpoint is fixed
+and no project-specific environment variable configures certification.
+
 Hard-backend certification uses the exact standard GitHub-hosted labels
 `ubuntu-24.04` and `windows-2025`. Each job receives a fresh VM, performs runtime
 qualification, runs every required scenario, and fails instead of accepting an

@@ -55,7 +55,7 @@ impl InterruptionWait for crate::windows_job::ConsoleControl {
             context,
         )
         .map_err(Box::new)?;
-        Ok(attempt_execution(execution))
+        attempt_execution(execution).map_err(Box::new)
     }
 }
 
@@ -98,22 +98,61 @@ impl AttemptContext {
 }
 
 pub fn capabilities(info: &BackendInfo) -> BackendCapabilityReport {
+    capabilities_for(info, BoundaryRequirement::Standard)
+}
+
+pub fn capabilities_for(
+    info: &BackendInfo,
+    requirement: BoundaryRequirement,
+) -> BackendCapabilityReport {
+    let (boundary_qualification, sealed_unavailable) = match &info.boundary_support.sealed {
+        crate::backend::SealedAvailability::Available { qualification, .. } => (
+            Some(memcordon_core::BoundaryQualificationReport {
+                provider_identity: qualification.provider_identity.clone(),
+                receipt_digest: qualification.receipt_digest.clone(),
+                mechanism: qualification.mechanism.clone(),
+            }),
+            None,
+        ),
+        crate::backend::SealedAvailability::Unavailable {
+            reason,
+            prerequisites,
+        } => (
+            None,
+            Some(memcordon_core::SealedUnavailableReport {
+                reason: reason.clone(),
+                prerequisites: prerequisites.clone(),
+            }),
+        ),
+    };
+    let boundary = match requirement {
+        BoundaryRequirement::Standard => info.boundary_support.standard.clone(),
+        BoundaryRequirement::Sealed => match &info.boundary_support.sealed {
+            crate::backend::SealedAvailability::Available { capability, .. } => capability.clone(),
+            crate::backend::SealedAvailability::Unavailable {
+                reason,
+                prerequisites,
+            } => BoundaryCapability {
+                class: BoundaryClass::Unavailable,
+                mechanism: "sealed-provider-unavailable".to_owned(),
+                limitations: std::iter::once(reason.clone())
+                    .chain(
+                        prerequisites
+                            .iter()
+                            .map(|value| format!("prerequisite: {value}")),
+                    )
+                    .collect(),
+                ..BoundaryCapability::default()
+            },
+        },
+    };
     BackendCapabilityReport {
         name: info.name.to_owned(),
         containment: CapabilityStatusReport {
             supported: info.containment_supported,
             reason: None,
         },
-        boundary: BoundaryCapability {
-            class: BoundaryClass::Standard,
-            mechanism: info.startup_containment.to_owned(),
-            target_gated: info.containment_supported,
-            boundary_verified_before_authorization: info.containment_supported,
-            target_can_reconfigure_boundary: true,
-            frontend_loss_cleanup_authority: false,
-            workload_empty_proof: info.containment_supported,
-            limitations: vec!["certified sealed supervision is not implemented".to_owned()],
-        },
+        boundary,
         memory: Some(MemoryCapabilityReport {
             supported: info.memory_supported,
             class: info.class.to_owned(),
@@ -144,6 +183,8 @@ pub fn capabilities(info: &BackendInfo) -> BackendCapabilityReport {
             .iter()
             .map(|value| (*value).to_owned())
             .collect(),
+        boundary_qualification,
+        sealed_unavailable,
     }
 }
 
@@ -170,11 +211,45 @@ pub fn supervise(request: SupervisorRequest) -> Result<SupervisionExecution, Err
 #[allow(clippy::result_large_err)]
 fn reject_unavailable_sealed(request: &SupervisorRequest) -> Result<(), Error> {
     if request.policy.boundary() == BoundaryRequirement::Sealed {
+        let probe = crate::backend::probe();
+        if probe.selected.as_ref().is_some_and(|backend| {
+            matches!(
+                backend.boundary_support.sealed,
+                crate::backend::SealedAvailability::Available { .. }
+            )
+        }) {
+            return Ok(());
+        }
+        let reason = probe
+            .selected
+            .as_ref()
+            .and_then(|backend| match &backend.boundary_support.sealed {
+                crate::backend::SealedAvailability::Available { .. } => None,
+                crate::backend::SealedAvailability::Unavailable { reason, .. } => {
+                    Some(reason.as_str())
+                }
+            })
+            .unwrap_or("no certified sealed backend was selected");
+        // No target, helper, or boundary was created. Keep every cleanup fact
+        // false/unknown instead of presenting non-applicable work as observed.
+        let restart_safety = RestartSafetyProof::default();
         return Err(Error::new(
             ErrorCategory::Unsupported,
             "MCBOUNDARY-UNSUPPORTED",
-            "certified sealed supervision is unavailable on this host; the target was not authorized",
-        ));
+            format!(
+                "certified sealed supervision is unavailable: {reason}; the target was not authorized"
+            ),
+        )
+        .with_restart_safety(restart_safety.clone())
+        .with_boundary_setup_failure(memcordon_core::BoundarySetupFailure {
+            requested: BoundaryRequirement::Sealed,
+            mechanism: None,
+            phase: memcordon_core::BoundarySetupPhase::ProviderConnection,
+            target_created: false,
+            target_released: false,
+            cleanup_attempted: false,
+            restart_safety,
+        }));
     }
     Ok(())
 }
@@ -308,6 +383,9 @@ fn supervise_with<I: InterruptionWait>(
                             restart_decision: RestartDecisionRecord::default(),
                             launch: launch_from_error(&error),
                             restart_safety: proof_from_error(&error),
+                            boundary_detail: memcordon_core::BoundaryMechanismEvidence::Standard {
+                                backend: "setup-failed-before-selection".to_owned(),
+                            },
                         },
                         &mut aggregates,
                     )
@@ -451,6 +529,7 @@ fn supervise_with<I: InterruptionWait>(
                             restart_decision: decision,
                             launch: attempt.launch,
                             restart_safety: attempt.restart_safety,
+                            boundary_detail: attempt.execution.boundary_detail,
                         },
                         &mut aggregates,
                     )
@@ -492,6 +571,13 @@ fn run_unix_attempt(
     signal: &SignalSource,
     context: AttemptContext,
 ) -> Result<AttemptExecution, Error> {
+    #[cfg(target_os = "linux")]
+    if request.policy.boundary() == BoundaryRequirement::Sealed {
+        return attempt_execution(crate::sealed::client::run(
+            &request.policy,
+            &request.command,
+        )?);
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let helper = request.memcordon_executable.as_deref().ok_or_else(|| {
         Error::new(
@@ -518,38 +604,33 @@ fn run_unix_attempt(
     )?;
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     let execution = crate::unix_watchdog::run(request.policy.clone(), &request.command)?;
-    Ok(attempt_execution(execution))
+    attempt_execution(execution)
 }
 
-fn attempt_execution(execution: Execution) -> AttemptExecution {
-    let facts = execution.cleanup_facts.clone();
-    AttemptExecution {
-        launch: LaunchEvidence {
-            mechanism: launch_mechanism().to_owned(),
-            target_released: true,
-            containment_verified_before_authorization: true,
-            guardian_started_before_authorization: cfg!(any(
-                target_os = "linux",
-                target_os = "macos"
-            )),
-            target_spawn_error_reported: false,
-            boundary_requested: BoundaryRequirement::Standard,
-            boundary_effective: BoundaryClass::Standard,
-            boundary_assignment_verified: false,
-            boundary_reconfiguration_denied: false,
-            inherited_resources_restricted: false,
-            frontend_loss_cleanup_authority_verified: false,
-        },
-        restart_safety: RestartSafetyProof {
-            direct_child_reaped: facts.direct_child_reaped,
-            workload_empty: facts.workload_empty,
-            helpers_reaped: facts.helpers_reaped,
-            containment_removed: facts.containment_removed,
-            containment_incapable_of_live_members: facts.containment_incapable_of_live_members,
-            sealed_boundary_retired: false,
-            errors: facts.errors,
-        },
+#[allow(clippy::result_large_err)]
+fn attempt_execution(execution: Execution) -> Result<AttemptExecution, Error> {
+    validate_backend_execution(&execution)?;
+    Ok(AttemptExecution {
+        launch: execution.launch.clone(),
+        restart_safety: execution.restart_safety.clone(),
         execution,
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_backend_execution(execution: &Execution) -> Result<(), Error> {
+    if memcordon_core::boundary_evidence_is_consistent(
+        &execution.launch,
+        &execution.restart_safety,
+        &execution.boundary_detail,
+    ) {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorCategory::Monitor,
+            "MCBOUNDARY-EVIDENCE",
+            "backend returned contradictory launch or retirement evidence",
+        ))
     }
 }
 
@@ -725,6 +806,8 @@ fn unsupported_capability() -> BackendCapabilityReport {
         startup_containment: String::new(),
         restart_cleanup_condition: String::new(),
         limitations: Vec::new(),
+        boundary_qualification: None,
+        sealed_unavailable: None,
     }
 }
 

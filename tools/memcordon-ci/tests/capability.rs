@@ -54,7 +54,7 @@ fn exact_test_success_requires_one_executed_test() {
 #[test]
 fn certification_consumes_typed_doctor_schema() {
     let mut probe = json!({
-        "schema_version": 3,
+        "schema_version": memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
         "tool": { "name": "memcordon", "version": "0.3.0" },
         "host": { "os": "linux", "architecture": "x86_64" },
         "selected": backend_capability("linux-cgroup-v2", true, "hard"),

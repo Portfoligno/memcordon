@@ -520,6 +520,13 @@ fn check_certification_cache(
     const DEPENDENCY_PATHS: &str =
         "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n";
     const TARGET_PATHS: &str = "target/ci/bootstrap\ntarget/ci/backend\n";
+    const LINUX_TARGET_PATHS: &str =
+        "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/sealed-agent\n";
+    let target_paths = if context.contains("linux") {
+        LINUX_TARGET_PATHS
+    } else {
+        TARGET_PATHS
+    };
 
     let restores = action_steps(steps, restore_action)?;
     let saves = action_steps(steps, save_action)?;
@@ -531,7 +538,7 @@ fn check_certification_cache(
 
     for (id, path, expected_key) in [
         ("certification-deps", DEPENDENCY_PATHS, dependency_key),
-        ("certification-target", TARGET_PATHS, target_key),
+        ("certification-target", target_paths, target_key),
     ] {
         let restore = step_with_id(steps, id, context)?;
         exact_mapping_keys(restore, &["id", "uses", "with"], context)?;
@@ -658,6 +665,11 @@ fn check_certification_job(
     if uploads.len() != 1 {
         return Err(failure(format!("{context} artifact upload count differs")));
     }
+    if artifact_name.contains("linux") && scalar(uploads[0], "if") != Some("always()") {
+        return Err(failure(format!(
+            "{context} must retain Linux certification diagnostics under always()"
+        )));
+    }
     let inputs = mapping(
         uploads[0]
             .get(key("with"))
@@ -716,9 +728,9 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         (
             "linux",
             "ubuntu-24.04",
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup",
-            "backend-linux-cgroup-v2",
-            "target/ci/reports/backend-linux-cgroup-v2.json",
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed",
+            "backend-linux-sealed-v1",
+            "target/ci/reports/linux-sealed",
         ),
         (
             "windows",
@@ -1077,9 +1089,9 @@ fn check_release_structure(
         (
             "linux-certification",
             "ubuntu-24.04",
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup",
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed",
             "release-certification-linux",
-            "target/ci/reports/backend-linux-cgroup-v2.json",
+            "target/ci/reports/linux-sealed",
         ),
         (
             "windows-certification",

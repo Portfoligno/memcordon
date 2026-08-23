@@ -67,6 +67,214 @@ pub struct RestartSafetyProof {
     pub errors: Vec<String>,
 }
 
+/// Native facts supporting a boundary claim. This is report evidence, not a
+/// caller-selectable mechanism.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mechanism", rename_all = "kebab-case")]
+pub enum BoundaryMechanismEvidence {
+    Standard { backend: String },
+    LinuxPidNamespaceCgroupV1(LinuxSealedEvidence),
+    WindowsJobObjectV1(WindowsSealedEvidence),
+    MacosEndpointSecurityV1(MacosSealedEvidence),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LinuxSealedEvidence {
+    pub schema_version: u32,
+    pub provider_identity: String,
+    pub cgroup_identity_digest: String,
+    pub cgroup_created: bool,
+    pub cgroup_owned_by_provider: bool,
+    pub memory_configuration_verified: bool,
+    pub init_created_into_cgroup: bool,
+    pub pid_namespace_created: bool,
+    pub mount_namespace_created: bool,
+    pub cgroup_namespace_created: bool,
+    pub target_pidfd_verified: bool,
+    pub target_cgroup_membership_verified: bool,
+    pub target_pid_namespace_verified: bool,
+    pub target_credentials_verified: bool,
+    pub target_capabilities_empty: bool,
+    pub no_new_privs_verified: bool,
+    pub inherited_descriptors_verified: bool,
+    pub writable_cgroup_view_denied: bool,
+    pub guardian_ready: bool,
+    pub target_released: bool,
+    pub cgroup_kill_invoked: bool,
+    pub cgroup_empty_verified: bool,
+    pub namespace_init_reaped: bool,
+    pub guardian_reaped: bool,
+    pub cgroup_removed: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WindowsSealedEvidence {
+    pub schema_version: u32,
+    pub service_identity: String,
+    pub caller_token_authenticated: bool,
+    pub restricted_token_created: bool,
+    pub restricted_token_profile_verified: bool,
+    pub job_created: bool,
+    pub job_limits_verified: bool,
+    pub kill_on_close_verified: bool,
+    pub breakaway_denied: bool,
+    pub completion_port_associated: bool,
+    pub guardian_ready: bool,
+    pub target_created_suspended: bool,
+    pub job_list_applied_at_creation: bool,
+    pub handle_list_applied_at_creation: bool,
+    pub target_job_membership_verified: bool,
+    pub target_token_verified: bool,
+    pub target_still_suspended_during_verification: bool,
+    pub inherited_handles_verified: bool,
+    pub target_released: bool,
+    pub terminate_job_invoked: bool,
+    pub active_processes_zero: bool,
+    pub direct_target_reaped: bool,
+    pub relays_retired: bool,
+    pub guardian_reaped: bool,
+    pub final_job_handles_closed: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MacosSealedEvidence {
+    pub schema_version: u32,
+    pub daemon_identity: String,
+    pub system_extension_identity: String,
+    pub endpoint_security_entitled: bool,
+    pub required_subscriptions_active: bool,
+    pub event_sequence_complete: bool,
+    pub target_correlated_before_authorization: bool,
+    pub target_credentials_verified: bool,
+    pub inherited_descriptors_verified: bool,
+    pub guardian_ready: bool,
+    pub target_released: bool,
+    pub observed_fork_count: u64,
+    pub observed_exec_count: u64,
+    pub observed_exit_count: u64,
+    pub known_members_terminated: bool,
+    pub reconciliation_complete: bool,
+    pub stable_empty_passes: u32,
+    pub direct_target_reaped: bool,
+    pub helpers_reaped: bool,
+    pub launch_job_retired: bool,
+}
+
+/// Validates that generic launch and retirement facts agree with the native
+/// mechanism evidence. Both live backend results and deserialized reports use
+/// this validator so contradictory sealed claims fail closed.
+pub fn boundary_evidence_is_consistent(
+    launch: &LaunchEvidence,
+    restart_safety: &RestartSafetyProof,
+    detail: &BoundaryMechanismEvidence,
+) -> bool {
+    match detail {
+        BoundaryMechanismEvidence::Standard { backend } => {
+            !backend.is_empty()
+                && !launch.mechanism.is_empty()
+                && launch.boundary_requested == BoundaryRequirement::Standard
+                && launch.boundary_effective == BoundaryClass::Standard
+                && !restart_safety.sealed_boundary_retired
+        }
+        BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV1(native) => {
+            sealed_generic_evidence_is_consistent(launch, restart_safety)
+                && launch.mechanism == "linux-pid-namespace-cgroup-v1"
+                && native.schema_version == 1
+                && !native.provider_identity.is_empty()
+                && !native.cgroup_identity_digest.is_empty()
+                && native.cgroup_created
+                && native.cgroup_owned_by_provider
+                && native.memory_configuration_verified
+                && native.init_created_into_cgroup
+                && native.pid_namespace_created
+                && native.mount_namespace_created
+                && native.cgroup_namespace_created
+                && native.target_pidfd_verified
+                && native.target_cgroup_membership_verified
+                && native.target_pid_namespace_verified
+                && native.target_credentials_verified
+                && native.target_capabilities_empty
+                && native.no_new_privs_verified
+                && native.inherited_descriptors_verified
+                && native.writable_cgroup_view_denied
+                && native.guardian_ready
+                && native.target_released == launch.target_released
+                && native.cgroup_kill_invoked
+                && native.cgroup_empty_verified
+                && native.namespace_init_reaped
+                && native.guardian_reaped
+                && native.cgroup_removed
+        }
+        BoundaryMechanismEvidence::WindowsJobObjectV1(native) => {
+            sealed_generic_evidence_is_consistent(launch, restart_safety)
+                && launch.mechanism == "windows-job-object-v1"
+                && native.schema_version == 1
+                && !native.service_identity.is_empty()
+                && native.caller_token_authenticated
+                && native.restricted_token_created
+                && native.restricted_token_profile_verified
+                && native.job_created
+                && native.job_limits_verified
+                && native.kill_on_close_verified
+                && native.breakaway_denied
+                && native.completion_port_associated
+                && native.guardian_ready
+                && native.target_created_suspended
+                && native.job_list_applied_at_creation
+                && native.handle_list_applied_at_creation
+                && native.target_job_membership_verified
+                && native.target_token_verified
+                && native.target_still_suspended_during_verification
+                && native.inherited_handles_verified
+                && native.target_released == launch.target_released
+                && native.terminate_job_invoked
+                && native.active_processes_zero
+                && native.direct_target_reaped
+                && native.relays_retired
+                && native.guardian_reaped
+                && native.final_job_handles_closed
+        }
+        BoundaryMechanismEvidence::MacosEndpointSecurityV1(native) => {
+            sealed_generic_evidence_is_consistent(launch, restart_safety)
+                && launch.mechanism == "macos-endpoint-security-v1"
+                && native.schema_version == 1
+                && !native.daemon_identity.is_empty()
+                && !native.system_extension_identity.is_empty()
+                && native.endpoint_security_entitled
+                && native.required_subscriptions_active
+                && native.event_sequence_complete
+                && native.target_correlated_before_authorization
+                && native.target_credentials_verified
+                && native.inherited_descriptors_verified
+                && native.guardian_ready
+                && native.target_released == launch.target_released
+                && native.known_members_terminated
+                && native.reconciliation_complete
+                && native.stable_empty_passes >= 2
+                && native.direct_target_reaped
+                && native.helpers_reaped
+                && native.launch_job_retired
+        }
+    }
+}
+
+fn sealed_generic_evidence_is_consistent(
+    launch: &LaunchEvidence,
+    restart_safety: &RestartSafetyProof,
+) -> bool {
+    launch.boundary_requested == BoundaryRequirement::Sealed
+        && launch.boundary_effective == BoundaryClass::Sealed
+        && launch.target_released
+        && launch.containment_verified_before_authorization
+        && launch.guardian_started_before_authorization
+        && launch.target_spawn_error_reported
+        && launch.boundary_assignment_verified
+        && launch.boundary_reconfiguration_denied
+        && launch.inherited_resources_restricted
+        && launch.frontend_loss_cleanup_authority_verified
+        && restart_safety.is_safe_for(BoundaryRequirement::Sealed)
+}
+
 impl RestartSafetyProof {
     pub fn is_safe(&self) -> bool {
         self.is_safe_for(BoundaryRequirement::Standard)
@@ -187,6 +395,7 @@ pub struct AttemptRecord {
     pub restart_decision: RestartDecisionRecord,
     pub launch: LaunchEvidence,
     pub restart_safety: RestartSafetyProof,
+    pub boundary_detail: BoundaryMechanismEvidence,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -298,6 +507,11 @@ impl AttemptRecord {
                 (Some(authorized), Some(terminal)) => authorized <= terminal,
                 _ => true,
             }
+            && boundary_evidence_is_consistent(
+                &self.launch,
+                &self.restart_safety,
+                &self.boundary_detail,
+            )
     }
 }
 
@@ -321,6 +535,7 @@ impl<'de> Deserialize<'de> for AttemptRecord {
             restart_decision: RestartDecisionRecord,
             launch: LaunchEvidence,
             restart_safety: RestartSafetyProof,
+            boundary_detail: BoundaryMechanismEvidence,
         }
         let wire = Wire::deserialize(deserializer)?;
         let record = Self {
@@ -337,6 +552,7 @@ impl<'de> Deserialize<'de> for AttemptRecord {
             restart_decision: wire.restart_decision,
             launch: wire.launch,
             restart_safety: wire.restart_safety,
+            boundary_detail: wire.boundary_detail,
         };
         if !record.is_consistent() {
             return Err(serde::de::Error::custom("invalid attempt record"));
@@ -814,6 +1030,23 @@ pub struct BackendCapabilityReport {
     pub startup_containment: String,
     pub restart_cleanup_condition: String,
     pub limitations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_qualification: Option<BoundaryQualificationReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_unavailable: Option<SealedUnavailableReport>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BoundaryQualificationReport {
+    pub provider_identity: String,
+    pub receipt_digest: String,
+    pub mechanism: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SealedUnavailableReport {
+    pub reason: String,
+    pub prerequisites: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

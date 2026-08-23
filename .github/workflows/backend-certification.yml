@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   linux:
-    name: Linux cgroup v2
+    name: Linux sealed provider
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -34,13 +34,15 @@ jobs:
           path: |
             target/ci/bootstrap
             target/ci/backend
+            target/ci/sealed-agent
           key: cargo-target-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: backend-linux-cgroup-v2
-          path: target/ci/reports/backend-linux-cgroup-v2.json
+          name: backend-linux-sealed-v1
+          path: target/ci/reports/linux-sealed
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
@@ -50,6 +52,7 @@ jobs:
           path: |
             target/ci/bootstrap
             target/ci/backend
+            target/ci/sealed-agent
           key: ${{ steps.certification-target.outputs.cache-primary-key }}
       - if: always() && steps.certification-deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -85,7 +88,8 @@ jobs:
           key: cargo-target-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: backend-windows-job-object
           path: target/ci/reports/backend-windows-job-object.json

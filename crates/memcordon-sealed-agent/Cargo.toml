@@ -1,0 +1,32 @@
+[package]
+name = "memcordon-sealed-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+test-support = []
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "memcordon-sealed-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+memcordon-core = { path = "../memcordon-core", version = "=0.4.2-dev" }
+memcordon-platform = { path = "../memcordon-platform", version = "=0.4.2-dev" }
+tempfile.workspace = true

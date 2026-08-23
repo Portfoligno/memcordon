@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use memcordon_core::{CommandSpec, Error, ErrorCategory, Policy, RunOutcome};
+use memcordon_core::{
+    BoundaryCapability, BoundaryMechanismEvidence, CommandSpec, Error, ErrorCategory,
+    LaunchEvidence, Policy, RestartSafetyProof, RunOutcome,
+};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
@@ -13,6 +16,33 @@ pub struct BackendInfo {
     pub hard_limit: bool,
     pub startup_containment: &'static str,
     pub limitations: Vec<&'static str>,
+    pub boundary_support: BoundarySupport,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BoundarySupport {
+    pub standard: BoundaryCapability,
+    pub sealed: SealedAvailability,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum SealedAvailability {
+    Available {
+        capability: BoundaryCapability,
+        qualification: BoundaryQualification,
+    },
+    Unavailable {
+        reason: String,
+        prerequisites: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BoundaryQualification {
+    pub provider_identity: String,
+    pub receipt_digest: String,
+    pub mechanism: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -35,7 +65,9 @@ pub struct Execution {
     pub child_pid: u32,
     pub duration: Duration,
     pub authorization_offset: Option<Duration>,
-    pub cleanup_facts: BackendCleanupFacts,
+    pub launch: LaunchEvidence,
+    pub restart_safety: RestartSafetyProof,
+    pub boundary_detail: BoundaryMechanismEvidence,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -46,6 +78,73 @@ pub struct BackendCleanupFacts {
     pub containment_removed: bool,
     pub containment_incapable_of_live_members: bool,
     pub errors: Vec<String>,
+}
+
+pub(crate) fn standard_boundary_support(
+    mechanism: &str,
+    containment_supported: bool,
+    sealed_reason: &str,
+    prerequisites: &[&str],
+) -> BoundarySupport {
+    BoundarySupport {
+        standard: BoundaryCapability {
+            class: memcordon_core::BoundaryClass::Standard,
+            mechanism: mechanism.to_owned(),
+            target_gated: containment_supported,
+            boundary_verified_before_authorization: containment_supported,
+            target_can_reconfigure_boundary: true,
+            frontend_loss_cleanup_authority: false,
+            workload_empty_proof: containment_supported,
+            limitations: vec!["standard supervision is not a sealed boundary".to_owned()],
+        },
+        sealed: SealedAvailability::Unavailable {
+            reason: sealed_reason.to_owned(),
+            prerequisites: prerequisites
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        },
+    }
+}
+
+pub(crate) fn standard_execution_evidence(
+    backend: &BackendInfo,
+    facts: BackendCleanupFacts,
+) -> (
+    LaunchEvidence,
+    RestartSafetyProof,
+    BoundaryMechanismEvidence,
+) {
+    (
+        LaunchEvidence {
+            mechanism: backend.boundary_support.standard.mechanism.clone(),
+            target_released: true,
+            containment_verified_before_authorization: backend
+                .boundary_support
+                .standard
+                .boundary_verified_before_authorization,
+            guardian_started_before_authorization: false,
+            target_spawn_error_reported: false,
+            boundary_requested: memcordon_core::BoundaryRequirement::Standard,
+            boundary_effective: memcordon_core::BoundaryClass::Standard,
+            boundary_assignment_verified: false,
+            boundary_reconfiguration_denied: false,
+            inherited_resources_restricted: false,
+            frontend_loss_cleanup_authority_verified: false,
+        },
+        RestartSafetyProof {
+            direct_child_reaped: facts.direct_child_reaped,
+            workload_empty: facts.workload_empty,
+            helpers_reaped: facts.helpers_reaped,
+            containment_removed: facts.containment_removed,
+            containment_incapable_of_live_members: facts.containment_incapable_of_live_members,
+            sealed_boundary_retired: false,
+            errors: facts.errors,
+        },
+        BoundaryMechanismEvidence::Standard {
+            backend: backend.name.to_owned(),
+        },
+    )
 }
 
 pub fn probe() -> ProbeReport {

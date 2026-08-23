@@ -18,6 +18,8 @@ test-support = ["dep:tempfile"]
 libc.workspace = true
 memcordon-core = { path = "../memcordon-core", version = "=0.4.2-dev" }
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]

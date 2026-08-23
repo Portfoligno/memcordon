@@ -1,0 +1,13 @@
+[Unit]
+Description=MemCordon sealed supervision provider socket
+
+[Socket]
+ListenStream=/run/memcordon/sealed-agent.sock
+DirectoryMode=0750
+SocketMode=0660
+SocketUser=root
+SocketGroup=memcordon
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

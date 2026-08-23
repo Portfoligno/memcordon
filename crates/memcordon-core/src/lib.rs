@@ -17,7 +17,9 @@ mod supervision;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
-pub use error::{Error, ErrorCategory, InitialSpawnFailure};
+pub use error::{
+    BoundarySetupFailure, BoundarySetupPhase, Error, ErrorCategory, InitialSpawnFailure,
+};
 pub use outcome::{
     AttemptEventKind, ChildTermination, CleanupErrorRecord, CleanupSummary, DeadlineEvidence,
     Interruption, LimitEvidence, RunOutcome,
@@ -49,9 +51,11 @@ pub use restart::{
 pub use state_machine::{RunState, StateMachine, StateTransitionError};
 pub use supervision::{
     AttemptHistory, AttemptKind, AttemptPhase, AttemptRecord, BackendCapabilityReport,
-    BoundaryCapability, BoundaryClass, CapabilityStatusReport, DETAILED_ATTEMPT_CAPACITY,
-    LaunchEvidence, MemoryCapabilityReport, RestartDecisionKind, RestartDecisionRecord,
-    RestartSafetyProof, RestartSummary, SupervisionAggregates, SupervisionDeadlineEvidence,
-    SupervisionErrorRecord, SupervisionExecution, SupervisionModelError, SupervisionPhase,
-    SupervisionTerminal,
+    BoundaryCapability, BoundaryClass, BoundaryMechanismEvidence, BoundaryQualificationReport,
+    CapabilityStatusReport, DETAILED_ATTEMPT_CAPACITY, LaunchEvidence, LinuxSealedEvidence,
+    MacosSealedEvidence, MemoryCapabilityReport, RestartDecisionKind, RestartDecisionRecord,
+    RestartSafetyProof, RestartSummary, SealedUnavailableReport, SupervisionAggregates,
+    SupervisionDeadlineEvidence, SupervisionErrorRecord, SupervisionExecution,
+    SupervisionModelError, SupervisionPhase, SupervisionTerminal, WindowsSealedEvidence,
+    boundary_evidence_is_consistent,
 };

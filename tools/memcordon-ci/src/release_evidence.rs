@@ -6,35 +6,56 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION;
+
 use crate::{CiError, Result};
 
 const MAXIMUM_CERTIFICATION_REPORT_BYTES: u64 = 64 * 1024;
 const HARD_CERTIFICATION_RUNNER_CLASS: &str = "ephemeral-certified";
 const HARD_CERTIFICATION_RUNNER_PROVIDER: &str = "github-hosted";
 
-const LINUX_TESTS: &[&str] = &[
-    "certified_backend_preserves_ordinary_status_and_reaps",
-    "certified_backend_reports_limit_and_removes_workload",
-    "certified_backend_cleans_background_descendant_by_birth_identity",
-    "certified_backend_allows_bounded_transient_burst",
-    "linux_cgroup_v2_contains_aggregate_tree",
-    "linux_cgroup_v2_handles_rapid_process_churn",
-    "linux_cgroup_controls_are_applied_before_target_observation",
-    "linux_embedding_limiter_blocks_target_until_containment_is_verified",
-    "linux_embedding_limiter_preserves_non_utf8_target_argv",
-    "linux_target_spawn_failures_preserve_native_provenance",
-    "linux_memory_events_produce_limit_evidence",
-    "linux_cleanup_evidence_confirms_empty_reaped_cgroup",
-    "linux_cgroup_identity_is_verified_before_exec",
-    "linux_report_pid_is_the_actual_target_pid",
-    "linux_gate_failures_kill_the_blocked_target_before_fixture_code",
-    "linux_guardian_kills_process_group_after_wrapper_crash",
-    "linux_cgroup_kill_reaps_continually_forking_workload",
-    "linux_supervisor_monitor_error_fails_closed_end_to_end",
-    "limit_evidence_requires_counter_delta",
-    "cgroup_controls_are_written_exactly",
-    "monitor_file_errors_are_reported_instead_of_treated_as_success",
-    "cgroup_identity_verification_rejects_the_wrong_process",
+const LINUX_SEALED_FILES: &[&str] = &[
+    "provider-identity.json",
+    "qualification-receipt.json",
+    "sealed-scenario-report.json",
+    "fault-injection-report.json",
+    "cleanup-recovery-report.json",
+    "platform-environment.json",
+];
+pub const LINUX_SEALED_TESTS: &[&str] = &[
+    "qualification_fails_closed_without_root_provider",
+    "qualification_receipt_requires_complete_retirement",
+    "sealed_direct_exit_retires_fresh_boundary",
+    "sealed_child_outlives_direct_target_until_cleanup",
+    "sealed_double_fork_remains_in_pid_namespace_and_cgroup",
+    "sealed_setsid_daemon_remains_contained",
+    "sealed_retained_streams_do_not_finish_before_retirement",
+    "sealed_fork_storm_is_empty_before_result",
+    "sealed_fork_during_cleanup_cannot_survive",
+    "sealed_target_cannot_move_to_parent_or_sibling_cgroup",
+    "sealed_target_cannot_setns_into_host_namespace",
+    "sealed_target_cannot_mount_writable_cgroup_view",
+    "sealed_target_inherits_only_verified_descriptors",
+    "sealed_target_cannot_disable_namespace_init",
+    "sealed_frontend_loss_before_authorization_never_runs_target",
+    "sealed_frontend_loss_after_authorization_triggers_guardian",
+    "sealed_provider_worker_loss_triggers_guardian",
+    "sealed_guardian_loss_before_authorization_fails_closed",
+    "sealed_guardian_loss_after_authorization_cannot_report_success",
+    "sealed_exec_failure_preserves_native_provenance",
+    "sealed_restart_uses_fresh_retired_boundary",
+    "sealed_simultaneous_attempts_have_disjoint_boundaries",
+    "sealed_recovery_removes_authenticated_stale_record_without_cgroup",
+    "sealed_recovery_quarantines_cgroup_without_authenticated_record",
+    "sealed_recovery_blocks_capability_while_live_state_is_ambiguous",
+    "sealed_faults_before_authorization_never_create_marker",
+    "sealed_cgroup_kill_failure_never_reports_retirement",
+    "sealed_persistent_populated_state_blocks_restart",
+    "sealed_namespace_init_reap_delay_blocks_result",
+    "sealed_guardian_reap_failure_blocks_result",
+    "sealed_package_identity_rejects_tampered_provider",
+    "sealed_package_upgrade_recovers_before_advertising",
+    "sealed_package_uninstall_refuses_live_authenticated_attempt",
 ];
 
 const WINDOWS_TESTS: &[&str] = &[
@@ -76,7 +97,7 @@ pub struct CertificationRecord {
 
 #[derive(Clone, Copy)]
 enum ReportKind {
-    Linux,
+    LinuxSealed,
     Windows,
     Macos,
 }
@@ -92,11 +113,11 @@ struct ReportSpec {
 
 const REPORTS: &[ReportSpec] = &[
     ReportSpec {
-        backend: "linux-cgroup-v2",
+        backend: "linux-pid-namespace-cgroup-v1",
         artifact_directory: "release-certification-linux",
-        report_name: "backend-linux-cgroup-v2.json",
-        evidence_path: "certification/backend-linux-cgroup-v2.json",
-        kind: ReportKind::Linux,
+        report_name: "sealed-scenario-report.json",
+        evidence_path: "certification/sealed-scenario-report.json",
+        kind: ReportKind::LinuxSealed,
     },
     ReportSpec {
         backend: "windows-job-object",
@@ -145,24 +166,65 @@ struct HardCertificationReport<R> {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LinuxRuntimeEvidence {
-    unified_cgroup_v2: bool,
-    delegated_boundary: bool,
-    memory_controller: bool,
-    memory_max_round_trip: bool,
-    memory_swap_max: bool,
-    cgroup_kill: bool,
+struct LinuxSealedScenario {
+    name: String,
+    class: String,
+    result: String,
 }
 
-impl LinuxRuntimeEvidence {
-    fn complete(&self) -> bool {
-        self.unified_cgroup_v2
-            && self.delegated_boundary
-            && self.memory_controller
-            && self.memory_max_round_trip
-            && self.memory_swap_max
-            && self.cgroup_kill
-    }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxSealedScenarioReport {
+    schema_version: u32,
+    mechanism: String,
+    commit: String,
+    tests_run: u32,
+    tests_skipped: u32,
+    scenarios: Vec<LinuxSealedScenario>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxProviderIdentity {
+    schema_version: u32,
+    mechanism: String,
+    provider_identity: String,
+    receipt_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxQualificationReceipt {
+    schema_version: u32,
+    mechanism: String,
+    provider_identity: String,
+    receipt_digest: String,
+    unified_cgroup_v2: bool,
+    private_cgroup_subtree: bool,
+    clone3_into_cgroup: bool,
+    pid_namespace: bool,
+    mount_namespace: bool,
+    cgroup_namespace: bool,
+    pidfd: bool,
+    close_range: bool,
+    guardian_outside_boundary: bool,
+    target_gated: bool,
+    assignment_verified: bool,
+    inherited_descriptors_verified: bool,
+    frontend_loss_authority_verified: bool,
+    cgroup_kill: bool,
+    workload_empty: bool,
+    helpers_reaped: bool,
+    boundary_retired: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxNamedEvidence {
+    schema_version: u32,
+    mechanism: String,
+    result: String,
+    tests: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,6 +374,105 @@ fn validate_macos_report(bytes: &[u8], spec: ReportSpec, expected_commit: &str) 
     Ok(())
 }
 
+fn validate_linux_sealed_report(bytes: &[u8], expected_commit: &str) -> Result<()> {
+    let report: LinuxSealedScenarioReport = serde_json::from_slice(bytes)?;
+    let count = u32::try_from(report.scenarios.len())
+        .map_err(|_| failure("too many Linux sealed scenarios"))?;
+    let exact_inventory = report.scenarios.len() == LINUX_SEALED_TESTS.len()
+        && report
+            .scenarios
+            .iter()
+            .zip(LINUX_SEALED_TESTS)
+            .all(|(scenario, expected)| scenario.name == *expected);
+    if report.schema_version != 1
+        || report.mechanism != "linux-pid-namespace-cgroup-v1"
+        || report.commit != expected_commit
+        || report.tests_run != count
+        || report.tests_skipped != 0
+        || !exact_inventory
+        || report.scenarios.iter().any(|scenario| {
+            scenario.name.is_empty() || scenario.class.is_empty() || scenario.result != "passed"
+        })
+    {
+        return Err(failure("required Linux sealed certification failed"));
+    }
+    Ok(())
+}
+
+fn validate_linux_auxiliary(name: &str, bytes: &[u8]) -> Result<()> {
+    match name {
+        "provider-identity.json" => {
+            let report: LinuxProviderIdentity = serde_json::from_slice(bytes)?;
+            if report.schema_version != 1
+                || report.mechanism != "linux-pid-namespace-cgroup-v1"
+                || report.provider_identity.is_empty()
+                || report.receipt_digest.is_empty()
+            {
+                return Err(failure("Linux provider identity evidence is incomplete"));
+            }
+        }
+        "qualification-receipt.json" => {
+            let report: LinuxQualificationReceipt = serde_json::from_slice(bytes)?;
+            let complete = report.schema_version == 1
+                && report.mechanism == "linux-pid-namespace-cgroup-v1"
+                && !report.provider_identity.is_empty()
+                && !report.receipt_digest.is_empty()
+                && report.unified_cgroup_v2
+                && report.private_cgroup_subtree
+                && report.clone3_into_cgroup
+                && report.pid_namespace
+                && report.mount_namespace
+                && report.cgroup_namespace
+                && report.pidfd
+                && report.close_range
+                && report.guardian_outside_boundary
+                && report.target_gated
+                && report.assignment_verified
+                && report.inherited_descriptors_verified
+                && report.frontend_loss_authority_verified
+                && report.cgroup_kill
+                && report.workload_empty
+                && report.helpers_reaped
+                && report.boundary_retired;
+            if !complete {
+                return Err(failure("Linux qualification evidence is incomplete"));
+            }
+        }
+        "fault-injection-report.json" | "cleanup-recovery-report.json" => {
+            let report: LinuxNamedEvidence = serde_json::from_slice(bytes)?;
+            if report.schema_version != 1
+                || report.mechanism != "linux-pid-namespace-cgroup-v1"
+                || report.result != "passed"
+                || report.tests.is_empty()
+                || report.tests.iter().any(String::is_empty)
+            {
+                return Err(failure("Linux named certification evidence is incomplete"));
+            }
+        }
+        "platform-environment.json" => {
+            let report: serde_json::Value = serde_json::from_slice(bytes)?;
+            if report
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                != Some(u64::from(DOCTOR_REPORT_SCHEMA_VERSION))
+                || report
+                    .pointer("/selected/boundary/class")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("sealed")
+                || report
+                    .pointer("/selected/boundary/mechanism")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("linux-pid-namespace-cgroup-v1")
+            {
+                return Err(failure("Linux platform evidence did not select sealed"));
+            }
+        }
+        "sealed-scenario-report.json" => {}
+        _ => return Err(failure("unexpected Linux sealed evidence file")),
+    }
+    Ok(())
+}
+
 fn validate_artifact_inventory(input: &Path) -> Result<()> {
     let allowed_directories: BTreeSet<&str> =
         REPORTS.iter().map(|spec| spec.artifact_directory).collect();
@@ -339,9 +500,25 @@ fn validate_artifact_inventory(input: &Path) -> Result<()> {
             )));
         }
         let entries = fs::read_dir(&directory)?.collect::<std::io::Result<Vec<_>>>()?;
-        if entries.len() != 1
-            || entries[0].file_name().to_str() != Some(spec.report_name)
-            || !entries[0].file_type()?.is_file()
+        let expected: BTreeSet<&str> = if matches!(spec.kind, ReportKind::LinuxSealed) {
+            LINUX_SEALED_FILES.iter().copied().collect()
+        } else {
+            [spec.report_name].into_iter().collect()
+        };
+        let actual: BTreeSet<String> = entries
+            .iter()
+            .map(|entry| {
+                if !entry.file_type()?.is_file() {
+                    return Err(failure("certification artifact entry is not a file"));
+                }
+                entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| failure("certification artifact name is not UTF-8"))
+            })
+            .collect::<Result<_>>()?;
+        if actual.len() != expected.len()
+            || !actual.iter().all(|name| expected.contains(name.as_str()))
         {
             return Err(failure(format!(
                 "certification artifact has an unexpected inventory: {}",
@@ -388,6 +565,28 @@ fn validate_output_inventory(output: &Path) -> Result<()> {
             .file_name()
             .into_string()
             .map_err(|_| failure("release certification evidence name is not UTF-8"))?;
+        if name == "linux-sealed" && entry.file_type()?.is_dir() {
+            let actual: BTreeSet<String> = fs::read_dir(entry.path())?
+                .map(|item| {
+                    let item = item?;
+                    if !item.file_type()?.is_file() {
+                        return Err(failure("Linux release evidence entry is not a file"));
+                    }
+                    item.file_name()
+                        .into_string()
+                        .map_err(|_| failure("Linux release evidence name is not UTF-8"))
+                })
+                .collect::<Result<_>>()?;
+            let expected: BTreeSet<String> = LINUX_SEALED_FILES
+                .iter()
+                .filter(|name| **name != "sealed-scenario-report.json")
+                .map(|name| (*name).to_owned())
+                .collect();
+            if actual != expected {
+                return Err(failure("Linux release evidence inventory differs"));
+            }
+            continue;
+        }
         if !allowed_names.contains(name.as_str()) || !entry.file_type()?.is_file() {
             return Err(failure(format!(
                 "unexpected release certification evidence: {name}"
@@ -410,14 +609,13 @@ pub fn collect_certification(
         let path = input.join(spec.artifact_directory).join(spec.report_name);
         let bytes = read_report(&path)?;
         match spec.kind {
-            ReportKind::Linux => validate_hard_report::<LinuxRuntimeEvidence>(
-                &bytes,
-                *spec,
-                expected_commit,
-                "ubuntu-24.04",
-                LINUX_TESTS,
-                LinuxRuntimeEvidence::complete,
-            )?,
+            ReportKind::LinuxSealed => {
+                validate_linux_sealed_report(&bytes, expected_commit)?;
+                for name in LINUX_SEALED_FILES {
+                    let auxiliary = read_report(&input.join(spec.artifact_directory).join(name))?;
+                    validate_linux_auxiliary(name, &auxiliary)?;
+                }
+            }
             ReportKind::Windows => validate_hard_report::<WindowsRuntimeEvidence>(
                 &bytes,
                 *spec,
@@ -446,6 +644,24 @@ pub fn collect_certification(
             CertificationRecord {
                 evidence_path: report.spec.evidence_path.to_owned(),
                 sha256: report.sha256,
+            },
+        );
+    }
+    let linux_input = input.join("release-certification-linux");
+    let linux_output = evidence_directory.join("linux-sealed");
+    fs::create_dir_all(&linux_output)?;
+    for name in LINUX_SEALED_FILES {
+        if *name == "sealed-scenario-report.json" {
+            continue;
+        }
+        let bytes = read_report(&linux_input.join(name))?;
+        let relative = format!("certification/linux-sealed/{name}");
+        fs::write(output.join(&relative), &bytes)?;
+        records.insert(
+            format!("linux-pid-namespace-cgroup-v1/{name}"),
+            CertificationRecord {
+                evidence_path: relative,
+                sha256: sha256_bytes(&bytes),
             },
         );
     }

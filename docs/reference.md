@@ -335,7 +335,7 @@ Circuit policy reports expose `threshold`, `half_life_ms`, and `cooldown_ms`.
 
 ## Execution reports
 
-`--report PATH` writes a mandatory schema-6 JSON document. The document is
+`--report PATH` writes a mandatory schema-7 JSON document. The document is
 pretty-printed, ends in one newline, and is atomically persisted through a
 same-directory temporary file. The parent directory must exist. A write failure
 returns `125`.

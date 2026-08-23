@@ -167,6 +167,7 @@ fn finish_error(
             launch_phase: error.launch_phase.map(str::to_owned),
             target_released: error.target_released,
             workload_may_be_alive: error.workload_may_be_alive,
+            boundary_setup_failure: error.boundary_setup_failure.clone(),
         };
         match report(
             args,
@@ -214,7 +215,7 @@ fn report(
             .iter()
             .map(|value| memcordon_core::NativeArgument::from_os(value)),
     );
-    MemcordonReport::schema6(
+    MemcordonReport::schema7(
         tool_report(),
         InvocationReport {
             syntax: "plus-budgets-v1".to_owned(),
@@ -299,7 +300,7 @@ fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, 
             ),
         ))
     })?;
-    let capability = capabilities(&backend);
+    let capability = memcordon_platform::capabilities_for(&backend, policy.boundary());
     if policy.boundary() == BoundaryRequirement::Sealed
         && capability.boundary.class != BoundaryClass::Sealed
     {
@@ -396,11 +397,22 @@ fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, 
 }
 
 fn sealed_boundary_unsupported() -> Box<Error> {
-    Box::new(Error::new(
-        ErrorCategory::Unsupported,
-        "MCBOUNDARY-UNSUPPORTED",
-        "certified sealed supervision is unavailable on this host; the target was not authorized",
-    ))
+    Box::new(
+        Error::new(
+            ErrorCategory::Unsupported,
+            "MCBOUNDARY-UNSUPPORTED",
+            "certified sealed supervision is unavailable on this host; the target was not authorized",
+        )
+        .with_boundary_setup_failure(memcordon_core::BoundarySetupFailure {
+            requested: BoundaryRequirement::Sealed,
+            mechanism: None,
+            phase: memcordon_core::BoundarySetupPhase::ProviderConnection,
+            target_created: false,
+            target_released: false,
+            cleanup_attempted: false,
+            restart_safety: memcordon_core::RestartSafetyProof::default(),
+        }),
+    )
 }
 
 fn add_condition(value: RestartConditions, condition: RestartCondition) -> RestartConditions {
@@ -726,14 +738,24 @@ fn unavailable_backend_capability() -> BackendCapabilityReport {
             ..BoundaryCapability::default()
         },
         limitations: vec!["no backend satisfies the requested sealed boundary".to_owned()],
+        sealed_unavailable: Some(memcordon_core::SealedUnavailableReport {
+            reason: "no certified sealed backend was selected".to_owned(),
+            prerequisites: Vec::new(),
+        }),
         ..BackendCapabilityReport::default()
     }
 }
 
 pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
     let probe = probe();
-    let selected = probe.selected.as_ref().map(capabilities);
-    let available = probe.available.iter().map(capabilities).collect::<Vec<_>>();
+    let capability = |backend: &memcordon_platform::BackendInfo| match args.requirement {
+        Some(Requirement::Sealed) => {
+            memcordon_platform::capabilities_for(backend, BoundaryRequirement::Sealed)
+        }
+        _ => capabilities(backend),
+    };
+    let selected = probe.selected.as_ref().map(capability);
+    let available = probe.available.iter().map(capability).collect::<Vec<_>>();
     let met = args.requirement.is_none_or(|required| {
         selected.as_ref().is_some_and(|backend| match required {
             Requirement::Hard => backend
@@ -986,14 +1008,17 @@ fn render_effect_warnings(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn clean_failure_json_is_schema_one_and_machine_readable() {
+    fn clean_failure_json_uses_current_schema_and_is_machine_readable() {
         let error = memcordon_core::Error::new(
             memcordon_core::ErrorCategory::Cleanup,
             "MCCLEANUP-TEST",
             "fixture failure",
         );
         let value = super::clean_failure_report(true, &error);
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            value["schema_version"],
+            memcordon_core::CLEAN_REPORT_SCHEMA_VERSION
+        );
         assert_eq!(value["dry_run"], true);
         assert_eq!(value["errors"][0]["code"], "MCCLEANUP-TEST");
     }
