@@ -803,7 +803,6 @@ pub fn run_attempt(
         helpers_reaped,
         containment_removed,
         containment_incapable_of_live_members: cleanup.workload_empty == Some(true),
-        sealed_boundary_retired: false,
         errors: cleanup
             .errors
             .iter()
@@ -1430,6 +1429,7 @@ fn record_failure_cleanup(
         helpers_reaped,
         containment_removed,
         containment_incapable_of_live_members: cleanup.workload_empty == Some(true),
+        sealed_boundary_retired: false,
         errors: cleanup
             .errors
             .iter()
