@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ByteSize, ChildTermination, CircuitState, CleanupSummary, DeadlineEvidence, RestartCondition,
-    RestartWaitKind, RunOutcome,
+    BoundaryRequirement, ByteSize, ChildTermination, CircuitState, CleanupSummary,
+    DeadlineEvidence, RestartCondition, RestartWaitKind, RunOutcome,
 };
 
 pub const DETAILED_ATTEMPT_CAPACITY: usize = 256;
@@ -48,6 +48,12 @@ pub struct LaunchEvidence {
     pub containment_verified_before_authorization: bool,
     pub guardian_started_before_authorization: bool,
     pub target_spawn_error_reported: bool,
+    pub boundary_requested: BoundaryRequirement,
+    pub boundary_effective: BoundaryClass,
+    pub boundary_assignment_verified: bool,
+    pub boundary_reconfiguration_denied: bool,
+    pub inherited_resources_restricted: bool,
+    pub frontend_loss_cleanup_authority_verified: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -57,15 +63,21 @@ pub struct RestartSafetyProof {
     pub helpers_reaped: bool,
     pub containment_removed: bool,
     pub containment_incapable_of_live_members: bool,
+    pub sealed_boundary_retired: bool,
     pub errors: Vec<String>,
 }
 
 impl RestartSafetyProof {
     pub fn is_safe(&self) -> bool {
+        self.is_safe_for(BoundaryRequirement::Standard)
+    }
+
+    pub fn is_safe_for(&self, boundary: BoundaryRequirement) -> bool {
         self.direct_child_reaped
             && self.workload_empty == Some(true)
             && self.helpers_reaped
             && (self.containment_removed || self.containment_incapable_of_live_members)
+            && (boundary != BoundaryRequirement::Sealed || self.sealed_boundary_retired)
             && self.errors.is_empty()
     }
 
@@ -76,6 +88,7 @@ impl RestartSafetyProof {
             helpers_reaped: false,
             containment_removed: false,
             containment_incapable_of_live_members: false,
+            sealed_boundary_retired: false,
             errors: cleanup
                 .errors
                 .iter()
@@ -585,6 +598,9 @@ impl SupervisionExecution {
         duration_ms: u64,
         targets_authorized: u64,
     ) -> Result<Self, SupervisionModelError> {
+        if !backend.boundary.is_consistent() {
+            return Err(SupervisionModelError::InconsistentExecution);
+        }
         let aggregate_total = aggregates
             .child_exits
             .checked_add(aggregates.memory_limits)
@@ -645,6 +661,26 @@ impl SupervisionExecution {
         if terminal_attempt.is_some_and(|number| number == 0 || number != attempts.total)
             || !terminal_matches_latest
             || outside_deadline != deadline.is_some()
+            || attempts.records().any(|record| {
+                let sealed = record.launch.boundary_requested == BoundaryRequirement::Sealed;
+                (record.launch.boundary_effective == BoundaryClass::Sealed
+                    && backend.boundary.class != BoundaryClass::Sealed)
+                    || (record.launch.target_released
+                        && sealed
+                        && (record.launch.boundary_effective != BoundaryClass::Sealed
+                            || !record.launch.boundary_assignment_verified
+                            || !record.launch.boundary_reconfiguration_denied
+                            || !record.launch.inherited_resources_restricted
+                            || !record.launch.frontend_loss_cleanup_authority_verified))
+                    || (sealed
+                        && record.restart_safety.is_safe()
+                        && !record.restart_safety.sealed_boundary_retired)
+            })
+            || (backend.boundary.class != BoundaryClass::Sealed
+                && attempts.records().any(|record| {
+                    record.launch.boundary_requested == BoundaryRequirement::Sealed
+                        && record.launch.target_released
+                }))
         {
             return Err(SupervisionModelError::InconsistentExecution);
         }
@@ -731,10 +767,43 @@ pub struct MemoryCapabilityReport {
     pub reason: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BoundaryClass {
+    #[default]
+    Standard,
+    Sealed,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BoundaryCapability {
+    pub class: BoundaryClass,
+    pub mechanism: String,
+    pub target_gated: bool,
+    pub boundary_verified_before_authorization: bool,
+    pub target_can_reconfigure_boundary: bool,
+    pub frontend_loss_cleanup_authority: bool,
+    pub workload_empty_proof: bool,
+    pub limitations: Vec<String>,
+}
+
+impl BoundaryCapability {
+    pub fn is_consistent(&self) -> bool {
+        self.class != BoundaryClass::Sealed
+            || (self.target_gated
+                && self.boundary_verified_before_authorization
+                && !self.target_can_reconfigure_boundary
+                && self.frontend_loss_cleanup_authority
+                && self.workload_empty_proof)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendCapabilityReport {
     pub name: String,
     pub containment: CapabilityStatusReport,
+    pub boundary: BoundaryCapability,
     pub memory: Option<MemoryCapabilityReport>,
     pub deadline: CapabilityStatusReport,
     pub restart: CapabilityStatusReport,

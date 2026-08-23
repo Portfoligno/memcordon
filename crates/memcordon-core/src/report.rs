@@ -14,9 +14,9 @@ use crate::{
     SupervisionAggregates, SupervisionExecution, SupervisionPhase, SupervisionTerminal,
 };
 
-pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 5;
-pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 4;
-pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 2;
+pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 6;
+pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 5;
+pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 3;
 pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize)]
@@ -32,7 +32,7 @@ pub struct MemcordonReport {
 }
 
 impl MemcordonReport {
-    pub fn schema5(
+    pub fn schema6(
         tool: ToolReport,
         invocation: InvocationReport,
         policy: PolicyEnvelopeReport,
@@ -45,6 +45,7 @@ impl MemcordonReport {
         }
         invocation.validate()?;
         policy.validate(&invocation)?;
+        validate_boundary_envelope(&policy, backend.as_ref())?;
         let (supervision, attempts) = supervision.map_or((None, Vec::new()), |execution| {
             let attempts = execution.attempts().records().cloned().collect();
             (
@@ -124,6 +125,8 @@ impl<'de> Deserialize<'de> for MemcordonReport {
         wire.policy
             .validate(&wire.invocation)
             .map_err(serde::de::Error::custom)?;
+        validate_boundary_envelope(&wire.policy, wire.backend.as_ref())
+            .map_err(serde::de::Error::custom)?;
         Ok(Self {
             schema_version: wire.schema_version,
             tool: wire.tool,
@@ -135,6 +138,31 @@ impl<'de> Deserialize<'de> for MemcordonReport {
             error: wire.error,
         })
     }
+}
+
+fn validate_boundary_envelope(
+    policy: &PolicyEnvelopeReport,
+    backend: Option<&BackendCapabilityReport>,
+) -> Result<(), ReportModelError> {
+    let Some(backend) = backend else {
+        return Ok(());
+    };
+    if !backend.boundary.is_consistent() {
+        return Err(ReportModelError::PolicyEnvelope);
+    }
+    let expected = match policy.requested.boundary {
+        crate::BoundaryRequirement::Standard => backend.boundary.class,
+        crate::BoundaryRequirement::Sealed
+            if backend.boundary.class == crate::BoundaryClass::Sealed =>
+        {
+            crate::BoundaryClass::Sealed
+        }
+        crate::BoundaryRequirement::Sealed => crate::BoundaryClass::Unavailable,
+    };
+    if policy.effective.boundary != expected {
+        return Err(ReportModelError::PolicyEnvelope);
+    }
+    Ok(())
 }
 
 fn validate_attempt_history(
@@ -463,6 +491,7 @@ pub struct PolicyEnvelopeReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestedPolicyReport {
+    pub boundary: crate::BoundaryRequirement,
     pub memory: Option<RequestedMemoryPolicyReport>,
     pub deadline: Option<DeadlinePolicyReport>,
     pub wait_for: String,
@@ -519,6 +548,7 @@ pub struct CircuitBreakerPolicyReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EffectivePolicyReport {
+    pub boundary: crate::BoundaryClass,
     pub memory: Option<EffectiveMemoryPolicyReport>,
     pub deadline: Option<DeadlinePolicyReport>,
     pub wait_for: String,

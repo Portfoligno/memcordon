@@ -1,6 +1,20 @@
 use std::time::Duration;
 
-use memcordon_core::{ByteSize, ByteSizeParseError, DeadlinePolicy, DeadlineScope, Policy};
+use memcordon_core::{
+    BoundaryRequirement, ByteSize, ByteSizeParseError, DeadlinePolicy, DeadlineScope, Policy,
+};
+
+#[test]
+fn sealed_boundary_is_opt_in_and_builder_owned() {
+    assert_eq!(
+        Policy::unbounded().boundary(),
+        BoundaryRequirement::Standard
+    );
+    assert_eq!(
+        Policy::unbounded().sealed().boundary(),
+        BoundaryRequirement::Sealed
+    );
+}
 
 #[test]
 fn parses_exact_binary_and_decimal_units() {

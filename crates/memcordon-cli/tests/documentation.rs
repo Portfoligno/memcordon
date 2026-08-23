@@ -189,7 +189,7 @@ fn reference_and_generated_help_cover_the_same_public_interface() {
     for syntax in [
         "memcordon [OPTION|BUDGET]... [--] COMMAND [ARGUMENT]...",
         "memcordon help [TOPIC]",
-        "memcordon doctor [--json] [--require hard|watchdog]",
+        "memcordon doctor [--json] [--require hard|watchdog|sealed]",
         "memcordon plan [OPTION|BUDGET]...",
         "memcordon clean [--dry-run] [--json]",
     ] {

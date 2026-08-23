@@ -21,7 +21,7 @@ use memcordon_core::{
 };
 
 fn report() -> MemcordonReport {
-    MemcordonReport::schema5(
+    MemcordonReport::schema6(
         ToolReport {
             name: "memcordon".to_owned(),
             version: "test".to_owned(),
@@ -38,6 +38,7 @@ fn report() -> MemcordonReport {
         },
         PolicyEnvelopeReport {
             requested: RequestedPolicyReport {
+                boundary: memcordon_core::BoundaryRequirement::Standard,
                 memory: None,
                 deadline: Some(DeadlinePolicyReport {
                     duration_ms: 1_000,
@@ -59,6 +60,7 @@ fn report() -> MemcordonReport {
                 },
             },
             effective: EffectivePolicyReport {
+                boundary: memcordon_core::BoundaryClass::Standard,
                 memory: None,
                 deadline: Some(DeadlinePolicyReport {
                     duration_ms: 1_000,
@@ -481,6 +483,7 @@ fn safe_proof() -> RestartSafetyProof {
         helpers_reaped: true,
         containment_removed: true,
         containment_incapable_of_live_members: false,
+        sealed_boundary_retired: false,
         errors: Vec::new(),
     }
 }
@@ -526,6 +529,7 @@ fn attempt_record(
             containment_verified_before_authorization: true,
             guardian_started_before_authorization: true,
             target_spawn_error_reported: false,
+            ..LaunchEvidence::default()
         },
         restart_safety: safe_proof(),
     }
@@ -586,7 +590,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         RestartConditions::NONE
     };
     base.policy.effective.restart.dormant_conditions.clear();
-    MemcordonReport::schema5(
+    MemcordonReport::schema6(
         base.tool,
         base.invocation,
         base.policy,
@@ -594,7 +598,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         Some(execution),
         None,
     )
-    .expect("schema5")
+    .expect("schema6")
 }
 
 fn coordinator() -> RestartCoordinator {

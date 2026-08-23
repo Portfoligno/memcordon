@@ -5,6 +5,10 @@ v2 containment on Linux, Job Objects on Windows, and sampled watchdog
 monitoring on macOS. Most users should install the `memcordon` CLI; this crate
 is for applications that embed backend probing or execution.
 
+Boundary capability is reported separately from memory enforcement. Sealed
+requests never fall back to these standard backends; this release reports them
+as unavailable and rejects the request before target authorization.
+
 ## Install
 
 ```console

@@ -127,6 +127,14 @@ pub enum Enforcement {
     Watchdog,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BoundaryRequirement {
+    #[default]
+    Standard,
+    Sealed,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 /// Selects attempt completion behavior after the direct command exits.
@@ -198,6 +206,7 @@ pub struct Policy {
     pub memory: Option<ByteSize>,
     pub deadline: Option<DeadlinePolicy>,
     pub enforcement: Enforcement,
+    boundary: BoundaryRequirement,
     /// Completion behavior after the direct command exits. Defaults to
     /// [`Lifetime::Command`].
     pub lifetime: Lifetime,
@@ -218,6 +227,7 @@ impl Policy {
             memory: Some(memory),
             deadline: None,
             enforcement: Enforcement::Auto,
+            boundary: BoundaryRequirement::Standard,
             lifetime: Lifetime::Command,
             metric: Metric::Native,
             poll_interval: Duration::from_millis(50),
@@ -233,6 +243,7 @@ impl Policy {
             memory: None,
             deadline: None,
             enforcement: Enforcement::Auto,
+            boundary: BoundaryRequirement::Standard,
             lifetime: Lifetime::Command,
             metric: Metric::Native,
             poll_interval: Duration::from_millis(50),
@@ -246,6 +257,19 @@ impl Policy {
     pub fn with_deadline(mut self, duration: Duration) -> Result<Self, DeadlinePolicyError> {
         self.deadline = Some(DeadlinePolicy::new(duration, DeadlineScope::Attempt)?);
         Ok(self)
+    }
+
+    pub const fn boundary(&self) -> BoundaryRequirement {
+        self.boundary
+    }
+
+    pub const fn with_boundary(mut self, boundary: BoundaryRequirement) -> Self {
+        self.boundary = boundary;
+        self
+    }
+
+    pub const fn sealed(self) -> Self {
+        self.with_boundary(BoundaryRequirement::Sealed)
     }
 }
 

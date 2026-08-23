@@ -28,6 +28,7 @@ fuzz_target!(|data: &[u8]| {
             helpers_reaped: true,
             containment_removed: true,
             containment_incapable_of_live_members: false,
+            sealed_boundary_retired: byte & 0x20 == 0,
             errors: Vec::new(),
         };
         let condition = if byte & 1 == 0 {

@@ -1,4 +1,7 @@
-use memcordon_core::{DeadlineScope, Error, ErrorCategory, RestartCondition, RestartSafetyProof};
+use memcordon_core::{
+    BoundaryCapability, BoundaryClass, BoundaryRequirement, DeadlineScope, Error, ErrorCategory,
+    RestartCondition, RestartSafetyProof,
+};
 use memcordon_platform::{BackendInfo, capabilities};
 use std::time::Duration;
 
@@ -48,12 +51,69 @@ fn categorized_errors_preserve_backend_restart_safety_evidence() {
         helpers_reaped: true,
         containment_removed: true,
         containment_incapable_of_live_members: true,
+        sealed_boundary_retired: false,
         errors: Vec::new(),
     };
     let error = Error::new(ErrorCategory::Setup, "MCSETUP-FIXTURE", "fixture failure")
         .with_restart_safety(proof.clone());
 
     assert_eq!(error.restart_safety, Some(proof));
+}
+
+#[test]
+fn sealed_capability_requires_every_normative_predicate() {
+    let valid = BoundaryCapability {
+        class: BoundaryClass::Sealed,
+        mechanism: "fixture".to_owned(),
+        target_gated: true,
+        boundary_verified_before_authorization: true,
+        target_can_reconfigure_boundary: false,
+        frontend_loss_cleanup_authority: true,
+        workload_empty_proof: true,
+        limitations: Vec::new(),
+    };
+    assert!(valid.is_consistent());
+    for invalid in [
+        BoundaryCapability {
+            target_gated: false,
+            ..valid.clone()
+        },
+        BoundaryCapability {
+            boundary_verified_before_authorization: false,
+            ..valid.clone()
+        },
+        BoundaryCapability {
+            target_can_reconfigure_boundary: true,
+            ..valid.clone()
+        },
+        BoundaryCapability {
+            frontend_loss_cleanup_authority: false,
+            ..valid.clone()
+        },
+        BoundaryCapability {
+            workload_empty_proof: false,
+            ..valid
+        },
+    ] {
+        assert!(!invalid.is_consistent());
+    }
+}
+
+#[test]
+fn sealed_restart_safety_requires_retirement() {
+    let mut proof = RestartSafetyProof {
+        direct_child_reaped: true,
+        workload_empty: Some(true),
+        helpers_reaped: true,
+        containment_removed: true,
+        containment_incapable_of_live_members: false,
+        sealed_boundary_retired: false,
+        errors: Vec::new(),
+    };
+    assert!(proof.is_safe());
+    assert!(!proof.is_safe_for(BoundaryRequirement::Sealed));
+    proof.sealed_boundary_retired = true;
+    assert!(proof.is_safe_for(BoundaryRequirement::Sealed));
 }
 
 #[test]

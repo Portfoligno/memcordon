@@ -5,6 +5,10 @@ state, and typed report models used by MemCordon. It does not start or contain
 processes; applications that need execution use `memcordon-platform` or the
 `memcordon` CLI.
 
+`BoundaryRequirement::Sealed` expresses the fail-closed sealed-supervision
+contract without exposing platform mechanisms. No currently certified native
+backend satisfies that request, so execution is rejected before authorization.
+
 ## Install
 
 ```console

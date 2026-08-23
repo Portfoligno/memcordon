@@ -303,6 +303,7 @@ pub fn run_attempt(
                 helpers_reaped: true,
                 containment_removed: false,
                 containment_incapable_of_live_members: false,
+                sealed_boundary_retired: false,
                 errors: (!direct_child_reaped)
                     .then(|| {
                         "direct child could not be reaped after guardian setup failure".to_owned()

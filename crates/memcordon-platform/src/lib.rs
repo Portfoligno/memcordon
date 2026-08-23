@@ -1,3 +1,9 @@
+//! Native supervision backends and capability reporting.
+//!
+//! Current backends provide standard supervision only. A sealed request is
+//! rejected before target authorization unless a future backend advertises
+//! and proves every required sealed-boundary predicate.
+
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod backend;

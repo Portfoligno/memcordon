@@ -213,7 +213,7 @@ fn report(
             .iter()
             .map(|value| memcordon_core::NativeArgument::from_os(value)),
     );
-    MemcordonReport::schema5(
+    MemcordonReport::schema6(
         tool_report(),
         InvocationReport {
             syntax: "plus-budgets-v1".to_owned(),
@@ -405,6 +405,7 @@ fn policy_report(
     effective_conditions: RestartConditions,
     dormant_conditions: Vec<DormantRestartCondition>,
 ) -> PolicyEnvelopeReport {
+    let boundary_capability = memcordon_platform::capabilities(backend).boundary;
     let effective_enforcement = if backend.hard_limit {
         "hard"
     } else {
@@ -508,6 +509,14 @@ fn policy_report(
     PolicyEnvelopeReport {
         requested,
         effective: EffectivePolicyReport {
+            boundary: match policy.boundary() {
+                memcordon_core::BoundaryRequirement::Sealed
+                    if boundary_capability.class != memcordon_core::BoundaryClass::Sealed =>
+                {
+                    memcordon_core::BoundaryClass::Unavailable
+                }
+                _ => boundary_capability.class,
+            },
             memory: policy.memory.map(|memory| EffectiveMemoryPolicyReport {
                 limit_bytes: memory.bytes(),
                 enforcement: effective_enforcement.to_owned(),
@@ -542,6 +551,7 @@ fn requested_report(
     configured: RestartConditions,
 ) -> RequestedPolicyReport {
     RequestedPolicyReport {
+        boundary: args.boundary,
         memory: budgets.memory.map(|memory| RequestedMemoryPolicyReport {
             limit_bytes: memory.bytes(),
             enforcement: enforcement_name(args.enforcement).to_owned(),
@@ -607,6 +617,7 @@ fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeRe
     PolicyEnvelopeReport {
         requested: requested_report(args, budgets, configured),
         effective: EffectivePolicyReport {
+            boundary: memcordon_core::BoundaryClass::Unavailable,
             memory: budgets.memory.map(|memory| EffectiveMemoryPolicyReport {
                 limit_bytes: memory.bytes(),
                 enforcement: "unresolved".to_owned(),
@@ -698,6 +709,7 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
                 .memory
                 .as_ref()
                 .is_some_and(|memory| memory.class == "watchdog"),
+            Requirement::Sealed => backend.boundary.class == memcordon_core::BoundaryClass::Sealed,
         })
     });
     let report = DoctorReport {
@@ -721,6 +733,7 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
             kind: args.requirement.map(|value| match value {
                 Requirement::Hard => "hard".to_owned(),
                 Requirement::Watchdog => "watchdog".to_owned(),
+                Requirement::Sealed => "sealed".to_owned(),
             }),
             met,
             reason: (!met)

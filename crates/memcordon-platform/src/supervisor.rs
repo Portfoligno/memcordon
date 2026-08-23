@@ -3,12 +3,12 @@ use std::time::{Duration, Instant};
 
 use memcordon_core::{
     AttemptHistory, AttemptKind, AttemptPhase, AttemptRecord, BackendCapabilityReport,
-    CapabilityStatusReport, CommandSpec, Error, ErrorCategory, LaunchEvidence,
-    MemoryCapabilityReport, Policy, RestartAction, RestartCondition, RestartCoordinator,
-    RestartDecisionKind, RestartDecisionRecord, RestartPolicy, RestartSafetyProof, RestartSummary,
-    RestartWaitKind, RunOutcome, SupervisionAggregates, SupervisionDeadlineEvidence,
-    SupervisionErrorRecord, SupervisionExecution, SupervisionPhase, SupervisionTerminal,
-    WaitCompletion,
+    BoundaryCapability, BoundaryClass, BoundaryRequirement, CapabilityStatusReport, CommandSpec,
+    Error, ErrorCategory, LaunchEvidence, MemoryCapabilityReport, Policy, RestartAction,
+    RestartCondition, RestartCoordinator, RestartDecisionKind, RestartDecisionRecord,
+    RestartPolicy, RestartSafetyProof, RestartSummary, RestartWaitKind, RunOutcome,
+    SupervisionAggregates, SupervisionDeadlineEvidence, SupervisionErrorRecord,
+    SupervisionExecution, SupervisionPhase, SupervisionTerminal, WaitCompletion,
 };
 
 use crate::backend::{BackendInfo, Execution};
@@ -104,6 +104,16 @@ pub fn capabilities(info: &BackendInfo) -> BackendCapabilityReport {
             supported: info.containment_supported,
             reason: None,
         },
+        boundary: BoundaryCapability {
+            class: BoundaryClass::Standard,
+            mechanism: info.startup_containment.to_owned(),
+            target_gated: info.containment_supported,
+            boundary_verified_before_authorization: info.containment_supported,
+            target_can_reconfigure_boundary: true,
+            frontend_loss_cleanup_authority: false,
+            workload_empty_proof: info.containment_supported,
+            limitations: vec!["certified sealed supervision is not implemented".to_owned()],
+        },
         memory: Some(MemoryCapabilityReport {
             supported: info.memory_supported,
             class: info.class.to_owned(),
@@ -140,6 +150,7 @@ pub fn capabilities(info: &BackendInfo) -> BackendCapabilityReport {
 #[cfg(unix)]
 #[allow(clippy::result_large_err)]
 pub fn supervise(request: SupervisorRequest) -> Result<SupervisionExecution, Error> {
+    reject_unavailable_sealed(&request)?;
     let signal = SignalSource::install().map_err(|error| {
         Error::new(ErrorCategory::Setup, "MCSETUP-SIGNAL", error.to_string()).with_os_error(&error)
     })?;
@@ -149,10 +160,23 @@ pub fn supervise(request: SupervisorRequest) -> Result<SupervisionExecution, Err
 #[cfg(target_os = "windows")]
 #[allow(clippy::result_large_err)]
 pub fn supervise(request: SupervisorRequest) -> Result<SupervisionExecution, Error> {
+    reject_unavailable_sealed(&request)?;
     let console = crate::windows_job::ConsoleControl::install().map_err(|error| {
         Error::new(ErrorCategory::Setup, "MCSETUP-CONSOLE", error.to_string()).with_os_error(&error)
     })?;
     supervise_with(request, &console)
+}
+
+#[allow(clippy::result_large_err)]
+fn reject_unavailable_sealed(request: &SupervisorRequest) -> Result<(), Error> {
+    if request.policy.boundary() == BoundaryRequirement::Sealed {
+        return Err(Error::new(
+            ErrorCategory::Unsupported,
+            "MCBOUNDARY-UNSUPPORTED",
+            "certified sealed supervision is unavailable on this host; the target was not authorized",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
@@ -509,6 +533,12 @@ fn attempt_execution(execution: Execution) -> AttemptExecution {
                 target_os = "macos"
             )),
             target_spawn_error_reported: false,
+            boundary_requested: BoundaryRequirement::Standard,
+            boundary_effective: BoundaryClass::Standard,
+            boundary_assignment_verified: false,
+            boundary_reconfiguration_denied: false,
+            inherited_resources_restricted: false,
+            frontend_loss_cleanup_authority_verified: false,
         },
         restart_safety: RestartSafetyProof {
             direct_child_reaped: facts.direct_child_reaped,
@@ -516,6 +546,7 @@ fn attempt_execution(execution: Execution) -> AttemptExecution {
             helpers_reaped: facts.helpers_reaped,
             containment_removed: facts.containment_removed,
             containment_incapable_of_live_members: facts.containment_incapable_of_live_members,
+            sealed_boundary_retired: false,
             errors: facts.errors,
         },
         execution,
@@ -643,6 +674,7 @@ fn proof_from_error(error: &Error) -> RestartSafetyProof {
         helpers_reaped: false,
         containment_removed: false,
         containment_incapable_of_live_members: false,
+        sealed_boundary_retired: false,
         errors: vec![format!(
             "{}: setup failure has no complete backend resource proof",
             error.code
@@ -656,6 +688,12 @@ fn launch_from_error(error: &Error) -> LaunchEvidence {
         containment_verified_before_authorization: error.cgroup_verified_before_release,
         guardian_started_before_authorization: error.guardian_ready_before_release,
         target_spawn_error_reported: error.launch_phase == Some("target-spawn-failed"),
+        boundary_requested: BoundaryRequirement::Standard,
+        boundary_effective: BoundaryClass::Standard,
+        boundary_assignment_verified: false,
+        boundary_reconfiguration_denied: false,
+        inherited_resources_restricted: false,
+        frontend_loss_cleanup_authority_verified: false,
     }
 }
 fn unsupported_capability() -> BackendCapabilityReport {
@@ -664,6 +702,12 @@ fn unsupported_capability() -> BackendCapabilityReport {
         containment: CapabilityStatusReport {
             supported: false,
             reason: Some("attempt setup failed before backend selection".to_owned()),
+        },
+        boundary: BoundaryCapability {
+            class: BoundaryClass::Unavailable,
+            mechanism: "unavailable".to_owned(),
+            limitations: vec!["certified sealed supervision is unavailable".to_owned()],
+            ..BoundaryCapability::default()
         },
         memory: None,
         deadline: CapabilityStatusReport {

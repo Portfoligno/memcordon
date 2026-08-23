@@ -5,9 +5,10 @@ use memcordon::invocation::{
     BudgetToken, HELP_TOPIC_USAGE, HELP_USAGE, HelpKind, Invocation, LimitToken, route,
 };
 use memcordon::parse_duration;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 use memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION;
-use memcordon_core::{DOCTOR_REPORT_SCHEMA_VERSION, Lifetime, PLAN_REPORT_SCHEMA_VERSION};
+use memcordon_core::{
+    BoundaryRequirement, DOCTOR_REPORT_SCHEMA_VERSION, Lifetime, PLAN_REPORT_SCHEMA_VERSION,
+};
 
 fn native(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
@@ -37,6 +38,76 @@ fn canonical_boundaries_produce_identical_requests() {
         8 * 1024 * 1024 * 1024
     );
     assert_eq!(concise.command, native(&["cargo", "test", "--workspace"]));
+}
+
+#[test]
+fn sealed_is_a_single_high_level_pre_command_policy() {
+    let request = execution(&["--sealed", "program", "--sealed"]);
+    assert_eq!(request.policy.boundary, BoundaryRequirement::Sealed);
+    assert_eq!(request.command, native(&["program", "--sealed"]));
+    assert_eq!(
+        plan(&["plan", "--sealed"]).policy.boundary,
+        BoundaryRequirement::Sealed
+    );
+    for values in [
+        ["--sealed", "--sealed", "program"].as_slice(),
+        ["--sealed=yes", "program"].as_slice(),
+    ] {
+        assert_eq!(
+            route(&native(values))
+                .expect_err("invalid sealed usage")
+                .code,
+            "MCUSAGE-SEALED"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sealed_execution_plan_and_doctor_fail_closed() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let marker = temporary.path().join("target-ran");
+    let report = temporary.path().join("sealed.json");
+    let execution = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .args(["--sealed", "--report"])
+        .arg(&report)
+        .arg("/usr/bin/touch")
+        .arg(&marker)
+        .output()
+        .expect("sealed execution should be rejected");
+    assert_eq!(execution.status.code(), Some(125));
+    assert!(
+        !marker.exists(),
+        "sealed target executed before authorization"
+    );
+    assert!(String::from_utf8_lossy(&execution.stderr).contains("MCBOUNDARY-UNSUPPORTED"));
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report).expect("failure report should exist"))
+            .expect("failure report JSON");
+    assert_eq!(report["schema_version"], EXECUTION_REPORT_SCHEMA_VERSION);
+    assert_eq!(report["policy"]["requested"]["boundary"], "sealed");
+    assert_eq!(report["policy"]["effective"]["boundary"], "unavailable");
+    assert_eq!(report["error"]["code"], "MCBOUNDARY-UNSUPPORTED");
+
+    let plan = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .args(["plan", "--sealed", "--json"])
+        .output()
+        .expect("sealed plan");
+    assert!(plan.status.success());
+    let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).expect("plan JSON");
+    assert_eq!(plan["schema_version"], PLAN_REPORT_SCHEMA_VERSION);
+    assert_eq!(plan["request"]["boundary"], "sealed");
+    assert_eq!(plan["resolution"]["effective"]["boundary"], "unavailable");
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        .args(["doctor", "--json", "--require", "sealed"])
+        .output()
+        .expect("sealed doctor");
+    assert_eq!(doctor.status.code(), Some(125));
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    assert_eq!(doctor["schema_version"], DOCTOR_REPORT_SCHEMA_VERSION);
+    assert_eq!(doctor["requirement"]["kind"], "sealed");
+    assert_eq!(doctor["requirement"]["met"], false);
 }
 
 #[test]

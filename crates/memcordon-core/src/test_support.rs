@@ -108,6 +108,7 @@ fn safe_cleanup(inert: bool) -> RestartSafetyProof {
         helpers_reaped: true,
         containment_removed: !inert,
         containment_incapable_of_live_members: inert,
+        sealed_boundary_retired: false,
         errors: Vec::new(),
     }
 }

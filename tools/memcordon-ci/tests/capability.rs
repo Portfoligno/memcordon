@@ -54,7 +54,7 @@ fn exact_test_success_requires_one_executed_test() {
 #[test]
 fn certification_consumes_typed_doctor_schema() {
     let mut probe = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "tool": { "name": "memcordon", "version": "0.3.0" },
         "host": { "os": "linux", "architecture": "x86_64" },
         "selected": backend_capability("linux-cgroup-v2", true, "hard"),
@@ -86,6 +86,16 @@ fn backend_capability(name: &str, memory_supported: bool, memory_class: &str) ->
     json!({
         "name": name,
         "containment": { "supported": true, "reason": null },
+        "boundary": {
+            "class": "standard",
+            "mechanism": "fixture",
+            "target_gated": true,
+            "boundary_verified_before_authorization": true,
+            "target_can_reconfigure_boundary": true,
+            "frontend_loss_cleanup_authority": false,
+            "workload_empty_proof": true,
+            "limitations": []
+        },
         "memory": {
             "supported": memory_supported,
             "class": memory_class,

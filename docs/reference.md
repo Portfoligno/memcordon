@@ -9,7 +9,7 @@ output. For installation and a first run, see the [README](../README.md).
 ```text
 memcordon [OPTION|BUDGET]... [--] COMMAND [ARGUMENT]...
 memcordon help [TOPIC]
-memcordon doctor [--json] [--require hard|watchdog]
+memcordon doctor [--json] [--require hard|watchdog|sealed]
 memcordon plan [OPTION|BUDGET]...
 memcordon clean [--dry-run] [--json]
 ```
@@ -21,7 +21,7 @@ position. Once the command starts, every remaining argument passes through as
 opaque native argv.
 
 Omitting `TOPIC` lists the available topics. Topic help is available for
-`usage`, `budgets`, `memory`, `deadline`, `lifecycle`, `restart`, `backoff`,
+`usage`, `budgets`, `memory`, `containment`, `deadline`, `lifecycle`, `restart`, `backoff`,
 `circuit`, `output`, `utilities`, `exit-status`, and `all`.
 
 - Without `+MEMORY`, MemCordon installs no memory policy and cannot produce
@@ -335,7 +335,7 @@ Circuit policy reports expose `threshold`, `half_life_ms`, and `cooldown_ms`.
 
 ## Execution reports
 
-`--report PATH` writes a mandatory schema-5 JSON document. The document is
+`--report PATH` writes a mandatory schema-6 JSON document. The document is
 pretty-printed, ends in one newline, and is atomically persisted through a
 same-directory temporary file. The parent directory must exist. A write failure
 returns `125`.
@@ -379,3 +379,6 @@ versions.
 MemCordon controls the documented workload resources and lifecycle; it is not a
 hostile-code security sandbox. On macOS, a descendant that deliberately escapes
 into another session can also leave the sampled workload boundary.
+## Sealed supervision
+
+`--sealed` requires certified process-boundary setup, independent cleanup authority, and terminal emptiness proof. It fails before target authorization if unavailable and never falls back. See [sealed supervision](sealed-supervision.md) for the normative threat model and exclusions.

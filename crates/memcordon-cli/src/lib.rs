@@ -29,9 +29,10 @@ pub mod exit_mapping;
 pub mod invocation;
 
 pub use memcordon_core::{
-    ByteSize, ChildTermination, CircuitBreakerPolicy, CleanupSummary, CommandSpec, Enforcement,
-    Error, HalfLifeLogisticBackoffPolicy, Lifetime, Metric, Policy, RestartConditions,
-    RestartLimit, RestartPolicy, RestartSettings, RunOutcome, SupervisionExecution,
+    BoundaryRequirement, ByteSize, ChildTermination, CircuitBreakerPolicy, CleanupSummary,
+    CommandSpec, Enforcement, Error, HalfLifeLogisticBackoffPolicy, Lifetime, Metric, Policy,
+    RestartConditions, RestartLimit, RestartPolicy, RestartSettings, RunOutcome,
+    SupervisionExecution,
 };
 pub use memcordon_platform::{BackendInfo, ProbeReport, probe};
 

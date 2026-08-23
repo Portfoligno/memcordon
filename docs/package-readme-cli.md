@@ -29,6 +29,10 @@ Everything after `--` is passed to the child command unchanged. When `cargo
 check` finishes normally, MemCordon returns its exit status; monitoring,
 cleanup, and reporting failures take precedence.
 
+`--sealed` requests the stronger process-boundary contract documented in
+`docs/sealed-supervision.md`. It is fail-closed and currently unavailable on
+all native backends, so the target is not executed when it is requested.
+
 The default completion mode is `--wait-for command`. When the direct command
 exits, the default zero command-exit grace force-cleans any remaining contained
 descendants before returning the direct command's status. Set
@@ -48,6 +52,7 @@ The installed command provides offline help:
 memcordon --help
 memcordon help
 memcordon help memory
+memcordon help containment
 memcordon help all
 memcordon doctor --help
 memcordon plan --help

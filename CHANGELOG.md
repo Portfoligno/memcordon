@@ -2,6 +2,24 @@
 
 All notable user-visible changes to MemCordon are documented here.
 
+## Unreleased
+
+### Added
+
+- Added the high-level `--sealed` policy and `BoundaryRequirement::Sealed`
+  API, capability evidence, containment help, and the normative sealed
+  supervision contract. The request never falls back; this release has no
+  certified Linux, Windows, macOS, or other Unix sealed backend and rejects it
+  before target authorization.
+
+### Breaking Changes
+
+- Execution reports advance from schema 5 to 6, plan reports from schema 4 to
+  5, and doctor reports from schema 2 to 3. The new schemas separate requested
+  and effective process-boundary assurance from memory enforcement and add
+  launch and retirement evidence. `MemcordonReport::schema5` is renamed to
+  `schema6`.
+
 ## [0.4.1] - 2026-08-07
 
 ### Fixed

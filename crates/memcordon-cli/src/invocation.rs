@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use memcordon_core::{
-    BackoffMultiplier, ByteSize, CircuitBreakerPolicy, DeadlinePolicy, DeadlineScope, Enforcement,
-    HalfLifeLogisticBackoffPolicy, Lifetime, Metric, Policy, RestartConditions, RestartLimit,
-    SwapPolicy,
+    BackoffMultiplier, BoundaryRequirement, ByteSize, CircuitBreakerPolicy, DeadlinePolicy,
+    DeadlineScope, Enforcement, HalfLifeLogisticBackoffPolicy, Lifetime, Metric, Policy,
+    RestartConditions, RestartLimit, SwapPolicy,
 };
 use std::num::NonZeroU64;
 
@@ -48,6 +48,7 @@ Usage:
     memcordon +1GiB +10m ./workload
 
 Budgets and common options:
+  --sealed                       Require certified sealed supervision; off
   +MEMORY                        Memory ceiling; bytes, KB..EB, or KiB..EiB
   +TIME                          Elapsed-time deadline; decimal ms, s, m, or h
   --wait-for command|workload    Terminate remaining members after command exit
@@ -79,6 +80,7 @@ Topics:
   usage        Invocation and argument boundaries
   budgets      Memory and time budget grammar
   memory       Memory policy
+  containment  Sealed process-supervision boundary
   deadline     Deadline policy
   lifecycle    Completion, remaining-member cleanup, and termination grace
   restart      Restart conditions and limits
@@ -93,6 +95,24 @@ Topics:
 );
 
 pub const HELP_TOPIC_USAGE: &[(&str, &str)] = &[
+    (
+        "containment",
+        with_reference!(
+            r#"Require a certified process-supervision boundary.
+
+Usage:
+  memcordon --sealed [OPTION|BUDGET]... [--] COMMAND [ARGUMENT]...
+  memcordon plan --sealed [OPTION|BUDGET]...
+  memcordon doctor --require sealed
+
+--sealed fails before target authorization when the host cannot establish and
+verify a certified boundary with independent cleanup authority and terminal
+workload-empty proof. It never falls back to standard supervision. It is not a
+filesystem, network, syscall, or secret sandbox.
+
+"#
+        ),
+    ),
     (
         "usage",
         with_reference!(
@@ -271,7 +291,7 @@ Rules:
             r#"Configure execution reports and optional wrapper output.
 
 Output options (value; default):
-  --report PATH                          Write schema-5 JSON to PATH; unset
+  --report PATH                          Write schema-6 JSON to PATH; unset
   --summary                              Write one final summary line to stderr; off
   --quiet                                Suppress optional wrapper output; off
 
@@ -281,8 +301,8 @@ Rules:
   with --quiet; quiet never suppresses required diagnostics or child streams.
 
 Utility JSON:
-  doctor --json    schema-2
-  plan --json      schema-4
+  doctor --json    schema-3
+  plan --json      schema-5
   clean --json     schema-1
 
 "#
@@ -295,15 +315,15 @@ Utility JSON:
 
 Usage:
   memcordon help [TOPIC]
-  memcordon doctor [--json] [--require hard|watchdog]
+  memcordon doctor [--json] [--require hard|watchdog|sealed]
   memcordon plan [OPTION|BUDGET]...
   memcordon clean [--dry-run] [--json]
   memcordon --version
 
 Utilities:
   help      List topics or show one topic
-  doctor    Print the version and selected backend; JSON uses schema-2
-  plan      Resolve policy with launch proof false; JSON uses schema-4
+  doctor    Print the version and selected backend; JSON uses schema-3
+  plan      Resolve policy with launch proof false; JSON uses schema-5
   clean     Inspect or remove stale owned artifacts; JSON uses schema-1
   --version Print one version line
 
@@ -348,7 +368,7 @@ optional memory and elapsed-time limits.
 Usage:
   memcordon [OPTION|BUDGET]... [--] COMMAND [ARGUMENT]...
   memcordon help [TOPIC]
-  memcordon doctor [--json] [--require hard|watchdog]
+  memcordon doctor [--json] [--require hard|watchdog|sealed]
   memcordon plan [OPTION|BUDGET]...
   memcordon clean [--dry-run] [--json]
 
@@ -378,6 +398,12 @@ Budgets and values:
 Options:
   Accepted values follow each option; descriptions end with the default when
   applicable.
+
+Containment:
+  --sealed                              Require certified sealed supervision; off
+
+  Sealed mode fails before target authorization when the complete contract is
+  unavailable and never falls back to standard supervision.
 
 Memory (requires +MEMORY):
   --enforcement auto|hard|watchdog       Enforcement requirement; auto
@@ -443,7 +469,7 @@ Circuit breaker (requires --restart or --restart-on):
   and cannot be set by itself.
 
 Output:
-  --report PATH                          Write a schema-5 JSON report; unset
+  --report PATH                          Write a schema-6 JSON report; unset
   --summary                              Final summary line on stderr; off
   --quiet                                Suppress optional MemCordon output; off
 
@@ -462,9 +488,9 @@ Utilities:
   clean [--dry-run] [--json]          Inspect or remove stale owned state
 
 Utility options:
-  doctor --json                       Write schema-2 JSON to stdout; off
-  doctor --require hard|watchdog      Require the selected backend class; unset
-  plan --json                         Write schema-4 JSON to stdout; off
+  doctor --json                       Write schema-3 JSON to stdout; off
+  doctor --require hard|watchdog|sealed Require the selected backend class; unset
+  plan --json                         Write schema-5 JSON to stdout; off
   clean --dry-run                     List without removing artifacts; off
   clean --json                        Write schema-1 JSON to stdout; off
 
@@ -496,7 +522,7 @@ Run memcordon help for topic-specific help.
 ];
 
 pub const DOCTOR_USAGE: &str = with_reference!(
-    "Inspect backend availability without launching a workload.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog]\n\nText prints the version and selected backend; --json prints full capabilities\nand limitations.\n\nOptions (default):\n  --json                         Write schema-2 JSON to stdout; off\n  --require hard|watchdog        Return 125 unless the backend matches; unset\n  -h, --help                     Print this help\n\n"
+    "Inspect backend availability without launching a workload.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog|sealed]\n\nText prints the version and selected backend; --json prints full capabilities\nand limitations.\n\nOptions (default):\n  --json                         Write schema-3 JSON to stdout; off\n  --require hard|watchdog|sealed Return 125 unless the backend matches; unset\n  -h, --help                     Print this help\n\n"
 );
 
 pub const PLAN_USAGE: &str = with_reference!(
@@ -516,6 +542,7 @@ Budgets:
   +TIME      Elapsed-time deadline; decimal ms, s, m, or h
 
 Policy options (value; default):
+  --sealed                              Require certified sealed supervision; off
   --enforcement auto|hard|watchdog       Backend requirement; auto
   --wait-for command|workload            Clean on direct-command exit or wait for workload empty; command
   --command-exit-grace DURATION          Natural-drain grace after direct-command exit; 0s
@@ -537,7 +564,7 @@ Policy options (value; default):
   --circuit-threshold SCORE              Decayed failure pressure to open; unset
   --circuit-cooldown DURATION            Minimum circuit quarantine; unset
   --circuit-half-life DURATION           Failure-pressure half-life; backoff half-life
-  --json                                 Write schema-4 JSON to stdout; off
+  --json                                 Write schema-5 JSON to stdout; off
   -h, --help                             Print this help
 
 Rules:
@@ -558,6 +585,7 @@ pub const CLEAN_USAGE: &str = with_reference!(
 );
 
 pub const PUBLIC_POLICY_OPTIONS: &[&str] = &[
+    "--sealed",
     "--enforcement",
     "--wait-for",
     "--command-exit-grace",
@@ -709,6 +737,7 @@ impl LimitToken {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicyArgs {
+    pub boundary: BoundaryRequirement,
     pub enforcement: Enforcement,
     pub wait_for: Lifetime,
     pub metric: Metric,
@@ -737,6 +766,7 @@ impl Eq for PolicyArgs {}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExplicitPolicyOptions {
+    pub boundary: bool,
     pub enforcement: bool,
     pub metric: bool,
     pub poll_interval: bool,
@@ -750,6 +780,7 @@ pub struct ExplicitPolicyOptions {
 impl Default for PolicyArgs {
     fn default() -> Self {
         Self {
+            boundary: BoundaryRequirement::Standard,
             enforcement: Enforcement::Auto,
             wait_for: Lifetime::Command,
             metric: Metric::Native,
@@ -785,6 +816,7 @@ impl PolicyArgs {
                 .unwrap_or_else(|error| panic!("validated CLI deadline became invalid: {error}"))
         });
         policy.enforcement = self.enforcement;
+        policy = policy.with_boundary(self.boundary);
         policy.lifetime = self.wait_for;
         policy.metric = self.metric;
         policy.poll_interval = self.poll_interval;
@@ -815,6 +847,7 @@ pub struct ExecutionArgs {
 pub enum Requirement {
     Hard,
     Watchdog,
+    Sealed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -917,7 +950,7 @@ fn parse_help(argv: &[OsString]) -> Result<Invocation, CliError> {
     if argv.len() > 1 {
         return Err(CliError::new(
             "MCCLI-HELP-TOPIC-COUNT",
-            "help accepts at most one topic: usage, budgets, memory, deadline, lifecycle, restart, backoff, circuit, output, utilities, exit-status, or all",
+            "help accepts at most one topic: usage, budgets, memory, containment, deadline, lifecycle, restart, backoff, circuit, output, utilities, exit-status, or all",
         ));
     }
     let topic = argv[0].to_str().ok_or_else(|| {
@@ -933,7 +966,7 @@ fn parse_help(argv: &[OsString]) -> Result<Invocation, CliError> {
             CliError::new(
                 "MCCLI-HELP-TOPIC",
                 format!(
-                    "unknown help topic `{topic}`; expected usage, budgets, memory, deadline, lifecycle, restart, backoff, circuit, output, utilities, exit-status, or all"
+                    "unknown help topic `{topic}`; expected usage, budgets, memory, containment, deadline, lifecycle, restart, backoff, circuit, output, utilities, exit-status, or all"
                 ),
             )
         })?;
@@ -1066,10 +1099,11 @@ fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
                 requirement = Some(match value.to_str() {
                     Some("hard") => Requirement::Hard,
                     Some("watchdog") => Requirement::Watchdog,
+                    Some("sealed") => Requirement::Sealed,
                     _ => {
                         return Err(CliError::new(
                             "MCCLI-DOCTOR-REQUIRE",
-                            "--require accepts hard or watchdog",
+                            "--require accepts hard, watchdog, or sealed",
                         ));
                     }
                 });
@@ -1266,6 +1300,17 @@ fn parse_policy_option(
     index: &mut usize,
     policy: &mut PolicyArgs,
 ) -> Result<(), CliError> {
+    if name == "--sealed" {
+        if inline_value.is_some() || policy.explicit.boundary {
+            return Err(CliError::new(
+                "MCUSAGE-SEALED",
+                "--sealed may be supplied once and does not accept a value",
+            ));
+        }
+        policy.boundary = BoundaryRequirement::Sealed;
+        policy.explicit.boundary = true;
+        return Ok(());
+    }
     if name == "--restart" {
         if inline_value.is_some() {
             return Err(CliError::new(

@@ -1,3 +1,10 @@
+//! Platform-neutral supervision policy and evidence models.
+//!
+//! [`BoundaryRequirement::Sealed`] requests a certified process-supervision
+//! boundary and never permits fallback to standard supervision. Capability,
+//! launch, and cleanup facts remain distinct so consumers can validate the
+//! contract without selecting a platform mechanism.
+
 #![forbid(unsafe_code)]
 
 mod error;
@@ -16,8 +23,8 @@ pub use outcome::{
     Interruption, LimitEvidence, RunOutcome,
 };
 pub use policy::{
-    ByteSize, ByteSizeParseError, CommandSpec, DeadlinePolicyError, Enforcement, Lifetime, Metric,
-    Policy, SwapPolicy,
+    BoundaryRequirement, ByteSize, ByteSizeParseError, CommandSpec, DeadlinePolicyError,
+    Enforcement, Lifetime, Metric, Policy, SwapPolicy,
 };
 pub use policy::{DeadlinePolicy, DeadlineScope};
 pub use report::{
@@ -42,8 +49,9 @@ pub use restart::{
 pub use state_machine::{RunState, StateMachine, StateTransitionError};
 pub use supervision::{
     AttemptHistory, AttemptKind, AttemptPhase, AttemptRecord, BackendCapabilityReport,
-    CapabilityStatusReport, DETAILED_ATTEMPT_CAPACITY, LaunchEvidence, MemoryCapabilityReport,
-    RestartDecisionKind, RestartDecisionRecord, RestartSafetyProof, RestartSummary,
-    SupervisionAggregates, SupervisionDeadlineEvidence, SupervisionErrorRecord,
-    SupervisionExecution, SupervisionModelError, SupervisionPhase, SupervisionTerminal,
+    BoundaryCapability, BoundaryClass, CapabilityStatusReport, DETAILED_ATTEMPT_CAPACITY,
+    LaunchEvidence, MemoryCapabilityReport, RestartDecisionKind, RestartDecisionRecord,
+    RestartSafetyProof, RestartSummary, SupervisionAggregates, SupervisionDeadlineEvidence,
+    SupervisionErrorRecord, SupervisionExecution, SupervisionModelError, SupervisionPhase,
+    SupervisionTerminal,
 };
