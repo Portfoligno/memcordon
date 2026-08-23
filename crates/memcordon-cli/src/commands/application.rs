@@ -5,17 +5,18 @@ use memcordon::invocation::{
     BudgetSet, BudgetToken, CleanArgs, DoctorArgs, ExecutionArgs, PlanArgs, PolicyArgs, Requirement,
 };
 use memcordon_core::{
-    BackendCapabilityReport, BackoffPolicyReport, BudgetKindReport, BudgetTokenReport,
-    CLEAN_REPORT_SCHEMA_VERSION, CircuitBreakerPolicyReport, CleanReport, CommandSpec,
-    DOCTOR_REPORT_SCHEMA_VERSION, DeadlinePolicyReport, DeadlineScope, DoctorReport,
-    DormantRestartCondition, EffectiveMemoryPolicyReport, EffectivePolicyReport,
-    EffectiveRestartPolicyReport, Enforcement, Error, ErrorCategory, ExecutionErrorReport,
-    HALF_LIFE_LOGISTIC_MODEL, HalfLifeLogisticBackoffState, HostReport, InvocationReport, Lifetime,
-    MemcordonReport, Metric, OptionEffectReport, PLAN_REPORT_SCHEMA_VERSION, PlanReport,
-    PlanResolutionReport, Policy, PolicyEnvelopeReport, RequestedMemoryPolicyReport,
-    RequestedPolicyReport, RequestedRestartPolicyReport, RequirementReport, RestartCondition,
-    RestartConditions, RestartPolicy, RestartSettings, SupervisionExecution, SupervisionTerminal,
-    SwapPolicy, SwapReport, ToolReport, UnavailableCapabilityReport, write_report_atomic,
+    BackendCapabilityReport, BackoffPolicyReport, BoundaryCapability, BoundaryClass,
+    BoundaryRequirement, BudgetKindReport, BudgetTokenReport, CLEAN_REPORT_SCHEMA_VERSION,
+    CircuitBreakerPolicyReport, CleanReport, CommandSpec, DOCTOR_REPORT_SCHEMA_VERSION,
+    DeadlinePolicyReport, DeadlineScope, DoctorReport, DormantRestartCondition,
+    EffectiveMemoryPolicyReport, EffectivePolicyReport, EffectiveRestartPolicyReport, Enforcement,
+    Error, ErrorCategory, ExecutionErrorReport, HALF_LIFE_LOGISTIC_MODEL,
+    HalfLifeLogisticBackoffState, HostReport, InvocationReport, Lifetime, MemcordonReport, Metric,
+    OptionEffectReport, PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanResolutionReport, Policy,
+    PolicyEnvelopeReport, RequestedMemoryPolicyReport, RequestedPolicyReport,
+    RequestedRestartPolicyReport, RequirementReport, RestartCondition, RestartConditions,
+    RestartPolicy, RestartSettings, SupervisionExecution, SupervisionTerminal, SwapPolicy,
+    SwapReport, ToolReport, UnavailableCapabilityReport, write_report_atomic,
 };
 use memcordon_platform::{SupervisorRequest, capabilities, cleanup_stale, probe, supervise};
 
@@ -281,6 +282,9 @@ fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, 
     let policy = policy_args.policy(budgets);
     let probe = probe();
     let backend = probe.selected.ok_or_else(|| {
+        if policy.boundary() == BoundaryRequirement::Sealed {
+            return sealed_boundary_unsupported();
+        }
         Box::new(Error::new(
             ErrorCategory::Unsupported,
             "MCUNSUPPORTED-BACKEND",
@@ -295,6 +299,12 @@ fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, 
             ),
         ))
     })?;
+    let capability = capabilities(&backend);
+    if policy.boundary() == BoundaryRequirement::Sealed
+        && capability.boundary.class != BoundaryClass::Sealed
+    {
+        return Err(sealed_boundary_unsupported());
+    }
     if policy.enforcement == Enforcement::Hard && !backend.hard_limit {
         return Err(Box::new(Error::new(
             ErrorCategory::Unsupported,
@@ -309,7 +319,6 @@ fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, 
             "watchdog enforcement is unavailable on the selected backend",
         )));
     }
-    let capability = capabilities(&backend);
     let configured = if policy_args.restart || policy_args.restart_on.is_some() {
         policy_args.restart_on.unwrap_or(RestartConditions::BOTH)
     } else {
@@ -384,6 +393,14 @@ fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, 
         restart,
         report,
     })
+}
+
+fn sealed_boundary_unsupported() -> Box<Error> {
+    Box::new(Error::new(
+        ErrorCategory::Unsupported,
+        "MCBOUNDARY-UNSUPPORTED",
+        "certified sealed supervision is unavailable on this host; the target was not authorized",
+    ))
 }
 
 fn add_condition(value: RestartConditions, condition: RestartCondition) -> RestartConditions {
@@ -647,8 +664,12 @@ fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeRe
 }
 
 pub(crate) fn plan(args: PlanArgs, presentation: &Presentation) -> i32 {
-    let resolution = match resolve(&args.policy, &args.budgets) {
-        Ok(value) => value,
+    let (backend, report) = match resolve(&args.policy, &args.budgets) {
+        Ok(value) => (value.backend, value.report),
+        Err(error) if error.code == "MCBOUNDARY-UNSUPPORTED" => (
+            unavailable_backend_capability(),
+            unresolved_report(&args.policy, &args.budgets),
+        ),
         Err(error) => {
             let mut out = presentation.stderr();
             presentation::write_runtime_error(&mut out, error)
@@ -656,16 +677,16 @@ pub(crate) fn plan(args: PlanArgs, presentation: &Presentation) -> i32 {
             return 125;
         }
     };
-    let limitations = resolution.backend.limitations.clone();
+    let limitations = backend.limitations.clone();
     let plan = PlanReport {
         schema_version: PLAN_REPORT_SCHEMA_VERSION,
         tool: tool_report(),
         budget_tokens: budget_tokens(&args.budgets),
-        request: resolution.report.requested.clone(),
+        request: report.requested,
         resolution: PlanResolutionReport {
-            backend: resolution.backend,
-            effective: resolution.report.effective,
-            effects: resolution.report.effects,
+            backend,
+            effective: report.effective,
+            effects: report.effects,
             limitations,
             launch_proof: false,
             backoff_sample_ms: if args.policy.restart || args.policy.restart_on.is_some() {
@@ -692,6 +713,20 @@ pub(crate) fn plan(args: PlanArgs, presentation: &Presentation) -> i32 {
         presentation::write_label_value(&mut out, "launch proof", false)
             .expect("plan output should be writable");
         0
+    }
+}
+
+fn unavailable_backend_capability() -> BackendCapabilityReport {
+    BackendCapabilityReport {
+        name: "unresolved".to_owned(),
+        boundary: BoundaryCapability {
+            class: BoundaryClass::Unavailable,
+            mechanism: "unavailable".to_owned(),
+            limitations: vec!["certified sealed supervision is unavailable".to_owned()],
+            ..BoundaryCapability::default()
+        },
+        limitations: vec!["no backend satisfies the requested sealed boundary".to_owned()],
+        ..BackendCapabilityReport::default()
     }
 }
 
