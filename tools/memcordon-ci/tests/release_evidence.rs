@@ -1,7 +1,18 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
 use memcordon_ci::release_evidence::{LINUX_SEALED_TESTS as LINUX_TESTS, collect_certification};
+use memcordon_core::{
+    AttemptHistory, AttemptKind, AttemptPhase, AttemptRecord, BackendCapabilityReport,
+    BoundaryCapability, BoundaryClass, BoundaryMechanismEvidence, BoundaryQualificationReport,
+    BoundaryRequirement, BudgetKindReport, BudgetTokenReport, ChildTermination, CleanupSummary,
+    DeadlinePolicyReport, DeadlineScope, EffectivePolicyReport, EffectiveRestartPolicyReport,
+    InvocationReport, LaunchEvidence, LinuxSealedEvidence, MemcordonReport, NativeArgument,
+    PolicyEnvelopeReport, RequestedPolicyReport, RequestedRestartPolicyReport, RestartConditions,
+    RestartDecisionRecord, RestartLimit, RestartSafetyProof, RestartSummary, RunOutcome,
+    SupervisionAggregates, SupervisionExecution, SupervisionTerminal, ToolReport,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -57,6 +68,190 @@ fn linux_report() -> Value {
         "tests_run": LINUX_TESTS.len(),
         "tests_skipped": 0
     })
+}
+
+fn public_launch_report() -> Value {
+    let provider_identity = "fixture-provider";
+    let receipt_digest = "fixture-receipt";
+    let mechanism = "linux-pid-namespace-cgroup-v1";
+    let backend = BackendCapabilityReport {
+        name: "linux-sealed-provider".to_owned(),
+        boundary: BoundaryCapability {
+            class: BoundaryClass::Sealed,
+            mechanism: mechanism.to_owned(),
+            target_gated: true,
+            boundary_verified_before_authorization: true,
+            target_can_reconfigure_boundary: false,
+            frontend_loss_cleanup_authority: true,
+            workload_empty_proof: true,
+            limitations: Vec::new(),
+        },
+        boundary_qualification: Some(BoundaryQualificationReport {
+            provider_identity: provider_identity.to_owned(),
+            receipt_digest: receipt_digest.to_owned(),
+            mechanism: mechanism.to_owned(),
+        }),
+        ..BackendCapabilityReport::default()
+    };
+    let cleanup = CleanupSummary {
+        direct_child_reaped: true,
+        workload_empty: Some(true),
+        ..CleanupSummary::default()
+    };
+    let outcome = RunOutcome::Exited {
+        child: ChildTermination::ExitCode { code: 0 },
+        peak: None,
+        cleanup,
+    };
+    let attempt = AttemptRecord {
+        number: 1,
+        kind: AttemptKind::Initial,
+        phase: AttemptPhase::Completed,
+        target_pid: Some(101),
+        started_offset_ms: Some(1),
+        authorized_offset_ms: Some(2),
+        terminal_offset_ms: Some(3),
+        finished_offset_ms: 4,
+        outcome: Some(outcome.clone()),
+        error: None,
+        restart_decision: RestartDecisionRecord::default(),
+        launch: LaunchEvidence {
+            mechanism: mechanism.to_owned(),
+            target_released: true,
+            containment_verified_before_authorization: true,
+            guardian_started_before_authorization: true,
+            target_spawn_error_reported: true,
+            boundary_requested: BoundaryRequirement::Sealed,
+            boundary_effective: BoundaryClass::Sealed,
+            boundary_assignment_verified: true,
+            boundary_reconfiguration_denied: true,
+            inherited_resources_restricted: true,
+            frontend_loss_cleanup_authority_verified: true,
+        },
+        restart_safety: RestartSafetyProof {
+            direct_child_reaped: true,
+            workload_empty: Some(true),
+            helpers_reaped: true,
+            containment_removed: true,
+            containment_incapable_of_live_members: true,
+            sealed_boundary_retired: true,
+            errors: Vec::new(),
+        },
+        boundary_detail: BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV1(
+            LinuxSealedEvidence {
+                schema_version: 1,
+                provider_identity: provider_identity.to_owned(),
+                cgroup_identity_digest: "fixture-cgroup".to_owned(),
+                cgroup_created: true,
+                cgroup_owned_by_provider: true,
+                memory_configuration_verified: true,
+                init_created_into_cgroup: true,
+                pid_namespace_created: true,
+                mount_namespace_created: true,
+                cgroup_namespace_created: true,
+                target_pidfd_verified: true,
+                target_cgroup_membership_verified: true,
+                target_pid_namespace_verified: true,
+                target_credentials_verified: true,
+                target_capabilities_empty: true,
+                no_new_privs_verified: true,
+                inherited_descriptors_verified: true,
+                writable_cgroup_view_denied: true,
+                guardian_ready: true,
+                target_released: true,
+                cgroup_kill_invoked: true,
+                cgroup_empty_verified: true,
+                namespace_init_reaped: true,
+                guardian_reaped: true,
+                cgroup_removed: true,
+            },
+        ),
+    };
+    let mut attempts = AttemptHistory::default();
+    let mut aggregates = SupervisionAggregates::default();
+    attempts
+        .append(attempt, &mut aggregates)
+        .expect("public launch attempt should append");
+    let execution = SupervisionExecution::new(
+        backend.clone(),
+        SupervisionTerminal::AttemptOutcome {
+            attempt_number: 1,
+            outcome,
+        },
+        attempts,
+        aggregates,
+        RestartSummary::default(),
+        None,
+        4,
+        1,
+    )
+    .expect("public launch execution should be valid");
+    let report = MemcordonReport::schema7(
+        ToolReport {
+            name: "memcordon".to_owned(),
+            version: "test".to_owned(),
+        },
+        InvocationReport {
+            syntax: "plus-budgets-v1".to_owned(),
+            budget_tokens: vec![BudgetTokenReport {
+                kind: BudgetKindReport::Time,
+                token: "+1s".to_owned(),
+            }],
+            memory_token: None,
+            deadline_token: Some("+1s".to_owned()),
+            argv: vec![NativeArgument::from_os(OsStr::new("/usr/bin/true"))],
+        },
+        PolicyEnvelopeReport {
+            requested: RequestedPolicyReport {
+                boundary: BoundaryRequirement::Sealed,
+                memory: None,
+                deadline: Some(DeadlinePolicyReport {
+                    duration_ms: 1_000,
+                    scope: DeadlineScope::Attempt,
+                    origin: None,
+                    clock: "rust-instant".to_owned(),
+                }),
+                wait_for: "command".to_owned(),
+                signal_grace_ms: 2_000,
+                command_exit_grace_ms: 0,
+                limit_grace_ms: 0,
+                restart: RequestedRestartPolicyReport {
+                    enabled: false,
+                    enablement_source: None,
+                    configured_conditions: RestartConditions::NONE,
+                    limit: RestartLimit::Unlimited,
+                    backoff: None,
+                    circuit_breaker: None,
+                },
+            },
+            effective: EffectivePolicyReport {
+                boundary: BoundaryClass::Sealed,
+                memory: None,
+                deadline: Some(DeadlinePolicyReport {
+                    duration_ms: 1_000,
+                    scope: DeadlineScope::Attempt,
+                    origin: Some("fixture".to_owned()),
+                    clock: "rust-instant".to_owned(),
+                }),
+                wait_for: "command".to_owned(),
+                signal_grace_ms: 2_000,
+                command_exit_grace_ms: 0,
+                limit_grace_ms: 0,
+                restart: EffectiveRestartPolicyReport {
+                    enabled: false,
+                    conditions: RestartConditions::NONE,
+                    dormant_conditions: Vec::new(),
+                    cleanup_proof_required: true,
+                },
+            },
+            effects: Vec::new(),
+        },
+        Some(backend),
+        Some(execution),
+        None,
+    )
+    .expect("public launch report should be valid");
+    serde_json::to_value(report).expect("public launch report should serialize")
 }
 
 fn windows_report() -> Value {
@@ -115,7 +310,44 @@ fn fixture() -> (TempDir, Value, Value, Value) {
             .join("sealed-scenario-report.json"),
         &linux,
     );
-    let identity = json!({"schema_version": 1, "mechanism": "linux-pid-namespace-cgroup-v1", "provider_identity": "fixture", "receipt_digest": "digest"});
+    let left_identity = "00".repeat(std::mem::size_of::<[u8; 16]>());
+    let right_identity = "11".repeat(std::mem::size_of::<[u8; 16]>());
+    write_report(
+        &input.join("release-certification-linux/sealed-concurrency-report.json"),
+        &json!({
+            "schema_version": 1,
+            "mechanism": "linux-pid-namespace-cgroup-v1",
+            "commit": COMMIT,
+            "overlap": true,
+            "attempts": [
+                {
+                    "identity": left_identity,
+                    "target_pid": 101,
+                    "live_cgroup_member_pids": [100, 101],
+                    "started_monotonic_millis": 1,
+                    "authorized_monotonic_millis": 3,
+                    "terminal_monotonic_millis": 8,
+                    "record_absent": true,
+                    "cgroup_absent": true,
+                    "fixture_absent": true,
+                    "boundary_retired": true
+                },
+                {
+                    "identity": right_identity,
+                    "target_pid": 201,
+                    "live_cgroup_member_pids": [200, 201],
+                    "started_monotonic_millis": 2,
+                    "authorized_monotonic_millis": 4,
+                    "terminal_monotonic_millis": 9,
+                    "record_absent": true,
+                    "cgroup_absent": true,
+                    "fixture_absent": true,
+                    "boundary_retired": true
+                }
+            ]
+        }),
+    );
+    let identity = json!({"schema_version": 1, "mechanism": "linux-pid-namespace-cgroup-v1", "provider_identity": "fixture-provider", "receipt_digest": "fixture-receipt"});
     write_report(
         &input.join("release-certification-linux/provider-identity.json"),
         &identity,
@@ -124,6 +356,7 @@ fn fixture() -> (TempDir, Value, Value, Value) {
     for field in [
         "unified_cgroup_v2",
         "private_cgroup_subtree",
+        "clone3",
         "clone3_into_cgroup",
         "pid_namespace",
         "mount_namespace",
@@ -134,11 +367,13 @@ fn fixture() -> (TempDir, Value, Value, Value) {
         "target_gated",
         "assignment_verified",
         "inherited_descriptors_verified",
+        "spawn_error_reporting_verified",
         "frontend_loss_authority_verified",
         "cgroup_kill",
         "workload_empty",
         "helpers_reaped",
         "boundary_retired",
+        "recovery_complete",
     ] {
         qualification[field] = json!(true);
     }
@@ -146,11 +381,177 @@ fn fixture() -> (TempDir, Value, Value, Value) {
         &input.join("release-certification-linux/qualification-receipt.json"),
         &qualification,
     );
-    let named = json!({"schema_version": 1, "mechanism": "linux-pid-namespace-cgroup-v1", "result": "passed", "tests": ["fixture"]});
+    let fault_selectors = [
+        (
+            "sealed_frontend_loss_before_authorization_never_runs_target",
+            "MCSEALED-FRONTEND-LOSS-BEFORE-AUTHORIZATION",
+            "authorization",
+            true,
+            false,
+            true,
+            "guardian",
+            true,
+        ),
+        (
+            "sealed_frontend_loss_after_authorization_triggers_guardian",
+            "MCSEALED-FRONTEND-LOSS-AFTER-AUTHORIZATION",
+            "monitoring",
+            true,
+            true,
+            true,
+            "guardian",
+            true,
+        ),
+        (
+            "sealed_provider_worker_loss_triggers_guardian",
+            "MCSEALED-PROVIDER-WORKER-LOSS",
+            "guardian-startup",
+            false,
+            false,
+            true,
+            "guardian",
+            true,
+        ),
+        (
+            "sealed_guardian_loss_before_authorization_fails_closed",
+            "MCSEALED-GUARDIAN-LOSS-BEFORE-AUTHORIZATION",
+            "authorization",
+            true,
+            false,
+            true,
+            "provider",
+            true,
+        ),
+        (
+            "sealed_guardian_loss_after_authorization_cannot_report_success",
+            "MCSEALED-GUARDIAN-LOSS-AFTER-AUTHORIZATION",
+            "monitoring",
+            true,
+            true,
+            true,
+            "provider",
+            true,
+        ),
+        (
+            "sealed_faults_before_authorization_never_create_marker",
+            "MCSEALED-LAUNCH-DESCRIPTOR-SET",
+            "request-validation",
+            false,
+            false,
+            false,
+            "provider",
+            false,
+        ),
+        (
+            "sealed_namespace_init_failure_is_typed_prompt_and_retired",
+            "MCSEALED-NAMESPACE-INIT-TARGET-FORK",
+            "target-creation",
+            false,
+            false,
+            true,
+            "provider",
+            true,
+        ),
+        (
+            "sealed_cgroup_kill_failure_never_reports_retirement",
+            "MCSEALED-CGROUP-KILL-FAILURE",
+            "retirement",
+            true,
+            true,
+            true,
+            "provider",
+            true,
+        ),
+        (
+            "sealed_persistent_populated_state_blocks_restart",
+            "MCSEALED-CGROUP-NOT-EMPTY",
+            "retirement",
+            true,
+            true,
+            true,
+            "provider",
+            true,
+        ),
+        (
+            "sealed_namespace_init_reap_delay_blocks_result",
+            "MCSEALED-NAMESPACE-INIT-REAP-DELAY",
+            "retirement",
+            true,
+            true,
+            true,
+            "provider",
+            true,
+        ),
+        (
+            "sealed_guardian_reap_failure_blocks_result",
+            "MCSEALED-GUARDIAN-REAP-FAILURE",
+            "retirement",
+            true,
+            true,
+            true,
+            "provider",
+            true,
+        ),
+    ];
+    let fault_evidence = fault_selectors
+        .iter()
+        .enumerate()
+        .map(
+            |(
+                index,
+                (
+                    selector,
+                    code,
+                    phase,
+                    target_created,
+                    target_released,
+                    cleanup_retired,
+                    retirement_owner,
+                    guardian_reaped,
+                ),
+            )| {
+            json!({
+                "schema_version": 1,
+                "selector": selector,
+                "attempt_id": format!("{index:032x}"),
+                "rejection": {
+                    "schema_version": 1,
+                    "code": code,
+                    "phase": phase,
+                    "detail": format!("{code}: release fixture"),
+                    "os_code": null,
+                    "target_created": target_created,
+                    "target_released": target_released,
+                    "cleanup": {
+                        "attempted": cleanup_retired,
+                        "direct_child_reaped": cleanup_retired,
+                        "workload_empty": if *cleanup_retired { json!(true) } else { Value::Null },
+                        "helpers_reaped": cleanup_retired,
+                        "containment_removed": cleanup_retired,
+                        "sealed_boundary_retired": cleanup_retired,
+                        "errors": []
+                    }
+                },
+                "retirement_owner": retirement_owner,
+                "marker_observed": target_released,
+                "guardian_reaped": guardian_reaped,
+                "final_record_absent": true,
+                "final_cgroup_absent": true
+            })
+        },
+        )
+        .collect::<Vec<_>>();
     write_report(
         &input.join("release-certification-linux/fault-injection-report.json"),
-        &named,
+        &json!({
+            "schema_version": 2,
+            "mechanism": "linux-pid-namespace-cgroup-v1",
+            "commit": COMMIT,
+            "result": "passed",
+            "evidence": fault_evidence
+        }),
     );
+    let named = json!({"schema_version": 1, "mechanism": "linux-pid-namespace-cgroup-v1", "result": "passed", "tests": ["fixture"]});
     write_report(
         &input.join("release-certification-linux/cleanup-recovery-report.json"),
         &named,
@@ -158,6 +559,23 @@ fn fixture() -> (TempDir, Value, Value, Value) {
     write_report(
         &input.join("release-certification-linux/platform-environment.json"),
         &json!({"schema_version": memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION, "selected": {"boundary": {"class": "sealed", "mechanism": "linux-pid-namespace-cgroup-v1"}}}),
+    );
+    write_report(
+        &input.join("release-certification-linux/provider-service-privileges.json"),
+        &json!({
+            "schema_version": 1,
+            "properties": {
+                "User": "root",
+                "Group": "memcordon",
+                "NoNewPrivileges": "yes",
+                "CapabilityBoundingSet": "cap_dac_override cap_kill cap_setgid cap_setuid cap_sys_admin cap_sys_chroot cap_sys_ptrace",
+                "AmbientCapabilities": ""
+            }
+        }),
+    );
+    write_report(
+        &input.join("release-certification-linux/sealed-public-launch.json"),
+        &public_launch_report(),
     );
     write_report(
         &input
@@ -182,7 +600,7 @@ fn valid_reports_are_copied_and_digest_bound() {
     let records = collect_certification(&input, &output, COMMIT)
         .expect("valid certification reports should collect");
 
-    assert_eq!(records.len(), 8);
+    assert_eq!(records.len(), 11);
     for (backend, report_name) in [
         (
             "linux-pid-namespace-cgroup-v1",
@@ -200,9 +618,12 @@ fn valid_reports_are_copied_and_digest_bound() {
     for name in [
         "provider-identity.json",
         "qualification-receipt.json",
+        "sealed-concurrency-report.json",
         "fault-injection-report.json",
         "cleanup-recovery-report.json",
         "platform-environment.json",
+        "provider-service-privileges.json",
+        "sealed-public-launch.json",
     ] {
         let key = format!("linux-pid-namespace-cgroup-v1/{name}");
         let record = records
@@ -247,6 +668,377 @@ fn hard_report_contract_mutations_fail_closed() {
         );
         assert!(result.is_err(), "{name} mutation should fail closed");
     }
+}
+
+#[test]
+fn linux_concurrency_evidence_mutations_fail_closed() {
+    let cases: &[(&str, ReportMutation)] = &[
+        ("overlap", |report| report["overlap"] = json!(false)),
+        ("identity", |report| {
+            report["attempts"][1]["identity"] = report["attempts"][0]["identity"].clone()
+        }),
+        ("membership", |report| {
+            report["attempts"][1]["live_cgroup_member_pids"] = json!([101, 201])
+        }),
+        ("target", |report| {
+            report["attempts"][0]["target_pid"] = json!(999)
+        }),
+        ("retirement", |report| {
+            report["attempts"][0]["record_absent"] = json!(false)
+        }),
+        ("interval", |report| {
+            report["attempts"][0]["terminal_monotonic_millis"] =
+                report["attempts"][1]["authorized_monotonic_millis"].clone()
+        }),
+        ("unknown", |report| report["unexpected"] = json!(true)),
+    ];
+
+    for (name, mutate) in cases {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-linux/sealed-concurrency-report.json");
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        mutate(&mut report);
+        write_report(&path, &report);
+        let result = collect_certification(
+            &temporary.path().join("input"),
+            &temporary.path().join("output"),
+            COMMIT,
+        );
+        assert!(result.is_err(), "{name} mutation should fail closed");
+    }
+}
+
+#[test]
+fn linux_fault_evidence_mutations_fail_closed() {
+    let cases: &[(&str, ReportMutation)] = &[
+        ("commit", |report| report["commit"] = json!("different")),
+        ("missing-selector", |report| {
+            report["evidence"].as_array_mut().unwrap().pop();
+        }),
+        ("duplicate-selector", |report| {
+            report["evidence"][1]["selector"] = report["evidence"][0]["selector"].clone()
+        }),
+        ("wrong-code", |report| {
+            report["evidence"][0]["rejection"]["code"] =
+                json!("MCSEALED-GUARDIAN-LOSS-BEFORE-AUTHORIZATION");
+            report["evidence"][0]["rejection"]["detail"] =
+                json!("MCSEALED-GUARDIAN-LOSS-BEFORE-AUTHORIZATION: wrong selector binding");
+        }),
+        ("wrong-phase", |report| {
+            report["evidence"][1]["rejection"]["phase"] = json!("retirement")
+        }),
+        ("wrong-owner", |report| {
+            report["evidence"][3]["retirement_owner"] = json!("guardian")
+        }),
+        ("wrong-target-facts", |report| {
+            report["evidence"][2]["rejection"]["target_created"] = json!(true)
+        }),
+        ("residual-record", |report| {
+            report["evidence"][0]["final_record_absent"] = json!(false)
+        }),
+        ("released-without-target", |report| {
+            report["evidence"][0]["rejection"]["target_created"] = json!(false);
+            report["evidence"][0]["rejection"]["target_released"] = json!(true);
+            report["evidence"][0]["marker_observed"] = json!(true);
+        }),
+        ("marker-contradiction", |report| {
+            report["evidence"][1]["marker_observed"] = json!(false)
+        }),
+        ("retirement-contradiction", |report| {
+            report["evidence"][0]["rejection"]["cleanup"]["sealed_boundary_retired"] = json!(true);
+            report["evidence"][0]["rejection"]["cleanup"]["workload_empty"] = json!(false);
+        }),
+        ("unknown", |report| {
+            report["evidence"][0]["unexpected"] = json!(true)
+        }),
+    ];
+
+    for (name, mutate) in cases {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-linux/fault-injection-report.json");
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        mutate(&mut report);
+        write_report(&path, &report);
+        let result = collect_certification(
+            &temporary.path().join("input"),
+            &temporary.path().join("output"),
+            COMMIT,
+        );
+        assert!(result.is_err(), "{name} mutation should fail closed");
+    }
+}
+
+#[test]
+fn promoted_linux_evidence_mutations_fail_closed() {
+    let cases: &[(&str, &str, ReportMutation)] = &[
+        (
+            "privilege-user",
+            "provider-service-privileges.json",
+            |report| report["properties"]["User"] = json!("memcordon"),
+        ),
+        (
+            "privilege-capabilities",
+            "provider-service-privileges.json",
+            |report| report["properties"]["CapabilityBoundingSet"] = json!("cap_kill"),
+        ),
+        (
+            "privilege-duplicate-capability",
+            "provider-service-privileges.json",
+            |report| {
+                report["properties"]["CapabilityBoundingSet"] = json!(
+                    "cap_dac_override cap_kill cap_setgid cap_setuid cap_sys_admin cap_sys_chroot cap_sys_ptrace cap_kill"
+                )
+            },
+        ),
+        (
+            "privilege-extra-property",
+            "provider-service-privileges.json",
+            |report| report["properties"]["Unexpected"] = json!("value"),
+        ),
+        (
+            "privilege-unknown-field",
+            "provider-service-privileges.json",
+            |report| report["unexpected"] = json!(true),
+        ),
+        ("public-schema", "sealed-public-launch.json", |report| {
+            report["schema_version"] = json!(0)
+        }),
+        (
+            "public-provider-identity",
+            "sealed-public-launch.json",
+            |report| {
+                report["backend"]["boundary_qualification"]["provider_identity"] =
+                    json!("other-provider")
+            },
+        ),
+        (
+            "public-receipt-digest",
+            "sealed-public-launch.json",
+            |report| {
+                report["backend"]["boundary_qualification"]["receipt_digest"] =
+                    json!("other-receipt")
+            },
+        ),
+        (
+            "public-boundary-mechanism",
+            "sealed-public-launch.json",
+            |report| report["backend"]["boundary"]["mechanism"] = json!("standard"),
+        ),
+        (
+            "public-terminal-cleanup",
+            "sealed-public-launch.json",
+            |report| {
+                report["supervision"]["terminal"]["outcome"]["cleanup"]["workload_empty"] =
+                    json!(false)
+            },
+        ),
+        (
+            "public-boundary-assignment",
+            "sealed-public-launch.json",
+            |report| report["attempts"][0]["launch"]["boundary_assignment_verified"] = json!(false),
+        ),
+        (
+            "public-native-provider",
+            "sealed-public-launch.json",
+            |report| {
+                report["attempts"][0]["boundary_detail"]["provider_identity"] =
+                    json!("other-provider")
+            },
+        ),
+        (
+            "public-native-namespace",
+            "sealed-public-launch.json",
+            |report| {
+                report["attempts"][0]["boundary_detail"]["pid_namespace_created"] = json!(false)
+            },
+        ),
+        (
+            "public-native-target-release",
+            "sealed-public-launch.json",
+            |report| report["attempts"][0]["boundary_detail"]["target_released"] = json!(false),
+        ),
+        (
+            "public-unknown-field",
+            "sealed-public-launch.json",
+            |report| report["unexpected"] = json!(true),
+        ),
+    ];
+
+    for (name, report_name, mutate) in cases {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-linux")
+            .join(report_name);
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        mutate(&mut report);
+        write_report(&path, &report);
+        let result = collect_certification(
+            &temporary.path().join("input"),
+            &temporary.path().join("output"),
+            COMMIT,
+        );
+        assert!(result.is_err(), "{name} mutation should fail closed");
+    }
+}
+
+#[test]
+fn linux_provider_identity_binding_fails_closed() {
+    for field in ["provider_identity", "receipt_digest"] {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-linux/qualification-receipt.json");
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        report[field] = json!(format!("mismatched-{field}"));
+        write_report(&path, &report);
+        assert!(
+            collect_certification(
+                &temporary.path().join("input"),
+                &temporary.path().join("output"),
+                COMMIT,
+            )
+            .is_err(),
+            "{field} mismatch should fail closed"
+        );
+    }
+}
+
+#[test]
+fn promoted_linux_inventory_is_exact_and_failure_inventory_is_not_releasable() {
+    let (successful, _, _, _) = fixture();
+    let successful_linux = successful.path().join("input/release-certification-linux");
+    assert_eq!(
+        fs::read_dir(&successful_linux)
+            .expect("successful Linux inventory should be readable")
+            .count(),
+        9,
+        "successful Linux release inventory must contain exactly nine files"
+    );
+
+    for name in [
+        "provider-service-privileges.json",
+        "sealed-public-launch.json",
+    ] {
+        let (temporary, _, _, _) = fixture();
+        fs::remove_file(
+            temporary
+                .path()
+                .join("input/release-certification-linux")
+                .join(name),
+        )
+        .expect("promoted evidence should be removable from the fixture");
+        assert!(
+            collect_certification(
+                &temporary.path().join("input"),
+                &temporary.path().join("output"),
+                COMMIT,
+            )
+            .is_err(),
+            "missing {name} should fail closed"
+        );
+    }
+
+    let (temporary, _, _, _) = fixture();
+    let linux = temporary.path().join("input/release-certification-linux");
+    write_report(
+        &linux.join("unexpected.json"),
+        &json!({"schema_version": 1}),
+    );
+    assert!(
+        collect_certification(
+            &temporary.path().join("input"),
+            &temporary.path().join("output"),
+            COMMIT,
+        )
+        .is_err(),
+        "extra Linux evidence should fail closed"
+    );
+
+    let (temporary, _, _, _) = fixture();
+    let linux = temporary.path().join("input/release-certification-linux");
+    for entry in fs::read_dir(&linux).expect("Linux fixture should be readable") {
+        fs::remove_file(entry.expect("fixture entry should be readable").path())
+            .expect("success evidence should be removable");
+    }
+    let failure_inventory = [
+        "certification-run.json",
+        "certification-failure.json",
+        "sealed-scenario-progress.json",
+        "provider-service-privileges.json",
+        "sealed-public-launch.json",
+        "provider-identity.json",
+        "qualification-receipt.json",
+        "platform-environment.json",
+    ];
+    assert_eq!(
+        failure_inventory.len(),
+        8,
+        "failed Linux diagnostic inventory must contain exactly eight files"
+    );
+    for name in failure_inventory {
+        write_report(&linux.join(name), &json!({"schema_version": 1}));
+    }
+    assert_eq!(
+        fs::read_dir(&linux)
+            .expect("failed Linux inventory should be readable")
+            .count(),
+        8,
+    );
+    assert!(
+        collect_certification(
+            &temporary.path().join("input"),
+            &temporary.path().join("output"),
+            COMMIT,
+        )
+        .is_err(),
+        "the eight-file failure diagnostic inventory must not be release input"
+    );
+
+    let (temporary, _, _, _) = fixture();
+    let linux = temporary.path().join("input/release-certification-linux");
+    for entry in fs::read_dir(&linux).expect("Linux fixture should be readable") {
+        fs::remove_file(entry.expect("fixture entry should be readable").path())
+            .expect("success evidence should be removable");
+    }
+    let late_package_failure_inventory = [
+        "certification-run.json",
+        "certification-failure.json",
+        "sealed-scenario-progress.json",
+        "provider-service-privileges.json",
+        "sealed-public-launch.json",
+        "provider-identity.json",
+        "qualification-receipt.json",
+        "platform-environment.json",
+        "sealed-concurrency-report.json",
+    ];
+    assert_eq!(
+        late_package_failure_inventory.len(),
+        9,
+        "late package failure diagnostics have the success inventory's count but not its names"
+    );
+    for name in late_package_failure_inventory {
+        write_report(&linux.join(name), &json!({"schema_version": 1}));
+    }
+    assert_eq!(
+        fs::read_dir(&linux)
+            .expect("late failed Linux inventory should be readable")
+            .count(),
+        9,
+    );
+    assert!(
+        collect_certification(
+            &temporary.path().join("input"),
+            &temporary.path().join("output"),
+            COMMIT,
+        )
+        .is_err(),
+        "the nine-file late package failure inventory must not be mistaken for release input"
+    );
 }
 
 #[test]

@@ -18,6 +18,7 @@ const MAX_NATIVE_VALUE: usize = 64 * 1024;
 const MAX_ARGUMENTS: usize = 4096;
 const MAX_ENVIRONMENT_ENTRIES: usize = 8192;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProbeReceipt {
     pub provider_identity: String,
     pub receipt_digest: String,
@@ -42,6 +43,7 @@ struct QualificationReceipt {
     target_gated: bool,
     assignment_verified: bool,
     inherited_descriptors_verified: bool,
+    spawn_error_reporting_verified: bool,
     frontend_loss_authority_verified: bool,
     cgroup_kill: bool,
     workload_empty: bool,
@@ -73,6 +75,7 @@ impl QualificationReceipt {
             && self.target_gated
             && self.assignment_verified
             && self.inherited_descriptors_verified
+            && self.spawn_error_reporting_verified
             && self.frontend_loss_authority_verified
             && self.cgroup_kill
             && self.workload_empty
@@ -84,6 +87,8 @@ impl QualificationReceipt {
 
 pub struct TerminalReceipt {
     pub status: i32,
+    pub exec_status: TerminalExecStatus,
+    pub spawn_error_reported: bool,
     pub target_pid: u32,
     pub authorization_offset_millis: u64,
     pub assignment_verified: bool,
@@ -103,17 +108,111 @@ pub struct TerminalReceipt {
     pub deadline_exceeded: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalExecStatus {
+    Succeeded,
+    Failed {
+        class: TerminalExecFailureClass,
+        os_code: i32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalExecFailureClass {
+    NotFound,
+    NotExecutable,
+    Other,
+}
+
+#[derive(Debug)]
+pub enum LaunchError {
+    Transport(String),
+    Rejected(memcordon_core::ProviderRejectionEvidence),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectionCleanupV1 {
+    attempted: bool,
+    direct_child_reaped: bool,
+    workload_empty: Option<bool>,
+    helpers_reaped: bool,
+    containment_removed: bool,
+    sealed_boundary_retired: bool,
+    errors: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectionV1 {
+    schema_version: u32,
+    code: String,
+    phase: memcordon_core::BoundarySetupPhase,
+    detail: String,
+    os_code: Option<i32>,
+    target_created: bool,
+    target_released: bool,
+    cleanup: RejectionCleanupV1,
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "the backend boundary preserves the public categorized Error contract"
+)]
 pub fn run(
     policy: &memcordon_core::Policy,
     command: &memcordon_core::CommandSpec,
+    context: crate::supervisor::AttemptContext,
 ) -> Result<crate::backend::Execution, memcordon_core::Error> {
     let started = std::time::Instant::now();
-    let terminal = launch(policy, command).map_err(|error| {
+    let qualification = probe().map_err(|error| {
         memcordon_core::Error::new(
             memcordon_core::ErrorCategory::Setup,
-            "MCSEALED-PROVIDER-TRANSACTION",
+            "MCSEALED-PROVIDER-QUALIFICATION",
             error,
         )
+    })?;
+    let terminal = launch(policy, command, context, started).map_err(|error| match error {
+        LaunchError::Transport(detail) => memcordon_core::Error::new(
+            memcordon_core::ErrorCategory::Setup,
+            "MCSEALED-PROVIDER-TRANSACTION",
+            detail,
+        ),
+        LaunchError::Rejected(rejection) => {
+            let restart_safety = rejection.restart_safety.clone();
+            let mut error = memcordon_core::Error::new(
+                memcordon_core::ErrorCategory::Setup,
+                "MCSEALED-PROVIDER-REJECTION",
+                format!(
+                    "provider rejected launch [{}]: {}",
+                    rejection.code, rejection.detail
+                ),
+            )
+            .with_boundary_setup_failure(memcordon_core::BoundarySetupFailure {
+                requested: memcordon_core::BoundaryRequirement::Sealed,
+                mechanism: Some("linux-pid-namespace-cgroup-v1".to_owned()),
+                phase: rejection.phase,
+                target_created: rejection.target_created,
+                target_released: rejection.target_released,
+                cleanup_attempted: rejection.cleanup_attempted,
+                restart_safety,
+            })
+            .with_provider_rejection(rejection.clone());
+            error.launch_phase = Some(boundary_phase_name(rejection.phase));
+            error.workload_may_be_alive =
+                rejection.target_created && rejection.restart_safety.workload_empty != Some(true);
+            if matches!(
+                rejection.phase,
+                memcordon_core::BoundarySetupPhase::ResourceVerification
+                    | memcordon_core::BoundarySetupPhase::Authorization
+                    | memcordon_core::BoundarySetupPhase::Monitoring
+                    | memcordon_core::BoundarySetupPhase::Retirement
+            ) {
+                error.cgroup_verified_before_release = true;
+                error.guardian_ready_before_release = true;
+            }
+            error
+        }
     })?;
     let cleanup = memcordon_core::CleanupSummary {
         direct_child_reaped: terminal.init_reaped,
@@ -121,6 +220,16 @@ pub fn run(
         errors: Vec::new(),
         ..memcordon_core::CleanupSummary::default()
     };
+    let restart_safety = terminal_restart_safety(&terminal);
+    if let TerminalExecStatus::Failed { class, os_code } = terminal.exec_status {
+        return Err(terminal_spawn_error(
+            &terminal,
+            class,
+            os_code,
+            cleanup,
+            restart_safety,
+        ));
+    }
     let child = memcordon_core::ChildTermination::ExitCode {
         code: terminal.status,
     };
@@ -186,8 +295,8 @@ pub fn run(
     };
     let evidence = memcordon_core::LinuxSealedEvidence {
         schema_version: 1,
-        provider_identity: "memcordon-sealed-agent-v1".to_owned(),
-        cgroup_identity_digest: "provider-terminal-receipt".to_owned(),
+        provider_identity: qualification.provider_identity.clone(),
+        cgroup_identity_digest: qualification.receipt_digest.clone(),
         cgroup_created: true,
         cgroup_owned_by_provider: true,
         memory_configuration_verified: true,
@@ -213,7 +322,7 @@ pub fn run(
     };
     Ok(crate::backend::Execution {
         outcome,
-        backend: crate::linux_cgroup::info(),
+        backend: crate::linux_cgroup::sealed_info(qualification),
         child_pid: terminal.target_pid,
         duration: started.elapsed(),
         authorization_offset: Some(Duration::from_millis(terminal.authorization_offset_millis)),
@@ -223,7 +332,7 @@ pub fn run(
             containment_verified_before_authorization: terminal.assignment_verified
                 && terminal.namespaces_verified,
             guardian_started_before_authorization: terminal.guardian_ready,
-            target_spawn_error_reported: true,
+            target_spawn_error_reported: terminal.spawn_error_reported,
             boundary_requested: memcordon_core::BoundaryRequirement::Sealed,
             boundary_effective: memcordon_core::BoundaryClass::Sealed,
             boundary_assignment_verified: terminal.assignment_verified,
@@ -231,47 +340,215 @@ pub fn run(
             inherited_resources_restricted: terminal.descriptors_verified,
             frontend_loss_cleanup_authority_verified: terminal.frontend_loss_authority,
         },
-        restart_safety: memcordon_core::RestartSafetyProof {
-            direct_child_reaped: true,
-            workload_empty: Some(terminal.cgroup_empty),
-            helpers_reaped: terminal.init_reaped && terminal.guardian_reaped,
-            containment_removed: terminal.boundary_retired,
-            containment_incapable_of_live_members: terminal.cgroup_empty,
-            sealed_boundary_retired: terminal.boundary_retired,
-            errors: Vec::new(),
-        },
+        restart_safety,
         boundary_detail: memcordon_core::BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV1(
             evidence,
         ),
     })
 }
 
-pub fn launch(
+pub(crate) fn terminal_restart_safety(
+    terminal: &TerminalReceipt,
+) -> memcordon_core::RestartSafetyProof {
+    memcordon_core::RestartSafetyProof {
+        direct_child_reaped: terminal.init_reaped,
+        workload_empty: Some(terminal.cgroup_empty),
+        helpers_reaped: terminal.init_reaped && terminal.guardian_reaped,
+        containment_removed: terminal.boundary_retired,
+        containment_incapable_of_live_members: terminal.cgroup_empty,
+        sealed_boundary_retired: terminal.boundary_retired,
+        errors: Vec::new(),
+    }
+}
+
+pub(crate) fn terminal_spawn_error(
+    terminal: &TerminalReceipt,
+    class: TerminalExecFailureClass,
+    os_code: i32,
+    cleanup: memcordon_core::CleanupSummary,
+    restart_safety: memcordon_core::RestartSafetyProof,
+) -> memcordon_core::Error {
+    let (code, initial_spawn_failure) = match class {
+        TerminalExecFailureClass::NotFound => (
+            "MCSPAWN-NOT-FOUND",
+            Some(memcordon_core::InitialSpawnFailure::NotFound),
+        ),
+        TerminalExecFailureClass::NotExecutable => (
+            "MCSPAWN-NOT-EXECUTABLE",
+            Some(memcordon_core::InitialSpawnFailure::NotExecutable),
+        ),
+        TerminalExecFailureClass::Other => ("MCSPAWN-FAILED", None),
+    };
+    let detail = format!(
+        "sealed provider reported a verified target exec failure with native OS code {os_code}"
+    );
+    let provider_rejection = memcordon_core::ProviderRejectionEvidence {
+        schema_version: 1,
+        code: code.to_owned(),
+        phase: memcordon_core::BoundarySetupPhase::TargetCreation,
+        detail: detail.clone(),
+        os_code: Some(os_code),
+        target_created: true,
+        target_released: true,
+        cleanup_attempted: true,
+        restart_safety: restart_safety.clone(),
+    };
+    let mut error = memcordon_core::Error::new(memcordon_core::ErrorCategory::Spawn, code, detail)
+        .with_provider_rejection(provider_rejection)
+        .with_boundary_setup_failure(memcordon_core::BoundarySetupFailure {
+            requested: memcordon_core::BoundaryRequirement::Sealed,
+            mechanism: Some("linux-pid-namespace-cgroup-v1".to_owned()),
+            phase: memcordon_core::BoundarySetupPhase::TargetCreation,
+            target_created: true,
+            target_released: true,
+            cleanup_attempted: true,
+            restart_safety: restart_safety.clone(),
+        });
+    if let Some(failure) = initial_spawn_failure {
+        error = error.with_initial_spawn_failure(failure);
+    }
+    error.os_code = Some(os_code);
+    error.target_pid = Some(terminal.target_pid);
+    error.launch_phase = Some("target-spawn-failed");
+    error.target_released = true;
+    error.authorization_offset = Some(Duration::from_millis(terminal.authorization_offset_millis));
+    error.cgroup_verified_before_release = terminal.assignment_verified
+        && terminal.namespaces_verified
+        && terminal.credentials_verified
+        && terminal.capabilities_empty
+        && terminal.descriptors_verified
+        && terminal.cgroup_view_denied;
+    error.guardian_ready_before_release = terminal.guardian_ready;
+    error.workload_may_be_alive =
+        !restart_safety.is_safe_for(memcordon_core::BoundaryRequirement::Sealed);
+    error.cleanup = cleanup;
+    error.restart_safety = Some(restart_safety);
+    error
+}
+
+pub(crate) fn launch(
     policy: &memcordon_core::Policy,
     command: &memcordon_core::CommandSpec,
-) -> Result<TerminalReceipt, String> {
-    verify_endpoint()?;
-    let mut stream = UnixStream::connect(Path::new(ENDPOINT)).map_err(|error| error.to_string())?;
-    verify_peer(&stream)?;
-    let attempt = nonce()?;
-    let nonce = nonce()?;
-    let payload = encode_launch(policy, command)?;
-    let frame = encoded_frame(2, nonce, attempt, &payload)?;
-    let cwd = fs::File::open(".").map_err(|error| error.to_string())?;
-    let frontend_pidfd = pidfd_self()?;
+    context: crate::supervisor::AttemptContext,
+    started: std::time::Instant,
+) -> Result<TerminalReceipt, LaunchError> {
+    verify_endpoint().map_err(LaunchError::Transport)?;
+    let mut stream = UnixStream::connect(Path::new(ENDPOINT))
+        .map_err(|error| LaunchError::Transport(error.to_string()))?;
+    verify_peer(&stream).map_err(LaunchError::Transport)?;
+    let attempt = nonce().map_err(LaunchError::Transport)?;
+    let nonce = nonce().map_err(LaunchError::Transport)?;
+    let deadline_budget = effective_deadline_duration(policy, context, started.elapsed());
+    let payload =
+        encode_launch(policy, command, deadline_budget).map_err(LaunchError::Transport)?;
+    let frame = encoded_frame(2, nonce, attempt, &payload).map_err(LaunchError::Transport)?;
+    let cwd = fs::File::open(".").map_err(|error| LaunchError::Transport(error.to_string()))?;
+    let frontend_pidfd = pidfd_self().map_err(LaunchError::Transport)?;
     let descriptors = [cwd.as_raw_fd(), 0, 1, 2, frontend_pidfd.as_raw_fd()];
-    send_with_descriptors(&stream, &frame, &descriptors)?;
-    let (kind, returned_nonce, returned_attempt, payload) = read_frame(&mut stream)?;
+    send_with_descriptors(&stream, &frame, &descriptors).map_err(LaunchError::Transport)?;
+    let WireFrame {
+        kind,
+        nonce: returned_nonce,
+        attempt: returned_attempt,
+        payload,
+    } = read_frame(&mut stream).map_err(LaunchError::Transport)?;
     if returned_nonce != nonce || returned_attempt != attempt {
-        return Err("provider terminal receipt identity mismatch".to_owned());
+        return Err(LaunchError::Transport(
+            "provider terminal receipt identity mismatch".to_owned(),
+        ));
     }
     if kind == 106 {
-        return Err(String::from_utf8_lossy(&payload).into_owned());
+        return Err(LaunchError::Rejected(parse_rejection(&payload).map_err(
+            |error| LaunchError::Transport(format!("invalid provider rejection: {error}")),
+        )?));
     }
     if kind != 105 {
-        return Err("provider omitted terminal receipt".to_owned());
+        return Err(LaunchError::Transport(
+            "provider omitted terminal receipt".to_owned(),
+        ));
     }
-    parse_terminal(&payload)
+    parse_terminal(&payload).map_err(LaunchError::Transport)
+}
+
+fn parse_rejection(payload: &[u8]) -> Result<memcordon_core::ProviderRejectionEvidence, String> {
+    const MAX_CODE_BYTES: usize = 128;
+    const MAX_DETAIL_BYTES: usize = 8 * 1024;
+    const MAX_CLEANUP_ERRORS: usize = 16;
+    const MAX_CLEANUP_ERROR_BYTES: usize = 1024;
+    let receipt: RejectionV1 =
+        serde_json::from_slice(payload).map_err(|error| error.to_string())?;
+    if receipt.schema_version != 1
+        || receipt.code.is_empty()
+        || receipt.code.len() > MAX_CODE_BYTES
+        || !receipt
+            .code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
+        || receipt.detail.len() > MAX_DETAIL_BYTES
+        || receipt.detail.contains('\0')
+        || receipt.target_released && !receipt.target_created
+        || receipt.cleanup.errors.len() > MAX_CLEANUP_ERRORS
+        || receipt
+            .cleanup
+            .errors
+            .iter()
+            .any(|error| error.len() > MAX_CLEANUP_ERROR_BYTES || error.contains('\0'))
+    {
+        return Err("typed rejection fields violate protocol bounds".to_owned());
+    }
+    if !receipt.cleanup.attempted
+        && (receipt.cleanup.direct_child_reaped
+            || receipt.cleanup.workload_empty.is_some()
+            || receipt.cleanup.helpers_reaped
+            || receipt.cleanup.containment_removed
+            || receipt.cleanup.sealed_boundary_retired
+            || !receipt.cleanup.errors.is_empty())
+    {
+        return Err("typed rejection cleanup evidence is contradictory".to_owned());
+    }
+    if receipt.cleanup.sealed_boundary_retired
+        && (!receipt.cleanup.direct_child_reaped
+            || receipt.cleanup.workload_empty != Some(true)
+            || !receipt.cleanup.helpers_reaped
+            || !receipt.cleanup.containment_removed
+            || !receipt.cleanup.errors.is_empty())
+    {
+        return Err("typed rejection retirement evidence is incomplete".to_owned());
+    }
+    Ok(memcordon_core::ProviderRejectionEvidence {
+        schema_version: receipt.schema_version,
+        code: receipt.code,
+        phase: receipt.phase,
+        detail: receipt.detail,
+        os_code: receipt.os_code,
+        target_created: receipt.target_created,
+        target_released: receipt.target_released,
+        cleanup_attempted: receipt.cleanup.attempted,
+        restart_safety: memcordon_core::RestartSafetyProof {
+            direct_child_reaped: receipt.cleanup.direct_child_reaped,
+            workload_empty: receipt.cleanup.workload_empty,
+            helpers_reaped: receipt.cleanup.helpers_reaped,
+            containment_removed: receipt.cleanup.containment_removed,
+            containment_incapable_of_live_members: receipt.cleanup.workload_empty == Some(true),
+            sealed_boundary_retired: receipt.cleanup.sealed_boundary_retired,
+            errors: receipt.cleanup.errors,
+        },
+    })
+}
+
+fn boundary_phase_name(phase: memcordon_core::BoundarySetupPhase) -> &'static str {
+    match phase {
+        memcordon_core::BoundarySetupPhase::ProviderConnection => "provider-connection",
+        memcordon_core::BoundarySetupPhase::ProviderIdentity => "provider-identity",
+        memcordon_core::BoundarySetupPhase::BoundaryCreation => "boundary-creation",
+        memcordon_core::BoundarySetupPhase::GuardianStartup => "guardian-startup",
+        memcordon_core::BoundarySetupPhase::TargetCreation => "target-creation",
+        memcordon_core::BoundarySetupPhase::AssignmentVerification => "assignment-verification",
+        memcordon_core::BoundarySetupPhase::ResourceVerification => "resource-verification",
+        memcordon_core::BoundarySetupPhase::Authorization => "authorization",
+        memcordon_core::BoundarySetupPhase::Monitoring => "monitoring",
+        memcordon_core::BoundarySetupPhase::Retirement => "retirement",
+    }
 }
 
 pub fn probe() -> Result<ProbeReceipt, String> {
@@ -286,7 +563,12 @@ pub fn probe() -> Result<ProbeReceipt, String> {
         .map_err(|error| error.to_string())?;
     let nonce = nonce()?;
     write_frame(&mut stream, 1, nonce, [0; 16], &[])?;
-    let (kind, returned_nonce, attempt, payload) = read_frame(&mut stream)?;
+    let WireFrame {
+        kind,
+        nonce: returned_nonce,
+        attempt,
+        payload,
+    } = read_frame(&mut stream)?;
     if kind != 101 || returned_nonce != nonce || attempt != [0; 16] {
         return Err("provider probe receipt identity mismatch".to_owned());
     }
@@ -346,6 +628,7 @@ fn verify_peer(stream: &UnixStream) -> Result<(), String> {
 fn encode_launch(
     policy: &memcordon_core::Policy,
     command: &memcordon_core::CommandSpec,
+    deadline_budget: Option<Duration>,
 ) -> Result<Vec<u8>, String> {
     if command.arguments().len() > MAX_ARGUMENTS {
         return Err("launch argument count exceeds protocol limit".to_owned());
@@ -378,12 +661,16 @@ fn encode_launch(
         memcordon_core::SwapPolicy::Unlimited => output.push(2),
         memcordon_core::SwapPolicy::Host => output.push(3),
     }
-    put_optional(
-        &mut output,
-        policy.deadline.map(|deadline| {
-            monotonic_millis().saturating_add(deadline.duration().as_millis() as u64)
-        }),
-    );
+    let absolute_deadline_millis = match deadline_budget {
+        Some(duration) => Some(
+            monotonic_millis()?.saturating_add(
+                u64::try_from(duration.as_millis())
+                    .map_err(|_| "sealed deadline exceeds protocol range".to_owned())?,
+            ),
+        ),
+        None => None,
+    };
+    put_optional(&mut output, absolute_deadline_millis);
     output.push(
         match policy
             .deadline
@@ -434,16 +721,45 @@ fn put_optional(output: &mut Vec<u8>, value: Option<u64>) {
     }
 }
 
-fn monotonic_millis() -> u64 {
+fn monotonic_millis() -> Result<u64, String> {
     let mut value = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: `value` is a valid writable timespec and CLOCK_MONOTONIC needs no other lifetime.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut value) };
-    (value.tv_sec as u64)
+    // SAFETY: `value` is an initialized writable timespec of the exact ABI size;
+    // CLOCK_MONOTONIC has no additional pointer, lifetime, or thread requirements.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut value) } != 0 {
+        return Err(format!(
+            "sealed monotonic clock unavailable: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if value.tv_sec < 0 || !(0..1_000_000_000).contains(&value.tv_nsec) {
+        return Err("sealed monotonic clock returned an invalid timespec".to_owned());
+    }
+    let seconds = u64::try_from(value.tv_sec)
+        .map_err(|_| "sealed monotonic clock seconds are not representable".to_owned())?;
+    let nanoseconds = u64::try_from(value.tv_nsec)
+        .map_err(|_| "sealed monotonic clock nanoseconds are not representable".to_owned())?;
+    Ok(seconds
         .saturating_mul(1000)
-        .saturating_add(value.tv_nsec as u64 / 1_000_000)
+        .saturating_add(nanoseconds / 1_000_000))
+}
+
+pub(crate) fn effective_deadline_duration(
+    policy: &memcordon_core::Policy,
+    context: crate::supervisor::AttemptContext,
+    setup_elapsed: Duration,
+) -> Option<Duration> {
+    policy.deadline.map(|deadline| match deadline.scope() {
+        memcordon_core::DeadlineScope::Attempt => deadline.duration(),
+        memcordon_core::DeadlineScope::Supervision => {
+            context.supervision_deadline_remaining.map_or_else(
+                || deadline.duration(),
+                |remaining| remaining.saturating_sub(setup_elapsed),
+            )
+        }
+    })
 }
 
 fn pidfd_self() -> Result<OwnedFd, String> {
@@ -521,54 +837,131 @@ fn send_with_descriptors(
     Ok(())
 }
 
-fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> {
+pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> {
     let text = std::str::from_utf8(payload).map_err(|_| "terminal receipt encoding".to_owned())?;
-    let status = text
-        .lines()
-        .find_map(|line| line.strip_prefix("status="))
-        .ok_or_else(|| "terminal status missing".to_owned())?
+    if !payload.ends_with(b"\n") {
+        return Err("terminal receipt is not newline terminated".to_owned());
+    }
+    let mut fields = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let (name, value) = line
+            .split_once('=')
+            .ok_or_else(|| "terminal receipt field is malformed".to_owned())?;
+        if name.is_empty() || fields.insert(name, value).is_some() {
+            return Err("terminal receipt contains an empty or duplicate field".to_owned());
+        }
+    }
+    let status = take_terminal_field(&mut fields, "status")?
         .parse()
         .map_err(|_| "terminal status invalid".to_owned())?;
-    let target_pid = text
-        .lines()
-        .find_map(|line| line.strip_prefix("target-pid="))
-        .ok_or_else(|| "target pid missing".to_owned())?
-        .parse()
-        .map_err(|_| "target pid invalid".to_owned())?;
-    let authorization_offset_millis = text
-        .lines()
-        .find_map(|line| line.strip_prefix("authorization-offset-millis="))
-        .ok_or_else(|| "authorization offset missing".to_owned())?
-        .parse()
-        .map_err(|_| "authorization offset invalid".to_owned())?;
-    let fact = |name: &str| -> Result<bool, String> {
-        let prefix = format!("{name}=");
-        match text.lines().find_map(|line| line.strip_prefix(&prefix)) {
-            Some("true") => Ok(true),
-            Some("false") => Ok(false),
-            _ => Err(format!("terminal fact {name} missing or invalid")),
-        }
+    let exec_name = take_terminal_field(&mut fields, "exec-status")?;
+    let exec_os_code = match take_terminal_field(&mut fields, "exec-os-code")? {
+        "none" => None,
+        value => Some(
+            value
+                .parse::<i32>()
+                .map_err(|_| "terminal exec OS code invalid".to_owned())?,
+        ),
     };
-    Ok(TerminalReceipt {
+    let spawn_error_reported = take_terminal_fact(&mut fields, "spawn-error-reported")?;
+    if !spawn_error_reported {
+        return Err("terminal receipt omitted verified spawn-error reporting".to_owned());
+    }
+    let exec_status = match (exec_name, exec_os_code) {
+        ("success", None) => TerminalExecStatus::Succeeded,
+        ("not-found", Some(os_code)) => TerminalExecStatus::Failed {
+            class: TerminalExecFailureClass::NotFound,
+            os_code,
+        },
+        ("not-executable", Some(os_code)) => TerminalExecStatus::Failed {
+            class: TerminalExecFailureClass::NotExecutable,
+            os_code,
+        },
+        ("failed", Some(os_code)) => TerminalExecStatus::Failed {
+            class: TerminalExecFailureClass::Other,
+            os_code,
+        },
+        _ => return Err("terminal exec status and OS code are contradictory".to_owned()),
+    };
+    if let TerminalExecStatus::Failed { class, os_code } = exec_status {
+        if os_code <= 0 || classify_terminal_exec_error(os_code) != class {
+            return Err("terminal exec errno classification mismatch".to_owned());
+        }
+        let expected_status = match class {
+            TerminalExecFailureClass::NotFound => 127,
+            TerminalExecFailureClass::NotExecutable | TerminalExecFailureClass::Other => 126,
+        };
+        if status != expected_status {
+            return Err("terminal exec failure and child status are contradictory".to_owned());
+        }
+    }
+    let target_pid = take_terminal_field(&mut fields, "target-pid")?
+        .parse()
+        .map_err(|_| "terminal target pid invalid".to_owned())?;
+    let authorization_offset_millis =
+        take_terminal_field(&mut fields, "authorization-offset-millis")?
+            .parse()
+            .map_err(|_| "terminal authorization offset invalid".to_owned())?;
+    let receipt = TerminalReceipt {
         status,
+        exec_status,
+        spawn_error_reported,
         target_pid,
         authorization_offset_millis,
-        assignment_verified: fact("assignment-verified")?,
-        namespaces_verified: fact("namespaces-verified")?,
-        credentials_verified: fact("credentials-verified")?,
-        capabilities_empty: fact("capabilities-empty")?,
-        descriptors_verified: fact("descriptors-verified")?,
-        cgroup_view_denied: fact("cgroup-view-denied")?,
-        guardian_ready: fact("guardian-ready-before-authorization")?,
-        frontend_loss_authority: fact("frontend-loss-authority-verified")?,
-        cgroup_kill: fact("cgroup-kill-invoked")?,
-        cgroup_empty: fact("cgroup-empty")?,
-        init_reaped: fact("init-reaped")?,
-        guardian_reaped: fact("guardian-reaped")?,
-        boundary_retired: fact("boundary-retired")?,
-        memory_limit_exceeded: fact("memory-limit-exceeded")?,
-        deadline_exceeded: fact("deadline-exceeded")?,
-    })
+        assignment_verified: take_terminal_fact(&mut fields, "assignment-verified")?,
+        namespaces_verified: take_terminal_fact(&mut fields, "namespaces-verified")?,
+        credentials_verified: take_terminal_fact(&mut fields, "credentials-verified")?,
+        capabilities_empty: take_terminal_fact(&mut fields, "capabilities-empty")?,
+        descriptors_verified: take_terminal_fact(&mut fields, "descriptors-verified")?,
+        cgroup_view_denied: take_terminal_fact(&mut fields, "cgroup-view-denied")?,
+        guardian_ready: take_terminal_fact(&mut fields, "guardian-ready-before-authorization")?,
+        frontend_loss_authority: take_terminal_fact(
+            &mut fields,
+            "frontend-loss-authority-verified",
+        )?,
+        cgroup_kill: take_terminal_fact(&mut fields, "cgroup-kill-invoked")?,
+        cgroup_empty: take_terminal_fact(&mut fields, "cgroup-empty")?,
+        init_reaped: take_terminal_fact(&mut fields, "init-reaped")?,
+        guardian_reaped: take_terminal_fact(&mut fields, "guardian-reaped")?,
+        boundary_retired: take_terminal_fact(&mut fields, "boundary-retired")?,
+        memory_limit_exceeded: take_terminal_fact(&mut fields, "memory-limit-exceeded")?,
+        deadline_exceeded: take_terminal_fact(&mut fields, "deadline-exceeded")?,
+    };
+    if fields.is_empty() {
+        Ok(receipt)
+    } else {
+        Err("terminal receipt contains unknown fields".to_owned())
+    }
+}
+
+fn take_terminal_field<'a>(
+    fields: &mut std::collections::BTreeMap<&'a str, &'a str>,
+    name: &str,
+) -> Result<&'a str, String> {
+    fields
+        .remove(name)
+        .ok_or_else(|| format!("terminal field {name} missing"))
+}
+
+fn take_terminal_fact<'a>(
+    fields: &mut std::collections::BTreeMap<&'a str, &'a str>,
+    name: &str,
+) -> Result<bool, String> {
+    match take_terminal_field(fields, name)? {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("terminal fact {name} invalid")),
+    }
+}
+
+fn classify_terminal_exec_error(os_code: i32) -> TerminalExecFailureClass {
+    match os_code {
+        libc::ENOENT | libc::ENOTDIR => TerminalExecFailureClass::NotFound,
+        libc::EACCES | libc::EPERM | libc::ENOEXEC | libc::EISDIR => {
+            TerminalExecFailureClass::NotExecutable
+        }
+        _ => TerminalExecFailureClass::Other,
+    }
 }
 
 fn nonce() -> Result<[u8; 16], String> {
@@ -604,7 +997,14 @@ fn write_frame(
         .map_err(|error| error.to_string())
 }
 
-fn read_frame(stream: &mut UnixStream) -> Result<(u16, [u8; 16], [u8; 16], Vec<u8>), String> {
+struct WireFrame {
+    kind: u16,
+    nonce: [u8; 16],
+    attempt: [u8; 16],
+    payload: Vec<u8>,
+}
+
+fn read_frame(stream: &mut UnixStream) -> Result<WireFrame, String> {
     let mut header = [0_u8; HEADER_LENGTH];
     stream
         .read_exact(&mut header)
@@ -628,5 +1028,10 @@ fn read_frame(stream: &mut UnixStream) -> Result<(u16, [u8; 16], [u8; 16], Vec<u
     if Sha256::digest(&payload).as_slice() != &header[40..72] {
         return Err("provider payload digest mismatch".to_owned());
     }
-    Ok((kind, nonce, attempt, payload))
+    Ok(WireFrame {
+        kind,
+        nonce,
+        attempt,
+        payload,
+    })
 }

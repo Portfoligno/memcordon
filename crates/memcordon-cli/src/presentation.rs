@@ -106,6 +106,9 @@ pub(crate) struct ExecutionSummary<'a> {
     pub(crate) backend: &'a str,
     pub(crate) attempts: u64,
     pub(crate) restarts: u64,
+    pub(crate) failure_code: Option<&'a str>,
+    pub(crate) failure_phase: Option<&'a str>,
+    pub(crate) failure_detail: Option<&'a str>,
 }
 
 fn error_style() -> Style {
@@ -272,9 +275,26 @@ pub(crate) fn write_clean_action(
 
 pub(crate) fn write_summary(out: &mut impl Write, summary: ExecutionSummary<'_>) -> io::Result<()> {
     let style = tone_style(summary.tone);
+    let failure = match (
+        summary.failure_code,
+        summary.failure_phase,
+        summary.failure_detail,
+    ) {
+        (Some(code), Some(phase), Some(detail)) => {
+            format!("; error {code} at {phase}: {detail}")
+        }
+        (Some(code), None, Some(detail)) => format!("; error {code}: {detail}"),
+        (Some(code), _, None) => format!("; error {code}"),
+        _ => String::new(),
+    };
     writeln!(
         out,
-        "memcordon: {style}{} {}{style:#}; backend {}; attempts {}; restarts {}",
-        summary.outcome, summary.status, summary.backend, summary.attempts, summary.restarts
+        "memcordon: {style}{} {}{style:#}; backend {}; attempts {}; restarts {}{}",
+        summary.outcome,
+        summary.status,
+        summary.backend,
+        summary.attempts,
+        summary.restarts,
+        failure
     )
 }

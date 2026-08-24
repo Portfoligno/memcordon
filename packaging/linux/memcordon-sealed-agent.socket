@@ -3,7 +3,7 @@ Description=MemCordon sealed supervision provider socket
 
 [Socket]
 ListenStream=/run/memcordon/sealed-agent.sock
-DirectoryMode=0750
+DirectoryMode=0755
 SocketMode=0660
 SocketUser=root
 SocketGroup=memcordon

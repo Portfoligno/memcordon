@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use memcordon_testkit::run_with_deadline;
+use memcordon_testkit::{ObservedOutput, run_with_deadline};
 
 use crate::{CiError, Result};
 
@@ -53,19 +53,7 @@ impl CommandSpec {
     }
 
     pub fn run(&self) -> Result<Vec<u8>> {
-        eprintln!("ci subprocess program: {:?}", self.program);
-        for argument in &self.arguments {
-            eprintln!("ci subprocess argument: {argument:?}");
-        }
-        eprintln!("ci subprocess deadline: {:?}", self.deadline);
-        let mut command = Command::new(&self.program);
-        command.args(&self.arguments).current_dir(&self.current_dir);
-        if self.credential_policy == CredentialPolicy::RemoveInherited {
-            command
-                .env_remove("CARGO_REGISTRY_TOKEN")
-                .env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
-        }
-        let output = run_with_deadline(&mut command, self.deadline)?;
+        let output = self.output()?;
         if output.status.success() {
             if !output.stdout.is_empty() {
                 print!("{}", String::from_utf8_lossy(&output.stdout));
@@ -82,6 +70,22 @@ impl CommandSpec {
                 String::from_utf8_lossy(&output.stderr)
             )))
         }
+    }
+
+    pub fn output(&self) -> Result<ObservedOutput> {
+        eprintln!("ci subprocess program: {:?}", self.program);
+        for argument in &self.arguments {
+            eprintln!("ci subprocess argument: {argument:?}");
+        }
+        eprintln!("ci subprocess deadline: {:?}", self.deadline);
+        let mut command = Command::new(&self.program);
+        command.args(&self.arguments).current_dir(&self.current_dir);
+        if self.credential_policy == CredentialPolicy::RemoveInherited {
+            command
+                .env_remove("CARGO_REGISTRY_TOKEN")
+                .env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
+        }
+        run_with_deadline(&mut command, self.deadline).map_err(Into::into)
     }
 }
 

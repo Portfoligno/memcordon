@@ -42,5 +42,9 @@ windows-sys = { workspace = true, features = [
 name = "test_support"
 required-features = ["test-support"]
 
+[[test]]
+name = "sealed_exec"
+required-features = ["test-support"]
+
 [lints]
 workspace = true

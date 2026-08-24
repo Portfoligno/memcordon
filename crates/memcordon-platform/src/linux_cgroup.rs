@@ -40,19 +40,50 @@ fn bounded_pause(duration: Duration) {
 }
 
 pub fn probe() -> ProbeReport {
-    match delegated_parent(true) {
+    let standard = match delegated_parent(true) {
         Ok(path) => {
             if let Err(error) = probe_delegated_parent(&path) {
-                return unavailable(error);
-            }
-            let backend = info();
-            ProbeReport {
-                selected: Some(backend.clone()),
-                available: vec![backend],
-                unavailable: Vec::new(),
+                Err(error)
+            } else {
+                Ok(())
             }
         }
-        Err(error) => unavailable(error),
+        Err(error) => Err(error),
+    };
+    compose_probe(standard, crate::sealed::client::probe())
+}
+
+pub(crate) fn compose_probe(
+    standard: Result<(), String>,
+    provider: Result<crate::sealed::client::ProbeReceipt, String>,
+) -> ProbeReport {
+    let mut available = Vec::new();
+    let mut unavailable = Vec::new();
+    let selected = match standard {
+        Ok(()) => {
+            let backend = info();
+            available.push(backend.clone());
+            Some(backend)
+        }
+        Err(reason) => {
+            unavailable.push(UnavailableBackend {
+                name: "linux-cgroup-v2",
+                reason,
+            });
+            None
+        }
+    };
+    match provider {
+        Ok(receipt) => available.push(sealed_info(receipt)),
+        Err(reason) => unavailable.push(UnavailableBackend {
+            name: "linux-sealed-provider",
+            reason,
+        }),
+    }
+    ProbeReport {
+        selected,
+        available,
+        unavailable,
     }
 }
 
@@ -143,17 +174,6 @@ fn check_probe_cgroup(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn unavailable(reason: String) -> ProbeReport {
-    ProbeReport {
-        selected: None,
-        available: Vec::new(),
-        unavailable: vec![UnavailableBackend {
-            name: "linux-cgroup-v2",
-            reason,
-        }],
-    }
-}
-
 #[allow(
     clippy::result_large_err,
     reason = "cleanup propagates the categorized Error unchanged through the public boundary"
@@ -204,41 +224,16 @@ pub fn cleanup_stale(dry_run: bool) -> Result<Vec<String>, Error> {
 }
 
 pub(crate) fn info() -> BackendInfo {
-    let provider = crate::sealed::client::probe();
-    let sealed_reason = provider
-        .as_ref()
-        .err()
-        .cloned()
-        .unwrap_or_else(|| "qualified provider available".to_owned());
-    let mut boundary_support = crate::backend::standard_boundary_support(
+    let boundary_support = crate::backend::standard_boundary_support(
         "gated-cgroup-v2-v1",
         true,
-        &sealed_reason,
+        "sealed supervision is provided by the independent root provider backend",
         &[
             "root-owned private cgroup v2 subtree",
             "clone3 PID, mount, and cgroup namespaces",
             "independent root guardian",
         ],
     );
-    if let Ok(receipt) = provider {
-        boundary_support.sealed = crate::backend::SealedAvailability::Available {
-            capability: memcordon_core::BoundaryCapability {
-                class: memcordon_core::BoundaryClass::Sealed,
-                mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
-                target_gated: true,
-                boundary_verified_before_authorization: true,
-                target_can_reconfigure_boundary: false,
-                frontend_loss_cleanup_authority: true,
-                workload_empty_proof: true,
-                limitations: vec!["requires installed root MemCordon provider".to_owned()],
-            },
-            qualification: crate::backend::BoundaryQualification {
-                provider_identity: receipt.provider_identity,
-                receipt_digest: receipt.receipt_digest,
-                mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
-            },
-        };
-    }
     BackendInfo {
         name: "linux-cgroup-v2",
         containment_supported: true,
@@ -253,6 +248,46 @@ pub(crate) fn info() -> BackendInfo {
             "swap accounting is a separate policy",
         ],
         boundary_support,
+    }
+}
+
+pub(crate) fn sealed_info(receipt: crate::sealed::client::ProbeReceipt) -> BackendInfo {
+    BackendInfo {
+        name: "linux-sealed-provider",
+        containment_supported: true,
+        memory_supported: true,
+        class: "hard",
+        metric: "linux-cgroup-memory",
+        hard_limit: true,
+        startup_containment: "provider-gated PID namespace target assigned before authorization",
+        limitations: vec!["requires installed root MemCordon provider"],
+        boundary_support: crate::backend::BoundarySupport {
+            standard: memcordon_core::BoundaryCapability {
+                class: memcordon_core::BoundaryClass::Unavailable,
+                mechanism: "sealed-provider-standard-unavailable".to_owned(),
+                limitations: vec![
+                    "the provider backend is selected only for sealed supervision".to_owned(),
+                ],
+                ..memcordon_core::BoundaryCapability::default()
+            },
+            sealed: crate::backend::SealedAvailability::Available {
+                capability: memcordon_core::BoundaryCapability {
+                    class: memcordon_core::BoundaryClass::Sealed,
+                    mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+                    target_gated: true,
+                    boundary_verified_before_authorization: true,
+                    target_can_reconfigure_boundary: false,
+                    frontend_loss_cleanup_authority: true,
+                    workload_empty_proof: true,
+                    limitations: vec!["requires installed root MemCordon provider".to_owned()],
+                },
+                qualification: crate::backend::BoundaryQualification {
+                    provider_identity: receipt.provider_identity,
+                    receipt_digest: receipt.receipt_digest,
+                    mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+                },
+            },
+        },
     }
 }
 

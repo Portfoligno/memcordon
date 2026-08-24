@@ -24,7 +24,7 @@ fn main() {
 fn serve() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        return memcordon_sealed_agent::linux::service::serve();
+        memcordon_sealed_agent::linux::service::serve()
     }
     #[cfg(not(target_os = "linux"))]
     Err("the sealed provider service is not implemented on this platform".to_owned())
@@ -33,11 +33,13 @@ fn serve() -> Result<(), String> {
 fn qualify() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
+        let _qualification_lease =
+            memcordon_sealed_agent::linux::service::acquire_qualification_lease()?;
         println!(
             "{}",
             memcordon_sealed_agent::linux::qualification::qualify()?.render()
         );
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     Err("sealed qualification is unavailable on this platform".to_owned())

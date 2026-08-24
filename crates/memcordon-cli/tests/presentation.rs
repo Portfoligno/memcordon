@@ -132,8 +132,34 @@ fn summary_tones_preserve_outcomes_statuses_and_metadata() {
                     backend: "fixture",
                     attempts: 2,
                     restarts: 1,
+                    failure_code: None,
+                    failure_phase: None,
+                    failure_detail: None,
                 },
             )
         });
     }
+}
+
+#[test]
+fn failed_summary_preserves_the_typed_provider_rejection() {
+    assert_renderer(
+        "memcordon: supervision failed 125; backend linux-sealed-provider; attempts 1; restarts 0; error MCSEALED-TARGET-DESCRIPTORS-READBACK at resource-verification: permission denied\n",
+        |out| {
+            presentation::write_summary(
+                out,
+                ExecutionSummary {
+                    outcome: "supervision failed",
+                    tone: SummaryTone::Error,
+                    status: 125,
+                    backend: "linux-sealed-provider",
+                    attempts: 1,
+                    restarts: 0,
+                    failure_code: Some("MCSEALED-TARGET-DESCRIPTORS-READBACK"),
+                    failure_phase: Some("resource-verification"),
+                    failure_detail: Some("permission denied"),
+                },
+            )
+        },
+    );
 }

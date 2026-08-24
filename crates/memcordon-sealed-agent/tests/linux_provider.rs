@@ -29,6 +29,7 @@ fn qualification_receipt_requires_complete_retirement() {
             target_gated: true,
             assignment_verified: true,
             inherited_descriptors_verified: true,
+            spawn_error_reporting_verified: true,
             frontend_loss_authority_verified: true,
             cgroup_kill: true,
             workload_empty: true,
@@ -37,5 +38,20 @@ fn qualification_receipt_requires_complete_retirement() {
             recovery_complete: false,
         };
         assert!(!incomplete.complete());
+    }
+}
+
+#[test]
+fn gated_target_cgroup_readback_uses_mountinfo_filesystem_type() {
+    #[cfg(target_os = "linux")]
+    {
+        let hidden = "36 25 0:32 / /sys rw,nosuid,nodev - tmpfs tmpfs rw\n";
+        assert!(!memcordon_sealed_agent::linux::launch::cgroup_mount_visible(hidden).unwrap());
+
+        let exposed = "37 25 0:29 / /sys/fs/cgroup rw,nosuid,nodev - cgroup2 cgroup rw\n";
+        assert!(memcordon_sealed_agent::linux::launch::cgroup_mount_visible(exposed).unwrap());
+
+        let malformed = "37 25 0:29 / /sys/fs/cgroup rw,nosuid,nodev cgroup2 cgroup rw\n";
+        assert!(memcordon_sealed_agent::linux::launch::cgroup_mount_visible(malformed).is_err());
     }
 }

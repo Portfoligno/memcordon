@@ -626,6 +626,7 @@ dependencies = [
  "clap",
  "flate2",
  "hex",
+ "libc",
  "memcordon-core",
  "memcordon-testkit",
  "semver",
@@ -672,6 +673,8 @@ dependencies = [
  "libc",
  "memcordon-core",
  "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "windows-sys 0.61.2",
 ]

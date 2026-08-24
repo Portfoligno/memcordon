@@ -1539,6 +1539,7 @@ struct RustPolicy {
     calls_current_exe: bool,
     names_proc_self_exe: bool,
     calls_env_remove: bool,
+    subprocess_env_mutations: usize,
     pre_exec_calls: usize,
     fork_calls: usize,
 }
@@ -1602,8 +1603,7 @@ impl<'ast> Visit<'ast> for RustPolicy {
             self.pre_exec_calls += 1;
         }
         if matches!(expression.method.to_string().as_str(), "env" | "envs") {
-            self.violations
-                .push("subprocess environment mutation is forbidden".to_owned());
+            self.subprocess_env_mutations += 1;
         }
         syn::visit::visit_expr_method_call(self, expression);
     }
@@ -1637,12 +1637,18 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     visitor.visit_file(&syntax);
     let test_support = Path::new("crates/memcordon-platform/src/test_support.rs");
     let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
+    let sealed_launch = Path::new("crates/memcordon-sealed-agent/src/linux/launch.rs");
+    if visitor.subprocess_env_mutations != 0 && relative != sealed_launch {
+        visitor
+            .violations
+            .push("subprocess environment mutation is forbidden".to_owned());
+    }
     if visitor.pre_exec_calls != 0 && relative != test_support {
         visitor.violations.push(
             "pre_exec is allowed only at the exact reviewed process-test boundary".to_owned(),
         );
     }
-    if visitor.fork_calls != 0 {
+    if visitor.fork_calls != 0 && !is_reviewed_raw_fork_boundary(relative) {
         visitor.violations.push("raw fork is forbidden".to_owned());
     }
     if relative.starts_with(Path::new("crates/memcordon-platform/src"))
@@ -1717,12 +1723,18 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         visitor.visit_file(&syntax);
         let test_support = Path::new("crates/memcordon-platform/src/test_support.rs");
         let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
+        let sealed_launch = Path::new("crates/memcordon-sealed-agent/src/linux/launch.rs");
+        if visitor.subprocess_env_mutations != 0 && relative != sealed_launch {
+            visitor
+                .violations
+                .push("subprocess environment mutation is forbidden".to_owned());
+        }
         if visitor.pre_exec_calls != 0 && relative != test_support {
             visitor
                 .violations
                 .push("pre_exec is allowed only at the reviewed process-test boundary".to_owned());
         }
-        if visitor.fork_calls != 0 {
+        if visitor.fork_calls != 0 && !is_reviewed_raw_fork_boundary(relative) {
             visitor.violations.push("raw fork is forbidden".to_owned());
         }
         if relative == test_support {
@@ -1757,6 +1769,20 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn is_reviewed_raw_fork_boundary(relative: &Path) -> bool {
+    matches!(
+        relative,
+        path if path == Path::new("crates/memcordon-sealed-agent/src/linux/launch.rs")
+            || path == Path::new("crates/memcordon-sealed-agent/src/linux/service.rs")
+            || path
+                == Path::new(
+                    "crates/memcordon-sealed-agent/src/bin/memcordon-sealed-test-fixture.rs",
+                )
+            || path == Path::new("crates/memcordon-sealed-agent/tests/linux_faults.rs")
+            || path == Path::new("crates/memcordon-sealed-agent/tests/linux_sealed.rs")
+    )
 }
 
 fn check_manifests(root: &Path, policy: &config::Policy) -> Result<()> {

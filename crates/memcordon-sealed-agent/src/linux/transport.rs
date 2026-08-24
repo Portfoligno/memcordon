@@ -1,5 +1,5 @@
 use std::io::{Cursor, Read};
-use std::mem::{size_of, zeroed};
+use std::mem::{size_of, size_of_val, zeroed};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
@@ -101,7 +101,7 @@ pub fn send(
     };
     let control_length =
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
-        unsafe { libc::CMSG_SPACE((descriptors.len() * size_of::<RawFd>()) as u32) } as usize;
+        unsafe { libc::CMSG_SPACE(size_of_val(descriptors) as u32) } as usize;
     let mut control = vec![0_u8; control_length];
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     let mut message: libc::msghdr = unsafe { zeroed() };
@@ -116,8 +116,7 @@ pub fn send(
         unsafe {
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len =
-                libc::CMSG_LEN((descriptors.len() * size_of::<RawFd>()) as u32) as usize;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(size_of_val(descriptors) as u32) as usize;
             std::ptr::copy_nonoverlapping(
                 descriptors.as_ptr(),
                 libc::CMSG_DATA(cmsg).cast(),

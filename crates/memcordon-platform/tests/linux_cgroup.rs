@@ -2,9 +2,11 @@
 
 use std::fs;
 
+use memcordon_core::BoundaryRequirement;
 use memcordon_platform::test_support::{
     linux_configure, linux_launcher_status, linux_launcher_status_timeout,
-    linux_limit_delta_is_authoritative, linux_monitor_errors, linux_verify,
+    linux_limit_delta_is_authoritative, linux_monitor_errors, linux_probe_from_results,
+    linux_verify,
 };
 
 fn status(kind: u8, errno: i32) -> [u8; 12] {
@@ -112,5 +114,66 @@ fn launcher_status_reports_a_live_incomplete_stream_as_timeout() {
     assert_eq!(
         linux_launcher_status_timeout(),
         std::io::ErrorKind::TimedOut
+    );
+}
+
+#[test]
+fn qualified_provider_is_selected_without_caller_delegation() {
+    let report = linux_probe_from_results(
+        Err("caller cgroup is not delegated".to_owned()),
+        Ok(("provider-v1".to_owned(), "ab".repeat(32))),
+    );
+    assert!(report.selected.is_none());
+    let sealed = report
+        .selected_for(BoundaryRequirement::Sealed)
+        .expect("qualified independent provider must satisfy sealed selection");
+    assert_eq!(sealed.name, "linux-sealed-provider");
+    assert_eq!(report.available.len(), 1);
+    assert_eq!(report.unavailable.len(), 1);
+    assert_eq!(report.unavailable[0].name, "linux-cgroup-v2");
+    assert_eq!(
+        report.unavailable[0].reason,
+        "caller cgroup is not delegated"
+    );
+    assert!(report.selected_for(BoundaryRequirement::Standard).is_none());
+}
+
+#[test]
+fn unavailable_provider_never_promotes_sealed_capability() {
+    let report = linux_probe_from_results(
+        Ok(()),
+        Err("provider endpoint permission denied".to_owned()),
+    );
+    assert_eq!(
+        report
+            .selected_for(BoundaryRequirement::Standard)
+            .expect("standard backend remains available")
+            .name,
+        "linux-cgroup-v2"
+    );
+    assert!(report.selected_for(BoundaryRequirement::Sealed).is_none());
+    assert!(report.unavailable.iter().any(|backend| {
+        backend.name == "linux-sealed-provider"
+            && backend.reason == "provider endpoint permission denied"
+    }));
+}
+
+#[test]
+fn standard_and_sealed_selection_remain_independent_when_both_are_available() {
+    let report = linux_probe_from_results(Ok(()), Ok(("provider-v1".to_owned(), "cd".repeat(32))));
+    assert_eq!(report.selected.as_ref().unwrap().name, "linux-cgroup-v2");
+    assert_eq!(
+        report
+            .selected_for(BoundaryRequirement::Standard)
+            .unwrap()
+            .name,
+        "linux-cgroup-v2"
+    );
+    assert_eq!(
+        report
+            .selected_for(BoundaryRequirement::Sealed)
+            .unwrap()
+            .name,
+        "linux-sealed-provider"
     );
 }

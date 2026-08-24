@@ -39,8 +39,74 @@ pub fn linux_launcher_status(bytes: &[u8]) -> io::Result<Option<i32>> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn sealed_terminal_spawn_error(
+    payload: &[u8],
+) -> Result<Option<memcordon_core::Error>, String> {
+    let terminal = crate::sealed::client::parse_terminal(payload)?;
+    let crate::sealed::client::TerminalExecStatus::Failed { class, os_code } = terminal.exec_status
+    else {
+        return Ok(None);
+    };
+    let cleanup = memcordon_core::CleanupSummary {
+        direct_child_reaped: terminal.init_reaped,
+        workload_empty: Some(terminal.cgroup_empty),
+        errors: Vec::new(),
+        ..memcordon_core::CleanupSummary::default()
+    };
+    let restart_safety = crate::sealed::client::terminal_restart_safety(&terminal);
+    Ok(Some(crate::sealed::client::terminal_spawn_error(
+        &terminal,
+        class,
+        os_code,
+        cleanup,
+        restart_safety,
+    )))
+}
+
+#[cfg(target_os = "linux")]
 pub fn linux_launcher_status_timeout() -> io::ErrorKind {
     crate::linux_cgroup::test_launcher_status_timeout()
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_probe_from_results(
+    standard: Result<(), String>,
+    provider: Result<(String, String), String>,
+) -> crate::ProbeReport {
+    crate::linux_cgroup::compose_probe(
+        standard,
+        provider.map(
+            |(provider_identity, receipt_digest)| crate::sealed::client::ProbeReceipt {
+                provider_identity,
+                receipt_digest,
+            },
+        ),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_sealed_deadline_duration(
+    policy: &memcordon_core::Policy,
+    context: crate::AttemptContext,
+    setup_elapsed: std::time::Duration,
+) -> Option<std::time::Duration> {
+    crate::sealed::client::effective_deadline_duration(policy, context, setup_elapsed)
+}
+
+pub fn backend_selection_matches(
+    selected: &memcordon_core::BackendCapabilityReport,
+    observed: &memcordon_core::BackendCapabilityReport,
+    metric: memcordon_core::Metric,
+) -> bool {
+    crate::supervisor::test_backend_selection_matches(selected, observed, metric)
+}
+
+pub fn sealed_deadline_rejection_is_outside_attempt(
+    policy: &memcordon_core::Policy,
+    context: crate::AttemptContext,
+    error: &memcordon_core::Error,
+) -> bool {
+    crate::supervisor::test_sealed_deadline_rejection_is_outside_attempt(policy, context, error)
 }
 
 #[cfg(windows)]

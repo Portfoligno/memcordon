@@ -65,6 +65,7 @@ pub struct SupervisorRequest {
     pub restart: RestartPolicy,
     pub command: CommandSpec,
     pub memcordon_executable: Option<PathBuf>,
+    pub resolved_backend: Option<BackendCapabilityReport>,
 }
 
 #[derive(Clone, Debug)]
@@ -191,54 +192,38 @@ pub fn capabilities_for(
 #[cfg(unix)]
 #[allow(clippy::result_large_err)]
 pub fn supervise(request: SupervisorRequest) -> Result<SupervisionExecution, Error> {
-    reject_unavailable_sealed(&request)?;
+    let resolved_backend = validate_resolved_backend(&request)?;
     let signal = SignalSource::install().map_err(|error| {
         Error::new(ErrorCategory::Setup, "MCSETUP-SIGNAL", error.to_string()).with_os_error(&error)
     })?;
-    supervise_with(request, &signal)
+    supervise_with(request, &signal, resolved_backend)
 }
 
 #[cfg(target_os = "windows")]
 #[allow(clippy::result_large_err)]
 pub fn supervise(request: SupervisorRequest) -> Result<SupervisionExecution, Error> {
-    reject_unavailable_sealed(&request)?;
+    let resolved_backend = validate_resolved_backend(&request)?;
     let console = crate::windows_job::ConsoleControl::install().map_err(|error| {
         Error::new(ErrorCategory::Setup, "MCSETUP-CONSOLE", error.to_string()).with_os_error(&error)
     })?;
-    supervise_with(request, &console)
+    supervise_with(request, &console, resolved_backend)
 }
 
 #[allow(clippy::result_large_err)]
-fn reject_unavailable_sealed(request: &SupervisorRequest) -> Result<(), Error> {
-    if request.policy.boundary() == BoundaryRequirement::Sealed {
-        let probe = crate::backend::probe();
-        if probe.selected.as_ref().is_some_and(|backend| {
-            matches!(
-                backend.boundary_support.sealed,
-                crate::backend::SealedAvailability::Available { .. }
-            )
-        }) {
-            return Ok(());
+fn validate_resolved_backend(
+    request: &SupervisorRequest,
+) -> Result<Option<BackendCapabilityReport>, Error> {
+    let Some(backend) = request.resolved_backend.clone() else {
+        if request.policy.boundary() != BoundaryRequirement::Sealed {
+            return Ok(None);
         }
-        let reason = probe
-            .selected
-            .as_ref()
-            .and_then(|backend| match &backend.boundary_support.sealed {
-                crate::backend::SealedAvailability::Available { .. } => None,
-                crate::backend::SealedAvailability::Unavailable { reason, .. } => {
-                    Some(reason.as_str())
-                }
-            })
-            .unwrap_or("no certified sealed backend was selected");
         // No target, helper, or boundary was created. Keep every cleanup fact
         // false/unknown instead of presenting non-applicable work as observed.
         let restart_safety = RestartSafetyProof::default();
         return Err(Error::new(
             ErrorCategory::Unsupported,
             "MCBOUNDARY-UNSUPPORTED",
-            format!(
-                "certified sealed supervision is unavailable: {reason}; the target was not authorized"
-            ),
+            "certified sealed supervision was not resolved before launch; the target was not authorized",
         )
         .with_restart_safety(restart_safety.clone())
         .with_boundary_setup_failure(memcordon_core::BoundarySetupFailure {
@@ -250,8 +235,19 @@ fn reject_unavailable_sealed(request: &SupervisorRequest) -> Result<(), Error> {
             cleanup_attempted: false,
             restart_safety,
         }));
+    };
+    let expected = match request.policy.boundary() {
+        BoundaryRequirement::Standard => memcordon_core::BoundaryClass::Standard,
+        BoundaryRequirement::Sealed => memcordon_core::BoundaryClass::Sealed,
+    };
+    if backend.name.is_empty() || backend.boundary.class != expected {
+        return Err(Error::new(
+            ErrorCategory::Setup,
+            "MCBACKEND-SELECTION-MISMATCH",
+            "resolved backend does not satisfy the requested boundary",
+        ));
     }
-    Ok(())
+    Ok(Some(backend))
 }
 
 #[cfg(not(any(unix, target_os = "windows")))]
@@ -268,6 +264,7 @@ pub fn supervise(_request: SupervisorRequest) -> Result<SupervisionExecution, Er
 fn supervise_with<I: InterruptionWait>(
     request: SupervisorRequest,
     signal: &I,
+    resolved_backend: Option<BackendCapabilityReport>,
 ) -> Result<SupervisionExecution, Error> {
     let started = Instant::now();
     let mut history = AttemptHistory::default();
@@ -280,7 +277,7 @@ fn supervise_with<I: InterruptionWait>(
             Some(RestartCoordinator::new(settings).map_err(controller_error)?)
         }
     };
-    let mut backend = None;
+    let mut backend = resolved_backend;
     let mut supervision_origin_offset = None;
     loop {
         let attempt_started = started.elapsed();
@@ -324,7 +321,13 @@ fn supervise_with<I: InterruptionWait>(
         match result {
             Err(error) => {
                 let error = *error;
-                if error.code == "MCSUPERVISION-DEADLINE-BEFORE-AUTHORIZATION" {
+                if error.code == "MCSUPERVISION-DEADLINE-BEFORE-AUTHORIZATION"
+                    || sealed_deadline_rejection_is_outside_attempt(
+                        &request.policy,
+                        context,
+                        &error,
+                    )
+                {
                     let outside_deadline = outside_deadline_evidence(
                         &request.policy,
                         supervision_origin_offset,
@@ -381,11 +384,17 @@ fn supervise_with<I: InterruptionWait>(
                             outcome: None,
                             error: Some(record_error.clone()),
                             restart_decision: RestartDecisionRecord::default(),
-                            launch: launch_from_error(&error),
+                            launch: launch_from_error(
+                                &error,
+                                request.policy.boundary(),
+                                backend.as_ref(),
+                            ),
                             restart_safety: proof_from_error(&error),
-                            boundary_detail: memcordon_core::BoundaryMechanismEvidence::Standard {
-                                backend: "setup-failed-before-selection".to_owned(),
-                            },
+                            boundary_detail: boundary_failure_detail(
+                                &error,
+                                request.policy.boundary(),
+                                backend.as_ref(),
+                            ),
                         },
                         &mut aggregates,
                     )
@@ -415,7 +424,19 @@ fn supervise_with<I: InterruptionWait>(
                         .authorization_offset
                         .map(|offset| attempt_started + offset);
                 }
-                backend.get_or_insert_with(|| capabilities(&attempt.execution.backend));
+                let observed =
+                    capabilities_for(&attempt.execution.backend, request.policy.boundary());
+                if backend.as_ref().is_some_and(|selected| {
+                    !backend_selection_matches(selected, &observed, request.policy.metric)
+                }) {
+                    return Err(Error::new(
+                        ErrorCategory::Monitor,
+                        "MCBACKEND-SELECTION-DRIFT",
+                        "runtime backend evidence disagrees with the resolved backend",
+                    )
+                    .with_restart_safety(attempt.restart_safety));
+                }
+                backend = Some(observed);
                 targets_authorized = targets_authorized
                     .checked_add(1)
                     .ok_or_else(counter_error)?;
@@ -564,6 +585,60 @@ fn supervise_with<I: InterruptionWait>(
     }
 }
 
+fn sealed_deadline_rejection_is_outside_attempt(
+    policy: &Policy,
+    context: AttemptContext,
+    error: &Error,
+) -> bool {
+    let Some(deadline) = policy.deadline else {
+        return false;
+    };
+    if deadline.scope() != memcordon_core::DeadlineScope::Supervision
+        || context.supervision_deadline_remaining.is_none()
+        || error.category != ErrorCategory::Setup
+        || error.code != "MCSEALED-PROVIDER-REJECTION"
+        || error.target_released
+        || error.authorization_offset.is_some()
+        || error.workload_may_be_alive
+        || error.launch_phase != Some("authorization")
+    {
+        return false;
+    }
+    let (Some(rejection), Some(failure)) = (
+        error.provider_rejection.as_ref(),
+        error.boundary_setup_failure.as_ref(),
+    ) else {
+        return false;
+    };
+    rejection.schema_version == 1
+        && rejection.code == "MCSEALED-AUTHORIZATION"
+        && rejection.phase == memcordon_core::BoundarySetupPhase::Authorization
+        && rejection.target_created
+        && !rejection.target_released
+        && rejection.cleanup_attempted
+        && rejection
+            .restart_safety
+            .is_safe_for(BoundaryRequirement::Sealed)
+        && error.os_code == rejection.os_code
+        && error.restart_safety.as_ref() == Some(&rejection.restart_safety)
+        && failure.requested == BoundaryRequirement::Sealed
+        && failure.mechanism.as_deref() == Some("linux-pid-namespace-cgroup-v1")
+        && failure.phase == rejection.phase
+        && failure.target_created == rejection.target_created
+        && failure.target_released == rejection.target_released
+        && failure.cleanup_attempted == rejection.cleanup_attempted
+        && failure.restart_safety == rejection.restart_safety
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn test_sealed_deadline_rejection_is_outside_attempt(
+    policy: &Policy,
+    context: AttemptContext,
+    error: &Error,
+) -> bool {
+    sealed_deadline_rejection_is_outside_attempt(policy, context, error)
+}
+
 #[allow(clippy::result_large_err)]
 #[cfg(unix)]
 fn run_unix_attempt(
@@ -576,6 +651,7 @@ fn run_unix_attempt(
         return attempt_execution(crate::sealed::client::run(
             &request.policy,
             &request.command,
+            context,
         )?);
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -651,6 +727,43 @@ fn supervision_remaining(
             None
         }
     })
+}
+
+fn backend_selection_matches(
+    selected: &BackendCapabilityReport,
+    observed: &BackendCapabilityReport,
+    metric: memcordon_core::Metric,
+) -> bool {
+    let mut expected = selected.clone();
+    if metric != memcordon_core::Metric::Native {
+        if let Some(memory) = expected
+            .memory
+            .as_mut()
+            .filter(|memory| memory.class == "watchdog")
+        {
+            memory.metric = watchdog_metric(metric).to_owned();
+        }
+    }
+    expected == *observed
+}
+
+const fn watchdog_metric(metric: memcordon_core::Metric) -> &'static str {
+    match metric {
+        memcordon_core::Metric::Native | memcordon_core::Metric::PhysicalFootprint => {
+            "physical-footprint-sum"
+        }
+        memcordon_core::Metric::Rss => "rss-sum",
+        memcordon_core::Metric::Virtual => "virtual-size-sum",
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn test_backend_selection_matches(
+    selected: &BackendCapabilityReport,
+    observed: &BackendCapabilityReport,
+    metric: memcordon_core::Metric,
+) -> bool {
+    backend_selection_matches(selected, observed, metric)
 }
 
 fn outside_deadline_evidence(
@@ -743,6 +856,7 @@ fn error_record(
         } else {
             None
         },
+        provider_rejection: error.provider_rejection.clone(),
     }
 }
 fn proof_from_error(error: &Error) -> RestartSafetyProof {
@@ -762,19 +876,65 @@ fn proof_from_error(error: &Error) -> RestartSafetyProof {
         )],
     }
 }
-fn launch_from_error(error: &Error) -> LaunchEvidence {
+fn launch_from_error(
+    error: &Error,
+    requested: BoundaryRequirement,
+    backend: Option<&BackendCapabilityReport>,
+) -> LaunchEvidence {
+    let mechanism = backend
+        .map(|backend| backend.boundary.mechanism.clone())
+        .filter(|mechanism| !mechanism.is_empty())
+        .unwrap_or_else(|| launch_mechanism().to_owned());
+    let sealed = requested == BoundaryRequirement::Sealed;
     LaunchEvidence {
-        mechanism: launch_mechanism().to_owned(),
+        mechanism,
         target_released: error.target_released,
         containment_verified_before_authorization: error.cgroup_verified_before_release,
         guardian_started_before_authorization: error.guardian_ready_before_release,
         target_spawn_error_reported: error.launch_phase == Some("target-spawn-failed"),
-        boundary_requested: BoundaryRequirement::Standard,
-        boundary_effective: BoundaryClass::Standard,
-        boundary_assignment_verified: false,
-        boundary_reconfiguration_denied: false,
-        inherited_resources_restricted: false,
-        frontend_loss_cleanup_authority_verified: false,
+        boundary_requested: requested,
+        boundary_effective: if error.target_released && sealed {
+            BoundaryClass::Sealed
+        } else if sealed {
+            BoundaryClass::Unavailable
+        } else {
+            BoundaryClass::Standard
+        },
+        boundary_assignment_verified: sealed && error.cgroup_verified_before_release,
+        boundary_reconfiguration_denied: sealed && error.cgroup_verified_before_release,
+        inherited_resources_restricted: sealed && error.cgroup_verified_before_release,
+        frontend_loss_cleanup_authority_verified: sealed && error.guardian_ready_before_release,
+    }
+}
+
+fn boundary_failure_detail(
+    error: &Error,
+    requested: BoundaryRequirement,
+    backend: Option<&BackendCapabilityReport>,
+) -> memcordon_core::BoundaryMechanismEvidence {
+    if let Some(failure) = &error.boundary_setup_failure {
+        return memcordon_core::BoundaryMechanismEvidence::SetupFailure {
+            provider_mechanism: failure
+                .mechanism
+                .clone()
+                .or_else(|| backend.map(|backend| backend.boundary.mechanism.clone()))
+                .unwrap_or_else(|| "unresolved-boundary-setup".to_owned()),
+            requested,
+        };
+    }
+    if requested == BoundaryRequirement::Sealed {
+        return memcordon_core::BoundaryMechanismEvidence::SetupFailure {
+            provider_mechanism: backend
+                .map(|backend| backend.boundary.mechanism.clone())
+                .filter(|mechanism| !mechanism.is_empty())
+                .unwrap_or_else(|| "unresolved-sealed-setup".to_owned()),
+            requested,
+        };
+    }
+    memcordon_core::BoundaryMechanismEvidence::Standard {
+        backend: backend
+            .map(|backend| backend.name.clone())
+            .unwrap_or_else(|| "setup-failed-before-selection".to_owned()),
     }
 }
 fn unsupported_capability() -> BackendCapabilityReport {

@@ -80,6 +80,36 @@ pub struct BackendCleanupFacts {
     pub errors: Vec<String>,
 }
 
+impl BackendInfo {
+    pub fn supports_boundary(&self, requirement: memcordon_core::BoundaryRequirement) -> bool {
+        match requirement {
+            memcordon_core::BoundaryRequirement::Standard => {
+                self.boundary_support.standard.class != memcordon_core::BoundaryClass::Unavailable
+            }
+            memcordon_core::BoundaryRequirement::Sealed => matches!(
+                &self.boundary_support.sealed,
+                SealedAvailability::Available { .. }
+            ),
+        }
+    }
+}
+
+impl ProbeReport {
+    pub fn selected_for(
+        &self,
+        requirement: memcordon_core::BoundaryRequirement,
+    ) -> Option<&BackendInfo> {
+        self.selected
+            .as_ref()
+            .filter(|backend| backend.supports_boundary(requirement))
+            .or_else(|| {
+                self.available
+                    .iter()
+                    .find(|backend| backend.supports_boundary(requirement))
+            })
+    }
+}
+
 pub(crate) fn standard_boundary_support(
     mechanism: &str,
     containment_supported: bool,

@@ -370,9 +370,11 @@ include omitted attempts. Half-life waits set
 and `supervision.restart.half_life_logistic_waits` counts all such waits. A
 deadline reached during backoff, cooldown, or later setup is a top-level
 outside-attempt terminal. Initial spawn errors use typed
-`initial_spawn_failure` provenance; statuses 126 and 127 derive exclusively
-from `not-executable` and `not-found`. Consumers must reject unsupported schema
-versions.
+`initial_spawn_failure` provenance; their wrapper statuses 126 and 127 derive
+from `not-executable` and `not-found`. A successfully executed program may also
+exit 126 or 127, so consumers distinguish those ordinary child outcomes using
+the typed spawn provenance rather than the number alone. Consumers must reject
+unsupported schema versions.
 
 ## Security boundary
 

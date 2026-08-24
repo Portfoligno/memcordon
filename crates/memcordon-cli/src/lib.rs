@@ -222,11 +222,17 @@ impl Supervisor {
         })?;
         let helper = self.memcordon_executable.map(|value| value.0);
         let restart = resolve_restart_policy(&self.policy, self.restart)?;
+        let boundary = self.policy.boundary();
+        let probe = memcordon_platform::probe();
+        let resolved_backend = probe
+            .selected_for(boundary)
+            .map(|backend| memcordon_platform::capabilities_for(backend, boundary));
         memcordon_platform::supervise(memcordon_platform::SupervisorRequest {
             policy: self.policy,
             restart,
             command,
             memcordon_executable: helper,
+            resolved_backend,
         })
     }
 }

@@ -22,6 +22,78 @@ pub struct NamespaceInit {
     pub pidfd: OwnedFd,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamespaceInitPhase {
+    MountIsolation,
+    CgroupViewIsolation,
+    ProcMount,
+    ChildSubreaper,
+    TargetFork,
+}
+
+impl NamespaceInitPhase {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::MountIsolation => 1,
+            Self::CgroupViewIsolation => 2,
+            Self::ProcMount => 3,
+            Self::ChildSubreaper => 4,
+            Self::TargetFork => 5,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::MountIsolation),
+            2 => Some(Self::CgroupViewIsolation),
+            3 => Some(Self::ProcMount),
+            4 => Some(Self::ChildSubreaper),
+            5 => Some(Self::TargetFork),
+            _ => None,
+        }
+    }
+
+    pub const fn rejection_code(self) -> &'static str {
+        match self {
+            Self::MountIsolation => "MCSEALED-NAMESPACE-INIT-MOUNT-ISOLATION",
+            Self::CgroupViewIsolation => "MCSEALED-NAMESPACE-INIT-CGROUP-VIEW",
+            Self::ProcMount => "MCSEALED-NAMESPACE-INIT-PROC-MOUNT",
+            Self::ChildSubreaper => "MCSEALED-NAMESPACE-INIT-SUBREAPER",
+            Self::TargetFork => "MCSEALED-NAMESPACE-INIT-TARGET-FORK",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamespaceInitError {
+    pub phase: NamespaceInitPhase,
+    pub os_code: i32,
+}
+
+impl NamespaceInitError {
+    pub(super) fn last(phase: NamespaceInitPhase) -> Self {
+        let error = std::io::Error::last_os_error();
+        let os_code = error
+            .raw_os_error()
+            .unwrap_or_else(|| panic!("failed namespace-init syscall omitted native errno"));
+        if os_code <= 0 {
+            panic!("failed namespace-init syscall returned invalid native errno {os_code}");
+        }
+        Self { phase, os_code }
+    }
+}
+
+impl std::fmt::Display for NamespaceInitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: {}",
+            self.phase.rejection_code(),
+            std::io::Error::from_raw_os_error(self.os_code)
+        )
+    }
+}
+
 /// Creates a trusted PID-namespace init directly in the already-open attempt
 /// cgroup. The child begins in `child_entry` and never returns to provider code.
 pub fn clone_into_cgroup<F>(cgroup: &std::fs::File, child_entry: F) -> Result<NamespaceInit, String>
@@ -67,7 +139,7 @@ where
     })
 }
 
-pub fn prepare_namespace_init() -> Result<(), String> {
+pub fn prepare_namespace_init() -> Result<(), NamespaceInitError> {
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     if unsafe {
         libc::mount(
@@ -79,16 +151,12 @@ pub fn prepare_namespace_init() -> Result<(), String> {
         )
     } == -1
     {
-        return Err(format!(
-            "MCSEALED-PID-NAMESPACE: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(NamespaceInitError::last(NamespaceInitPhase::MountIsolation));
     }
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     if unsafe { libc::umount2(c"/sys/fs/cgroup".as_ptr(), libc::MNT_DETACH) } == -1 {
-        return Err(format!(
-            "MCSEALED-CGROUP-VIEW: {}",
-            std::io::Error::last_os_error()
+        return Err(NamespaceInitError::last(
+            NamespaceInitPhase::CgroupViewIsolation,
         ));
     }
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
@@ -104,14 +172,11 @@ pub fn prepare_namespace_init() -> Result<(), String> {
         )
     } == -1
     {
-        return Err(format!(
-            "MCSEALED-PID-NAMESPACE: private proc mount failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(NamespaceInitError::last(NamespaceInitPhase::ProcMount));
     }
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(NamespaceInitError::last(NamespaceInitPhase::ChildSubreaper));
     }
     Ok(())
 }

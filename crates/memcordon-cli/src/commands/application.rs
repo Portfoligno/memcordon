@@ -74,6 +74,7 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
         restart: resolution.restart.clone(),
         command: command.clone(),
         memcordon_executable: helper,
+        resolved_backend: Some(resolution.backend.clone()),
     }) {
         Ok(execution) => finish_execution(&args, &command, &resolution, execution, presentation),
         Err(error) => finish_error(&args, &command, Some(&resolution), error, presentation),
@@ -168,6 +169,7 @@ fn finish_error(
             target_released: error.target_released,
             workload_may_be_alive: error.workload_may_be_alive,
             boundary_setup_failure: error.boundary_setup_failure.clone(),
+            provider_rejection: error.provider_rejection.clone(),
         };
         match report(
             args,
@@ -269,6 +271,23 @@ fn execution_summary(execution: &SupervisionExecution) -> ExecutionSummary<'_> {
         }
         SupervisionTerminal::Error { .. } => ("supervision failed", SummaryTone::Error),
     };
+    let (failure_code, failure_phase, failure_detail) = match execution.terminal() {
+        SupervisionTerminal::Error { error, .. } => error.provider_rejection.as_ref().map_or(
+            (
+                Some(error.code.as_str()),
+                error.launch_phase.as_deref(),
+                Some(error.message.as_str()),
+            ),
+            |rejection| {
+                (
+                    Some(rejection.code.as_str()),
+                    error.launch_phase.as_deref(),
+                    Some(rejection.detail.as_str()),
+                )
+            },
+        ),
+        _ => (None, None, None),
+    };
     ExecutionSummary {
         outcome,
         tone,
@@ -276,30 +295,36 @@ fn execution_summary(execution: &SupervisionExecution) -> ExecutionSummary<'_> {
         backend: &execution.backend().name,
         attempts: execution.attempts().total,
         restarts: execution.restart().restarts_launched(),
+        failure_code,
+        failure_phase,
+        failure_detail,
     }
 }
 
 fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, Box<Error>> {
     let policy = policy_args.policy(budgets);
     let probe = probe();
-    let backend = probe.selected.ok_or_else(|| {
-        if policy.boundary() == BoundaryRequirement::Sealed {
-            return sealed_boundary_unsupported();
-        }
-        Box::new(Error::new(
-            ErrorCategory::Unsupported,
-            "MCUNSUPPORTED-BACKEND",
-            format!(
-                "no supported backend is available: {}",
-                probe
-                    .unavailable
-                    .iter()
-                    .map(|value| format!("{}: {}", value.name, value.reason))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-        ))
-    })?;
+    let backend = probe
+        .selected_for(policy.boundary())
+        .cloned()
+        .ok_or_else(|| {
+            if policy.boundary() == BoundaryRequirement::Sealed {
+                return sealed_boundary_unsupported();
+            }
+            Box::new(Error::new(
+                ErrorCategory::Unsupported,
+                "MCUNSUPPORTED-BACKEND",
+                format!(
+                    "no supported backend is available: {}",
+                    probe
+                        .unavailable
+                        .iter()
+                        .map(|value| format!("{}: {}", value.name, value.reason))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            ))
+        })?;
     let capability = memcordon_platform::capabilities_for(&backend, policy.boundary());
     if policy.boundary() == BoundaryRequirement::Sealed
         && capability.boundary.class != BoundaryClass::Sealed
@@ -434,7 +459,8 @@ fn policy_report(
     effective_conditions: RestartConditions,
     dormant_conditions: Vec<DormantRestartCondition>,
 ) -> PolicyEnvelopeReport {
-    let boundary_capability = memcordon_platform::capabilities(backend).boundary;
+    let boundary_capability =
+        memcordon_platform::capabilities_for(backend, policy.boundary()).boundary;
     let effective_enforcement = if backend.hard_limit {
         "hard"
     } else {
@@ -494,7 +520,7 @@ fn policy_report(
             option: "command-exit-grace".to_owned(),
         });
     }
-    if backend.name == "linux-cgroup-v2" {
+    if uses_linux_cgroup_memory(backend.name) {
         effects.push(OptionEffectReport::Applied {
             option: "swap".to_owned(),
         });
@@ -551,7 +577,7 @@ fn policy_report(
                 enforcement: effective_enforcement.to_owned(),
                 metric: effective_metric.to_owned(),
                 poll_interval_ms: Some(milliseconds(policy.poll_interval)),
-                swap: (backend.name == "linux-cgroup-v2").then(|| swap_report(policy.swap)),
+                swap: uses_linux_cgroup_memory(backend.name).then(|| swap_report(policy.swap)),
             }),
             deadline: policy.deadline.map(|deadline| DeadlinePolicyReport {
                 duration_ms: milliseconds(deadline.duration()),
@@ -754,7 +780,11 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
         }
         _ => capabilities(backend),
     };
-    let selected = probe.selected.as_ref().map(capability);
+    let selected_backend = match args.requirement {
+        Some(Requirement::Sealed) => probe.selected_for(BoundaryRequirement::Sealed),
+        _ => probe.selected.as_ref(),
+    };
+    let selected = selected_backend.map(capability);
     let available = probe.available.iter().map(capability).collect::<Vec<_>>();
     let met = args.requirement.is_none_or(|required| {
         selected.as_ref().is_some_and(|backend| match required {
@@ -965,6 +995,9 @@ fn deadline_origin(backend: &str) -> &'static str {
         "macos-watchdog" => "pre-spawn",
         _ => "platform-authorization",
     }
+}
+fn uses_linux_cgroup_memory(backend: &str) -> bool {
+    matches!(backend, "linux-cgroup-v2" | "linux-sealed-provider")
 }
 fn category_name(value: ErrorCategory) -> &'static str {
     match value {

@@ -31,10 +31,14 @@ fuzz_target!(|count: u16| {
                         target_released: false,
                         workload_may_be_alive: false,
                         initial_spawn_failure: None,
+                        provider_rejection: None,
                     }),
                     restart_decision: memcordon_core::RestartDecisionRecord::default(),
                     launch: memcordon_core::LaunchEvidence::default(),
                     restart_safety: memcordon_core::RestartSafetyProof::default(),
+                    boundary_detail: memcordon_core::BoundaryMechanismEvidence::Standard {
+                        backend: "fuzz-fixture".to_owned(),
+                    },
                 },
                 &mut aggregates,
             )

@@ -1,11 +1,8 @@
-use std::fs;
-use std::path::Path;
-
-use super::CGROUP_ROOT;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualificationReceipt {
     pub schema_version: u32,
     pub mechanism: String,
@@ -24,6 +21,7 @@ pub struct QualificationReceipt {
     pub target_gated: bool,
     pub assignment_verified: bool,
     pub inherited_descriptors_verified: bool,
+    pub spawn_error_reporting_verified: bool,
     pub frontend_loss_authority_verified: bool,
     pub cgroup_kill: bool,
     pub workload_empty: bool,
@@ -48,6 +46,7 @@ impl QualificationReceipt {
             && self.target_gated
             && self.assignment_verified
             && self.inherited_descriptors_verified
+            && self.spawn_error_reporting_verified
             && self.frontend_loss_authority_verified
             && self.cgroup_kill
             && self.workload_empty
@@ -67,11 +66,7 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
         return Err("MCSEALED-PROVIDER-IDENTITY: provider must run as root".to_owned());
     }
     super::attempt::secure_state_root()?;
-    fs::create_dir_all(CGROUP_ROOT)
-        .map_err(|error| format!("MCSEALED-CGROUP-PRIVATE-SUBTREE: {error}"))?;
-    let cgroup_v2 = ["cgroup.procs", "cgroup.events", "cgroup.kill"]
-        .iter()
-        .all(|name| Path::new("/sys/fs/cgroup").join(name).exists());
+    super::cgroup::prepare_private_root()?;
     let clone3 = syscall_present(libc::SYS_clone3);
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
@@ -83,38 +78,66 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
         false
     };
     let close_range = syscall_present(libc::SYS_close_range);
-    let recovery_complete = super::recovery::recover()?.is_empty();
-    let sacrificial = sacrificial_attempt();
-    let qualified = sacrificial.is_ok();
+    let ambiguous_recovery = super::recovery::recover()?;
+    let recovery_complete = ambiguous_recovery.is_empty();
+    let sacrificial = sacrificial_attempt(b"/usr/bin/true");
+    let missing_target = b"/run/memcordon/sealed-qualification-target-must-not-exist";
+    let missing_target_path = std::path::Path::new(
+        std::str::from_utf8(missing_target).expect("fixed qualification path is UTF-8"),
+    );
+    match std::fs::symlink_metadata(missing_target_path) {
+        Ok(_) => {
+            return Err(
+                "MCSEALED-PROVIDER-UNAVAILABLE: missing-target qualification path exists"
+                    .to_owned(),
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "MCSEALED-PROVIDER-UNAVAILABLE: missing-target qualification readback failed: {error}"
+            ));
+        }
+    }
+    let missing_sacrificial = sacrificial_attempt(missing_target);
+    let sacrificial_error = sacrificial
+        .as_ref()
+        .err()
+        .map(|error| format!("success-transaction={error}"))
+        .or_else(|| {
+            missing_sacrificial
+                .as_ref()
+                .err()
+                .map(|error| format!("spawn-error-transaction={error}"))
+        });
+    let success_verified = sacrificial.as_ref().is_ok_and(|facts| {
+        facts.child_status == 0
+            && facts.spawn_error_reported
+            && facts.exec_status == super::launch::TargetExecStatus::Succeeded
+    });
+    let spawn_error_verified = missing_sacrificial.as_ref().is_ok_and(|facts| {
+        facts.child_status == 127
+            && facts.spawn_error_reported
+            && matches!(
+                facts.exec_status,
+                super::launch::TargetExecStatus::Failed {
+                    class: super::launch::ExecFailureClass::NotFound,
+                    os_code: libc::ENOENT
+                }
+            )
+            && facts.cgroup_empty
+            && facts.init_reaped
+            && facts.guardian_reaped
+            && facts.boundary_retired
+    });
+    let qualified = success_verified && spawn_error_verified;
     let digest = sacrificial
         .as_ref()
-        .map(|facts| {
-            Sha256::digest(
-                format!(
-                    "memcordon-sealed-agent-v1:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-                    facts.child_status,
-                    facts.target_pid,
-                    facts.authorization_offset_millis,
-                    facts.assignment_verified,
-                    facts.namespaces_verified,
-                    facts.credentials_verified,
-                    facts.capabilities_empty,
-                    facts.descriptors_verified,
-                    facts.cgroup_view_denied,
-                    facts.guardian_ready_before_authorization,
-                    facts.frontend_loss_authority_verified,
-                    facts.cgroup_kill_invoked,
-                    facts.cgroup_empty,
-                    facts.init_reaped,
-                    facts.guardian_reaped,
-                    facts.boundary_retired,
-                    facts.memory_limit_exceeded,
-                    facts.deadline_exceeded,
-                )
-                .as_bytes(),
-            )
-        })
-        .ok();
+        .ok()
+        .zip(missing_sacrificial.as_ref().ok())
+        .map(|(facts, missing)| {
+            Sha256::digest(format!("memcordon-sealed-agent-v1:{facts:?}:{missing:?}").as_bytes())
+        });
     let receipt = QualificationReceipt {
         schema_version: 1,
         mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
@@ -122,8 +145,8 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
         receipt_digest: digest
             .map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
             .unwrap_or_default(),
-        unified_cgroup_v2: cgroup_v2,
-        private_cgroup_subtree: Path::new(CGROUP_ROOT).exists(),
+        unified_cgroup_v2: true,
+        private_cgroup_subtree: true,
         clone3,
         clone3_into_cgroup: qualified,
         pid_namespace: qualified,
@@ -135,6 +158,7 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
         target_gated: qualified,
         assignment_verified: qualified,
         inherited_descriptors_verified: qualified,
+        spawn_error_reporting_verified: spawn_error_verified,
         frontend_loss_authority_verified: qualified,
         cgroup_kill: qualified,
         workload_empty: sacrificial.as_ref().is_ok_and(|facts| facts.cgroup_empty),
@@ -149,14 +173,36 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
     if receipt.complete() {
         Ok(receipt)
     } else {
+        let mut causes = Vec::new();
+        if !ambiguous_recovery.is_empty() {
+            let examples = ambiguous_recovery
+                .iter()
+                .take(16)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",");
+            causes.push(format!(
+                "recovery-ambiguous-count={}; examples={examples}",
+                ambiguous_recovery.len()
+            ));
+        }
+        if let Some(error) = sacrificial_error {
+            causes.push(format!("sacrificial-error={error}"));
+        }
+        if causes.is_empty() {
+            causes.push(
+                "qualification predicates were incomplete without a native phase error".to_owned(),
+            );
+        }
         Err(format!(
-            "MCSEALED-PROVIDER-UNAVAILABLE: {}",
-            receipt.render()
+            "MCSEALED-PROVIDER-UNAVAILABLE: receipt={}; {}",
+            receipt.render(),
+            causes.join("; "),
         ))
     }
 }
 
-fn sacrificial_attempt() -> Result<super::launch::TerminalFacts, String> {
+fn sacrificial_attempt(program: &[u8]) -> Result<super::launch::TerminalFacts, String> {
     use crate::request::{
         DeadlineScope, DescriptorPurpose, LaunchPolicyV1, LaunchRequestV1, SwapLimit,
     };
@@ -183,13 +229,15 @@ fn sacrificial_attempt() -> Result<super::launch::TerminalFacts, String> {
     )
     .map_err(|error| error.to_string())?;
     let request = LaunchRequestV1 {
-        program: b"/usr/bin/true".to_vec(),
+        program: program.to_vec(),
         arguments: Vec::new(),
         environment: Vec::new(),
         policy: LaunchPolicyV1 {
             memory_limit_bytes: None,
             swap_limit: SwapLimit::Bytes(0),
-            absolute_deadline_millis: Some(monotonic_millis().saturating_add(30_000)),
+            absolute_deadline_millis: Some(
+                super::clock::monotonic_millis()?.saturating_add(30_000),
+            ),
             deadline_scope: DeadlineScope::Attempt,
             lifetime: crate::request::Lifetime::Command,
             poll_interval_millis: 10,
@@ -225,18 +273,6 @@ fn sacrificial_attempt() -> Result<super::launch::TerminalFacts, String> {
         unsafe { libc::getegid() },
         groups,
     )
-}
-
-fn monotonic_millis() -> u64 {
-    let mut value = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut value) };
-    (value.tv_sec as u64)
-        .saturating_mul(1_000)
-        .saturating_add(value.tv_nsec as u64 / 1_000_000)
 }
 
 fn current_groups() -> Result<Vec<libc::gid_t>, String> {

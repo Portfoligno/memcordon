@@ -7,7 +7,7 @@ After=local-fs.target
 Type=simple
 ExecStart=/usr/libexec/memcordon-sealed-agent serve
 User=root
-Group=root
+Group=memcordon
 Delegate=yes
 KillMode=process
 RuntimeDirectory=memcordon
@@ -18,7 +18,8 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed /sys/fs/cgroup
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_KILL CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_KILL CAP_DAC_OVERRIDE CAP_SYS_PTRACE
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target

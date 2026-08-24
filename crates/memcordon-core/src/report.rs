@@ -614,6 +614,7 @@ pub struct ExecutionErrorReport {
     pub target_released: bool,
     pub workload_may_be_alive: bool,
     pub boundary_setup_failure: Option<crate::BoundarySetupFailure>,
+    pub provider_rejection: Option<crate::ProviderRejectionEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

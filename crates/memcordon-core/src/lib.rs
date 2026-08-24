@@ -19,6 +19,7 @@ pub mod test_support;
 
 pub use error::{
     BoundarySetupFailure, BoundarySetupPhase, Error, ErrorCategory, InitialSpawnFailure,
+    ProviderRejectionEvidence,
 };
 pub use outcome::{
     AttemptEventKind, ChildTermination, CleanupErrorRecord, CleanupSummary, DeadlineEvidence,

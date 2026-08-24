@@ -72,7 +72,13 @@ pub struct RestartSafetyProof {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mechanism", rename_all = "kebab-case")]
 pub enum BoundaryMechanismEvidence {
-    Standard { backend: String },
+    Standard {
+        backend: String,
+    },
+    SetupFailure {
+        provider_mechanism: String,
+        requested: BoundaryRequirement,
+    },
     LinuxPidNamespaceCgroupV1(LinuxSealedEvidence),
     WindowsJobObjectV1(WindowsSealedEvidence),
     MacosEndpointSecurityV1(MacosSealedEvidence),
@@ -175,6 +181,28 @@ pub fn boundary_evidence_is_consistent(
                 && launch.boundary_requested == BoundaryRequirement::Standard
                 && launch.boundary_effective == BoundaryClass::Standard
                 && !restart_safety.sealed_boundary_retired
+        }
+        BoundaryMechanismEvidence::SetupFailure {
+            provider_mechanism,
+            requested,
+        } => {
+            let retirement_is_consistent = !restart_safety.sealed_boundary_retired
+                || restart_safety.is_safe_for(BoundaryRequirement::Sealed);
+            !provider_mechanism.is_empty()
+                && launch.mechanism == *provider_mechanism
+                && launch.boundary_requested == *requested
+                && retirement_is_consistent
+                && if launch.target_released {
+                    launch.boundary_effective == BoundaryClass::Sealed
+                        && launch.containment_verified_before_authorization
+                        && launch.guardian_started_before_authorization
+                        && launch.boundary_assignment_verified
+                        && launch.boundary_reconfiguration_denied
+                        && launch.inherited_resources_restricted
+                        && launch.frontend_loss_cleanup_authority_verified
+                } else {
+                    launch.boundary_effective == BoundaryClass::Unavailable
+                }
         }
         BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV1(native) => {
             sealed_generic_evidence_is_consistent(launch, restart_safety)
@@ -318,6 +346,7 @@ pub struct SupervisionErrorRecord {
     pub target_released: bool,
     pub workload_may_be_alive: bool,
     pub initial_spawn_failure: Option<crate::InitialSpawnFailure>,
+    pub provider_rejection: Option<crate::ProviderRejectionEvidence>,
 }
 
 impl SupervisionErrorRecord {
@@ -329,11 +358,55 @@ impl SupervisionErrorRecord {
     }
 
     fn provenance_is_consistent(&self) -> bool {
-        self.initial_spawn_failure.is_none()
+        let initial_spawn_is_consistent = self.initial_spawn_failure.is_none()
             || (self.category == "spawn"
                 && self.supervision_phase == SupervisionPhase::AttemptSetup
                 && self.launch_phase.as_deref() == Some("target-spawn-failed")
-                && self.attempt_number.is_some())
+                && self.attempt_number.is_some());
+        let provider_rejection_is_consistent =
+            self.provider_rejection.as_ref().is_none_or(|value| {
+                let wrapper_is_consistent = self.code == "MCSEALED-PROVIDER-REJECTION"
+                    && self.launch_phase.as_deref() == Some(boundary_setup_phase_name(value.phase));
+                let spawn_is_consistent = self.category == "spawn"
+                    && self.supervision_phase == SupervisionPhase::AttemptSetup
+                    && self.attempt_number.is_some()
+                    && self.launch_phase.as_deref() == Some("target-spawn-failed")
+                    && value.phase == crate::BoundarySetupPhase::TargetCreation
+                    && value.target_created
+                    && value.target_released
+                    && value.cleanup_attempted
+                    && match (self.code.as_str(), self.initial_spawn_failure) {
+                        ("MCSPAWN-NOT-FOUND", Some(crate::InitialSpawnFailure::NotFound))
+                        | (
+                            "MCSPAWN-NOT-EXECUTABLE",
+                            Some(crate::InitialSpawnFailure::NotExecutable),
+                        )
+                        | ("MCSPAWN-FAILED", None) => self.code == value.code,
+                        _ => false,
+                    };
+                (wrapper_is_consistent || spawn_is_consistent)
+                    && self.target_released == value.target_released
+                    && self.workload_may_be_alive
+                        == (value.target_created
+                            && value.restart_safety.workload_empty != Some(true))
+                    && value.is_consistent()
+            });
+        initial_spawn_is_consistent && provider_rejection_is_consistent
+    }
+}
+
+const fn boundary_setup_phase_name(value: crate::BoundarySetupPhase) -> &'static str {
+    match value {
+        crate::BoundarySetupPhase::ProviderConnection => "provider-connection",
+        crate::BoundarySetupPhase::ProviderIdentity => "provider-identity",
+        crate::BoundarySetupPhase::BoundaryCreation => "boundary-creation",
+        crate::BoundarySetupPhase::GuardianStartup => "guardian-startup",
+        crate::BoundarySetupPhase::TargetCreation => "target-creation",
+        crate::BoundarySetupPhase::AssignmentVerification => "assignment-verification",
+        crate::BoundarySetupPhase::ResourceVerification => "resource-verification",
+        crate::BoundarySetupPhase::Authorization => "authorization",
+        crate::BoundarySetupPhase::Monitoring => "monitoring",
+        crate::BoundarySetupPhase::Retirement => "retirement",
     }
 }
 

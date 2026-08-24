@@ -6,7 +6,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION;
+use memcordon_core::{
+    BoundaryClass, BoundaryMechanismEvidence, BoundaryRequirement, ChildTermination,
+    DOCTOR_REPORT_SCHEMA_VERSION, EXECUTION_REPORT_SCHEMA_VERSION, MemcordonReport, RunOutcome,
+    SupervisionTerminal,
+};
 
 use crate::{CiError, Result};
 
@@ -18,14 +22,20 @@ const LINUX_SEALED_FILES: &[&str] = &[
     "provider-identity.json",
     "qualification-receipt.json",
     "sealed-scenario-report.json",
+    "sealed-concurrency-report.json",
     "fault-injection-report.json",
     "cleanup-recovery-report.json",
     "platform-environment.json",
+    "provider-service-privileges.json",
+    "sealed-public-launch.json",
 ];
 pub const LINUX_SEALED_TESTS: &[&str] = &[
     "qualification_fails_closed_without_root_provider",
     "qualification_receipt_requires_complete_retirement",
     "sealed_direct_exit_retires_fresh_boundary",
+    "sealed_staged_fixture_is_isolated_and_removed_after_retirement",
+    "sealed_future_deadline_authorizes_and_retires",
+    "sealed_expired_deadline_never_authorizes_and_retires",
     "sealed_child_outlives_direct_target_until_cleanup",
     "sealed_double_fork_remains_in_pid_namespace_and_cgroup",
     "sealed_setsid_daemon_remains_contained",
@@ -42,13 +52,17 @@ pub const LINUX_SEALED_TESTS: &[&str] = &[
     "sealed_provider_worker_loss_triggers_guardian",
     "sealed_guardian_loss_before_authorization_fails_closed",
     "sealed_guardian_loss_after_authorization_cannot_report_success",
-    "sealed_exec_failure_preserves_native_provenance",
+    "sealed_native_nonzero_exit_preserves_provenance",
+    "sealed_native_exit_126_and_127_are_not_exec_failures",
+    "sealed_missing_target_preserves_enoent_exec_provenance",
+    "sealed_non_executable_target_preserves_eacces_exec_provenance",
     "sealed_restart_uses_fresh_retired_boundary",
     "sealed_simultaneous_attempts_have_disjoint_boundaries",
     "sealed_recovery_removes_authenticated_stale_record_without_cgroup",
     "sealed_recovery_quarantines_cgroup_without_authenticated_record",
     "sealed_recovery_blocks_capability_while_live_state_is_ambiguous",
     "sealed_faults_before_authorization_never_create_marker",
+    "sealed_namespace_init_failure_is_typed_prompt_and_retired",
     "sealed_cgroup_kill_failure_never_reports_retirement",
     "sealed_persistent_populated_state_blocks_restart",
     "sealed_namespace_init_reap_delay_blocks_result",
@@ -201,6 +215,7 @@ struct LinuxQualificationReceipt {
     receipt_digest: String,
     unified_cgroup_v2: bool,
     private_cgroup_subtree: bool,
+    clone3: bool,
     clone3_into_cgroup: bool,
     pid_namespace: bool,
     mount_namespace: bool,
@@ -211,11 +226,13 @@ struct LinuxQualificationReceipt {
     target_gated: bool,
     assignment_verified: bool,
     inherited_descriptors_verified: bool,
+    spawn_error_reporting_verified: bool,
     frontend_loss_authority_verified: bool,
     cgroup_kill: bool,
     workload_empty: bool,
     helpers_reaped: bool,
     boundary_retired: bool,
+    recovery_complete: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,6 +242,230 @@ struct LinuxNamedEvidence {
     mechanism: String,
     result: String,
     tests: Vec<String>,
+}
+
+const LINUX_FAULT_EVIDENCE_TESTS: &[&str] = &[
+    "sealed_frontend_loss_before_authorization_never_runs_target",
+    "sealed_frontend_loss_after_authorization_triggers_guardian",
+    "sealed_provider_worker_loss_triggers_guardian",
+    "sealed_guardian_loss_before_authorization_fails_closed",
+    "sealed_guardian_loss_after_authorization_cannot_report_success",
+    "sealed_faults_before_authorization_never_create_marker",
+    "sealed_namespace_init_failure_is_typed_prompt_and_retired",
+    "sealed_cgroup_kill_failure_never_reports_retirement",
+    "sealed_persistent_populated_state_blocks_restart",
+    "sealed_namespace_init_reap_delay_blocks_result",
+    "sealed_guardian_reap_failure_blocks_result",
+];
+
+#[derive(Clone, Copy)]
+struct ExpectedLinuxFaultEvidence {
+    code: &'static str,
+    phase: &'static str,
+    target_created: bool,
+    target_released: bool,
+    cleanup_retired: bool,
+    retirement_owner: &'static str,
+    guardian_reaped: bool,
+}
+
+fn expected_linux_fault_evidence(selector: &str) -> Option<ExpectedLinuxFaultEvidence> {
+    let expected = match selector {
+        "sealed_frontend_loss_before_authorization_never_runs_target" => {
+            ExpectedLinuxFaultEvidence {
+                code: "MCSEALED-FRONTEND-LOSS-BEFORE-AUTHORIZATION",
+                phase: "authorization",
+                target_created: true,
+                target_released: false,
+                cleanup_retired: true,
+                retirement_owner: "guardian",
+                guardian_reaped: true,
+            }
+        }
+        "sealed_frontend_loss_after_authorization_triggers_guardian" => {
+            ExpectedLinuxFaultEvidence {
+                code: "MCSEALED-FRONTEND-LOSS-AFTER-AUTHORIZATION",
+                phase: "monitoring",
+                target_created: true,
+                target_released: true,
+                cleanup_retired: true,
+                retirement_owner: "guardian",
+                guardian_reaped: true,
+            }
+        }
+        "sealed_provider_worker_loss_triggers_guardian" => ExpectedLinuxFaultEvidence {
+            code: "MCSEALED-PROVIDER-WORKER-LOSS",
+            phase: "guardian-startup",
+            target_created: false,
+            target_released: false,
+            cleanup_retired: true,
+            retirement_owner: "guardian",
+            guardian_reaped: true,
+        },
+        "sealed_guardian_loss_before_authorization_fails_closed" => ExpectedLinuxFaultEvidence {
+            code: "MCSEALED-GUARDIAN-LOSS-BEFORE-AUTHORIZATION",
+            phase: "authorization",
+            target_created: true,
+            target_released: false,
+            cleanup_retired: true,
+            retirement_owner: "provider",
+            guardian_reaped: true,
+        },
+        "sealed_guardian_loss_after_authorization_cannot_report_success" => {
+            ExpectedLinuxFaultEvidence {
+                code: "MCSEALED-GUARDIAN-LOSS-AFTER-AUTHORIZATION",
+                phase: "monitoring",
+                target_created: true,
+                target_released: true,
+                cleanup_retired: true,
+                retirement_owner: "provider",
+                guardian_reaped: true,
+            }
+        }
+        "sealed_faults_before_authorization_never_create_marker" => ExpectedLinuxFaultEvidence {
+            code: "MCSEALED-LAUNCH-DESCRIPTOR-SET",
+            phase: "request-validation",
+            target_created: false,
+            target_released: false,
+            cleanup_retired: false,
+            retirement_owner: "provider",
+            guardian_reaped: false,
+        },
+        "sealed_namespace_init_failure_is_typed_prompt_and_retired" => ExpectedLinuxFaultEvidence {
+            code: "MCSEALED-NAMESPACE-INIT-TARGET-FORK",
+            phase: "target-creation",
+            target_created: false,
+            target_released: false,
+            cleanup_retired: true,
+            retirement_owner: "provider",
+            guardian_reaped: true,
+        },
+        "sealed_cgroup_kill_failure_never_reports_retirement" => ExpectedLinuxFaultEvidence {
+            code: "MCSEALED-CGROUP-KILL-FAILURE",
+            phase: "retirement",
+            target_created: true,
+            target_released: true,
+            cleanup_retired: true,
+            retirement_owner: "provider",
+            guardian_reaped: true,
+        },
+        "sealed_persistent_populated_state_blocks_restart" => ExpectedLinuxFaultEvidence {
+            code: "MCSEALED-CGROUP-NOT-EMPTY",
+            phase: "retirement",
+            target_created: true,
+            target_released: true,
+            cleanup_retired: true,
+            retirement_owner: "provider",
+            guardian_reaped: true,
+        },
+        "sealed_namespace_init_reap_delay_blocks_result" => ExpectedLinuxFaultEvidence {
+            code: "MCSEALED-NAMESPACE-INIT-REAP-DELAY",
+            phase: "retirement",
+            target_created: true,
+            target_released: true,
+            cleanup_retired: true,
+            retirement_owner: "provider",
+            guardian_reaped: true,
+        },
+        "sealed_guardian_reap_failure_blocks_result" => ExpectedLinuxFaultEvidence {
+            code: "MCSEALED-GUARDIAN-REAP-FAILURE",
+            phase: "retirement",
+            target_created: true,
+            target_released: true,
+            cleanup_retired: true,
+            retirement_owner: "provider",
+            guardian_reaped: true,
+        },
+        _ => return None,
+    };
+    Some(expected)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxFaultCleanupEvidence {
+    attempted: bool,
+    direct_child_reaped: bool,
+    workload_empty: Option<bool>,
+    helpers_reaped: bool,
+    containment_removed: bool,
+    sealed_boundary_retired: bool,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxFaultRejectionEvidence {
+    schema_version: u32,
+    code: String,
+    phase: String,
+    detail: String,
+    os_code: Option<i32>,
+    target_created: bool,
+    target_released: bool,
+    cleanup: LinuxFaultCleanupEvidence,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxFaultScenarioEvidence {
+    schema_version: u32,
+    selector: String,
+    attempt_id: String,
+    rejection: LinuxFaultRejectionEvidence,
+    retirement_owner: String,
+    marker_observed: bool,
+    guardian_reaped: bool,
+    final_record_absent: bool,
+    final_cgroup_absent: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxFaultInjectionReport {
+    schema_version: u32,
+    mechanism: String,
+    commit: String,
+    result: String,
+    evidence: Vec<LinuxFaultScenarioEvidence>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxProviderServicePrivileges {
+    schema_version: u32,
+    properties: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+struct LinuxProviderBinding {
+    provider_identity: String,
+    receipt_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxConcurrencyAttempt {
+    identity: String,
+    target_pid: u32,
+    live_cgroup_member_pids: Vec<u32>,
+    started_monotonic_millis: u64,
+    authorized_monotonic_millis: u64,
+    terminal_monotonic_millis: u64,
+    record_absent: bool,
+    cgroup_absent: bool,
+    fixture_absent: bool,
+    boundary_retired: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinuxConcurrencyReport {
+    schema_version: u32,
+    mechanism: String,
+    commit: String,
+    overlap: bool,
+    attempts: Vec<LinuxConcurrencyAttempt>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,14 +640,340 @@ fn validate_linux_sealed_report(bytes: &[u8], expected_commit: &str) -> Result<(
     Ok(())
 }
 
-fn validate_linux_auxiliary(name: &str, bytes: &[u8]) -> Result<()> {
+fn valid_linux_attempt_identity(identity: &str) -> bool {
+    identity.len().is_multiple_of(2)
+        && identity.len() / 2 == std::mem::size_of::<[u8; 16]>()
+        && identity
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_linux_concurrency(report: &LinuxConcurrencyReport, expected_commit: &str) -> bool {
+    if report.schema_version != 1
+        || report.mechanism != "linux-pid-namespace-cgroup-v1"
+        || report.commit != expected_commit
+        || !report.overlap
+        || report.attempts.len() != 2
+    {
+        return false;
+    }
+    let identities = report
+        .attempts
+        .iter()
+        .map(|attempt| attempt.identity.as_str())
+        .collect::<BTreeSet<_>>();
+    let targets = report
+        .attempts
+        .iter()
+        .map(|attempt| attempt.target_pid)
+        .collect::<BTreeSet<_>>();
+    if identities.len() != report.attempts.len()
+        || targets.len() != report.attempts.len()
+        || targets.contains(&0)
+    {
+        return false;
+    }
+    let complete = report.attempts.iter().all(|attempt| {
+        let members = attempt
+            .live_cgroup_member_pids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        valid_linux_attempt_identity(&attempt.identity)
+            && members.len() == attempt.live_cgroup_member_pids.len()
+            && !members.contains(&0)
+            && members.contains(&attempt.target_pid)
+            && attempt.started_monotonic_millis <= attempt.authorized_monotonic_millis
+            && attempt.authorized_monotonic_millis < attempt.terminal_monotonic_millis
+            && attempt.record_absent
+            && attempt.cgroup_absent
+            && attempt.fixture_absent
+            && attempt.boundary_retired
+    });
+    let left = report.attempts[0]
+        .live_cgroup_member_pids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let right = report.attempts[1]
+        .live_cgroup_member_pids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let overlap_started = report
+        .attempts
+        .iter()
+        .map(|attempt| attempt.authorized_monotonic_millis)
+        .max()
+        .expect("two concurrency attempts were already required");
+    let overlap_ended = report
+        .attempts
+        .iter()
+        .map(|attempt| attempt.terminal_monotonic_millis)
+        .min()
+        .expect("two concurrency attempts were already required");
+    complete && left.is_disjoint(&right) && overlap_started < overlap_ended
+}
+
+fn linux_provider_binding(directory: &Path) -> Result<LinuxProviderBinding> {
+    let identity_bytes = read_report(&directory.join("provider-identity.json"))?;
+    let qualification_bytes = read_report(&directory.join("qualification-receipt.json"))?;
+    let identity: LinuxProviderIdentity = serde_json::from_slice(&identity_bytes)?;
+    let qualification: LinuxQualificationReceipt = serde_json::from_slice(&qualification_bytes)?;
+    if identity.schema_version != 1
+        || identity.mechanism != "linux-pid-namespace-cgroup-v1"
+        || identity.provider_identity.is_empty()
+        || identity.receipt_digest.is_empty()
+        || qualification.provider_identity != identity.provider_identity
+        || qualification.receipt_digest != identity.receipt_digest
+    {
+        return Err(failure(
+            "Linux provider identity and qualification evidence are not bound",
+        ));
+    }
+    Ok(LinuxProviderBinding {
+        provider_identity: identity.provider_identity,
+        receipt_digest: identity.receipt_digest,
+    })
+}
+
+fn validate_linux_provider_privileges(report: &LinuxProviderServicePrivileges) -> bool {
+    let expected_keys = [
+        "AmbientCapabilities",
+        "CapabilityBoundingSet",
+        "Group",
+        "NoNewPrivileges",
+        "User",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual_keys = report
+        .properties
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_capabilities = [
+        "cap_dac_override",
+        "cap_kill",
+        "cap_setgid",
+        "cap_setuid",
+        "cap_sys_admin",
+        "cap_sys_chroot",
+        "cap_sys_ptrace",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let capability_tokens = report
+        .properties
+        .get("CapabilityBoundingSet")
+        .map(|value| {
+            value
+                .split_ascii_whitespace()
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let capabilities = capability_tokens
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    report.schema_version == 1
+        && actual_keys == expected_keys
+        && report.properties.get("User").map(String::as_str) == Some("root")
+        && report.properties.get("Group").map(String::as_str) == Some("memcordon")
+        && report.properties.get("NoNewPrivileges").map(String::as_str) == Some("yes")
+        && report
+            .properties
+            .get("AmbientCapabilities")
+            .map(String::as_str)
+            == Some("")
+        && capability_tokens.len() == capabilities.len()
+        && capabilities == expected_capabilities
+}
+
+fn validate_linux_public_launch(report: &MemcordonReport, binding: &LinuxProviderBinding) -> bool {
+    let Some(backend) = report.backend.as_ref() else {
+        return false;
+    };
+    let Some(supervision) = report.supervision.as_ref() else {
+        return false;
+    };
+    let qualification = backend.boundary_qualification.as_ref();
+    let attempt = report.attempts.first();
+    let exited_zero = matches!(
+        &supervision.terminal,
+        SupervisionTerminal::AttemptOutcome {
+            attempt_number: 1,
+            outcome: RunOutcome::Exited {
+                child: ChildTermination::ExitCode { code: 0 },
+                cleanup,
+                ..
+            },
+        } if cleanup.direct_child_reaped
+            && cleanup.workload_empty == Some(true)
+            && cleanup.errors.is_empty()
+    );
+    report.schema_version == EXECUTION_REPORT_SCHEMA_VERSION
+        && report.error.is_none()
+        && backend.name == "linux-sealed-provider"
+        && backend.boundary.class == BoundaryClass::Sealed
+        && backend.boundary.mechanism == "linux-pid-namespace-cgroup-v1"
+        && qualification.is_some_and(|qualification| {
+            qualification.provider_identity == binding.provider_identity
+                && qualification.receipt_digest == binding.receipt_digest
+                && qualification.mechanism == "linux-pid-namespace-cgroup-v1"
+        })
+        && supervision.wrapper_exit_code == 0
+        && supervision.attempt_records_created == 1
+        && supervision.targets_authorized == 1
+        && supervision.restart.restarts_launched() == 0
+        && exited_zero
+        && report.attempts.len() == 1
+        && attempt.is_some_and(|attempt| {
+            attempt.number == 1
+                && attempt.launch.boundary_requested == BoundaryRequirement::Sealed
+                && attempt.launch.boundary_effective == BoundaryClass::Sealed
+                && attempt.launch.target_released
+                && attempt.launch.boundary_assignment_verified
+                && attempt.launch.inherited_resources_restricted
+                && attempt
+                    .restart_safety
+                    .is_safe_for(BoundaryRequirement::Sealed)
+                && matches!(
+                    &attempt.boundary_detail,
+                    BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV1(native)
+                        if native.schema_version == 1
+                            && native.provider_identity == binding.provider_identity
+                            && !native.cgroup_identity_digest.is_empty()
+                            && native.cgroup_created
+                            && native.cgroup_owned_by_provider
+                            && native.memory_configuration_verified
+                            && native.init_created_into_cgroup
+                            && native.pid_namespace_created
+                            && native.mount_namespace_created
+                            && native.cgroup_namespace_created
+                            && native.target_pidfd_verified
+                            && native.target_cgroup_membership_verified
+                            && native.target_pid_namespace_verified
+                            && native.target_credentials_verified
+                            && native.target_capabilities_empty
+                            && native.no_new_privs_verified
+                            && native.inherited_descriptors_verified
+                            && native.writable_cgroup_view_denied
+                            && native.guardian_ready
+                            && native.target_released
+                            && native.cgroup_kill_invoked
+                            && native.cgroup_empty_verified
+                            && native.namespace_init_reaped
+                            && native.guardian_reaped
+                            && native.cgroup_removed
+                )
+        })
+}
+
+fn validate_linux_fault_evidence(
+    report: &LinuxFaultInjectionReport,
+    expected_commit: &str,
+) -> bool {
+    if report.schema_version != 2
+        || report.mechanism != "linux-pid-namespace-cgroup-v1"
+        || report.commit != expected_commit
+        || report.result != "passed"
+        || report.evidence.len() != LINUX_FAULT_EVIDENCE_TESTS.len()
+    {
+        return false;
+    }
+    report
+        .evidence
+        .iter()
+        .zip(LINUX_FAULT_EVIDENCE_TESTS)
+        .all(|(evidence, expected_selector)| {
+            let Some(expected) = expected_linux_fault_evidence(expected_selector) else {
+                return false;
+            };
+            let rejection = &evidence.rejection;
+            let cleanup = &rejection.cleanup;
+            let code_bound = rejection.code.starts_with("MCSEALED-")
+                && (rejection.detail == rejection.code
+                    || rejection
+                        .detail
+                        .strip_prefix(&rejection.code)
+                        .is_some_and(|detail| detail.starts_with(':')));
+            let cleanup_exact = if expected.cleanup_retired {
+                cleanup.attempted
+                    && cleanup.direct_child_reaped
+                    && cleanup.workload_empty == Some(true)
+                    && cleanup.helpers_reaped
+                    && cleanup.containment_removed
+                    && cleanup.sealed_boundary_retired
+                    && cleanup.errors.is_empty()
+            } else {
+                !cleanup.attempted
+                    && !cleanup.direct_child_reaped
+                    && cleanup.workload_empty.is_none()
+                    && !cleanup.helpers_reaped
+                    && !cleanup.containment_removed
+                    && !cleanup.sealed_boundary_retired
+                    && cleanup.errors.is_empty()
+            };
+            evidence.schema_version == 1
+                && evidence.selector == *expected_selector
+                && valid_linux_attempt_identity(&evidence.attempt_id)
+                && rejection.schema_version == 1
+                && rejection.code == expected.code
+                && rejection.phase == expected.phase
+                && code_bound
+                && rejection.os_code.is_none()
+                && rejection.target_created == expected.target_created
+                && rejection.target_released == expected.target_released
+                && cleanup_exact
+                && evidence.retirement_owner == expected.retirement_owner
+                && evidence.final_record_absent
+                && evidence.final_cgroup_absent
+                && evidence.guardian_reaped == expected.guardian_reaped
+                && evidence.marker_observed == expected.target_released
+        })
+}
+
+fn parse_linux_public_launch(bytes: &[u8]) -> Result<MemcordonReport> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let expected_keys = [
+        "attempts",
+        "backend",
+        "error",
+        "invocation",
+        "policy",
+        "schema_version",
+        "supervision",
+        "tool",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual_keys = value
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    if actual_keys != expected_keys {
+        return Err(failure(
+            "Linux public sealed launch evidence has an unexpected schema envelope",
+        ));
+    }
+    serde_json::from_value(value).map_err(Into::into)
+}
+
+fn validate_linux_auxiliary(
+    name: &str,
+    bytes: &[u8],
+    expected_commit: &str,
+    binding: &LinuxProviderBinding,
+) -> Result<()> {
     match name {
         "provider-identity.json" => {
             let report: LinuxProviderIdentity = serde_json::from_slice(bytes)?;
             if report.schema_version != 1
                 || report.mechanism != "linux-pid-namespace-cgroup-v1"
-                || report.provider_identity.is_empty()
-                || report.receipt_digest.is_empty()
+                || report.provider_identity != binding.provider_identity
+                || report.receipt_digest != binding.receipt_digest
             {
                 return Err(failure("Linux provider identity evidence is incomplete"));
             }
@@ -415,10 +982,11 @@ fn validate_linux_auxiliary(name: &str, bytes: &[u8]) -> Result<()> {
             let report: LinuxQualificationReceipt = serde_json::from_slice(bytes)?;
             let complete = report.schema_version == 1
                 && report.mechanism == "linux-pid-namespace-cgroup-v1"
-                && !report.provider_identity.is_empty()
-                && !report.receipt_digest.is_empty()
+                && report.provider_identity == binding.provider_identity
+                && report.receipt_digest == binding.receipt_digest
                 && report.unified_cgroup_v2
                 && report.private_cgroup_subtree
+                && report.clone3
                 && report.clone3_into_cgroup
                 && report.pid_namespace
                 && report.mount_namespace
@@ -429,16 +997,26 @@ fn validate_linux_auxiliary(name: &str, bytes: &[u8]) -> Result<()> {
                 && report.target_gated
                 && report.assignment_verified
                 && report.inherited_descriptors_verified
+                && report.spawn_error_reporting_verified
                 && report.frontend_loss_authority_verified
                 && report.cgroup_kill
                 && report.workload_empty
                 && report.helpers_reaped
-                && report.boundary_retired;
+                && report.boundary_retired
+                && report.recovery_complete;
             if !complete {
                 return Err(failure("Linux qualification evidence is incomplete"));
             }
         }
-        "fault-injection-report.json" | "cleanup-recovery-report.json" => {
+        "fault-injection-report.json" => {
+            let report: LinuxFaultInjectionReport = serde_json::from_slice(bytes)?;
+            if !validate_linux_fault_evidence(&report, expected_commit) {
+                return Err(failure(
+                    "Linux fault-injection evidence is incomplete or contradictory",
+                ));
+            }
+        }
+        "cleanup-recovery-report.json" => {
             let report: LinuxNamedEvidence = serde_json::from_slice(bytes)?;
             if report.schema_version != 1
                 || report.mechanism != "linux-pid-namespace-cgroup-v1"
@@ -447,6 +1025,30 @@ fn validate_linux_auxiliary(name: &str, bytes: &[u8]) -> Result<()> {
                 || report.tests.iter().any(String::is_empty)
             {
                 return Err(failure("Linux named certification evidence is incomplete"));
+            }
+        }
+        "sealed-concurrency-report.json" => {
+            let report: LinuxConcurrencyReport = serde_json::from_slice(bytes)?;
+            if !validate_linux_concurrency(&report, expected_commit) {
+                return Err(failure(
+                    "Linux sealed concurrency evidence is incomplete or contradictory",
+                ));
+            }
+        }
+        "provider-service-privileges.json" => {
+            let report: LinuxProviderServicePrivileges = serde_json::from_slice(bytes)?;
+            if !validate_linux_provider_privileges(&report) {
+                return Err(failure(
+                    "Linux provider service privilege evidence is incomplete or contradictory",
+                ));
+            }
+        }
+        "sealed-public-launch.json" => {
+            let report = parse_linux_public_launch(bytes)?;
+            if !validate_linux_public_launch(&report, binding) {
+                return Err(failure(
+                    "Linux public sealed launch evidence is incomplete or contradictory",
+                ));
             }
         }
         "platform-environment.json" => {
@@ -611,9 +1213,10 @@ pub fn collect_certification(
         match spec.kind {
             ReportKind::LinuxSealed => {
                 validate_linux_sealed_report(&bytes, expected_commit)?;
+                let binding = linux_provider_binding(&input.join(spec.artifact_directory))?;
                 for name in LINUX_SEALED_FILES {
                     let auxiliary = read_report(&input.join(spec.artifact_directory).join(name))?;
-                    validate_linux_auxiliary(name, &auxiliary)?;
+                    validate_linux_auxiliary(name, &auxiliary, expected_commit, &binding)?;
                 }
             }
             ReportKind::Windows => validate_hard_report::<WindowsRuntimeEvidence>(

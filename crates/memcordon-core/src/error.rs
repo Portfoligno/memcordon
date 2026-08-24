@@ -15,6 +15,7 @@ pub enum BoundarySetupPhase {
     AssignmentVerification,
     ResourceVerification,
     Authorization,
+    Monitoring,
     Retirement,
 }
 
@@ -27,6 +28,48 @@ pub struct BoundarySetupFailure {
     pub target_released: bool,
     pub cleanup_attempted: bool,
     pub restart_safety: RestartSafetyProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderRejectionEvidence {
+    pub schema_version: u32,
+    pub code: String,
+    pub phase: BoundarySetupPhase,
+    pub detail: String,
+    pub os_code: Option<i32>,
+    pub target_created: bool,
+    pub target_released: bool,
+    pub cleanup_attempted: bool,
+    pub restart_safety: RestartSafetyProof,
+}
+
+impl ProviderRejectionEvidence {
+    pub(crate) fn is_consistent(&self) -> bool {
+        const MAX_CODE_BYTES: usize = 128;
+        const MAX_DETAIL_BYTES: usize = 8 * 1024;
+        const MAX_CLEANUP_ERRORS: usize = 16;
+        const MAX_CLEANUP_ERROR_BYTES: usize = 1024;
+        self.schema_version == 1
+            && !self.code.is_empty()
+            && self.code.len() <= MAX_CODE_BYTES
+            && self
+                .code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
+            && !self.detail.is_empty()
+            && self.detail.len() <= MAX_DETAIL_BYTES
+            && !self.detail.contains('\0')
+            && (!self.target_released || self.target_created)
+            && self.restart_safety.errors.len() <= MAX_CLEANUP_ERRORS
+            && self
+                .restart_safety
+                .errors
+                .iter()
+                .all(|error| error.len() <= MAX_CLEANUP_ERROR_BYTES && !error.contains('\0'))
+            && (self.cleanup_attempted || self.restart_safety == RestartSafetyProof::default())
+            && (!self.restart_safety.sealed_boundary_retired
+                || self.restart_safety.is_safe_for(BoundaryRequirement::Sealed))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -78,6 +121,7 @@ pub struct Error {
     pub restart_safety: Option<RestartSafetyProof>,
     pub initial_spawn_failure: Option<InitialSpawnFailure>,
     pub boundary_setup_failure: Option<BoundarySetupFailure>,
+    pub provider_rejection: Option<ProviderRejectionEvidence>,
 }
 
 impl Error {
@@ -99,6 +143,7 @@ impl Error {
             restart_safety: None,
             initial_spawn_failure: None,
             boundary_setup_failure: None,
+            provider_rejection: None,
         }
     }
 
@@ -125,6 +170,14 @@ impl Error {
 
     pub fn with_boundary_setup_failure(mut self, failure: BoundarySetupFailure) -> Self {
         self.boundary_setup_failure = Some(failure);
+        self
+    }
+
+    pub fn with_provider_rejection(mut self, rejection: ProviderRejectionEvidence) -> Self {
+        self.os_code = rejection.os_code;
+        self.target_released = rejection.target_released;
+        self.restart_safety = Some(rejection.restart_safety.clone());
+        self.provider_rejection = Some(rejection);
         self
     }
 }

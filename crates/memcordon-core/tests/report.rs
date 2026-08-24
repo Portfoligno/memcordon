@@ -11,14 +11,123 @@ use memcordon_core::{
     SupervisionExecution, SupervisionPhase, SupervisionTerminal, WaitCompletion,
 };
 use memcordon_core::{
-    BackoffPolicyReport, BudgetKindReport, BudgetTokenReport, CircuitBreakerPolicyReport,
-    CircuitState, DeadlinePolicyReport, DeadlineScope, DormantRestartCondition,
-    EXECUTION_REPORT_SCHEMA_VERSION, EffectiveMemoryPolicyReport, EffectivePolicyReport,
-    EffectiveRestartPolicyReport, ErrorCategory, ExecutionErrorReport, InvocationReport,
-    MemcordonReport, NativeArgument, PolicyEnvelopeReport, RequestedMemoryPolicyReport,
-    RequestedPolicyReport, RequestedRestartPolicyReport, RestartCondition, RestartConditions,
-    RestartLimit, SwapReport, ToolReport, write_report_atomic,
+    BackoffPolicyReport, BoundaryMechanismEvidence, BudgetKindReport, BudgetTokenReport,
+    CircuitBreakerPolicyReport, CircuitState, DeadlinePolicyReport, DeadlineScope,
+    DormantRestartCondition, EXECUTION_REPORT_SCHEMA_VERSION, EffectiveMemoryPolicyReport,
+    EffectivePolicyReport, EffectiveRestartPolicyReport, ErrorCategory, ExecutionErrorReport,
+    InvocationReport, MemcordonReport, NativeArgument, PolicyEnvelopeReport,
+    RequestedMemoryPolicyReport, RequestedPolicyReport, RequestedRestartPolicyReport,
+    RestartCondition, RestartConditions, RestartLimit, SwapReport, ToolReport, write_report_atomic,
 };
+
+#[test]
+fn sealed_setup_failure_preserves_the_resolved_provider_mechanism() {
+    let evidence = BoundaryMechanismEvidence::SetupFailure {
+        provider_mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+        requested: memcordon_core::BoundaryRequirement::Sealed,
+    };
+
+    let value = serde_json::to_value(&evidence).expect("evidence must serialize");
+    assert_eq!(value["mechanism"], "setup-failure");
+    assert_eq!(value["provider_mechanism"], "linux-pid-namespace-cgroup-v1");
+    assert_eq!(value["requested"], "sealed");
+    let decoded: BoundaryMechanismEvidence =
+        serde_json::from_value(value).expect("evidence must round trip");
+    assert_eq!(decoded, evidence);
+}
+
+#[test]
+fn sealed_setup_failure_preserves_truthful_incomplete_retirement() {
+    let launch = LaunchEvidence {
+        mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+        target_released: true,
+        containment_verified_before_authorization: true,
+        guardian_started_before_authorization: true,
+        target_spawn_error_reported: false,
+        boundary_requested: memcordon_core::BoundaryRequirement::Sealed,
+        boundary_effective: memcordon_core::BoundaryClass::Sealed,
+        boundary_assignment_verified: true,
+        boundary_reconfiguration_denied: true,
+        inherited_resources_restricted: true,
+        frontend_loss_cleanup_authority_verified: true,
+    };
+    let incomplete = RestartSafetyProof {
+        direct_child_reaped: false,
+        workload_empty: Some(false),
+        helpers_reaped: false,
+        containment_removed: false,
+        containment_incapable_of_live_members: false,
+        sealed_boundary_retired: false,
+        errors: vec!["authenticated residue remains".to_owned()],
+    };
+    let detail = BoundaryMechanismEvidence::SetupFailure {
+        provider_mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+        requested: memcordon_core::BoundaryRequirement::Sealed,
+    };
+
+    assert!(memcordon_core::boundary_evidence_is_consistent(
+        &launch,
+        &incomplete,
+        &detail
+    ));
+
+    let mut false_retirement = incomplete;
+    false_retirement.sealed_boundary_retired = true;
+    assert!(!memcordon_core::boundary_evidence_is_consistent(
+        &launch,
+        &false_retirement,
+        &detail
+    ));
+}
+
+#[test]
+fn typed_provider_rejection_round_trips_with_cleanup_proof() {
+    let rejection = memcordon_core::ProviderRejectionEvidence {
+        schema_version: 1,
+        code: "MCSEALED-TARGET-DESCRIPTORS-READBACK".to_owned(),
+        phase: memcordon_core::BoundarySetupPhase::ResourceVerification,
+        detail: "permission denied".to_owned(),
+        os_code: Some(13),
+        target_created: true,
+        target_released: false,
+        cleanup_attempted: true,
+        restart_safety: RestartSafetyProof {
+            direct_child_reaped: true,
+            workload_empty: Some(true),
+            helpers_reaped: true,
+            containment_removed: true,
+            containment_incapable_of_live_members: true,
+            sealed_boundary_retired: true,
+            errors: Vec::new(),
+        },
+    };
+    let error = ExecutionErrorReport {
+        category: "setup".to_owned(),
+        code: "MCSEALED-PROVIDER-REJECTION".to_owned(),
+        message: "provider rejected launch".to_owned(),
+        os_code: Some(13),
+        attempt_number: Some(1),
+        supervision_phase: Some("attempt-setup".to_owned()),
+        launch_phase: Some("resource-verification".to_owned()),
+        target_released: false,
+        workload_may_be_alive: false,
+        boundary_setup_failure: None,
+        provider_rejection: Some(rejection.clone()),
+    };
+
+    let value = serde_json::to_value(&error).expect("error must serialize");
+    assert_eq!(
+        value["provider_rejection"]["code"],
+        "MCSEALED-TARGET-DESCRIPTORS-READBACK"
+    );
+    assert_eq!(
+        value["provider_rejection"]["restart_safety"]["sealed_boundary_retired"],
+        true
+    );
+    let decoded: ExecutionErrorReport =
+        serde_json::from_value(value).expect("error must round trip");
+    assert_eq!(decoded.provider_rejection, Some(rejection));
+}
 
 fn report() -> MemcordonReport {
     MemcordonReport::schema7(
@@ -94,6 +203,7 @@ fn report() -> MemcordonReport {
             target_released: false,
             workload_may_be_alive: false,
             boundary_setup_failure: None,
+            provider_rejection: None,
         }),
     )
     .expect("valid report")
@@ -888,6 +998,7 @@ fn schema_five_later_helper_error_preserves_prior_attempt() {
         target_released: false,
         workload_may_be_alive: false,
         initial_spawn_failure: None,
+        provider_rejection: None,
     };
     history
         .append(
@@ -937,6 +1048,7 @@ fn schema_five_initial_spawn_status_round_trips_typed_provenance() {
             target_released: true,
             workload_may_be_alive: false,
             initial_spawn_failure: Some(failure),
+            provider_rejection: None,
         };
         let mut history = AttemptHistory::default();
         let mut aggregates = SupervisionAggregates::default();
@@ -967,6 +1079,72 @@ fn schema_five_initial_spawn_status_round_trips_typed_provenance() {
 }
 
 #[test]
+fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
+    let restart_safety = RestartSafetyProof {
+        direct_child_reaped: true,
+        workload_empty: Some(true),
+        helpers_reaped: true,
+        containment_removed: true,
+        containment_incapable_of_live_members: true,
+        sealed_boundary_retired: true,
+        errors: Vec::new(),
+    };
+    let provider_rejection = memcordon_core::ProviderRejectionEvidence {
+        schema_version: 1,
+        code: "MCSPAWN-NOT-FOUND".to_owned(),
+        phase: memcordon_core::BoundarySetupPhase::TargetCreation,
+        detail: "authenticated target exec failed with ENOENT".to_owned(),
+        os_code: Some(2),
+        target_created: true,
+        target_released: true,
+        cleanup_attempted: true,
+        restart_safety,
+    };
+    let error = SupervisionErrorRecord {
+        category: "spawn".to_owned(),
+        code: "MCSPAWN-NOT-FOUND".to_owned(),
+        message: "sealed target exec failed".to_owned(),
+        os_code: Some(2),
+        attempt_number: Some(1),
+        supervision_phase: SupervisionPhase::AttemptSetup,
+        launch_phase: Some("target-spawn-failed".to_owned()),
+        target_released: true,
+        workload_may_be_alive: false,
+        initial_spawn_failure: Some(InitialSpawnFailure::NotFound),
+        provider_rejection: Some(provider_rejection),
+    };
+    let mut history = AttemptHistory::default();
+    let mut aggregates = SupervisionAggregates::default();
+    history
+        .append(
+            attempt_record(1, None, Some(error.clone())),
+            &mut aggregates,
+        )
+        .expect("append");
+    let execution = SupervisionExecution::new(
+        BackendCapabilityReport::default(),
+        SupervisionTerminal::Error {
+            attempt_number: Some(1),
+            error,
+        },
+        history,
+        aggregates,
+        RestartSummary::default(),
+        None,
+        4,
+        0,
+    )
+    .expect("authenticated sealed spawn provenance must remain reportable");
+    let value = serde_json::to_value(report_from_execution(execution)).expect("json");
+    assert_eq!(value["supervision"]["wrapper_exit_code"], 127);
+    assert_eq!(
+        value["attempts"][0]["error"]["provider_rejection"]["code"],
+        "MCSPAWN-NOT-FOUND"
+    );
+    let _: MemcordonReport = serde_json::from_value(value).expect("round trip");
+}
+
+#[test]
 fn supervision_constructor_rejects_mismatched_or_misclassified_error_terminal() {
     let mut error = SupervisionErrorRecord {
         category: "spawn".to_owned(),
@@ -979,6 +1157,7 @@ fn supervision_constructor_rejects_mismatched_or_misclassified_error_terminal() 
         target_released: true,
         workload_may_be_alive: false,
         initial_spawn_failure: Some(InitialSpawnFailure::NotFound),
+        provider_rejection: None,
     };
     let mut history = AttemptHistory::default();
     let mut aggregates = SupervisionAggregates::default();
@@ -1038,6 +1217,7 @@ fn supervision_constructor_rejects_stale_error_terminal() {
         target_released: false,
         workload_may_be_alive: false,
         initial_spawn_failure: None,
+        provider_rejection: None,
     };
     let first = error(1);
     let second = error(2);
@@ -1083,6 +1263,7 @@ fn supervision_constructor_rejects_embedded_error_attempt_mismatch() {
         target_released: false,
         workload_may_be_alive: false,
         initial_spawn_failure: None,
+        provider_rejection: None,
     };
     let mut history = AttemptHistory::default();
     let mut aggregates = SupervisionAggregates::default();
