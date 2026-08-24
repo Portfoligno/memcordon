@@ -1,4 +1,61 @@
 #[cfg(target_os = "linux")]
+fn spawn_elevated_transition_descendant() {
+    let mut readiness = [-1, -1];
+    // SAFETY: readiness points to storage for exactly two file descriptors.
+    if unsafe { libc::pipe(readiness.as_mut_ptr()) } == -1 {
+        std::process::exit(103);
+    }
+    let readiness_argument =
+        std::ffi::CString::new(readiness[1].to_string()).expect("descriptor text has no NUL");
+    // SAFETY: the fixture is single-threaded here and both fork children either exec or _exit.
+    let first = unsafe { libc::fork() };
+    if first == -1 {
+        std::process::exit(104);
+    }
+    if first == 0 {
+        // SAFETY: the child does not read its own readiness pipe.
+        unsafe { libc::close(readiness[0]) };
+        // SAFETY: setsid has no pointer arguments and affects only this child.
+        if unsafe { libc::setsid() } == -1 {
+            unsafe { libc::_exit(105) };
+        }
+        // SAFETY: this single-threaded child immediately exits or execs after the second fork.
+        let second = unsafe { libc::fork() };
+        if second == -1 {
+            unsafe { libc::_exit(106) };
+        }
+        if second > 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let arguments = [
+            c"/proc/self/exe".as_ptr(),
+            c"elevated-transition-descendant".as_ptr(),
+            readiness_argument.as_ptr(),
+            std::ptr::null(),
+        ];
+        // SAFETY: executable and argv are NUL-terminated live strings with a trailing null.
+        unsafe { libc::execv(c"/proc/self/exe".as_ptr(), arguments.as_ptr()) };
+        unsafe { libc::_exit(107) };
+    }
+    // SAFETY: the parent does not write its own readiness pipe.
+    unsafe { libc::close(readiness[1]) };
+    let mut status = 0;
+    let mut ready = [0_u8; 1];
+    // SAFETY: first is a live direct child, status is initialized, and ready is writable.
+    let first_reaped = unsafe { libc::waitpid(first, &raw mut status, 0) } == first;
+    let ready_count = unsafe { libc::read(readiness[0], ready.as_mut_ptr().cast(), ready.len()) };
+    unsafe { libc::close(readiness[0]) };
+    if !first_reaped
+        || !libc::WIFEXITED(status)
+        || libc::WEXITSTATUS(status) != 0
+        || ready_count != 1
+        || ready != [1]
+    {
+        std::process::exit(108);
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn main() {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -213,9 +270,110 @@ fn main() {
                 std::process::exit(92);
             }
         }
+        "assert-credential-transition-root" => {
+            if unsafe { libc::geteuid() } != 0 {
+                std::process::exit(95);
+            }
+            spawn_elevated_transition_descendant();
+        }
+        "assert-effective-uid" => {
+            let expected = std::env::args()
+                .nth(2)
+                .and_then(|value| value.parse::<libc::uid_t>().ok());
+            if expected != Some(unsafe { libc::geteuid() }) {
+                std::process::exit(96);
+            }
+        }
+        "assert-file-capability-transition" => {
+            if unsafe { libc::setuid(0) } != 0 || unsafe { libc::geteuid() } != 0 {
+                std::process::exit(97);
+            }
+            spawn_elevated_transition_descendant();
+        }
+        "assert-bounding-capability-absent" => {
+            let capability = std::env::args()
+                .nth(2)
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value < 64);
+            let bounding_set = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|status| {
+                    memcordon_sealed_agent::linux::envelope::parse_proc_status(&status).ok()
+                })
+                .map(|status| status.capability_bounding_set);
+            if unsafe { libc::geteuid() } != 0
+                || capability
+                    .is_none_or(|value| bounding_set.is_none_or(|set| set & (1_u64 << value) != 0))
+            {
+                std::process::exit(111);
+            }
+            spawn_elevated_transition_descendant();
+        }
+        "elevated-transition-descendant" => {
+            let readiness = std::env::args()
+                .nth(2)
+                .and_then(|value| value.parse::<libc::c_int>().ok());
+            if unsafe { libc::geteuid() } != 0
+                || std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/sys/fs/cgroup/cgroup.procs")
+                    .is_ok()
+            {
+                std::process::exit(98);
+            }
+            let Some(readiness) = readiness else {
+                std::process::exit(109);
+            };
+            // SAFETY: the descriptor was inherited through exec specifically for readiness.
+            if unsafe { libc::write(readiness, [1_u8].as_ptr().cast(), 1) } != 1 {
+                std::process::exit(110);
+            }
+            unsafe { libc::close(readiness) };
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            }
+        }
+        "assert-mount-marker" => {
+            let Some(marker) = std::env::args_os().nth(2) else {
+                std::process::exit(99);
+            };
+            if !std::fs::read(marker).is_ok_and(|contents| contents == b"caller-mount-context\n") {
+                std::process::exit(100);
+            }
+        }
+        "assert-recursive-provider-rejected" => {
+            let Some(memcordon) = std::env::args_os().nth(2) else {
+                std::process::exit(126);
+            };
+            let Some(report) = std::env::args_os().nth(3) else {
+                std::process::exit(127);
+            };
+            let status = std::process::Command::new(memcordon)
+                .arg("--sealed")
+                .arg("--report")
+                .arg(&report)
+                .arg("--")
+                .arg("/usr/bin/true")
+                .status();
+            if !status.is_ok_and(|status| !status.success()) {
+                std::process::exit(101);
+            }
+            let value = std::fs::read(report)
+                .ok()
+                .filter(|bytes| bytes.len() <= 1024 * 1024)
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+            if value.as_ref().and_then(|value| {
+                value
+                    .pointer("/attempts/0/error/provider_rejection/code")
+                    .and_then(serde_json::Value::as_str)
+            }) != Some("MCSEALED-RECURSIVE-PROVIDER-REQUEST")
+            {
+                std::process::exit(102);
+            }
+        }
         "identity" => {
             let status = std::fs::read_to_string("/proc/self/status").unwrap();
-            if !status.contains("NoNewPrivs:\t1") || !status.contains("CapEff:\t0000000000000000") {
+            if !status.contains("CapEff:\t0000000000000000") {
                 std::process::exit(93);
             }
             let mut descriptors = std::fs::read_dir("/proc/self/fd")

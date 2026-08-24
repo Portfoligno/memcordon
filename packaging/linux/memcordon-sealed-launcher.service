@@ -1,0 +1,23 @@
+[Unit]
+Description=MemCordon sealed supervision launch broker
+Requires=memcordon-sealed-launcher.socket
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/memcordon-sealed-agent launch-broker
+User=root
+Group=root
+Delegate=yes
+KillMode=process
+RuntimeDirectory=memcordon
+RuntimeDirectoryMode=0750
+StateDirectory=memcordon/sealed
+StateDirectoryMode=0700
+NoNewPrivileges=no
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

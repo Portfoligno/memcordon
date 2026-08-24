@@ -23,13 +23,13 @@ use memcordon_core::{
 #[test]
 fn sealed_setup_failure_preserves_the_resolved_provider_mechanism() {
     let evidence = BoundaryMechanismEvidence::SetupFailure {
-        provider_mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+        provider_mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
         requested: memcordon_core::BoundaryRequirement::Sealed,
     };
 
     let value = serde_json::to_value(&evidence).expect("evidence must serialize");
     assert_eq!(value["mechanism"], "setup-failure");
-    assert_eq!(value["provider_mechanism"], "linux-pid-namespace-cgroup-v1");
+    assert_eq!(value["provider_mechanism"], "linux-pid-namespace-cgroup-v2");
     assert_eq!(value["requested"], "sealed");
     let decoded: BoundaryMechanismEvidence =
         serde_json::from_value(value).expect("evidence must round trip");
@@ -39,7 +39,7 @@ fn sealed_setup_failure_preserves_the_resolved_provider_mechanism() {
 #[test]
 fn sealed_setup_failure_preserves_truthful_incomplete_retirement() {
     let launch = LaunchEvidence {
-        mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+        mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
         target_released: true,
         containment_verified_before_authorization: true,
         guardian_started_before_authorization: true,
@@ -61,7 +61,7 @@ fn sealed_setup_failure_preserves_truthful_incomplete_retirement() {
         errors: vec!["authenticated residue remains".to_owned()],
     };
     let detail = BoundaryMechanismEvidence::SetupFailure {
-        provider_mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+        provider_mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
         requested: memcordon_core::BoundaryRequirement::Sealed,
     };
 
@@ -130,7 +130,7 @@ fn typed_provider_rejection_round_trips_with_cleanup_proof() {
 }
 
 fn report() -> MemcordonReport {
-    MemcordonReport::schema7(
+    MemcordonReport::schema8(
         ToolReport {
             name: "memcordon".to_owned(),
             version: "test".to_owned(),
@@ -735,7 +735,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         RestartConditions::NONE
     };
     base.policy.effective.restart.dormant_conditions.clear();
-    MemcordonReport::schema7(
+    MemcordonReport::schema8(
         base.tool,
         base.invocation,
         base.policy,
@@ -743,7 +743,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         Some(execution),
         None,
     )
-    .expect("schema7")
+    .expect("schema8")
 }
 
 fn coordinator() -> RestartCoordinator {

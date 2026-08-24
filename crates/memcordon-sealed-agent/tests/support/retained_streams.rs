@@ -2,7 +2,7 @@ use std::io::Read;
 use std::os::unix::net::UnixStream;
 
 use memcordon_sealed_agent::linux::launch::TerminalFacts;
-use memcordon_sealed_agent::request::LaunchRequestV1;
+use memcordon_sealed_agent::request::LaunchRequestV2;
 
 use crate::support;
 
@@ -13,7 +13,7 @@ pub struct CapturedExecution {
     pub execution_millis: u64,
 }
 
-pub fn execute(request: LaunchRequestV1) -> Result<CapturedExecution, String> {
+pub fn execute(request: LaunchRequestV2) -> Result<CapturedExecution, String> {
     let (mut stdout_reader, stdout_writer) =
         UnixStream::pair().map_err(|error| error.to_string())?;
     let (mut stderr_reader, stderr_writer) =

@@ -1,13 +1,22 @@
 use std::ffi::OsStr;
 
-const SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision provider\nRequires=memcordon-sealed-agent.socket\nAfter=local-fs.target\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent serve\nUser=root\nGroup=memcordon\nDelegate=yes\nKillMode=process\nRuntimeDirectory=memcordon\nRuntimeDirectoryMode=0750\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/run/memcordon /var/lib/memcordon/sealed /sys/fs/cgroup\nCapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_KILL CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=\n\n[Install]\nWantedBy=multi-user.target\n";
-const SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision provider socket\n\n[Socket]\nListenStream=/run/memcordon/sealed-agent.sock\nDirectoryMode=0755\nSocketMode=0660\nSocketUser=root\nSocketGroup=memcordon\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
+const SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision control provider\nRequires=memcordon-sealed-agent.socket memcordon-sealed-launcher.socket\nAfter=local-fs.target memcordon-sealed-launcher.socket\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent serve\nUser=root\nGroup=memcordon\nKillMode=process\nRuntimeDirectory=memcordon\nRuntimeDirectoryMode=0750\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/run/memcordon /var/lib/memcordon/sealed\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
+const SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision control socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-agent.sock\nDirectoryMode=0755\nSocketMode=0660\nSocketUser=root\nSocketGroup=memcordon\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
+const LAUNCHER_SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker\nRequires=memcordon-sealed-launcher.socket\nAfter=local-fs.target\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent launch-broker\nUser=root\nGroup=root\nDelegate=yes\nKillMode=process\nRuntimeDirectory=memcordon\nRuntimeDirectoryMode=0750\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=no\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
+const LAUNCHER_SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-launcher.sock\nDirectoryMode=0750\nSocketMode=0600\nSocketUser=root\nSocketGroup=root\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
+const TMPFILES: &str = "d /run/memcordon 0750 root memcordon -\n";
 #[cfg(target_os = "linux")]
 const BINARY: &str = "/usr/libexec/memcordon-sealed-agent";
 #[cfg(target_os = "linux")]
 const UNIT: &str = "/usr/lib/systemd/system/memcordon-sealed-agent.service";
 #[cfg(target_os = "linux")]
 const SOCKET_UNIT: &str = "/usr/lib/systemd/system/memcordon-sealed-agent.socket";
+#[cfg(target_os = "linux")]
+const LAUNCHER_UNIT: &str = "/usr/lib/systemd/system/memcordon-sealed-launcher.service";
+#[cfg(target_os = "linux")]
+const LAUNCHER_SOCKET_UNIT: &str = "/usr/lib/systemd/system/memcordon-sealed-launcher.socket";
+#[cfg(target_os = "linux")]
+const TMPFILES_FILE: &str = "/usr/lib/tmpfiles.d/memcordon.conf";
 
 pub fn run(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     if operation == "verify" {
@@ -24,7 +33,7 @@ pub fn run(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     }
 }
 
-fn verify() -> Result<(), String> {
+pub(crate) fn verify() -> Result<(), String> {
     verify_compiled_metadata()?;
     #[cfg(target_os = "linux")]
     verify_installed_package()?;
@@ -32,31 +41,69 @@ fn verify() -> Result<(), String> {
 }
 
 fn verify_compiled_metadata() -> Result<(), String> {
-    const CAPABILITY_BOUNDING_SET: &str = "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_KILL CAP_DAC_OVERRIDE CAP_SYS_PTRACE";
-    let capability_lines = SERVICE
+    const CONTROL_CAPABILITY_BOUNDING_SET: &str =
+        "CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE";
+    let control_capabilities = SERVICE
         .lines()
         .filter(|line| line.starts_with("CapabilityBoundingSet="))
         .collect::<Vec<_>>();
-    let ambient_lines = SERVICE
+    let control_ambient = SERVICE
         .lines()
         .filter(|line| line.starts_with("AmbientCapabilities="))
         .collect::<Vec<_>>();
-    if SERVICE.contains("ExecStart=/usr/libexec/memcordon-sealed-agent serve")
+    let launcher_capabilities = LAUNCHER_SERVICE
+        .lines()
+        .filter(|line| line.starts_with("CapabilityBoundingSet="))
+        .collect::<Vec<_>>();
+    let launcher_ambient = LAUNCHER_SERVICE
+        .lines()
+        .filter(|line| line.starts_with("AmbientCapabilities="))
+        .collect::<Vec<_>>();
+    let launcher_forbidden = [
+        "PrivateTmp=",
+        "ProtectSystem=",
+        "ReadWritePaths=",
+        "ReadOnlyPaths=",
+        "InaccessiblePaths=",
+        "RestrictSUIDSGID=",
+    ];
+    let launcher_changes_target_mounts = LAUNCHER_SERVICE.lines().any(|line| {
+        launcher_forbidden
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+    });
+    if SERVICE.contains("Description=MemCordon sealed supervision control provider")
+        && SERVICE.contains("ExecStart=/usr/libexec/memcordon-sealed-agent serve")
         && SERVICE.contains("User=root")
         && SERVICE.contains("Group=memcordon")
-        && SERVICE.contains("RuntimeDirectoryMode=0750")
         && SERVICE.contains("NoNewPrivileges=yes")
-        && capability_lines == [CAPABILITY_BOUNDING_SET]
-        && ambient_lines == ["AmbientCapabilities="]
+        && SERVICE.contains("PrivateTmp=yes")
+        && SERVICE.contains("ProtectSystem=strict")
+        && control_capabilities == [CONTROL_CAPABILITY_BOUNDING_SET]
+        && control_ambient == ["AmbientCapabilities="]
         && SOCKET.contains("ListenStream=/run/memcordon/sealed-agent.sock")
-        && SOCKET.contains("DirectoryMode=0755")
+        && SOCKET.contains("After=systemd-tmpfiles-setup.service")
         && SOCKET.contains("SocketMode=0660")
-        && SOCKET.contains("SocketUser=root")
         && SOCKET.contains("SocketGroup=memcordon")
+        && LAUNCHER_SERVICE.contains("Description=MemCordon sealed supervision launch broker")
+        && LAUNCHER_SERVICE.contains("ExecStart=/usr/libexec/memcordon-sealed-agent launch-broker")
+        && LAUNCHER_SERVICE.contains("User=root")
+        && LAUNCHER_SERVICE.contains("Group=root")
+        && LAUNCHER_SERVICE.contains("NoNewPrivileges=no")
+        && launcher_capabilities.is_empty()
+        && launcher_ambient == ["AmbientCapabilities="]
+        && !launcher_changes_target_mounts
+        && LAUNCHER_SOCKET.contains("ListenStream=/run/memcordon/sealed-launcher.sock")
+        && LAUNCHER_SOCKET.contains("After=systemd-tmpfiles-setup.service")
+        && LAUNCHER_SOCKET.contains("DirectoryMode=0750")
+        && LAUNCHER_SOCKET.contains("SocketMode=0600")
+        && LAUNCHER_SOCKET.contains("SocketUser=root")
+        && LAUNCHER_SOCKET.contains("SocketGroup=root")
+        && TMPFILES == "d /run/memcordon 0750 root memcordon -\n"
     {
         Ok(())
     } else {
-        Err("compiled service metadata is inconsistent".to_owned())
+        Err("compiled split-service metadata is inconsistent".to_owned())
     }
 }
 
@@ -69,6 +116,13 @@ fn verify_installed_package() -> Result<(), String> {
         (BINARY, 0o755, None),
         (UNIT, 0o644, Some(SERVICE.as_bytes())),
         (SOCKET_UNIT, 0o644, Some(SOCKET.as_bytes())),
+        (LAUNCHER_UNIT, 0o644, Some(LAUNCHER_SERVICE.as_bytes())),
+        (
+            LAUNCHER_SOCKET_UNIT,
+            0o644,
+            Some(LAUNCHER_SOCKET.as_bytes()),
+        ),
+        (TMPFILES_FILE, 0o644, Some(TMPFILES.as_bytes())),
     ];
     for (path, expected_mode, expected_bytes) in artifacts {
         let mut file = match std::fs::OpenOptions::new()
@@ -140,9 +194,13 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     })?;
     if operation == "uninstall" {
         stop_unit("memcordon-sealed-agent.service")?;
+        stop_unit("memcordon-sealed-launcher.service")?;
         stop_unit("memcordon-sealed-agent.socket")?;
+        stop_unit("memcordon-sealed-launcher.socket")?;
         ensure_unit_inactive("memcordon-sealed-agent.service")?;
+        ensure_unit_inactive("memcordon-sealed-launcher.service")?;
         ensure_unit_inactive("memcordon-sealed-agent.socket")?;
+        ensure_unit_inactive("memcordon-sealed-launcher.socket")?;
         let ambiguous = crate::linux::recovery::recover()?;
         if !ambiguous.is_empty() {
             return Err(format!(
@@ -155,7 +213,14 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
                 "refusing to uninstall while an authenticated attempt record exists".to_owned(),
             );
         }
-        for path in [SOCKET_UNIT, UNIT, BINARY] {
+        for path in [
+            SOCKET_UNIT,
+            UNIT,
+            LAUNCHER_SOCKET_UNIT,
+            LAUNCHER_UNIT,
+            TMPFILES_FILE,
+            BINARY,
+        ] {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -167,9 +232,13 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     }
     if operation == "upgrade" {
         stop_unit("memcordon-sealed-agent.service")?;
+        stop_unit("memcordon-sealed-launcher.service")?;
         stop_unit("memcordon-sealed-agent.socket")?;
+        stop_unit("memcordon-sealed-launcher.socket")?;
         ensure_unit_inactive("memcordon-sealed-agent.service")?;
+        ensure_unit_inactive("memcordon-sealed-launcher.service")?;
         ensure_unit_inactive("memcordon-sealed-agent.socket")?;
+        ensure_unit_inactive("memcordon-sealed-launcher.socket")?;
         let ambiguous = crate::linux::recovery::recover()?;
         if !ambiguous.is_empty() {
             return Err(format!(
@@ -184,7 +253,17 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         }
     }
     verify_compiled_metadata()?;
-    ensure_service_group()?;
+    let service_gid = ensure_service_group()?;
+    let runtime_directory =
+        std::ffi::CString::new("/run/memcordon").expect("static runtime path has no NUL");
+    // SAFETY: runtime_directory is a live NUL-terminated path and service_gid came from the
+    // system group database. The public socket group needs traversal through this 0750 parent.
+    if unsafe { libc::chown(runtime_directory.as_ptr(), 0, service_gid) } == -1 {
+        return Err(format!(
+            "could not assign /run/memcordon to root:memcordon: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
     let source = std::env::current_exe().map_err(|error| error.to_string())?;
     let installations = [
         (
@@ -194,6 +273,21 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         ),
         (Path::new(UNIT), SERVICE.as_bytes().to_vec(), 0o644),
         (Path::new(SOCKET_UNIT), SOCKET.as_bytes().to_vec(), 0o644),
+        (
+            Path::new(LAUNCHER_UNIT),
+            LAUNCHER_SERVICE.as_bytes().to_vec(),
+            0o644,
+        ),
+        (
+            Path::new(LAUNCHER_SOCKET_UNIT),
+            LAUNCHER_SOCKET.as_bytes().to_vec(),
+            0o644,
+        ),
+        (
+            Path::new(TMPFILES_FILE),
+            TMPFILES.as_bytes().to_vec(),
+            0o644,
+        ),
     ];
     for (path, bytes, mode) in installations {
         let parent = path
@@ -222,10 +316,13 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     verify_installed_package()?;
     systemctl(["daemon-reload"])?;
     if ephemeral_ci {
+        systemctl(["start", "memcordon-sealed-launcher.socket"])?;
         systemctl(["start", "memcordon-sealed-agent.socket"])?;
     } else {
+        systemctl(["enable", "--now", "memcordon-sealed-launcher.socket"])?;
         systemctl(["enable", "--now", "memcordon-sealed-agent.socket"])?;
     }
+    systemctl(["restart", "memcordon-sealed-launcher.service"])?;
     systemctl(["restart", "memcordon-sealed-agent.service"])?;
     wait_provider_ready()?;
     verify_client_access()?;
@@ -315,7 +412,8 @@ pub fn probe_provider() -> Result<crate::linux::qualification::QualificationRece
     let qualification: crate::linux::qualification::QualificationReceipt =
         serde_json::from_slice(&receipt.payload)
             .map_err(|error| readiness_error(&error.to_string()))?;
-    if qualification.mechanism != "linux-pid-namespace-cgroup-v1"
+    if qualification.schema_version != 2
+        || qualification.mechanism != "linux-pid-namespace-cgroup-v2"
         || qualification.provider_identity.is_empty()
         || qualification.receipt_digest.is_empty()
         || !qualification.complete()
@@ -345,21 +443,28 @@ fn live_attempt_exists() -> Result<bool, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_service_group() -> Result<(), String> {
+fn ensure_service_group() -> Result<libc::gid_t, String> {
     let name = std::ffi::CString::new("memcordon").expect("static group name has no NUL");
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
-    if !unsafe { libc::getgrnam(name.as_ptr()) }.is_null() {
-        return Ok(());
+    let group = unsafe { libc::getgrnam(name.as_ptr()) };
+    if !group.is_null() {
+        // SAFETY: getgrnam returned a live libc-managed group record.
+        return Ok(unsafe { (*group).gr_gid });
     }
     let status = std::process::Command::new("/usr/sbin/groupadd")
         .args(["--system", "memcordon"])
         .status()
         .map_err(|error| format!("could not create service group: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("service group creation failed with {status}"))
+    if !status.success() {
+        return Err(format!("service group creation failed with {status}"));
     }
+    // SAFETY: groupadd succeeded and name remains a live NUL-terminated lookup key.
+    let group = unsafe { libc::getgrnam(name.as_ptr()) };
+    if group.is_null() {
+        return Err("service group was not visible after successful creation".to_owned());
+    }
+    // SAFETY: getgrnam returned a live libc-managed group record.
+    Ok(unsafe { (*group).gr_gid })
 }
 
 #[cfg(target_os = "linux")]

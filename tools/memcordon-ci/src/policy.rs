@@ -722,19 +722,25 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
     }
     exact_mapping_keys(jobs, &["linux", "windows"], "backend certification jobs")?;
 
-    let dependency_key = "cargo-deps-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}";
-    let target_key = "cargo-target-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
-    for (job_name, runner, suite, artifact_name, artifact_path) in [
+    let linux_dependency_key = "cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}";
+    let linux_target_key = "cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
+    let legacy_dependency_key = "cargo-deps-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}";
+    let legacy_target_key = "cargo-target-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
+    for (job_name, runner, dependency_key, target_key, suite, artifact_name, artifact_path) in [
         (
             "linux",
             "ubuntu-24.04",
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed",
-            "backend-linux-sealed-v1",
-            "target/ci/reports/linux-sealed",
+            linux_dependency_key,
+            linux_target_key,
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2",
+            "backend-linux-sealed-v2",
+            "target/ci/reports/linux-sealed-v2",
         ),
         (
             "windows",
             "windows-2025",
+            legacy_dependency_key,
+            legacy_target_key,
             "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job",
             "backend-windows-job-object",
             "target/ci/reports/backend-windows-job-object.json",
@@ -1075,7 +1081,7 @@ fn check_release_structure(
         "release preflight target cache inputs",
     )?;
     let expected_preflight_target_key = format!(
-        "cargo-target-release-v2-preflight-{}-msrv-{}-${{{{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'CHANGELOG.md', 'RELEASING.md', '.github/workflows/release.yml') }}}}",
+        "cargo-target-release-v3-preflight-{}-msrv-{}-${{{{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}}}",
         toolchains.stable, toolchains.msrv
     );
     if scalar(preflight_target_inputs, "path") != Some("target/ci")
@@ -1083,19 +1089,25 @@ fn check_release_structure(
     {
         return Err(failure("release preflight target cache identity differs"));
     }
-    let dependency_key = "cargo-deps-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}";
-    let target_key = "cargo-target-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
-    for (job_name, runner, suite, artifact_name, artifact_path) in [
+    let linux_dependency_key = "cargo-deps-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}";
+    let linux_target_key = "cargo-target-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
+    let legacy_dependency_key = "cargo-deps-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}";
+    let legacy_target_key = "cargo-target-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
+    for (job_name, runner, dependency_key, target_key, suite, artifact_name, artifact_path) in [
         (
             "linux-certification",
             "ubuntu-24.04",
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed",
+            linux_dependency_key,
+            linux_target_key,
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2",
             "release-certification-linux",
-            "target/ci/reports/linux-sealed",
+            "target/ci/reports/linux-sealed-v2",
         ),
         (
             "windows-certification",
             "windows-2025",
+            legacy_dependency_key,
+            legacy_target_key,
             "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job",
             "release-certification-windows",
             "target/ci/reports/backend-windows-job-object.json",
@@ -1775,6 +1787,7 @@ fn is_reviewed_raw_fork_boundary(relative: &Path) -> bool {
     matches!(
         relative,
         path if path == Path::new("crates/memcordon-sealed-agent/src/linux/launch.rs")
+            || path == Path::new("crates/memcordon-sealed-agent/src/linux/namespace.rs")
             || path == Path::new("crates/memcordon-sealed-agent/src/linux/service.rs")
             || path
                 == Path::new(
@@ -2026,6 +2039,222 @@ fn check_cargo_configuration(root: &Path, files: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+fn require_credential_transition_fragments(
+    root: &Path,
+    relative: &str,
+    required: &[&str],
+    forbidden: &[&str],
+) -> Result<()> {
+    let source = fs::read_to_string(root.join(relative))?;
+    for fragment in required {
+        if !source.contains(fragment) {
+            return Err(failure(format!(
+                "credential-transition v2 policy fragment is absent from {relative}: {fragment:?}"
+            )));
+        }
+    }
+    for fragment in forbidden {
+        if source.contains(fragment) {
+            return Err(failure(format!(
+                "legacy credential-transition policy fragment remains in {relative}: {fragment:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_credential_transition_redesign(root: &Path) -> Result<()> {
+    require_credential_transition_fragments(
+        root,
+        "crates/memcordon-core/src/report.rs",
+        &[
+            "pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 8;",
+            "pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 7;",
+            "pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 5;",
+            "pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 2;",
+        ],
+        &[],
+    )?;
+    require_credential_transition_fragments(
+        root,
+        "crates/memcordon-core/src/supervision.rs",
+        &[
+            "CredentialTransitionDisposition",
+            "PreserveCallerEnvelope",
+            "LinuxSealedEvidenceV2",
+            "WindowsSealedEvidenceV2",
+            "LinuxPidNamespaceCgroupV2",
+            "WindowsJobObjectV2",
+        ],
+        &["linux-pid-namespace-cgroup-v1"],
+    )?;
+    require_credential_transition_fragments(
+        root,
+        "crates/memcordon-sealed-agent/src/protocol.rs",
+        &["pub const PROTOCOL_VERSION: u16 = 2;"],
+        &["linux-pid-namespace-cgroup-v1"],
+    )?;
+    require_credential_transition_fragments(
+        root,
+        "crates/memcordon-sealed-agent/src/request.rs",
+        &[
+            "pub const LAUNCH_REQUEST_VERSION: u16 = 2;",
+            "pub const LAUNCH_BROKER_REQUEST_VERSION: u16 = 2;",
+            "CallerExecutionEnvelopeV2",
+            "LaunchBrokerRequestV2",
+            "request_digest",
+            "control_process_start_time",
+            "record_identity",
+            "request_authentication_binding",
+        ],
+        &["linux-pid-namespace-cgroup-v1"],
+    )?;
+    require_credential_transition_fragments(
+        root,
+        "crates/memcordon-sealed-agent/src/linux/qualification.rs",
+        &[
+            "schema_version: 2",
+            "linux-pid-namespace-cgroup-v2",
+            "preserve-caller-envelope",
+            "setid_transition_certification_digest",
+            "sudo_transition_certification_digest",
+            "recursive_provider_request_rejected",
+        ],
+        &["linux-pid-namespace-cgroup-v1"],
+    )?;
+    let selectors = [
+        "sealed_setid_transition_preserves_boundary",
+        "sealed_sudo_transition_preserves_boundary",
+        "sealed_file_capability_transition_preserves_boundary",
+        "sealed_caller_no_new_privs_is_reproduced",
+        "sealed_caller_capability_bounding_set_is_reproduced",
+        "sealed_caller_mount_context_is_reproduced",
+        "sealed_recursive_provider_request_is_rejected",
+    ];
+    require_credential_transition_fragments(
+        root,
+        "crates/memcordon-sealed-agent/tests/linux_sealed.rs",
+        &selectors,
+        &[],
+    )?;
+    let artifacts = [
+        "provider-package-verification.json",
+        "provider-qualification-v2.json",
+        "setid-transition.json",
+        "sudo-transition.json",
+        "file-capability-transition.json",
+        "caller-envelope.json",
+        "mount-context.json",
+        "fault-injection.json",
+        "cleanup-leak-check.json",
+    ];
+    let mut runner_fragments = vec![
+        "linux-pid-namespace-cgroup-v2",
+        "target/ci/reports/linux-sealed-v2",
+    ];
+    runner_fragments.extend(selectors);
+    runner_fragments.extend(artifacts);
+    require_credential_transition_fragments(
+        root,
+        "tools/memcordon-ci/src/sealed_linux.rs",
+        &runner_fragments,
+        &["linux-pid-namespace-cgroup-v1"],
+    )?;
+    let mut release_fragments = vec![
+        "linux-pid-namespace-cgroup-v2",
+        "LinuxPidNamespaceCgroupV2",
+        "PreserveCallerEnvelope",
+    ];
+    release_fragments.extend(selectors);
+    release_fragments.extend(artifacts);
+    require_credential_transition_fragments(
+        root,
+        "tools/memcordon-ci/src/release_evidence.rs",
+        &release_fragments,
+        &["linux-pid-namespace-cgroup-v1"],
+    )?;
+    let fuzz_targets = [
+        "caller-envelope-status",
+        "capability-mask",
+        "namespace-identity",
+        "broker-protocol-v2",
+        "qualification-receipt-v2",
+        "terminal-receipt-v2",
+        "linux-evidence-v2",
+        "service-unit-policy",
+        "provider-recursion-proof",
+        "mount-context-manifest",
+    ];
+    require_credential_transition_fragments(root, "fuzz/Cargo.toml", &fuzz_targets, &[])?;
+    require_credential_transition_fragments(
+        root,
+        "tools/memcordon-ci/src/suites.rs",
+        &fuzz_targets,
+        &[],
+    )?;
+    require_credential_transition_fragments(
+        root,
+        "docs/sealed-supervision.md",
+        &[
+            "linux-pid-namespace-cgroup-v2",
+            "preserve-caller-envelope",
+            "credential transitions",
+        ],
+        &[],
+    )?;
+    require_credential_transition_fragments(
+        root,
+        "docs/sealed-provider.md",
+        &[
+            "memcordon-sealed-launcher.service",
+            "NoNewPrivileges=no",
+            "provider protocol v2",
+        ],
+        &[],
+    )?;
+    require_credential_transition_fragments(
+        root,
+        "packaging/linux/memcordon.conf",
+        &["d /run/memcordon 0750 root memcordon -"],
+        &[],
+    )?;
+    require_credential_transition_fragments(root, "spec/sealed-linux-v2.md", &artifacts, &[])?;
+    require_credential_transition_fragments(
+        root,
+        "spec/sealed-linux-v1.md",
+        &["Historical specification", "reject this mechanism"],
+        &[],
+    )?;
+    require_credential_transition_fragments(
+        root,
+        "spec/sealed-provider-protocol-v1.md",
+        &["Historical specification", "reject protocol v1"],
+        &[],
+    )?;
+    require_credential_transition_fragments(
+        root,
+        "tools/memcordon-ci/tests/release_evidence.rs",
+        &[
+            "required_credential_transition_mutants_fail_closed_and_map_to_named_tests",
+            "retain-service-nnp-on-target",
+            "force-target-nnp-regardless-of-caller",
+            "ignore-caller-capability-bounding-set",
+            "preserve-provider-capability",
+            "inherit-control-service-mount-namespace",
+            "authorize-before-mount-context-verification",
+            "allow-recursive-provider-request",
+            "accept-v1-provider",
+            "hardcode-transition-compatibility",
+            "skip-setid-certification-digest",
+            "treat-credential-change-as-boundary-loss",
+            "omit-cgroup-kill-after-credential-change",
+            "restart-before-v2-retirement",
+        ],
+        &[],
+    )?;
+    Ok(())
+}
+
 pub fn run(root: &Path) -> Result<()> {
     let policy = config::policy(root)?;
     for command in &policy.workflow.allowed_run_commands {
@@ -2142,6 +2371,7 @@ pub fn run(root: &Path) -> Result<()> {
             "action pin inventory differs from workflow uses: used={used_actions:?} configured={configured_actions:?}"
         )));
     }
+    check_credential_transition_redesign(root)?;
     check_rust(root, &files)?;
     check_cargo_configuration(root, &files)?;
     check_manifests(root, &policy)?;

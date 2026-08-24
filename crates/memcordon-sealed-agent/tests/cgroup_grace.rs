@@ -4,7 +4,7 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use memcordon_sealed_agent::linux::cgroup::AttemptCgroup;
-use memcordon_sealed_agent::request::{DeadlineScope, LaunchPolicyV1, Lifetime, SwapLimit};
+use memcordon_sealed_agent::request::{DeadlineScope, LaunchPolicyV2, Lifetime, SwapLimit};
 
 fn cgroup(populated: bool) -> (tempfile::TempDir, AttemptCgroup) {
     let directory = tempfile::tempdir().unwrap();
@@ -17,8 +17,8 @@ fn cgroup(populated: bool) -> (tempfile::TempDir, AttemptCgroup) {
     (directory, cgroup)
 }
 
-fn command_policy(grace_millis: u64, absolute_deadline_millis: Option<u64>) -> LaunchPolicyV1 {
-    LaunchPolicyV1 {
+fn command_policy(grace_millis: u64, absolute_deadline_millis: Option<u64>) -> LaunchPolicyV2 {
+    LaunchPolicyV2 {
         memory_limit_bytes: None,
         swap_limit: SwapLimit::Bytes(0),
         absolute_deadline_millis,

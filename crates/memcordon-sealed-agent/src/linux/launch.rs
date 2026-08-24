@@ -8,11 +8,13 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 #[cfg(feature = "test-support")]
 use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 use crate::rejection::{RejectionCleanupV1, RejectionPhaseV1, RejectionV1};
-use crate::request::LaunchRequestV1;
+use crate::request::{CallerExecutionEnvelopeV2, LaunchRequestV2};
 
 use super::attempt::AttemptRecord;
 use super::cgroup::{AttemptCgroup, AttemptRetirementObservation};
@@ -90,10 +92,20 @@ pub struct TerminalFacts {
     pub boundary_retired: bool,
     pub assignment_verified: bool,
     pub namespaces_verified: bool,
-    pub credentials_verified: bool,
-    pub capabilities_empty: bool,
+    pub target_initial_credentials_verified: bool,
+    pub initial_provider_capabilities_absent: bool,
+    pub caller_envelope_digest: String,
+    pub caller_no_new_privs: bool,
+    pub target_no_new_privs_matched: bool,
+    pub caller_capability_bounding_set_digest: String,
+    pub target_capability_bounding_set_matched: bool,
+    pub caller_mount_namespace_digest: String,
+    pub target_mount_context_derived_from_caller: bool,
+    pub boundary_independent_of_credentials: bool,
     pub descriptors_verified: bool,
-    pub cgroup_view_denied: bool,
+    pub writable_ancestor_cgroup_denied: bool,
+    pub parent_namespace_handles_denied: bool,
+    pub recursive_provider_request_denied: bool,
     pub guardian_ready_before_authorization: bool,
     pub frontend_loss_authority_verified: bool,
     pub cgroup_kill_invoked: bool,
@@ -150,6 +162,84 @@ struct TargetCredentials {
     uid: libc::uid_t,
     gid: libc::gid_t,
     groups: Vec<libc::gid_t>,
+    no_new_privs: bool,
+    capability_bounding_set: u64,
+    caller_envelope_digest: String,
+    caller_capability_bounding_set_digest: String,
+    caller_mount_namespace_digest: String,
+    mount_context_derived_from_caller: bool,
+}
+
+impl TargetCredentials {
+    fn direct(
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+        groups: Vec<libc::gid_t>,
+    ) -> Result<Self, String> {
+        let status = std::fs::read_to_string("/proc/self/status")
+            .map_err(|error| format!("MCSEALED-CALLER-ENVELOPE-CAPTURE: {error}"))?;
+        let status = super::envelope::parse_proc_status(&status)
+            .map_err(|error| format!("MCSEALED-CALLER-ENVELOPE-CAPTURE: {error}"))?;
+        let mount = std::fs::metadata("/proc/self/ns/mnt")
+            .map_err(|error| format!("MCSEALED-CALLER-ENVELOPE-CAPTURE: {error}"))?;
+        let mut identity = Sha256::new();
+        identity.update(uid.to_be_bytes());
+        identity.update(gid.to_be_bytes());
+        for group in &groups {
+            identity.update(group.to_be_bytes());
+        }
+        identity.update([u8::from(status.no_new_privs)]);
+        identity.update(status.capability_bounding_set.to_be_bytes());
+        identity.update(mount.dev().to_be_bytes());
+        identity.update(mount.ino().to_be_bytes());
+        Ok(Self {
+            uid,
+            gid,
+            groups,
+            no_new_privs: status.no_new_privs,
+            capability_bounding_set: status.capability_bounding_set,
+            caller_envelope_digest: hex_digest(identity.finalize()),
+            caller_capability_bounding_set_digest: digest_u64(status.capability_bounding_set),
+            caller_mount_namespace_digest: digest_pair(mount.dev(), mount.ino()),
+            mount_context_derived_from_caller: true,
+        })
+    }
+
+    fn from_caller(caller: &CallerExecutionEnvelopeV2) -> Self {
+        Self {
+            uid: caller.uid,
+            gid: caller.gid,
+            groups: caller.supplementary_groups.clone(),
+            no_new_privs: caller.no_new_privs,
+            capability_bounding_set: caller.capability_bounding_set,
+            caller_envelope_digest: caller.digest_hex(),
+            caller_capability_bounding_set_digest: digest_u64(caller.capability_bounding_set),
+            caller_mount_namespace_digest: digest_pair(
+                caller.mount_namespace_identity.device,
+                caller.mount_namespace_identity.inode,
+            ),
+            mount_context_derived_from_caller: true,
+        }
+    }
+}
+
+fn digest_u64(value: u64) -> String {
+    hex_digest(Sha256::digest(value.to_be_bytes()))
+}
+
+fn digest_pair(first: u64, second: u64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(first.to_be_bytes());
+    digest.update(second.to_be_bytes());
+    hex_digest(digest.finalize())
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 struct NamespaceStartupChannel {
@@ -608,7 +698,7 @@ fn persist_guardian_claim_for_test(path: &std::path::Path, encoded: &[u8]) -> Re
 }
 
 pub fn execute(
-    request: LaunchRequestV1,
+    request: LaunchRequestV2,
     descriptors: Vec<OwnedFd>,
     attempt: [u8; 16],
     frontend_pid: libc::pid_t,
@@ -616,14 +706,15 @@ pub fn execute(
     gid: libc::gid_t,
     groups: Vec<libc::gid_t>,
 ) -> Result<TerminalFacts, String> {
+    let credentials = TargetCredentials::direct(uid, gid, groups)?;
     execute_inner(
         request,
         descriptors,
         attempt,
         frontend_pid,
-        uid,
-        gid,
-        groups,
+        credentials,
+        None,
+        None,
         None,
         None,
         None,
@@ -631,7 +722,7 @@ pub fn execute(
 }
 
 pub fn execute_typed(
-    request: LaunchRequestV1,
+    request: LaunchRequestV2,
     descriptors: Vec<OwnedFd>,
     attempt: [u8; 16],
     frontend_pid: libc::pid_t,
@@ -651,10 +742,41 @@ pub fn execute_typed(
     .map_err(|error| rejection_for_launch_error(&error, attempt))
 }
 
+pub fn execute_brokered_typed(
+    request: LaunchRequestV2,
+    descriptors: Vec<OwnedFd>,
+    attempt: [u8; 16],
+    caller: CallerExecutionEnvelopeV2,
+    mount_namespace: OwnedFd,
+    root: OwnedFd,
+    record: AttemptRecord,
+) -> Result<TerminalFacts, RejectionV1> {
+    let credentials = TargetCredentials::from_caller(&caller);
+    let context = super::namespace::CallerMountContext {
+        mount_namespace,
+        root,
+        mount_namespace_identity: caller.mount_namespace_identity,
+        root_identity: caller.root_identity,
+    };
+    execute_inner(
+        request,
+        descriptors,
+        attempt,
+        caller.pid,
+        credentials,
+        Some(record),
+        Some(context),
+        None,
+        None,
+        None,
+    )
+    .map_err(|error| rejection_for_launch_error(&error, attempt))
+}
+
 #[cfg(feature = "test-support")]
 #[allow(clippy::too_many_arguments)]
 pub fn execute_with_fault(
-    request: LaunchRequestV1,
+    request: LaunchRequestV2,
     descriptors: Vec<OwnedFd>,
     attempt: [u8; 16],
     frontend_pid: libc::pid_t,
@@ -663,14 +785,15 @@ pub fn execute_with_fault(
     groups: Vec<libc::gid_t>,
     fault: FaultPoint,
 ) -> Result<TerminalFacts, String> {
+    let credentials = TargetCredentials::direct(uid, gid, groups)?;
     execute_inner(
         request,
         descriptors,
         attempt,
         frontend_pid,
-        uid,
-        gid,
-        groups,
+        credentials,
+        None,
+        None,
         Some(fault),
         None,
         None,
@@ -680,7 +803,7 @@ pub fn execute_with_fault(
 #[cfg(feature = "test-support")]
 #[allow(clippy::too_many_arguments)]
 pub fn execute_with_fault_typed(
-    request: LaunchRequestV1,
+    request: LaunchRequestV2,
     descriptors: Vec<OwnedFd>,
     attempt: [u8; 16],
     frontend_pid: libc::pid_t,
@@ -690,14 +813,16 @@ pub fn execute_with_fault_typed(
     plan: FaultPlan,
 ) -> Result<TerminalFacts, FaultExecutionOutcome> {
     let point = plan.point;
+    let credentials = TargetCredentials::direct(uid, gid, groups)
+        .map_err(|detail| fault_outcome(attempt, point, &detail))?;
     execute_inner(
         request,
         descriptors,
         attempt,
         frontend_pid,
-        uid,
-        gid,
-        groups,
+        credentials,
+        None,
+        None,
         Some(point),
         plan.postauthorization_ready,
         plan.provider_loss_claim_path,
@@ -707,13 +832,13 @@ pub fn execute_with_fault_typed(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_inner(
-    request: LaunchRequestV1,
+    request: LaunchRequestV2,
     descriptors: Vec<OwnedFd>,
     attempt: [u8; 16],
     frontend_pid: libc::pid_t,
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-    groups: Vec<libc::gid_t>,
+    credentials: TargetCredentials,
+    precreated_record: Option<AttemptRecord>,
+    mount_context: Option<super::namespace::CallerMountContext>,
     #[cfg(feature = "test-support")] fault: Option<FaultPoint>,
     #[cfg(not(feature = "test-support"))] _fault: Option<()>,
     #[cfg(feature = "test-support")] postauthorization_ready: Option<FaultReady>,
@@ -731,8 +856,18 @@ fn execute_inner(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let record = AttemptRecord::create(identity.clone(), frontend_pid)
-        .map_err(|error| format!("MCSEALED-RECORD-ALLOCATE: {error}"))?;
+    let record = match precreated_record {
+        Some(record) => record,
+        None => AttemptRecord::create_v2(
+            identity.clone(),
+            frontend_pid,
+            credentials.caller_envelope_digest.clone(),
+        )
+        .map_err(|error| format!("MCSEALED-RECORD-ALLOCATE: {error}"))?,
+    };
+    record
+        .transition("caller-envelope-captured")
+        .map_err(|error| format!("MCSEALED-RECORD-CALLER-ENVELOPE: {error}"))?;
     let mut cleanup_guard = AttemptCleanupGuard::new(record.clone(), attempt);
     let cgroup = AttemptCgroup::create(
         &identity,
@@ -757,7 +892,7 @@ fn execute_inner(
     let cgroup_file = cgroup
         .open()
         .map_err(|error| format!("MCSEALED-CGROUP-OPEN: {error}"))?;
-    let target_credentials = TargetCredentials { uid, gid, groups };
+    let target_credentials = credentials;
     let expected_credentials = target_credentials.clone();
     let provider_control_fd = provider_control.as_raw_fd();
     let provider_startup_fd = namespace_startup.as_raw_fd();
@@ -765,7 +900,7 @@ fn execute_inner(
     let inject_namespace_init_failure = fault == Some(FaultPoint::NamespaceInitFailureBeforeTarget);
     #[cfg(not(feature = "test-support"))]
     let inject_namespace_init_failure = false;
-    let init = super::namespace::clone_into_cgroup(&cgroup_file, move || {
+    let child_entry = move || {
         namespace_init(
             request,
             descriptors,
@@ -779,7 +914,12 @@ fn execute_inner(
                 inject_failure_before_target: inject_namespace_init_failure,
             },
         )
-    })?;
+    };
+    let init = if let Some(context) = mount_context {
+        super::namespace::clone_into_cgroup_from_caller(&cgroup_file, context, child_entry)
+    } else {
+        super::namespace::clone_into_cgroup(&cgroup_file, child_entry)
+    }?;
     cleanup_guard.init_pid = Some(init.host_pid);
     let (mut guardian_read, guardian_write) =
         pipe().map_err(|error| format!("MCSEALED-GUARDIAN-CONTROL: {error}"))?;
@@ -931,9 +1071,7 @@ fn execute_inner(
             target_pid,
             init.host_pid,
             &identity,
-            expected_credentials.uid,
-            expected_credentials.gid,
-            &expected_credentials.groups,
+            &expected_credentials,
             target_control_inode,
         )?;
         record
@@ -942,6 +1080,9 @@ fn execute_inner(
         record
             .transition("resource-inheritance-verified")
             .map_err(|error| format!("MCSEALED-RECORD-RESOURCE: {error}"))?;
+        record
+            .transition("caller-envelope-verified")
+            .map_err(|error| format!("MCSEALED-RECORD-CALLER-ENVELOPE: {error}"))?;
         #[cfg(feature = "test-support")]
         if matches!(
             fault,
@@ -1296,10 +1437,25 @@ fn execute_inner(
             boundary_retired: true,
             assignment_verified: true,
             namespaces_verified: true,
-            credentials_verified: true,
-            capabilities_empty: true,
+            target_initial_credentials_verified: true,
+            initial_provider_capabilities_absent: true,
+            caller_envelope_digest: expected_credentials.caller_envelope_digest.clone(),
+            caller_no_new_privs: expected_credentials.no_new_privs,
+            target_no_new_privs_matched: true,
+            caller_capability_bounding_set_digest: expected_credentials
+                .caller_capability_bounding_set_digest
+                .clone(),
+            target_capability_bounding_set_matched: true,
+            caller_mount_namespace_digest: expected_credentials
+                .caller_mount_namespace_digest
+                .clone(),
+            target_mount_context_derived_from_caller: expected_credentials
+                .mount_context_derived_from_caller,
+            boundary_independent_of_credentials: true,
             descriptors_verified: true,
-            cgroup_view_denied: true,
+            writable_ancestor_cgroup_denied: true,
+            parent_namespace_handles_denied: true,
+            recursive_provider_request_denied: true,
             guardian_ready_before_authorization: true,
             frontend_loss_authority_verified: true,
             cgroup_kill_invoked: true,
@@ -1320,7 +1476,7 @@ fn execute_inner(
 
 fn wait_command_exit_grace(
     cgroup: &AttemptCgroup,
-    policy: &crate::request::LaunchPolicyV1,
+    policy: &crate::request::LaunchPolicyV2,
 ) -> Result<bool, String> {
     let grace = Duration::from_millis(policy.command_exit_grace_millis);
     let started = Instant::now();
@@ -1354,13 +1510,13 @@ fn wait_command_exit_grace(
 #[cfg(feature = "test-support")]
 pub fn wait_command_exit_grace_for_test(
     cgroup: &AttemptCgroup,
-    policy: &crate::request::LaunchPolicyV1,
+    policy: &crate::request::LaunchPolicyV2,
 ) -> Result<bool, String> {
     wait_command_exit_grace(cgroup, policy)
 }
 
 fn namespace_init(
-    request: LaunchRequestV1,
+    request: LaunchRequestV2,
     descriptors: Vec<OwnedFd>,
     control: File,
     provider_control_fd: i32,
@@ -1439,7 +1595,7 @@ fn namespace_init(
 }
 
 fn target_exec(
-    request: LaunchRequestV1,
+    request: LaunchRequestV2,
     descriptors: Vec<OwnedFd>,
     control: File,
     status_fd: i32,
@@ -1473,8 +1629,7 @@ fn target_exec(
     }
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     let mut control = unsafe { File::from_raw_fd(3) };
-    // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == -1 {
+    if drop_bounding_set(credentials.capability_bounding_set).is_err() {
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
         unsafe { libc::_exit(125) };
     }
@@ -1501,6 +1656,17 @@ fn target_exec(
         || clear_capabilities().is_err()
     {
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
+        unsafe { libc::_exit(125) };
+    }
+    // SAFETY: PR_GET_NO_NEW_PRIVS has no pointer arguments and returns the current immutable bit.
+    let inherited_no_new_privs = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+    if inherited_no_new_privs == -1
+        || (!credentials.no_new_privs && inherited_no_new_privs != 0)
+        || (credentials.no_new_privs
+            // SAFETY: the authenticated caller had NNP set, so reproducing it is required.
+            && unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == -1)
+    {
+        // SAFETY: target has not been authorized and exits without invoking caller code.
         unsafe { libc::_exit(125) };
     }
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
@@ -1538,6 +1704,31 @@ fn target_exec(
     let code = exec_failure_exit_code(class);
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     unsafe { libc::_exit(if reported { code } else { 125 }) }
+}
+
+fn drop_bounding_set(caller_bounding_set: u64) -> Result<(), ()> {
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|_| ())?;
+    let status = super::envelope::parse_proc_status(&status).map_err(|_| ())?;
+    if caller_bounding_set & !status.capability_bounding_set != 0 {
+        return Err(());
+    }
+    let last_capability = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .map_err(|_| ())?
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| ())?;
+    if last_capability >= u64::BITS {
+        return Err(());
+    }
+    for capability in 0..=last_capability {
+        if caller_bounding_set & (1_u64 << capability) == 0 {
+            // SAFETY: capability is bounded by the kernel-reported cap_last_cap value.
+            if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } == -1 {
+                return Err(());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn clear_capabilities() -> Result<(), ()> {
@@ -1631,7 +1822,7 @@ fn decode_exec_failure(
     Ok(TargetExecStatus::Failed { class, os_code })
 }
 
-fn exec_status_deadline(policy: &crate::request::LaunchPolicyV1) -> Result<Instant, String> {
+fn exec_status_deadline(policy: &crate::request::LaunchPolicyV2) -> Result<Instant, String> {
     let mut remaining = EXEC_STATUS_TIMEOUT;
     if let Some(deadline) = policy.absolute_deadline_millis {
         let now = super::clock::monotonic_millis()
@@ -2093,55 +2284,53 @@ fn verify_gated_target(
     pid: libc::pid_t,
     init_pid: libc::pid_t,
     identity: &str,
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-    groups: &[libc::gid_t],
+    credentials: &TargetCredentials,
     target_control_inode: u64,
 ) -> Result<(), String> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+    let process = std::path::Path::new("/proc").join(pid.to_string());
+    let status = std::fs::read_to_string(process.join("status"))
         .map_err(|error| format!("MCSEALED-TARGET-CREDENTIAL-READBACK: {error}"))?;
-    if !status.lines().any(|line| line == "NoNewPrivs:\t1") {
-        return Err("MCSEALED-TARGET-IDENTITY: no_new_privs not verified".to_owned());
+    let status = super::envelope::parse_proc_status(&status)
+        .map_err(|error| format!("MCSEALED-TARGET-CREDENTIAL-READBACK: {error}"))?;
+    if status.no_new_privs != credentials.no_new_privs {
+        return Err("MCSEALED-TARGET-IDENTITY: caller no_new_privs was not reproduced".to_owned());
     }
-    for field in [
-        "CapInh:\t0000000000000000",
-        "CapPrm:\t0000000000000000",
-        "CapEff:\t0000000000000000",
-        "CapAmb:\t0000000000000000",
-    ] {
-        if !status.lines().any(|line| line == field) {
-            return Err("MCSEALED-TARGET-IDENTITY: capabilities are not empty".to_owned());
-        }
-    }
-    let uid_line = format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}");
-    let gid_line = format!("Gid:\t{gid}\t{gid}\t{gid}\t{gid}");
-    if !status.lines().any(|line| line == uid_line) || !status.lines().any(|line| line == gid_line)
+    if status.capability_inheritable_set != 0
+        || status.capability_permitted_set != 0
+        || status.capability_effective_set != 0
+        || status.capability_ambient_set != 0
     {
+        return Err("MCSEALED-TARGET-IDENTITY: provider capabilities are not absent".to_owned());
+    }
+    if status.capability_bounding_set != credentials.capability_bounding_set {
+        return Err(
+            "MCSEALED-TARGET-IDENTITY: caller capability bounding set was not reproduced"
+                .to_owned(),
+        );
+    }
+    if status.uids != [credentials.uid; 4] || status.gids != [credentials.gid; 4] {
         return Err("MCSEALED-TARGET-IDENTITY: caller credentials not verified".to_owned());
     }
-    let mut actual_groups = status
-        .lines()
-        .find_map(|line| line.strip_prefix("Groups:\t"))
-        .ok_or_else(|| "MCSEALED-TARGET-IDENTITY: supplementary groups missing".to_owned())?
-        .split_whitespace()
-        .map(|group| {
-            group
-                .parse::<libc::gid_t>()
-                .map_err(|error| error.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut expected_groups = groups.to_vec();
+    let mut actual_groups = status.supplementary_groups;
+    let mut expected_groups = credentials.groups.clone();
     actual_groups.sort_unstable();
     expected_groups.sort_unstable();
     if actual_groups != expected_groups {
         return Err("MCSEALED-TARGET-IDENTITY: supplementary groups not verified".to_owned());
     }
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+    let cgroup = std::fs::read_to_string(process.join("cgroup"))
         .map_err(|error| format!("MCSEALED-TARGET-CGROUP-READBACK: {error}"))?;
-    if !cgroup.contains(identity) {
+    let assigned = cgroup.lines().any(|line| {
+        line.split_once("::").is_some_and(|(_, path)| {
+            std::path::Path::new(path)
+                .components()
+                .any(|component| component.as_os_str() == identity)
+        })
+    });
+    if !assigned {
         return Err("MCSEALED-TARGET-IDENTITY: cgroup membership mismatch".to_owned());
     }
-    let mut descriptors = std::fs::read_dir(format!("/proc/{pid}/fd"))
+    let mut descriptors = std::fs::read_dir(process.join("fd"))
         .map_err(|error| format!("MCSEALED-TARGET-DESCRIPTORS-READBACK: {error}"))?
         .map(|entry| {
             entry
@@ -2155,7 +2344,7 @@ fn verify_gated_target(
             "MCSEALED-DESCRIPTOR-SET: gated target descriptor inventory mismatch".to_owned(),
         );
     }
-    let control_path = format!("/proc/{pid}/fd/3");
+    let control_path = process.join("fd").join("3");
     let control_metadata = std::fs::metadata(&control_path)
         .map_err(|error| format!("MCSEALED-TARGET-CONTROL-READBACK: {error}"))?;
     if control_metadata.ino() != target_control_inode {
@@ -2166,7 +2355,7 @@ fn verify_gated_target(
     if !control_link.to_string_lossy().starts_with("socket:[") {
         return Err("MCSEALED-TARGET-CONTROL-READBACK: fd 3 is not a socket".to_owned());
     }
-    let descriptor_info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/3"))
+    let descriptor_info = std::fs::read_to_string(process.join("fdinfo").join("3"))
         .map_err(|error| format!("MCSEALED-TARGET-CONTROL-READBACK: {error}"))?;
     let descriptor_flags = descriptor_info
         .lines()
@@ -2178,17 +2367,22 @@ fn verify_gated_target(
         return Err("MCSEALED-TARGET-CONTROL-READBACK: fd 3 is not close-on-exec".to_owned());
     }
     for namespace in ["pid", "mnt", "cgroup"] {
-        let target = std::fs::read_link(format!("/proc/{pid}/ns/{namespace}"))
+        let target = std::fs::read_link(process.join("ns").join(namespace))
             .map_err(|error| format!("MCSEALED-TARGET-NAMESPACE-READBACK: {error}"))?;
-        let init = std::fs::read_link(format!("/proc/{init_pid}/ns/{namespace}"))
-            .map_err(|error| format!("MCSEALED-TARGET-NAMESPACE-READBACK: {error}"))?;
-        let provider = std::fs::read_link(format!("/proc/self/ns/{namespace}"))
+        let init = std::fs::read_link(
+            std::path::Path::new("/proc")
+                .join(init_pid.to_string())
+                .join("ns")
+                .join(namespace),
+        )
+        .map_err(|error| format!("MCSEALED-TARGET-NAMESPACE-READBACK: {error}"))?;
+        let provider = std::fs::read_link(std::path::Path::new("/proc/self/ns").join(namespace))
             .map_err(|error| format!("MCSEALED-TARGET-NAMESPACE-READBACK: {error}"))?;
         if target != init || target == provider {
             return Err("MCSEALED-TARGET-IDENTITY: namespace membership mismatch".to_owned());
         }
     }
-    let mountinfo = std::fs::read_to_string(format!("/proc/{pid}/mountinfo"))
+    let mountinfo = std::fs::read_to_string(process.join("mountinfo"))
         .map_err(|error| format!("MCSEALED-CGROUP-VIEW: mountinfo unavailable: {error}"))?;
     if cgroup_mount_visible(&mountinfo)? {
         return Err("MCSEALED-CGROUP-VIEW: target can still see host cgroup mount".to_owned());

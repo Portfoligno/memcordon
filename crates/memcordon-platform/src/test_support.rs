@@ -64,6 +64,16 @@ pub fn sealed_terminal_spawn_error(
 }
 
 #[cfg(target_os = "linux")]
+pub fn sealed_terminal_v2_is_valid(payload: &[u8]) -> Result<(), String> {
+    crate::sealed::client::parse_terminal(payload).map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+pub fn sealed_qualification_v2_is_valid(payload: &[u8]) -> Result<(), String> {
+    crate::sealed::client::parse_qualification(payload).map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
 pub fn linux_launcher_status_timeout() -> io::ErrorKind {
     crate::linux_cgroup::test_launcher_status_timeout()
 }
@@ -78,6 +88,10 @@ pub fn linux_probe_from_results(
         provider.map(
             |(provider_identity, receipt_digest)| crate::sealed::client::ProbeReceipt {
                 provider_identity,
+                control_service_identity: "memcordon-sealed-agent.service:v2".to_owned(),
+                launcher_service_identity: "memcordon-sealed-launcher.service:v2".to_owned(),
+                setid_transition_certification_digest: receipt_digest.clone(),
+                sudo_transition_certification_digest: receipt_digest.clone(),
                 receipt_digest,
             },
         ),

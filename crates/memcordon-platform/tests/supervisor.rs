@@ -180,7 +180,7 @@ fn only_exact_retired_sealed_retry_deadline_rejection_is_outside_attempt() {
     )
     .with_boundary_setup_failure(BoundarySetupFailure {
         requested: BoundaryRequirement::Sealed,
-        mechanism: Some("linux-pid-namespace-cgroup-v1".to_owned()),
+        mechanism: Some("linux-pid-namespace-cgroup-v2".to_owned()),
         phase: BoundarySetupPhase::Authorization,
         target_created: true,
         target_released: false,

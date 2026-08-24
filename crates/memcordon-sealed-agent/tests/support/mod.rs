@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use memcordon_sealed_agent::linux::launch::TerminalFacts;
 use memcordon_sealed_agent::request::{
-    DeadlineScope, DescriptorPurpose, LaunchPolicyV1, LaunchRequestV1, Lifetime,
+    DeadlineScope, DescriptorPurpose, LaunchPolicyV2, LaunchRequestV2, Lifetime,
 };
 
 pub fn fixture() -> &'static str {
@@ -96,7 +96,7 @@ impl StagedFixture {
         &self.program
     }
 
-    pub fn request(&self, mode: &str, lifetime: Lifetime) -> Result<LaunchRequestV1, String> {
+    pub fn request(&self, mode: &str, lifetime: Lifetime) -> Result<LaunchRequestV2, String> {
         let deadline =
             memcordon_sealed_agent::linux::clock::monotonic_millis()?.saturating_add(30_000);
         Ok(self.request_with_deadline(mode, lifetime, deadline))
@@ -107,7 +107,7 @@ impl StagedFixture {
         mode: &str,
         lifetime: Lifetime,
         absolute_deadline_millis: u64,
-    ) -> LaunchRequestV1 {
+    ) -> LaunchRequestV2 {
         request_for_program(self.program(), mode, lifetime, absolute_deadline_millis)
     }
 }
@@ -125,11 +125,29 @@ pub fn execute_captured(mode: &str, lifetime: Lifetime) -> Result<CapturedExecut
     execute_request_captured(request)
 }
 
-pub fn execute_request(request: LaunchRequestV1) -> Result<TerminalFacts, String> {
+pub fn execute_request(request: LaunchRequestV2) -> Result<TerminalFacts, String> {
     execute_request_captured(request).map(|captured| captured.facts)
 }
 
-pub fn execute_request_captured(request: LaunchRequestV1) -> Result<CapturedExecution, String> {
+pub fn execute_request_as(
+    request: LaunchRequestV2,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    groups: Vec<libc::gid_t>,
+) -> Result<TerminalFacts, String> {
+    let (descriptors, attempt) = resources(unsafe { libc::getpid() })?;
+    memcordon_sealed_agent::linux::launch::execute(
+        request,
+        descriptors,
+        attempt,
+        unsafe { libc::getpid() },
+        uid,
+        gid,
+        groups,
+    )
+}
+
+pub fn execute_request_captured(request: LaunchRequestV2) -> Result<CapturedExecution, String> {
     let (descriptors, attempt) = resources(unsafe { libc::getpid() })?;
     let facts = memcordon_sealed_agent::linux::launch::execute(
         request,
@@ -179,7 +197,7 @@ pub(crate) fn resources_with_outputs(
     ))
 }
 
-pub fn request(mode: &str, lifetime: Lifetime) -> Result<LaunchRequestV1, String> {
+pub fn request(mode: &str, lifetime: Lifetime) -> Result<LaunchRequestV2, String> {
     let deadline = memcordon_sealed_agent::linux::clock::monotonic_millis()?.saturating_add(30_000);
     Ok(request_with_deadline(mode, lifetime, deadline))
 }
@@ -188,7 +206,7 @@ pub fn request_with_deadline(
     mode: &str,
     lifetime: Lifetime,
     absolute_deadline_millis: u64,
-) -> LaunchRequestV1 {
+) -> LaunchRequestV2 {
     request_for_program(
         Path::new(fixture()),
         mode,
@@ -202,12 +220,12 @@ fn request_for_program(
     mode: &str,
     lifetime: Lifetime,
     absolute_deadline_millis: u64,
-) -> LaunchRequestV1 {
-    LaunchRequestV1 {
+) -> LaunchRequestV2 {
+    LaunchRequestV2 {
         program: program.as_os_str().as_encoded_bytes().to_vec(),
         arguments: vec![mode.as_bytes().to_vec()],
         environment: Vec::new(),
-        policy: LaunchPolicyV1 {
+        policy: LaunchPolicyV2 {
             memory_limit_bytes: None,
             swap_limit: memcordon_sealed_agent::request::SwapLimit::Bytes(0),
             absolute_deadline_millis: Some(absolute_deadline_millis),
@@ -231,10 +249,16 @@ fn request_for_program(
 pub fn assert_retired(facts: &TerminalFacts) {
     assert!(facts.assignment_verified);
     assert!(facts.namespaces_verified);
-    assert!(facts.credentials_verified);
-    assert!(facts.capabilities_empty);
+    assert!(facts.target_initial_credentials_verified);
+    assert!(facts.initial_provider_capabilities_absent);
+    assert!(facts.target_no_new_privs_matched);
+    assert!(facts.target_capability_bounding_set_matched);
+    assert!(facts.target_mount_context_derived_from_caller);
+    assert!(facts.boundary_independent_of_credentials);
     assert!(facts.descriptors_verified);
-    assert!(facts.cgroup_view_denied);
+    assert!(facts.writable_ancestor_cgroup_denied);
+    assert!(facts.parent_namespace_handles_denied);
+    assert!(facts.recursive_provider_request_denied);
     assert!(facts.guardian_ready_before_authorization);
     assert!(facts.frontend_loss_authority_verified);
     assert!(facts.cgroup_kill_invoked);

@@ -12,6 +12,8 @@ libfuzzer-sys = "0.4"
 memcordon-core = { path = "../crates/memcordon-core", features = ["test-support"] }
 memcordon = { path = "../crates/memcordon-cli" }
 memcordon-ci = { path = "../tools/memcordon-ci" }
+memcordon-platform = { path = "../crates/memcordon-platform", features = ["test-support"] }
+memcordon-sealed-agent = { path = "../crates/memcordon-sealed-agent", features = ["test-support"] }
 serde_json = "1"
 
 [[bin]]
@@ -136,6 +138,76 @@ bench = false
 [[bin]]
 name = "schema_four"
 path = "fuzz_targets/schema_four.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "caller-envelope-status"
+path = "fuzz_targets/caller_envelope_status.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capability-mask"
+path = "fuzz_targets/capability_mask.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "namespace-identity"
+path = "fuzz_targets/namespace_identity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "broker-protocol-v2"
+path = "fuzz_targets/broker_protocol_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qualification-receipt-v2"
+path = "fuzz_targets/qualification_receipt_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "terminal-receipt-v2"
+path = "fuzz_targets/terminal_receipt_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "linux-evidence-v2"
+path = "fuzz_targets/linux_evidence_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "service-unit-policy"
+path = "fuzz_targets/service_unit_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provider-recursion-proof"
+path = "fuzz_targets/provider_recursion_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mount-context-manifest"
+path = "fuzz_targets/mount_context_manifest.rs"
 test = false
 doc = false
 bench = false

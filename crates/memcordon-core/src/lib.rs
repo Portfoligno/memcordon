@@ -53,10 +53,10 @@ pub use state_machine::{RunState, StateMachine, StateTransitionError};
 pub use supervision::{
     AttemptHistory, AttemptKind, AttemptPhase, AttemptRecord, BackendCapabilityReport,
     BoundaryCapability, BoundaryClass, BoundaryMechanismEvidence, BoundaryQualificationReport,
-    CapabilityStatusReport, DETAILED_ATTEMPT_CAPACITY, LaunchEvidence, LinuxSealedEvidence,
-    MacosSealedEvidence, MemoryCapabilityReport, RestartDecisionKind, RestartDecisionRecord,
-    RestartSafetyProof, RestartSummary, SealedUnavailableReport, SupervisionAggregates,
-    SupervisionDeadlineEvidence, SupervisionErrorRecord, SupervisionExecution,
-    SupervisionModelError, SupervisionPhase, SupervisionTerminal, WindowsSealedEvidence,
-    boundary_evidence_is_consistent,
+    CapabilityStatusReport, CredentialTransitionDisposition, DETAILED_ATTEMPT_CAPACITY,
+    LaunchEvidence, LinuxSealedEvidenceV2, MacosSealedEvidence, MemoryCapabilityReport,
+    RestartDecisionKind, RestartDecisionRecord, RestartSafetyProof, RestartSummary,
+    SealedUnavailableReport, SupervisionAggregates, SupervisionDeadlineEvidence,
+    SupervisionErrorRecord, SupervisionExecution, SupervisionModelError, SupervisionPhase,
+    SupervisionTerminal, WindowsSealedEvidenceV2, boundary_evidence_is_consistent,
 };

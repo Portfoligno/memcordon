@@ -51,7 +51,7 @@ enum Suite {
     Fuzz,
     Stress,
     BackendLinuxCgroup,
-    BackendLinuxSealed,
+    BackendLinuxSealedV2,
     BackendWindowsJob,
     BackendMacosWatchdog,
     ReleasePreflight,

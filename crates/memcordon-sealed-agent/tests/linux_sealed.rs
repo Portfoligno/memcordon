@@ -22,6 +22,180 @@ use memcordon_sealed_agent::{
     rejection::{RejectionCleanupV1, RejectionPhaseV1, RejectionV1},
 };
 
+struct EphemeralCertificationUser {
+    name: String,
+    uid: libc::uid_t,
+    removed: bool,
+}
+
+impl EphemeralCertificationUser {
+    fn create(role: &str, primary_gid: Option<libc::gid_t>) -> Self {
+        let name = format!("mcrd{role}{:x}", std::process::id());
+        let mut command = std::process::Command::new("/usr/sbin/useradd");
+        command
+            .arg("--no-create-home")
+            .arg("--shell")
+            .arg("/usr/sbin/nologin");
+        if let Some(gid) = primary_gid {
+            command.arg("--gid").arg(gid.to_string());
+        }
+        let output = command
+            .arg(&name)
+            .output()
+            .expect("credential-transition certification requires /usr/sbin/useradd");
+        assert!(
+            output.status.success(),
+            "ephemeral certification user creation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = std::process::Command::new("/usr/bin/id")
+            .arg("-u")
+            .arg(&name)
+            .output()
+            .expect("credential-transition certification requires /usr/bin/id");
+        assert!(output.status.success(), "ephemeral user uid lookup failed");
+        let uid = String::from_utf8(output.stdout)
+            .expect("ephemeral uid is UTF-8")
+            .trim()
+            .parse()
+            .expect("ephemeral uid is numeric");
+        Self {
+            name,
+            uid,
+            removed: false,
+        }
+    }
+
+    fn remove(mut self) {
+        let status = std::process::Command::new("/usr/sbin/userdel")
+            .arg(&self.name)
+            .status()
+            .expect("credential-transition certification requires /usr/sbin/userdel");
+        assert!(
+            status.success(),
+            "ephemeral certification user cleanup failed"
+        );
+        self.removed = true;
+    }
+}
+
+struct EphemeralSudoersRule {
+    path: std::path::PathBuf,
+    removed: bool,
+}
+
+impl EphemeralSudoersRule {
+    fn create(caller: &str, candidate: &str, fixture: &std::path::Path, uid: libc::uid_t) -> Self {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let path = std::path::Path::new("/etc/sudoers.d")
+            .join(format!("memcordon-credential-{}", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o440)
+            .open(&path)
+            .expect("ephemeral sudoers rule must be created exclusively");
+        writeln!(
+            file,
+            "{caller} ALL=({candidate}) NOPASSWD: {} assert-effective-uid {uid}",
+            fixture.display()
+        )
+        .expect("ephemeral sudoers rule must be written");
+        file.sync_all()
+            .expect("ephemeral sudoers rule must be durable");
+        let status = std::process::Command::new("/usr/sbin/visudo")
+            .arg("-c")
+            .arg("-f")
+            .arg(&path)
+            .status()
+            .expect("sudo certification requires /usr/sbin/visudo");
+        assert!(status.success(), "ephemeral sudoers rule is invalid");
+        Self {
+            path,
+            removed: false,
+        }
+    }
+
+    fn remove(mut self) {
+        std::fs::remove_file(&self.path).expect("ephemeral sudoers rule cleanup failed");
+        self.removed = true;
+    }
+}
+
+impl Drop for EphemeralSudoersRule {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl Drop for EphemeralCertificationUser {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = std::process::Command::new("/usr/sbin/userdel")
+                .arg(&self.name)
+                .status();
+        }
+    }
+}
+
+fn assert_no_process_uses_uid(uid: libc::uid_t) {
+    let remaining = std::fs::read_dir("/proc")
+        .expect("process inventory")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("status")).ok())
+        .filter_map(|status| {
+            memcordon_sealed_agent::linux::envelope::parse_proc_status(&status).ok()
+        })
+        .any(|status| status.uids.contains(&uid));
+    assert!(
+        !remaining,
+        "alternate-credential descendant survived sealed retirement"
+    );
+}
+
+fn assert_public_transition_report(path: &std::path::Path) {
+    let report: memcordon_core::MemcordonReport =
+        serde_json::from_slice(&std::fs::read(path).expect("public transition report must exist"))
+            .expect("public transition report must be schema-valid");
+    assert_eq!(
+        report.schema_version,
+        memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION
+    );
+    assert!(report.error.is_none());
+    let supervision = report
+        .supervision
+        .as_ref()
+        .expect("public transition report must contain supervision");
+    assert_eq!(supervision.wrapper_exit_code, 0);
+    assert_eq!(supervision.targets_authorized, 1);
+    assert_eq!(report.attempts.len(), 1);
+    let attempt = report.attempts.first().expect("one transition attempt");
+    assert!(memcordon_core::boundary_evidence_is_consistent(
+        &attempt.launch,
+        &attempt.restart_safety,
+        &attempt.boundary_detail,
+    ));
+    assert!(matches!(
+        &attempt.boundary_detail,
+        memcordon_core::BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2(native)
+            if native.boundary_independent_of_credentials
+                && native.cgroup_empty_verified
+                && native.namespace_init_reaped
+                && native.guardian_reaped
+                && native.cgroup_removed
+    ));
+}
+
 #[cfg(feature = "test-support")]
 #[test]
 fn staged_frontend_hold_is_ready_live_and_sigkill_reaped() {
@@ -43,6 +217,323 @@ fn run(mode: &str, lifetime: Lifetime) {
         "fixture mode {mode} did not complete successfully"
     );
     support::assert_retired(&facts);
+}
+
+fn assert_forked_certification(child: libc::pid_t, scenario: &str) {
+    assert!(child > 0, "{scenario}: fork failed");
+    let mut status = 0;
+    // SAFETY: child is the direct child returned by fork and status is writable.
+    assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "{scenario}: child status {status}"
+    );
+}
+
+fn assert_transition_terminal(
+    result: Result<memcordon_sealed_agent::linux::launch::TerminalFacts, String>,
+) -> memcordon_sealed_agent::linux::launch::TerminalFacts {
+    let facts = result.expect("credential transition must finish under the sealed boundary");
+    assert_eq!(facts.child_status, 0);
+    assert!(facts.boundary_independent_of_credentials);
+    assert!(facts.target_initial_credentials_verified);
+    assert!(facts.initial_provider_capabilities_absent);
+    assert!(facts.assignment_verified);
+    assert!(facts.namespaces_verified);
+    assert!(facts.descriptors_verified);
+    assert!(facts.writable_ancestor_cgroup_denied);
+    assert!(facts.parent_namespace_handles_denied);
+    assert!(facts.recursive_provider_request_denied);
+    assert!(facts.cgroup_kill_invoked);
+    support::assert_retired(&facts);
+    facts
+}
+
+#[test]
+#[ignore = "requires privileged Linux sealed credential-transition certification"]
+fn sealed_setid_transition_preserves_boundary() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = support::StagedFixture::new().expect("root-owned fixture must stage");
+    std::fs::set_permissions(fixture.program(), std::fs::Permissions::from_mode(0o4755))
+        .expect("set-ID fixture permissions must be installed");
+    assert_eq!(
+        std::fs::metadata(fixture.program())
+            .expect("set-ID fixture metadata")
+            .permissions()
+            .mode()
+            & 0o4777,
+        0o4755
+    );
+    let facts = assert_transition_terminal(support::execute_request(
+        fixture
+            .request("assert-credential-transition-root", Lifetime::Command)
+            .expect("set-ID launch request"),
+    ));
+    assert!(!facts.caller_no_new_privs);
+    assert!(facts.target_no_new_privs_matched);
+}
+
+#[test]
+#[ignore = "requires privileged Linux sealed credential-transition certification"]
+fn sealed_sudo_transition_preserves_boundary() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let fixture = support::StagedFixture::new().expect("root-owned fixture must stage");
+    let sudo = std::path::Path::new("/usr/bin/sudo");
+    assert!(sudo.is_file(), "sudo certification requires /usr/bin/sudo");
+    let provider_gid = std::fs::symlink_metadata(memcordon_sealed_agent::linux::SOCKET_PATH)
+        .expect("installed public provider socket metadata")
+        .gid();
+    assert_ne!(provider_gid, 0, "provider access group must be non-root");
+    let caller = EphemeralCertificationUser::create("caller", Some(provider_gid));
+    let candidate = EphemeralCertificationUser::create("sudo", None);
+    let sudoers = EphemeralSudoersRule::create(
+        &caller.name,
+        &candidate.name,
+        fixture.program(),
+        candidate.uid,
+    );
+    let report_directory = tempfile::Builder::new()
+        .prefix("memcordon-sudo-transition-")
+        .tempdir_in("/tmp")
+        .expect("sudo transition report directory");
+    std::fs::set_permissions(
+        report_directory.path(),
+        std::fs::Permissions::from_mode(0o770),
+    )
+    .expect("sudo report directory permissions");
+    let report_directory_c = std::ffi::CString::new(
+        report_directory
+            .path()
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec(),
+    )
+    .expect("sudo report directory has no NUL");
+    // SAFETY: the path is live and NUL-terminated; uid -1 preserves root ownership.
+    assert_eq!(
+        unsafe { libc::chown(report_directory_c.as_ptr(), libc::uid_t::MAX, provider_gid) },
+        0,
+        "sudo report directory group ownership"
+    );
+    let report = report_directory.path().join("execution.json");
+    let memcordon = std::env::current_dir()
+        .expect("certification working directory")
+        .join("target/ci/sealed-agent/debug/memcordon");
+    assert!(
+        memcordon.is_file(),
+        "sudo certification requires CI memcordon"
+    );
+    let output = std::process::Command::new("/usr/bin/setpriv")
+        .arg(format!("--reuid={}", caller.uid))
+        .arg(format!("--regid={provider_gid}"))
+        .arg("--clear-groups")
+        .arg("--")
+        .arg(&memcordon)
+        .arg("--sealed")
+        .arg("--report")
+        .arg(&report)
+        .arg("--")
+        .arg(sudo)
+        .arg("-n")
+        .arg("-u")
+        .arg(&candidate.name)
+        .arg("--")
+        .arg(fixture.program())
+        .arg("assert-effective-uid")
+        .arg(candidate.uid.to_string())
+        .output()
+        .expect("public sudo transition must execute through native argv");
+    assert!(
+        output.status.success(),
+        "public sudo transition failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_public_transition_report(&report);
+    assert_no_process_uses_uid(candidate.uid);
+    assert_no_process_uses_uid(caller.uid);
+    sudoers.remove();
+    candidate.remove();
+    caller.remove();
+}
+
+#[test]
+#[ignore = "requires privileged Linux sealed credential-transition certification"]
+fn sealed_file_capability_transition_preserves_boundary() {
+    let fixture = support::StagedFixture::new().expect("root-owned fixture must stage");
+    let status = std::process::Command::new("setcap")
+        .arg("cap_setuid=ep")
+        .arg(fixture.program())
+        .status()
+        .expect("file-capability certification requires setcap");
+    assert!(status.success(), "setcap did not install cap_setuid=ep");
+    let facts = assert_transition_terminal(support::execute_request(
+        fixture
+            .request("assert-file-capability-transition", Lifetime::Command)
+            .expect("file-capability launch request"),
+    ));
+    assert!(!facts.caller_no_new_privs);
+    assert!(facts.target_no_new_privs_matched);
+}
+
+#[test]
+#[ignore = "requires privileged Linux sealed credential-transition certification"]
+fn sealed_caller_no_new_privs_is_reproduced() {
+    // SAFETY: this privileged certification forks before running the isolated synchronous case.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: prctl receives scalar arguments and irreversibly tightens only this child.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            unsafe { libc::_exit(101) };
+        }
+        let success = support::execute("exit", Lifetime::Command).is_ok_and(|facts| {
+            facts.caller_no_new_privs && facts.target_no_new_privs_matched && facts.boundary_retired
+        });
+        unsafe { libc::_exit(i32::from(!success)) };
+    }
+    assert_forked_certification(child, "caller no-new-privileges reproduction");
+}
+
+#[test]
+#[ignore = "requires privileged Linux sealed credential-transition certification"]
+fn sealed_caller_capability_bounding_set_is_reproduced() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = support::StagedFixture::new().expect("root-owned fixture must stage");
+    std::fs::set_permissions(fixture.program(), std::fs::Permissions::from_mode(0o4755))
+        .expect("bounding-set set-ID fixture permissions");
+    // SAFETY: this privileged certification forks before tightening the child bounding set.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        let before = memcordon_sealed_agent::linux::envelope::parse_proc_status(
+            &std::fs::read_to_string("/proc/self/status").expect("caller status"),
+        )
+        .expect("caller status parses")
+        .capability_bounding_set;
+        let capability = (0..64)
+            .find(|capability| before & (1_u64 << capability) != 0)
+            .expect("certification caller must have a droppable bounding capability");
+        // SAFETY: prctl receives a capability number observed in this child's bounding set.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability as libc::c_ulong, 0, 0, 0) } != 0
+        {
+            unsafe { libc::_exit(102) };
+        }
+        let after = memcordon_sealed_agent::linux::envelope::parse_proc_status(
+            &std::fs::read_to_string("/proc/self/status").expect("reduced caller status"),
+        )
+        .expect("reduced caller status parses")
+        .capability_bounding_set;
+        let mut request =
+            match fixture.request("assert-bounding-capability-absent", Lifetime::Command) {
+                Ok(value) => value,
+                Err(_) => unsafe { libc::_exit(103) },
+            };
+        request.arguments.push(capability.to_string().into_bytes());
+        let success = before != after
+            && support::execute_request(request).is_ok_and(|facts| {
+                facts.target_capability_bounding_set_matched
+                    && facts.caller_capability_bounding_set_digest.len() == 64
+                    && facts.boundary_independent_of_credentials
+                    && facts.boundary_retired
+            });
+        unsafe { libc::_exit(i32::from(!success)) };
+    }
+    assert_forked_certification(child, "caller capability bounding-set reproduction");
+}
+
+#[test]
+#[ignore = "requires privileged Linux sealed credential-transition certification"]
+fn sealed_caller_mount_context_is_reproduced() {
+    let mountpoint = tempfile::Builder::new()
+        .prefix("memcordon-sealed-caller-mount-")
+        .tempdir_in("/tmp")
+        .expect("caller mountpoint");
+    // SAFETY: this privileged certification forks before unsharing the child's mount context.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: unshare and mount receive valid scalar flags and live C strings.
+        if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0
+            || unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                )
+            } != 0
+        {
+            unsafe { libc::_exit(103) };
+        }
+        let mountpoint_c =
+            std::ffi::CString::new(mountpoint.path().as_os_str().as_encoded_bytes().to_vec())
+                .expect("mountpoint has no NUL");
+        if unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                mountpoint_c.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV,
+                c"size=64k,mode=0755".as_ptr().cast(),
+            )
+        } != 0
+        {
+            unsafe { libc::_exit(104) };
+        }
+        let marker = mountpoint.path().join("caller-marker");
+        if std::fs::write(&marker, b"caller-mount-context\n").is_err() {
+            unsafe { libc::_exit(105) };
+        }
+        let fixture = match support::StagedFixture::new() {
+            Ok(value) => value,
+            Err(_) => unsafe { libc::_exit(106) },
+        };
+        let mut request = match fixture.request("assert-mount-marker", Lifetime::Command) {
+            Ok(value) => value,
+            Err(_) => unsafe { libc::_exit(107) },
+        };
+        request
+            .arguments
+            .push(marker.as_os_str().as_encoded_bytes().to_vec());
+        let success = support::execute_request(request).is_ok_and(|facts| {
+            facts.target_mount_context_derived_from_caller
+                && facts.caller_mount_namespace_digest.len() == 64
+                && facts.boundary_retired
+                && facts.child_status == 0
+        });
+        unsafe { libc::_exit(i32::from(!success)) };
+    }
+    assert_forked_certification(child, "caller mount-context reproduction");
+}
+
+#[test]
+#[ignore = "requires privileged Linux sealed credential-transition certification"]
+fn sealed_recursive_provider_request_is_rejected() {
+    let fixture = support::StagedFixture::new().expect("root-owned fixture must stage");
+    let memcordon = std::env::current_dir()
+        .expect("certification working directory")
+        .join("target/ci/sealed-agent/debug/memcordon");
+    assert!(
+        memcordon.is_file(),
+        "recursive certification requires the CI memcordon executable"
+    );
+    let report_directory = tempfile::Builder::new()
+        .prefix("memcordon-recursive-provider-")
+        .tempdir_in("/tmp")
+        .expect("recursive rejection report directory");
+    let report = report_directory.path().join("rejection.json");
+    let mut request = fixture
+        .request("assert-recursive-provider-rejected", Lifetime::Command)
+        .expect("recursive provider launch request");
+    request
+        .arguments
+        .push(memcordon.as_os_str().as_encoded_bytes().to_vec());
+    request
+        .arguments
+        .push(report.as_os_str().as_encoded_bytes().to_vec());
+    assert_transition_terminal(support::execute_request_as(request, 0, 0, Vec::new()));
 }
 
 #[test]

@@ -6,10 +6,12 @@ use memcordon_sealed_agent::rejection::{RejectionPhaseV1, RejectionV1};
 
 fn qualification() -> QualificationReceipt {
     QualificationReceipt {
-        schema_version: 1,
-        mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
-        provider_identity: "cached-provider".to_owned(),
-        receipt_digest: "cached-digest".to_owned(),
+        schema_version: 2,
+        mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
+        provider_identity: "memcordon-sealed-agent-v2".to_owned(),
+        control_service_identity: "memcordon-sealed-agent.service:v2".to_owned(),
+        launcher_service_identity: "memcordon-sealed-launcher.service:v2".to_owned(),
+        receipt_digest: "0".repeat(64),
         unified_cgroup_v2: true,
         private_cgroup_subtree: true,
         clone3: true,
@@ -30,6 +32,19 @@ fn qualification() -> QualificationReceipt {
         helpers_reaped: true,
         boundary_retired: true,
         recovery_complete: true,
+        split_control_and_launcher_services: true,
+        launcher_no_new_privs_disabled: true,
+        caller_mount_namespace_reproduction_verified: true,
+        caller_no_new_privs_reproduction_verified: true,
+        caller_capability_bounding_set_reproduction_verified: true,
+        initial_provider_capabilities_absent: true,
+        credential_transition_disposition: "preserve-caller-envelope".to_owned(),
+        setid_transition_certification_digest: "1".repeat(64),
+        sudo_transition_certification_digest: "2".repeat(64),
+        post_transition_cgroup_membership_verified: true,
+        post_transition_pid_namespace_verified: true,
+        post_transition_cleanup_verified: true,
+        recursive_provider_request_rejected: true,
     }
 }
 

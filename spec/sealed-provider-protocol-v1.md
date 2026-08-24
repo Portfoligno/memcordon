@@ -1,5 +1,7 @@
 # Sealed provider protocol v1
 
+> Historical specification. Current production clients reject protocol v1; see [sealed provider protocol v2](sealed-provider-protocol-v2.md).
+
 This is a private local protocol. It is not a stable caller configuration API.
 
 Each frame starts with a 72-byte header: big-endian protocol version (`u16`), message kind (`u16`), total frame length (`u32`), 16-byte request nonce, 16-byte attempt id, and the 32-byte SHA-256 digest of the payload. The remaining bytes are a counted payload. Total length is checked before allocation and is limited to 1 MiB. A digest mismatch rejects the frame before payload interpretation. Transport-derived peer identity and the request nonce provide authentication and replay binding; the digest is an integrity check, not a substitute for peer authentication.

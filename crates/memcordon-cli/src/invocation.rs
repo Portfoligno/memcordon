@@ -291,7 +291,7 @@ Rules:
             r#"Configure execution reports and optional wrapper output.
 
 Output options (value; default):
-  --report PATH                          Write schema-7 JSON to PATH; unset
+  --report PATH                          Write schema-8 JSON to PATH; unset
   --summary                              Write one final summary line to stderr; off
   --quiet                                Suppress optional wrapper output; off
 
@@ -301,8 +301,8 @@ Rules:
   with --quiet; quiet never suppresses required diagnostics or child streams.
 
 Utility JSON:
-  doctor --json    schema-4
-  plan --json      schema-6
+  doctor --json    schema-5
+  plan --json      schema-7
   clean --json     schema-2
 
 "#
@@ -322,8 +322,8 @@ Usage:
 
 Utilities:
   help      List topics or show one topic
-  doctor    Print the version and selected backend; JSON uses schema-4
-  plan      Resolve policy with launch proof false; JSON uses schema-6
+  doctor    Print the version and selected backend; JSON uses schema-5
+  plan      Resolve policy with launch proof false; JSON uses schema-7
   clean     Inspect or remove stale owned artifacts; JSON uses schema-2
   --version Print one version line
 
@@ -469,7 +469,7 @@ Circuit breaker (requires --restart or --restart-on):
   and cannot be set by itself.
 
 Output:
-  --report PATH                          Write a schema-7 JSON report; unset
+  --report PATH                          Write a schema-8 JSON report; unset
   --summary                              Final summary line on stderr; off
   --quiet                                Suppress optional MemCordon output; off
 
@@ -488,9 +488,9 @@ Utilities:
   clean [--dry-run] [--json]          Inspect or remove stale owned state
 
 Utility options:
-  doctor --json                       Write schema-4 JSON to stdout; off
+  doctor --json                       Write schema-5 JSON to stdout; off
   doctor --require hard|watchdog|sealed Require the selected backend class; unset
-  plan --json                         Write schema-6 JSON to stdout; off
+  plan --json                         Write schema-7 JSON to stdout; off
   clean --dry-run                     List without removing artifacts; off
   clean --json                        Write schema-2 JSON to stdout; off
 
@@ -522,7 +522,7 @@ Run memcordon help for topic-specific help.
 ];
 
 pub const DOCTOR_USAGE: &str = with_reference!(
-    "Inspect backend availability without launching a workload.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog|sealed]\n\nText prints the version and selected backend; --json prints full capabilities\nand limitations.\n\nOptions (default):\n  --json                         Write schema-4 JSON to stdout; off\n  --require hard|watchdog|sealed Return 125 unless the backend matches; unset\n  -h, --help                     Print this help\n\n"
+    "Inspect backend availability without launching a workload.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog|sealed]\n\nText prints the version and selected backend; --json prints full capabilities\nand limitations.\n\nOptions (default):\n  --json                         Write schema-5 JSON to stdout; off\n  --require hard|watchdog|sealed Return 125 unless the backend matches; unset\n  -h, --help                     Print this help\n\n"
 );
 
 pub const PLAN_USAGE: &str = with_reference!(
@@ -564,7 +564,7 @@ Policy options (value; default):
   --circuit-threshold SCORE              Decayed failure pressure to open; unset
   --circuit-cooldown DURATION            Minimum circuit quarantine; unset
   --circuit-half-life DURATION           Failure-pressure half-life; backoff half-life
-  --json                                 Write schema-6 JSON to stdout; off
+  --json                                 Write schema-7 JSON to stdout; off
   -h, --help                             Print this help
 
 Rules:

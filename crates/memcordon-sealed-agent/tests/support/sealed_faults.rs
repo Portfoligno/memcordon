@@ -232,7 +232,7 @@ pub fn prepare_fault_target(
     fixture: &support::StagedFixture,
 ) -> (
     std::path::PathBuf,
-    memcordon_sealed_agent::request::LaunchRequestV1,
+    memcordon_sealed_agent::request::LaunchRequestV2,
 ) {
     let marker = fixture.directory().join("fault-ready");
     std::fs::OpenOptions::new()
@@ -363,7 +363,7 @@ fn path_absent(path: &std::path::Path) -> bool {
 }
 
 pub fn exit_as_provider_worker(
-    request: memcordon_sealed_agent::request::LaunchRequestV1,
+    request: memcordon_sealed_agent::request::LaunchRequestV2,
     claim_path: std::path::PathBuf,
     attempt: [u8; 16],
 ) -> ! {

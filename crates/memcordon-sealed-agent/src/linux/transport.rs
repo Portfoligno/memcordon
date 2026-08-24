@@ -6,7 +6,7 @@ use std::os::unix::net::UnixStream;
 use crate::protocol::{Frame, MAX_FRAME_LENGTH, read_frame};
 
 const FRAME_HEADER_LENGTH: usize = 72;
-const MAX_DESCRIPTORS: usize = 6;
+const MAX_DESCRIPTORS: usize = 8;
 
 pub fn receive(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>), String> {
     let mut header = [0_u8; FRAME_HEADER_LENGTH];

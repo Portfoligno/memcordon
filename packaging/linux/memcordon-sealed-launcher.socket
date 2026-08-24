@@ -1,0 +1,14 @@
+[Unit]
+Description=MemCordon sealed supervision launch broker socket
+After=systemd-tmpfiles-setup.service
+
+[Socket]
+ListenStream=/run/memcordon/sealed-launcher.sock
+DirectoryMode=0750
+SocketMode=0600
+SocketUser=root
+SocketGroup=root
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

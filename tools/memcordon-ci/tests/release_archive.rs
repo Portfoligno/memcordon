@@ -8,11 +8,14 @@ const EXPECTED_STATIC_PATHS: &[&str] = &[
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
+    "docs/linux-sealed-certification.md",
     "docs/reference.md",
     "docs/sealed-provider.md",
     "docs/sealed-supervision.md",
     "docs/assets/banner.png",
     "docs/assets/key-guarantees.png",
+    "spec/sealed-linux-v2.md",
+    "spec/sealed-provider-protocol-v2.md",
 ];
 
 fn repository_root() -> PathBuf {
@@ -70,9 +73,9 @@ fn native_archive_markdown_links_reject_each_missing_sealed_document() {
     );
     assert_missing_document_link(
         Path::new("docs/sealed-provider.md"),
-        Path::new("docs/sealed-supervision.md"),
+        Path::new("docs/linux-sealed-certification.md"),
         "sealed-provider.md",
-        "transitive link to missing sealed provider document must fail",
+        "certification link to missing sealed provider document must fail",
     );
 }
 

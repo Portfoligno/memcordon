@@ -273,7 +273,7 @@ pub(crate) fn sealed_info(receipt: crate::sealed::client::ProbeReceipt) -> Backe
             sealed: crate::backend::SealedAvailability::Available {
                 capability: memcordon_core::BoundaryCapability {
                     class: memcordon_core::BoundaryClass::Sealed,
-                    mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+                    mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
                     target_gated: true,
                     boundary_verified_before_authorization: true,
                     target_can_reconfigure_boundary: false,
@@ -284,7 +284,7 @@ pub(crate) fn sealed_info(receipt: crate::sealed::client::ProbeReceipt) -> Backe
                 qualification: crate::backend::BoundaryQualification {
                     provider_identity: receipt.provider_identity,
                     receipt_digest: receipt.receipt_digest,
-                    mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+                    mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
                 },
             },
         },

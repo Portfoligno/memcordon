@@ -1,5 +1,15 @@
+use std::io::Read;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+
+use crate::request::{FileIdentity, NamespaceIdentity};
+
+pub struct CallerMountContext {
+    pub mount_namespace: OwnedFd,
+    pub root: OwnedFd,
+    pub mount_namespace_identity: NamespaceIdentity,
+    pub root_identity: FileIdentity,
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -137,6 +147,144 @@ where
         host_pid: result as libc::pid_t,
         pidfd,
     })
+}
+
+/// Joins the authenticated caller mount context in a dedicated bootstrap and
+/// creates the namespace init from that context. The provider parent never
+/// leaves its host mount namespace and retains all cleanup authority.
+pub fn clone_into_cgroup_from_caller<F>(
+    cgroup: &std::fs::File,
+    context: CallerMountContext,
+    child_entry: F,
+) -> Result<NamespaceInit, String>
+where
+    F: FnOnce() -> i32,
+{
+    const RECORD_LENGTH: usize = 10;
+    // The caller-context bootstrap must exit before the provider starts monitoring. Make this
+    // single-request launcher worker the subreaper so the namespace init remains a waitable
+    // direct descendant for terminal cleanup proof after its bootstrap parent exits.
+    // SAFETY: prctl receives the documented scalar PR_SET_CHILD_SUBREAPER arguments.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
+        return Err(format!(
+            "MCSEALED-CALLER-MOUNT-NAMESPACE-ADOPTION: subreaper: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut descriptors = [-1_i32; 2];
+    // SAFETY: pipe2 receives writable storage for two descriptors.
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(format!(
+            "MCSEALED-CALLER-MOUNT-NAMESPACE-ADOPTION: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: successful pipe2 initialized both descriptors and transfers ownership here.
+    let mut read_end = unsafe { std::fs::File::from_raw_fd(descriptors[0]) };
+    // SAFETY: successful pipe2 initialized both descriptors and transfers ownership here.
+    let write_end = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    // SAFETY: launcher service is single-threaded at this fork boundary and all inherited
+    // descriptors have explicit ownership in the two resulting processes.
+    let bootstrap = unsafe { libc::fork() };
+    if bootstrap == -1 {
+        return Err(format!(
+            "MCSEALED-CALLER-MOUNT-NAMESPACE-ADOPTION: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if bootstrap == 0 {
+        drop(read_end);
+        let result = adopt_caller_mount_context(&context)
+            .and_then(|()| clone_into_cgroup(cgroup, child_entry).map_err(|_| libc::EIO));
+        let (status, pid, error) = match result {
+            Ok(init) => (0_u8, init.host_pid, 0_i32),
+            Err(error) => (1_u8, 0_i32, error),
+        };
+        let mut record = [0_u8; RECORD_LENGTH];
+        record[0] = 2;
+        record[1] = status;
+        record[2..6].copy_from_slice(&pid.to_be_bytes());
+        record[6..10].copy_from_slice(&error.to_be_bytes());
+        // SAFETY: the record is smaller than PIPE_BUF, and the descriptor is the bootstrap's
+        // private write end. A short/error write is reported by bootstrap exit status.
+        let written =
+            unsafe { libc::write(write_end.as_raw_fd(), record.as_ptr().cast(), record.len()) };
+        // SAFETY: bootstrap owns no Rust runtime state that may be unwound after fork.
+        unsafe { libc::_exit(i32::from(written != record.len() as isize || status != 0)) };
+    }
+    drop(write_end);
+    drop(child_entry);
+    drop(context);
+    let mut record = [0_u8; RECORD_LENGTH];
+    let read_result = read_end.read_exact(&mut record);
+    let mut raw = 0_i32;
+    // SAFETY: bootstrap is a direct child and raw points to live wait status storage.
+    let waited = unsafe { libc::waitpid(bootstrap, &raw mut raw, 0) };
+    if waited != bootstrap || read_result.is_err() || record[0] != 2 || record[1] != 0 {
+        let os_code = i32::from_be_bytes(record[6..10].try_into().expect("exact length"));
+        let detail = if os_code > 0 {
+            std::io::Error::from_raw_os_error(os_code).to_string()
+        } else {
+            "bootstrap did not return a valid namespace-init identity".to_owned()
+        };
+        return Err(format!(
+            "MCSEALED-CALLER-MOUNT-NAMESPACE-ADOPTION: {detail}"
+        ));
+    }
+    let host_pid = i32::from_be_bytes(record[2..6].try_into().expect("exact length"));
+    // SAFETY: pidfd_open receives an authenticated positive PID created by the bootstrap.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, host_pid, 0) } as i32;
+    if pidfd < 0 {
+        return Err(format!(
+            "MCSEALED-CALLER-MOUNT-NAMESPACE-ADOPTION: pidfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: successful pidfd_open returned a fresh descriptor owned here.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+    Ok(NamespaceInit { host_pid, pidfd })
+}
+
+fn adopt_caller_mount_context(context: &CallerMountContext) -> Result<(), i32> {
+    if !super::envelope::namespace_descriptor_matches(
+        context.mount_namespace.as_fd(),
+        context.mount_namespace_identity,
+    )
+    .map_err(|_| libc::ESTALE)?
+        || !super::envelope::descriptor_matches(context.root.as_fd(), context.root_identity)
+            .map_err(|_| libc::ESTALE)?
+    {
+        return Err(libc::ESTALE);
+    }
+    // SAFETY: the descriptor was opened from the authenticated caller's mount namespace and
+    // identity-checked immediately before setns in this dedicated single-threaded bootstrap.
+    if unsafe { libc::setns(context.mount_namespace.as_raw_fd(), libc::CLONE_NEWNS) } == -1 {
+        return Err(last_errno());
+    }
+    let joined = std::fs::metadata("/proc/self/ns/mnt").map_err(|_| libc::ESTALE)?;
+    use std::os::unix::fs::MetadataExt;
+    if joined.dev() != context.mount_namespace_identity.device
+        || joined.ino() != context.mount_namespace_identity.inode
+    {
+        return Err(libc::ESTALE);
+    }
+    // SAFETY: root is the identity-checked directory descriptor for the same caller. fchdir plus
+    // chroot(".") reproduces the caller root without accepting a caller-supplied path.
+    let root_change_failed = unsafe {
+        libc::fchdir(context.root.as_raw_fd()) == -1
+            || libc::chroot(c".".as_ptr()) == -1
+            || libc::chdir(c"/".as_ptr()) == -1
+    };
+    if root_change_failed {
+        return Err(last_errno());
+    }
+    Ok(())
+}
+
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
 }
 
 pub fn prepare_namespace_init() -> Result<(), NamespaceInitError> {

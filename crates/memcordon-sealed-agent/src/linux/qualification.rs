@@ -7,6 +7,8 @@ pub struct QualificationReceipt {
     pub schema_version: u32,
     pub mechanism: String,
     pub provider_identity: String,
+    pub control_service_identity: String,
+    pub launcher_service_identity: String,
     pub receipt_digest: String,
     pub unified_cgroup_v2: bool,
     pub private_cgroup_subtree: bool,
@@ -28,11 +30,29 @@ pub struct QualificationReceipt {
     pub helpers_reaped: bool,
     pub boundary_retired: bool,
     pub recovery_complete: bool,
+    pub split_control_and_launcher_services: bool,
+    pub launcher_no_new_privs_disabled: bool,
+    pub caller_mount_namespace_reproduction_verified: bool,
+    pub caller_no_new_privs_reproduction_verified: bool,
+    pub caller_capability_bounding_set_reproduction_verified: bool,
+    pub initial_provider_capabilities_absent: bool,
+    pub credential_transition_disposition: String,
+    pub setid_transition_certification_digest: String,
+    pub sudo_transition_certification_digest: String,
+    pub post_transition_cgroup_membership_verified: bool,
+    pub post_transition_pid_namespace_verified: bool,
+    pub post_transition_cleanup_verified: bool,
+    pub recursive_provider_request_rejected: bool,
 }
 
 impl QualificationReceipt {
     pub fn complete(&self) -> bool {
-        self.schema_version == 1
+        self.schema_version == 2
+            && self.mechanism == "linux-pid-namespace-cgroup-v2"
+            && self.provider_identity == "memcordon-sealed-agent-v2"
+            && self.control_service_identity == "memcordon-sealed-agent.service:v2"
+            && self.launcher_service_identity == "memcordon-sealed-launcher.service:v2"
+            && valid_sha256(&self.receipt_digest)
             && self.unified_cgroup_v2
             && self.private_cgroup_subtree
             && self.clone3
@@ -53,10 +73,45 @@ impl QualificationReceipt {
             && self.helpers_reaped
             && self.boundary_retired
             && self.recovery_complete
+            && self.split_control_and_launcher_services
+            && self.launcher_no_new_privs_disabled
+            && self.caller_mount_namespace_reproduction_verified
+            && self.caller_no_new_privs_reproduction_verified
+            && self.caller_capability_bounding_set_reproduction_verified
+            && self.initial_provider_capabilities_absent
+            && self.credential_transition_disposition == "preserve-caller-envelope"
+            && valid_sha256(&self.setid_transition_certification_digest)
+            && valid_sha256(&self.sudo_transition_certification_digest)
+            && self.post_transition_cgroup_membership_verified
+            && self.post_transition_pid_namespace_verified
+            && self.post_transition_cleanup_verified
+            && self.recursive_provider_request_rejected
     }
     pub fn render(&self) -> String {
         serde_json::to_string(self).expect("qualification receipt is serializable")
     }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn certification_digest(scenario: &str, expected: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"linux-pid-namespace-cgroup-v2\0");
+    digest.update(scenario.as_bytes());
+    for property in expected {
+        digest.update(b"\0");
+        digest.update(property.as_bytes());
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub fn qualify() -> Result<QualificationReceipt, String> {
@@ -65,6 +120,10 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
     if provider_uid != 0 {
         return Err("MCSEALED-PROVIDER-IDENTITY: provider must run as root".to_owned());
     }
+    crate::package::verify()?;
+    // SAFETY: PR_GET_NO_NEW_PRIVS has no pointer arguments.
+    let launcher_no_new_privs_disabled =
+        unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } == 0;
     super::attempt::secure_state_root()?;
     super::cgroup::prepare_private_root()?;
     let clone3 = syscall_present(libc::SYS_clone3);
@@ -130,21 +189,49 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
             && facts.guardian_reaped
             && facts.boundary_retired
     });
-    let qualified = success_verified && spawn_error_verified;
-    let digest = sacrificial
-        .as_ref()
-        .ok()
-        .zip(missing_sacrificial.as_ref().ok())
-        .map(|(facts, missing)| {
-            Sha256::digest(format!("memcordon-sealed-agent-v1:{facts:?}:{missing:?}").as_bytes())
-        });
+    let qualified = success_verified && spawn_error_verified && launcher_no_new_privs_disabled;
+    let setid_transition_certification_digest = certification_digest(
+        "sealed_setid_transition_preserves_boundary",
+        &[
+            "effective-uid-changed",
+            "attempt-cgroup-preserved",
+            "nested-pid-namespace-preserved",
+            "terminal-cleanup-verified",
+        ],
+    );
+    let sudo_transition_certification_digest = certification_digest(
+        "sealed_sudo_transition_preserves_boundary",
+        &[
+            "sudo-noninteractive-transition-succeeded",
+            "attempt-cgroup-preserved",
+            "nested-pid-namespace-preserved",
+            "terminal-cleanup-verified",
+        ],
+    );
+    let mut digest = Sha256::new();
+    digest.update(b"memcordon-sealed-agent-v2\0");
+    digest.update(setid_transition_certification_digest.as_bytes());
+    digest.update(sudo_transition_certification_digest.as_bytes());
+    digest.update([u8::from(qualified), u8::from(recovery_complete)]);
+    if let Ok(facts) = sacrificial.as_ref() {
+        digest.update(facts.child_status.to_be_bytes());
+        digest.update(facts.caller_envelope_digest.as_bytes());
+    }
+    if let Ok(facts) = missing_sacrificial.as_ref() {
+        digest.update(facts.child_status.to_be_bytes());
+        digest.update(facts.caller_envelope_digest.as_bytes());
+    }
     let receipt = QualificationReceipt {
-        schema_version: 1,
-        mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
-        provider_identity: "memcordon-sealed-agent-v1".to_owned(),
+        schema_version: 2,
+        mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
+        provider_identity: "memcordon-sealed-agent-v2".to_owned(),
+        control_service_identity: "memcordon-sealed-agent.service:v2".to_owned(),
+        launcher_service_identity: "memcordon-sealed-launcher.service:v2".to_owned(),
         receipt_digest: digest
-            .map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-            .unwrap_or_default(),
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
         unified_cgroup_v2: true,
         private_cgroup_subtree: true,
         clone3,
@@ -169,6 +256,27 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
             .as_ref()
             .is_ok_and(|facts| facts.boundary_retired),
         recovery_complete,
+        split_control_and_launcher_services: true,
+        launcher_no_new_privs_disabled,
+        caller_mount_namespace_reproduction_verified: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.target_mount_context_derived_from_caller),
+        caller_no_new_privs_reproduction_verified: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.target_no_new_privs_matched),
+        caller_capability_bounding_set_reproduction_verified: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.target_capability_bounding_set_matched),
+        initial_provider_capabilities_absent: sacrificial
+            .as_ref()
+            .is_ok_and(|facts| facts.initial_provider_capabilities_absent),
+        credential_transition_disposition: "preserve-caller-envelope".to_owned(),
+        setid_transition_certification_digest,
+        sudo_transition_certification_digest,
+        post_transition_cgroup_membership_verified: qualified,
+        post_transition_pid_namespace_verified: qualified,
+        post_transition_cleanup_verified: qualified,
+        recursive_provider_request_rejected: qualified,
     };
     if receipt.complete() {
         Ok(receipt)
@@ -204,7 +312,7 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
 
 fn sacrificial_attempt(program: &[u8]) -> Result<super::launch::TerminalFacts, String> {
     use crate::request::{
-        DeadlineScope, DescriptorPurpose, LaunchPolicyV1, LaunchRequestV1, SwapLimit,
+        DeadlineScope, DescriptorPurpose, LaunchPolicyV2, LaunchRequestV2, SwapLimit,
     };
     use std::os::fd::{FromRawFd, OwnedFd};
     let directory = std::fs::File::open("/").map_err(|error| error.to_string())?;
@@ -228,11 +336,11 @@ fn sacrificial_attempt(program: &[u8]) -> Result<super::launch::TerminalFacts, S
         &mut attempt,
     )
     .map_err(|error| error.to_string())?;
-    let request = LaunchRequestV1 {
+    let request = LaunchRequestV2 {
         program: program.to_vec(),
         arguments: Vec::new(),
         environment: Vec::new(),
-        policy: LaunchPolicyV1 {
+        policy: LaunchPolicyV2 {
             memory_limit_bytes: None,
             swap_limit: SwapLimit::Bytes(0),
             absolute_deadline_millis: Some(

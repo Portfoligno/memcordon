@@ -150,10 +150,33 @@ fn sealed_package_upgrade_recovers_before_advertising() {
         .status()
         .unwrap();
     assert!(socket.success());
+    let launcher_socket = Command::new("/usr/bin/systemctl")
+        .args(["is-active", "memcordon-sealed-launcher.socket"])
+        .status()
+        .unwrap();
+    assert!(launcher_socket.success());
     let qualification = Command::new(AGENT).arg("probe").output().unwrap();
     assert!(qualification.status.success());
     let receipt: serde_json::Value = serde_json::from_slice(&qualification.stdout).unwrap();
     assert_eq!(receipt["boundary_retired"], true);
+    assert_eq!(receipt["schema_version"], 2);
+    assert_eq!(receipt["mechanism"], "linux-pid-namespace-cgroup-v2");
+    assert_eq!(receipt["provider_identity"], "memcordon-sealed-agent-v2");
+    for field in [
+        "receipt_digest",
+        "setid_transition_certification_digest",
+        "sudo_transition_certification_digest",
+    ] {
+        let digest = receipt[field]
+            .as_str()
+            .expect("qualification SHA-256 field");
+        assert_eq!(digest.len(), 64);
+        assert!(
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+    }
 
     let policy = memcordon_core::Policy::unbounded().sealed();
     let backend = memcordon_platform::probe()
@@ -192,8 +215,8 @@ fn sealed_package_upgrade_recovers_before_advertising() {
     assert!(attempt.restart_safety.sealed_boundary_retired);
     assert!(matches!(
         &attempt.boundary_detail,
-        memcordon_core::BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV1(evidence)
-            if evidence.schema_version == 1
+        memcordon_core::BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2(evidence)
+            if evidence.schema_version == 2
                 && receipt["provider_identity"].as_str()
                     == Some(evidence.provider_identity.as_str())
                 && receipt["receipt_digest"].as_str()
@@ -213,6 +236,11 @@ fn sealed_package_upgrade_recovers_before_advertising() {
         .status()
         .unwrap();
     assert!(service.success());
+    let launcher_service = Command::new("/usr/bin/systemctl")
+        .args(["is-active", "memcordon-sealed-launcher.service"])
+        .status()
+        .unwrap();
+    assert!(launcher_service.success());
 }
 
 #[test]

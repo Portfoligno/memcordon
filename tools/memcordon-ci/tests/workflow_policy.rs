@@ -90,8 +90,8 @@ fn release_preflight_binds_provisioning_and_cache_to_toolchain_config() {
         ),
         (
             "wrong MSRV cache identity",
-            "cargo-target-release-v2-preflight-1.97.1-msrv-1.85.0-",
-            "cargo-target-release-v2-preflight-1.97.1-msrv-1.97.1-",
+            "cargo-target-release-v3-preflight-1.97.1-msrv-1.85.0-",
+            "cargo-target-release-v3-preflight-1.97.1-msrv-1.97.1-",
             "release preflight target cache identity differs",
         ),
     ] {

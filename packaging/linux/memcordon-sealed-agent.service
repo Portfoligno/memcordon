@@ -1,14 +1,13 @@
 [Unit]
-Description=MemCordon sealed supervision provider
-Requires=memcordon-sealed-agent.socket
-After=local-fs.target
+Description=MemCordon sealed supervision control provider
+Requires=memcordon-sealed-agent.socket memcordon-sealed-launcher.socket
+After=local-fs.target memcordon-sealed-launcher.socket
 
 [Service]
 Type=simple
 ExecStart=/usr/libexec/memcordon-sealed-agent serve
 User=root
 Group=memcordon
-Delegate=yes
 KillMode=process
 RuntimeDirectory=memcordon
 RuntimeDirectoryMode=0750
@@ -17,9 +16,11 @@ StateDirectoryMode=0700
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed /sys/fs/cgroup
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_KILL CAP_DAC_OVERRIDE CAP_SYS_PTRACE
+ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE
 AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target

@@ -1,5 +1,6 @@
 [Unit]
-Description=MemCordon sealed supervision provider socket
+Description=MemCordon sealed supervision control socket
+After=systemd-tmpfiles-setup.service
 
 [Socket]
 ListenStream=/run/memcordon/sealed-agent.sock

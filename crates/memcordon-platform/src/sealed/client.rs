@@ -11,7 +11,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const ENDPOINT: &str = "/run/memcordon/sealed-agent.sock";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_LENGTH: usize = 72;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_NATIVE_VALUE: usize = 64 * 1024;
@@ -21,14 +21,21 @@ const MAX_ENVIRONMENT_ENTRIES: usize = 8192;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProbeReceipt {
     pub provider_identity: String,
+    pub control_service_identity: String,
+    pub launcher_service_identity: String,
     pub receipt_digest: String,
+    pub setid_transition_certification_digest: String,
+    pub sudo_transition_certification_digest: String,
 }
 
-#[derive(Deserialize)]
-struct QualificationReceipt {
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QualificationReceipt {
     schema_version: u32,
     mechanism: String,
     provider_identity: String,
+    control_service_identity: String,
+    launcher_service_identity: String,
     receipt_digest: String,
     unified_cgroup_v2: bool,
     private_cgroup_subtree: bool,
@@ -50,18 +57,29 @@ struct QualificationReceipt {
     helpers_reaped: bool,
     boundary_retired: bool,
     recovery_complete: bool,
+    split_control_and_launcher_services: bool,
+    launcher_no_new_privs_disabled: bool,
+    caller_mount_namespace_reproduction_verified: bool,
+    caller_no_new_privs_reproduction_verified: bool,
+    caller_capability_bounding_set_reproduction_verified: bool,
+    initial_provider_capabilities_absent: bool,
+    credential_transition_disposition: String,
+    setid_transition_certification_digest: String,
+    sudo_transition_certification_digest: String,
+    post_transition_cgroup_membership_verified: bool,
+    post_transition_pid_namespace_verified: bool,
+    post_transition_cleanup_verified: bool,
+    recursive_provider_request_rejected: bool,
 }
 
 impl QualificationReceipt {
     fn is_complete(&self) -> bool {
-        self.schema_version == 1
-            && self.mechanism == "linux-pid-namespace-cgroup-v1"
-            && !self.provider_identity.is_empty()
-            && self.receipt_digest.len() == 64
-            && self
-                .receipt_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+        self.schema_version == 2
+            && self.mechanism == "linux-pid-namespace-cgroup-v2"
+            && self.provider_identity == "memcordon-sealed-agent-v2"
+            && self.control_service_identity == "memcordon-sealed-agent.service:v2"
+            && self.launcher_service_identity == "memcordon-sealed-launcher.service:v2"
+            && valid_sha256(&self.receipt_digest)
             && self.unified_cgroup_v2
             && self.private_cgroup_subtree
             && self.clone3
@@ -82,10 +100,43 @@ impl QualificationReceipt {
             && self.helpers_reaped
             && self.boundary_retired
             && self.recovery_complete
+            && self.split_control_and_launcher_services
+            && self.launcher_no_new_privs_disabled
+            && self.caller_mount_namespace_reproduction_verified
+            && self.caller_no_new_privs_reproduction_verified
+            && self.caller_capability_bounding_set_reproduction_verified
+            && self.initial_provider_capabilities_absent
+            && self.credential_transition_disposition == "preserve-caller-envelope"
+            && valid_sha256(&self.setid_transition_certification_digest)
+            && valid_sha256(&self.sudo_transition_certification_digest)
+            && self.post_transition_cgroup_membership_verified
+            && self.post_transition_pid_namespace_verified
+            && self.post_transition_cleanup_verified
+            && self.recursive_provider_request_rejected
     }
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn parse_qualification(payload: &[u8]) -> Result<QualificationReceipt, String> {
+    let receipt: QualificationReceipt =
+        serde_json::from_slice(payload).map_err(|error| error.to_string())?;
+    if receipt.is_complete() {
+        Ok(receipt)
+    } else {
+        Err("provider qualification receipt is incomplete or incompatible".to_owned())
+    }
+}
+
+#[allow(dead_code)]
 pub struct TerminalReceipt {
+    pub schema_version: u32,
+    pub mechanism: String,
     pub status: i32,
     pub exec_status: TerminalExecStatus,
     pub spawn_error_reported: bool,
@@ -93,10 +144,21 @@ pub struct TerminalReceipt {
     pub authorization_offset_millis: u64,
     pub assignment_verified: bool,
     pub namespaces_verified: bool,
-    pub credentials_verified: bool,
-    pub capabilities_empty: bool,
+    pub target_initial_credentials_verified: bool,
+    pub initial_provider_capabilities_absent: bool,
+    pub caller_envelope_digest: String,
+    pub caller_no_new_privs: bool,
+    pub target_no_new_privs_matched: bool,
+    pub caller_capability_bounding_set_digest: String,
+    pub target_capability_bounding_set_matched: bool,
+    pub caller_mount_namespace_digest: String,
+    pub target_mount_context_derived_from_caller: bool,
+    pub credential_transition_disposition: memcordon_core::CredentialTransitionDisposition,
+    pub boundary_independent_of_credentials: bool,
     pub descriptors_verified: bool,
-    pub cgroup_view_denied: bool,
+    pub writable_ancestor_cgroup_denied: bool,
+    pub parent_namespace_handles_denied: bool,
+    pub recursive_provider_request_denied: bool,
     pub guardian_ready: bool,
     pub frontend_loss_authority: bool,
     pub cgroup_kill: bool,
@@ -190,7 +252,7 @@ pub fn run(
             )
             .with_boundary_setup_failure(memcordon_core::BoundarySetupFailure {
                 requested: memcordon_core::BoundaryRequirement::Sealed,
-                mechanism: Some("linux-pid-namespace-cgroup-v1".to_owned()),
+                mechanism: Some("linux-pid-namespace-cgroup-v2".to_owned()),
                 phase: rejection.phase,
                 target_created: rejection.target_created,
                 target_released: rejection.target_released,
@@ -246,7 +308,7 @@ pub fn run(
             observed: None,
             peak: None,
             evidence: memcordon_core::LimitEvidence {
-                backend: "linux-pid-namespace-cgroup-v1".to_owned(),
+                backend: "linux-pid-namespace-cgroup-v2".to_owned(),
                 metric: "memory.current".to_owned(),
                 detail: "memory.events oom_kill incremented".to_owned(),
             },
@@ -293,9 +355,11 @@ pub fn run(
             cleanup,
         }
     };
-    let evidence = memcordon_core::LinuxSealedEvidence {
-        schema_version: 1,
+    let evidence = memcordon_core::LinuxSealedEvidenceV2 {
+        schema_version: 2,
         provider_identity: qualification.provider_identity.clone(),
+        control_service_identity: qualification.control_service_identity.clone(),
+        launcher_service_identity: qualification.launcher_service_identity.clone(),
         cgroup_identity_digest: qualification.receipt_digest.clone(),
         cgroup_created: true,
         cgroup_owned_by_provider: true,
@@ -307,11 +371,17 @@ pub fn run(
         target_pidfd_verified: true,
         target_cgroup_membership_verified: terminal.assignment_verified,
         target_pid_namespace_verified: terminal.namespaces_verified,
-        target_credentials_verified: terminal.credentials_verified,
-        target_capabilities_empty: terminal.capabilities_empty,
-        no_new_privs_verified: true,
+        target_initial_credentials_verified: terminal.target_initial_credentials_verified,
+        initial_provider_capabilities_absent: terminal.initial_provider_capabilities_absent,
+        caller_no_new_privs_reproduced: terminal.target_no_new_privs_matched,
+        caller_capability_bounding_set_reproduced: terminal.target_capability_bounding_set_matched,
+        caller_mount_context_reproduced: terminal.target_mount_context_derived_from_caller,
+        credential_transition_disposition: terminal.credential_transition_disposition,
+        boundary_independent_of_credentials: terminal.boundary_independent_of_credentials,
         inherited_descriptors_verified: terminal.descriptors_verified,
-        writable_cgroup_view_denied: terminal.cgroup_view_denied,
+        writable_ancestor_cgroup_denied: terminal.writable_ancestor_cgroup_denied,
+        parent_namespace_handles_denied: terminal.parent_namespace_handles_denied,
+        recursive_provider_request_denied: terminal.recursive_provider_request_denied,
         guardian_ready: terminal.guardian_ready,
         target_released: true,
         cgroup_kill_invoked: terminal.cgroup_kill,
@@ -327,7 +397,7 @@ pub fn run(
         duration: started.elapsed(),
         authorization_offset: Some(Duration::from_millis(terminal.authorization_offset_millis)),
         launch: memcordon_core::LaunchEvidence {
-            mechanism: "linux-pid-namespace-cgroup-v1".to_owned(),
+            mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
             target_released: true,
             containment_verified_before_authorization: terminal.assignment_verified
                 && terminal.namespaces_verified,
@@ -336,12 +406,12 @@ pub fn run(
             boundary_requested: memcordon_core::BoundaryRequirement::Sealed,
             boundary_effective: memcordon_core::BoundaryClass::Sealed,
             boundary_assignment_verified: terminal.assignment_verified,
-            boundary_reconfiguration_denied: terminal.cgroup_view_denied,
+            boundary_reconfiguration_denied: terminal.writable_ancestor_cgroup_denied,
             inherited_resources_restricted: terminal.descriptors_verified,
             frontend_loss_cleanup_authority_verified: terminal.frontend_loss_authority,
         },
         restart_safety,
-        boundary_detail: memcordon_core::BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV1(
+        boundary_detail: memcordon_core::BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2(
             evidence,
         ),
     })
@@ -397,7 +467,7 @@ pub(crate) fn terminal_spawn_error(
         .with_provider_rejection(provider_rejection)
         .with_boundary_setup_failure(memcordon_core::BoundarySetupFailure {
             requested: memcordon_core::BoundaryRequirement::Sealed,
-            mechanism: Some("linux-pid-namespace-cgroup-v1".to_owned()),
+            mechanism: Some("linux-pid-namespace-cgroup-v2".to_owned()),
             phase: memcordon_core::BoundarySetupPhase::TargetCreation,
             target_created: true,
             target_released: true,
@@ -414,10 +484,13 @@ pub(crate) fn terminal_spawn_error(
     error.authorization_offset = Some(Duration::from_millis(terminal.authorization_offset_millis));
     error.cgroup_verified_before_release = terminal.assignment_verified
         && terminal.namespaces_verified
-        && terminal.credentials_verified
-        && terminal.capabilities_empty
+        && terminal.target_initial_credentials_verified
+        && terminal.initial_provider_capabilities_absent
+        && terminal.target_no_new_privs_matched
+        && terminal.target_capability_bounding_set_matched
+        && terminal.target_mount_context_derived_from_caller
         && terminal.descriptors_verified
-        && terminal.cgroup_view_denied;
+        && terminal.writable_ancestor_cgroup_denied;
     error.guardian_ready_before_release = terminal.guardian_ready;
     error.workload_may_be_alive =
         !restart_safety.is_safe_for(memcordon_core::BoundaryRequirement::Sealed);
@@ -540,6 +613,19 @@ fn boundary_phase_name(phase: memcordon_core::BoundarySetupPhase) -> &'static st
     match phase {
         memcordon_core::BoundarySetupPhase::ProviderConnection => "provider-connection",
         memcordon_core::BoundarySetupPhase::ProviderIdentity => "provider-identity",
+        memcordon_core::BoundarySetupPhase::CallerEnvelopeCapture => "caller-envelope-capture",
+        memcordon_core::BoundarySetupPhase::LauncherServiceAuthentication => {
+            "launcher-service-authentication"
+        }
+        memcordon_core::BoundarySetupPhase::CallerMountNamespaceAdoption => {
+            "caller-mount-namespace-adoption"
+        }
+        memcordon_core::BoundarySetupPhase::CallerCapabilityEnvelope => {
+            "caller-capability-envelope"
+        }
+        memcordon_core::BoundarySetupPhase::CredentialTransitionPolicy => {
+            "credential-transition-policy"
+        }
         memcordon_core::BoundarySetupPhase::BoundaryCreation => "boundary-creation",
         memcordon_core::BoundarySetupPhase::GuardianStartup => "guardian-startup",
         memcordon_core::BoundarySetupPhase::TargetCreation => "target-creation",
@@ -572,16 +658,14 @@ pub fn probe() -> Result<ProbeReceipt, String> {
     if kind != 101 || returned_nonce != nonce || attempt != [0; 16] {
         return Err("provider probe receipt identity mismatch".to_owned());
     }
-    let identity = String::from_utf8(payload)
-        .map_err(|_| "provider qualification receipt is not UTF-8".to_owned())?;
-    let receipt: QualificationReceipt = serde_json::from_str(&identity)
-        .map_err(|error| format!("provider qualification receipt is invalid: {error}"))?;
-    if !receipt.is_complete() {
-        return Err("provider reported an uncertified mechanism".to_owned());
-    }
+    let receipt = parse_qualification(&payload)?;
     Ok(ProbeReceipt {
         provider_identity: receipt.provider_identity,
+        control_service_identity: receipt.control_service_identity,
+        launcher_service_identity: receipt.launcher_service_identity,
         receipt_digest: receipt.receipt_digest,
+        setid_transition_certification_digest: receipt.setid_transition_certification_digest,
+        sudo_transition_certification_digest: receipt.sudo_transition_certification_digest,
     })
 }
 
@@ -590,6 +674,15 @@ fn verify_endpoint() -> Result<(), String> {
         .map_err(|error| format!("provider endpoint unavailable: {error}"))?;
     if !metadata.file_type().is_socket() || metadata.uid() != 0 || metadata.mode() & 0o007 != 0 {
         return Err("provider endpoint is not a root-owned socket identity".to_owned());
+    }
+    let launcher = fs::symlink_metadata("/run/memcordon/sealed-launcher.sock")
+        .map_err(|error| format!("launcher endpoint unavailable: {error}"))?;
+    if !launcher.file_type().is_socket()
+        || launcher.uid() != 0
+        || launcher.gid() != 0
+        || launcher.mode() & 0o777 != 0o600
+    {
+        return Err("launcher endpoint is not a root-only socket identity".to_owned());
     }
     let executable = fs::symlink_metadata("/usr/libexec/memcordon-sealed-agent")
         .map_err(|error| format!("provider executable unavailable: {error}"))?;
@@ -634,7 +727,7 @@ fn encode_launch(
         return Err("launch argument count exceeds protocol limit".to_owned());
     }
     let mut output = Vec::new();
-    output.extend_from_slice(&1_u16.to_be_bytes());
+    output.extend_from_slice(&2_u16.to_be_bytes());
     put_bytes(&mut output, command.program().as_bytes())?;
     put_count(&mut output, command.arguments().len())?;
     for argument in command.arguments() {
@@ -851,6 +944,13 @@ pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> 
             return Err("terminal receipt contains an empty or duplicate field".to_owned());
         }
     }
+    let schema_version = take_terminal_field(&mut fields, "schema-version")?
+        .parse::<u32>()
+        .map_err(|_| "terminal schema version invalid".to_owned())?;
+    let mechanism = take_terminal_field(&mut fields, "mechanism")?.to_owned();
+    if schema_version != 2 || mechanism != "linux-pid-namespace-cgroup-v2" {
+        return Err("terminal receipt schema or mechanism is incompatible".to_owned());
+    }
     let status = take_terminal_field(&mut fields, "status")?
         .parse()
         .map_err(|_| "terminal status invalid".to_owned())?;
@@ -902,7 +1002,28 @@ pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> 
         take_terminal_field(&mut fields, "authorization-offset-millis")?
             .parse()
             .map_err(|_| "terminal authorization offset invalid".to_owned())?;
+    let caller_envelope_digest =
+        take_terminal_field(&mut fields, "caller-envelope-digest")?.to_owned();
+    let caller_capability_bounding_set_digest =
+        take_terminal_field(&mut fields, "caller-capability-bounding-set-digest")?.to_owned();
+    let caller_mount_namespace_digest =
+        take_terminal_field(&mut fields, "caller-mount-namespace-digest")?.to_owned();
+    if !valid_sha256(&caller_envelope_digest)
+        || !valid_sha256(&caller_capability_bounding_set_digest)
+        || !valid_sha256(&caller_mount_namespace_digest)
+    {
+        return Err("terminal caller-envelope digest is invalid".to_owned());
+    }
+    let credential_transition_disposition =
+        match take_terminal_field(&mut fields, "credential-transition-disposition")? {
+            "preserve-caller-envelope" => {
+                memcordon_core::CredentialTransitionDisposition::PreserveCallerEnvelope
+            }
+            _ => return Err("terminal credential-transition disposition is invalid".to_owned()),
+        };
     let receipt = TerminalReceipt {
+        schema_version,
+        mechanism,
         status,
         exec_status,
         spawn_error_reported,
@@ -910,10 +1031,48 @@ pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> 
         authorization_offset_millis,
         assignment_verified: take_terminal_fact(&mut fields, "assignment-verified")?,
         namespaces_verified: take_terminal_fact(&mut fields, "namespaces-verified")?,
-        credentials_verified: take_terminal_fact(&mut fields, "credentials-verified")?,
-        capabilities_empty: take_terminal_fact(&mut fields, "capabilities-empty")?,
+        target_initial_credentials_verified: take_terminal_fact(
+            &mut fields,
+            "target-initial-credentials-verified",
+        )?,
+        initial_provider_capabilities_absent: take_terminal_fact(
+            &mut fields,
+            "initial-provider-capabilities-absent",
+        )?,
+        caller_envelope_digest,
+        caller_no_new_privs: take_terminal_fact(&mut fields, "caller-no-new-privs")?,
+        target_no_new_privs_matched: take_terminal_fact(
+            &mut fields,
+            "target-no-new-privs-matched",
+        )?,
+        caller_capability_bounding_set_digest,
+        target_capability_bounding_set_matched: take_terminal_fact(
+            &mut fields,
+            "target-capability-bounding-set-matched",
+        )?,
+        caller_mount_namespace_digest,
+        target_mount_context_derived_from_caller: take_terminal_fact(
+            &mut fields,
+            "target-mount-context-derived-from-caller",
+        )?,
+        credential_transition_disposition,
+        boundary_independent_of_credentials: take_terminal_fact(
+            &mut fields,
+            "boundary-independent-of-credentials",
+        )?,
         descriptors_verified: take_terminal_fact(&mut fields, "descriptors-verified")?,
-        cgroup_view_denied: take_terminal_fact(&mut fields, "cgroup-view-denied")?,
+        writable_ancestor_cgroup_denied: take_terminal_fact(
+            &mut fields,
+            "writable-ancestor-cgroup-denied",
+        )?,
+        parent_namespace_handles_denied: take_terminal_fact(
+            &mut fields,
+            "parent-namespace-handles-denied",
+        )?,
+        recursive_provider_request_denied: take_terminal_fact(
+            &mut fields,
+            "recursive-provider-request-denied",
+        )?,
         guardian_ready: take_terminal_fact(&mut fields, "guardian-ready-before-authorization")?,
         frontend_loss_authority: take_terminal_fact(
             &mut fields,

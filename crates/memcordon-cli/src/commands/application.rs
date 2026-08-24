@@ -217,7 +217,7 @@ fn report(
             .iter()
             .map(|value| memcordon_core::NativeArgument::from_os(value)),
     );
-    MemcordonReport::schema7(
+    MemcordonReport::schema8(
         tool_report(),
         InvocationReport {
             syntax: "plus-budgets-v1".to_owned(),

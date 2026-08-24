@@ -8,11 +8,14 @@ pub const NATIVE_ARCHIVE_STATIC_PATHS: &[&str] = &[
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
+    "docs/linux-sealed-certification.md",
     "docs/reference.md",
     "docs/sealed-provider.md",
     "docs/sealed-supervision.md",
     "docs/assets/banner.png",
     "docs/assets/key-guarantees.png",
+    "spec/sealed-linux-v2.md",
+    "spec/sealed-provider-protocol-v2.md",
 ];
 
 fn failure(message: impl Into<String>) -> CiError {

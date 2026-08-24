@@ -4,6 +4,7 @@ fn main() {
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
     let result = match arguments.as_slice() {
         [command] if command == "serve" => serve(),
+        [command] if command == "launch-broker" => launch_broker(),
         [command] if command == "probe" => probe(),
         [command] if command == "qualify" => qualify(),
         [package, operation] if package == "package" => {
@@ -14,7 +15,7 @@ fn main() {
         {
             memcordon_sealed_agent::package::run(operation, true)
         }
-        _ => Err("usage: memcordon-sealed-agent serve|probe|qualify|package verify|install|upgrade|uninstall [--ephemeral-ci]".to_owned()),
+        _ => Err("usage: memcordon-sealed-agent serve|launch-broker|probe|qualify|package verify|install|upgrade|uninstall [--ephemeral-ci]".to_owned()),
     };
     if let Err(error) = result {
         eprintln!("{error}");
@@ -42,6 +43,15 @@ fn serve() -> Result<(), String> {
     }
     #[cfg(not(target_os = "linux"))]
     Err("the sealed provider service is not implemented on this platform".to_owned())
+}
+
+fn launch_broker() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        memcordon_sealed_agent::linux::launcher::serve()
+    }
+    #[cfg(not(target_os = "linux"))]
+    Err("the sealed launch broker is not implemented on this platform".to_owned())
 }
 
 fn qualify() -> Result<(), String> {

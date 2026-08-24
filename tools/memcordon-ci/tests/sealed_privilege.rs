@@ -1,4 +1,6 @@
 const PRIVILEGED_REASON: &str = "#[ignore = \"requires privileged Linux sealed certification\"]";
+const CREDENTIAL_TRANSITION_REASON: &str =
+    "#[ignore = \"requires privileged Linux sealed credential-transition certification\"]";
 
 fn semantic_function_region(source: &str, signature: &str, next_signature: &str) -> Option<String> {
     let mut lines = source.lines();
@@ -83,9 +85,12 @@ fn generic_workspace_tests_ignore_every_privileged_linux_sealed_selector() {
     ];
     let ignored = privileged_tests
         .iter()
-        .map(|source| source.matches(PRIVILEGED_REASON).count())
+        .map(|source| {
+            source.matches(PRIVILEGED_REASON).count()
+                + source.matches(CREDENTIAL_TRANSITION_REASON).count()
+        })
         .sum::<usize>();
-    assert_eq!(ignored, 38, "all root-required selectors must be ignored");
+    assert_eq!(ignored, 45, "all root-required selectors must be ignored");
 
     let provider = include_str!("../../../crates/memcordon-sealed-agent/tests/linux_provider.rs");
     assert!(!provider.contains(PRIVILEGED_REASON));
@@ -142,10 +147,17 @@ fn release_inventory_promotes_and_binds_public_provider_evidence() {
     let evidence = include_str!("../src/release_evidence.rs");
     assert!(evidence.contains("validate_linux_fault_evidence"));
     assert!(evidence.contains("LINUX_FAULT_EVIDENCE_TESTS"));
-    let specification = include_str!("../../../spec/sealed-linux-v1.md");
+    let specification = include_str!("../../../spec/sealed-linux-v2.md");
     for name in [
-        "provider-service-privileges.json",
-        "sealed-public-launch.json",
+        "provider-package-verification.json",
+        "provider-qualification-v2.json",
+        "setid-transition.json",
+        "sudo-transition.json",
+        "file-capability-transition.json",
+        "caller-envelope.json",
+        "mount-context.json",
+        "fault-injection.json",
+        "cleanup-leak-check.json",
     ] {
         assert!(evidence.contains(name), "release inventory omitted {name}");
         assert!(
@@ -154,18 +166,91 @@ fn release_inventory_promotes_and_binds_public_provider_evidence() {
         );
     }
     for required in [
-        "LinuxProviderServicePrivileges",
-        "validate_linux_provider_privileges",
+        "LinuxProviderPackageVerification",
+        "validate_linux_provider_package",
         "validate_linux_public_launch",
         "linux_provider_binding",
-        "qualification.provider_identity != identity.provider_identity",
-        "qualification.receipt_digest != identity.receipt_digest",
-        "BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV1",
+        "linux_qualification_complete",
+        "BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2",
+        "CredentialTransitionDisposition::PreserveCallerEnvelope",
         "SupervisionTerminal::AttemptOutcome",
     ] {
         assert!(
             evidence.contains(required),
             "release validation omitted {required}"
+        );
+    }
+}
+
+#[test]
+fn credential_redesign_fuzz_targets_bind_real_parser_surfaces() {
+    let manifest = include_str!("../../../fuzz/Cargo.toml");
+    let suite = include_str!("../src/suites.rs");
+    let targets = [
+        (
+            "caller-envelope-status",
+            include_str!("../../../fuzz/fuzz_targets/caller_envelope_status.rs"),
+            "parse_proc_status",
+        ),
+        (
+            "capability-mask",
+            include_str!("../../../fuzz/fuzz_targets/capability_mask.rs"),
+            "parse_capability_mask",
+        ),
+        (
+            "namespace-identity",
+            include_str!("../../../fuzz/fuzz_targets/namespace_identity.rs"),
+            "parse_namespace_identity",
+        ),
+        (
+            "broker-protocol-v2",
+            include_str!("../../../fuzz/fuzz_targets/broker_protocol_v2.rs"),
+            "decode_launch_broker_request",
+        ),
+        (
+            "qualification-receipt-v2",
+            include_str!("../../../fuzz/fuzz_targets/qualification_receipt_v2.rs"),
+            "sealed_qualification_v2_is_valid",
+        ),
+        (
+            "terminal-receipt-v2",
+            include_str!("../../../fuzz/fuzz_targets/terminal_receipt_v2.rs"),
+            "sealed_terminal_v2_is_valid",
+        ),
+        (
+            "linux-evidence-v2",
+            include_str!("../../../fuzz/fuzz_targets/linux_evidence_v2.rs"),
+            "BoundaryMechanismEvidence",
+        ),
+        (
+            "service-unit-policy",
+            include_str!("../../../fuzz/fuzz_targets/service_unit_policy.rs"),
+            "fuzz_linux_service_unit_policy",
+        ),
+        (
+            "provider-recursion-proof",
+            include_str!("../../../fuzz/fuzz_targets/provider_recursion_proof.rs"),
+            "cgroup_membership_is_sealed",
+        ),
+        (
+            "mount-context-manifest",
+            include_str!("../../../fuzz/fuzz_targets/mount_context_manifest.rs"),
+            "fuzz_linux_mount_context_manifest",
+        ),
+    ];
+
+    for (target, source, parser) in targets {
+        assert!(
+            manifest.contains(&format!("name = \"{target}\"")),
+            "fuzz manifest omitted {target}"
+        );
+        assert!(
+            suite.contains(&format!("\"{target}\"")),
+            "fuzz suite omitted {target}"
+        );
+        assert!(
+            source.contains(parser),
+            "{target} does not exercise {parser}"
         );
     }
 }
@@ -334,7 +419,7 @@ fn certification_uses_a_nonroot_frontend_with_the_provider_access_group() {
     assert!(identity.contains("OsString::from(\"--no-new-privs\")"));
     assert!(!runner.contains("OsString::from(\"--user\")"));
     assert!(!runner.contains("OsString::from(\"--group\")"));
-    assert!(runner.contains("report_dir.join(\"sealed-public-launch.json\")"));
+    assert!(runner.contains("report_dir.join(\".sealed-public-launch.json\")"));
     assert!(runner.contains("OsString::from(\"--sealed\")"));
     assert!(runner.contains("OsString::from(\"--report\")"));
     assert!(runner.contains("public_report.as_os_str().to_os_string()"));

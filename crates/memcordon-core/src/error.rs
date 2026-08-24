@@ -9,6 +9,11 @@ use crate::{BoundaryRequirement, CleanupSummary, RestartSafetyProof};
 pub enum BoundarySetupPhase {
     ProviderConnection,
     ProviderIdentity,
+    CallerEnvelopeCapture,
+    LauncherServiceAuthentication,
+    CallerMountNamespaceAdoption,
+    CallerCapabilityEnvelope,
+    CredentialTransitionPolicy,
     BoundaryCreation,
     GuardianStartup,
     TargetCreation,

@@ -67,6 +67,15 @@ pub struct RestartSafetyProof {
     pub errors: Vec<String>,
 }
 
+/// Records how a sealed backend treats credential transitions. This is native
+/// evidence and is not caller-selectable policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialTransitionDisposition {
+    #[default]
+    PreserveCallerEnvelope,
+}
+
 /// Native facts supporting a boundary claim. This is report evidence, not a
 /// caller-selectable mechanism.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -79,15 +88,18 @@ pub enum BoundaryMechanismEvidence {
         provider_mechanism: String,
         requested: BoundaryRequirement,
     },
-    LinuxPidNamespaceCgroupV1(LinuxSealedEvidence),
-    WindowsJobObjectV1(WindowsSealedEvidence),
+    LinuxPidNamespaceCgroupV2(LinuxSealedEvidenceV2),
+    WindowsJobObjectV2(WindowsSealedEvidenceV2),
     MacosEndpointSecurityV1(MacosSealedEvidence),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LinuxSealedEvidence {
+#[serde(deny_unknown_fields)]
+pub struct LinuxSealedEvidenceV2 {
     pub schema_version: u32,
     pub provider_identity: String,
+    pub control_service_identity: String,
+    pub launcher_service_identity: String,
     pub cgroup_identity_digest: String,
     pub cgroup_created: bool,
     pub cgroup_owned_by_provider: bool,
@@ -99,11 +111,17 @@ pub struct LinuxSealedEvidence {
     pub target_pidfd_verified: bool,
     pub target_cgroup_membership_verified: bool,
     pub target_pid_namespace_verified: bool,
-    pub target_credentials_verified: bool,
-    pub target_capabilities_empty: bool,
-    pub no_new_privs_verified: bool,
+    pub target_initial_credentials_verified: bool,
+    pub initial_provider_capabilities_absent: bool,
+    pub caller_no_new_privs_reproduced: bool,
+    pub caller_capability_bounding_set_reproduced: bool,
+    pub caller_mount_context_reproduced: bool,
+    pub credential_transition_disposition: CredentialTransitionDisposition,
+    pub boundary_independent_of_credentials: bool,
     pub inherited_descriptors_verified: bool,
-    pub writable_cgroup_view_denied: bool,
+    pub writable_ancestor_cgroup_denied: bool,
+    pub parent_namespace_handles_denied: bool,
+    pub recursive_provider_request_denied: bool,
     pub guardian_ready: bool,
     pub target_released: bool,
     pub cgroup_kill_invoked: bool,
@@ -114,12 +132,14 @@ pub struct LinuxSealedEvidence {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct WindowsSealedEvidence {
+#[serde(deny_unknown_fields)]
+pub struct WindowsSealedEvidenceV2 {
     pub schema_version: u32,
     pub service_identity: String,
     pub caller_token_authenticated: bool,
-    pub restricted_token_created: bool,
-    pub restricted_token_profile_verified: bool,
+    pub initial_target_token_matches_caller: bool,
+    pub credential_transition_disposition: CredentialTransitionDisposition,
+    pub job_membership_independent_of_token: bool,
     pub job_created: bool,
     pub job_limits_verified: bool,
     pub kill_on_close_verified: bool,
@@ -130,7 +150,6 @@ pub struct WindowsSealedEvidence {
     pub job_list_applied_at_creation: bool,
     pub handle_list_applied_at_creation: bool,
     pub target_job_membership_verified: bool,
-    pub target_token_verified: bool,
     pub target_still_suspended_during_verification: bool,
     pub inherited_handles_verified: bool,
     pub target_released: bool,
@@ -204,12 +223,18 @@ pub fn boundary_evidence_is_consistent(
                     launch.boundary_effective == BoundaryClass::Unavailable
                 }
         }
-        BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV1(native) => {
+        BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2(native) => {
             sealed_generic_evidence_is_consistent(launch, restart_safety)
-                && launch.mechanism == "linux-pid-namespace-cgroup-v1"
-                && native.schema_version == 1
-                && !native.provider_identity.is_empty()
-                && !native.cgroup_identity_digest.is_empty()
+                && launch.mechanism == "linux-pid-namespace-cgroup-v2"
+                && native.schema_version == 2
+                && native.provider_identity == "memcordon-sealed-agent-v2"
+                && native.control_service_identity == "memcordon-sealed-agent.service:v2"
+                && native.launcher_service_identity == "memcordon-sealed-launcher.service:v2"
+                && native.cgroup_identity_digest.len() == 64
+                && native
+                    .cgroup_identity_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
                 && native.cgroup_created
                 && native.cgroup_owned_by_provider
                 && native.memory_configuration_verified
@@ -220,11 +245,18 @@ pub fn boundary_evidence_is_consistent(
                 && native.target_pidfd_verified
                 && native.target_cgroup_membership_verified
                 && native.target_pid_namespace_verified
-                && native.target_credentials_verified
-                && native.target_capabilities_empty
-                && native.no_new_privs_verified
+                && native.target_initial_credentials_verified
+                && native.initial_provider_capabilities_absent
+                && native.caller_no_new_privs_reproduced
+                && native.caller_capability_bounding_set_reproduced
+                && native.caller_mount_context_reproduced
+                && native.credential_transition_disposition
+                    == CredentialTransitionDisposition::PreserveCallerEnvelope
+                && native.boundary_independent_of_credentials
                 && native.inherited_descriptors_verified
-                && native.writable_cgroup_view_denied
+                && native.writable_ancestor_cgroup_denied
+                && native.parent_namespace_handles_denied
+                && native.recursive_provider_request_denied
                 && native.guardian_ready
                 && native.target_released == launch.target_released
                 && native.cgroup_kill_invoked
@@ -233,14 +265,16 @@ pub fn boundary_evidence_is_consistent(
                 && native.guardian_reaped
                 && native.cgroup_removed
         }
-        BoundaryMechanismEvidence::WindowsJobObjectV1(native) => {
+        BoundaryMechanismEvidence::WindowsJobObjectV2(native) => {
             sealed_generic_evidence_is_consistent(launch, restart_safety)
-                && launch.mechanism == "windows-job-object-v1"
-                && native.schema_version == 1
+                && launch.mechanism == "windows-job-object-v2"
+                && native.schema_version == 2
                 && !native.service_identity.is_empty()
                 && native.caller_token_authenticated
-                && native.restricted_token_created
-                && native.restricted_token_profile_verified
+                && native.initial_target_token_matches_caller
+                && native.credential_transition_disposition
+                    == CredentialTransitionDisposition::PreserveCallerEnvelope
+                && native.job_membership_independent_of_token
                 && native.job_created
                 && native.job_limits_verified
                 && native.kill_on_close_verified
@@ -251,7 +285,6 @@ pub fn boundary_evidence_is_consistent(
                 && native.job_list_applied_at_creation
                 && native.handle_list_applied_at_creation
                 && native.target_job_membership_verified
-                && native.target_token_verified
                 && native.target_still_suspended_during_verification
                 && native.inherited_handles_verified
                 && native.target_released == launch.target_released
@@ -399,6 +432,15 @@ const fn boundary_setup_phase_name(value: crate::BoundarySetupPhase) -> &'static
     match value {
         crate::BoundarySetupPhase::ProviderConnection => "provider-connection",
         crate::BoundarySetupPhase::ProviderIdentity => "provider-identity",
+        crate::BoundarySetupPhase::CallerEnvelopeCapture => "caller-envelope-capture",
+        crate::BoundarySetupPhase::LauncherServiceAuthentication => {
+            "launcher-service-authentication"
+        }
+        crate::BoundarySetupPhase::CallerMountNamespaceAdoption => {
+            "caller-mount-namespace-adoption"
+        }
+        crate::BoundarySetupPhase::CallerCapabilityEnvelope => "caller-capability-envelope",
+        crate::BoundarySetupPhase::CredentialTransitionPolicy => "credential-transition-policy",
         crate::BoundarySetupPhase::BoundaryCreation => "boundary-creation",
         crate::BoundarySetupPhase::GuardianStartup => "guardian-startup",
         crate::BoundarySetupPhase::TargetCreation => "target-creation",

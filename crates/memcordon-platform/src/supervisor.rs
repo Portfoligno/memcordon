@@ -622,7 +622,7 @@ fn sealed_deadline_rejection_is_outside_attempt(
         && error.os_code == rejection.os_code
         && error.restart_safety.as_ref() == Some(&rejection.restart_safety)
         && failure.requested == BoundaryRequirement::Sealed
-        && failure.mechanism.as_deref() == Some("linux-pid-namespace-cgroup-v1")
+        && failure.mechanism.as_deref() == Some("linux-pid-namespace-cgroup-v2")
         && failure.phase == rejection.phase
         && failure.target_created == rejection.target_created
         && failure.target_released == rejection.target_released

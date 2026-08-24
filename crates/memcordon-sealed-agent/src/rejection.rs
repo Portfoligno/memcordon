@@ -9,6 +9,11 @@ const MAX_CLEANUP_ERROR_BYTES: usize = 1024;
 #[serde(rename_all = "kebab-case")]
 pub enum RejectionPhaseV1 {
     RequestValidation,
+    CallerEnvelopeCapture,
+    LauncherServiceAuthentication,
+    CallerMountNamespaceAdoption,
+    CallerCapabilityEnvelope,
+    CredentialTransitionPolicy,
     BoundaryCreation,
     GuardianStartup,
     TargetCreation,
@@ -205,7 +210,20 @@ fn valid_code(code: &str) -> bool {
 }
 
 fn phase_for_code(code: &str) -> RejectionPhaseV1 {
-    if code == "MCSEALED-FRONTEND-LOSS-BEFORE-AUTHORIZATION"
+    if code.contains("CALLER-ENVELOPE-CAPTURE") {
+        RejectionPhaseV1::CallerEnvelopeCapture
+    } else if code.contains("LAUNCHER-SERVICE-AUTHENTICATION")
+        || code.contains("LAUNCHER-CONNECTION")
+        || code.contains("LAUNCHER-AUTHORIZATION")
+    {
+        RejectionPhaseV1::LauncherServiceAuthentication
+    } else if code.contains("CALLER-MOUNT-NAMESPACE-ADOPTION") {
+        RejectionPhaseV1::CallerMountNamespaceAdoption
+    } else if code.contains("CALLER-CAPABILITY-ENVELOPE") {
+        RejectionPhaseV1::CallerCapabilityEnvelope
+    } else if code.contains("CREDENTIAL-TRANSITION-POLICY") {
+        RejectionPhaseV1::CredentialTransitionPolicy
+    } else if code == "MCSEALED-FRONTEND-LOSS-BEFORE-AUTHORIZATION"
         || code == "MCSEALED-GUARDIAN-LOSS-BEFORE-AUTHORIZATION"
     {
         RejectionPhaseV1::Authorization

@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 
 use sha2::{Digest, Sha256};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_LENGTH: usize = 1024 * 1024;
 const DIGEST_LENGTH: usize = 32;
 const HEADER_LENGTH: usize = 2 + 2 + 4 + 16 + 16 + DIGEST_LENGTH;
@@ -14,6 +14,8 @@ pub enum MessageKind {
     Launch = 2,
     Cancel = 3,
     Query = 4,
+    BrokerProbe = 5,
+    BrokerLaunch = 6,
     ProbeReceipt = 101,
     LaunchPrepared = 102,
     Authorized = 103,
@@ -31,6 +33,8 @@ impl TryFrom<u16> for MessageKind {
             2 => Ok(Self::Launch),
             3 => Ok(Self::Cancel),
             4 => Ok(Self::Query),
+            5 => Ok(Self::BrokerProbe),
+            6 => Ok(Self::BrokerLaunch),
             101 => Ok(Self::ProbeReceipt),
             102 => Ok(Self::LaunchPrepared),
             103 => Ok(Self::Authorized),

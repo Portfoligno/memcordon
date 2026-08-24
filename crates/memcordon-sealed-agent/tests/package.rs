@@ -3,59 +3,63 @@ fn semantic_lines(value: &str) -> Vec<&str> {
 }
 
 #[test]
-fn compiled_package_metadata_uses_fixed_root_service_identity() {
-    let service = include_str!("../../../packaging/linux/memcordon-sealed-agent.service");
-    let socket = include_str!("../../../packaging/linux/memcordon-sealed-agent.socket");
+fn compiled_package_metadata_uses_split_control_and_launcher_identities() {
+    let control_service = include_str!("../../../packaging/linux/memcordon-sealed-agent.service");
+    let control_socket = include_str!("../../../packaging/linux/memcordon-sealed-agent.socket");
+    let launcher_service =
+        include_str!("../../../packaging/linux/memcordon-sealed-launcher.service");
+    let launcher_socket = include_str!("../../../packaging/linux/memcordon-sealed-launcher.socket");
+    let tmpfiles = include_str!("../../../packaging/linux/memcordon.conf");
+
+    assert!(
+        semantic_lines(control_service)
+            .contains(&"ExecStart=/usr/libexec/memcordon-sealed-agent serve")
+    );
+    assert!(semantic_lines(control_service).contains(&"NoNewPrivileges=yes"));
+    assert!(
+        semantic_lines(control_service)
+            .contains(&"CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE")
+    );
+    assert!(!control_service.contains("Delegate=yes"));
+    assert!(!control_service.contains("CAP_SYS_ADMIN"));
+    assert!(!control_service.contains("CAP_SYS_CHROOT"));
+    assert!(!control_service.contains("CAP_SETUID"));
+    assert!(!control_service.contains("CAP_SETGID"));
+
+    assert!(
+        semantic_lines(launcher_service)
+            .contains(&"ExecStart=/usr/libexec/memcordon-sealed-agent launch-broker")
+    );
+    assert!(semantic_lines(launcher_service).contains(&"User=root"));
+    assert!(semantic_lines(launcher_service).contains(&"Group=root"));
+    assert!(semantic_lines(launcher_service).contains(&"Delegate=yes"));
+    assert!(semantic_lines(launcher_service).contains(&"NoNewPrivileges=no"));
+    assert!(!launcher_service.contains("CapabilityBoundingSet="));
+    assert!(!launcher_service.contains("PrivateTmp="));
+    assert!(!launcher_service.contains("ProtectSystem="));
+    assert!(!launcher_service.contains("RestrictSUIDSGID="));
+
+    assert!(control_socket.contains("ListenStream=/run/memcordon/sealed-agent.sock"));
+    assert!(control_socket.contains("SocketMode=0660"));
+    assert!(control_socket.contains("SocketGroup=memcordon"));
+    assert!(control_socket.contains("After=systemd-tmpfiles-setup.service"));
+    assert!(launcher_socket.contains("ListenStream=/run/memcordon/sealed-launcher.sock"));
+    assert!(launcher_socket.contains("After=systemd-tmpfiles-setup.service"));
+    assert!(launcher_socket.contains("DirectoryMode=0750"));
+    assert!(launcher_socket.contains("SocketMode=0600"));
+    assert!(launcher_socket.contains("SocketUser=root"));
+    assert!(launcher_socket.contains("SocketGroup=root"));
+    assert_eq!(tmpfiles, "d /run/memcordon 0750 root memcordon -\n");
+
     assert_eq!(
-        semantic_lines(service),
-        [
-            "[Unit]",
-            "Description=MemCordon sealed supervision provider",
-            "Requires=memcordon-sealed-agent.socket",
-            "After=local-fs.target",
-            "",
-            "[Service]",
-            "Type=simple",
-            "ExecStart=/usr/libexec/memcordon-sealed-agent serve",
-            "User=root",
-            "Group=memcordon",
-            "Delegate=yes",
-            "KillMode=process",
-            "RuntimeDirectory=memcordon",
-            "RuntimeDirectoryMode=0750",
-            "StateDirectory=memcordon/sealed",
-            "StateDirectoryMode=0700",
-            "NoNewPrivileges=yes",
-            "PrivateTmp=yes",
-            "ProtectSystem=strict",
-            "ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed /sys/fs/cgroup",
-            "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_KILL CAP_DAC_OVERRIDE CAP_SYS_PTRACE",
-            "AmbientCapabilities=",
-            "",
-            "[Install]",
-            "WantedBy=multi-user.target",
-        ]
+        control_service
+            .lines()
+            .filter(|line| line.starts_with("AmbientCapabilities="))
+            .collect::<Vec<_>>(),
+        ["AmbientCapabilities="]
     );
     assert_eq!(
-        semantic_lines(socket),
-        [
-            "[Unit]",
-            "Description=MemCordon sealed supervision provider socket",
-            "",
-            "[Socket]",
-            "ListenStream=/run/memcordon/sealed-agent.sock",
-            "DirectoryMode=0755",
-            "SocketMode=0660",
-            "SocketUser=root",
-            "SocketGroup=memcordon",
-            "RemoveOnStop=yes",
-            "",
-            "[Install]",
-            "WantedBy=sockets.target",
-        ]
-    );
-    assert_eq!(
-        service
+        launcher_service
             .lines()
             .filter(|line| line.starts_with("AmbientCapabilities="))
             .collect::<Vec<_>>(),

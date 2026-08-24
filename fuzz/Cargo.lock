@@ -664,6 +664,8 @@ dependencies = [
  "memcordon",
  "memcordon-ci",
  "memcordon-core",
+ "memcordon-platform",
+ "memcordon-sealed-agent",
  "serde_json",
 ]
 
@@ -678,6 +680,16 @@ dependencies = [
  "sha2",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "memcordon-sealed-agent"
+version = "0.5.1-dev"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

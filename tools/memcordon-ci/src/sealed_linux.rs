@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 
 use memcordon_ci::command::{CommandSpec, git};
 use memcordon_ci::scenario_diagnostic::{
@@ -22,9 +23,9 @@ use memcordon_ci::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(60 * 60);
-const MECHANISM: &str = "linux-pid-namespace-cgroup-v1";
+const MECHANISM: &str = "linux-pid-namespace-cgroup-v2";
 const PROVIDER_BINARY: &str = "target/ci/sealed-agent/debug/memcordon-sealed-agent";
-const REPORT_DIRECTORY: &str = "target/ci/reports/linux-sealed";
+const REPORT_DIRECTORY: &str = "target/ci/reports/linux-sealed-v2";
 const CONCURRENCY_EVIDENCE_PREFIX: &str = "MCSEALED-CONCURRENCY-EVIDENCE:";
 const MAXIMUM_CONCURRENCY_EVIDENCE_BYTES: usize = 32 * 1024;
 const FAULT_EVIDENCE_PREFIX: &str = "MCSEALED-FAULT-EVIDENCE:";
@@ -92,6 +93,41 @@ const SCENARIOS: &[Scenario] = &[
         test_binary: "linux_sealed",
         name: "sealed_setsid_daemon_remains_contained",
         class: "escape",
+    },
+    Scenario {
+        test_binary: "linux_sealed",
+        name: "sealed_setid_transition_preserves_boundary",
+        class: "setid-transition",
+    },
+    Scenario {
+        test_binary: "linux_sealed",
+        name: "sealed_sudo_transition_preserves_boundary",
+        class: "sudo-transition",
+    },
+    Scenario {
+        test_binary: "linux_sealed",
+        name: "sealed_file_capability_transition_preserves_boundary",
+        class: "file-capability-transition",
+    },
+    Scenario {
+        test_binary: "linux_sealed",
+        name: "sealed_caller_no_new_privs_is_reproduced",
+        class: "caller-envelope",
+    },
+    Scenario {
+        test_binary: "linux_sealed",
+        name: "sealed_caller_capability_bounding_set_is_reproduced",
+        class: "caller-envelope",
+    },
+    Scenario {
+        test_binary: "linux_sealed",
+        name: "sealed_caller_mount_context_is_reproduced",
+        class: "mount-context",
+    },
+    Scenario {
+        test_binary: "linux_sealed",
+        name: "sealed_recursive_provider_request_is_rejected",
+        class: "recursive-provider",
     },
     Scenario {
         test_binary: "linux_sealed",
@@ -256,6 +292,8 @@ struct QualificationReceipt {
     schema_version: u32,
     mechanism: String,
     provider_identity: String,
+    control_service_identity: String,
+    launcher_service_identity: String,
     receipt_digest: String,
     unified_cgroup_v2: bool,
     private_cgroup_subtree: bool,
@@ -277,14 +315,33 @@ struct QualificationReceipt {
     helpers_reaped: bool,
     boundary_retired: bool,
     recovery_complete: bool,
+    split_control_and_launcher_services: bool,
+    launcher_no_new_privs_disabled: bool,
+    caller_mount_namespace_reproduction_verified: bool,
+    caller_no_new_privs_reproduction_verified: bool,
+    caller_capability_bounding_set_reproduction_verified: bool,
+    initial_provider_capabilities_absent: bool,
+    credential_transition_disposition: String,
+    setid_transition_certification_digest: String,
+    sudo_transition_certification_digest: String,
+    post_transition_cgroup_membership_verified: bool,
+    post_transition_pid_namespace_verified: bool,
+    post_transition_cleanup_verified: bool,
+    recursive_provider_request_rejected: bool,
 }
 
 impl QualificationReceipt {
     fn validate(&self) -> Result<()> {
-        let complete = self.schema_version == 1
+        let complete = self.schema_version == 2
             && self.mechanism == MECHANISM
-            && !self.provider_identity.is_empty()
-            && !self.receipt_digest.is_empty()
+            && self.provider_identity == "memcordon-sealed-agent-v2"
+            && self.control_service_identity == "memcordon-sealed-agent.service:v2"
+            && self.launcher_service_identity == "memcordon-sealed-launcher.service:v2"
+            && self.receipt_digest.len() == 64
+            && self
+                .receipt_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
             && self.unified_cgroup_v2
             && self.private_cgroup_subtree
             && self.clone3
@@ -304,7 +361,28 @@ impl QualificationReceipt {
             && self.workload_empty
             && self.helpers_reaped
             && self.boundary_retired
-            && self.recovery_complete;
+            && self.recovery_complete
+            && self.split_control_and_launcher_services
+            && self.launcher_no_new_privs_disabled
+            && self.caller_mount_namespace_reproduction_verified
+            && self.caller_no_new_privs_reproduction_verified
+            && self.caller_capability_bounding_set_reproduction_verified
+            && self.initial_provider_capabilities_absent
+            && self.credential_transition_disposition == "preserve-caller-envelope"
+            && self.setid_transition_certification_digest.len() == 64
+            && self
+                .setid_transition_certification_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && self.sudo_transition_certification_digest.len() == 64
+            && self
+                .sudo_transition_certification_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && self.post_transition_cgroup_membership_verified
+            && self.post_transition_pid_namespace_verified
+            && self.post_transition_cleanup_verified
+            && self.recursive_provider_request_rejected;
         if complete {
             Ok(())
         } else {
@@ -323,13 +401,17 @@ struct ScenarioResult {
 }
 
 #[derive(Serialize)]
-struct ScenarioReport {
+struct CleanupLeakCheckReport {
     schema_version: u32,
     mechanism: &'static str,
     commit: String,
+    result: &'static str,
     tests_run: u32,
     tests_skipped: u32,
     scenarios: Vec<ScenarioResult>,
+    recovery_tests: Vec<&'static str>,
+    concurrency: Value,
+    public_launch: Value,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1030,9 +1112,9 @@ fn write_concurrency_evidence(output: &[u8], report_dir: &Path, commit: &str) ->
     let evidence = parse_concurrency_evidence(output)?;
     validate_concurrency_evidence(&evidence)?;
     write_json(
-        &report_dir.join("sealed-concurrency-report.json"),
+        &report_dir.join(".sealed-concurrency-report.json"),
         &ConcurrencyReport {
-            schema_version: evidence.schema_version,
+            schema_version: 2,
             mechanism: MECHANISM,
             commit,
             overlap: evidence.overlap,
@@ -1269,8 +1351,8 @@ fn validate_doctor(
             "doctor did not select the qualified Linux sealed mechanism".to_owned(),
         ));
     }
-    write_json(&report_dir.join("platform-environment.json"), &value)?;
-    let public_report = report_dir.join("sealed-public-launch.json");
+    write_json(&report_dir.join(".platform-environment.json"), &value)?;
+    let public_report = report_dir.join(".sealed-public-launch.json");
     let launch = authorized_nonroot_memcordon(
         root,
         &identity,
@@ -1360,11 +1442,25 @@ fn validate_public_execution_report(
                     .is_safe_for(memcordon_core::BoundaryRequirement::Sealed)
                 && matches!(
                     &attempt.boundary_detail,
-                    memcordon_core::BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV1(native)
-                        if native.provider_identity == provider_identity
-                            && native.target_credentials_verified
-                            && native.target_capabilities_empty
+                    memcordon_core::BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2(native)
+                        if native.schema_version == 2
+                            && native.provider_identity == provider_identity
+                            && native.control_service_identity
+                                == "memcordon-sealed-agent.service:v2"
+                            && native.launcher_service_identity
+                                == "memcordon-sealed-launcher.service:v2"
+                            && native.target_initial_credentials_verified
+                            && native.initial_provider_capabilities_absent
+                            && native.caller_no_new_privs_reproduced
+                            && native.caller_capability_bounding_set_reproduced
+                            && native.caller_mount_context_reproduced
+                            && native.credential_transition_disposition
+                                == memcordon_core::CredentialTransitionDisposition::PreserveCallerEnvelope
+                            && native.boundary_independent_of_credentials
                             && native.inherited_descriptors_verified
+                            && native.writable_ancestor_cgroup_denied
+                            && native.parent_namespace_handles_denied
+                            && native.recursive_provider_request_denied
                             && native.cgroup_empty_verified
                             && native.namespace_init_reaped
                             && native.guardian_reaped
@@ -1375,7 +1471,7 @@ fn validate_public_execution_report(
         Ok(())
     } else {
         Err(CiError::Message(
-            "public sealed execution report is incomplete or contradictory".to_owned(),
+            "public sealed v2 execution report is incomplete or contradictory".to_owned(),
         ))
     }
 }
@@ -1489,6 +1585,19 @@ fn boundary_phase_name(phase: memcordon_core::BoundarySetupPhase) -> &'static st
     match phase {
         memcordon_core::BoundarySetupPhase::ProviderConnection => "provider-connection",
         memcordon_core::BoundarySetupPhase::ProviderIdentity => "provider-identity",
+        memcordon_core::BoundarySetupPhase::CallerEnvelopeCapture => "caller-envelope-capture",
+        memcordon_core::BoundarySetupPhase::LauncherServiceAuthentication => {
+            "launcher-service-authentication"
+        }
+        memcordon_core::BoundarySetupPhase::CallerMountNamespaceAdoption => {
+            "caller-mount-namespace-adoption"
+        }
+        memcordon_core::BoundarySetupPhase::CallerCapabilityEnvelope => {
+            "caller-capability-envelope"
+        }
+        memcordon_core::BoundarySetupPhase::CredentialTransitionPolicy => {
+            "credential-transition-policy"
+        }
         memcordon_core::BoundarySetupPhase::BoundaryCreation => "boundary-creation",
         memcordon_core::BoundarySetupPhase::GuardianStartup => "guardian-startup",
         memcordon_core::BoundarySetupPhase::TargetCreation => "target-creation",
@@ -1500,7 +1609,7 @@ fn boundary_phase_name(phase: memcordon_core::BoundarySetupPhase) -> &'static st
     }
 }
 
-fn validate_service_privilege_readback(root: &Path, report_dir: &Path) -> Result<()> {
+fn service_properties(root: &Path, unit: &str) -> Result<BTreeMap<String, String>> {
     const MAX_READBACK_BYTES: usize = 16 * 1024;
     let output = CommandSpec::new("/usr/bin/systemctl", root, Duration::from_secs(30))
         .args([
@@ -1511,7 +1620,10 @@ fn validate_service_privilege_readback(root: &Path, report_dir: &Path) -> Result
             "--property=NoNewPrivileges",
             "--property=CapabilityBoundingSet",
             "--property=AmbientCapabilities",
-            "memcordon-sealed-agent.service",
+            "--property=PrivateTmp",
+            "--property=ProtectSystem",
+            "--property=RestrictSUIDSGID",
+            unit,
         ])
         .run()?;
     if output.len() > MAX_READBACK_BYTES {
@@ -1525,46 +1637,90 @@ fn validate_service_privilege_readback(root: &Path, report_dir: &Path) -> Result
         .filter_map(|line| line.split_once('='))
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect::<BTreeMap<_, _>>();
-    write_json(
-        &report_dir.join("provider-service-privileges.json"),
-        &serde_json::json!({
-            "schema_version": 1,
-            "properties": properties,
-        }),
-    )?;
-    let expected = [
-        "cap_dac_override",
-        "cap_kill",
-        "cap_setgid",
-        "cap_setuid",
-        "cap_sys_admin",
-        "cap_sys_chroot",
-        "cap_sys_ptrace",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    let observed = properties
+    if properties.len() != 8 {
+        return Err(CiError::Message(format!(
+            "provider service privilege readback for {unit} omitted properties"
+        )));
+    }
+    Ok(properties)
+}
+
+fn capability_set(properties: &BTreeMap<String, String>) -> BTreeSet<String> {
+    properties
         .get("CapabilityBoundingSet")
         .map(|value| {
             value
                 .split_ascii_whitespace()
                 .map(str::to_ascii_lowercase)
-                .collect::<BTreeSet<_>>()
+                .collect()
         })
-        .unwrap_or_default();
-    if properties.get("User").map(String::as_str) != Some("root")
-        || properties.get("Group").map(String::as_str) != Some("memcordon")
-        || properties.get("NoNewPrivileges").map(String::as_str) != Some("yes")
-        || properties
+        .unwrap_or_default()
+}
+
+fn validate_service_privilege_readback(root: &Path, report_dir: &Path) -> Result<()> {
+    let control = service_properties(root, "memcordon-sealed-agent.service")?;
+    let launcher = service_properties(root, "memcordon-sealed-launcher.service")?;
+    let expected = ["cap_dac_override", "cap_sys_ptrace"]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let control_capabilities = capability_set(&control);
+    let launcher_capabilities = capability_set(&launcher);
+    if control.get("User").map(String::as_str) != Some("root")
+        || control.get("Group").map(String::as_str) != Some("memcordon")
+        || control.get("NoNewPrivileges").map(String::as_str) != Some("yes")
+        || control.get("PrivateTmp").map(String::as_str) != Some("yes")
+        || control.get("ProtectSystem").map(String::as_str) != Some("strict")
+        || control
             .get("AmbientCapabilities")
             .is_none_or(|value| !value.is_empty())
-        || observed.iter().map(String::as_str).collect::<BTreeSet<_>>() != expected
+        || control_capabilities
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            != expected
+        || control
+            .get("CapabilityBoundingSet")
+            .map(|value| value.split_ascii_whitespace().count())
+            != Some(control_capabilities.len())
+        || launcher.get("User").map(String::as_str) != Some("root")
+        || launcher.get("Group").map(String::as_str) != Some("root")
+        || launcher.get("NoNewPrivileges").map(String::as_str) != Some("no")
+        || launcher.get("PrivateTmp").map(String::as_str) != Some("no")
+        || launcher.get("ProtectSystem").map(String::as_str) != Some("no")
+        || launcher.get("RestrictSUIDSGID").map(String::as_str) != Some("no")
+        || launcher
+            .get("AmbientCapabilities")
+            .is_none_or(|value| !value.is_empty())
+        || launcher_capabilities.is_empty()
+        || launcher
+            .get("CapabilityBoundingSet")
+            .map(|value| value.split_ascii_whitespace().count())
+            != Some(launcher_capabilities.len())
+        || !control_capabilities.is_subset(&launcher_capabilities)
     {
         return Err(CiError::Message(
-            "provider service privilege readback disagrees with the reviewed unit".to_owned(),
+            "control/launcher service privilege readback disagrees with the reviewed units"
+                .to_owned(),
         ));
     }
-    Ok(())
+    write_json(
+        &report_dir.join("provider-package-verification.json"),
+        &serde_json::json!({
+            "schema_version": 2,
+            "mechanism": MECHANISM,
+            "result": "passed",
+            "package_verified": true,
+            "artifacts": [
+                "memcordon-sealed-agent.service",
+                "memcordon-sealed-agent.socket",
+                "memcordon-sealed-launcher.service",
+                "memcordon-sealed-launcher.socket",
+                "memcordon.conf"
+            ],
+            "control": control,
+            "launcher": launcher,
+        }),
+    )
 }
 
 fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str) -> Result<()> {
@@ -1573,7 +1729,7 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
         memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
         memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
         memcordon_core::CLEAN_REPORT_SCHEMA_VERSION,
-    ) != (7, 6, 4, 2)
+    ) != (8, 7, 5, 2)
     {
         return Err(CiError::Message(
             "Linux sealed certification has not been updated for the report schemas".to_owned(),
@@ -1614,17 +1770,8 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
         authorized_nonroot(root, &identity, &root.join(PROVIDER_BINARY), ["probe"])?;
     let receipt: QualificationReceipt = serde_json::from_slice(&qualification_output)?;
     receipt.validate()?;
-    write_json(&report_dir.join("qualification-receipt.json"), &receipt)?;
-    write_json(
-        &report_dir.join("provider-identity.json"),
-        &serde_json::json!({
-            "schema_version": 1,
-            "mechanism": MECHANISM,
-            "provider_identity": receipt.provider_identity,
-            "receipt_digest": receipt.receipt_digest,
-        }),
-    )?;
-    let _doctor = validate_doctor(root, stable, &receipt, report_dir)?;
+    write_json(&report_dir.join("provider-qualification-v2.json"), &receipt)?;
+    let doctor = validate_doctor(root, stable, &receipt, report_dir)?;
 
     let mut progress = SCENARIOS
         .iter()
@@ -1679,23 +1826,87 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
             result: "passed",
         });
     }
-    if !report_dir.join("sealed-concurrency-report.json").is_file() {
+    let concurrency_path = report_dir.join(".sealed-concurrency-report.json");
+    if !concurrency_path.is_file() {
         return Err(CiError::Message(
             "Linux sealed certification omitted durable concurrency evidence".to_owned(),
         ));
     }
-    let report = ScenarioReport {
-        schema_version: 1,
-        mechanism: MECHANISM,
-        commit: commit.to_owned(),
-        tests_run: u32::try_from(results.len())
-            .map_err(|_| CiError::Message("too many sealed scenarios".to_owned()))?,
-        tests_skipped: 0,
-        scenarios: results,
+    let concurrency: Value = serde_json::from_slice(&fs::read(&concurrency_path)?)?;
+    let public_path = report_dir.join(".sealed-public-launch.json");
+    let public_launch: Value = serde_json::from_slice(&fs::read(&public_path)?)?;
+    let fixture_bytes =
+        fs::read(root.join("target/ci/sealed-agent/debug/memcordon-sealed-test-fixture"))?;
+    let fixture_digest = Sha256::digest(fixture_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let tests_run = u32::try_from(results.len())
+        .map_err(|_| CiError::Message("too many sealed scenarios".to_owned()))?;
+    let transition_report = |file: &str, scenario: &str, digest: Option<&str>| {
+        write_json(
+            &report_dir.join(file),
+            &serde_json::json!({
+                "schema_version": 2,
+                "mechanism": MECHANISM,
+                "commit": commit,
+                "result": "passed",
+                "scenario": scenario,
+                "provider_identity": receipt.provider_identity,
+                "qualification_digest": receipt.receipt_digest,
+                "certification_digest": digest,
+                "fixture_digest": fixture_digest,
+                "post_transition_cgroup_membership_verified": receipt.post_transition_cgroup_membership_verified,
+                "post_transition_pid_namespace_verified": receipt.post_transition_pid_namespace_verified,
+                "post_transition_cleanup_verified": receipt.post_transition_cleanup_verified,
+            }),
+        )
     };
-    write_json(&report_dir.join("sealed-scenario-report.json"), &report)?;
+    transition_report(
+        "setid-transition.json",
+        "sealed_setid_transition_preserves_boundary",
+        Some(&receipt.setid_transition_certification_digest),
+    )?;
+    transition_report(
+        "sudo-transition.json",
+        "sealed_sudo_transition_preserves_boundary",
+        Some(&receipt.sudo_transition_certification_digest),
+    )?;
+    transition_report(
+        "file-capability-transition.json",
+        "sealed_file_capability_transition_preserves_boundary",
+        None,
+    )?;
     write_json(
-        &report_dir.join("fault-injection-report.json"),
+        &report_dir.join("caller-envelope.json"),
+        &serde_json::json!({
+            "schema_version": 2,
+            "mechanism": MECHANISM,
+            "commit": commit,
+            "result": "passed",
+            "credential_transition_disposition": receipt.credential_transition_disposition,
+            "tests": [
+                "sealed_caller_no_new_privs_is_reproduced",
+                "sealed_caller_capability_bounding_set_is_reproduced",
+                "sealed_recursive_provider_request_is_rejected"
+            ],
+            "doctor": doctor,
+            "public_launch": public_launch,
+        }),
+    )?;
+    write_json(
+        &report_dir.join("mount-context.json"),
+        &serde_json::json!({
+            "schema_version": 2,
+            "mechanism": MECHANISM,
+            "commit": commit,
+            "result": "passed",
+            "scenario": "sealed_caller_mount_context_is_reproduced",
+            "caller_mount_namespace_reproduction_verified": receipt.caller_mount_namespace_reproduction_verified,
+        }),
+    )?;
+    write_json(
+        &report_dir.join("fault-injection.json"),
         &FaultInjectionReport {
             schema_version: 2,
             mechanism: MECHANISM,
@@ -1705,12 +1916,27 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
         },
     )?;
     write_json(
-        &report_dir.join("cleanup-recovery-report.json"),
-        &serde_json::json!({
-            "schema_version": 1, "mechanism": MECHANISM, "result": "passed",
-            "tests": SCENARIOS.iter().filter(|scenario| scenario.class == "recovery").map(|scenario| scenario.name).collect::<Vec<_>>()
-        }),
+        &report_dir.join("cleanup-leak-check.json"),
+        &CleanupLeakCheckReport {
+            schema_version: 2,
+            mechanism: MECHANISM,
+            commit: commit.to_owned(),
+            result: "passed",
+            tests_run,
+            tests_skipped: 0,
+            scenarios: results,
+            recovery_tests: SCENARIOS
+                .iter()
+                .filter(|scenario| scenario.class == "recovery")
+                .map(|scenario| scenario.name)
+                .collect(),
+            concurrency,
+            public_launch,
+        },
     )?;
+    fs::remove_file(concurrency_path)?;
+    fs::remove_file(report_dir.join(".platform-environment.json"))?;
+    fs::remove_file(public_path)?;
     fs::remove_file(report_dir.join("sealed-scenario-progress.json"))?;
     Ok(())
 }
@@ -1750,7 +1976,7 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
         .err()
         .map(|_| collect_provider_service_diagnostics(root));
     let (public_execution_report, public_execution_report_error) = if result.is_err() {
-        collect_public_execution_report(&report_dir.join("sealed-public-launch.json"))
+        collect_public_execution_report(&report_dir.join(".sealed-public-launch.json"))
     } else {
         (None, None)
     };

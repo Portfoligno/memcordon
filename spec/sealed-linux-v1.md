@@ -1,6 +1,8 @@
 # Linux sealed mechanism v1
 
-`linux-pid-namespace-cgroup-v1` is available only through the installed root-owned MemCordon provider. The public caller cannot select its socket, cgroup, namespaces, identities, guardian, or recovery state.
+> Historical specification. Current production clients and release policy reject this mechanism; see [Linux sealed mechanism v2](sealed-linux-v2.md).
+
+`linux-pid-namespace-cgroup-v1` was available only through the installed root-owned MemCordon provider. The public caller could not select its socket, cgroup, namespaces, identities, guardian, or recovery state.
 
 ## Capability qualification
 

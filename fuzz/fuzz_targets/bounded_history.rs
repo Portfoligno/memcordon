@@ -46,9 +46,18 @@ fuzz_target!(|count: u16| {
     }
     assert!(history.retained() <= memcordon_core::DETAILED_ATTEMPT_CAPACITY);
     assert_eq!(history.total, u64::from(count));
-    assert_eq!(history.omitted, history.total.saturating_sub(history.retained() as u64));
+    assert_eq!(
+        history.omitted,
+        history.total.saturating_sub(history.retained() as u64)
+    );
     if count > 0 {
-        assert_eq!(history.records().next().map(|record| record.number), Some(1));
-        assert_eq!(history.records().last().map(|record| record.number), Some(u64::from(count)));
+        assert_eq!(
+            history.records().next().map(|record| record.number),
+            Some(1)
+        );
+        assert_eq!(
+            history.records().last().map(|record| record.number),
+            Some(u64::from(count))
+        );
     }
 });
