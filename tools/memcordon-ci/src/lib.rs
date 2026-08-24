@@ -5,6 +5,7 @@ pub mod command;
 pub mod config;
 pub mod line_evidence;
 pub mod policy;
+pub mod release_archive;
 pub mod release_evidence;
 pub mod scenario_diagnostic;
 pub mod sealed_identity;

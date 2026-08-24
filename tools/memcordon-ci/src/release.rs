@@ -17,6 +17,7 @@ use tempfile::TempDir;
 use walkdir::WalkDir;
 
 use memcordon_ci::capability;
+use memcordon_ci::release_archive::{NATIVE_ARCHIVE_STATIC_PATHS, validate_markdown_documents};
 use memcordon_ci::release_evidence::{CertificationRecord, collect_certification};
 
 use crate::command::{CommandSpec, git, rustup_cargo};
@@ -614,114 +615,6 @@ fn normalized_member_path(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn markdown_anchor(text: &str) -> String {
-    let mut anchor = String::new();
-    for character in text.trim().chars() {
-        if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
-            anchor.push(character.to_ascii_lowercase());
-        } else if character.is_whitespace() {
-            anchor.push('-');
-        }
-    }
-    anchor
-}
-
-fn markdown_anchors(markdown: &str) -> BTreeSet<String> {
-    markdown
-        .lines()
-        .filter_map(|line| {
-            let heading = line.trim_start().strip_prefix('#')?;
-            let heading = heading.trim_start_matches('#').trim();
-            (!heading.is_empty()).then(|| markdown_anchor(heading))
-        })
-        .collect()
-}
-
-fn markdown_links(markdown: &str) -> Vec<&str> {
-    let mut links = Vec::new();
-    let mut remaining = markdown;
-    while let Some(start) = remaining.find("](") {
-        remaining = &remaining[start + 2..];
-        let Some(end) = remaining.find(')') else {
-            break;
-        };
-        let destination = remaining[..end]
-            .split_ascii_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches(['<', '>']);
-        if !destination.is_empty() {
-            links.push(destination);
-        }
-        remaining = &remaining[end + 1..];
-    }
-    links
-}
-
-fn resolve_document_link<'a>(
-    source: &Path,
-    destination: &'a str,
-) -> Result<(PathBuf, Option<&'a str>)> {
-    let (path, anchor) = destination
-        .split_once('#')
-        .map_or((destination, None), |(path, anchor)| (path, Some(anchor)));
-    let mut resolved = if path.is_empty() {
-        source.to_path_buf()
-    } else {
-        source
-            .parent()
-            .unwrap_or_else(|| Path::new(""))
-            .to_path_buf()
-    };
-    if !path.is_empty() {
-        for component in Path::new(path).components() {
-            match component {
-                Component::Normal(value) => resolved.push(value),
-                Component::ParentDir => {
-                    if !resolved.pop() {
-                        return Err(failure("Markdown link escapes its package or archive"));
-                    }
-                }
-                Component::CurDir => {}
-                _ => return Err(failure("Markdown link is not a normal relative path")),
-            }
-        }
-    }
-    Ok((resolved, anchor))
-}
-
-fn validate_markdown_documents(documents: &BTreeMap<PathBuf, Vec<u8>>) -> Result<()> {
-    for (source, bytes) in documents {
-        if source.extension() != Some(OsStr::new("md")) {
-            continue;
-        }
-        let markdown = std::str::from_utf8(bytes)
-            .map_err(|_| failure(format!("Markdown document is not UTF-8: {source:?}")))?;
-        for destination in markdown_links(markdown) {
-            if destination.contains("://") || destination.starts_with("mailto:") {
-                continue;
-            }
-            let (target, anchor) = resolve_document_link(source, destination)?;
-            let target_bytes = documents.get(&target).ok_or_else(|| {
-                failure(format!(
-                    "Markdown link target is absent from package or archive: {source:?} -> {target:?}"
-                ))
-            })?;
-            if let Some(anchor) = anchor.filter(|anchor| !anchor.is_empty()) {
-                let target_markdown = std::str::from_utf8(target_bytes).map_err(|_| {
-                    failure(format!("Markdown anchor target is not UTF-8: {target:?}"))
-                })?;
-                if !markdown_anchors(target_markdown).contains(anchor) {
-                    return Err(failure(format!(
-                        "Markdown anchor is absent: {source:?} -> {target:?}#{anchor}"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_crate_readme(path: &Path, package: &str) -> Result<()> {
     let decoder = GzDecoder::new(File::open(path)?);
     let mut archive = tar::Archive::new(decoder);
@@ -1099,31 +992,11 @@ fn build_archive(root: &Path, identity: &ReleaseIdentity, target: &AssetTarget) 
         "memcordon-v{}-{}",
         identity.version, target.rust_target
     ));
-    let mut entries = vec![
-        (executable, PathBuf::from(&target.executable), 0o755),
-        (root.join("README.md"), PathBuf::from("README.md"), 0o644),
-        (root.join("LICENSE"), PathBuf::from("LICENSE"), 0o644),
-        (
-            root.join("CHANGELOG.md"),
-            PathBuf::from("CHANGELOG.md"),
-            0o644,
-        ),
-        (
-            root.join("docs/reference.md"),
-            PathBuf::from("docs/reference.md"),
-            0o644,
-        ),
-        (
-            root.join("docs/assets/banner.png"),
-            PathBuf::from("docs/assets/banner.png"),
-            0o644,
-        ),
-        (
-            root.join("docs/assets/key-guarantees.png"),
-            PathBuf::from("docs/assets/key-guarantees.png"),
-            0o644,
-        ),
-    ];
+    let mut entries = vec![(executable, PathBuf::from(&target.executable), 0o755)];
+    entries.extend(NATIVE_ARCHIVE_STATIC_PATHS.iter().map(|relative| {
+        let relative = PathBuf::from(*relative);
+        (root.join(&relative), relative, 0o644)
+    }));
     entries.sort_by_key(|entry| top.join(&entry.1));
     if target.archive == "zip" {
         let file = File::create(&path)?;
@@ -1216,15 +1089,12 @@ fn inspect_extract_and_smoke(
         }
     }
     let top = PathBuf::from(format!("memcordon-v{version}-{}", target.rust_target));
-    let expected = BTreeSet::from([
-        top.join(&target.executable),
-        top.join("README.md"),
-        top.join("LICENSE"),
-        top.join("CHANGELOG.md"),
-        top.join("docs/reference.md"),
-        top.join("docs/assets/banner.png"),
-        top.join("docs/assets/key-guarantees.png"),
-    ]);
+    let mut expected = BTreeSet::from([top.join(&target.executable)]);
+    expected.extend(
+        NATIVE_ARCHIVE_STATIC_PATHS
+            .iter()
+            .map(|relative| top.join(*relative)),
+    );
     if extracted_files != expected {
         return Err(failure(format!(
             "release archive member set differs: expected={expected:?} actual={extracted_files:?}"
@@ -3175,41 +3045,6 @@ mod tests {
             missing_readme.to_string(),
             "package README source is missing: \"../../docs/package-readme.md\""
         );
-    }
-
-    #[test]
-    fn markdown_validation_accepts_packaged_relative_targets_and_anchors() {
-        let documents = BTreeMap::from([
-            (
-                PathBuf::from("README.md"),
-                b"# Package\n\n[Top](#package)\n[Details](docs/reference.md#exact-contract)\n"
-                    .to_vec(),
-            ),
-            (
-                PathBuf::from("docs/reference.md"),
-                b"# Reference\n\n## Exact contract\n".to_vec(),
-            ),
-        ]);
-        validate_markdown_documents(&documents)
-            .expect("packaged relative target and anchor should validate");
-    }
-
-    #[test]
-    fn markdown_validation_rejects_missing_packaged_target_or_anchor() {
-        let missing_target = BTreeMap::from([(
-            PathBuf::from("README.md"),
-            b"# Package\n\n[Missing](docs/missing.md)\n".to_vec(),
-        )]);
-        assert!(validate_markdown_documents(&missing_target).is_err());
-
-        let missing_anchor = BTreeMap::from([
-            (
-                PathBuf::from("README.md"),
-                b"# Package\n\n[Missing](reference.md#missing)\n".to_vec(),
-            ),
-            (PathBuf::from("reference.md"), b"# Reference\n".to_vec()),
-        ]);
-        assert!(validate_markdown_documents(&missing_anchor).is_err());
     }
 
     enum MockResponse {
