@@ -4,6 +4,8 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+## [0.5.0-rc.4] - 2026-08-24
+
 ### Added
 
 - Added `--sealed` and the `BoundaryRequirement::Sealed` Rust API for certified
