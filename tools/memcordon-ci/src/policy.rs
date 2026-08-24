@@ -1787,6 +1787,7 @@ fn is_reviewed_raw_fork_boundary(relative: &Path) -> bool {
     matches!(
         relative,
         path if path == Path::new("crates/memcordon-sealed-agent/src/linux/launch.rs")
+            || path == Path::new("crates/memcordon-sealed-agent/src/linux/launcher.rs")
             || path == Path::new("crates/memcordon-sealed-agent/src/linux/namespace.rs")
             || path == Path::new("crates/memcordon-sealed-agent/src/linux/service.rs")
             || path

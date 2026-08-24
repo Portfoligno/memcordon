@@ -33,6 +33,8 @@ fn pre_exec_and_raw_fork_are_confined_to_exact_reviewed_boundaries() {
     );
     for reviewed in [
         "crates/memcordon-sealed-agent/src/linux/launch.rs",
+        "crates/memcordon-sealed-agent/src/linux/launcher.rs",
+        "crates/memcordon-sealed-agent/src/linux/namespace.rs",
         "crates/memcordon-sealed-agent/src/linux/service.rs",
         "crates/memcordon-sealed-agent/src/bin/memcordon-sealed-test-fixture.rs",
         "crates/memcordon-sealed-agent/tests/linux_faults.rs",
