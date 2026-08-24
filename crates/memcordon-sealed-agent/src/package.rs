@@ -273,7 +273,7 @@ fn service_group_gid() -> Result<libc::gid_t, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_provider_ready() -> Result<(), String> {
+pub fn probe_provider() -> Result<crate::linux::qualification::QualificationReceipt, String> {
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
@@ -322,6 +322,12 @@ fn wait_provider_ready() -> Result<(), String> {
     {
         return Err(readiness_error("incomplete qualification"));
     }
+    Ok(qualification)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_provider_ready() -> Result<(), String> {
+    let _qualification = probe_provider()?;
     if live_attempt_exists()? {
         return Err(readiness_error("provider is not idle"));
     }

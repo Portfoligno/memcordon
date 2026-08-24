@@ -150,7 +150,7 @@ fn sealed_package_upgrade_recovers_before_advertising() {
         .status()
         .unwrap();
     assert!(socket.success());
-    let qualification = Command::new(AGENT).arg("qualify").output().unwrap();
+    let qualification = Command::new(AGENT).arg("probe").output().unwrap();
     assert!(qualification.status.success());
     let receipt: serde_json::Value = serde_json::from_slice(&qualification.stdout).unwrap();
     assert_eq!(receipt["boundary_retired"], true);
@@ -160,15 +160,26 @@ fn sealed_package_upgrade_recovers_before_advertising() {
         .selected_for(memcordon_core::BoundaryRequirement::Sealed)
         .cloned()
         .expect("installed provider must resolve");
+    let backend_capabilities =
+        memcordon_platform::capabilities_for(&backend, memcordon_core::BoundaryRequirement::Sealed);
+    let active_qualification = backend_capabilities
+        .boundary_qualification
+        .as_ref()
+        .expect("installed provider must expose its active qualification");
+    assert_eq!(
+        receipt["provider_identity"],
+        active_qualification.provider_identity
+    );
+    assert_eq!(
+        receipt["receipt_digest"],
+        active_qualification.receipt_digest
+    );
     let execution = memcordon_platform::supervise(memcordon_platform::SupervisorRequest {
         policy,
         restart: memcordon_core::RestartPolicy::Never,
         command: memcordon_core::CommandSpec::new("/usr/bin/true"),
         memcordon_executable: None,
-        resolved_backend: Some(memcordon_platform::capabilities_for(
-            &backend,
-            memcordon_core::BoundaryRequirement::Sealed,
-        )),
+        resolved_backend: Some(backend_capabilities),
     })
     .expect("installed socket-activated provider must supervise end to end");
     assert_successful_public_execution(&execution);
@@ -183,6 +194,10 @@ fn sealed_package_upgrade_recovers_before_advertising() {
         &attempt.boundary_detail,
         memcordon_core::BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV1(evidence)
             if evidence.schema_version == 1
+                && receipt["provider_identity"].as_str()
+                    == Some(evidence.provider_identity.as_str())
+                && receipt["receipt_digest"].as_str()
+                    == Some(evidence.cgroup_identity_digest.as_str())
                 && evidence.cgroup_empty_verified
                 && evidence.namespace_init_reaped
                 && evidence.guardian_reaped

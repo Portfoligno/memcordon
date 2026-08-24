@@ -1242,6 +1242,7 @@ fn validate_doctor(
         || qualification.get("mechanism").and_then(Value::as_str) != Some(MECHANISM)
         || active_digest.len() != 64
         || !active_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || active_digest != receipt.receipt_digest
         || selected.get("sealed_unavailable").is_some()
         || memory
             .and_then(|memory| memory.get("supported"))
@@ -1293,7 +1294,11 @@ fn validate_doctor(
             ))),
         };
     }
-    validate_public_execution_report(&public_report, &receipt.provider_identity, active_digest)?;
+    validate_public_execution_report(
+        &public_report,
+        &receipt.provider_identity,
+        &receipt.receipt_digest,
+    )?;
     Ok(value)
 }
 
@@ -1603,7 +1608,10 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
     privileged_agent(root, ["package", "upgrade", "--ephemeral-ci"])?;
     validate_service_privilege_readback(root, report_dir)?;
 
-    let qualification_output = privileged_agent(root, ["qualify"])?;
+    let identity = frontend_identity(root)?;
+    verify_frontend_credentials(root, &identity)?;
+    let qualification_output =
+        authorized_nonroot(root, &identity, &root.join(PROVIDER_BINARY), ["probe"])?;
     let receipt: QualificationReceipt = serde_json::from_slice(&qualification_output)?;
     receipt.validate()?;
     write_json(&report_dir.join("qualification-receipt.json"), &receipt)?;
