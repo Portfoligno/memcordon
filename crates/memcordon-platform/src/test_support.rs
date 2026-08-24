@@ -533,16 +533,20 @@ fn terminate_unix_session(session: i32) -> io::Result<()> {
                 continue;
             };
             match process_identity(pid_value) {
-                Ok(identity) if !signalled.contains(&identity) => members.push((pid, identity)),
-                Ok(_) => {}
+                Ok(identity) => members.push((pid, identity)),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
         }
         if members.is_empty() {
-            return first_error.map_or(Ok(()), Err);
+            // The boundary outcome is authoritative: a signal may be rejected for a
+            // short-lived privilege-separated descendant which then exits on its own.
+            return Ok(());
         }
         for (pid, identity) in members {
+            if signalled.contains(&identity) {
+                continue;
+            }
             // SAFETY: kill accepts a process identity and does not dereference Rust memory.
             if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
                 let error = io::Error::last_os_error();

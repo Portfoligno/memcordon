@@ -33,6 +33,25 @@ fn archive_documents() -> BTreeMap<PathBuf, Vec<u8>> {
         .collect()
 }
 
+fn assert_missing_document_link(
+    omitted: &Path,
+    source: &Path,
+    target_file_name: &str,
+    expectation: &str,
+) {
+    let mut documents = archive_documents();
+    assert!(
+        documents.remove(omitted).is_some(),
+        "archive fixture should contain omitted document {omitted:?}"
+    );
+    let error = validate_markdown_documents(&documents).expect_err(expectation);
+    let target = source.with_file_name(target_file_name);
+    assert_eq!(
+        error.to_string(),
+        format!("Markdown link target is absent from package or archive: {source:?} -> {target:?}")
+    );
+}
+
 #[test]
 fn native_archive_markdown_links_resolve_within_member_set() {
     assert_eq!(NATIVE_ARCHIVE_STATIC_PATHS, EXPECTED_STATIC_PATHS);
@@ -43,30 +62,17 @@ fn native_archive_markdown_links_resolve_within_member_set() {
 
 #[test]
 fn native_archive_markdown_links_reject_each_missing_sealed_document() {
-    let mut documents = archive_documents();
-    documents.remove(Path::new("docs/sealed-supervision.md"));
-    let error = validate_markdown_documents(&documents)
-        .expect_err("reference link to missing sealed supervision document must fail");
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "Markdown link target is absent from package or archive: {:?} -> {:?}",
-            Path::new("docs/reference.md"),
-            Path::new("docs/sealed-supervision.md")
-        )
+    assert_missing_document_link(
+        Path::new("docs/sealed-supervision.md"),
+        Path::new("docs/reference.md"),
+        "sealed-supervision.md",
+        "reference link to missing sealed supervision document must fail",
     );
-
-    let mut documents = archive_documents();
-    documents.remove(Path::new("docs/sealed-provider.md"));
-    let error = validate_markdown_documents(&documents)
-        .expect_err("transitive link to missing sealed provider document must fail");
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "Markdown link target is absent from package or archive: {:?} -> {:?}",
-            Path::new("docs/sealed-supervision.md"),
-            Path::new("docs/sealed-provider.md")
-        )
+    assert_missing_document_link(
+        Path::new("docs/sealed-provider.md"),
+        Path::new("docs/sealed-supervision.md"),
+        "sealed-provider.md",
+        "transitive link to missing sealed provider document must fail",
     );
 }
 
