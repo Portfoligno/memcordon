@@ -6,19 +6,40 @@ All notable user-visible changes to MemCordon are documented here.
 
 ### Added
 
-- Added the high-level `--sealed` policy and `BoundaryRequirement::Sealed`
-  API, capability evidence, containment help, and the normative sealed
-  supervision contract. The request never falls back; this release has no
-  certified Linux, Windows, macOS, or other Unix sealed backend and rejects it
-  before target authorization.
+- Added `--sealed` and the `BoundaryRequirement::Sealed` Rust API for certified
+  process supervision. Qualified Linux installations gate the target inside
+  provider-owned cgroup v2, PID, mount, and cgroup namespaces, retain an
+  external guardian, and prove the boundary empty, reaped, and removed before
+  returning or restarting.
+- Added the root-owned `memcordon-sealed-agent` Linux provider and fixed systemd
+  socket. Package verification checks the installed binary and unit ownership,
+  modes, and contents; upgrade and uninstall recover authenticated abandoned
+  attempts and refuse live or ambiguous state.
+- Added sealed capability and qualification details to `doctor`, `plan`, and
+  execution reports, including requested and effective boundaries, missing
+  prerequisites, native launch and retirement facts, and typed provider setup
+  or target-exec failures. A sealed request never falls back and fails with
+  `MCBOUNDARY-UNSUPPORTED` before target authorization when no qualified native
+  provider is available.
+
+### Changed
+
+- Sealed restarts create a fresh native boundary for every attempt and consume
+  the remaining supervision deadline. Authenticated exec failures remain
+  distinct from successful child exits 126 and 127, and no result is returned
+  without complete containment and helper-retirement evidence.
 
 ### Breaking Changes
 
-- Execution reports advance from schema 5 to 6, plan reports from schema 4 to
-  5, and doctor reports from schema 2 to 3. The new schemas separate requested
-  and effective process-boundary assurance from memory enforcement and add
-  launch and retirement evidence. `MemcordonReport::schema5` is renamed to
-  `schema6`.
+- Execution reports advance from schema 5 to 7, plan reports from schema 4 to
+  6, doctor reports from schema 2 to 4, and clean reports from schema 1 to 2.
+  The new schemas separate requested and effective process-boundary assurance
+  from memory enforcement and add provider qualification, setup-failure,
+  rejection, launch, and retirement evidence. `MemcordonReport::schema5` is
+  renamed to `schema7`.
+- Public Rust policy, capability, supervision, error, and report models add
+  required boundary and provider-evidence fields and variants. External struct
+  literals and exhaustive matches must be updated.
 
 ## [0.4.1] - 2026-08-07
 
