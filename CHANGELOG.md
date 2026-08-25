@@ -4,11 +4,47 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+### Added
+
+- Added credential-transition-aware Linux sealed supervision. Before
+  authorization, the provider reproduces the authenticated caller's
+  credentials, groups, working directory, mount context, `NoNewPrivs` value,
+  capability ceiling, native arguments, environment, and streams while
+  removing provider-only authority. The sealed boundary remains effective
+  across permitted set-ID, file-capability, `sudo`, `setsid`, and daemonization
+  transitions.
+
+### Changed
+
+- Split the installed Linux provider into a hardened public control
+  service/socket and a root-only launcher service/socket. A packaged tmpfiles
+  policy owns the runtime directory and stable package lease, and package
+  verification checks the complete installed artifact identities, modes, and
+  contents.
+- Linux package upgrade and uninstall now check authenticated recovery state
+  before stopping provider units, retain transition-safe locking, and refuse
+  live or ambiguous attempts without disrupting the active provider.
+
 ### Fixed
 
-- Preserved typed `request-validation` provider rejections in public reports and
-  made the stable Linux package lease boot-safe without widening the hardened
-  control service's write access.
+- Preserved typed `request-validation` provider rejections in public reports,
+  authenticated systemd socket-activated launcher workers, and rejected unsafe
+  recursive-provider inventory without mistaking cgroup v2 control files for
+  active attempts.
+- Made Linux runtime ownership and the root-only package lease boot-safe,
+  allowed unprivileged package verification without widening lease access, and
+  retained complete failure diagnostics in certification artifacts.
+
+### Breaking Changes
+
+- Execution reports advance from schema 7 to 8, plan reports from schema 6 to
+  7, and doctor reports from schema 4 to 5. Sealed mechanism, evidence,
+  qualification, and terminal records advance to v2, and provider protocol v1
+  is rejected rather than negotiated.
+- Public Rust sealed-boundary evidence gains required credential-transition,
+  caller-envelope, control/launcher identity, and recursive-request fields.
+  `BoundarySetupPhase` also adds `RequestValidation`; external struct literals
+  and exhaustive matches must be updated.
 
 ## [0.5.0-rc.4] - 2026-08-24
 
