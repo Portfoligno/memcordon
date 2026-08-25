@@ -32,6 +32,11 @@ Unrelated privileged host brokers remain outside the process-lineage threat mode
 
 Runtime qualification schema 2 proves split-service installation/authentication, launcher NNP disabled, caller mount/NNP/CapBnd reproduction, initial provider capabilities absent, cgroup and namespace containment, exact descriptors, recursive-provider rejection, front-end-loss cleanup, recursive emptiness, helper reaping, boundary retirement, and recovery. The receipt binds the release certification scenario inventory and required set-ID/`sudo` digests.
 
+The receipt also carries the exact MemCordon package version. The public client
+rejects a provider whose version differs from its own before target
+authorization; an operator must explicitly install the matching package and
+run the package upgrade command.
+
 Execution report schema 8 carries `LinuxSealedEvidenceV2` and `preserve-caller-envelope`. Consistency requires caller envelope reproduction and boundary independence from credentials; it does not require permanently empty target capabilities or `NoNewPrivs: 1`. Plan and doctor schemas are 7 and 5. V1 provider/mechanism/evidence is never accepted under the new schemas.
 
 Linux x86-64 release certification builds temporary Rust fixtures, a root-owned mode-`04755` set-ID fixture, a minimal file-capability fixture, and an ephemeral test user. It verifies set-ID, `sudo -n -u`, file-capability, caller NNP 0 and 1, reduced CapBnd, caller-specific mount context, post-transition cgroup/PID membership, elevated escape denial, recursive-provider rejection, front-end/provider/launcher/guardian loss, `cgroup.kill`, `populated 0`, complete reaping, package upgrade/recovery, and absence of leaked users/processes/records/cgroups/fixtures/units. All subprocesses use native argv from Rust; no shell or workflow environment protocol is involved.

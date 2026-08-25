@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
-pub const RELEASE_SCHEMA_VERSION: u32 = 2;
+pub const RELEASE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Toolchains {
@@ -121,11 +121,37 @@ pub struct Assets {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssetTarget {
     pub id: String,
     pub rust_target: String,
     pub archive: String,
-    pub executable: String,
+    pub executable: Vec<AssetExecutable>,
+    pub sealed: SealedAssetPolicy,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssetExecutable {
+    pub package: String,
+    pub binary: String,
+    pub archive_path: String,
+    pub mode: u32,
+    pub role: RuntimeComponentRole,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeComponentRole {
+    PublicCli,
+    SealedAgent,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SealedAssetPolicy {
+    Included,
+    NotApplicable,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -190,32 +216,12 @@ pub fn release_target_id_for_host(os: &str, arch: &str) -> Result<&'static str> 
 
 pub fn validate_release_configuration_identity(release: &Release) -> Result<()> {
     let expected_targets = [
-        (
-            "linux-x64",
-            "x86_64-unknown-linux-gnu",
-            "tar-gz",
-            "memcordon",
-        ),
-        (
-            "linux-arm64",
-            "aarch64-unknown-linux-gnu",
-            "tar-gz",
-            "memcordon",
-        ),
-        ("macos-arm64", "aarch64-apple-darwin", "tar-gz", "memcordon"),
-        ("macos-x64", "x86_64-apple-darwin", "tar-gz", "memcordon"),
-        (
-            "windows-x64",
-            "x86_64-pc-windows-msvc",
-            "zip",
-            "memcordon.exe",
-        ),
-        (
-            "windows-arm64",
-            "aarch64-pc-windows-msvc",
-            "zip",
-            "memcordon.exe",
-        ),
+        ("linux-x64", "x86_64-unknown-linux-gnu", "tar-gz", true),
+        ("linux-arm64", "aarch64-unknown-linux-gnu", "tar-gz", true),
+        ("macos-arm64", "aarch64-apple-darwin", "tar-gz", false),
+        ("macos-x64", "x86_64-apple-darwin", "tar-gz", false),
+        ("windows-x64", "x86_64-pc-windows-msvc", "zip", false),
+        ("windows-arm64", "aarch64-pc-windows-msvc", "zip", false),
     ];
     let targets_match = release.assets.target.len() == expected_targets.len()
         && release
@@ -228,8 +234,9 @@ pub fn validate_release_configuration_identity(release: &Release) -> Result<()> 
                     actual.id.as_str(),
                     actual.rust_target.as_str(),
                     actual.archive.as_str(),
-                    actual.executable.as_str(),
+                    actual.sealed == SealedAssetPolicy::Included,
                 ) == expected
+                    && validate_target_executables(actual, expected.3)
             });
     if release.schema_version != RELEASE_SCHEMA_VERSION
         || release.registry != "crates-io"
@@ -248,6 +255,45 @@ pub fn validate_release_configuration_identity(release: &Release) -> Result<()> 
         ));
     }
     Ok(())
+}
+
+fn validate_target_executables(target: &AssetTarget, sealed: bool) -> bool {
+    let expected_public_path = if target.archive == "zip" {
+        "memcordon.exe"
+    } else {
+        "memcordon"
+    };
+    let expected_count = usize::from(sealed) + 1;
+    if target.executable.len() != expected_count {
+        return false;
+    }
+    let public = &target.executable[0];
+    if public.package != "memcordon"
+        || public.binary != "memcordon"
+        || public.archive_path != expected_public_path
+        || public.mode != 0o755
+        || public.role != RuntimeComponentRole::PublicCli
+    {
+        return false;
+    }
+    if sealed {
+        let agent = &target.executable[1];
+        if agent.package != "memcordon"
+            || agent.binary != "memcordon-sealed-agent"
+            || agent.archive_path != "memcordon-sealed-agent"
+            || agent.mode != 0o755
+            || agent.role != RuntimeComponentRole::SealedAgent
+        {
+            return false;
+        }
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    let mut binaries = std::collections::BTreeSet::new();
+    target.executable.iter().all(|component| {
+        component.package == "memcordon"
+            && paths.insert(component.archive_path.as_str())
+            && binaries.insert(component.binary.as_str())
+    })
 }
 
 #[cfg(test)]

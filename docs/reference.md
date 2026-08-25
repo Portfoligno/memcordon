@@ -384,3 +384,26 @@ into another session can also leave the sampled workload boundary.
 ## Sealed supervision
 
 `--sealed` requires certified process-boundary setup, independent cleanup authority, and terminal emptiness proof. It fails before target authorization if unavailable and never falls back. See [sealed supervision](sealed-supervision.md) for the normative threat model and exclusions.
+
+## Sealed provider distribution
+
+`cargo install --locked memcordon` installs exactly two default binaries:
+`memcordon` and `memcordon-sealed-agent`. Test fixtures are feature-gated and
+are not installed by default. Linux native archives contain those same two
+runtime components plus `runtime-manifest.json`; macOS and Windows archives
+contain only the public CLI and mark sealed packaging not applicable.
+
+The provider remains an explicit privileged installation:
+
+```console
+sudo /absolute/path/to/memcordon-sealed-agent package install
+/absolute/path/to/memcordon-sealed-agent package inspect --json
+/absolute/path/to/memcordon-sealed-agent package verify --json
+memcordon doctor --require sealed
+```
+
+The agent and CLI versions must match exactly. A missing provider diagnostic
+identifies the companion beside the running CLI. A mismatch names both versions
+and directs the operator to install the matching package and run an explicit
+package upgrade. Neither path automatically downloads, compiles, or installs a
+provider.

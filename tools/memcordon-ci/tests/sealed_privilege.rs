@@ -37,7 +37,9 @@ fn semantic_function_region_accepts_lf_and_crlf_without_broad_matching() {
 
 #[test]
 fn post_guardian_errors_use_one_finalizer_and_deadline_proves_no_residue() {
-    let launch = include_str!("../../../crates/memcordon-sealed-agent/src/linux/launch.rs");
+    let launch = include_str!(
+        "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs"
+    );
     let execute =
         semantic_function_region(launch, "fn execute_inner(", "fn wait_command_exit_grace(")
             .expect("execute_inner must have a semantic boundary before its next helper");
@@ -53,7 +55,8 @@ fn post_guardian_errors_use_one_finalizer_and_deadline_proves_no_residue() {
     assert!(channels < outcome && outcome < finalizer);
     assert!(execute.contains("MCSEALED-BOUNDARY-NOT-RETIRED: primary={error}; cleanup={cleanup}"));
 
-    let scenarios = include_str!("../../../crates/memcordon-sealed-agent/tests/linux_sealed.rs");
+    let scenarios =
+        include_str!("../../../crates/memcordon-cli/tests/sealed_agent/linux_sealed.rs");
     let deadline = semantic_function_region(
         scenarios,
         "fn sealed_expired_deadline_never_authorizes_and_retires() {",
@@ -65,7 +68,7 @@ fn post_guardian_errors_use_one_finalizer_and_deadline_proves_no_residue() {
         "!record_path.exists()",
         "!transaction_path.exists()",
         "!cgroup_path.exists()",
-        "memcordon_sealed_agent::linux::recovery::recover()",
+        "crate::linux::recovery::recover()",
         "ambiguity.is_empty()",
     ] {
         assert!(
@@ -80,10 +83,10 @@ fn generic_workspace_tests_ignore_every_privileged_linux_sealed_selector() {
     const STABLE_LEASE_SELECTOR: &str =
         "sealed_package_stable_lease_survives_legacy_inode_replacement";
     let privileged_tests = [
-        include_str!("../../../crates/memcordon-sealed-agent/tests/linux_sealed.rs"),
-        include_str!("../../../crates/memcordon-sealed-agent/tests/linux_faults.rs"),
-        include_str!("../../../crates/memcordon-sealed-agent/tests/linux_recovery.rs"),
-        include_str!("../../../crates/memcordon-sealed-agent/tests/linux_package.rs"),
+        include_str!("../../../crates/memcordon-cli/tests/sealed_agent/linux_sealed.rs"),
+        include_str!("../../../crates/memcordon-cli/tests/sealed_agent/linux_faults.rs"),
+        include_str!("../../../crates/memcordon-cli/tests/sealed_agent/linux_recovery.rs"),
+        include_str!("../../../crates/memcordon-cli/tests/sealed_agent/linux_package.rs"),
     ];
     let ignored = privileged_tests
         .iter()
@@ -112,7 +115,8 @@ fn generic_workspace_tests_ignore_every_privileged_linux_sealed_selector() {
         "the stable lease selector must remain in release evidence"
     );
 
-    let provider = include_str!("../../../crates/memcordon-sealed-agent/tests/linux_provider.rs");
+    let provider =
+        include_str!("../../../crates/memcordon-cli/tests/sealed_agent/linux_provider.rs");
     assert!(!provider.contains(PRIVILEGED_REASON));
     assert_eq!(provider.matches("#[test]").count(), 3);
 }
@@ -149,7 +153,7 @@ fn dedicated_certification_explicitly_selects_ignored_tests() {
 #[test]
 fn fault_producer_emits_truthful_observation_before_contract_assertions() {
     let producer =
-        include_str!("../../../crates/memcordon-sealed-agent/tests/support/sealed_faults.rs");
+        include_str!("../../../crates/memcordon-cli/tests/sealed_agent/support/sealed_faults.rs");
     let assertion = producer
         .find("assert_eq!(rejection.code, code)")
         .expect("fault producer must assert the exact rejection code");
@@ -250,12 +254,42 @@ fn credential_redesign_fuzz_targets_bind_real_parser_surfaces() {
         (
             "provider-recursion-proof",
             include_str!("../../../fuzz/fuzz_targets/provider_recursion_proof.rs"),
-            "cgroup_membership_is_sealed",
+            "cgroup_membership::is_sealed",
         ),
         (
             "mount-context-manifest",
             include_str!("../../../fuzz/fuzz_targets/mount_context_manifest.rs"),
             "fuzz_linux_mount_context_manifest",
+        ),
+        (
+            "runtime-manifest",
+            include_str!("../../../fuzz/fuzz_targets/runtime_manifest.rs"),
+            "fuzz_runtime_manifest",
+        ),
+        (
+            "release-asset-components",
+            include_str!("../../../fuzz/fuzz_targets/release_asset_components.rs"),
+            "config::Release",
+        ),
+        (
+            "agent-package-inspection",
+            include_str!("../../../fuzz/fuzz_targets/agent_package_inspection.rs"),
+            "AgentPackageInspectionV1",
+        ),
+        (
+            "installed-provider-inspection",
+            include_str!("../../../fuzz/fuzz_targets/installed_provider_inspection.rs"),
+            "InstalledProviderInspectionV1",
+        ),
+        (
+            "cargo-bin-inventory",
+            include_str!("../../../fuzz/fuzz_targets/cargo_bin_inventory.rs"),
+            "toml::Value",
+        ),
+        (
+            "channel-pairing",
+            include_str!("../../../fuzz/fuzz_targets/channel_pairing.rs"),
+            "source_commit",
         ),
     ];
 
@@ -277,11 +311,11 @@ fn credential_redesign_fuzz_targets_bind_real_parser_surfaces() {
 
 #[test]
 fn sealed_fixtures_are_isolated_and_status_assertions_are_mandatory() {
-    let support = include_str!("../../../crates/memcordon-sealed-agent/tests/support/mod.rs");
-    let scenarios = include_str!("../../../crates/memcordon-sealed-agent/tests/linux_sealed.rs");
-    let fixture = include_str!(
-        "../../../crates/memcordon-sealed-agent/src/bin/memcordon-sealed-test-fixture.rs"
-    );
+    let support = include_str!("../../../crates/memcordon-cli/tests/sealed_agent/support/mod.rs");
+    let scenarios =
+        include_str!("../../../crates/memcordon-cli/tests/sealed_agent/linux_sealed.rs");
+    let fixture =
+        include_str!("../../../crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture.rs");
 
     for required in [
         ".tempdir_in(\"/tmp\")",
@@ -326,8 +360,10 @@ fn sealed_fixtures_are_isolated_and_status_assertions_are_mandatory() {
 
 #[test]
 fn package_scenarios_tamper_and_recover_real_installed_state() {
-    let package = include_str!("../../../crates/memcordon-sealed-agent/src/package.rs");
-    let scenarios = include_str!("../../../crates/memcordon-sealed-agent/tests/linux_package.rs");
+    let package =
+        include_str!("../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/package.rs");
+    let scenarios =
+        include_str!("../../../crates/memcordon-cli/tests/sealed_agent/linux_package.rs");
     let runner = include_str!("../src/sealed_linux.rs");
 
     for required in [
@@ -404,7 +440,8 @@ fn package_scenarios_tamper_and_recover_real_installed_state() {
 
 #[test]
 fn package_stop_suppresses_success_noise_and_bounds_failure_diagnostics() {
-    let package = include_str!("../../../crates/memcordon-sealed-agent/src/package.rs");
+    let package =
+        include_str!("../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/package.rs");
     let stop = semantic_function_region(
         package,
         "fn stop_unit(unit: &str) -> Result<(), String> {",
@@ -520,9 +557,10 @@ fn certification_uses_a_nonroot_frontend_with_the_provider_access_group() {
 
 #[test]
 fn package_refusal_preflight_preserves_live_service_state() {
-    let package = include_str!("../../../crates/memcordon-sealed-agent/src/package.rs");
+    let package =
+        include_str!("../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/package.rs");
     let package_tests =
-        include_str!("../../../crates/memcordon-sealed-agent/tests/linux_package.rs");
+        include_str!("../../../crates/memcordon-cli/tests/sealed_agent/linux_package.rs");
     let runner = include_str!("../src/sealed_linux.rs");
 
     let mutation_start = package

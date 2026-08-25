@@ -74,6 +74,29 @@ pub fn sealed_qualification_v2_is_valid(payload: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn sealed_provider_pairing_is_exact(
+    cli_version: &str,
+    provider_version: &str,
+    cli_channel: &str,
+    provider_channel: &str,
+) -> Result<(), String> {
+    crate::sealed::client::validate_exact_provider_pairing(
+        cli_version,
+        provider_version,
+        cli_channel,
+        provider_channel,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub fn sealed_provider_installation_diagnostic() -> String {
+    crate::sealed::client::provider_installation_error(
+        "provider endpoint unavailable",
+        &std::io::Error::from(std::io::ErrorKind::NotFound),
+    )
+}
+
+#[cfg(target_os = "linux")]
 pub fn sealed_rejection_v1(
     payload: &[u8],
 ) -> Result<memcordon_core::ProviderRejectionEvidence, String> {
@@ -94,6 +117,7 @@ pub fn linux_probe_from_results(
         standard,
         provider.map(
             |(provider_identity, receipt_digest)| crate::sealed::client::ProbeReceipt {
+                version: env!("CARGO_PKG_VERSION").to_owned(),
                 provider_identity,
                 control_service_identity: "memcordon-sealed-agent.service:v2".to_owned(),
                 launcher_service_identity: "memcordon-sealed-launcher.service:v2".to_owned(),

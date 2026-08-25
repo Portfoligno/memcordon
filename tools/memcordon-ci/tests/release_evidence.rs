@@ -367,6 +367,7 @@ fn fixture() -> (TempDir, Value, Value, Value) {
     let sudo_digest = "ef".repeat(32);
     let mut qualification = json!({
         "schema_version": 2,
+        "version": env!("CARGO_PKG_VERSION"),
         "mechanism": "linux-pid-namespace-cgroup-v2",
         "provider_identity": "memcordon-sealed-agent-v2",
         "control_service_identity": "memcordon-sealed-agent.service:v2",

@@ -7,8 +7,21 @@ workload cleanup and reports any cleanup failure.
 ## Install
 
 ```console
-cargo install memcordon
+cargo install --locked memcordon
 ```
+
+The package installs both `memcordon` and the private
+`memcordon-sealed-agent` companion binary. Ordinary supervision needs no
+privileged setup. On Linux, enable sealed supervision explicitly:
+
+```console
+sudo ~/.cargo/bin/memcordon-sealed-agent package install
+~/.cargo/bin/memcordon doctor --require sealed
+```
+
+Use the agent's absolute path because `sudo` may omit the Cargo bin directory
+from its secure path. Native Linux release archives provide the same two
+binaries together.
 
 ## Run
 
@@ -30,8 +43,9 @@ check` finishes normally, MemCordon returns its exit status; monitoring,
 cleanup, and reporting failures take precedence.
 
 `--sealed` requests the stronger process-boundary contract documented in
-`docs/sealed-supervision.md`. It is fail-closed and currently unavailable on
-all native backends, so the target is not executed when it is requested.
+`docs/sealed-supervision.md`. Certified Linux mechanism v2 requires the
+matching installed provider, fails before target authorization when missing or
+mismatched, and never falls back to a standard backend.
 
 The default completion mode is `--wait-for command`. When the direct command
 exits, the default zero command-exit grace force-cleans any remaining contained

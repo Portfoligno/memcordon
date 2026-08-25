@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::digest::OutputSizeUser;
 use sha2::{Digest as _, Sha256};
 
 use memcordon_ci::command::{CommandSpec, git};
@@ -297,6 +298,7 @@ const SCENARIOS: &[Scenario] = &[
 #[serde(deny_unknown_fields)]
 struct QualificationReceipt {
     schema_version: u32,
+    version: String,
     mechanism: String,
     provider_identity: String,
     control_service_identity: String,
@@ -340,11 +342,12 @@ struct QualificationReceipt {
 impl QualificationReceipt {
     fn validate(&self) -> Result<()> {
         let complete = self.schema_version == 2
+            && self.version == env!("CARGO_PKG_VERSION")
             && self.mechanism == MECHANISM
             && self.provider_identity == "memcordon-sealed-agent-v2"
             && self.control_service_identity == "memcordon-sealed-agent.service:v2"
             && self.launcher_service_identity == "memcordon-sealed-launcher.service:v2"
-            && self.receipt_digest.len() == 64
+            && self.receipt_digest.len() == <Sha256 as OutputSizeUser>::output_size() * 2
             && self
                 .receipt_digest
                 .bytes()
@@ -1143,11 +1146,11 @@ fn run_exact(
         "target/ci/sealed-agent",
         "--locked",
         "--package",
-        "memcordon-sealed-agent",
+        "memcordon",
         "--features",
         "test-support",
         "--test",
-        scenario.test_binary,
+        "sealed_agent",
         "--no-run",
         "--message-format=json",
     ];
@@ -1159,8 +1162,7 @@ fn run_exact(
         .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
         .find(|value| {
             value.get("reason").and_then(Value::as_str) == Some("compiler-artifact")
-                && value.pointer("/target/name").and_then(Value::as_str)
-                    == Some(scenario.test_binary)
+                && value.pointer("/target/name").and_then(Value::as_str) == Some("sealed_agent")
                 && value.get("executable").is_some_and(Value::is_string)
         })
         .and_then(|value| {
@@ -1807,7 +1809,7 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
             "target/ci/sealed-agent",
             "--locked",
             "--package",
-            "memcordon-sealed-agent",
+            "memcordon",
             "--bin",
             "memcordon-sealed-agent",
         ],

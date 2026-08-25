@@ -1,4 +1,4 @@
-schema_version = 2
+schema_version = 3
 repository = "Portfoligno/memcordon"
 workflow = "release.yml"
 registry = "crates-io"
@@ -21,37 +21,93 @@ notes = "RELEASE_NOTES.md"
 id = "linux-x64"
 rust_target = "x86_64-unknown-linux-gnu"
 archive = "tar-gz"
-executable = "memcordon"
+sealed = "included"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon"
+mode = 493
+role = "public-cli"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-sealed-agent"
+archive_path = "memcordon-sealed-agent"
+mode = 493
+role = "sealed-agent"
 
 [[assets.target]]
 id = "linux-arm64"
 rust_target = "aarch64-unknown-linux-gnu"
 archive = "tar-gz"
-executable = "memcordon"
+sealed = "included"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon"
+mode = 493
+role = "public-cli"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-sealed-agent"
+archive_path = "memcordon-sealed-agent"
+mode = 493
+role = "sealed-agent"
 
 [[assets.target]]
 id = "macos-arm64"
 rust_target = "aarch64-apple-darwin"
 archive = "tar-gz"
-executable = "memcordon"
+sealed = "not-applicable"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon"
+mode = 493
+role = "public-cli"
 
 [[assets.target]]
 id = "macos-x64"
 rust_target = "x86_64-apple-darwin"
 archive = "tar-gz"
-executable = "memcordon"
+sealed = "not-applicable"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon"
+mode = 493
+role = "public-cli"
 
 [[assets.target]]
 id = "windows-x64"
 rust_target = "x86_64-pc-windows-msvc"
 archive = "zip"
-executable = "memcordon.exe"
+sealed = "not-applicable"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon.exe"
+mode = 493
+role = "public-cli"
 
 [[assets.target]]
 id = "windows-arm64"
 rust_target = "aarch64-pc-windows-msvc"
 archive = "zip"
-executable = "memcordon.exe"
+sealed = "not-applicable"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon.exe"
+mode = 493
+role = "public-cli"
 
 [registry_wait]
 initial_milliseconds = 500

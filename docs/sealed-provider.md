@@ -1,6 +1,36 @@
 # Sealed provider operation
 
-The sealed provider is private MemCordon machinery installed by the native package. The public request remains `memcordon --sealed ... COMMAND ARGUMENT...`; the CLI never accepts a provider endpoint, platform principal, boundary handle, or cleanup hook.
+The sealed provider is private MemCordon machinery distributed with the
+`memcordon` Cargo package and Linux native release archives. The public request
+remains `memcordon --sealed ... COMMAND ARGUMENT...`; the CLI never accepts a
+provider endpoint, platform principal, boundary handle, or cleanup hook.
+
+## Acquisition and administration
+
+Cargo installs the public CLI and its exact-version companion together:
+
+```console
+cargo install --locked memcordon
+sudo ~/.cargo/bin/memcordon-sealed-agent package install
+~/.cargo/bin/memcordon-sealed-agent package verify --json
+~/.cargo/bin/memcordon doctor --require sealed
+```
+
+A verified Linux native archive contains `memcordon`,
+`memcordon-sealed-agent`, and `runtime-manifest.json` at its root. Its flow
+is equivalent:
+
+```console
+sudo ./memcordon-sealed-agent package install
+./memcordon-sealed-agent package verify --json
+./memcordon doctor --require sealed
+```
+
+`package inspect --json` is credential-free and reports the current agent,
+embedded unit digests, protocol, report schemas, source commit, and executable
+digest. `package install`, `upgrade`, and `uninstall` remain explicit root
+mutations. CLI/provider version mismatch fails before target authorization;
+installation and upgrade never download or compile a component.
 
 ## Trust and transport
 

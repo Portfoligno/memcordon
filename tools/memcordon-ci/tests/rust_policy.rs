@@ -13,7 +13,7 @@ fn unrelated_exec_method_is_not_rejected_by_name() {
 fn subprocess_environment_is_confined_to_the_sealed_exec_boundary() {
     let source = b"fn run(command: &mut std::process::Command) { command.env(\"A\", \"B\"); }";
     validate_rust_policy_bytes(
-        Path::new("crates/memcordon-sealed-agent/src/linux/launch.rs"),
+        Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs"),
         source,
     )
     .expect("the exact sealed exec boundary may restore the requested environment");
@@ -32,21 +32,21 @@ fn pre_exec_and_raw_fork_are_confined_to_exact_reviewed_boundaries() {
             .is_err()
     );
     for reviewed in [
-        "crates/memcordon-sealed-agent/src/linux/launch.rs",
-        "crates/memcordon-sealed-agent/src/linux/launcher.rs",
-        "crates/memcordon-sealed-agent/src/linux/namespace.rs",
-        "crates/memcordon-sealed-agent/src/linux/service.rs",
-        "crates/memcordon-sealed-agent/src/bin/memcordon-sealed-test-fixture.rs",
-        "crates/memcordon-sealed-agent/tests/linux_faults.rs",
-        "crates/memcordon-sealed-agent/tests/linux_sealed.rs",
-        "crates/memcordon-sealed-agent/tests/launcher_activation.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launcher.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/namespace.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/service.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture.rs",
+        "crates/memcordon-cli/tests/sealed_agent/linux_faults.rs",
+        "crates/memcordon-cli/tests/sealed_agent/linux_sealed.rs",
+        "crates/memcordon-cli/tests/sealed_agent/launcher_activation.rs",
     ] {
         validate_rust_policy_bytes(Path::new(reviewed), fork)
             .expect("an exact reviewed sealed-provider boundary may fork");
     }
     assert!(
         validate_rust_policy_bytes(
-            Path::new("crates/memcordon-sealed-agent/tests/support/sealed_faults.rs"),
+            Path::new("crates/memcordon-cli/tests/sealed_agent/support/sealed_faults.rs"),
             fork,
         )
         .is_err(),
@@ -54,7 +54,7 @@ fn pre_exec_and_raw_fork_are_confined_to_exact_reviewed_boundaries() {
     );
     assert!(
         validate_rust_policy_bytes(
-            Path::new("crates/memcordon-sealed-agent/tests/support/mod.rs"),
+            Path::new("crates/memcordon-cli/tests/sealed_agent/support/mod.rs"),
             fork,
         )
         .is_err(),
@@ -62,7 +62,7 @@ fn pre_exec_and_raw_fork_are_confined_to_exact_reviewed_boundaries() {
     );
     assert!(
         validate_rust_policy_bytes(
-            Path::new("crates/memcordon-sealed-agent/tests/launcher_activation_copy.rs"),
+            Path::new("crates/memcordon-cli/tests/sealed_agent/launcher_activation_copy.rs"),
             fork,
         )
         .is_err(),
@@ -70,7 +70,7 @@ fn pre_exec_and_raw_fork_are_confined_to_exact_reviewed_boundaries() {
     );
     assert!(
         validate_rust_policy_bytes(
-            Path::new("crates/memcordon-sealed-agent/src/linux/qualification.rs"),
+            Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/qualification.rs"),
             fork,
         )
         .is_err()

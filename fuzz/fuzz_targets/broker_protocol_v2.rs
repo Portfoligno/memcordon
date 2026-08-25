@@ -3,11 +3,19 @@
 use std::io::Cursor;
 
 use libfuzzer_sys::fuzz_target;
-use memcordon_sealed_agent::state::{AttemptState, AttemptStateMachine};
+
+#[path = "../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/protocol.rs"]
+mod protocol;
+#[path = "../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/request.rs"]
+mod request;
+#[path = "../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/state.rs"]
+mod state;
+
+use state::{AttemptState, AttemptStateMachine};
 
 fuzz_target!(|data: &[u8]| {
-    let _ = memcordon_sealed_agent::protocol::read_frame(&mut Cursor::new(data));
-    let _ = memcordon_sealed_agent::request::decode_launch_broker_request(data);
+    let _ = protocol::read_frame(&mut Cursor::new(data));
+    let _ = request::decode_launch_broker_request(data);
 
     let mut state = AttemptStateMachine::default();
     let mut boundary_created = false;
@@ -18,7 +26,7 @@ fuzz_target!(|data: &[u8]| {
     for event in data.iter().copied().map(|byte| byte % 8) {
         match event {
             0 => {
-                let _ = memcordon_sealed_agent::protocol::read_frame(&mut Cursor::new(data));
+                let _ = protocol::read_frame(&mut Cursor::new(data));
             }
             1 => {
                 if state.transition(AttemptState::BoundaryCreated).is_ok() {

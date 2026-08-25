@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::Path;
 
 use memcordon::exit_mapping::error_exit_code;
@@ -844,6 +845,14 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
                 .map_or("none", |value| value.name.as_str()),
         )
         .expect("doctor output should be writable");
+        if !met && args.requirement == Some(Requirement::Sealed) {
+            for unavailable in &report.unavailable {
+                if unavailable.name == "linux-sealed-provider" {
+                    writeln!(out, "{}", unavailable.reason)
+                        .expect("sealed provider diagnostic should be writable");
+                }
+            }
+        }
     }
     if met { 0 } else { 125 }
 }

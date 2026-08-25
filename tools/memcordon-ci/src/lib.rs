@@ -7,6 +7,7 @@ pub mod line_evidence;
 pub mod policy;
 pub mod release_archive;
 pub mod release_evidence;
+pub mod runtime_manifest;
 pub mod scenario_diagnostic;
 pub mod sealed_identity;
 

@@ -1663,7 +1663,8 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     visitor.visit_file(&syntax);
     let test_support = Path::new("crates/memcordon-platform/src/test_support.rs");
     let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
-    let sealed_launch = Path::new("crates/memcordon-sealed-agent/src/linux/launch.rs");
+    let sealed_launch =
+        Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");
     if visitor.subprocess_env_mutations != 0 && relative != sealed_launch {
         visitor
             .violations
@@ -1749,7 +1750,8 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         visitor.visit_file(&syntax);
         let test_support = Path::new("crates/memcordon-platform/src/test_support.rs");
         let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
-        let sealed_launch = Path::new("crates/memcordon-sealed-agent/src/linux/launch.rs");
+        let sealed_launch =
+            Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");
         if visitor.subprocess_env_mutations != 0 && relative != sealed_launch {
             visitor
                 .violations
@@ -1800,17 +1802,17 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
 fn is_reviewed_raw_fork_boundary(relative: &Path) -> bool {
     matches!(
         relative,
-        path if path == Path::new("crates/memcordon-sealed-agent/src/linux/launch.rs")
-            || path == Path::new("crates/memcordon-sealed-agent/src/linux/launcher.rs")
-            || path == Path::new("crates/memcordon-sealed-agent/src/linux/namespace.rs")
-            || path == Path::new("crates/memcordon-sealed-agent/src/linux/service.rs")
+        path if path == Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs")
+            || path == Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launcher.rs")
+            || path == Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/namespace.rs")
+            || path == Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/service.rs")
             || path
                 == Path::new(
-                    "crates/memcordon-sealed-agent/src/bin/memcordon-sealed-test-fixture.rs",
+                    "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture.rs",
                 )
-            || path == Path::new("crates/memcordon-sealed-agent/tests/linux_faults.rs")
-            || path == Path::new("crates/memcordon-sealed-agent/tests/linux_sealed.rs")
-            || path == Path::new("crates/memcordon-sealed-agent/tests/launcher_activation.rs")
+            || path == Path::new("crates/memcordon-cli/tests/sealed_agent/linux_faults.rs")
+            || path == Path::new("crates/memcordon-cli/tests/sealed_agent/linux_sealed.rs")
+            || path == Path::new("crates/memcordon-cli/tests/sealed_agent/launcher_activation.rs")
     )
 }
 
@@ -2106,13 +2108,13 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
     )?;
     require_credential_transition_fragments(
         root,
-        "crates/memcordon-sealed-agent/src/protocol.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/protocol.rs",
         &["pub const PROTOCOL_VERSION: u16 = 2;"],
         &["linux-pid-namespace-cgroup-v1"],
     )?;
     require_credential_transition_fragments(
         root,
-        "crates/memcordon-sealed-agent/src/request.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/request.rs",
         &[
             "pub const LAUNCH_REQUEST_VERSION: u16 = 2;",
             "pub const LAUNCH_BROKER_REQUEST_VERSION: u16 = 2;",
@@ -2127,7 +2129,7 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
     )?;
     require_credential_transition_fragments(
         root,
-        "crates/memcordon-sealed-agent/src/linux/qualification.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/qualification.rs",
         &[
             "schema_version: 2",
             "linux-pid-namespace-cgroup-v2",
@@ -2149,7 +2151,7 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
     ];
     require_credential_transition_fragments(
         root,
-        "crates/memcordon-sealed-agent/tests/linux_sealed.rs",
+        "crates/memcordon-cli/tests/sealed_agent/linux_sealed.rs",
         &selectors,
         &[],
     )?;

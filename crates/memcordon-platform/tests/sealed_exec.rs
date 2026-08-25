@@ -2,6 +2,57 @@
 
 use memcordon_core::{ErrorCategory, InitialSpawnFailure};
 
+#[test]
+fn exact_channel_pairing_refuses_both_version_directions_before_authorization() {
+    assert!(
+        memcordon_platform::test_support::sealed_provider_pairing_is_exact(
+            "0.5.2",
+            "0.5.2",
+            "Cargo CLI",
+            "Cargo provider",
+        )
+        .is_ok()
+    );
+    for (cli_version, provider_version, cli_channel, provider_channel) in [
+        ("0.5.2", "0.5.1", "Cargo CLI", "native provider"),
+        ("0.5.1", "0.5.2", "native CLI", "Cargo provider"),
+        ("0.5.2", "0.5.1", "native CLI", "native provider"),
+        ("0.5.1", "0.5.2", "Cargo CLI", "Cargo provider"),
+    ] {
+        let error = memcordon_platform::test_support::sealed_provider_pairing_is_exact(
+            cli_version,
+            provider_version,
+            cli_channel,
+            provider_channel,
+        )
+        .expect_err("a cross-version provider must be refused");
+        assert!(error.contains(cli_version));
+        assert!(error.contains(provider_version));
+        assert!(error.contains(cli_channel));
+        assert!(error.contains(provider_channel));
+        assert!(error.contains("before target authorization"));
+        assert!(error.contains("package upgrade"));
+    }
+}
+
+#[test]
+fn missing_provider_names_both_installation_channels_and_companion() {
+    let diagnostic = memcordon_platform::test_support::sealed_provider_installation_diagnostic();
+    for required in [
+        "sealed provider is not installed or reachable",
+        "provider endpoint unavailable",
+        "Cargo installation:",
+        "memcordon-sealed-agent package install",
+        "Native archive:",
+        "included beside this executable",
+    ] {
+        assert!(
+            diagnostic.contains(required),
+            "missing-provider diagnostic omitted {required}"
+        );
+    }
+}
+
 fn terminal(status: i32, exec_status: &str, os_code: &str) -> Vec<u8> {
     const CALLER_ENVELOPE_DIGEST: &str =
         "0000000000000000000000000000000000000000000000000000000000000000";

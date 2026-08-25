@@ -73,9 +73,9 @@ fn native_archive_markdown_links_reject_each_missing_sealed_document() {
     );
     assert_missing_document_link(
         Path::new("docs/sealed-provider.md"),
-        Path::new("docs/linux-sealed-certification.md"),
-        "sealed-provider.md",
-        "certification link to missing sealed provider document must fail",
+        Path::new("README.md"),
+        "docs/sealed-provider.md",
+        "top-level provider guide link to missing sealed provider document must fail",
     );
 }
 

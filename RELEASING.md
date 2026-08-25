@@ -5,6 +5,13 @@ Release through the OIDC-only workflow. The release is complete only when the
 public crates, assets, checksums, publication report, and credential-free
 verification all agree.
 
+The `memcordon` crate installs both `memcordon` and
+`memcordon-sealed-agent`; there is no fourth crate or trusted-publisher slot.
+Linux native archives contain those two binaries plus
+`runtime-manifest.json`. macOS and Windows archives contain only the CLI
+and mark the sealed runtime not applicable. Release schema 3, native asset
+report schema 2, and publication report schema 2 bind that exact inventory.
+
 Repository architecture, validation suites, and backend certification are
 described in [MAINTAINERS.md](MAINTAINERS.md). Record user-visible changes in
 [CHANGELOG.md](CHANGELOG.md).
@@ -46,6 +53,11 @@ inspection pass and the package graph, lockfiles, generated help, documentation,
 README rendering, and archive contents agree. Correct the release commit and
 repeat its CI and archive checks if they do not; do not defer a failure to the
 tag-triggered workflow.
+
+For the normalized `memcordon` archive, require `autobins = false`,
+exactly the CLI and sealed agent as default-install binaries, feature-gated test
+fixtures, the complete binary-private agent source tree, and no public agent
+library target.
 
 ## 2. Verify immutable inputs
 
@@ -91,6 +103,13 @@ stages a GitHub draft, publishes at most one crate per credential slot in
 dependency order, verifies public package content, uploads the deterministic
 publication report and native assets, publishes the GitHub Release, and runs
 credential-free public verification. Do not finalize the release manually.
+
+Native verification checks exact archive members, runtime-manifest identity,
+component order/modes/digests, CLI and agent versions, agent package inspection,
+and Linux sealed-provider installation from the bundled agent. Public Cargo
+verification installs the released `memcordon` crate into a fresh root,
+requires exactly both runtime binaries, and exercises the same version and
+inspection checks.
 
 Linux cgroup v2 and Windows Job Object certification runs on fresh
 GitHub-hosted VMs with the exact labels `ubuntu-24.04` and `windows-2025`.

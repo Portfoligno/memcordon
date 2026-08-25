@@ -213,6 +213,7 @@ struct LinuxSealedScenarioReport {
 #[serde(deny_unknown_fields)]
 struct LinuxQualificationReceipt {
     schema_version: u32,
+    version: String,
     mechanism: String,
     provider_identity: String,
     control_service_identity: String,
@@ -802,6 +803,7 @@ fn linux_provider_binding(directory: &Path) -> Result<LinuxProviderBinding> {
     let qualification_bytes = read_report(&directory.join("provider-qualification-v2.json"))?;
     let qualification: LinuxQualificationReceipt = serde_json::from_slice(&qualification_bytes)?;
     if qualification.schema_version != 2
+        || qualification.version != env!("CARGO_PKG_VERSION")
         || qualification.mechanism != "linux-pid-namespace-cgroup-v2"
         || qualification.provider_identity.is_empty()
         || qualification.receipt_digest.is_empty()

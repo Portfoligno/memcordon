@@ -10,14 +10,30 @@ description = "Cross-platform command memory containment and watchdog CLI"
 keywords = ["memory", "process", "cgroup", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 publish = ["crates-io"]
+autobins = false
 
 [features]
 test-fixtures = ["memcordon-platform/test-support"]
+test-support = ["memcordon-platform/test-support"]
+
+[[bin]]
+name = "memcordon"
+path = "src/main.rs"
+
+[[bin]]
+name = "memcordon-sealed-agent"
+path = "src/bin/memcordon-sealed-agent/main.rs"
+doc = false
 
 [[bin]]
 name = "memcordon-test-fixture"
 path = "src/bin/memcordon-test-fixture.rs"
 required-features = ["test-fixtures"]
+
+[[bin]]
+name = "memcordon-sealed-test-fixture"
+path = "src/bin/memcordon-sealed-test-fixture.rs"
+required-features = ["test-support"]
 
 [[bin]]
 name = "memcordon-embedding-fixture"
@@ -34,11 +50,15 @@ memcordon-core = { path = "../memcordon-core", version = "=0.5.2-dev" }
 memcordon-platform = { path = "../memcordon-platform", version = "=0.5.2-dev" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 memcordon-testkit = { path = "../memcordon-testkit" }
 tempfile.workspace = true
 toml.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

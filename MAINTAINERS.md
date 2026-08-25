@@ -137,6 +137,19 @@ required scenario with zero skips for the tagged commit.
 
 ## Release maintenance
 
+The published runtime remains three crates in dependency order:
+`memcordon-core`, `memcordon-platform`, and `memcordon`. The sealed
+agent is a binary-private module tree in the `memcordon` package, not a
+fourth crate or a public Rust API. Cargo installs two default runtime binaries.
+Linux native archives contain those same two binaries and a generated runtime
+manifest; non-Linux archives contain only the CLI.
+
+Release schema 3 binds each archive's runtime-manifest digest and exact
+component size, mode, role, and digest. Native asset report schema 2 records
+the exact member-inventory digest and smoke results. Publication report schema
+2 carries the same runtime inventory through credential-free public
+verification.
+
 The actionable release procedure and credential invariants live in
 [RELEASING.md](RELEASING.md). User-visible changes belong in
 [CHANGELOG.md](CHANGELOG.md), which is parsed by release tooling.

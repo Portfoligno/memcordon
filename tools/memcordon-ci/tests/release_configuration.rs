@@ -1,4 +1,4 @@
-use memcordon_ci::config::{self, Release};
+use memcordon_ci::config::{self, Release, SealedAssetPolicy};
 
 type ReleaseMutation = (&'static str, fn(&mut Release));
 
@@ -65,7 +65,7 @@ fn canonical_release_identity_accepts_only_supported_values() {
 #[test]
 fn canonical_release_targets_match_native_hosts() {
     let release = canonical_release();
-    let actual: Vec<(&str, &str, &str, &str)> = release
+    let actual: Vec<(&str, &str, &str, bool, Vec<&str>)> = release
         .assets
         .target
         .iter()
@@ -74,7 +74,12 @@ fn canonical_release_targets_match_native_hosts() {
                 target.id.as_str(),
                 target.rust_target.as_str(),
                 target.archive.as_str(),
-                target.executable.as_str(),
+                target.sealed == SealedAssetPolicy::Included,
+                target
+                    .executable
+                    .iter()
+                    .map(|component| component.archive_path.as_str())
+                    .collect(),
             )
         })
         .collect();
@@ -85,27 +90,43 @@ fn canonical_release_targets_match_native_hosts() {
                 "linux-x64",
                 "x86_64-unknown-linux-gnu",
                 "tar-gz",
-                "memcordon",
+                true,
+                vec!["memcordon", "memcordon-sealed-agent"],
             ),
             (
                 "linux-arm64",
                 "aarch64-unknown-linux-gnu",
                 "tar-gz",
-                "memcordon",
+                true,
+                vec!["memcordon", "memcordon-sealed-agent"],
             ),
-            ("macos-arm64", "aarch64-apple-darwin", "tar-gz", "memcordon",),
-            ("macos-x64", "x86_64-apple-darwin", "tar-gz", "memcordon",),
+            (
+                "macos-arm64",
+                "aarch64-apple-darwin",
+                "tar-gz",
+                false,
+                vec!["memcordon"],
+            ),
+            (
+                "macos-x64",
+                "x86_64-apple-darwin",
+                "tar-gz",
+                false,
+                vec!["memcordon"],
+            ),
             (
                 "windows-x64",
                 "x86_64-pc-windows-msvc",
                 "zip",
-                "memcordon.exe",
+                false,
+                vec!["memcordon.exe"],
             ),
             (
                 "windows-arm64",
                 "aarch64-pc-windows-msvc",
                 "zip",
-                "memcordon.exe",
+                false,
+                vec!["memcordon.exe"],
             ),
         ]
     );

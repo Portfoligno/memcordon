@@ -4,6 +4,8 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::{CiError, Result};
 
+pub const RUNTIME_MANIFEST: &str = "runtime-manifest.json";
+
 pub const NATIVE_ARCHIVE_STATIC_PATHS: &[&str] = &[
     "README.md",
     "LICENSE",

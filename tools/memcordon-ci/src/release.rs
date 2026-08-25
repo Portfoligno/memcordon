@@ -17,11 +17,14 @@ use tempfile::TempDir;
 use walkdir::WalkDir;
 
 use memcordon_ci::capability;
-use memcordon_ci::release_archive::{NATIVE_ARCHIVE_STATIC_PATHS, validate_markdown_documents};
+use memcordon_ci::release_archive::{
+    NATIVE_ARCHIVE_STATIC_PATHS, RUNTIME_MANIFEST, validate_markdown_documents,
+};
 use memcordon_ci::release_evidence::{CertificationRecord, collect_certification};
+use memcordon_ci::runtime_manifest::{RuntimeComponentRecord, RuntimeManifestV1, SealedRuntimeV1};
 
 use crate::command::{CommandSpec, git, rustup_cargo};
-use crate::config::{self, AssetTarget};
+use crate::config::{self, AssetTarget, RuntimeComponentRole, SealedAssetPolicy};
 use crate::{CiError, ReleasePhase, Result};
 
 const RELEASE_DEADLINE: Duration = Duration::from_secs(30 * 60);
@@ -126,6 +129,8 @@ struct AssetRecord {
     target: String,
     size: u64,
     sha256: String,
+    runtime_manifest_sha256: String,
+    components: Vec<RuntimeComponentRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -134,6 +139,41 @@ struct NativeAssetReport {
     tag: String,
     source_commit: String,
     asset: AssetRecord,
+    archive_member_inventory_sha256: String,
+    smoke: NativeSmokeReport,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct NativeSmokeReport {
+    cli_version: bool,
+    doctor: bool,
+    agent_version: Option<bool>,
+    agent_inspection: Option<bool>,
+    provider_install: Option<bool>,
+    provider_verify: Option<bool>,
+    provider_qualification: Option<bool>,
+    sealed_execution: Option<bool>,
+    provider_uninstall: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPackageInspection {
+    schema_version: u32,
+    version: String,
+    source_commit: String,
+    executable_sha256: String,
+    provider_protocol: u32,
+    mechanism: String,
+    execution_report_schema: u32,
+    plan_report_schema: u32,
+    doctor_report_schema: u32,
+    control_service_sha256: String,
+    control_socket_sha256: String,
+    launcher_service_sha256: String,
+    launcher_socket_sha256: String,
+    tmpfiles_sha256: String,
+    compiled_metadata_valid: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -183,6 +223,8 @@ struct PublicAssetRecord {
     name: String,
     size: u64,
     sha256: String,
+    runtime_manifest_sha256: Option<String>,
+    components: Vec<RuntimeComponentRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -570,6 +612,12 @@ pub fn validate_packages(root: &Path) -> Result<()> {
             verify_public_crate(&release, &record)?;
         }
     }
+    smoke_packaged_memcordon_install(
+        root,
+        &toolchains.stable,
+        &identity.version,
+        &identity.commit,
+    )?;
     Ok(())
 }
 
@@ -646,6 +694,169 @@ fn validate_crate_readme(path: &Path, package: &str) -> Result<()> {
         .get(&readme)
         .ok_or_else(|| failure(format!("{package} normalized README is absent")))?;
     validate_markdown_documents(&documents)
+}
+
+fn validate_memcordon_crate_distribution(path: &Path) -> Result<()> {
+    let decoder = GzDecoder::new(File::open(path)?);
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = BTreeSet::new();
+    let mut manifest = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let normalized = normalized_member_path(&entry.path()?)?;
+        if normalized == Path::new("Cargo.toml") {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            manifest = Some(toml::from_str::<toml::Value>(
+                std::str::from_utf8(&bytes)
+                    .map_err(|_| failure("normalized memcordon Cargo.toml is not UTF-8"))?,
+            )?);
+        }
+        files.insert(normalized);
+    }
+    for required in [
+        "Cargo.toml",
+        "Cargo.toml.orig",
+        "Cargo.lock",
+        "src/lib.rs",
+        "src/main.rs",
+        "src/bin/memcordon-sealed-agent/main.rs",
+        "src/bin/memcordon-sealed-agent/package.rs",
+        "src/bin/memcordon-sealed-agent/protocol.rs",
+        "src/bin/memcordon-sealed-agent/linux/mod.rs",
+    ] {
+        if !files.contains(Path::new(required)) {
+            return Err(failure(format!(
+                "memcordon crate archive omits required runtime source: {required}"
+            )));
+        }
+    }
+    let manifest = manifest.ok_or_else(|| failure("memcordon crate manifest is absent"))?;
+    if manifest
+        .get("package")
+        .and_then(|value| value.get("autobins"))
+        .and_then(toml::Value::as_bool)
+        != Some(false)
+    {
+        return Err(failure(
+            "memcordon crate does not disable automatic binaries",
+        ));
+    }
+    let bins = manifest
+        .get("bin")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| failure("memcordon crate has no explicit binary inventory"))?;
+    let actual_bins = bins
+        .iter()
+        .map(|bin| {
+            let features = bin
+                .get("required-features")
+                .and_then(toml::Value::as_array)
+                .map(|features| {
+                    features
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (
+                bin.get("name").and_then(toml::Value::as_str),
+                bin.get("path").and_then(toml::Value::as_str),
+                bin.get("doc").and_then(toml::Value::as_bool),
+                features,
+            )
+        })
+        .collect::<Vec<_>>();
+    if actual_bins
+        != [
+            (Some("memcordon"), Some("src/main.rs"), None, vec![]),
+            (
+                Some("memcordon-sealed-agent"),
+                Some("src/bin/memcordon-sealed-agent/main.rs"),
+                Some(false),
+                vec![],
+            ),
+            (
+                Some("memcordon-test-fixture"),
+                Some("src/bin/memcordon-test-fixture.rs"),
+                None,
+                vec!["test-fixtures"],
+            ),
+            (
+                Some("memcordon-sealed-test-fixture"),
+                Some("src/bin/memcordon-sealed-test-fixture.rs"),
+                None,
+                vec!["test-support"],
+            ),
+            (
+                Some("memcordon-embedding-fixture"),
+                Some("src/bin/memcordon-embedding-fixture.rs"),
+                None,
+                vec!["test-fixtures"],
+            ),
+        ]
+    {
+        return Err(failure(
+            "memcordon crate binary inventory differs from the exact reviewed set",
+        ));
+    }
+    let default_bins = bins
+        .iter()
+        .filter(|bin| bin.get("required-features").is_none())
+        .map(|bin| {
+            (
+                bin.get("name").and_then(toml::Value::as_str),
+                bin.get("path").and_then(toml::Value::as_str),
+                bin.get("doc").and_then(toml::Value::as_bool),
+            )
+        })
+        .collect::<Vec<_>>();
+    if default_bins
+        != [
+            (Some("memcordon"), Some("src/main.rs"), None),
+            (
+                Some("memcordon-sealed-agent"),
+                Some("src/bin/memcordon-sealed-agent/main.rs"),
+                Some(false),
+            ),
+        ]
+    {
+        return Err(failure(
+            "memcordon crate default binary inventory is not CLI plus sealed agent",
+        ));
+    }
+    if bins.iter().any(|bin| {
+        bin.get("required-features").is_none()
+            && !matches!(
+                bin.get("name").and_then(toml::Value::as_str),
+                Some("memcordon" | "memcordon-sealed-agent")
+            )
+    }) {
+        return Err(failure(
+            "memcordon crate contains an unexpected default-install binary",
+        ));
+    }
+    for table in ["dependencies", "build-dependencies"] {
+        if manifest
+            .get(table)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|dependencies| {
+                dependencies.values().any(|dependency| {
+                    dependency
+                        .as_table()
+                        .is_some_and(|specification| specification.contains_key("path"))
+                })
+            })
+        {
+            return Err(failure(format!(
+                "memcordon normalized crate retains a workspace path in {table}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn canonical_crate_tree(path: &Path) -> Result<String> {
@@ -917,6 +1128,9 @@ fn package_crate(
         )));
     }
     validate_crate_readme(&archive, package)?;
+    if package == "memcordon" {
+        validate_memcordon_crate_distribution(&archive)?;
+    }
     let archive_sha256 = sha256_file(&archive)?;
     Ok(CrateRecord {
         name: package.to_owned(),
@@ -939,6 +1153,207 @@ fn create_package_archives(root: &Path, stable: &str, packages: &[String]) -> Re
         arguments.push(OsString::from(package));
     }
     rustup_cargo(root, stable, arguments, RELEASE_DEADLINE).run()?;
+    Ok(())
+}
+
+fn extract_crate_source(archive_path: &Path, destination: &Path) -> Result<()> {
+    let decoder = GzDecoder::new(File::open(archive_path)?);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let relative = normalized_member_path(&entry.path()?)?;
+        let output = destination.join(relative);
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(&output)?;
+        } else if entry.header().entry_type().is_file() {
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = File::create(output)?;
+            std::io::copy(&mut entry, &mut file)?;
+        } else {
+            return Err(failure("crate archive contains a non-file member"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_agent_package_inspection(
+    output: &[u8],
+    expected_version: &str,
+    expected_source_commit: &str,
+) -> Result<()> {
+    let inspection: AgentPackageInspection = serde_json::from_slice(output)?;
+    let sha256_text_length = sha256_bytes(&[]).len();
+    let digests = [
+        &inspection.executable_sha256,
+        &inspection.control_service_sha256,
+        &inspection.control_socket_sha256,
+        &inspection.launcher_service_sha256,
+        &inspection.launcher_socket_sha256,
+        &inspection.tmpfiles_sha256,
+    ];
+    let digests_valid = digests.iter().all(|digest| {
+        digest.len() == sha256_text_length
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    if inspection.schema_version != 1
+        || inspection.version != expected_version
+        || inspection.source_commit != expected_source_commit
+        || inspection.provider_protocol != 2
+        || inspection.mechanism != "linux-pid-namespace-cgroup-v2"
+        || inspection.execution_report_schema != memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION
+        || inspection.plan_report_schema != memcordon_core::PLAN_REPORT_SCHEMA_VERSION
+        || inspection.doctor_report_schema != memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION
+        || !inspection.compiled_metadata_valid
+        || !digests_valid
+    {
+        return Err(failure(
+            "sealed agent package inspection differs from the release identity",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_component_version(
+    executable: &Path,
+    component_name: &str,
+    expected_version: &str,
+    root: &Path,
+) -> Result<()> {
+    let output = CommandSpec::new(executable, root, Duration::from_secs(30))
+        .arg("--version")
+        .run()?;
+    let expected = format!("{component_name} {expected_version}\n");
+    if output != expected.as_bytes() {
+        return Err(failure(format!(
+            "{component_name} reports a version other than the release identity"
+        )));
+    }
+    Ok(())
+}
+
+fn smoke_packaged_memcordon_install(
+    root: &Path,
+    stable: &str,
+    version: &Version,
+    source_commit: &str,
+) -> Result<()> {
+    let temporary = TempDir::new()?;
+    let sources = temporary.path().join("sources");
+    let core = sources.join("memcordon-core");
+    let platform = sources.join("memcordon-platform");
+    let cli = sources.join("memcordon");
+    for (package, destination) in [
+        ("memcordon-core", &core),
+        ("memcordon-platform", &platform),
+        ("memcordon", &cli),
+    ] {
+        let archive = root
+            .join("target")
+            .join("package")
+            .join(format!("{package}-{version}.crate"));
+        extract_crate_source(&archive, destination)?;
+    }
+    let cargo_configuration = temporary.path().join(".cargo");
+    fs::create_dir_all(&cargo_configuration)?;
+    let mut core_specification = toml::Table::new();
+    core_specification.insert(
+        "path".to_owned(),
+        toml::Value::String(core.to_string_lossy().into_owned()),
+    );
+    let mut platform_specification = toml::Table::new();
+    platform_specification.insert(
+        "path".to_owned(),
+        toml::Value::String(platform.to_string_lossy().into_owned()),
+    );
+    let mut crates_io = toml::Table::new();
+    crates_io.insert(
+        "memcordon-core".to_owned(),
+        toml::Value::Table(core_specification),
+    );
+    crates_io.insert(
+        "memcordon-platform".to_owned(),
+        toml::Value::Table(platform_specification),
+    );
+    let mut patch_table = toml::Table::new();
+    patch_table.insert("crates-io".to_owned(), toml::Value::Table(crates_io));
+    let mut configuration = toml::Table::new();
+    configuration.insert("patch".to_owned(), toml::Value::Table(patch_table));
+    fs::write(
+        cargo_configuration.join("config.toml"),
+        toml::to_string(&toml::Value::Table(configuration)).map_err(|error| {
+            failure(format!(
+                "packaged-source Cargo configuration serialization failed: {error}"
+            ))
+        })?,
+    )?;
+    let install_root = temporary.path().join("install");
+    rustup_cargo(
+        temporary.path(),
+        stable,
+        [
+            OsString::from("install"),
+            OsString::from("--locked"),
+            OsString::from("--root"),
+            install_root.clone().into_os_string(),
+            OsString::from("--path"),
+            cli.into_os_string(),
+        ],
+        RELEASE_DEADLINE,
+    )
+    .run()?;
+    let binaries = install_root.join("bin");
+    let cli_name = if cfg!(windows) {
+        "memcordon.exe"
+    } else {
+        "memcordon"
+    };
+    let agent_name = if cfg!(windows) {
+        "memcordon-sealed-agent.exe"
+    } else {
+        "memcordon-sealed-agent"
+    };
+    let actual = fs::read_dir(&binaries)?
+        .map(|entry| entry.map(|entry| entry.file_name()).map_err(CiError::from))
+        .collect::<Result<BTreeSet<_>>>()?;
+    let expected = BTreeSet::from([OsString::from(cli_name), OsString::from(agent_name)]);
+    if actual != expected {
+        return Err(failure(format!(
+            "packaged-source Cargo install binary inventory differs: expected={expected:?} actual={actual:?}"
+        )));
+    }
+    let installed_cli = binaries.join(cli_name);
+    let installed_agent = binaries.join(agent_name);
+    let expected_version = version.to_string();
+    verify_component_version(&installed_cli, "memcordon", &expected_version, root)?;
+    verify_component_version(
+        &installed_agent,
+        "memcordon-sealed-agent",
+        &expected_version,
+        root,
+    )?;
+    let inspection = CommandSpec::new(&installed_agent, root, Duration::from_secs(30))
+        .args(["package", "inspect", "--json"])
+        .run()?;
+    validate_agent_package_inspection(&inspection, &expected_version, source_commit)?;
+    #[cfg(target_os = "linux")]
+    {
+        let mut smoke = NativeSmokeReport {
+            cli_version: true,
+            doctor: true,
+            agent_version: Some(true),
+            agent_inspection: Some(true),
+            provider_install: None,
+            provider_verify: None,
+            provider_qualification: None,
+            sealed_execution: None,
+            provider_uninstall: None,
+        };
+        smoke_linux_provider(&installed_cli, &installed_agent, root, &mut smoke)?;
+    }
     Ok(())
 }
 
@@ -977,22 +1392,113 @@ fn append_tar_file(
     Ok(())
 }
 
-fn build_archive(root: &Path, identity: &ReleaseIdentity, target: &AssetTarget) -> Result<PathBuf> {
-    let output = root.join("target").join("ci").join("release-output");
-    fs::create_dir_all(&output)?;
-    let path = output.join(archive_name(&identity.version, target));
-    let executable = root
-        .join("target")
+struct BuiltArchive {
+    path: PathBuf,
+    runtime_manifest_sha256: String,
+    components: Vec<RuntimeComponentRecord>,
+}
+
+fn built_executable_path(
+    root: &Path,
+    target: &AssetTarget,
+    component: &config::AssetExecutable,
+) -> PathBuf {
+    let mut binary = PathBuf::from(&component.binary);
+    if target.archive == "zip" {
+        binary.set_extension("exe");
+    }
+    root.join("target")
         .join("ci")
         .join("release-native")
         .join(&target.rust_target)
         .join("release")
-        .join(&target.executable);
+        .join(binary)
+}
+
+fn runtime_component_id(role: RuntimeComponentRole) -> &'static str {
+    match role {
+        RuntimeComponentRole::PublicCli => "public-cli",
+        RuntimeComponentRole::SealedAgent => "sealed-agent",
+    }
+}
+
+fn runtime_components(root: &Path, target: &AssetTarget) -> Result<Vec<RuntimeComponentRecord>> {
+    target
+        .executable
+        .iter()
+        .map(|component| {
+            let source = built_executable_path(root, target, component);
+            Ok(RuntimeComponentRecord {
+                id: runtime_component_id(component.role).to_owned(),
+                path: component.archive_path.clone(),
+                role: component.role,
+                size: fs::metadata(&source)?.len(),
+                mode: component.mode,
+                sha256: sha256_file(&source)?,
+            })
+        })
+        .collect()
+}
+
+fn runtime_manifest(
+    identity: &ReleaseIdentity,
+    target: &AssetTarget,
+    components: Vec<RuntimeComponentRecord>,
+) -> RuntimeManifestV1 {
+    let sealed = match target.sealed {
+        SealedAssetPolicy::Included => SealedRuntimeV1::Included {
+            agent_component: "sealed-agent".to_owned(),
+            provider_protocol: 2,
+            mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
+            execution_report_schema: memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
+            plan_report_schema: memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
+            doctor_report_schema: memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
+            qualification_schema: 2,
+        },
+        SealedAssetPolicy::NotApplicable => SealedRuntimeV1::NotApplicable {
+            reason: "the packaged sealed provider is available only on Linux".to_owned(),
+        },
+    };
+    RuntimeManifestV1 {
+        schema_version: 1,
+        project: "memcordon".to_owned(),
+        version: identity.version.to_string(),
+        source_commit: identity.commit.clone(),
+        target: target.rust_target.clone(),
+        components,
+        sealed,
+    }
+}
+
+fn build_archive(
+    root: &Path,
+    identity: &ReleaseIdentity,
+    target: &AssetTarget,
+) -> Result<BuiltArchive> {
+    let output = root.join("target").join("ci").join("release-output");
+    fs::create_dir_all(&output)?;
+    let path = output.join(archive_name(&identity.version, target));
+    let components = runtime_components(root, target)?;
+    let manifest = runtime_manifest(identity, target, components.clone());
+    let manifest_path = output.join(format!("runtime-manifest-{}.json", target.id));
+    write_json(&manifest_path, &manifest)?;
+    let runtime_manifest_sha256 = sha256_file(&manifest_path)?;
     let top = PathBuf::from(format!(
         "memcordon-v{}-{}",
         identity.version, target.rust_target
     ));
-    let mut entries = vec![(executable, PathBuf::from(&target.executable), 0o755)];
+    let mut entries = target
+        .executable
+        .iter()
+        .map(|component| {
+            (
+                built_executable_path(root, target, component),
+                PathBuf::from(&component.archive_path),
+                component.mode,
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.push((manifest_path, PathBuf::from(RUNTIME_MANIFEST), 0o644));
     entries.extend(NATIVE_ARCHIVE_STATIC_PATHS.iter().map(|relative| {
         let relative = PathBuf::from(*relative);
         (root.join(&relative), relative, 0o644)
@@ -1022,7 +1528,11 @@ fn build_archive(root: &Path, identity: &ReleaseIdentity, target: &AssetTarget) 
         let encoder = builder.into_inner()?;
         encoder.finish()?;
     }
-    Ok(path)
+    Ok(BuiltArchive {
+        path,
+        runtime_manifest_sha256,
+        components,
+    })
 }
 
 fn safe_archive_path(path: &Path) -> Result<PathBuf> {
@@ -1036,15 +1546,23 @@ fn safe_archive_path(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+struct ArchiveInspection {
+    runtime_manifest_sha256: String,
+    components: Vec<RuntimeComponentRecord>,
+    archive_member_inventory_sha256: String,
+    smoke: NativeSmokeReport,
+}
+
 fn inspect_extract_and_smoke(
     root: &Path,
     archive_path: &Path,
     target: &AssetTarget,
-    version: &Version,
+    identity: &ReleaseIdentity,
     execute: bool,
-) -> Result<()> {
+) -> Result<ArchiveInspection> {
     let temporary = TempDir::new()?;
     let mut extracted_files = BTreeSet::new();
+    let mut archive_modes = BTreeMap::new();
     if target.archive == "zip" {
         let mut archive = zip::ZipArchive::new(File::open(archive_path)?)?;
         for index in 0..archive.len() {
@@ -1062,6 +1580,13 @@ fn inspect_extract_and_smoke(
                 }
                 let mut output = File::create(&destination)?;
                 std::io::copy(&mut entry, &mut output)?;
+                archive_modes.insert(
+                    relative.clone(),
+                    entry
+                        .unix_mode()
+                        .ok_or_else(|| failure("ZIP archive member has no Unix mode"))?
+                        & 0o7777,
+                );
                 extracted_files.insert(relative);
             } else {
                 return Err(failure("ZIP archive contains a non-file member"));
@@ -1082,14 +1607,23 @@ fn inspect_extract_and_smoke(
                 }
                 let mut output = File::create(&destination)?;
                 std::io::copy(&mut entry, &mut output)?;
+                archive_modes.insert(relative.clone(), entry.header().mode()? & 0o7777);
                 extracted_files.insert(relative);
             } else {
                 return Err(failure("tar archive contains a non-file member"));
             }
         }
     }
-    let top = PathBuf::from(format!("memcordon-v{version}-{}", target.rust_target));
-    let mut expected = BTreeSet::from([top.join(&target.executable)]);
+    let top = PathBuf::from(format!(
+        "memcordon-v{}-{}",
+        identity.version, target.rust_target
+    ));
+    let mut expected = target
+        .executable
+        .iter()
+        .map(|component| top.join(&component.archive_path))
+        .collect::<BTreeSet<_>>();
+    expected.insert(top.join(RUNTIME_MANIFEST));
     expected.extend(
         NATIVE_ARCHIVE_STATIC_PATHS
             .iter()
@@ -1099,6 +1633,41 @@ fn inspect_extract_and_smoke(
         return Err(failure(format!(
             "release archive member set differs: expected={expected:?} actual={extracted_files:?}"
         )));
+    }
+    for component in &target.executable {
+        let archive_path = top.join(&component.archive_path);
+        if archive_modes.get(&archive_path) != Some(&component.mode) {
+            return Err(failure(format!(
+                "runtime component mode differs: {}",
+                component.archive_path
+            )));
+        }
+    }
+    let manifest_path = temporary.path().join(&top).join(RUNTIME_MANIFEST);
+    if archive_modes.get(&top.join(RUNTIME_MANIFEST)) != Some(&0o644) {
+        return Err(failure("runtime manifest archive mode differs"));
+    }
+    let manifest_bytes = fs::read(&manifest_path)?;
+    if !manifest_bytes.ends_with(b"\n") {
+        return Err(failure("runtime manifest is not newline terminated"));
+    }
+    let manifest: RuntimeManifestV1 = serde_json::from_slice(&manifest_bytes)?;
+    let mut components = Vec::new();
+    for configured in &target.executable {
+        let path = temporary.path().join(&top).join(&configured.archive_path);
+        components.push(RuntimeComponentRecord {
+            id: runtime_component_id(configured.role).to_owned(),
+            path: configured.archive_path.clone(),
+            role: configured.role,
+            size: fs::metadata(&path)?.len(),
+            mode: configured.mode,
+            sha256: sha256_file(&path)?,
+        });
+    }
+    if manifest != runtime_manifest(identity, target, components.clone()) {
+        return Err(failure(
+            "runtime manifest identity or component inventory differs",
+        ));
     }
     let mut documents = BTreeMap::new();
     for path in &extracted_files {
@@ -1111,7 +1680,12 @@ fn inspect_extract_and_smoke(
         );
     }
     validate_markdown_documents(&documents)?;
-    let executable = temporary.path().join(top).join(&target.executable);
+    let public = target
+        .executable
+        .iter()
+        .find(|component| component.role == RuntimeComponentRole::PublicCli)
+        .ok_or_else(|| failure("runtime archive has no public CLI component"))?;
+    let executable = temporary.path().join(&top).join(&public.archive_path);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1119,13 +1693,156 @@ fn inspect_extract_and_smoke(
         permissions.set_mode(0o755);
         fs::set_permissions(&executable, permissions)?;
     }
+    let mut smoke = NativeSmokeReport {
+        cli_version: false,
+        doctor: false,
+        agent_version: None,
+        agent_inspection: None,
+        provider_install: None,
+        provider_verify: None,
+        provider_qualification: None,
+        sealed_execution: None,
+        provider_uninstall: None,
+    };
     if execute {
-        CommandSpec::new(&executable, root, Duration::from_secs(30))
-            .arg("--version")
-            .run()?;
+        let expected_version = identity.version.to_string();
+        verify_component_version(&executable, "memcordon", &expected_version, root)?;
+        smoke.cli_version = true;
         CommandSpec::new(&executable, root, Duration::from_secs(30))
             .args(["doctor", "--json"])
             .run()?;
+        smoke.doctor = true;
+        if let Some(agent) = target
+            .executable
+            .iter()
+            .find(|component| component.role == RuntimeComponentRole::SealedAgent)
+        {
+            let agent_executable = temporary.path().join(&top).join(&agent.archive_path);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = fs::metadata(&agent_executable)?.permissions();
+                permissions.set_mode(agent.mode);
+                fs::set_permissions(&agent_executable, permissions)?;
+            }
+            verify_component_version(
+                &agent_executable,
+                "memcordon-sealed-agent",
+                &expected_version,
+                root,
+            )?;
+            smoke.agent_version = Some(true);
+            let output = CommandSpec::new(&agent_executable, root, Duration::from_secs(30))
+                .args(["package", "inspect", "--json"])
+                .run()?;
+            validate_agent_package_inspection(&output, &expected_version, &identity.commit)?;
+            smoke.agent_inspection = Some(true);
+            #[cfg(target_os = "linux")]
+            smoke_linux_provider(&executable, &agent_executable, root, &mut smoke)?;
+        }
+    }
+    let mut inventory = Sha256::new();
+    for path in &extracted_files {
+        inventory.update(path.to_string_lossy().as_bytes());
+        inventory.update([0]);
+        inventory.update(
+            archive_modes
+                .get(path)
+                .ok_or_else(|| failure("archive member mode is missing"))?
+                .to_le_bytes(),
+        );
+        inventory.update(sha256_file(&temporary.path().join(path))?.as_bytes());
+    }
+    Ok(ArchiveInspection {
+        runtime_manifest_sha256: sha256_bytes(&manifest_bytes),
+        components,
+        archive_member_inventory_sha256: hex::encode(inventory.finalize()),
+        smoke,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn smoke_linux_provider(
+    cli: &Path,
+    agent: &Path,
+    root: &Path,
+    smoke: &mut NativeSmokeReport,
+) -> Result<()> {
+    let privileged_agent = |arguments: &[&str]| {
+        let mut command = vec![agent.as_os_str().to_os_string()];
+        command.extend(arguments.iter().map(OsString::from));
+        CommandSpec::new("sudo", root, RELEASE_DEADLINE)
+            .args(command)
+            .run()
+            .map(|_| ())
+    };
+    let primary: Result<()> = (|| {
+        privileged_agent(&["package", "install", "--ephemeral-ci"])?;
+        smoke.provider_install = Some(true);
+        privileged_agent(&["package", "verify", "--json"])?;
+        smoke.provider_verify = Some(true);
+        privileged_agent(&["qualify"])?;
+        smoke.provider_qualification = Some(true);
+        CommandSpec::new(cli, root, RELEASE_DEADLINE)
+            .args(["doctor", "--require", "sealed"])
+            .run()?;
+        CommandSpec::new(cli, root, RELEASE_DEADLINE)
+            .args(["--sealed", "--", "/usr/bin/true"])
+            .run()?;
+        smoke.sealed_execution = Some(true);
+        Ok(())
+    })();
+    let uninstall = privileged_agent(&["package", "uninstall", "--ephemeral-ci"])
+        .and_then(|()| verify_linux_provider_absent());
+    if uninstall.is_ok() {
+        smoke.provider_uninstall = Some(true);
+    }
+    match (primary, uninstall) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(failure(format!(
+            "Linux bundle provider smoke failed: primary={primary}; cleanup={cleanup}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_linux_provider_absent() -> Result<()> {
+    verify_absent_paths([
+        Path::new("/usr/libexec/memcordon-sealed-agent"),
+        Path::new("/usr/lib/systemd/system/memcordon-sealed-agent.service"),
+        Path::new("/usr/lib/systemd/system/memcordon-sealed-agent.socket"),
+        Path::new("/usr/lib/systemd/system/memcordon-sealed-launcher.service"),
+        Path::new("/usr/lib/systemd/system/memcordon-sealed-launcher.socket"),
+        Path::new("/usr/lib/tmpfiles.d/memcordon.conf"),
+        Path::new("/run/memcordon/sealed-agent.sock"),
+        Path::new("/run/memcordon/sealed-launcher.sock"),
+        Path::new("/run/memcordon/sealed-package.lock"),
+        Path::new("/run/memcordon"),
+        Path::new("/var/lib/memcordon/sealed"),
+        Path::new("/sys/fs/cgroup/memcordon-sealed"),
+    ])
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn verify_absent_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<()> {
+    for path in paths {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(failure(format!(
+                    "Linux provider uninstall left residual state at {}",
+                    path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(failure(format!(
+                    "Linux provider uninstall state proof failed for {}: {error}",
+                    path.display()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1183,62 +1900,83 @@ pub fn native_asset(root: &Path) -> Result<()> {
             "release-native backend-dependent stress is unavailable on this runner; required dedicated backend certification remains authoritative: {probe}"
         );
     }
-    let arguments = vec![
-        OsString::from("build"),
-        OsString::from("--target-dir"),
-        release_target.into_os_string(),
-        OsString::from("--package"),
-        OsString::from("memcordon"),
-        OsString::from("--release"),
-        OsString::from("--locked"),
-        OsString::from("--target"),
-        OsString::from(&target.rust_target),
-    ];
-    rustup_cargo(root, &toolchains.stable, arguments, RELEASE_DEADLINE).run()?;
-    let executable = root
-        .join("target")
-        .join("ci")
-        .join("release-native")
-        .join(&target.rust_target)
-        .join("release")
-        .join(&target.executable);
-    CommandSpec::new(&executable, root, Duration::from_secs(30))
-        .arg("--version")
-        .run()?;
-    CommandSpec::new(&executable, root, Duration::from_secs(30))
-        .args(["doctor", "--json"])
-        .run()?;
-    let archive = build_archive(root, &identity, target)?;
-    if fs::metadata(&archive)?.len() > release.maximum_asset_bytes {
+    for component in &target.executable {
+        let arguments = vec![
+            OsString::from("build"),
+            OsString::from("--target-dir"),
+            release_target.clone().into_os_string(),
+            OsString::from("--package"),
+            OsString::from(&component.package),
+            OsString::from("--bin"),
+            OsString::from(&component.binary),
+            OsString::from("--release"),
+            OsString::from("--locked"),
+            OsString::from("--target"),
+            OsString::from(&target.rust_target),
+        ];
+        rustup_cargo(root, &toolchains.stable, arguments, RELEASE_DEADLINE).run()?;
+        let executable = built_executable_path(root, target, component);
+        verify_component_version(
+            &executable,
+            &component.binary,
+            &identity.version.to_string(),
+            root,
+        )?;
+        match component.role {
+            RuntimeComponentRole::PublicCli => {
+                CommandSpec::new(&executable, root, Duration::from_secs(30))
+                    .args(["doctor", "--json"])
+                    .run()?;
+            }
+            RuntimeComponentRole::SealedAgent => {
+                CommandSpec::new(&executable, root, Duration::from_secs(30))
+                    .args(["package", "inspect", "--json"])
+                    .run()?;
+            }
+        }
+    }
+    let built = build_archive(root, &identity, target)?;
+    if fs::metadata(&built.path)?.len() > release.maximum_asset_bytes {
         return Err(failure(
             "native release archive exceeds configured size policy",
         ));
     }
-    inspect_extract_and_smoke(root, &archive, target, &identity.version, true)?;
+    let inspection = inspect_extract_and_smoke(root, &built.path, target, &identity, true)?;
+    if inspection.runtime_manifest_sha256 != built.runtime_manifest_sha256
+        || inspection.components != built.components
+    {
+        return Err(failure("built archive runtime inventory differs"));
+    }
     let asset = AssetRecord {
-        name: archive
+        name: built
+            .path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| failure("archive name is not UTF-8"))?
             .to_owned(),
         target: target.rust_target.clone(),
-        size: fs::metadata(&archive)?.len(),
-        sha256: sha256_file(&archive)?,
+        size: fs::metadata(&built.path)?.len(),
+        sha256: sha256_file(&built.path)?,
+        runtime_manifest_sha256: inspection.runtime_manifest_sha256,
+        components: inspection.components,
     };
     let report = NativeAssetReport {
-        schema_version: 1,
+        schema_version: 2,
         tag: identity.tag,
         source_commit: identity.commit,
         asset,
+        archive_member_inventory_sha256: inspection.archive_member_inventory_sha256,
+        smoke: inspection.smoke,
     };
     let report_name = format!(
         "{}.json",
-        archive
+        built
+            .path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| failure("archive name is not UTF-8"))?
     );
-    write_json(&archive.with_file_name(report_name), &report)?;
+    write_json(&built.path.with_file_name(report_name), &report)?;
     Ok(())
 }
 
@@ -1285,12 +2023,14 @@ fn copy_release_inputs(
         if fs::metadata(&destination)?.len() > maximum_asset_bytes {
             return Err(failure(format!("release input is too large: {name}")));
         }
-        inspect_extract_and_smoke(root, &destination, target, &identity.version, false)?;
+        let inspection = inspect_extract_and_smoke(root, &destination, target, identity, false)?;
         let asset = AssetRecord {
             name,
             target: target.rust_target.clone(),
             size: fs::metadata(&destination)?.len(),
             sha256: sha256_file(&destination)?,
+            runtime_manifest_sha256: inspection.runtime_manifest_sha256,
+            components: inspection.components,
         };
         let report_name = format!("{}.json", asset.name);
         let reports: Vec<PathBuf> = WalkDir::new(&input)
@@ -1308,10 +2048,21 @@ fn copy_release_inputs(
             )));
         }
         let report: NativeAssetReport = serde_json::from_slice(&fs::read(&reports[0])?)?;
-        if report.schema_version != 1
+        let expected_agent_smoke = (target.sealed == SealedAssetPolicy::Included).then_some(true);
+        if report.schema_version != 2
             || report.tag != identity.tag
             || report.source_commit != identity.commit
             || report.asset != asset
+            || !report.smoke.cli_version
+            || !report.smoke.doctor
+            || report.smoke.agent_version != expected_agent_smoke
+            || report.smoke.agent_inspection != expected_agent_smoke
+            || report.smoke.provider_install != expected_agent_smoke
+            || report.smoke.provider_verify != expected_agent_smoke
+            || report.smoke.provider_qualification != expected_agent_smoke
+            || report.smoke.sealed_execution != expected_agent_smoke
+            || report.smoke.provider_uninstall != expected_agent_smoke
+            || report.archive_member_inventory_sha256 != inspection.archive_member_inventory_sha256
         {
             return Err(failure(format!(
                 "native report identity differs for {}",
@@ -1808,6 +2559,7 @@ fn public_asset_records(
     release: &config::Release,
     remote: &serde_json::Value,
     paths: &[PathBuf],
+    manifest_assets: &[AssetRecord],
 ) -> Result<Vec<PublicAssetRecord>> {
     let assets = remote
         .get("assets")
@@ -1842,6 +2594,7 @@ fn public_asset_records(
                 "GitHub asset identity differs or is duplicated: {name}"
             )));
         }
+        let runtime = manifest_assets.iter().find(|asset| asset.name == name);
         records.push(PublicAssetRecord {
             id: matching[0]
                 .get("id")
@@ -1850,6 +2603,10 @@ fn public_asset_records(
             name: name.to_owned(),
             size: fs::metadata(path)?.len(),
             sha256: sha256_file(path)?,
+            runtime_manifest_sha256: runtime.map(|asset| asset.runtime_manifest_sha256.clone()),
+            components: runtime
+                .map(|asset| asset.components.clone())
+                .unwrap_or_default(),
         });
     }
     records.sort_by(|left, right| left.name.cmp(&right.name));
@@ -2109,7 +2866,7 @@ fn stage_github_at(root: &Path, token: &str, endpoints: &HttpEndpoints) -> Resul
     {
         return Err(failure("GitHub release state changed during staging"));
     }
-    public_asset_records(&release, &reconciled, &static_paths)?;
+    public_asset_records(&release, &reconciled, &static_paths, &manifest.assets)?;
     if !draft {
         let publication_report = reconciled
             .get("assets")
@@ -2362,8 +3119,6 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
     .run()?;
     if record.name == "memcordon" {
         let install_root = temporary.path().join("install");
-        let mut exact_version = OsString::from("=");
-        exact_version.push(&record.version);
         rustup_cargo(
             root,
             &toolchains.stable,
@@ -2371,7 +3126,7 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
                 OsString::from("install"),
                 OsString::from("memcordon"),
                 OsString::from("--version"),
-                exact_version,
+                OsString::from(&record.version),
                 OsString::from("--locked"),
                 OsString::from("--root"),
                 install_root.clone().into_os_string(),
@@ -2379,16 +3134,48 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
             RELEASE_DEADLINE,
         )
         .run()?;
-        let executable = install_root.join("bin").join(if cfg!(windows) {
+        let binary_directory = install_root.join("bin");
+        let cli_name = if cfg!(windows) {
             "memcordon.exe"
         } else {
             "memcordon"
-        });
-        let output = CommandSpec::new(executable, root, Duration::from_secs(30))
-            .arg("--version")
+        };
+        let agent_name = if cfg!(windows) {
+            "memcordon-sealed-agent.exe"
+        } else {
+            "memcordon-sealed-agent"
+        };
+        let actual = fs::read_dir(&binary_directory)?
+            .map(|entry| entry.map(|entry| entry.file_name()).map_err(CiError::from))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let expected = BTreeSet::from([OsString::from(cli_name), OsString::from(agent_name)]);
+        if actual != expected {
+            return Err(failure(format!(
+                "installed memcordon binary inventory differs: expected={expected:?} actual={actual:?}"
+            )));
+        }
+        let executable = binary_directory.join(cli_name);
+        verify_component_version(&executable, "memcordon", &record.version, root)?;
+        let agent = binary_directory.join(agent_name);
+        verify_component_version(&agent, "memcordon-sealed-agent", &record.version, root)?;
+        let output = CommandSpec::new(&agent, root, Duration::from_secs(30))
+            .args(["package", "inspect", "--json"])
             .run()?;
-        if !String::from_utf8_lossy(&output).contains(&record.version) {
-            return Err(failure("installed memcordon reports the wrong version"));
+        validate_agent_package_inspection(&output, &record.version, &record.vcs_commit)?;
+        #[cfg(target_os = "linux")]
+        {
+            let mut smoke = NativeSmokeReport {
+                cli_version: true,
+                doctor: true,
+                agent_version: Some(true),
+                agent_inspection: Some(true),
+                provider_install: None,
+                provider_verify: None,
+                provider_qualification: None,
+                sealed_execution: None,
+                provider_uninstall: None,
+            };
+            smoke_linux_provider(&executable, &agent, root, &mut smoke)?;
         }
     }
     Ok(())
@@ -2735,9 +3522,9 @@ fn finalize_github(root: &Path) -> Result<()> {
         unreachable!("published release returned above")
     };
     let static_paths = static_asset_paths(&release, &manifest, &output)?;
-    let assets = public_asset_records(&release, &remote, &static_paths)?;
+    let assets = public_asset_records(&release, &remote, &static_paths, &manifest.assets)?;
     let report = PublicationReport {
-        schema_version: 1,
+        schema_version: 2,
         manifest_sha256: sha256_file(&output.join(&release.assets.manifest))?,
         github_release_id: release_id,
         source_commit: manifest.source_commit.clone(),
@@ -2874,10 +3661,11 @@ fn verify_public(root: &Path) -> Result<()> {
                 == Some(release.assets.publication_report.as_str())
         })
         .ok_or_else(|| failure("public publication report asset is missing"))?;
-    let report_path = output.join(&release.assets.publication_report);
-    if !report_path.is_file() {
-        download_github_asset(&release, report_asset, None, &report_path)?;
-    }
+    let public_downloads = TempDir::new()?;
+    let report_path = public_downloads
+        .path()
+        .join(&release.assets.publication_report);
+    download_github_asset(&release, report_asset, None, &report_path)?;
     if !asset_matches(report_asset, &report_path)? {
         return Err(failure("public publication report digest differs"));
     }
@@ -2886,9 +3674,55 @@ fn verify_public(root: &Path) -> Result<()> {
         .get("id")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| failure("public release has no id"))?;
-    let static_paths = static_asset_paths(&release, &manifest, &output)?;
-    let public_assets = public_asset_records(&release, &remote, &static_paths)?;
-    if report.manifest_sha256 != sha256_file(&output.join(&release.assets.manifest))?
+    let local_static_paths = static_asset_paths(&release, &manifest, &output)?;
+    let mut static_paths = Vec::new();
+    for local_path in local_static_paths {
+        let name = local_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| failure("public asset name is not UTF-8"))?;
+        let asset = remote_assets
+            .iter()
+            .find(|asset| asset.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .ok_or_else(|| failure(format!("public asset is missing: {name}")))?;
+        let destination = public_downloads.path().join(name);
+        download_github_asset(&release, asset, None, &destination)?;
+        if !asset_matches(asset, &destination)? {
+            return Err(failure(format!("public asset digest differs: {name}")));
+        }
+        static_paths.push(destination);
+    }
+    let public_assets = public_asset_records(&release, &remote, &static_paths, &manifest.assets)?;
+    let identity = ReleaseIdentity {
+        tag: manifest.tag.clone(),
+        version: Version::parse(&manifest.version)?,
+        commit: manifest.source_commit.clone(),
+        changelog_section: String::new(),
+        source_date: manifest.source_date.clone(),
+    };
+    let host = config::release_target_id_for_host(std::env::consts::OS, std::env::consts::ARCH)?;
+    for asset in &manifest.assets {
+        let target = release
+            .assets
+            .target
+            .iter()
+            .find(|target| target.rust_target == asset.target)
+            .ok_or_else(|| failure(format!("public asset target is unknown: {}", asset.target)))?;
+        let archive = public_downloads.path().join(&asset.name);
+        let inspection =
+            inspect_extract_and_smoke(root, &archive, target, &identity, target.id == host)?;
+        if inspection.runtime_manifest_sha256 != asset.runtime_manifest_sha256
+            || inspection.components != asset.components
+        {
+            return Err(failure(format!(
+                "public runtime inventory differs for {}",
+                asset.name
+            )));
+        }
+    }
+    if report.schema_version != 2
+        || report.manifest_sha256
+            != sha256_file(&public_downloads.path().join(&release.assets.manifest))?
         || report.crates != verify_crates(root)?
         || report.github_release_id != release_id
         || report.source_commit != manifest.source_commit
@@ -2946,7 +3780,8 @@ fn verify_public(root: &Path) -> Result<()> {
     {
         return Err(failure("release notes do not bind the publication report"));
     }
-    let checksum_text = fs::read_to_string(output.join(&release.assets.checksums))?;
+    let checksum_text =
+        fs::read_to_string(public_downloads.path().join(&release.assets.checksums))?;
     if !checksum_text.ends_with('\n') {
         return Err(failure("SHA256SUMS is not newline terminated"));
     }
@@ -2985,6 +3820,90 @@ mod tests {
     use std::io::{BufRead, BufReader, Cursor};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
+
+    fn package_inspection_fixture() -> serde_json::Value {
+        let digest = sha256_bytes(b"package-inspection-fixture");
+        serde_json::json!({
+            "schema_version": 1,
+            "version": "1.2.3",
+            "source_commit": "source-commit",
+            "executable_sha256": digest,
+            "provider_protocol": 2,
+            "mechanism": "linux-pid-namespace-cgroup-v2",
+            "execution_report_schema": memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
+            "plan_report_schema": memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
+            "doctor_report_schema": memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
+            "control_service_sha256": digest,
+            "control_socket_sha256": digest,
+            "launcher_service_sha256": digest,
+            "launcher_socket_sha256": digest,
+            "tmpfiles_sha256": digest,
+            "compiled_metadata_valid": true
+        })
+    }
+
+    #[test]
+    fn package_inspection_binds_version_source_commit_and_sha256_fields() {
+        let canonical = package_inspection_fixture();
+        validate_agent_package_inspection(
+            &serde_json::to_vec(&canonical).unwrap(),
+            "1.2.3",
+            "source-commit",
+        )
+        .expect("canonical package inspection should validate");
+
+        let mut wrong_commit = canonical.clone();
+        wrong_commit["source_commit"] = serde_json::json!("different-commit");
+        assert!(
+            validate_agent_package_inspection(
+                &serde_json::to_vec(&wrong_commit).unwrap(),
+                "1.2.3",
+                "source-commit",
+            )
+            .is_err()
+        );
+
+        let mut invalid_digest = canonical.clone();
+        invalid_digest["executable_sha256"] = serde_json::json!("not-a-sha256");
+        assert!(
+            validate_agent_package_inspection(
+                &serde_json::to_vec(&invalid_digest).unwrap(),
+                "1.2.3",
+                "source-commit",
+            )
+            .is_err()
+        );
+
+        let mut unknown_field = canonical;
+        unknown_field["future_field"] = serde_json::json!(true);
+        assert!(
+            validate_agent_package_inspection(
+                &serde_json::to_vec(&unknown_field).unwrap(),
+                "1.2.3",
+                "source-commit",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_uninstall_proof_rejects_every_residual_path() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let artifact = temporary.path().join("installed-agent");
+        let endpoint = temporary.path().join("sealed-agent.sock");
+        let state = temporary.path().join("state");
+        fs::write(&artifact, b"agent").expect("artifact should write");
+        fs::write(&endpoint, b"endpoint").expect("endpoint should write");
+        fs::create_dir(&state).expect("state directory should exist");
+        for residual in [&artifact, &endpoint, &state] {
+            assert!(verify_absent_paths([residual.as_path()]).is_err());
+        }
+        fs::remove_file(&artifact).unwrap();
+        fs::remove_file(&endpoint).unwrap();
+        fs::remove_dir(&state).unwrap();
+        verify_absent_paths([artifact.as_path(), endpoint.as_path(), state.as_path()])
+            .expect("complete uninstall inventory should be absent");
+    }
 
     #[test]
     fn canonical_source_tree_resolves_relocated_manifest_readme() {
@@ -3449,7 +4368,7 @@ mod tests {
     #[test]
     fn immutable_publication_report_has_no_credential_origin() {
         let report = PublicationReport {
-            schema_version: 1,
+            schema_version: 2,
             manifest_sha256: "digest".to_owned(),
             github_release_id: 7,
             source_commit: "commit".to_owned(),
@@ -3955,6 +4874,8 @@ mod tests {
                 .expect("native asset metadata")
                 .len(),
             sha256: sha256_file(&native_path).expect("native asset digest"),
+            runtime_manifest_sha256: "runtime-manifest-digest".to_owned(),
+            components: Vec::new(),
         });
         for (backend, relative) in certification {
             let evidence_path = output.join(relative);

@@ -4,6 +4,27 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+### Added
+
+- The published `memcordon` Cargo package now installs both the public CLI
+  and the binary-private `memcordon-sealed-agent` companion. Linux sealed
+  provider installation no longer requires a source checkout or a separately
+  versioned crate.
+- Linux native release archives now include both runtime binaries and a
+  component-digested `runtime-manifest.json`. Release and publication
+  evidence bind the internal component inventory across Cargo and native
+  channels.
+
+### Changed
+
+- Sealed-provider administration now exposes version, credential-free package
+  inspection JSON, and installed-package verification JSON. CLI/provider
+  version mismatch fails before target authorization and names the explicit
+  upgrade repair.
+- Package documentation now describes certified Linux mechanism v2 and its
+  fail-closed provider setup instead of reporting sealed supervision
+  unavailable on every backend.
+
 ## [0.5.1-rc.2] - 2026-08-25
 
 ### Added

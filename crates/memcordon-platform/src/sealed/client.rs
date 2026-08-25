@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
+use sha2::digest::OutputSizeUser;
 use sha2::{Digest, Sha256};
 
 const ENDPOINT: &str = "/run/memcordon/sealed-agent.sock";
@@ -20,6 +21,7 @@ const MAX_ENVIRONMENT_ENTRIES: usize = 8192;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProbeReceipt {
+    pub version: String,
     pub provider_identity: String,
     pub control_service_identity: String,
     pub launcher_service_identity: String,
@@ -32,6 +34,7 @@ pub struct ProbeReceipt {
 #[serde(deny_unknown_fields)]
 pub(crate) struct QualificationReceipt {
     schema_version: u32,
+    version: String,
     mechanism: String,
     provider_identity: String,
     control_service_identity: String,
@@ -117,7 +120,7 @@ impl QualificationReceipt {
 }
 
 fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
+    value.len() == <Sha256 as OutputSizeUser>::output_size() * 2
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -642,7 +645,8 @@ fn boundary_phase_name(phase: memcordon_core::BoundarySetupPhase) -> &'static st
 
 pub fn probe() -> Result<ProbeReceipt, String> {
     verify_endpoint()?;
-    let mut stream = UnixStream::connect(Path::new(ENDPOINT)).map_err(|error| error.to_string())?;
+    let mut stream = UnixStream::connect(Path::new(ENDPOINT))
+        .map_err(|error| provider_installation_error("provider connection failed", &error))?;
     verify_peer(&stream)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -662,7 +666,14 @@ pub fn probe() -> Result<ProbeReceipt, String> {
         return Err("provider probe receipt identity mismatch".to_owned());
     }
     let receipt = parse_qualification(&payload)?;
+    validate_exact_provider_pairing(
+        env!("CARGO_PKG_VERSION"),
+        &receipt.version,
+        "CLI",
+        "installed provider",
+    )?;
     Ok(ProbeReceipt {
+        version: receipt.version,
         provider_identity: receipt.provider_identity,
         control_service_identity: receipt.control_service_identity,
         launcher_service_identity: receipt.launcher_service_identity,
@@ -672,14 +683,51 @@ pub fn probe() -> Result<ProbeReceipt, String> {
     })
 }
 
+pub(crate) fn validate_exact_provider_pairing(
+    cli_version: &str,
+    provider_version: &str,
+    cli_channel: &str,
+    provider_channel: &str,
+) -> Result<(), String> {
+    if provider_version != cli_version {
+        return Err(format!(
+            "sealed provider version mismatch before target authorization: {cli_channel} version {cli_version}; {provider_channel} version {provider_version}; install the matching memcordon package version and rerun package upgrade"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn provider_installation_error(context: &str, error: &std::io::Error) -> String {
+    let agent = invoked_executable_path()
+        .and_then(|executable| executable.parent().map(Path::to_path_buf))
+        .map(|directory| directory.join("memcordon-sealed-agent"))
+        .unwrap_or_else(|| Path::new("memcordon-sealed-agent").to_path_buf());
+    format!(
+        "sealed provider is not installed or reachable: {context}: {error}\n\nCargo installation:\n  install the matching memcordon package version, then run:\n  {} package install\n\nNative archive:\n  run the memcordon-sealed-agent included beside this executable",
+        agent.display()
+    )
+}
+
+fn invoked_executable_path() -> Option<std::path::PathBuf> {
+    let invoked = std::env::args_os().next().map(std::path::PathBuf::from)?;
+    if invoked.components().count() > 1 {
+        return fs::canonicalize(invoked).ok();
+    }
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(&invoked))
+            .find_map(|candidate| fs::canonicalize(candidate).ok())
+    })
+}
+
 fn verify_endpoint() -> Result<(), String> {
     let metadata = fs::symlink_metadata(ENDPOINT)
-        .map_err(|error| format!("provider endpoint unavailable: {error}"))?;
+        .map_err(|error| provider_installation_error("provider endpoint unavailable", &error))?;
     if !metadata.file_type().is_socket() || metadata.uid() != 0 || metadata.mode() & 0o007 != 0 {
         return Err("provider endpoint is not a root-owned socket identity".to_owned());
     }
     let launcher = fs::symlink_metadata("/run/memcordon/sealed-launcher.sock")
-        .map_err(|error| format!("launcher endpoint unavailable: {error}"))?;
+        .map_err(|error| provider_installation_error("launcher endpoint unavailable", &error))?;
     if !launcher.file_type().is_socket()
         || launcher.uid() != 0
         || launcher.gid() != 0
@@ -688,7 +736,7 @@ fn verify_endpoint() -> Result<(), String> {
         return Err("launcher endpoint is not a root-only socket identity".to_owned());
     }
     let executable = fs::symlink_metadata("/usr/libexec/memcordon-sealed-agent")
-        .map_err(|error| format!("provider executable unavailable: {error}"))?;
+        .map_err(|error| provider_installation_error("provider executable unavailable", &error))?;
     if !executable.file_type().is_file() || executable.uid() != 0 || executable.mode() & 0o022 != 0
     {
         return Err("provider executable identity or permissions are unsafe".to_owned());

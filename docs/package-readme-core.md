@@ -6,8 +6,10 @@ processes; applications that need execution use `memcordon-platform` or the
 `memcordon` CLI.
 
 `BoundaryRequirement::Sealed` expresses the fail-closed sealed-supervision
-contract without exposing platform mechanisms. No currently certified native
-backend satisfies that request, so execution is rejected before authorization.
+contract without exposing platform mechanisms. Certified Linux mechanism v2
+satisfies the request only through a matching, qualified provider. A missing or
+mismatched provider rejects execution before authorization and never falls
+back to a standard backend. Execution reports use schema 8.
 
 ## Install
 

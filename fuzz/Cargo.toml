@@ -13,8 +13,11 @@ memcordon-core = { path = "../crates/memcordon-core", features = ["test-support"
 memcordon = { path = "../crates/memcordon-cli" }
 memcordon-ci = { path = "../tools/memcordon-ci" }
 memcordon-platform = { path = "../crates/memcordon-platform", features = ["test-support"] }
-memcordon-sealed-agent = { path = "../crates/memcordon-sealed-agent", features = ["test-support"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+toml = "0.9"
 
 [[bin]]
 name = "byte_size"
@@ -208,6 +211,48 @@ bench = false
 [[bin]]
 name = "mount-context-manifest"
 path = "fuzz_targets/mount_context_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "runtime-manifest"
+path = "fuzz_targets/runtime_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "release-asset-components"
+path = "fuzz_targets/release_asset_components.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent-package-inspection"
+path = "fuzz_targets/agent_package_inspection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "installed-provider-inspection"
+path = "fuzz_targets/installed_provider_inspection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cargo-bin-inventory"
+path = "fuzz_targets/cargo_bin_inventory.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "channel-pairing"
+path = "fuzz_targets/channel_pairing.rs"
 test = false
 doc = false
 bench = false
