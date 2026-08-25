@@ -8,7 +8,7 @@ fn linux_package_artifacts_are_pinned_to_lf_checkouts() {
     assert!(
         attributes
             .lines()
-            .any(|line| line == "packaging/linux/** text eol=lf")
+            .any(|line| line == "/packaging/linux/** text eol=lf")
     );
 }
 
