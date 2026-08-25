@@ -48,6 +48,15 @@ impl InterruptionWait for crate::windows_job::ConsoleControl {
         request: &SupervisorRequest,
         context: AttemptContext,
     ) -> Result<AttemptExecution, Box<Error>> {
+        if !windows_standard_route_selected(request.policy.boundary(), None) {
+            return attempt_execution(crate::sealed::windows::run(
+                &request.policy,
+                &request.command,
+                self,
+                context,
+            )?)
+            .map_err(Box::new);
+        }
         let execution = crate::windows_job::run_attempt(
             request.policy.clone(),
             &request.command,
@@ -56,6 +65,39 @@ impl InterruptionWait for crate::windows_job::ConsoleControl {
         )
         .map_err(Box::new)?;
         attempt_execution(execution).map_err(Box::new)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_standard_route_selected(
+    boundary: BoundaryRequirement,
+    mutant: Option<memcordon_core::WindowsSealedMutant>,
+) -> bool {
+    boundary != BoundaryRequirement::Sealed
+        || mutant == Some(memcordon_core::WindowsSealedMutant::FallBackToStandard)
+}
+
+#[cfg(target_os = "windows")]
+pub fn certify_windows_platform_mutant(
+    mutant: memcordon_core::WindowsSealedMutant,
+) -> Option<memcordon_core::WindowsMutantNativeObservationV1> {
+    match mutant {
+        memcordon_core::WindowsSealedMutant::FallBackToStandard => {
+            let ordinary_route_sealed =
+                !windows_standard_route_selected(BoundaryRequirement::Sealed, None);
+            let mutant_route_standard =
+                windows_standard_route_selected(BoundaryRequirement::Sealed, Some(mutant));
+            Some(
+                memcordon_core::WindowsMutantNativeObservationV1::PlatformRouteFallback {
+                    ordinary_route_sealed,
+                    mutant_route_standard,
+                },
+            )
+        }
+        memcordon_core::WindowsSealedMutant::AdvertiseWithoutCertificate => {
+            crate::sealed::windows::certify_qualification_predicate_mutant(mutant)
+        }
+        _ => None,
     }
 }
 

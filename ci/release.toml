@@ -87,7 +87,7 @@ role = "public-cli"
 id = "windows-x64"
 rust_target = "x86_64-pc-windows-msvc"
 archive = "zip"
-sealed = "not-applicable"
+sealed = "included"
 
 [[assets.target.executable]]
 package = "memcordon"
@@ -95,12 +95,19 @@ binary = "memcordon"
 archive_path = "memcordon.exe"
 mode = 493
 role = "public-cli"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-sealed-agent"
+archive_path = "memcordon-sealed-agent.exe"
+mode = 493
+role = "sealed-agent"
 
 [[assets.target]]
 id = "windows-arm64"
 rust_target = "aarch64-pc-windows-msvc"
 archive = "zip"
-sealed = "not-applicable"
+sealed = "included"
 
 [[assets.target.executable]]
 package = "memcordon"
@@ -108,6 +115,13 @@ binary = "memcordon"
 archive_path = "memcordon.exe"
 mode = 493
 role = "public-cli"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-sealed-agent"
+archive_path = "memcordon-sealed-agent.exe"
+mode = 493
+role = "sealed-agent"
 
 [registry_wait]
 initial_milliseconds = 500

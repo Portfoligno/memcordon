@@ -9,7 +9,8 @@ use walkdir::WalkDir;
 use memcordon_core::{
     BoundaryClass, BoundaryMechanismEvidence, BoundaryRequirement, ChildTermination,
     DOCTOR_REPORT_SCHEMA_VERSION, EXECUTION_REPORT_SCHEMA_VERSION, MemcordonReport, RunOutcome,
-    SupervisionTerminal,
+    SupervisionTerminal, WindowsAuthorityLossEvidenceV1, WindowsCertificationObservationsV1,
+    WindowsMutantKillEvidenceV1, WindowsQualificationReceiptV1, WindowsTokenMatrixEvidenceV1,
 };
 
 use crate::{CiError, Result};
@@ -80,24 +81,42 @@ pub const LINUX_SEALED_TESTS: &[&str] = &[
     "sealed_package_uninstall_refuses_live_authenticated_attempt",
 ];
 
+const WINDOWS_SEALED_FILES: &[&str] = &[
+    "windows-package-inspection.json",
+    "windows-installed-provider.json",
+    "windows-qualification.json",
+    "windows-token-envelope.json",
+    "windows-handle-inventory.json",
+    "windows-preauthorization.json",
+    "windows-alternate-token.json",
+    "windows-nested-job.json",
+    "windows-front-end-loss.json",
+    "windows-recovery.json",
+    "windows-cleanup.json",
+];
 const WINDOWS_TESTS: &[&str] = &[
-    "certified_backend_preserves_ordinary_status_and_reaps",
-    "certified_backend_reports_limit_and_removes_workload",
-    "certified_backend_cleans_background_descendant_by_birth_identity",
-    "certified_backend_allows_bounded_transient_burst",
-    "windows_job_object_contains_aggregate_tree",
-    "windows_job_object_handles_rapid_process_churn",
-    "windows_target_is_suspended_until_job_assignment",
-    "windows_descendants_remain_in_job_and_are_cleaned",
-    "windows_breakaway_descendant_is_not_left_alive",
-    "windows_job_notification_produces_limit_evidence",
-    "windows_kill_on_close_cleans_workload",
-    "windows_wrapper_crash_closes_job_and_reaps_descendants",
-    "windows_quoting_preserves_spaces_and_quotes",
-    "target_remains_suspended_until_successful_job_assignment",
-    "kill_on_job_close_terminates_a_running_member",
-    "nested_assignment_is_accounted_by_the_memcordon_job",
-    "assignment_failure_terminates_suspended_target_before_execution",
+    "package_install_verify_probe_and_same_version_upgrade",
+    "active_attempt_upgrade_and_uninstall_are_refused",
+    "public_sealed_launch_preserves_status_and_native_evidence",
+    "frontend_loss_retires_the_job_and_durable_record",
+    "package_uninstall_leaves_no_provider_state",
+    "deadline_memory_and_raw_ntstatus_are_preserved",
+    "production_package_lifecycle_without_ci_fault_gate",
+    "windows_target_token_identity",
+    "windows_creation_time_job_list",
+    "windows_exact_handle_manifest",
+    "windows_job_policy_readback",
+    "windows_caller_token_authentication",
+    "windows_job_membership_readback",
+    "windows_preauthorization_gate",
+    "windows_recursive_provider_rejection",
+    "windows_guardian_authority",
+    "windows_active_process_accounting",
+    "windows_relay_retirement",
+    "windows_final_handle_ordering",
+    "windows_sealed_mechanism_selection",
+    "windows_native_archive_inventory",
+    "windows_qualification_advertisement",
 ];
 
 const MACOS_SCENARIOS: &[&str] = &[
@@ -117,7 +136,7 @@ pub struct CertificationRecord {
     pub sha256: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum ReportKind {
     LinuxSealed,
     Windows,
@@ -126,34 +145,56 @@ enum ReportKind {
 
 #[derive(Clone, Copy)]
 struct ReportSpec {
+    record_key: &'static str,
     backend: &'static str,
     artifact_directory: &'static str,
     report_name: &'static str,
     evidence_path: &'static str,
     kind: ReportKind,
+    architecture: Option<&'static str>,
+    runner_label: Option<&'static str>,
 }
 
 const REPORTS: &[ReportSpec] = &[
     ReportSpec {
+        record_key: "linux-pid-namespace-cgroup-v2",
         backend: "linux-pid-namespace-cgroup-v2",
         artifact_directory: "release-certification-linux",
         report_name: "cleanup-leak-check.json",
         evidence_path: "certification/cleanup-leak-check.json",
         kind: ReportKind::LinuxSealed,
+        architecture: None,
+        runner_label: None,
     },
     ReportSpec {
-        backend: "windows-job-object",
-        artifact_directory: "release-certification-windows",
-        report_name: "backend-windows-job-object.json",
-        evidence_path: "certification/backend-windows-job-object.json",
+        record_key: "windows-job-object-v2/x86_64-pc-windows-msvc",
+        backend: "windows-job-object-v2",
+        artifact_directory: "release-certification-windows-x64",
+        report_name: "windows-cleanup.json",
+        evidence_path: "certification/windows-sealed-v2/x64-windows-cleanup.json",
         kind: ReportKind::Windows,
+        architecture: Some("x86_64"),
+        runner_label: Some("windows-2025"),
     },
     ReportSpec {
+        record_key: "windows-job-object-v2/aarch64-pc-windows-msvc",
+        backend: "windows-job-object-v2",
+        artifact_directory: "release-certification-windows-arm64",
+        report_name: "windows-cleanup.json",
+        evidence_path: "certification/windows-sealed-v2/arm64-windows-cleanup.json",
+        kind: ReportKind::Windows,
+        architecture: Some("aarch64"),
+        runner_label: Some("windows-11-arm"),
+    },
+    ReportSpec {
+        record_key: "macos-watchdog",
         backend: "macos-watchdog",
         artifact_directory: "release-acceptance-macos-arm64",
         report_name: "backend-macos-watchdog.json",
         evidence_path: "certification/backend-macos-watchdog.json",
         kind: ReportKind::Macos,
+        architecture: None,
+        runner_label: None,
     },
 ];
 
@@ -180,6 +221,13 @@ struct HardCertificationReport<R> {
     runner_class: String,
     runner_provider: String,
     runner_label: String,
+    architecture: String,
+    #[serde(default)]
+    native_archive_sha256: Option<String>,
+    #[serde(default)]
+    runtime_manifest_sha256: Option<String>,
+    #[serde(default)]
+    native_target: Option<String>,
     runtime: R,
     tests: Vec<CertificationTest>,
     tests_run: u32,
@@ -529,20 +577,433 @@ struct LinuxConcurrencyReport {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WindowsRuntimeEvidence {
-    job_memory_limit: bool,
-    kill_on_close: bool,
-    suspended_assignment: bool,
-    nested_job: bool,
-    completion_port: bool,
+    qualification: WindowsQualificationReceiptV1,
+    public_launch: MemcordonReport,
+    active_attempt_upgrade_refused: bool,
+    active_attempt_uninstall_refused: bool,
+    frontend_loss_record_retired: bool,
+    provider_state_removed: bool,
+    status_matrix: WindowsStatusMatrixEvidence,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsStatusMatrixEvidence {
+    schema_version: u32,
+    ordinary_exit_codes: Vec<u32>,
+    deadline_outcome: memcordon_core::RunOutcome,
+    memory_limit_outcome: memcordon_core::RunOutcome,
+    raw_ntstatus_outcome: memcordon_core::RunOutcome,
+    orphan_descendant_outcome: memcordon_core::RunOutcome,
+    command_not_found: memcordon_core::SupervisionErrorRecord,
+    command_not_executable: memcordon_core::SupervisionErrorRecord,
+    provider_setup_failure: memcordon_core::ProviderRejectionEvidence,
+    relay_failure: memcordon_core::ProviderRejectionEvidence,
+    terminal_truncation_rejected: bool,
+    report_consistency_verified: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsPackageInspection {
+    schema_version: u32,
+    version: String,
+    source_commit: String,
+    executable_sha256: String,
+    provider_protocol: u32,
+    mechanism: String,
+    execution_report_schema: u32,
+    plan_report_schema: u32,
+    doctor_report_schema: u32,
+    platform: String,
+    control_service_name: String,
+    launcher_service_name: String,
+    control_service_config_sha256: String,
+    launcher_service_config_sha256: String,
+    control_pipe: String,
+    launcher_pipe: String,
+    binary_install_path: String,
+    state_root: String,
+    control_service_sid_type: String,
+    launcher_service_sid_type: String,
+    control_required_privileges: Vec<String>,
+    launcher_required_privileges: Vec<String>,
+    control_pipe_security_sha256: String,
+    launcher_pipe_security_sha256: String,
+    install_directory_security_sha256: String,
+    state_directory_security_sha256: String,
+    compiled_metadata_valid: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsInstalledProviderInspection {
+    schema_version: u32,
+    agent: WindowsPackageInspection,
+    installed_executable_sha256: String,
+    installed_artifacts_valid: bool,
+    provider_identity: Option<String>,
+    provider_reachable: bool,
+    qualification_complete: bool,
+}
+
+impl WindowsPackageInspection {
+    fn valid(&self, expected_commit: &str) -> bool {
+        self.schema_version == 2
+            && self.version == env!("CARGO_PKG_VERSION")
+            && self.source_commit == expected_commit
+            && valid_sha256(&self.executable_sha256)
+            && self.provider_protocol == memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION
+            && self.mechanism == "windows-job-object-v2"
+            && self.execution_report_schema == memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION
+            && self.plan_report_schema == memcordon_core::PLAN_REPORT_SCHEMA_VERSION
+            && self.doctor_report_schema == memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION
+            && self.platform == "windows-service"
+            && self.control_service_name == memcordon_core::WINDOWS_CONTROL_SERVICE_NAME
+            && self.launcher_service_name == memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME
+            && self.control_pipe == memcordon_core::WINDOWS_CONTROL_PIPE
+            && self.launcher_pipe == memcordon_core::WINDOWS_LAUNCHER_PIPE
+            && self
+                .binary_install_path
+                .ends_with("MemCordon\\memcordon-sealed-agent.exe")
+            && self.state_root.ends_with("MemCordon\\sealed")
+            && self.control_service_sid_type == "restricted"
+            && self.launcher_service_sid_type == "restricted"
+            && self.control_required_privileges == ["SeImpersonatePrivilege"]
+            && self.launcher_required_privileges
+                == ["SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"]
+            && [
+                &self.control_service_config_sha256,
+                &self.launcher_service_config_sha256,
+                &self.control_pipe_security_sha256,
+                &self.launcher_pipe_security_sha256,
+                &self.install_directory_security_sha256,
+                &self.state_directory_security_sha256,
+            ]
+            .iter()
+            .all(|value| valid_sha256(value))
+            && self.compiled_metadata_valid
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowsEvidenceEnvelope {
+    schema_version: u32,
+    mechanism: String,
+    architecture: String,
+    commit: String,
+    result: String,
+    evidence: serde_json::Value,
 }
 
 impl WindowsRuntimeEvidence {
     fn complete(&self) -> bool {
-        self.job_memory_limit
-            && self.kill_on_close
-            && self.suspended_assignment
-            && self.nested_job
-            && self.completion_port
+        self.qualification.qualified
+            && self.qualification.is_consistent()
+            && validate_windows_public_launch(&self.public_launch)
+            && self.active_attempt_upgrade_refused
+            && self.active_attempt_uninstall_refused
+            && self.frontend_loss_record_retired
+            && self.provider_state_removed
+            && self.status_matrix.complete()
+    }
+}
+
+impl WindowsStatusMatrixEvidence {
+    fn complete(&self) -> bool {
+        self.schema_version == 1
+            && self.ordinary_exit_codes == (u8::MIN..=u8::MAX).map(u32::from).collect::<Vec<_>>()
+            && matches!(
+                self.deadline_outcome,
+                memcordon_core::RunOutcome::DeadlineExceeded { .. }
+            )
+            && matches!(
+                self.memory_limit_outcome,
+                memcordon_core::RunOutcome::LimitExceeded { .. }
+            )
+            && matches!(
+                self.raw_ntstatus_outcome,
+                memcordon_core::RunOutcome::Exited {
+                    child: memcordon_core::ChildTermination::WindowsStatus {
+                        status: 0xC000_013A
+                    },
+                    ..
+                }
+            )
+            && matches!(
+                self.orphan_descendant_outcome,
+                memcordon_core::RunOutcome::Exited {
+                    child: memcordon_core::ChildTermination::ExitCode { code: 0 },
+                    ..
+                }
+            )
+            && self.command_not_found.initial_spawn_failure
+                == Some(memcordon_core::InitialSpawnFailure::NotFound)
+            && self.command_not_found.os_code == Some(2)
+            && self.command_not_executable.initial_spawn_failure
+                == Some(memcordon_core::InitialSpawnFailure::NotExecutable)
+            && self.command_not_executable.os_code == Some(193)
+            && self.provider_setup_failure.phase
+                == memcordon_core::BoundarySetupPhase::BoundaryCreation
+            && !self.provider_setup_failure.target_released
+            && self.provider_setup_failure.is_consistent()
+            && self.relay_failure.phase == memcordon_core::BoundarySetupPhase::Retirement
+            && self.relay_failure.target_released
+            && self.relay_failure.is_consistent()
+            && self.terminal_truncation_rejected
+            && self.report_consistency_verified
+    }
+}
+
+fn validate_windows_public_launch(report: &MemcordonReport) -> bool {
+    let Some(attempt) = report.attempts.last() else {
+        return false;
+    };
+    let BoundaryMechanismEvidence::WindowsJobObjectV2(native) = &attempt.boundary_detail else {
+        return false;
+    };
+    attempt.launch.target_released
+        && attempt.launch.containment_verified_before_authorization
+        && attempt.launch.guardian_started_before_authorization
+        && attempt.launch.boundary_assignment_verified
+        && attempt.launch.boundary_reconfiguration_denied
+        && attempt.launch.inherited_resources_restricted
+        && attempt.launch.frontend_loss_cleanup_authority_verified
+        && native.caller_token_authenticated
+        && native.initial_target_token_matches_caller
+        && native.job_created
+        && native.job_limits_verified
+        && native.kill_on_close_verified
+        && native.breakaway_denied
+        && native.completion_port_associated
+        && native.guardian_ready
+        && native.target_created_suspended
+        && native.job_list_applied_at_creation
+        && native.handle_list_applied_at_creation
+        && native.target_job_membership_verified
+        && native.target_still_suspended_during_verification
+        && native.inherited_handles_verified
+        && native.target_released
+        && native.active_processes_zero
+        && native.direct_target_reaped
+        && native.relays_retired
+        && native.guardian_reaped
+        && native.final_job_handles_closed
+}
+
+fn validate_windows_auxiliary(
+    name: &str,
+    bytes: &[u8],
+    expected_commit: &str,
+    expected_architecture: &str,
+) -> Result<()> {
+    match name {
+        "windows-package-inspection.json" => {
+            let inspection: WindowsPackageInspection = serde_json::from_slice(bytes)?;
+            if !inspection.valid(expected_commit) {
+                return Err(failure("Windows package inspection is incomplete"));
+            }
+        }
+        "windows-installed-provider.json" => {
+            let inspection: WindowsInstalledProviderInspection = serde_json::from_slice(bytes)?;
+            if inspection.schema_version != 2
+                || !inspection.agent.valid(expected_commit)
+                || inspection.installed_executable_sha256 != inspection.agent.executable_sha256
+                || !inspection.installed_artifacts_valid
+                || inspection.provider_identity.as_deref()
+                    != Some(
+                        format!(
+                            "memcordon-sealed-agent-windows-v1:{}",
+                            env!("CARGO_PKG_VERSION")
+                        )
+                        .as_str(),
+                    )
+                || !inspection.provider_reachable
+                || !inspection.qualification_complete
+            {
+                return Err(failure(
+                    "Windows installed-provider inspection is incomplete",
+                ));
+            }
+        }
+        "windows-qualification.json" => {
+            let receipt: WindowsQualificationReceiptV1 = serde_json::from_slice(bytes)?;
+            if !receipt.qualified || !receipt.is_consistent() {
+                return Err(failure("Windows qualification evidence is incomplete"));
+            }
+        }
+        "windows-cleanup.json" => {}
+        _ => {
+            let report: WindowsEvidenceEnvelope = serde_json::from_slice(bytes)?;
+            if report.schema_version != 1
+                || report.mechanism != "windows-job-object-v2"
+                || report.architecture != expected_architecture
+                || report.commit != expected_commit
+                || report.result != "passed"
+            {
+                return Err(failure(format!(
+                    "Windows auxiliary evidence is incomplete: {name}"
+                )));
+            }
+            match name {
+                "windows-token-envelope.json" => {
+                    require_windows_evidence_fields(
+                        name,
+                        &report.evidence,
+                        &[
+                            "caller_token_authenticated",
+                            "initial_target_token_matches_caller",
+                            "restricted_caller_token_verified",
+                            "primary_token_duplication_verified",
+                        ],
+                    )?;
+                    let token_matrix: WindowsTokenMatrixEvidenceV1 = serde_json::from_value(
+                        report
+                            .evidence
+                            .get("token_matrix")
+                            .cloned()
+                            .ok_or_else(|| failure("Windows token matrix is missing"))?,
+                    )?;
+                    if !token_matrix.is_complete() {
+                        return Err(failure("Windows token matrix is incomplete"));
+                    }
+                }
+                "windows-handle-inventory.json" => require_windows_evidence_fields(
+                    name,
+                    &report.evidence,
+                    &[
+                        "job_list_applied_at_creation",
+                        "handle_list_applied_at_creation",
+                        "inherited_handles_verified",
+                        "exact_handle_inheritance_verified",
+                        "relays_retired",
+                    ],
+                )?,
+                "windows-preauthorization.json" => require_windows_evidence_fields(
+                    name,
+                    &report.evidence,
+                    &[
+                        "guardian_ready",
+                        "target_created_suspended",
+                        "target_job_membership_verified",
+                        "target_still_suspended_during_verification",
+                        "target_released",
+                    ],
+                )
+                .and_then(|()| {
+                    let fault_matrix: WindowsCertificationObservationsV1 = serde_json::from_value(
+                        report
+                            .evidence
+                            .get("fault_matrix")
+                            .cloned()
+                            .ok_or_else(|| {
+                                failure("Windows preauthorization evidence lacks a fault matrix")
+                            })?,
+                    )?;
+                    if fault_matrix.is_complete() {
+                        let mutant_kills: WindowsMutantKillEvidenceV1 = serde_json::from_value(
+                            report
+                                .evidence
+                                .get("mutant_kills")
+                                .cloned()
+                                .ok_or_else(|| {
+                                    failure(
+                                        "Windows preauthorization evidence lacks executable mutant kills",
+                                    )
+                                })?,
+                        )?;
+                        if mutant_kills.is_complete() {
+                            Ok(())
+                        } else {
+                            Err(failure(
+                                "Windows executable mutant kill evidence is incomplete",
+                            ))
+                        }
+                    } else {
+                        Err(failure(
+                            "Windows preauthorization fault matrix is incomplete",
+                        ))
+                    }
+                })?,
+                "windows-alternate-token.json" => require_windows_evidence_fields(
+                    name,
+                    &report.evidence,
+                    &[
+                        "alternate_token_child_contained",
+                        "initial_target_token_matches_caller",
+                        "job_membership_independent_of_token",
+                    ],
+                )?,
+                "windows-nested-job.json" => require_windows_evidence_fields(
+                    name,
+                    &report.evidence,
+                    &[
+                        "nested_host_job_supported",
+                        "nested_child_job_contained",
+                        "target_job_membership_verified",
+                    ],
+                )?,
+                "windows-front-end-loss.json" => {
+                    require_windows_evidence_fields(
+                        name,
+                        &report.evidence,
+                        &[
+                            "frontend_loss_cleanup_verified",
+                            "record_retired",
+                            "active_processes_zero_verified",
+                            "guardian_verified",
+                        ],
+                    )?;
+                    require_windows_authority_loss(&report.evidence)?;
+                }
+                "windows-recovery.json" => {
+                    require_windows_evidence_fields(
+                        name,
+                        &report.evidence,
+                        &[
+                            "recovery_complete",
+                            "active_processes_zero_verified",
+                            "relays_retired_verified",
+                        ],
+                    )?;
+                    require_windows_authority_loss(&report.evidence)?;
+                }
+                _ => return Err(failure("unexpected Windows sealed v2 evidence file")),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_windows_authority_loss(evidence: &serde_json::Value) -> Result<()> {
+    let authority: WindowsAuthorityLossEvidenceV1 = serde_json::from_value(
+        evidence
+            .get("authority_loss")
+            .cloned()
+            .ok_or_else(|| failure("Windows authority-loss evidence is absent"))?,
+    )?;
+    if authority.is_complete() {
+        Ok(())
+    } else {
+        Err(failure("Windows authority-loss evidence is incomplete"))
+    }
+}
+
+fn require_windows_evidence_fields(
+    name: &str,
+    evidence: &serde_json::Value,
+    fields: &[&str],
+) -> Result<()> {
+    if fields
+        .iter()
+        .all(|field| evidence.get(*field).and_then(serde_json::Value::as_bool) == Some(true))
+    {
+        Ok(())
+    } else {
+        Err(failure(format!(
+            "Windows scenario evidence is contradictory: {name}"
+        )))
     }
 }
 
@@ -609,6 +1070,7 @@ fn validate_hard_report<R: DeserializeOwned>(
     spec: ReportSpec,
     expected_commit: &str,
     expected_label: &str,
+    expected_architecture: &str,
     expected_tests: &[&str],
     runtime_complete: impl FnOnce(&R) -> bool,
 ) -> Result<()> {
@@ -625,6 +1087,21 @@ fn validate_hard_report<R: DeserializeOwned>(
         .all(|test| test.result == CertificationTestResult::Passed);
     let derived_count = u32::try_from(report.tests.len())
         .map_err(|_| failure("too many certification test results"))?;
+    let native_identity_valid = spec.kind != ReportKind::Windows
+        || (report.native_target.as_deref()
+            == Some(match expected_architecture {
+                "x86_64" => "x86_64-pc-windows-msvc",
+                "aarch64" => "aarch64-pc-windows-msvc",
+                _ => "",
+            })
+            && report
+                .native_archive_sha256
+                .as_deref()
+                .is_some_and(valid_sha256)
+            && report
+                .runtime_manifest_sha256
+                .as_deref()
+                .is_some_and(valid_sha256));
     if report.schema != 2
         || report.backend != spec.backend
         || !report.certified
@@ -632,12 +1109,14 @@ fn validate_hard_report<R: DeserializeOwned>(
         || report.runner_class != HARD_CERTIFICATION_RUNNER_CLASS
         || report.runner_provider != HARD_CERTIFICATION_RUNNER_PROVIDER
         || report.runner_label != expected_label
+        || report.architecture != expected_architecture
         || !runtime_complete(&report.runtime)
         || !ordered_names_match
         || !all_passed
         || report.tests_run != derived_count
         || report.tests_run != u32::try_from(expected_tests.len()).expect("static inventory fits")
         || report.tests_skipped != 0
+        || !native_identity_valid
     {
         return Err(failure(format!(
             "required certification failed: {}",
@@ -645,6 +1124,13 @@ fn validate_hard_report<R: DeserializeOwned>(
         )));
     }
     Ok(())
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == Sha256::output_size() * 2
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_macos_report(bytes: &[u8], spec: ReportSpec, expected_commit: &str) -> Result<()> {
@@ -1312,10 +1798,10 @@ fn validate_artifact_inventory(input: &Path) -> Result<()> {
             )));
         }
         let entries = fs::read_dir(&directory)?.collect::<std::io::Result<Vec<_>>>()?;
-        let expected: BTreeSet<&str> = if matches!(spec.kind, ReportKind::LinuxSealed) {
-            LINUX_SEALED_FILES.iter().copied().collect()
-        } else {
-            [spec.report_name].into_iter().collect()
+        let expected: BTreeSet<&str> = match spec.kind {
+            ReportKind::LinuxSealed => LINUX_SEALED_FILES.iter().copied().collect(),
+            ReportKind::Windows => WINDOWS_SEALED_FILES.iter().copied().collect(),
+            ReportKind::Macos => [spec.report_name].into_iter().collect(),
         };
         let actual: BTreeSet<String> = entries
             .iter()
@@ -1339,7 +1825,12 @@ fn validate_artifact_inventory(input: &Path) -> Result<()> {
         }
 
         let expected_path = directory.join(spec.report_name);
-        let matching_paths = WalkDir::new(input)
+        let search_root = if matches!(spec.kind, ReportKind::Windows) {
+            &directory
+        } else {
+            input
+        };
+        let matching_paths = WalkDir::new(search_root)
             .into_iter()
             .map(|entry| entry.map_err(|error| failure(error.to_string())))
             .collect::<Result<Vec<_>>>()?
@@ -1399,6 +1890,31 @@ fn validate_output_inventory(output: &Path) -> Result<()> {
             }
             continue;
         }
+        if name == "windows-sealed-v2" && entry.file_type()?.is_dir() {
+            let expected: BTreeSet<String> = ["x64", "arm64"]
+                .into_iter()
+                .flat_map(|architecture| {
+                    WINDOWS_SEALED_FILES
+                        .iter()
+                        .map(move |name| format!("{architecture}-{name}"))
+                })
+                .collect();
+            let actual: BTreeSet<String> = fs::read_dir(entry.path())?
+                .map(|file| {
+                    let file = file?;
+                    if !file.file_type()?.is_file() {
+                        return Err(failure("Windows release evidence item is not a file"));
+                    }
+                    file.file_name()
+                        .into_string()
+                        .map_err(|_| failure("Windows release evidence name is not UTF-8"))
+                })
+                .collect::<Result<_>>()?;
+            if actual != expected {
+                return Err(failure("Windows release evidence inventory differs"));
+            }
+            continue;
+        }
         if !allowed_names.contains(name.as_str()) || !entry.file_type()?.is_file() {
             return Err(failure(format!(
                 "unexpected release certification evidence: {name}"
@@ -1429,14 +1945,25 @@ pub fn collect_certification(
                     validate_linux_auxiliary(name, &auxiliary, expected_commit, &binding)?;
                 }
             }
-            ReportKind::Windows => validate_hard_report::<WindowsRuntimeEvidence>(
-                &bytes,
-                *spec,
-                expected_commit,
-                "windows-2025",
-                WINDOWS_TESTS,
-                WindowsRuntimeEvidence::complete,
-            )?,
+            ReportKind::Windows => {
+                let architecture = spec
+                    .architecture
+                    .expect("Windows report has an architecture");
+                validate_hard_report::<WindowsRuntimeEvidence>(
+                    &bytes,
+                    *spec,
+                    expected_commit,
+                    spec.runner_label
+                        .expect("Windows report has a runner label"),
+                    architecture,
+                    WINDOWS_TESTS,
+                    WindowsRuntimeEvidence::complete,
+                )?;
+                for name in WINDOWS_SEALED_FILES {
+                    let auxiliary = read_report(&input.join(spec.artifact_directory).join(name))?;
+                    validate_windows_auxiliary(name, &auxiliary, expected_commit, architecture)?;
+                }
+            }
             ReportKind::Macos => validate_macos_report(&bytes, *spec, expected_commit)?,
         }
         validated.push(ValidatedReport {
@@ -1451,9 +1978,14 @@ pub fn collect_certification(
     let mut records = BTreeMap::new();
     for report in validated {
         let destination = output.join(report.spec.evidence_path);
+        fs::create_dir_all(
+            destination
+                .parent()
+                .ok_or_else(|| failure("certification evidence path has no parent"))?,
+        )?;
         fs::write(&destination, report.bytes)?;
         records.insert(
-            report.spec.backend.to_owned(),
+            report.spec.record_key.to_owned(),
             CertificationRecord {
                 evidence_path: report.spec.evidence_path.to_owned(),
                 sha256: report.sha256,
@@ -1477,6 +2009,34 @@ pub fn collect_certification(
                 sha256: sha256_bytes(&bytes),
             },
         );
+    }
+    for spec in REPORTS
+        .iter()
+        .filter(|spec| matches!(spec.kind, ReportKind::Windows))
+    {
+        let architecture = spec
+            .architecture
+            .expect("Windows report has an architecture");
+        let output_architecture = if architecture == "x86_64" {
+            "x64"
+        } else {
+            "arm64"
+        };
+        for name in WINDOWS_SEALED_FILES {
+            if *name == spec.report_name {
+                continue;
+            }
+            let bytes = read_report(&input.join(spec.artifact_directory).join(name))?;
+            let relative = format!("certification/windows-sealed-v2/{output_architecture}-{name}");
+            fs::write(output.join(&relative), &bytes)?;
+            records.insert(
+                format!("{}/{name}", spec.record_key),
+                CertificationRecord {
+                    evidence_path: relative,
+                    sha256: sha256_bytes(&bytes),
+                },
+            );
+        }
     }
     Ok(records)
 }

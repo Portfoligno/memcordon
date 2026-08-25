@@ -50,7 +50,7 @@ pub struct ProviderRejectionEvidence {
 }
 
 impl ProviderRejectionEvidence {
-    pub(crate) fn is_consistent(&self) -> bool {
+    pub fn is_consistent(&self) -> bool {
         const MAX_CODE_BYTES: usize = 128;
         const MAX_DETAIL_BYTES: usize = 8 * 1024;
         const MAX_CLEANUP_ERRORS: usize = 16;

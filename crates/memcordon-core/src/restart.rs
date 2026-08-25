@@ -853,6 +853,7 @@ impl RestartController {
         })
     }
 
+    #[cfg(feature = "test-support")]
     pub const fn restarts_launched(&self) -> u64 {
         self.restarts_launched
     }

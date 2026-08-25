@@ -65,8 +65,16 @@ jobs:
           key: ${{ steps.certification-deps.outputs.cache-primary-key }}
 
   windows:
-    name: Windows Job Object
-    runs-on: windows-2025
+    name: Windows sealed provider v2 / ${{ matrix.id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: x64
+            runner: windows-2025
+          - id: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -79,21 +87,28 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: cargo-deps-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+          key: cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
       - id: certification-target
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             target/ci/bootstrap
             target/ci/backend
-          key: cargo-target-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
+            target/ci/windows-sealed
+            target/ci/windows-sealed-cargo
+          key: cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job
+      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-sealed-v2
+      - name: Certify packaged Cargo channel
+        env:
+          CARGO_TARGET_DIR: target/ci/windows-sealed-cargo/build
+        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite package-windows-sealed
+      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite channel-parity-windows-sealed
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: backend-windows-job-object
-          path: target/ci/reports/backend-windows-job-object.json
+          name: backend-windows-sealed-v2-${{ matrix.id }}
+          path: target/ci/reports/windows-sealed-v2
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
@@ -103,6 +118,8 @@ jobs:
           path: |
             target/ci/bootstrap
             target/ci/backend
+            target/ci/windows-sealed
+            target/ci/windows-sealed-cargo
           key: ${{ steps.certification-target.outputs.cache-primary-key }}
       - if: always() && steps.certification-deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9

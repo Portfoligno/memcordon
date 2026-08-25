@@ -6,10 +6,10 @@ monitoring on macOS. Most users should install the `memcordon` CLI; this crate
 is for applications that embed backend probing or execution.
 
 Boundary capability is reported separately from memory enforcement. Sealed
-requests never fall back to standard backends. Linux reports sealed capability
-only when the matching mechanism-v2 provider is installed and qualified;
-missing, stale, or mismatched providers reject the request before target
-authorization. Execution reports use schema 8.
+requests never fall back to standard backends. Linux and Windows report sealed
+capability only when their matching mechanism-v2 providers are installed and
+qualified; missing, stale, or mismatched providers reject the request before
+target authorization. Execution reports use schema 8.
 
 ## Install
 

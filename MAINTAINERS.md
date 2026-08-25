@@ -95,13 +95,13 @@ argument vectors and monotonic subprocess deadlines.
 - `ci.yml` runs repository policy, quality, MSRV, supply-chain, and five-target
   native checks.
 - `deep-ci.yml` runs Miri, fuzz smoke tests, and native stress tests.
-- `backend-certification.yml` produces exact-run Linux and Windows hard-backend
-  evidence.
+- `backend-certification.yml` produces exact-run Linux and Windows
+  sealed-provider evidence.
 - `release.yml` repeats release-grade gates before assembly, publication, and
   public-state verification.
 
 The architecture uses GitHub-hosted runners only. Public CI covers Linux x64 and
-ARM64, macOS x64 and ARM64, and Windows x64. Deep CI and backend certification
+ARM64, macOS x64 and ARM64, and Windows x64 and ARM64. Deep CI and backend certification
 run on every unfiltered branch or tag push and support inputless manual
 dispatch. Repository policy is the source of truth for exact triggers,
 permissions, pins, cache separation, and dependency-update coverage.
@@ -116,14 +116,22 @@ injection, recovery, and the exact six-file evidence inventory documented in
 converted to skips or standard-backend success. The provider endpoint is fixed
 and no project-specific environment variable configures certification.
 
-Hard-backend certification uses the exact standard GitHub-hosted labels
-`ubuntu-24.04` and `windows-2025`. Each job receives a fresh VM, performs runtime
+Hard-backend certification uses the exact GitHub-hosted labels `ubuntu-24.04`,
+`windows-2025`, and the Windows ARM64 runner declared in the workflow. Each job receives a fresh VM, performs runtime
 qualification, runs every required scenario, and fails instead of accepting an
 unavailable backend as a skip.
 
 Linux uses privilege only inside the typed CI driver to establish a systemd
 delegation; qualification and scenarios run as the unprivileged runner user.
-Windows qualification and the real assignment test run in the same job context.
+Windows runtime certification invokes the typed `backend-windows-sealed-v2`,
+`package-windows-sealed`, and `channel-parity-windows-sealed` suites on separate
+elevated x64 and ARM64 jobs. The
+provider is installed with native SCM APIs, qualified, exercised through the
+public CLI, and uninstalled on each runner. Package, qualification, execution,
+doctor, and cleanup JSON evidence are uploaded as one exact-run inventory.
+The package and parity suites are release-blocking. Post-public verification
+also installs the published Cargo package and exercises the native archive on
+matching x64 and ARM64 Windows runners.
 
 In certification schema 2, `runner_class: "ephemeral-certified"` describes the
 evidence from that exact hosted job run. It includes provider, fixed label,
@@ -141,8 +149,8 @@ The published runtime remains three crates in dependency order:
 `memcordon-core`, `memcordon-platform`, and `memcordon`. The sealed
 agent is a binary-private module tree in the `memcordon` package, not a
 fourth crate or a public Rust API. Cargo installs two default runtime binaries.
-Linux native archives contain those same two binaries and a generated runtime
-manifest; non-Linux archives contain only the CLI.
+Linux and Windows native archives contain those same two binaries and a
+generated runtime manifest. Other native archives contain only the CLI.
 
 Release schema 3 binds each archive's runtime-manifest digest and exact
 component size, mode, role, and digest. Native asset report schema 2 records

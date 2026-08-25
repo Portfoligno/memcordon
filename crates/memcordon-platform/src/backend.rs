@@ -298,15 +298,15 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
             Error::new(ErrorCategory::Setup, "MCSETUP-CONSOLE", error.to_string())
                 .with_os_error(&error)
         })?;
-        crate::windows_job::run_attempt(
-            policy,
-            command,
-            &console,
-            crate::supervisor::AttemptContext {
-                supervision_offset: Duration::ZERO,
-                supervision_deadline_remaining: None,
-            },
-        )
+        let context = crate::supervisor::AttemptContext {
+            supervision_offset: Duration::ZERO,
+            supervision_deadline_remaining: None,
+        };
+        if policy.boundary() == memcordon_core::BoundaryRequirement::Sealed {
+            crate::sealed::windows::run(&policy, command, &console, context)
+        } else {
+            crate::windows_job::run_attempt(policy, command, &console, context)
+        }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {

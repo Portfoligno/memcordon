@@ -593,6 +593,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -628,6 +629,7 @@ dependencies = [
  "base64",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
 ]

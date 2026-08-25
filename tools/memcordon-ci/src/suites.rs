@@ -249,6 +249,17 @@ fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
         "state_machine",
         "terminal-receipt-v2",
         "workflow_parser",
+        "windows-public-provider-protocol",
+        "windows-private-launcher-protocol",
+        "windows-token-envelope",
+        "windows-security-descriptor",
+        "windows-handle-manifest",
+        "windows-environment-block",
+        "windows-argv",
+        "windows-qualification",
+        "windows-terminal-receipt",
+        "windows-attempt-record",
+        "windows-package-inspection",
     ];
     for target in targets {
         CommandSpec::new("rustup", root, CARGO_DEADLINE)
@@ -864,6 +875,13 @@ pub fn run(root: &Path, suite: Suite) -> Result<()> {
             "windows-job-object",
             cfg!(target_os = "windows"),
         ),
+        Suite::BackendWindowsSealedV2 => crate::sealed_windows::certify(root, &toolchains.stable),
+        Suite::PackageWindowsSealed => {
+            crate::sealed_windows::package_certify(root, &toolchains.stable)
+        }
+        Suite::ChannelParityWindowsSealed => {
+            crate::sealed_windows::channel_parity(root, &toolchains.stable)
+        }
         Suite::BackendMacosWatchdog => macos_acceptance(root, &toolchains.stable),
         Suite::ReleasePreflight => {
             release::preflight(root)?;

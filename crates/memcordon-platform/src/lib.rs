@@ -1,8 +1,8 @@
 //! Native supervision backends and capability reporting.
 //!
-//! Current backends provide standard supervision only. A sealed request is
-//! rejected before target authorization unless a future backend advertises
-//! and proves every required sealed-boundary predicate.
+//! Linux and Windows can provide sealed supervision through their installed,
+//! qualified companion providers. Other backends reject a sealed request
+//! before target authorization.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -13,7 +13,7 @@ mod guardian;
 mod linux_cgroup;
 #[cfg(target_os = "macos")]
 mod macos_watchdog;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod sealed;
 mod signal;
 mod supervisor;
@@ -28,6 +28,8 @@ pub use backend::{
     BackendCleanupFacts, BackendInfo, BoundaryQualification, BoundarySupport, Execution,
     ProbeReport, SealedAvailability, cleanup_stale, probe, run,
 };
+#[cfg(target_os = "windows")]
+pub use supervisor::certify_windows_platform_mutant;
 pub use supervisor::{
     AttemptContext, AttemptExecution, SupervisorRequest, capabilities, capabilities_for, supervise,
 };

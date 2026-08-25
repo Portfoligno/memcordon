@@ -304,6 +304,11 @@ const NATIVE_MATRIX: [(&str, &str); 6] = [
     ("windows-x64", "windows-2025"),
     ("windows-arm64", "windows-11-arm"),
 ];
+const VERIFY_PUBLIC_MATRIX: [(&str, &str); 3] = [
+    ("linux-x64", "blacksmith-4vcpu-ubuntu-2404"),
+    ("windows-x64", "windows-2025"),
+    ("windows-arm64", "windows-11-arm"),
+];
 
 const STRESS_MATRIX: [(&str, &str); 5] = [
     ("linux-x64", "ubuntu-24.04"),
@@ -522,8 +527,11 @@ fn check_certification_cache(
     const TARGET_PATHS: &str = "target/ci/bootstrap\ntarget/ci/backend\n";
     const LINUX_TARGET_PATHS: &str =
         "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/sealed-agent\n";
+    const WINDOWS_TARGET_PATHS: &str = "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n";
     let target_paths = if context.contains("linux") {
         LINUX_TARGET_PATHS
+    } else if context.contains("windows") {
+        WINDOWS_TARGET_PATHS
     } else {
         TARGET_PATHS
     };
@@ -607,7 +615,9 @@ fn check_certification_job(
         return Err(failure(format!("{context} timeout differs")));
     }
     let steps = certification_steps(job, context)?;
-    if steps.len() != checkout_count + 7 {
+    let windows = context.contains("windows");
+    let release_windows = context == "release windows-certification job";
+    if steps.len() != checkout_count + 7 + usize::from(windows) * 2 + usize::from(release_windows) {
         return Err(failure(format!("{context} step count differs")));
     }
 
@@ -615,6 +625,7 @@ fn check_certification_job(
     let restore_action = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
     let save_action = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
     let upload_action = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+    let download_action = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
 
     let checkouts = action_steps(steps, checkout_action)?;
     if checkouts.len() != checkout_count {
@@ -637,18 +648,49 @@ fn check_certification_job(
             )));
         }
     }
+    let downloads = action_steps(steps, download_action)?;
+    if release_windows {
+        if downloads.len() != 1 {
+            return Err(failure(format!(
+                "{context} must download exactly one native archive"
+            )));
+        }
+        let inputs = mapping(
+            downloads[0]
+                .get(key("with"))
+                .ok_or_else(|| failure(format!("{context} native download lacks inputs")))?,
+            context,
+        )?;
+        exact_mapping_keys(inputs, &["name", "path"], context)?;
+        if scalar(inputs, "name") != Some("release-native-windows-${{ matrix.id }}")
+            || scalar(inputs, "path") != Some("target/ci/release-input")
+        {
+            return Err(failure(format!(
+                "{context} native archive download differs"
+            )));
+        }
+    } else if !downloads.is_empty() {
+        return Err(failure(format!(
+            "{context} must not download a native archive"
+        )));
+    }
 
     let run_commands: Vec<&str> = steps
         .iter()
         .filter_map(Value::as_mapping)
         .filter_map(|step| scalar(step, "run"))
         .collect();
-    if run_commands
-        != [
-            "rustup toolchain install 1.97.1 --profile minimal",
-            suite_command,
-        ]
-    {
+    let mut expected_run_commands = vec![
+        "rustup toolchain install 1.97.1 --profile minimal",
+        suite_command,
+    ];
+    if windows {
+        expected_run_commands.extend([
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite package-windows-sealed",
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite channel-parity-windows-sealed",
+        ]);
+    }
+    if run_commands != expected_run_commands {
         return Err(failure(format!("{context} run commands differ")));
     }
 
@@ -665,9 +707,11 @@ fn check_certification_job(
     if uploads.len() != 1 {
         return Err(failure(format!("{context} artifact upload count differs")));
     }
-    if artifact_name.contains("linux") && scalar(uploads[0], "if") != Some("always()") {
+    if (artifact_name.contains("linux") || artifact_name.contains("windows"))
+        && scalar(uploads[0], "if") != Some("always()")
+    {
         return Err(failure(format!(
-            "{context} must retain Linux certification diagnostics under always()"
+            "{context} must retain sealed certification diagnostics under always()"
         )));
     }
     let inputs = mapping(
@@ -738,8 +782,6 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
 
     let linux_dependency_key = "cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}";
     let linux_target_key = "cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
-    let legacy_dependency_key = "cargo-deps-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}";
-    let legacy_target_key = "cargo-target-backend-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
     for (job_name, runner, dependency_key, target_key, suite, artifact_name, artifact_path) in [
         (
             "linux",
@@ -752,12 +794,12 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         ),
         (
             "windows",
-            "windows-2025",
-            legacy_dependency_key,
-            legacy_target_key,
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job",
-            "backend-windows-job-object",
-            "target/ci/reports/backend-windows-job-object.json",
+            "${{ matrix.runner }}",
+            linux_dependency_key,
+            linux_target_key,
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-sealed-v2",
+            "backend-windows-sealed-v2-${{ matrix.id }}",
+            "target/ci/reports/windows-sealed-v2",
         ),
     ] {
         let job = mapping(
@@ -766,11 +808,26 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
             })?,
             job_name,
         )?;
-        exact_mapping_keys(
-            job,
-            &["name", "runs-on", "timeout-minutes", "steps"],
-            &format!("backend certification {job_name} job"),
-        )?;
+        let context = format!("backend certification {job_name} job");
+        if job_name == "windows" {
+            exact_mapping_keys(
+                job,
+                &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
+                &context,
+            )?;
+            check_runner_matrix(
+                jobs,
+                job_name,
+                &[("x64", "windows-2025"), ("arm64", "windows-11-arm")],
+                &context,
+            )?;
+        } else {
+            exact_mapping_keys(
+                job,
+                &["name", "runs-on", "timeout-minutes", "steps"],
+                &context,
+            )?;
+        }
         check_certification_job(
             job,
             runner,
@@ -781,7 +838,7 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
             suite,
             artifact_name,
             artifact_path,
-            &format!("backend certification {job_name} job"),
+            &context,
         )?;
     }
     Ok(())
@@ -1105,8 +1162,6 @@ fn check_release_structure(
     }
     let linux_dependency_key = "cargo-deps-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}";
     let linux_target_key = "cargo-target-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
-    let legacy_dependency_key = "cargo-deps-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}";
-    let legacy_target_key = "cargo-target-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
     for (job_name, runner, dependency_key, target_key, suite, artifact_name, artifact_path) in [
         (
             "linux-certification",
@@ -1119,12 +1174,12 @@ fn check_release_structure(
         ),
         (
             "windows-certification",
-            "windows-2025",
-            legacy_dependency_key,
-            legacy_target_key,
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job",
-            "release-certification-windows",
-            "target/ci/reports/backend-windows-job-object.json",
+            "${{ matrix.runner }}",
+            linux_dependency_key,
+            linux_target_key,
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-sealed-v2",
+            "release-certification-windows-${{ matrix.id }}",
+            "target/ci/reports/windows-sealed-v2",
         ),
     ] {
         let job = mapping(
@@ -1132,14 +1187,44 @@ fn check_release_structure(
                 .ok_or_else(|| failure(format!("release {job_name} job is absent")))?,
             job_name,
         )?;
-        exact_mapping_keys(
-            job,
-            &["name", "needs", "runs-on", "timeout-minutes", "steps"],
-            &format!("release {job_name} job"),
-        )?;
-        if scalar(job, "needs") != Some("preflight") {
+        let context = format!("release {job_name} job");
+        if job_name == "windows-certification" {
+            exact_mapping_keys(
+                job,
+                &[
+                    "name",
+                    "needs",
+                    "strategy",
+                    "runs-on",
+                    "timeout-minutes",
+                    "steps",
+                ],
+                &context,
+            )?;
+            check_runner_matrix(
+                jobs,
+                job_name,
+                &[("x64", "windows-2025"), ("arm64", "windows-11-arm")],
+                &context,
+            )?;
+        } else {
+            exact_mapping_keys(
+                job,
+                &["name", "needs", "runs-on", "timeout-minutes", "steps"],
+                &context,
+            )?;
+        }
+        if job_name == "windows-certification" {
+            exact_string_sequence(
+                job.get(key("needs")).ok_or_else(|| {
+                    failure("release Windows certification dependencies are absent")
+                })?,
+                &["preflight", "native"],
+                "release Windows certification dependencies",
+            )?;
+        } else if scalar(job, "needs") != Some("preflight") {
             return Err(failure(format!(
-                "release {job_name} must depend only on preflight"
+                "release {job_name} must depend on preflight"
             )));
         }
         check_certification_job(
@@ -1152,7 +1237,7 @@ fn check_release_structure(
             suite,
             artifact_name,
             artifact_path,
-            &format!("release {job_name} job"),
+            &context,
         )?;
     }
     let assemble = mapping(
@@ -1206,10 +1291,148 @@ fn check_release_structure(
             .ok_or_else(|| failure("verify-public job is absent"))?,
         "verify-public job",
     )?;
-    if scalar(verify, "needs") != Some("publish") {
+    check_verify_public_job(jobs, verify, toolchains)?;
+    check_release_credentials(jobs, release, auth_action)?;
+    Ok(())
+}
+
+fn check_verify_public_job(
+    jobs: &Mapping,
+    job: &Mapping,
+    toolchains: &config::Toolchains,
+) -> Result<()> {
+    let context = "verify-public job";
+    exact_mapping_keys(
+        job,
+        &[
+            "name",
+            "needs",
+            "strategy",
+            "runs-on",
+            "timeout-minutes",
+            "permissions",
+            "steps",
+        ],
+        context,
+    )?;
+    if scalar(job, "needs") != Some("publish") {
         return Err(failure("verify-public must depend on publish"));
     }
-    check_release_credentials(jobs, release, auth_action)?;
+    check_runner_matrix(jobs, "verify-public", &VERIFY_PUBLIC_MATRIX, context)?;
+    if job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(90) {
+        return Err(failure("verify-public timeout differs"));
+    }
+    let permissions = mapping(
+        job.get(key("permissions"))
+            .ok_or_else(|| failure("verify-public permissions are absent"))?,
+        context,
+    )?;
+    exact_mapping_keys(permissions, &["contents"], context)?;
+    if scalar(permissions, "contents") != Some("read") {
+        return Err(failure("verify-public permissions differ"));
+    }
+    let steps = certification_steps(job, context)?;
+    if steps.len() != 10 {
+        return Err(failure("verify-public step count differs"));
+    }
+    let checkout = action_steps(
+        steps,
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    )?;
+    let downloads = action_steps(
+        steps,
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+    )?;
+    if checkout.len() != 2 || downloads.len() != 2 {
+        return Err(failure(
+            "verify-public checkout or release-bundle download count differs",
+        ));
+    }
+    let run_commands = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter_map(|step| scalar(step, "run"))
+        .collect::<Vec<_>>();
+    let expected = [
+        format!(
+            "rustup toolchain install {} --profile minimal",
+            toolchains.stable
+        ),
+        format!(
+            "rustup run {} cargo run --locked --target-dir target/ci/verify-bootstrap --package memcordon-ci -- release verify-public",
+            toolchains.stable
+        ),
+    ];
+    if run_commands.len() != expected.len()
+        || !run_commands
+            .iter()
+            .zip(&expected)
+            .all(|(actual, expected)| *actual == expected)
+    {
+        return Err(failure("verify-public command inventory differs"));
+    }
+    let restore = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
+    let save = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
+    if action_steps(steps, restore)?.len() != 2 || action_steps(steps, save)?.len() != 2 {
+        return Err(failure("verify-public split cache inventory differs"));
+    }
+    for (id, path, key_fragment) in [
+        (
+            "verify-public-deps",
+            "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n",
+            "cargo-deps-release-verify-public-v2-",
+        ),
+        (
+            "verify-public-target",
+            "target/ci/verify-bootstrap",
+            "cargo-target-release-verify-public-v2-",
+        ),
+    ] {
+        let restore_step = step_with_id(steps, id, context)?;
+        if scalar(restore_step, "uses") != Some(restore) {
+            return Err(failure(format!(
+                "verify-public {id} is not a cache restore"
+            )));
+        }
+        let inputs = mapping(
+            restore_step
+                .get(key("with"))
+                .ok_or_else(|| failure(format!("verify-public {id} inputs are absent")))?,
+            context,
+        )?;
+        if scalar(inputs, "path") != Some(path)
+            || !scalar(inputs, "key").is_some_and(|value| {
+                value.starts_with(key_fragment)
+                    && value.contains("${{ runner.os }}")
+                    && value.contains("${{ runner.arch }}")
+                    && value.contains("hashFiles(")
+            })
+        {
+            return Err(failure(format!("verify-public {id} cache inputs differ")));
+        }
+        let condition = format!("always() && steps.{id}.outputs.cache-hit != 'true'");
+        let primary_key = format!("${{{{ steps.{id}.outputs.cache-primary-key }}}}");
+        let matching_saves = action_steps(steps, save)?
+            .into_iter()
+            .filter(|step| scalar(step, "if") == Some(condition.as_str()))
+            .collect::<Vec<_>>();
+        if matching_saves.len() != 1 {
+            return Err(failure(format!("verify-public {id} cache save differs")));
+        }
+        let save_inputs = mapping(
+            matching_saves[0]
+                .get(key("with"))
+                .ok_or_else(|| failure(format!("verify-public {id} save inputs are absent")))?,
+            context,
+        )?;
+        if scalar(save_inputs, "path") != Some(path)
+            || scalar(save_inputs, "key") != Some(primary_key.as_str())
+        {
+            return Err(failure(format!(
+                "verify-public {id} cache save inputs differ"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -2361,9 +2584,9 @@ pub fn run(root: &Path) -> Result<()> {
         .iter()
         .filter(|definition| definition.file == ".github/workflows/release.yml")
         .collect();
-    if release_environment.len() != 8 {
+    if release_environment.len() != 9 {
         return Err(failure(
-            "release workflow must have exactly eight step-local environment mappings",
+            "release workflow must have exactly nine step-local environment mappings",
         ));
     }
     for name in ["Stage GitHub draft and assets", "Finalize GitHub release"] {
@@ -2508,15 +2731,18 @@ jobs:
                 .get_mut(key("jobs"))
                 .and_then(Value::as_mapping_mut)
                 .ok_or_else(|| failure("release jobs are absent"))?;
-            for job_name in ["publish", "verify-public"] {
-                jobs.insert(
-                    key(job_name),
-                    fixture_jobs
-                        .get(key(job_name))
-                        .ok_or_else(|| failure(format!("steady {job_name} job is absent")))?
-                        .clone(),
-                );
-            }
+            // The steady-state fixture exercises publication authentication.
+            // Keep the production public-verification matrix intact so its
+            // independently strict Windows x64/ARM64 structure is still
+            // checked by check_release_structure.
+            let job_name = "publish";
+            jobs.insert(
+                key(job_name),
+                fixture_jobs
+                    .get(key(job_name))
+                    .ok_or_else(|| failure(format!("steady {job_name} job is absent")))?
+                    .clone(),
+            );
         }
         let workflow = mapping(&document, "release workflow")?;
         let jobs = mapping(

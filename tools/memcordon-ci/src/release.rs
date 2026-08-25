@@ -157,7 +157,6 @@ struct NativeSmokeReport {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct AgentPackageInspection {
     schema_version: u32,
     version: String,
@@ -168,12 +167,40 @@ struct AgentPackageInspection {
     execution_report_schema: u32,
     plan_report_schema: u32,
     doctor_report_schema: u32,
-    control_service_sha256: String,
-    control_socket_sha256: String,
-    launcher_service_sha256: String,
-    launcher_socket_sha256: String,
-    tmpfiles_sha256: String,
+    #[serde(flatten)]
+    platform: AgentPackagePlatform,
     compiled_metadata_valid: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(clippy::large_enum_variant)] // Mirror the package schema without changing its field shape.
+#[serde(tag = "platform", rename_all = "kebab-case", deny_unknown_fields)]
+enum AgentPackagePlatform {
+    LinuxSystemd {
+        control_service_sha256: String,
+        control_socket_sha256: String,
+        launcher_service_sha256: String,
+        launcher_socket_sha256: String,
+        tmpfiles_sha256: String,
+    },
+    WindowsService {
+        control_service_name: String,
+        launcher_service_name: String,
+        control_service_config_sha256: String,
+        launcher_service_config_sha256: String,
+        control_pipe: String,
+        launcher_pipe: String,
+        binary_install_path: String,
+        state_root: String,
+        control_service_sid_type: String,
+        launcher_service_sid_type: String,
+        control_required_privileges: Vec<String>,
+        launcher_required_privileges: Vec<String>,
+        control_pipe_security_sha256: String,
+        launcher_pipe_security_sha256: String,
+        install_directory_security_sha256: String,
+        state_directory_security_sha256: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -727,6 +754,11 @@ fn validate_memcordon_crate_distribution(path: &Path) -> Result<()> {
         "src/bin/memcordon-sealed-agent/package.rs",
         "src/bin/memcordon-sealed-agent/protocol.rs",
         "src/bin/memcordon-sealed-agent/linux/mod.rs",
+        "src/bin/memcordon-sealed-agent/windows/mod.rs",
+        "src/bin/memcordon-sealed-agent/windows/control_service.rs",
+        "src/bin/memcordon-sealed-agent/windows/launcher_service.rs",
+        "src/bin/memcordon-sealed-agent/windows/package.rs",
+        "src/bin/memcordon-sealed-agent/windows/qualification.rs",
     ] {
         if !files.contains(Path::new(required)) {
             return Err(failure(format!(
@@ -1142,7 +1174,11 @@ fn package_crate(
     })
 }
 
-fn create_package_archives(root: &Path, stable: &str, packages: &[String]) -> Result<()> {
+pub(crate) fn create_package_archives(
+    root: &Path,
+    stable: &str,
+    packages: &[String],
+) -> Result<()> {
     let mut arguments = vec![
         OsString::from("package"),
         OsString::from("--locked"),
@@ -1156,7 +1192,7 @@ fn create_package_archives(root: &Path, stable: &str, packages: &[String]) -> Re
     Ok(())
 }
 
-fn extract_crate_source(archive_path: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn extract_crate_source(archive_path: &Path, destination: &Path) -> Result<()> {
     let decoder = GzDecoder::new(File::open(archive_path)?);
     let mut archive = tar::Archive::new(decoder);
     for entry in archive.entries()? {
@@ -1185,30 +1221,83 @@ fn validate_agent_package_inspection(
 ) -> Result<()> {
     let inspection: AgentPackageInspection = serde_json::from_slice(output)?;
     let sha256_text_length = sha256_bytes(&[]).len();
-    let digests = [
-        &inspection.executable_sha256,
-        &inspection.control_service_sha256,
-        &inspection.control_socket_sha256,
-        &inspection.launcher_service_sha256,
-        &inspection.launcher_socket_sha256,
-        &inspection.tmpfiles_sha256,
-    ];
-    let digests_valid = digests.iter().all(|digest| {
+    let valid_digest = |digest: &String| {
         digest.len() == sha256_text_length
             && digest
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    });
-    if inspection.schema_version != 1
+    };
+    let platform_valid = match &inspection.platform {
+        AgentPackagePlatform::LinuxSystemd {
+            control_service_sha256,
+            control_socket_sha256,
+            launcher_service_sha256,
+            launcher_socket_sha256,
+            tmpfiles_sha256,
+        } => {
+            inspection.provider_protocol == 2
+                && inspection.mechanism == "linux-pid-namespace-cgroup-v2"
+                && [
+                    control_service_sha256,
+                    control_socket_sha256,
+                    launcher_service_sha256,
+                    launcher_socket_sha256,
+                    tmpfiles_sha256,
+                ]
+                .into_iter()
+                .all(valid_digest)
+        }
+        AgentPackagePlatform::WindowsService {
+            control_service_name,
+            launcher_service_name,
+            control_service_config_sha256,
+            launcher_service_config_sha256,
+            control_pipe,
+            launcher_pipe,
+            binary_install_path,
+            state_root,
+            control_service_sid_type,
+            launcher_service_sid_type,
+            control_required_privileges,
+            launcher_required_privileges,
+            control_pipe_security_sha256,
+            launcher_pipe_security_sha256,
+            install_directory_security_sha256,
+            state_directory_security_sha256,
+        } => {
+            inspection.provider_protocol == 1
+                && inspection.mechanism == "windows-job-object-v2"
+                && control_service_name == "MemCordonSealedControl"
+                && launcher_service_name == "MemCordonSealedLauncher"
+                && control_pipe == r"\\.\pipe\memcordon-sealed-agent-v1"
+                && launcher_pipe == r"\\.\pipe\memcordon-sealed-launcher-v1"
+                && !binary_install_path.is_empty()
+                && !state_root.is_empty()
+                && control_service_sid_type == "restricted"
+                && launcher_service_sid_type == "restricted"
+                && !control_required_privileges.is_empty()
+                && !launcher_required_privileges.is_empty()
+                && [
+                    control_service_config_sha256,
+                    launcher_service_config_sha256,
+                    control_pipe_security_sha256,
+                    launcher_pipe_security_sha256,
+                    install_directory_security_sha256,
+                    state_directory_security_sha256,
+                ]
+                .into_iter()
+                .all(valid_digest)
+        }
+    };
+    if inspection.schema_version != 2
         || inspection.version != expected_version
         || inspection.source_commit != expected_source_commit
-        || inspection.provider_protocol != 2
-        || inspection.mechanism != "linux-pid-namespace-cgroup-v2"
         || inspection.execution_report_schema != memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION
         || inspection.plan_report_schema != memcordon_core::PLAN_REPORT_SCHEMA_VERSION
         || inspection.doctor_report_schema != memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION
         || !inspection.compiled_metadata_valid
-        || !digests_valid
+        || !valid_digest(&inspection.executable_sha256)
+        || !platform_valid
     {
         return Err(failure(
             "sealed agent package inspection differs from the release identity",
@@ -1354,6 +1443,21 @@ fn smoke_packaged_memcordon_install(
         };
         smoke_linux_provider(&installed_cli, &installed_agent, root, &mut smoke)?;
     }
+    #[cfg(target_os = "windows")]
+    {
+        let mut smoke = NativeSmokeReport {
+            cli_version: true,
+            doctor: true,
+            agent_version: Some(true),
+            agent_inspection: Some(true),
+            provider_install: None,
+            provider_verify: None,
+            provider_qualification: None,
+            sealed_execution: None,
+            provider_uninstall: None,
+        };
+        smoke_windows_provider(&installed_cli, &installed_agent, root, &mut smoke)?;
+    }
     Ok(())
 }
 
@@ -1445,8 +1549,17 @@ fn runtime_manifest(
     target: &AssetTarget,
     components: Vec<RuntimeComponentRecord>,
 ) -> RuntimeManifestV1 {
-    let sealed = match target.sealed {
-        SealedAssetPolicy::Included => SealedRuntimeV1::Included {
+    let sealed = match (target.sealed, target.rust_target.contains("windows")) {
+        (SealedAssetPolicy::Included, true) => SealedRuntimeV1::Included {
+            agent_component: "sealed-agent".to_owned(),
+            provider_protocol: 1,
+            mechanism: "windows-job-object-v2".to_owned(),
+            execution_report_schema: memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
+            plan_report_schema: memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
+            doctor_report_schema: memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
+            qualification_schema: 1,
+        },
+        (SealedAssetPolicy::Included, false) => SealedRuntimeV1::Included {
             agent_component: "sealed-agent".to_owned(),
             provider_protocol: 2,
             mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
@@ -1455,8 +1568,8 @@ fn runtime_manifest(
             doctor_report_schema: memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
             qualification_schema: 2,
         },
-        SealedAssetPolicy::NotApplicable => SealedRuntimeV1::NotApplicable {
-            reason: "the packaged sealed provider is available only on Linux".to_owned(),
+        (SealedAssetPolicy::NotApplicable, _) => SealedRuntimeV1::NotApplicable {
+            reason: "the platform has no qualified packaged sealed provider".to_owned(),
         },
     };
     RuntimeManifestV1 {
@@ -1739,6 +1852,8 @@ fn inspect_extract_and_smoke(
             smoke.agent_inspection = Some(true);
             #[cfg(target_os = "linux")]
             smoke_linux_provider(&executable, &agent_executable, root, &mut smoke)?;
+            #[cfg(target_os = "windows")]
+            smoke_windows_provider(&executable, &agent_executable, root, &mut smoke)?;
         }
     }
     let mut inventory = Sha256::new();
@@ -1759,6 +1874,103 @@ fn inspect_extract_and_smoke(
         archive_member_inventory_sha256: hex::encode(inventory.finalize()),
         smoke,
     })
+}
+
+#[cfg(target_os = "windows")]
+fn smoke_windows_provider(
+    cli: &Path,
+    agent: &Path,
+    root: &Path,
+    smoke: &mut NativeSmokeReport,
+) -> Result<()> {
+    let agent_command = |arguments: &[&str]| {
+        CommandSpec::new(agent, root, RELEASE_DEADLINE)
+            .args(arguments.iter().copied())
+            .run()
+            .map(|_| ())
+    };
+    let primary: Result<()> = (|| {
+        agent_command(&["package", "install", "--ephemeral-ci"])?;
+        smoke.provider_install = Some(true);
+        agent_command(&["package", "verify", "--json"])?;
+        smoke.provider_verify = Some(true);
+        agent_command(&["qualify"])?;
+        smoke.provider_qualification = Some(true);
+        CommandSpec::new(cli, root, RELEASE_DEADLINE)
+            .args(["doctor", "--require", "sealed"])
+            .run()?;
+        CommandSpec::new(cli, root, RELEASE_DEADLINE)
+            .args([
+                OsString::from("--sealed"),
+                OsString::from("--"),
+                agent.as_os_str().to_os_string(),
+                OsString::from("--version"),
+            ])
+            .run()?;
+        smoke.sealed_execution = Some(true);
+        Ok(())
+    })();
+    let uninstall = agent_command(&["package", "uninstall", "--ephemeral-ci"])
+        .and_then(|()| {
+            let output = CommandSpec::new(agent, root, RELEASE_DEADLINE)
+                .arg("windows-provider-state-absent")
+                .run()?;
+            if output
+                .strip_suffix(b"\n")
+                .and_then(|value| value.strip_suffix(b"\r").or(Some(value)))
+                == Some(b"true")
+            {
+                Ok(())
+            } else {
+                Err(failure(format!(
+                    "Windows native absence probe did not report true: {:?}",
+                    String::from_utf8_lossy(&output)
+                )))
+            }
+        })
+        .and_then(|()| verify_windows_provider_absent());
+    if uninstall.is_ok() {
+        smoke.provider_uninstall = Some(true);
+    }
+    match (primary, uninstall) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(failure(format!(
+            "Windows bundle provider smoke failed: primary={primary}; cleanup={cleanup}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn verify_windows_provider_absent() -> Result<()> {
+    let program_files = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    let program_data = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    for path in [
+        program_files.join("MemCordon"),
+        program_data.join("MemCordon").join("sealed"),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(failure(format!(
+                    "Windows provider uninstall left residual state at {}",
+                    path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(failure(format!(
+                    "Windows provider uninstall state proof failed for {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -3177,6 +3389,21 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
             };
             smoke_linux_provider(&executable, &agent, root, &mut smoke)?;
         }
+        #[cfg(target_os = "windows")]
+        {
+            let mut smoke = NativeSmokeReport {
+                cli_version: true,
+                doctor: true,
+                agent_version: Some(true),
+                agent_inspection: Some(true),
+                provider_install: None,
+                provider_verify: None,
+                provider_qualification: None,
+                sealed_execution: None,
+                provider_uninstall: None,
+            };
+            smoke_windows_provider(&executable, &agent, root, &mut smoke)?;
+        }
     }
     Ok(())
 }
@@ -3824,12 +4051,13 @@ mod tests {
     fn package_inspection_fixture() -> serde_json::Value {
         let digest = sha256_bytes(b"package-inspection-fixture");
         serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "version": "1.2.3",
             "source_commit": "source-commit",
             "executable_sha256": digest,
             "provider_protocol": 2,
             "mechanism": "linux-pid-namespace-cgroup-v2",
+            "platform": "linux-systemd",
             "execution_report_schema": memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
             "plan_report_schema": memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
             "doctor_report_schema": memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
@@ -4849,8 +5077,12 @@ mod tests {
                 "certification/backend-linux-cgroup-v2.json",
             ),
             (
-                "windows-job-object",
-                "certification/backend-windows-job-object.json",
+                "windows-job-object-v2/x86_64-pc-windows-msvc",
+                "certification/windows-sealed-v2/x64-windows-cleanup.json",
+            ),
+            (
+                "windows-job-object-v2/aarch64-pc-windows-msvc",
+                "certification/windows-sealed-v2/arm64-windows-cleanup.json",
             ),
             (
                 "macos-watchdog",
@@ -4879,6 +5111,12 @@ mod tests {
         });
         for (backend, relative) in certification {
             let evidence_path = output.join(relative);
+            fs::create_dir_all(
+                evidence_path
+                    .parent()
+                    .expect("certification evidence should have a parent"),
+            )
+            .expect("certification evidence directory should exist");
             fs::write(&evidence_path, format!("{backend} certified\n"))
                 .expect("certification evidence should write");
             manifest.certification.insert(

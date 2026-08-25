@@ -16,6 +16,7 @@ mod state_machine;
 mod supervision;
 #[cfg(feature = "test-support")]
 pub mod test_support;
+mod windows_sealed;
 
 pub use error::{
     BoundarySetupFailure, BoundarySetupPhase, Error, ErrorCategory, InitialSpawnFailure,
@@ -59,4 +60,28 @@ pub use supervision::{
     SealedUnavailableReport, SupervisionAggregates, SupervisionDeadlineEvidence,
     SupervisionErrorRecord, SupervisionExecution, SupervisionModelError, SupervisionPhase,
     SupervisionTerminal, WindowsSealedEvidenceV2, boundary_evidence_is_consistent,
+};
+pub use windows_sealed::{
+    NativeWindowsCommandV1, WINDOWS_CONTROL_PIPE, WINDOWS_CONTROL_SERVICE_NAME,
+    WINDOWS_LAUNCHER_PIPE, WINDOWS_LAUNCHER_SERVICE_NAME, WINDOWS_MAX_FRAME_BYTES,
+    WINDOWS_MAX_JOB_PROCESS_IDENTITIES, WINDOWS_PREAUTHORIZATION_FAULTS,
+    WINDOWS_PRIVATE_PROTOCOL_VERSION, WINDOWS_PUBLIC_PROTOCOL_VERSION,
+    WINDOWS_QUALIFICATION_SCHEMA_VERSION, WINDOWS_RELEASE_MUTANT_VARIANTS, WINDOWS_RELEASE_MUTANTS,
+    WINDOWS_RETIREMENT_FAULTS, WindowsAttemptStateV1, WindowsAuthorityLossEvidenceV1,
+    WindowsCallerTokenEnvelopeV1, WindowsCertificationObservationsV1, WindowsCertificationPhaseV1,
+    WindowsCleanupProcessCreationEvidenceV1, WindowsDurableAttemptRecordV1,
+    WindowsDurableCleanupStateV1, WindowsEnvironmentEntryV1, WindowsFaultRejectionObservationV1,
+    WindowsLaunchBrokerRequestV1, WindowsLaunchPolicyV1, WindowsLaunchRequestV1,
+    WindowsLauncherRequestV1, WindowsLauncherResponseV1, WindowsLifetimeV1,
+    WindowsMutantHookObservationV1, WindowsMutantKillEvidenceV1, WindowsMutantNativeObservationV1,
+    WindowsMutantNativeReceiptV1, WindowsMutantObservationV1,
+    WindowsPreauthorizationFaultMatrixEvidenceV1, WindowsProcessIdentityV1,
+    WindowsProviderRequestV1, WindowsProviderResponseV1, WindowsQualificationReceiptV1,
+    WindowsRemoteStreamV1, WindowsRetirementFaultMatrixEvidenceV1, WindowsSealedFault,
+    WindowsSealedMutant, WindowsStreamRoleV1, WindowsTerminalReceiptV1,
+    WindowsTokenMatrixEvidenceV1, WindowsTokenScenarioEvidenceV1, decode_windows_command_line,
+    encode_windows_command_line, encode_windows_environment_block,
+    parse_and_authenticate_windows_attempt_record, validate_windows_security_descriptor_text,
+    validate_windows_stream_manifest, windows_attempt_transition_allowed,
+    windows_certification_transition_allowed,
 };

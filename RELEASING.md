@@ -7,10 +7,10 @@ verification all agree.
 
 The `memcordon` crate installs both `memcordon` and
 `memcordon-sealed-agent`; there is no fourth crate or trusted-publisher slot.
-Linux native archives contain those two binaries plus
-`runtime-manifest.json`. macOS and Windows archives contain only the CLI
-and mark the sealed runtime not applicable. Release schema 3, native asset
-report schema 2, and publication report schema 2 bind that exact inventory.
+Linux and Windows native archives contain those two binaries plus
+`runtime-manifest.json`. macOS archives contain only the CLI and mark the
+sealed runtime not applicable. Release schema 3, native asset report schema 2,
+and publication report schema 2 bind that exact inventory.
 
 Repository architecture, validation suites, and backend certification are
 described in [MAINTAINERS.md](MAINTAINERS.md). Record user-visible changes in
@@ -23,8 +23,9 @@ described in [MAINTAINERS.md](MAINTAINERS.md). Record user-visible changes in
   workflow `release.yml`.
 - Start from a clean checkout of the intended release commit after every public
   CI check has passed.
-- Confirm the fixed `ubuntu-24.04` and `windows-2025` certification jobs are
-  available. A skipped scenario or failed runtime qualification blocks release.
+- Confirm the fixed `ubuntu-24.04`, `windows-2025`, and Windows ARM64 native
+  jobs are available. A skipped scenario or failed runtime qualification
+  blocks release.
 - Confirm the intended version has not been published and its tag does not
   exist. Never move or reuse a published tag or version.
 
@@ -106,13 +107,15 @@ credential-free public verification. Do not finalize the release manually.
 
 Native verification checks exact archive members, runtime-manifest identity,
 component order/modes/digests, CLI and agent versions, agent package inspection,
-and Linux sealed-provider installation from the bundled agent. Public Cargo
+and Linux or Windows sealed-provider installation from the bundled agent. Public Cargo
 verification installs the released `memcordon` crate into a fresh root,
 requires exactly both runtime binaries, and exercises the same version and
 inspection checks.
 
 Linux cgroup v2 and Windows Job Object certification runs on fresh
-GitHub-hosted VMs with the exact labels `ubuntu-24.04` and `windows-2025`.
+GitHub-hosted VMs with the exact labels `ubuntu-24.04`, `windows-2025`, and the
+workflow's Windows ARM64 runner. Windows backend, package, channel-parity, and
+post-public Cargo/native smoke gates are required on their matching architecture.
 Those jobs retain only `contents: read`, receive no release credentials, and
 must pass runtime qualification and every hard-backend scenario with zero skips
 before assembly. In schema 2, `ephemeral-certified` binds evidence to that

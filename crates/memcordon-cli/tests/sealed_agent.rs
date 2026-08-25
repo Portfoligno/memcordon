@@ -17,6 +17,10 @@ mod state;
 #[path = "../src/bin/memcordon-sealed-agent/linux/mod.rs"]
 mod linux;
 
+#[cfg(target_os = "windows")]
+#[path = "../src/bin/memcordon-sealed-agent/windows/mod.rs"]
+mod windows;
+
 include!(concat!(env!("OUT_DIR"), "/source_commit.rs"));
 
 #[path = "sealed_agent/attempt_record_atomic.rs"]

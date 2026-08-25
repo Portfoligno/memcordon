@@ -42,10 +42,11 @@ fn package_inspection_is_credential_free_and_machine_readable() {
     );
     let inspection: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("inspection should be JSON");
-    assert_eq!(inspection["schema_version"], 1);
+    assert_eq!(inspection["schema_version"], 2);
     assert_eq!(inspection["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(inspection["provider_protocol"], 2);
     assert_eq!(inspection["mechanism"], "linux-pid-namespace-cgroup-v2");
+    assert_eq!(inspection["platform"], "linux-systemd");
     assert_eq!(
         inspection["execution_report_schema"],
         memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION

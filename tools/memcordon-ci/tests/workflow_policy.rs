@@ -200,6 +200,53 @@ fn windows_arm_native_matrix_entries_are_structurally_required() {
 }
 
 #[test]
+fn public_windows_release_smoke_is_structurally_required() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
+    for (name, source, replacement, expected) in [
+        (
+            "ARM runner",
+            "          - id: linux-x64\n            runner: blacksmith-4vcpu-ubuntu-2404\n          - id: windows-x64\n            runner: windows-2025\n          - id: windows-arm64\n            runner: windows-11-arm\n",
+            "          - id: linux-x64\n            runner: blacksmith-4vcpu-ubuntu-2404\n          - id: windows-x64\n            runner: windows-2025\n",
+            "verify-public job matrix entries differ",
+        ),
+        (
+            "timeout",
+            "    timeout-minutes: 90\n    permissions:\n      contents: read\n",
+            "    timeout-minutes: 30\n    permissions:\n      contents: read\n",
+            "verify-public timeout differs",
+        ),
+        (
+            "public verification command",
+            "      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/verify-bootstrap --package memcordon-ci -- release verify-public\n",
+            "",
+            "verify-public step count differs",
+        ),
+        (
+            "target cache path",
+            "          path: target/ci/verify-bootstrap\n          key: cargo-target-release-verify-public-v2-",
+            "          path: target/ci/other\n          key: cargo-target-release-verify-public-v2-",
+            "verify-public verify-public-target cache inputs differ",
+        ),
+    ] {
+        let invalid = exact.replacen(source, replacement, 1);
+        assert_ne!(invalid, exact, "{name} mutation must apply");
+        let error = policy::validate_workflow_bytes(
+            &root,
+            Path::new(".github/workflows/release.yml"),
+            invalid.as_bytes(),
+            &repository_policy,
+        )
+        .expect_err("public Windows release-smoke regression must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected {name} policy error: {error}"
+        );
+    }
+}
+
+#[test]
 fn action_input_boolean_value_selection_is_rejected() {
     let root = repository_root();
     let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
@@ -287,8 +334,8 @@ fn certification_runner_regressions_are_rejected_structurally() {
         (
             Path::new(".github/workflows/backend-certification.yml"),
             backend.as_str(),
-            "    runs-on: windows-2025\n",
-            "    runs-on: [self-hosted, memcordon, windows, x64, job-object, ephemeral]\n",
+            "          - id: x64\n            runner: windows-2025\n",
+            "          - id: x64\n            runner: [self-hosted, memcordon, windows, x64, job-object, ephemeral]\n",
         ),
         (
             Path::new(".github/workflows/release.yml"),
@@ -299,8 +346,8 @@ fn certification_runner_regressions_are_rejected_structurally() {
         (
             Path::new(".github/workflows/release.yml"),
             release.as_str(),
-            "  windows-certification:\n    name: Release / Windows Job Object certification\n    needs: preflight\n    runs-on: windows-2025\n",
-            "  windows-certification:\n    name: Release / Windows Job Object certification\n    needs: preflight\n    runs-on: [self-hosted, memcordon, windows, x64, job-object, ephemeral]\n",
+            "  windows-certification:\n    name: Release / Windows sealed certification / ${{ matrix.id }}\n    needs:\n      - preflight\n      - native\n",
+            "  windows-certification:\n    name: Release / Windows sealed certification / ${{ matrix.id }}\n    needs:\n      - preflight\n      - native\n    runs-on: [self-hosted, memcordon, windows, x64, job-object, ephemeral]\n",
         ),
         (
             Path::new(".github/workflows/backend-certification.yml"),
@@ -311,8 +358,8 @@ fn certification_runner_regressions_are_rejected_structurally() {
         (
             Path::new(".github/workflows/backend-certification.yml"),
             backend.as_str(),
-            "    runs-on: windows-2025\n",
-            "    runs-on: windows-latest\n",
+            "          - id: x64\n            runner: windows-2025\n",
+            "          - id: x64\n            runner: windows-latest\n",
         ),
         (
             Path::new(".github/workflows/release.yml"),
@@ -323,8 +370,8 @@ fn certification_runner_regressions_are_rejected_structurally() {
         (
             Path::new(".github/workflows/release.yml"),
             release.as_str(),
-            "  windows-certification:\n    name: Release / Windows Job Object certification\n    needs: preflight\n    runs-on: windows-2025\n",
-            "  windows-certification:\n    name: Release / Windows Job Object certification\n    needs: preflight\n    runs-on: windows-latest\n",
+            "  windows-certification:\n    name: Release / Windows sealed certification / ${{ matrix.id }}\n    needs:\n      - preflight\n      - native\n",
+            "  windows-certification:\n    name: Release / Windows sealed certification / ${{ matrix.id }}\n    needs:\n      - preflight\n      - native\n    runs-on: windows-latest\n",
         ),
     ];
 

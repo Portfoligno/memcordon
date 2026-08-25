@@ -269,7 +269,7 @@ pub fn boundary_evidence_is_consistent(
             sealed_generic_evidence_is_consistent(launch, restart_safety)
                 && launch.mechanism == "windows-job-object-v2"
                 && native.schema_version == 2
-                && !native.service_identity.is_empty()
+                && native.service_identity == "MemCordonSealedControl+MemCordonSealedLauncher:v1"
                 && native.caller_token_authenticated
                 && native.initial_target_token_matches_caller
                 && native.credential_transition_disposition
@@ -390,6 +390,10 @@ impl SupervisionErrorRecord {
         }
     }
 
+    pub fn is_consistent(&self) -> bool {
+        self.provenance_is_consistent()
+    }
+
     fn provenance_is_consistent(&self) -> bool {
         let initial_spawn_is_consistent = self.initial_spawn_failure.is_none()
             || (self.category == "spawn"
@@ -405,9 +409,8 @@ impl SupervisionErrorRecord {
                     && self.attempt_number.is_some()
                     && self.launch_phase.as_deref() == Some("target-spawn-failed")
                     && value.phase == crate::BoundarySetupPhase::TargetCreation
-                    && value.target_created
-                    && value.target_released
-                    && value.cleanup_attempted
+                    && ((value.target_created && value.target_released && value.cleanup_attempted)
+                        || (!value.target_created && !value.target_released))
                     && match (self.code.as_str(), self.initial_spawn_failure) {
                         ("MCSPAWN-NOT-FOUND", Some(crate::InitialSpawnFailure::NotFound))
                         | (

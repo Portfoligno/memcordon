@@ -389,17 +389,28 @@ into another session can also leave the sampled workload boundary.
 
 `cargo install --locked memcordon` installs exactly two default binaries:
 `memcordon` and `memcordon-sealed-agent`. Test fixtures are feature-gated and
-are not installed by default. Linux native archives contain those same two
-runtime components plus `runtime-manifest.json`; macOS and Windows archives
-contain only the public CLI and mark sealed packaging not applicable.
+are not installed by default. Linux and Windows native archives contain those
+same two runtime components plus `runtime-manifest.json`; macOS archives
+contain only the public CLI and mark sealed packaging not applicable. Windows
+manifests bind provider protocol 1, mechanism `windows-job-object-v2`, and
+qualification schema 1.
 
-The provider remains an explicit privileged installation:
+The provider remains an explicit root or elevated installation:
 
 ```console
 sudo /absolute/path/to/memcordon-sealed-agent package install
 /absolute/path/to/memcordon-sealed-agent package inspect --json
 /absolute/path/to/memcordon-sealed-agent package verify --json
 memcordon doctor --require sealed
+```
+
+On Windows, use an elevated Command Prompt or PowerShell window:
+
+```console
+C:\absolute\path\memcordon-sealed-agent.exe package install
+C:\absolute\path\memcordon-sealed-agent.exe package inspect --json
+C:\absolute\path\memcordon-sealed-agent.exe package verify --json
+memcordon.exe doctor --require sealed
 ```
 
 The agent and CLI versions must match exactly. A missing provider diagnostic

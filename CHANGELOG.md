@@ -6,6 +6,13 @@ All notable user-visible changes to MemCordon are documented here.
 
 ### Added
 
+- Added certified Windows sealed supervision through split LocalService and
+  LocalSystem services, authenticated named pipes, caller-token reproduction,
+  creation-time unnamed Job assignment, exact inherited handles, a per-attempt
+  guardian, and terminal Job-emptiness proof. Windows x64 and ARM64 archives
+  now include the exact-version sealed agent and platform-specific runtime
+  manifest metadata.
+
 - The published `memcordon` Cargo package now installs both the public CLI
   and the binary-private `memcordon-sealed-agent` companion. Linux sealed
   provider installation no longer requires a source checkout or a separately

@@ -2,6 +2,7 @@
 
 mod release;
 mod sealed_linux;
+mod sealed_windows;
 mod suites;
 
 use std::path::{Path, PathBuf};
@@ -53,6 +54,9 @@ enum Suite {
     BackendLinuxCgroup,
     BackendLinuxSealedV2,
     BackendWindowsJob,
+    BackendWindowsSealedV2,
+    PackageWindowsSealed,
+    ChannelParityWindowsSealed,
     BackendMacosWatchdog,
     ReleasePreflight,
     ReleaseNative,

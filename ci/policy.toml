@@ -33,7 +33,9 @@ allowed_run_commands = [
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite fuzz",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite stress",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2",
-  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-sealed-v2",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite package-windows-sealed",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite channel-parity-windows-sealed",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-macos-watchdog",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite release-preflight",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite release-native",
@@ -45,6 +47,18 @@ allowed_run_commands = [
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/verify-bootstrap --package memcordon-ci -- release verify-public",
 ]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/backend-certification.yml"
+variable = "CARGO_TARGET_DIR"
+source = "target/ci/windows-sealed-cargo/build"
+steps = ["Certify packaged Cargo channel"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_TARGET_DIR"
+source = "target/ci/windows-sealed-cargo/build"
+steps = ["Certify packaged Cargo channel"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"

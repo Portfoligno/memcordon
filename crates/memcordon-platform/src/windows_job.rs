@@ -152,7 +152,18 @@ pub fn probe() -> ProbeReport {
     }
 }
 
-fn info() -> BackendInfo {
+pub(crate) fn info() -> BackendInfo {
+    let sealed = crate::sealed::windows::probe()
+        .map(crate::sealed::windows::info)
+        .map(|backend| backend.boundary_support.sealed)
+        .unwrap_or_else(|reason| crate::backend::SealedAvailability::Unavailable {
+            reason: format!("Windows sealed provider is not installed or qualified: {reason}"),
+            prerequisites: vec![
+                "matching memcordon-sealed-agent.exe package installation".to_owned(),
+                "qualified MemCordonSealedControl and MemCordonSealedLauncher services".to_owned(),
+                "native creation-time Job-list and exact handle-list certification".to_owned(),
+            ],
+        });
     BackendInfo {
         name: "windows-job-object",
         containment_supported: true,
@@ -166,15 +177,19 @@ fn info() -> BackendInfo {
             "nested host Job Object restrictions may prevent assignment",
             "console graceful termination is application-dependent",
         ],
-        boundary_support: crate::backend::standard_boundary_support(
-            "suspended-job-assignment-v1",
-            true,
-            "the LocalSystem sealed-agent service is unavailable or not qualified",
-            &[
-                "MemCordonSealedAgent LocalSystem service",
-                "creation-time Job-list and exact handle-list support",
-            ],
-        ),
+        boundary_support: crate::backend::BoundarySupport {
+            standard: crate::backend::standard_boundary_support(
+                "suspended-job-assignment-v1",
+                true,
+                "the LocalSystem sealed-agent service is unavailable or not qualified",
+                &[
+                    "MemCordonSealedAgent LocalSystem service",
+                    "creation-time Job-list and exact handle-list support",
+                ],
+            )
+            .standard,
+            sealed,
+        },
     }
 }
 

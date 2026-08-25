@@ -220,8 +220,8 @@ pub fn validate_release_configuration_identity(release: &Release) -> Result<()> 
         ("linux-arm64", "aarch64-unknown-linux-gnu", "tar-gz", true),
         ("macos-arm64", "aarch64-apple-darwin", "tar-gz", false),
         ("macos-x64", "x86_64-apple-darwin", "tar-gz", false),
-        ("windows-x64", "x86_64-pc-windows-msvc", "zip", false),
-        ("windows-arm64", "aarch64-pc-windows-msvc", "zip", false),
+        ("windows-x64", "x86_64-pc-windows-msvc", "zip", true),
+        ("windows-arm64", "aarch64-pc-windows-msvc", "zip", true),
     ];
     let targets_match = release.assets.target.len() == expected_targets.len()
         && release
@@ -257,6 +257,25 @@ pub fn validate_release_configuration_identity(release: &Release) -> Result<()> 
     Ok(())
 }
 
+pub fn certify_windows_archive_omission_mutant(root: &Path) -> Result<bool> {
+    let mut mutated = release(root)?;
+    let target_id = release_target_id_for_host("windows", std::env::consts::ARCH)?;
+    let target = mutated
+        .assets
+        .target
+        .iter_mut()
+        .find(|target| target.id == target_id)
+        .ok_or_else(|| {
+            crate::CiError::Message("host Windows release target is absent".to_owned())
+        })?;
+    let original_count = target.executable.len();
+    target
+        .executable
+        .retain(|component| component.role != RuntimeComponentRole::SealedAgent);
+    Ok(target.executable.len() + 1 == original_count
+        && validate_release_configuration_identity(&mutated).is_err())
+}
+
 fn validate_target_executables(target: &AssetTarget, sealed: bool) -> bool {
     let expected_public_path = if target.archive == "zip" {
         "memcordon.exe"
@@ -278,9 +297,14 @@ fn validate_target_executables(target: &AssetTarget, sealed: bool) -> bool {
     }
     if sealed {
         let agent = &target.executable[1];
+        let expected_agent_path = if target.archive == "zip" {
+            "memcordon-sealed-agent.exe"
+        } else {
+            "memcordon-sealed-agent"
+        };
         if agent.package != "memcordon"
             || agent.binary != "memcordon-sealed-agent"
-            || agent.archive_path != "memcordon-sealed-agent"
+            || agent.archive_path != expected_agent_path
             || agent.mode != 0o755
             || agent.role != RuntimeComponentRole::SealedAgent
         {

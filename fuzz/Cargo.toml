@@ -257,4 +257,81 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "windows-public-provider-protocol"
+path = "fuzz_targets/windows_public_provider_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "windows-private-launcher-protocol"
+path = "fuzz_targets/windows_private_launcher_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "windows-token-envelope"
+path = "fuzz_targets/windows_token_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "windows-security-descriptor"
+path = "fuzz_targets/windows_security_descriptor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "windows-handle-manifest"
+path = "fuzz_targets/windows_handle_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "windows-environment-block"
+path = "fuzz_targets/windows_environment_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "windows-argv"
+path = "fuzz_targets/windows_argv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "windows-qualification"
+path = "fuzz_targets/windows_qualification.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "windows-terminal-receipt"
+path = "fuzz_targets/windows_terminal_receipt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "windows-attempt-record"
+path = "fuzz_targets/windows_attempt_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "windows-package-inspection"
+path = "fuzz_targets/windows_package_inspection.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

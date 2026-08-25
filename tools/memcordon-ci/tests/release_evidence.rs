@@ -23,23 +23,28 @@ const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 type ReportMutation = fn(&mut Value);
 
 const WINDOWS_TESTS: &[&str] = &[
-    "certified_backend_preserves_ordinary_status_and_reaps",
-    "certified_backend_reports_limit_and_removes_workload",
-    "certified_backend_cleans_background_descendant_by_birth_identity",
-    "certified_backend_allows_bounded_transient_burst",
-    "windows_job_object_contains_aggregate_tree",
-    "windows_job_object_handles_rapid_process_churn",
-    "windows_target_is_suspended_until_job_assignment",
-    "windows_descendants_remain_in_job_and_are_cleaned",
-    "windows_breakaway_descendant_is_not_left_alive",
-    "windows_job_notification_produces_limit_evidence",
-    "windows_kill_on_close_cleans_workload",
-    "windows_wrapper_crash_closes_job_and_reaps_descendants",
-    "windows_quoting_preserves_spaces_and_quotes",
-    "target_remains_suspended_until_successful_job_assignment",
-    "kill_on_job_close_terminates_a_running_member",
-    "nested_assignment_is_accounted_by_the_memcordon_job",
-    "assignment_failure_terminates_suspended_target_before_execution",
+    "package_install_verify_probe_and_same_version_upgrade",
+    "active_attempt_upgrade_and_uninstall_are_refused",
+    "public_sealed_launch_preserves_status_and_native_evidence",
+    "frontend_loss_retires_the_job_and_durable_record",
+    "package_uninstall_leaves_no_provider_state",
+    "deadline_memory_and_raw_ntstatus_are_preserved",
+    "production_package_lifecycle_without_ci_fault_gate",
+    "windows_target_token_identity",
+    "windows_creation_time_job_list",
+    "windows_exact_handle_manifest",
+    "windows_job_policy_readback",
+    "windows_caller_token_authentication",
+    "windows_job_membership_readback",
+    "windows_preauthorization_gate",
+    "windows_recursive_provider_rejection",
+    "windows_guardian_authority",
+    "windows_active_process_accounting",
+    "windows_relay_retirement",
+    "windows_final_handle_ordering",
+    "windows_sealed_mechanism_selection",
+    "windows_native_archive_inventory",
+    "windows_qualification_advertisement",
 ];
 
 const MACOS_SCENARIOS: &[&str] = &[
@@ -306,25 +311,464 @@ fn public_launch_report() -> Value {
     serde_json::to_value(report).expect("public launch report should serialize")
 }
 
-fn windows_report() -> Value {
+fn windows_qualification() -> Value {
+    let mut value = json!({
+        "schema_version": 1,
+        "provider_identity": format!("memcordon-sealed-agent-windows-v1:{}", env!("CARGO_PKG_VERSION")),
+        "control_service_identity": "MemCordonSealedControl:LocalService:restricted",
+        "launcher_service_identity": "MemCordonSealedLauncher:LocalSystem:restricted"
+    });
+    for field in [
+        "package_verified",
+        "public_pipe_security_verified",
+        "private_pipe_security_verified",
+        "control_service_privileges_verified",
+        "launcher_service_privileges_verified",
+        "caller_token_authentication_verified",
+        "restricted_caller_token_verified",
+        "primary_token_duplication_verified",
+        "create_process_as_user_verified",
+        "job_list_supported",
+        "handle_list_supported",
+        "nested_host_job_supported",
+        "kill_on_close_verified",
+        "breakaway_denied",
+        "completion_port_verified",
+        "guardian_verified",
+        "frontend_loss_cleanup_verified",
+        "alternate_token_child_contained",
+        "nested_child_job_contained",
+        "recursive_provider_request_denied",
+        "exact_handle_inheritance_verified",
+        "active_processes_zero_verified",
+        "relays_retired_verified",
+        "recovery_complete",
+        "qualified",
+    ] {
+        value[field] = json!(true);
+    }
+    value
+}
+
+fn windows_authority_loss() -> Value {
+    json!({
+        "schema_version": 1,
+        "frontend_killed": true,
+        "frontend_disconnected": true,
+        "control_worker_lost": true,
+        "control_service_lost": true,
+        "launcher_worker_lost": true,
+        "launcher_service_lost": true,
+        "guardian_killed_before_authorization": true,
+        "guardian_killed_after_authorization": true,
+        "all_job_owners_closed": true,
+        "durable_service_restart_recovered": true,
+        "machine_restart_recovery_exercised": true,
+        "active_processes_zero_after_each": true,
+        "relays_retired_after_each": true,
+        "records_retired_after_each": true
+    })
+}
+
+fn windows_mutant_kills() -> Value {
+    use memcordon_core::{WindowsMutantNativeObservationV1 as Native, WindowsSealedMutant as M};
+
+    let digest_a = hex::encode(Sha256::digest(b"mutant-caller"));
+    let digest_b = hex::encode(Sha256::digest(b"mutant-target"));
+    json!({
+        "schema_version": 1,
+        "observations": memcordon_core::WINDOWS_RELEASE_MUTANT_VARIANTS
+            .iter()
+            .zip(memcordon_core::WINDOWS_RELEASE_MUTANTS)
+            .map(|(mutant, (_, mapped_test))| json!({
+                "mutant": mutant,
+                "mapped_test": mapped_test,
+                "native_observation": match mutant {
+                    M::UseCreateProcessW => Native::TargetTokenMismatch {
+                        creation_api: "create-process-w".to_owned(),
+                        token_source: "launcher-service".to_owned(),
+                        authenticated_envelope_sha256: digest_a.clone(),
+                        target_envelope_sha256: digest_b.clone(),
+                    },
+                    M::CreateUnderServiceToken => Native::TargetTokenMismatch {
+                        creation_api: "create-process-as-user-w".to_owned(),
+                        token_source: "launcher-service".to_owned(),
+                        authenticated_envelope_sha256: digest_a.clone(),
+                        target_envelope_sha256: digest_b.clone(),
+                    },
+                    M::TrustClientToken => Native::TargetTokenMismatch {
+                        creation_api: "create-process-as-user-w".to_owned(),
+                        token_source: "authenticated-handle-untrusted-envelope".to_owned(),
+                        authenticated_envelope_sha256: digest_a.clone(),
+                        target_envelope_sha256: digest_b.clone(),
+                    },
+                    M::AssignJobAfterCreate => Native::CreationManifest {
+                        used_create_process_as_user: true,
+                        job_list_present: false,
+                        handle_list_present: true,
+                        post_create_job_assignment: true,
+                        unexpected_handle_count: 0,
+                    },
+                    M::OmitJobList => Native::CreationManifest {
+                        used_create_process_as_user: true,
+                        job_list_present: false,
+                        handle_list_present: true,
+                        post_create_job_assignment: false,
+                        unexpected_handle_count: 0,
+                    },
+                    M::SkipJobMembershipReadback => Native::ExternalJobMembershipMissing {
+                        process_in_any_job: false,
+                    },
+                    M::OmitHandleList => Native::CreationManifest {
+                        used_create_process_as_user: true,
+                        job_list_present: true,
+                        handle_list_present: false,
+                        post_create_job_assignment: false,
+                        unexpected_handle_count: 0,
+                    },
+                    M::PermitBreakaway => Native::JobLimitReadback { breakaway_allowed: true },
+                    M::SkipTargetTokenReadback => Native::ExternalTargetTokenMismatch {
+                        authenticated_envelope_sha256: digest_a.clone(),
+                        target_envelope_sha256: digest_b.clone(),
+                    },
+                    M::ResumeBeforeGuardian => Native::PrematureAuthorization {
+                        guardian_ready: false,
+                        relays_ready: true,
+                        target_marker_observed: true,
+                    },
+                    M::ResumeBeforeRelays => Native::PrematureAuthorization {
+                        guardian_ready: true,
+                        relays_ready: false,
+                        target_marker_observed: true,
+                    },
+                    M::LeakJobHandleToTarget => Native::LeakedHandleObserved { kind: "job".to_owned() },
+                    M::LeakLauncherPipe => Native::LeakedHandleObserved { kind: "pipe".to_owned() },
+                    M::AcceptRecursiveProvider => Native::RecursiveLaunchAccepted,
+                    M::OmitGuardian => Native::GuardianMissing,
+                    M::AcceptCompletionWithoutAccounting => Native::CompletionAcceptedWithoutAccounting {
+                        completion_zero_observed: true,
+                        active_process_query_performed: false,
+                    },
+                    M::SuccessBeforeActiveZero => Native::SuccessBeforeActiveZero { active_processes: 1 },
+                    M::SkipRelayAck => Native::RelayAckSkipped {
+                        target_retired_sent: true,
+                        relays_retired_received: false,
+                    },
+                    M::CloseJobBeforeEvidence => Native::EvidenceAfterFinalHandleClose {
+                        final_handles_closed: true,
+                        evidence_constructed_after_close: true,
+                    },
+                    M::FallBackToStandard => Native::PlatformRouteFallback {
+                        ordinary_route_sealed: true,
+                        mutant_route_standard: true,
+                    },
+                    M::OmitAgentFromArchive => Native::ArchiveInventoryOmission {
+                        sealed_agent_removed: true,
+                        configuration_rejected: true,
+                    },
+                    M::AdvertiseWithoutCertificate => Native::UnqualifiedAdvertisement {
+                        ordinary_advertised: false,
+                        mutant_advertised: true,
+                    },
+                }
+            }))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn windows_public_launch_report() -> Value {
+    let mut value = public_launch_report();
+    value["backend"]["name"] = json!("windows-job-object");
+    value["backend"]["boundary"]["mechanism"] = json!("windows-job-object-v2");
+    value["backend"]["boundary_qualification"]["provider_identity"] =
+        json!("memcordon-sealed-agent-windows-v1:test");
+    value["backend"]["boundary_qualification"]["mechanism"] = json!("windows-job-object-v2");
+    value["attempts"][0]["launch"]["mechanism"] = json!("windows-job-object-v2");
+    value["attempts"][0]["boundary_detail"] = json!({
+        "mechanism": "windows-job-object-v2",
+        "schema_version": 2,
+        "service_identity": "MemCordonSealedControl+MemCordonSealedLauncher:v1",
+        "caller_token_authenticated": true,
+        "initial_target_token_matches_caller": true,
+        "credential_transition_disposition": "preserve-caller-envelope",
+        "job_membership_independent_of_token": true,
+        "job_created": true,
+        "job_limits_verified": true,
+        "kill_on_close_verified": true,
+        "breakaway_denied": true,
+        "completion_port_associated": true,
+        "guardian_ready": true,
+        "target_created_suspended": true,
+        "job_list_applied_at_creation": true,
+        "handle_list_applied_at_creation": true,
+        "target_job_membership_verified": true,
+        "target_still_suspended_during_verification": true,
+        "inherited_handles_verified": true,
+        "target_released": true,
+        "terminate_job_invoked": true,
+        "active_processes_zero": true,
+        "direct_target_reaped": true,
+        "relays_retired": true,
+        "guardian_reaped": true,
+        "final_job_handles_closed": true
+    });
+    let _: MemcordonReport = serde_json::from_value(value.clone())
+        .expect("Windows public launch fixture should be consistent");
+    value
+}
+
+fn windows_token_matrix() -> Value {
+    let envelope = json!({
+        "user_sid": "S-1-5-21-1",
+        "owner_sid": "S-1-5-21-1",
+        "primary_group_sid": "S-1-5-32-545",
+        "groups_sha256": "01".repeat(32),
+        "privileges_sha256": "02".repeat(32),
+        "restricted_sids_sha256": "03".repeat(32),
+        "integrity_level": "S-1-16-8192",
+        "mandatory_policy": 1,
+        "session_id": 1,
+        "elevation_type": 2,
+        "elevated": true,
+        "virtualization_allowed": false,
+        "virtualization_enabled": false,
+        "ui_access": false,
+        "appcontainer": false,
+        "authentication_id": 1,
+        "token_type": 1,
+        "impersonation_level": 0
+    });
+    let scenarios = [
+        "elevated-admin",
+        "ordinary-user",
+        "restricted",
+        "write-restricted",
+        "disabled-privileges",
+        "deny-only-admin",
+        "low-integrity",
+    ]
+    .into_iter()
+    .map(|name| {
+        let mut scenario_envelope = envelope.clone();
+        if name == "ordinary-user" {
+            scenario_envelope["elevated"] = json!(false);
+        }
+        if name == "low-integrity" {
+            scenario_envelope["integrity_level"] = json!("S-1-16-4096");
+        }
+        let restricted = matches!(name, "restricted" | "write-restricted" | "deny-only-admin");
+        json!({
+            "name": name,
+            "caller_envelope": scenario_envelope,
+            "restricted_sid_count": u32::from(restricted),
+            "token_is_restricted": restricted,
+            "enabled_sensitive_privilege_count": if name == "disabled-privileges" { 0 } else { 1 },
+            "administrator_deny_only": name == "deny-only-admin",
+            "initial_target_token_matches_caller": true
+        })
+    })
+    .collect::<Vec<_>>();
+    json!({
+        "schema_version": 1,
+        "scenarios": scenarios,
+        "appcontainer_rejected_before_target": true,
+        "different_session_supported": true,
+        "different_session_verified": true
+    })
+}
+
+fn windows_report(architecture: &str, runner_label: &str) -> Value {
     json!({
         "schema": 2,
-        "backend": "windows-job-object",
+        "backend": "windows-job-object-v2",
         "certified": true,
         "commit": COMMIT,
         "runner_class": "ephemeral-certified",
         "runner_provider": "github-hosted",
-        "runner_label": "windows-2025",
+        "runner_label": runner_label,
+        "architecture": architecture,
+        "native_archive_sha256": "12".repeat(32),
+        "runtime_manifest_sha256": "34".repeat(32),
+        "native_target": match architecture {
+            "x86_64" => "x86_64-pc-windows-msvc",
+            "aarch64" => "aarch64-pc-windows-msvc",
+            _ => "unsupported",
+        },
         "runtime": {
-            "job_memory_limit": true,
-            "kill_on_close": true,
-            "suspended_assignment": true,
-            "nested_job": true,
-            "completion_port": true
+            "qualification": windows_qualification(),
+            "public_launch": windows_public_launch_report(),
+            "active_attempt_upgrade_refused": true,
+            "active_attempt_uninstall_refused": true,
+            "frontend_loss_record_retired": true,
+            "provider_state_removed": true,
+            "status_matrix": windows_status_matrix()
         },
         "tests": tests(WINDOWS_TESTS),
         "tests_run": WINDOWS_TESTS.len(),
         "tests_skipped": 0
+    })
+}
+
+fn windows_status_matrix() -> Value {
+    let cleanup = memcordon_core::CleanupSummary {
+        graceful_attempted: false,
+        force_attempted: true,
+        direct_child_reaped: true,
+        workload_empty: Some(true),
+        errors: Vec::new(),
+    };
+    let deadline = memcordon_core::RunOutcome::DeadlineExceeded {
+        deadline: memcordon_core::DeadlineEvidence::new(
+            100,
+            memcordon_core::DeadlineScope::Attempt,
+            "windows-qualification".to_owned(),
+            100,
+            100,
+            0,
+            0,
+            None,
+            Some("TerminateJobObject".to_owned()),
+        )
+        .expect("deadline evidence should be valid"),
+        child_after_termination: Some(memcordon_core::ChildTermination::WindowsStatus {
+            status: 0xC000_013A,
+        }),
+        peak: None,
+        cleanup: cleanup.clone(),
+    };
+    let memory = memcordon_core::RunOutcome::LimitExceeded {
+        limit: memcordon_core::ByteSize::from_bytes(8 * 1024 * 1024),
+        observed: Some(memcordon_core::ByteSize::from_bytes(8 * 1024 * 1024)),
+        peak: Some(memcordon_core::ByteSize::from_bytes(8 * 1024 * 1024)),
+        evidence: memcordon_core::LimitEvidence {
+            backend: "windows-job-object-v2".to_owned(),
+            metric: "job-memory".to_owned(),
+            detail: "completion-port plus accounting readback".to_owned(),
+        },
+        child_after_termination: Some(memcordon_core::ChildTermination::WindowsStatus {
+            status: 0xC000_0017,
+        }),
+        cleanup: cleanup.clone(),
+    };
+    let ntstatus = memcordon_core::RunOutcome::Exited {
+        child: memcordon_core::ChildTermination::WindowsStatus {
+            status: 0xC000_013A,
+        },
+        peak: None,
+        cleanup: cleanup.clone(),
+    };
+    let orphan = memcordon_core::RunOutcome::Exited {
+        child: memcordon_core::ChildTermination::ExitCode { code: 0 },
+        peak: None,
+        cleanup,
+    };
+    json!({
+        "schema_version": 1,
+        "ordinary_exit_codes": (u8::MIN..=u8::MAX).map(u32::from).collect::<Vec<_>>(),
+        "deadline_outcome": deadline,
+        "memory_limit_outcome": memory,
+        "raw_ntstatus_outcome": ntstatus,
+        "orphan_descendant_outcome": orphan,
+        "command_not_found": windows_spawn_error("MCSPAWN-NOT-FOUND", 2, "not-found"),
+        "command_not_executable": windows_spawn_error("MCSPAWN-NOT-EXECUTABLE", 193, "not-executable"),
+        "provider_setup_failure": windows_fault_rejection("job-create", false),
+        "relay_failure": windows_fault_rejection("relay-retire", true),
+        "terminal_truncation_rejected": true,
+        "report_consistency_verified": true
+    })
+}
+
+fn windows_fault_rejection(fault: &str, released: bool) -> Value {
+    json!({
+        "schema_version": 1,
+        "code": "MCSEALED-WINDOWS-CERTIFICATION-FAULT",
+        "phase": if fault == "job-create" { "boundary-creation" } else if released { "retirement" } else { "provider-connection" },
+        "detail": format!("injected certification fault: {fault}"),
+        "os_code": null,
+        "target_created": released,
+        "target_released": released,
+        "cleanup_attempted": released,
+        "restart_safety": if released {
+            json!({
+                "direct_child_reaped": true,
+                "workload_empty": true,
+                "helpers_reaped": true,
+                "containment_removed": true,
+                "containment_incapable_of_live_members": true,
+                "sealed_boundary_retired": true,
+                "errors": []
+            })
+        } else {
+            json!({
+                "direct_child_reaped": false,
+                "workload_empty": null,
+                "helpers_reaped": false,
+                "containment_removed": false,
+                "containment_incapable_of_live_members": false,
+                "sealed_boundary_retired": false,
+                "errors": []
+            })
+        }
+    })
+}
+
+fn windows_fault_observations(faults: &[&str], released: bool) -> Vec<Value> {
+    faults
+        .iter()
+        .map(|fault| {
+            json!({
+                "fault": fault,
+                "rejection": windows_fault_rejection(fault, released)
+            })
+        })
+        .collect()
+}
+
+fn windows_spawn_error(code: &str, os_code: i32, failure: &str) -> Value {
+    json!({
+        "category": "spawn",
+        "code": code,
+        "message": "native Windows spawn failure",
+        "os_code": os_code,
+        "attempt_number": 1,
+        "supervision_phase": "attempt-setup",
+        "launch_phase": "target-spawn-failed",
+        "target_released": false,
+        "workload_may_be_alive": false,
+        "initial_spawn_failure": failure,
+        "provider_rejection": null
+    })
+}
+
+fn windows_package_inspection() -> Value {
+    json!({
+        "schema_version": 2,
+        "version": env!("CARGO_PKG_VERSION"),
+        "source_commit": COMMIT,
+        "executable_sha256": "56".repeat(32),
+        "provider_protocol": memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        "mechanism": "windows-job-object-v2",
+        "execution_report_schema": memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
+        "plan_report_schema": memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
+        "doctor_report_schema": memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
+        "platform": "windows-service",
+        "control_service_name": memcordon_core::WINDOWS_CONTROL_SERVICE_NAME,
+        "launcher_service_name": memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
+        "control_service_config_sha256": "10".repeat(32),
+        "launcher_service_config_sha256": "20".repeat(32),
+        "control_pipe": memcordon_core::WINDOWS_CONTROL_PIPE,
+        "launcher_pipe": memcordon_core::WINDOWS_LAUNCHER_PIPE,
+        "binary_install_path": r"C:\Program Files\MemCordon\memcordon-sealed-agent.exe",
+        "state_root": r"C:\ProgramData\MemCordon\sealed",
+        "control_service_sid_type": "restricted",
+        "launcher_service_sid_type": "restricted",
+        "control_required_privileges": ["SeImpersonatePrivilege"],
+        "launcher_required_privileges": ["SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"],
+        "control_pipe_security_sha256": "30".repeat(32),
+        "launcher_pipe_security_sha256": "40".repeat(32),
+        "install_directory_security_sha256": "50".repeat(32),
+        "state_directory_security_sha256": "60".repeat(32),
+        "compiled_metadata_valid": true
     })
 }
 
@@ -349,12 +793,169 @@ fn write_report(path: &Path, value: &Value) {
     fs::write(path, bytes).expect("report should write");
 }
 
+fn write_windows_artifact(input: &Path, id: &str, architecture: &str, runner_label: &str) {
+    let directory = input.join(format!("release-certification-windows-{id}"));
+    let qualification = windows_qualification();
+    let package = windows_package_inspection();
+    write_report(&directory.join("windows-package-inspection.json"), &package);
+    write_report(
+        &directory.join("windows-installed-provider.json"),
+        &json!({
+            "schema_version": 2,
+            "agent": package,
+            "installed_executable_sha256": "56".repeat(32),
+            "installed_artifacts_valid": true,
+            "provider_identity": format!("memcordon-sealed-agent-windows-v1:{}", env!("CARGO_PKG_VERSION")),
+            "provider_reachable": true,
+            "qualification_complete": true
+        }),
+    );
+    write_report(
+        &directory.join("windows-qualification.json"),
+        &qualification,
+    );
+    for (name, evidence) in [
+        (
+            "windows-token-envelope.json",
+            json!({
+                "service_identity": "MemCordonSealedControl+MemCordonSealedLauncher:v1",
+                "caller_token_authenticated": true,
+                "initial_target_token_matches_caller": true,
+                "credential_transition_disposition": "preserve-caller-envelope",
+                "restricted_caller_token_verified": true,
+                "primary_token_duplication_verified": true,
+                "token_matrix": windows_token_matrix()
+            }),
+        ),
+        (
+            "windows-handle-inventory.json",
+            json!({
+                "job_list_applied_at_creation": true,
+                "handle_list_applied_at_creation": true,
+                "inherited_handles_verified": true,
+                "exact_handle_inheritance_verified": true,
+                "relays_retired": true
+            }),
+        ),
+        (
+            "windows-preauthorization.json",
+            json!({
+                "guardian_ready": true,
+                "target_created_suspended": true,
+                "target_job_membership_verified": true,
+                "target_still_suspended_during_verification": true,
+                "target_released": true,
+                "fault_matrix": {
+                    "schema_version": 1,
+                    "preauthorization": {
+                        "schema_version": 1,
+                        "faults": [
+                            "public-pipe-create", "caller-pid-lookup",
+                            "caller-token-impersonation", "primary-token-duplicate",
+                            "private-pipe-connect", "launcher-peer-verify",
+                            "token-handle-duplicate", "job-create", "job-configure",
+                            "completion-port", "guardian-create",
+                            "guardian-killed-before-authorization", "stream-create",
+                            "relay-handle-duplicate", "relay-ready", "attribute-list",
+                            "job-list", "handle-list", "create-process-as-user",
+                            "target-token-readback", "job-membership-readback",
+                            "before-resume", "resume"
+                        ],
+                        "first_instruction_markers_absent": true,
+                        "recovery_clear_after_each_fault": true,
+                        "terminal_frame_truncation_rejected": true,
+                        "rejections": windows_fault_observations(&[
+                            "public-pipe-create", "caller-pid-lookup",
+                            "caller-token-impersonation", "primary-token-duplicate",
+                            "private-pipe-connect", "launcher-peer-verify",
+                            "token-handle-duplicate", "job-create", "job-configure",
+                            "completion-port", "guardian-create",
+                            "guardian-killed-before-authorization", "stream-create",
+                            "relay-handle-duplicate", "relay-ready", "attribute-list",
+                            "job-list", "handle-list", "create-process-as-user",
+                            "target-token-readback", "job-membership-readback",
+                            "before-resume", "resume"
+                        ], false)
+                    },
+                    "retirement": {
+                        "schema_version": 1,
+                        "faults": [
+                            "guardian-killed-after-authorization", "terminate-job",
+                            "active-process-query", "relay-retire", "guardian-reap",
+                            "final-handle-close", "record-retire"
+                        ],
+                        "first_instruction_markers_observed": true,
+                        "recovery_clear_after_each_fault": true,
+                        "rejections": windows_fault_observations(&[
+                            "guardian-killed-after-authorization", "terminate-job",
+                            "active-process-query", "relay-retire", "guardian-reap",
+                            "final-handle-close", "record-retire"
+                        ], true)
+                    }
+                },
+                "mutant_kills": windows_mutant_kills()
+            }),
+        ),
+        (
+            "windows-alternate-token.json",
+            json!({
+                "alternate_token_child_contained": true,
+                "initial_target_token_matches_caller": true,
+                "job_membership_independent_of_token": true
+            }),
+        ),
+        (
+            "windows-nested-job.json",
+            json!({
+                "nested_host_job_supported": true,
+                "nested_child_job_contained": true,
+                "target_job_membership_verified": true
+            }),
+        ),
+        (
+            "windows-front-end-loss.json",
+            json!({
+                "frontend_loss_cleanup_verified": true,
+                "record_retired": true,
+                "active_processes_zero_verified": true,
+                "guardian_verified": true,
+                "authority_loss": windows_authority_loss()
+            }),
+        ),
+        (
+            "windows-recovery.json",
+            json!({
+                "recovery_complete": true,
+                "active_processes_zero_verified": true,
+                "relays_retired_verified": true,
+                "authority_loss": windows_authority_loss()
+            }),
+        ),
+    ] {
+        write_report(
+            &directory.join(name),
+            &json!({
+                "schema_version": 1,
+                "mechanism": "windows-job-object-v2",
+                "architecture": architecture,
+                "commit": COMMIT,
+                "result": "passed",
+                "evidence": evidence
+            }),
+        );
+    }
+    write_report(
+        &directory.join("windows-cleanup.json"),
+        &windows_report(architecture, runner_label),
+    );
+}
+
 fn fixture() -> (TempDir, Value, Value, Value) {
     let temporary = TempDir::new().expect("temporary directory should exist");
     let input = temporary.path().join("input");
     fs::create_dir_all(&input).expect("input directory should exist");
     let linux = linux_report();
-    let windows = windows_report();
+    let windows = windows_report("x86_64", "windows-2025");
     let macos = macos_report();
     write_report(
         &input
@@ -685,12 +1286,8 @@ fn fixture() -> (TempDir, Value, Value, Value) {
             "caller_mount_namespace_reproduction_verified": true
         }),
     );
-    write_report(
-        &input
-            .join("release-certification-windows")
-            .join("backend-windows-job-object.json"),
-        &windows,
-    );
+    write_windows_artifact(&input, "x64", "x86_64", "windows-2025");
+    write_windows_artifact(&input, "arm64", "aarch64", "windows-11-arm");
     write_report(
         &input
             .join("release-acceptance-macos-arm64")
@@ -708,10 +1305,9 @@ fn valid_reports_are_copied_and_digest_bound() {
     let records = collect_certification(&input, &output, COMMIT)
         .expect("valid certification reports should collect");
 
-    assert_eq!(records.len(), 11);
+    assert_eq!(records.len(), 32);
     for (backend, report_name) in [
         ("linux-pid-namespace-cgroup-v2", "cleanup-leak-check.json"),
-        ("windows-job-object", "backend-windows-job-object.json"),
         ("macos-watchdog", "backend-macos-watchdog.json"),
     ] {
         let record = records.get(backend).expect("record should exist");
@@ -719,6 +1315,16 @@ fn valid_reports_are_copied_and_digest_bound() {
         let evidence = fs::read(output.join(&record.evidence_path))
             .expect("copied evidence should be readable");
         assert_eq!(record.sha256, hex::encode(Sha256::digest(evidence)));
+    }
+    for (key, architecture) in [
+        ("windows-job-object-v2/x86_64-pc-windows-msvc", "x64"),
+        ("windows-job-object-v2/aarch64-pc-windows-msvc", "arm64"),
+    ] {
+        let record = records.get(key).expect("Windows record should exist");
+        assert_eq!(
+            record.evidence_path,
+            format!("certification/windows-sealed-v2/{architecture}-windows-cleanup.json")
+        );
     }
     for name in [
         "provider-package-verification.json",
@@ -737,6 +1343,173 @@ fn valid_reports_are_copied_and_digest_bound() {
         assert_eq!(
             record.evidence_path,
             format!("certification/linux-sealed-v2/{name}")
+        );
+    }
+}
+
+#[test]
+fn required_windows_mutants_are_mapped_and_killed_by_promoted_evidence() {
+    for (mutant, mapped_test) in memcordon_core::WINDOWS_RELEASE_MUTANTS {
+        assert!(
+            WINDOWS_TESTS.contains(mapped_test),
+            "{mutant} must map to a release-required native test"
+        );
+        let (temporary, _, _, _) = fixture();
+        let directory = temporary
+            .path()
+            .join("input/release-certification-windows-x64");
+        let (report_name, pointer) = match *mutant {
+            "use-create-process-w"
+            | "create-under-service-token"
+            | "skip-target-token-readback" => (
+                "windows-token-envelope.json",
+                "/evidence/initial_target_token_matches_caller",
+            ),
+            "assign-job-after-create" | "omit-job-list" => (
+                "windows-handle-inventory.json",
+                "/evidence/job_list_applied_at_creation",
+            ),
+            "omit-handle-list" | "leak-job-handle-to-target" | "leak-launcher-pipe" => (
+                "windows-handle-inventory.json",
+                "/evidence/inherited_handles_verified",
+            ),
+            "permit-breakaway" => (
+                "windows-cleanup.json",
+                "/runtime/public_launch/attempts/0/boundary_detail/breakaway_denied",
+            ),
+            "trust-client-token" => (
+                "windows-token-envelope.json",
+                "/evidence/caller_token_authenticated",
+            ),
+            "skip-job-membership-readback" => (
+                "windows-preauthorization.json",
+                "/evidence/target_job_membership_verified",
+            ),
+            "resume-before-guardian" | "resume-before-relays" => {
+                ("windows-preauthorization.json", "/evidence/guardian_ready")
+            }
+            "accept-recursive-provider" => (
+                "windows-qualification.json",
+                "/recursive_provider_request_denied",
+            ),
+            "omit-guardian" => ("windows-front-end-loss.json", "/evidence/guardian_verified"),
+            "accept-completion-without-accounting" | "success-before-active-zero" => (
+                "windows-cleanup.json",
+                "/runtime/public_launch/attempts/0/boundary_detail/active_processes_zero",
+            ),
+            "skip-relay-ack" => ("windows-handle-inventory.json", "/evidence/relays_retired"),
+            "close-job-before-evidence" => (
+                "windows-cleanup.json",
+                "/runtime/public_launch/attempts/0/boundary_detail/final_job_handles_closed",
+            ),
+            "fall-back-to-standard" => (
+                "windows-cleanup.json",
+                "/runtime/public_launch/attempts/0/launch/mechanism",
+            ),
+            "omit-agent-from-archive" => ("windows-cleanup.json", "/native_target"),
+            "advertise-without-certificate" => ("windows-qualification.json", "/qualified"),
+            other => panic!("unmapped Windows mutant: {other}"),
+        };
+        let path = directory.join(report_name);
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let replacement = if *mutant == "fall-back-to-standard" {
+            json!("standard")
+        } else if *mutant == "omit-agent-from-archive" {
+            json!("x86_64-pc-windows-gnu")
+        } else {
+            json!(false)
+        };
+        *report
+            .pointer_mut(pointer)
+            .expect("mutant evidence pointer must exist") = replacement;
+        write_report(&path, &report);
+        let result = collect_certification(
+            &temporary.path().join("input"),
+            &temporary.path().join("output"),
+            COMMIT,
+        );
+        assert!(result.is_err(), "{mutant} must be killed by {mapped_test}");
+    }
+}
+
+#[test]
+fn windows_package_identity_mutations_fail_closed() {
+    for (name, report_name, pointer, replacement) in [
+        (
+            "version",
+            "windows-package-inspection.json",
+            "/version",
+            json!("0.0.0"),
+        ),
+        (
+            "commit",
+            "windows-package-inspection.json",
+            "/source_commit",
+            json!("wrong"),
+        ),
+        (
+            "protocol",
+            "windows-package-inspection.json",
+            "/provider_protocol",
+            json!(99),
+        ),
+        (
+            "service name",
+            "windows-package-inspection.json",
+            "/control_service_name",
+            json!("OtherService"),
+        ),
+        (
+            "privilege inventory",
+            "windows-package-inspection.json",
+            "/launcher_required_privileges",
+            json!([]),
+        ),
+        (
+            "ACL digest",
+            "windows-package-inspection.json",
+            "/control_pipe_security_sha256",
+            json!("invalid"),
+        ),
+        (
+            "installed digest",
+            "windows-installed-provider.json",
+            "/installed_executable_sha256",
+            json!("78".repeat(32)),
+        ),
+        (
+            "installed provider identity",
+            "windows-installed-provider.json",
+            "/provider_identity",
+            json!("other"),
+        ),
+        (
+            "unknown package field",
+            "windows-package-inspection.json",
+            "/unexpected",
+            json!(true),
+        ),
+    ] {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-windows-x64")
+            .join(report_name);
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        if pointer == "/unexpected" {
+            report["unexpected"] = replacement;
+        } else {
+            *report.pointer_mut(pointer).expect("fixture pointer exists") = replacement;
+        }
+        write_report(&path, &report);
+        assert!(
+            collect_certification(
+                &temporary.path().join("input"),
+                &temporary.path().join("output"),
+                COMMIT,
+            )
+            .is_err(),
+            "{name} mutation must fail closed"
         );
     }
 }

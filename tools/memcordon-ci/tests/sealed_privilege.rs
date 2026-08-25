@@ -19,6 +19,451 @@ fn semantic_function_region(source: &str, signature: &str, next_signature: &str)
     None
 }
 
+#[derive(Clone)]
+struct WindowsProductionSources {
+    process: String,
+    job: String,
+    launcher: String,
+    control: String,
+    supervisor: String,
+    platform: String,
+    release_config: String,
+    release_evidence: String,
+}
+
+#[derive(Clone, Copy)]
+enum WindowsProductionSource {
+    Process,
+    Job,
+    Launcher,
+    Control,
+    Supervisor,
+    Platform,
+    ReleaseConfig,
+}
+
+impl WindowsProductionSources {
+    fn load() -> Self {
+        Self {
+            process: include_str!(
+                "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/process.rs"
+            )
+            .to_owned(),
+            job: include_str!(
+                "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/job.rs"
+            )
+            .to_owned(),
+            launcher: include_str!(
+                "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/launcher_service.rs"
+            )
+            .to_owned(),
+            control: include_str!(
+                "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/control_service.rs"
+            )
+            .to_owned(),
+            supervisor: include_str!("../../../crates/memcordon-platform/src/supervisor.rs")
+                .to_owned(),
+            platform: include_str!("../../../crates/memcordon-platform/src/sealed/windows.rs")
+                .to_owned(),
+            release_config: include_str!("../src/config.rs").to_owned(),
+            release_evidence: include_str!("../src/release_evidence.rs").to_owned(),
+        }
+    }
+
+    fn source(&self, source: WindowsProductionSource) -> &str {
+        match source {
+            WindowsProductionSource::Process => &self.process,
+            WindowsProductionSource::Job => &self.job,
+            WindowsProductionSource::Launcher => &self.launcher,
+            WindowsProductionSource::Control => &self.control,
+            WindowsProductionSource::Supervisor => &self.supervisor,
+            WindowsProductionSource::Platform => &self.platform,
+            WindowsProductionSource::ReleaseConfig => &self.release_config,
+        }
+    }
+
+    fn source_mut(&mut self, source: WindowsProductionSource) -> &mut String {
+        match source {
+            WindowsProductionSource::Process => &mut self.process,
+            WindowsProductionSource::Job => &mut self.job,
+            WindowsProductionSource::Launcher => &mut self.launcher,
+            WindowsProductionSource::Control => &mut self.control,
+            WindowsProductionSource::Supervisor => &mut self.supervisor,
+            WindowsProductionSource::Platform => &mut self.platform,
+            WindowsProductionSource::ReleaseConfig => &mut self.release_config,
+        }
+    }
+}
+
+fn windows_mutant_hook(mutant: &str) -> (WindowsProductionSource, &'static str) {
+    match mutant {
+        "use-create-process-w" => (
+            WindowsProductionSource::Process,
+            "let created = if matches!(\n            certification_mutant,\n            Some(\n                WindowsSealedMutant::UseCreateProcessW\n                    | WindowsSealedMutant::SkipTargetTokenReadback",
+        ),
+        "create-under-service-token" => (
+            WindowsProductionSource::Process,
+            "let service_token =\n            if certification_mutant == Some(WindowsSealedMutant::CreateUnderServiceToken)",
+        ),
+        "assign-job-after-create" => (
+            WindowsProductionSource::Process,
+            "if certification_mutant == Some(WindowsSealedMutant::AssignJobAfterCreate)\n            && unsafe { AssignProcessToJobObject",
+        ),
+        "omit-job-list" => (
+            WindowsProductionSource::Process,
+            "if !matches!(\n            certification_mutant,\n            Some(\n                WindowsSealedMutant::AssignJobAfterCreate\n                    | WindowsSealedMutant::OmitJobList",
+        ),
+        "omit-handle-list" => (
+            WindowsProductionSource::Process,
+            "if certification_mutant != Some(WindowsSealedMutant::OmitHandleList) {",
+        ),
+        "permit-breakaway" => (
+            WindowsProductionSource::Job,
+            "if certification_mutant == Some(WindowsSealedMutant::PermitBreakaway) {\n            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_BREAKAWAY_OK;",
+        ),
+        "trust-client-token" => (
+            WindowsProductionSource::Control,
+            "if certification_mutant == Some(WindowsSealedMutant::TrustClientToken) {",
+        ),
+        "skip-target-token-readback" => (
+            WindowsProductionSource::Launcher,
+            "let target_token = if request.certification_mutant\n            == Some(memcordon_core::WindowsSealedMutant::SkipTargetTokenReadback)",
+        ),
+        "skip-job-membership-readback" => (
+            WindowsProductionSource::Launcher,
+            "request.certification_mutant\n            != Some(memcordon_core::WindowsSealedMutant::SkipJobMembershipReadback)",
+        ),
+        "resume-before-guardian" => (
+            WindowsProductionSource::Launcher,
+            "request.certification_mutant\n        != Some(memcordon_core::WindowsSealedMutant::ResumeBeforeGuardian)\n        && unsafe { WaitForSingleObject(ready.raw(), 10_000) }",
+        ),
+        "resume-before-relays" => (
+            WindowsProductionSource::Launcher,
+            "request.certification_mutant != Some(memcordon_core::WindowsSealedMutant::ResumeBeforeRelays)\n        && let Err(detail) = wait_for_relays_ready(",
+        ),
+        "leak-job-handle-to-target" => (
+            WindowsProductionSource::Process,
+            "Some(WindowsSealedMutant::LeakJobHandleToTarget) => Some(\"job\"),",
+        ),
+        "leak-launcher-pipe" => (
+            WindowsProductionSource::Process,
+            "Some(WindowsSealedMutant::LeakLauncherPipe) => Some(\"pipe\"),",
+        ),
+        "accept-recursive-provider" => (
+            WindowsProductionSource::Control,
+            "&& certification_mutant == Some(WindowsSealedMutant::AcceptRecursiveProvider) => {}",
+        ),
+        "omit-guardian" => (
+            WindowsProductionSource::Launcher,
+            "request.certification_mutant\n        == Some(memcordon_core::WindowsSealedMutant::OmitGuardian)",
+        ),
+        "accept-completion-without-accounting" => (
+            WindowsProductionSource::Launcher,
+            "request.certification_mutant\n        == Some(memcordon_core::WindowsSealedMutant::AcceptCompletionWithoutAccounting)",
+        ),
+        "success-before-active-zero" => (
+            WindowsProductionSource::Launcher,
+            "request.certification_mutant\n        == Some(memcordon_core::WindowsSealedMutant::SuccessBeforeActiveZero)",
+        ),
+        "skip-relay-ack" => (
+            WindowsProductionSource::Launcher,
+            "request.certification_mutant == Some(memcordon_core::WindowsSealedMutant::SkipRelayAck)",
+        ),
+        "close-job-before-evidence" => (
+            WindowsProductionSource::Launcher,
+            "request.certification_mutant\n        == Some(memcordon_core::WindowsSealedMutant::CloseJobBeforeEvidence)",
+        ),
+        "fall-back-to-standard" => (
+            WindowsProductionSource::Supervisor,
+            "mutant == Some(memcordon_core::WindowsSealedMutant::FallBackToStandard)",
+        ),
+        "omit-agent-from-archive" => (
+            WindowsProductionSource::ReleaseConfig,
+            "agent.binary != \"memcordon-sealed-agent\"",
+        ),
+        "advertise-without-certificate" => (
+            WindowsProductionSource::Platform,
+            "mutant == Some(memcordon_core::WindowsSealedMutant::AdvertiseWithoutCertificate)",
+        ),
+        other => panic!("unmapped Windows production mutant hook: {other}"),
+    }
+}
+
+fn require_source(source: &str, fragment: &str, invariant: &str) -> Result<(), String> {
+    if source.contains(fragment) {
+        Ok(())
+    } else {
+        Err(format!("Windows production contract omitted {invariant}"))
+    }
+}
+
+fn require_source_order(source: &str, fragments: &[(&str, &str)]) -> Result<(), String> {
+    let mut cursor = 0_usize;
+    for (fragment, invariant) in fragments {
+        let offset = source[cursor..]
+            .find(fragment)
+            .ok_or_else(|| format!("Windows production contract omitted {invariant}"))?;
+        cursor = cursor
+            .checked_add(offset)
+            .and_then(|value| value.checked_add(fragment.len()))
+            .ok_or_else(|| "Windows production contract source offset overflowed".to_owned())?;
+    }
+    Ok(())
+}
+
+fn validate_windows_production_contract(sources: &WindowsProductionSources) -> Result<(), String> {
+    require_source(
+        &sources.process,
+        "} else {\n            unsafe {\n                CreateProcessAsUserW(\n                    service_token.as_ref().map_or(token, OwnedHandle::raw),",
+        "caller-token CreateProcessAsUserW",
+    )?;
+    require_source(
+        &sources.process,
+        "process_attributes_manifest.push(Attribute::new(\n                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,",
+        "creation-time Job list",
+    )?;
+    require_source(
+        &sources.process,
+        "process_attributes_manifest.push(Attribute::new(\n                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,",
+        "creation-time handle list",
+    )?;
+    require_source(
+        &sources.process,
+        "let mut handles = streams.target_handles().to_vec();",
+        "exact three-stream handle manifest",
+    )?;
+    require_source(
+        &sources.process,
+        "validate_target_handle_list(&handles)?;",
+        "ordinary exact handle-list validation",
+    )?;
+    require_source(
+        &sources.job,
+        "limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;",
+        "kill-on-close-only Job policy",
+    )?;
+    require_source(
+        &sources.job,
+        "flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK) != 0",
+        "breakaway readback rejection",
+    )?;
+    require_source(
+        &sources.control,
+        "let (primary_token, mut caller_token_envelope, frontend, before) =\n        super::token::authenticate_pipe_client(public, client_pid, None)?;",
+        "kernel-authenticated caller token capture",
+    )?;
+    require_source(
+        &sources.control,
+        "inside_active_job: true,",
+        "recursive-provider membership rejection",
+    )?;
+    require_source(
+        &sources.control,
+        "MCSEALED-WINDOWS-RECURSIVE-PROVIDER",
+        "typed recursive-provider rejection",
+    )?;
+    require_source(
+        &sources.launcher,
+        "super::process::create_guardian(",
+        "per-attempt guardian creation",
+    )?;
+    require_source(
+        &sources.launcher,
+        "super::token::process_token(target.handle())?",
+        "target-token readback equality",
+    )?;
+    require_source(
+        &sources.launcher,
+        ".is_some_and(|target_envelope| target_envelope != &request.caller_token_envelope)",
+        "target-token readback comparison",
+    )?;
+    require_source(
+        &sources.launcher,
+        "&& !job.contains(target.handle())?",
+        "target Job-membership readback",
+    )?;
+    require_source(
+        &sources.launcher,
+        "job.active_processes()? == 0",
+        "authoritative active-process accounting query",
+    )?;
+    require_source(
+        &sources.launcher,
+        "let empty = job.wait_empty(Instant::now() + Duration::from_secs(30))?;",
+        "zero-active-process terminal gate",
+    )?;
+    require_source_order(
+        &sources.launcher,
+        &[
+            (
+                "        && let Err(detail) = wait_for_relays_ready(\n            connection,",
+                "relay readiness before target creation",
+            ),
+            (
+                "    let target_result = SuspendedTarget::create(",
+                "target creation after relay readiness",
+            ),
+            (
+                "    if let Err(detail) = require_guardian_live(guardian.raw()) {",
+                "guardian liveness before authorization",
+            ),
+            (
+                "    if let Err(detail) = cleanup_guard.record.authorize() {",
+                "durable authorization record",
+            ),
+            (
+                "    if let Err(detail) = require_guardian_live(guardian.raw()) {",
+                "guardian liveness immediately before resume",
+            ),
+            (
+                "    if let Err(detail) = target.resume(None) {",
+                "single target resume",
+            ),
+        ],
+    )?;
+    let normal_retirement = sources
+        .launcher
+        .find(
+            "    cleanup_guard\n        .record\n        .transition(super::record::WindowsAttemptStateV1::Terminating)?;",
+        )
+        .map(|start| &sources.launcher[start..])
+        .ok_or_else(|| "Windows production contract omitted normal retirement".to_owned())?;
+    let zero_proof = normal_retirement
+        .find("let empty = job.wait_empty(Instant::now() + Duration::from_secs(30))?;")
+        .ok_or_else(|| {
+            "Windows production contract omitted zero-active-process proof".to_owned()
+        })?;
+    let first_job_close = normal_retirement
+        .find("drop(job);")
+        .ok_or_else(|| "Windows production contract omitted final Job-handle closure".to_owned())?;
+    if first_job_close < zero_proof {
+        return Err(
+            "Windows production contract closes a final Job handle before zero proof".to_owned(),
+        );
+    }
+    require_source_order(
+        normal_retirement,
+        &[
+            (
+                "let empty = job.wait_empty(Instant::now() + Duration::from_secs(30))?;",
+                "zero-active-process proof before retirement",
+            ),
+            (
+                "wait_for_relay_retirement_proof(",
+                "relay retirement acknowledgment",
+            ),
+            ("drop(job);", "final Job-handle closure"),
+            ("record.retire()?;", "durable record retirement"),
+            (
+                "let receipt = build_terminal_receipt(",
+                "terminal native evidence after final-handle closure",
+            ),
+            (
+                "WindowsLauncherResponseV1::Terminal(receipt)",
+                "terminal receipt after retirement",
+            ),
+        ],
+    )?;
+    require_source(
+        &sources.supervisor,
+        "return attempt_execution(crate::sealed::windows::run(",
+        "sealed Windows routing without standard fallback",
+    )?;
+    require_source(
+        &sources.platform,
+        "qualification_is_advertisable(&qualification, None)",
+        "native qualification before sealed advertisement",
+    )?;
+    require_source(
+        &sources.release_config,
+        "agent.binary != \"memcordon-sealed-agent\"",
+        "sealed agent in Windows archive inventory",
+    )?;
+    for (mutant, _) in memcordon_core::WINDOWS_RELEASE_MUTANTS {
+        let (source, hook) = windows_mutant_hook(mutant);
+        require_source(
+            sources.source(source),
+            hook,
+            &format!("typed production hook for {mutant}"),
+        )?;
+    }
+    for (_, mapped_test) in memcordon_core::WINDOWS_RELEASE_MUTANTS {
+        require_source(
+            &sources.release_evidence,
+            &format!("\"{mapped_test}\""),
+            &format!("native mutant evidence mapping for {mapped_test}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_windows_source_once(source: &mut String, exact: &str, replacement: &str, mutant: &str) {
+    assert_eq!(
+        source.matches(exact).count(),
+        1,
+        "{mutant} production mutation must select one exact source fragment"
+    );
+    *source = source.replacen(exact, replacement, 1);
+}
+
+fn apply_windows_production_mutant(sources: &mut WindowsProductionSources, mutant: &str) {
+    let (source, hook) = windows_mutant_hook(mutant);
+    replace_windows_source_once(
+        sources.source_mut(source),
+        hook,
+        "/* production mutant hook removed */",
+        mutant,
+    );
+}
+
+#[test]
+fn windows_production_source_mutants_are_killed_by_native_contract() {
+    const REQUIRED_MUTANTS: [&str; 22] = [
+        "use-create-process-w",
+        "create-under-service-token",
+        "assign-job-after-create",
+        "omit-job-list",
+        "omit-handle-list",
+        "permit-breakaway",
+        "trust-client-token",
+        "skip-target-token-readback",
+        "skip-job-membership-readback",
+        "resume-before-guardian",
+        "resume-before-relays",
+        "leak-job-handle-to-target",
+        "leak-launcher-pipe",
+        "accept-recursive-provider",
+        "omit-guardian",
+        "accept-completion-without-accounting",
+        "success-before-active-zero",
+        "skip-relay-ack",
+        "close-job-before-evidence",
+        "fall-back-to-standard",
+        "omit-agent-from-archive",
+        "advertise-without-certificate",
+    ];
+
+    let inventory = memcordon_core::WINDOWS_RELEASE_MUTANTS
+        .iter()
+        .map(|(mutant, _)| *mutant)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inventory, REQUIRED_MUTANTS,
+        "the source mutation gate must cover the exact design inventory"
+    );
+    let production = WindowsProductionSources::load();
+    validate_windows_production_contract(&production)
+        .expect("unmutated Windows production sources must satisfy the native contract");
+    for mutant in REQUIRED_MUTANTS {
+        let mut mutated = production.clone();
+        apply_windows_production_mutant(&mut mutated, mutant);
+        assert!(
+            validate_windows_production_contract(&mutated).is_err(),
+            "production source mutant {mutant} survived the native contract validator"
+        );
+    }
+}
+
 #[test]
 fn semantic_function_region_accepts_lf_and_crlf_without_broad_matching() {
     let lf = "fn selected() {\n    structured_call();\n}\n\nfn following() {\n}\n";
@@ -274,12 +719,12 @@ fn credential_redesign_fuzz_targets_bind_real_parser_surfaces() {
         (
             "agent-package-inspection",
             include_str!("../../../fuzz/fuzz_targets/agent_package_inspection.rs"),
-            "AgentPackageInspectionV1",
+            "AgentPackageInspectionV2",
         ),
         (
             "installed-provider-inspection",
             include_str!("../../../fuzz/fuzz_targets/installed_provider_inspection.rs"),
-            "InstalledProviderInspectionV1",
+            "InstalledProviderInspectionV2",
         ),
         (
             "cargo-bin-inventory",
@@ -290,6 +735,61 @@ fn credential_redesign_fuzz_targets_bind_real_parser_surfaces() {
             "channel-pairing",
             include_str!("../../../fuzz/fuzz_targets/channel_pairing.rs"),
             "source_commit",
+        ),
+        (
+            "windows-public-provider-protocol",
+            include_str!("../../../fuzz/fuzz_targets/windows_public_provider_protocol.rs"),
+            "WindowsProviderRequestV1",
+        ),
+        (
+            "windows-private-launcher-protocol",
+            include_str!("../../../fuzz/fuzz_targets/windows_private_launcher_protocol.rs"),
+            "WindowsLauncherRequestV1",
+        ),
+        (
+            "windows-token-envelope",
+            include_str!("../../../fuzz/fuzz_targets/windows_token_envelope.rs"),
+            "WindowsCallerTokenEnvelopeV1",
+        ),
+        (
+            "windows-security-descriptor",
+            include_str!("../../../fuzz/fuzz_targets/windows_security_descriptor.rs"),
+            "validate_windows_security_descriptor_text",
+        ),
+        (
+            "windows-handle-manifest",
+            include_str!("../../../fuzz/fuzz_targets/windows_handle_manifest.rs"),
+            "WindowsRemoteStreamV1",
+        ),
+        (
+            "windows-environment-block",
+            include_str!("../../../fuzz/fuzz_targets/windows_environment_block.rs"),
+            "WindowsEnvironmentEntryV1",
+        ),
+        (
+            "windows-argv",
+            include_str!("../../../fuzz/fuzz_targets/windows_argv.rs"),
+            "encode_windows_command_line",
+        ),
+        (
+            "windows-qualification",
+            include_str!("../../../fuzz/fuzz_targets/windows_qualification.rs"),
+            "is_consistent",
+        ),
+        (
+            "windows-terminal-receipt",
+            include_str!("../../../fuzz/fuzz_targets/windows_terminal_receipt.rs"),
+            "WindowsTerminalReceiptV1",
+        ),
+        (
+            "windows-attempt-record",
+            include_str!("../../../fuzz/fuzz_targets/windows_attempt_record.rs"),
+            "windows_certification_transition_allowed",
+        ),
+        (
+            "windows-package-inspection",
+            include_str!("../../../fuzz/fuzz_targets/windows_package_inspection.rs"),
+            "AgentPackageInspectionV2",
         ),
     ];
 

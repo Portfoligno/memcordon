@@ -16,6 +16,8 @@ const EXPECTED_STATIC_PATHS: &[&str] = &[
     "docs/assets/key-guarantees.png",
     "spec/sealed-linux-v2.md",
     "spec/sealed-provider-protocol-v2.md",
+    "spec/sealed-windows-provider-v1.md",
+    "spec/sealed-windows-v2.md",
 ];
 
 fn repository_root() -> PathBuf {

@@ -18,6 +18,8 @@ pub const NATIVE_ARCHIVE_STATIC_PATHS: &[&str] = &[
     "docs/assets/key-guarantees.png",
     "spec/sealed-linux-v2.md",
     "spec/sealed-provider-protocol-v2.md",
+    "spec/sealed-windows-provider-v1.md",
+    "spec/sealed-windows-v2.md",
 ];
 
 fn failure(message: impl Into<String>) -> CiError {

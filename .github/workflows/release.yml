@@ -281,9 +281,19 @@ jobs:
           key: ${{ steps.certification-deps.outputs.cache-primary-key }}
 
   windows-certification:
-    name: Release / Windows Job Object certification
-    needs: preflight
-    runs-on: windows-2025
+    name: Release / Windows sealed certification / ${{ matrix.id }}
+    needs:
+      - preflight
+      - native
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: x64
+            runner: windows-2025
+          - id: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 75
     steps:
       - name: Check out pushed tag
@@ -307,20 +317,32 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: cargo-deps-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+          key: cargo-deps-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-native-windows-${{ matrix.id }}
+          path: target/ci/release-input
       - id: certification-target
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             target/ci/bootstrap
             target/ci/backend
-          key: cargo-target-release-certification-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
+            target/ci/windows-sealed
+            target/ci/windows-sealed-cargo
+          key: cargo-target-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-sealed-v2
+      - name: Certify packaged Cargo channel
+        env:
+          CARGO_TARGET_DIR: target/ci/windows-sealed-cargo/build
+        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite package-windows-sealed
+      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite channel-parity-windows-sealed
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: release-certification-windows
-          path: target/ci/reports/backend-windows-job-object.json
+          name: release-certification-windows-${{ matrix.id }}
+          path: target/ci/reports/windows-sealed-v2
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
@@ -330,6 +352,8 @@ jobs:
           path: |
             target/ci/bootstrap
             target/ci/backend
+            target/ci/windows-sealed
+            target/ci/windows-sealed-cargo
           key: ${{ steps.certification-target.outputs.cache-primary-key }}
       - if: always() && steps.certification-deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -481,10 +505,20 @@ jobs:
           compression-level: 0
 
   verify-public:
-    name: Release / verify public state
+    name: Release / verify public state / ${{ matrix.id }}
     needs: publish
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x64
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - id: windows-x64
+            runner: windows-2025
+          - id: windows-arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -510,5 +544,31 @@ jobs:
         with:
           name: release-publication-report
           path: target/ci/release-bundle
+      - id: verify-public-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-release-verify-public-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - id: verify-public-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/verify-bootstrap
+          key: cargo-target-release-verify-public-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/release.yml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/verify-bootstrap --package memcordon-ci -- release verify-public
+      - if: always() && steps.verify-public-target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci/verify-bootstrap
+          key: ${{ steps.verify-public-target.outputs.cache-primary-key }}
+      - if: always() && steps.verify-public-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.verify-public-deps.outputs.cache-primary-key }}
