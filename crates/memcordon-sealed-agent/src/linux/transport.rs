@@ -9,10 +9,35 @@ const FRAME_HEADER_LENGTH: usize = 72;
 const MAX_DESCRIPTORS: usize = 8;
 
 pub fn receive(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>), String> {
+    let received = receive_inner(stream, false)?;
+    Ok((received.frame, received.descriptors))
+}
+
+pub(crate) fn receive_with_credentials(
+    stream: &UnixStream,
+) -> Result<(Frame, Vec<OwnedFd>, Option<libc::ucred>), String> {
+    let received = receive_inner(stream, true)?;
+    Ok((received.frame, received.descriptors, received.credentials))
+}
+
+struct ReceivedMessage {
+    frame: Frame,
+    descriptors: Vec<OwnedFd>,
+    credentials: Option<libc::ucred>,
+}
+
+fn receive_inner(stream: &UnixStream, accept_credentials: bool) -> Result<ReceivedMessage, String> {
     let mut header = [0_u8; FRAME_HEADER_LENGTH];
-    let control_capacity =
+    let descriptor_capacity =
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
         unsafe { libc::CMSG_SPACE((MAX_DESCRIPTORS * size_of::<libc::c_int>()) as u32) } as usize;
+    let credential_capacity = if accept_credentials {
+        // SAFETY: libc computes ancillary storage for one kernel credential record.
+        (unsafe { libc::CMSG_SPACE(size_of::<libc::ucred>() as u32) }) as usize
+    } else {
+        0
+    };
+    let control_capacity = descriptor_capacity + credential_capacity;
     let mut control = vec![0_u8; control_capacity];
     let mut iovec = libc::iovec {
         iov_base: header.as_mut_ptr().cast(),
@@ -53,36 +78,54 @@ pub fn receive(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>), String> {
         .map_err(|error| error.to_string())?;
     bytes.extend_from_slice(&payload);
     let mut descriptors = Vec::new();
+    let mut credentials = None;
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     let mut header_ptr = unsafe { libc::CMSG_FIRSTHDR(&message) };
     while !header_ptr.is_null() {
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
         let header_ref = unsafe { &*header_ptr };
-        if header_ref.cmsg_level != libc::SOL_SOCKET || header_ref.cmsg_type != libc::SCM_RIGHTS {
+        if header_ref.cmsg_level != libc::SOL_SOCKET {
             return Err("unexpected ancillary provider data".to_owned());
         }
-        // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
-        let data_length = header_ref.cmsg_len as usize - unsafe { libc::CMSG_LEN(0) } as usize;
-        if data_length % size_of::<libc::c_int>() != 0 {
-            return Err("misaligned descriptor inventory".to_owned());
-        }
-        let count = data_length / size_of::<libc::c_int>();
-        if descriptors.len() + count > MAX_DESCRIPTORS {
-            return Err("too many provider descriptors".to_owned());
-        }
-        // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
-        let data = unsafe { libc::CMSG_DATA(header_ptr).cast::<libc::c_int>() };
-        for index in 0..count {
+        // SAFETY: libc computes the fixed ancillary header length without dereferencing memory.
+        let header_length = unsafe { libc::CMSG_LEN(0) } as usize;
+        let data_length = (header_ref.cmsg_len as usize)
+            .checked_sub(header_length)
+            .ok_or_else(|| "invalid ancillary provider data length".to_owned())?;
+        if header_ref.cmsg_type == libc::SCM_RIGHTS {
+            if data_length % size_of::<libc::c_int>() != 0 {
+                return Err("misaligned descriptor inventory".to_owned());
+            }
+            let count = data_length / size_of::<libc::c_int>();
+            if descriptors.len() + count > MAX_DESCRIPTORS {
+                return Err("too many provider descriptors".to_owned());
+            }
             // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
-            let descriptor = unsafe { *data.add(index) };
-            // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
-            descriptors.push(unsafe { OwnedFd::from_raw_fd(descriptor) });
+            let data = unsafe { libc::CMSG_DATA(header_ptr).cast::<libc::c_int>() };
+            for index in 0..count {
+                // SAFETY: the kernel supplied `count` complete descriptor values.
+                let descriptor = unsafe { *data.add(index) };
+                // SAFETY: SCM_RIGHTS transferred ownership of each received descriptor.
+                descriptors.push(unsafe { OwnedFd::from_raw_fd(descriptor) });
+            }
+        } else if accept_credentials && header_ref.cmsg_type == libc::SCM_CREDENTIALS {
+            if data_length != size_of::<libc::ucred>() || credentials.is_some() {
+                return Err("invalid launcher credential inventory".to_owned());
+            }
+            // SAFETY: the kernel supplied one complete SCM_CREDENTIALS record.
+            credentials = Some(unsafe { *libc::CMSG_DATA(header_ptr).cast::<libc::ucred>() });
+        } else {
+            return Err("unexpected ancillary provider data".to_owned());
         }
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
         header_ptr = unsafe { libc::CMSG_NXTHDR(&message, header_ptr) };
     }
     let frame = read_frame(&mut Cursor::new(bytes)).map_err(|error| error.to_string())?;
-    Ok((frame, descriptors))
+    Ok(ReceivedMessage {
+        frame,
+        descriptors,
+        credentials,
+    })
 }
 
 use std::os::fd::{AsRawFd, RawFd};

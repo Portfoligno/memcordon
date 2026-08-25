@@ -340,6 +340,31 @@ fn certification_runner_regressions_are_rejected_structurally() {
 }
 
 #[test]
+fn linux_certification_uploads_retain_hidden_failure_diagnostics() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    for (path, fixture) in [
+        (
+            Path::new(".github/workflows/backend-certification.yml"),
+            include_str!("../../../.github/workflows/backend-certification.yml"),
+        ),
+        (
+            Path::new(".github/workflows/release.yml"),
+            include_str!("../../../.github/workflows/release.yml"),
+        ),
+    ] {
+        let normalized = fixture.replace("\r\n", "\n");
+        let invalid = normalized.replacen("          include-hidden-files: true\n", "", 1);
+        assert_ne!(
+            invalid, normalized,
+            "hidden-diagnostic fixture mutation must apply: {path:?}"
+        );
+        policy::validate_workflow_bytes(&root, path, invalid.as_bytes(), &repository_policy)
+            .expect_err("Linux certification must upload hidden failure diagnostics");
+    }
+}
+
+#[test]
 fn deep_and_backend_workflows_require_unfiltered_push_and_manual_dispatch() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");

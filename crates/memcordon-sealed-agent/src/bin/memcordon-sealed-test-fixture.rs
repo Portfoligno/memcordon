@@ -362,12 +362,49 @@ fn main() {
                 .ok()
                 .filter(|bytes| bytes.len() <= 1024 * 1024)
                 .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-            if value.as_ref().and_then(|value| {
-                value
-                    .pointer("/attempts/0/error/provider_rejection/code")
+            let rejection = value
+                .as_ref()
+                .and_then(|value| value.pointer("/attempts/0/error/provider_rejection"));
+            let exact_rejection = rejection.is_some_and(|rejection| {
+                rejection
+                    .pointer("/code")
                     .and_then(serde_json::Value::as_str)
-            }) != Some("MCSEALED-RECURSIVE-PROVIDER-REQUEST")
-            {
+                    == Some("MCSEALED-RECURSIVE-PROVIDER-REQUEST")
+                    && rejection
+                        .pointer("/detail")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("caller is already inside an active sealed attempt")
+                    && rejection
+                        .pointer("/phase")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("request-validation")
+                    && rejection
+                        .pointer("/target_created")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+                    && rejection
+                        .pointer("/target_released")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+                    && rejection
+                        .pointer("/cleanup_attempted")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+            });
+            let exact_envelope = value.as_ref().is_some_and(|value| {
+                value
+                    .pointer("/supervision/targets_authorized")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(0)
+                    && value
+                        .pointer("/supervision/restart/restarts_launched")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(0)
+                    && value
+                        .pointer("/attempts/0/authorized_offset_ms")
+                        .is_some_and(serde_json::Value::is_null)
+            });
+            if !exact_rejection || !exact_envelope {
                 std::process::exit(102);
             }
         }

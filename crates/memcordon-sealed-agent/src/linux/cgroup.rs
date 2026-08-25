@@ -1,5 +1,6 @@
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -22,6 +23,38 @@ const ATTEMPT_CONTROLS: &[&str] = &[
     "memory.max",
     "memory.swap.max",
 ];
+
+pub(super) enum AttemptRootEntry {
+    KernelControl,
+    Attempt { name: OsString, path: PathBuf },
+    InvalidDirectory(OsString),
+    Unsafe(OsString),
+}
+
+pub(super) fn classify_attempt_root_entry(entry: &fs::DirEntry) -> io::Result<AttemptRootEntry> {
+    let file_type = entry.file_type()?;
+    if file_type.is_file() {
+        return Ok(AttemptRootEntry::KernelControl);
+    }
+    let name = entry.file_name();
+    if file_type.is_dir() {
+        if name.to_str().is_some_and(valid_attempt_identity) {
+            return Ok(AttemptRootEntry::Attempt {
+                name,
+                path: entry.path(),
+            });
+        }
+        return Ok(AttemptRootEntry::InvalidDirectory(name));
+    }
+    Ok(AttemptRootEntry::Unsafe(name))
+}
+
+pub(super) fn valid_attempt_identity(identity: &str) -> bool {
+    identity.len() == 32
+        && identity
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 pub fn prepare_private_root() -> Result<(), String> {
     let root = Path::new(CGROUP_ROOT);
@@ -104,11 +137,7 @@ impl AttemptCgroup {
         memory_max: Option<u64>,
         swap_limit: crate::request::SwapLimit,
     ) -> Result<Self, String> {
-        if identity.len() != 32
-            || !identity
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if !valid_attempt_identity(identity) {
             return Err("invalid attempt identity".to_owned());
         }
         let path = Path::new(CGROUP_ROOT).join(identity);

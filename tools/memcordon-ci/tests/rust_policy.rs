@@ -39,6 +39,7 @@ fn pre_exec_and_raw_fork_are_confined_to_exact_reviewed_boundaries() {
         "crates/memcordon-sealed-agent/src/bin/memcordon-sealed-test-fixture.rs",
         "crates/memcordon-sealed-agent/tests/linux_faults.rs",
         "crates/memcordon-sealed-agent/tests/linux_sealed.rs",
+        "crates/memcordon-sealed-agent/tests/launcher_activation.rs",
     ] {
         validate_rust_policy_bytes(Path::new(reviewed), fork)
             .expect("an exact reviewed sealed-provider boundary may fork");
@@ -58,6 +59,14 @@ fn pre_exec_and_raw_fork_are_confined_to_exact_reviewed_boundaries() {
         )
         .is_err(),
         "the generic shared support module must not retain raw-fork authority",
+    );
+    assert!(
+        validate_rust_policy_bytes(
+            Path::new("crates/memcordon-sealed-agent/tests/launcher_activation_copy.rs"),
+            fork,
+        )
+        .is_err(),
+        "raw-fork authority must remain confined to the exact activation test path",
     );
     assert!(
         validate_rust_policy_bytes(

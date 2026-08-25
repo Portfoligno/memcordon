@@ -56,6 +56,8 @@ fn close_on_exec_eof_is_distinct_from_native_exit_126_or_127() {
             TargetExecStatus::Succeeded,
             child_status,
         ));
+        memcordon_platform::test_support::sealed_terminal_v2_is_valid(&payload)
+            .expect("producer terminal receipt must be accepted by the platform consumer");
         let text = std::str::from_utf8(&payload).unwrap();
         assert!(text.lines().any(|line| line == "exec-status=success"));
         assert!(text.lines().any(|line| line == "exec-os-code=none"));
@@ -89,6 +91,8 @@ fn native_exec_errors_are_bounded_and_classified_before_terminal_receipt() {
             status,
             child_status,
         ));
+        memcordon_platform::test_support::sealed_terminal_v2_is_valid(&payload)
+            .expect("producer terminal receipt must be accepted by the platform consumer");
         let text = std::str::from_utf8(&payload).unwrap();
         assert!(
             text.lines()

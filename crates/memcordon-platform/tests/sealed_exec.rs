@@ -3,8 +3,55 @@
 use memcordon_core::{ErrorCategory, InitialSpawnFailure};
 
 fn terminal(status: i32, exec_status: &str, os_code: &str) -> Vec<u8> {
+    const CALLER_ENVELOPE_DIGEST: &str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+    const CALLER_CAPABILITY_BOUNDING_SET_DIGEST: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const CALLER_MOUNT_NAMESPACE_DIGEST: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
     format!(
-        "status={status}\nexec-status={exec_status}\nexec-os-code={os_code}\nspawn-error-reported=true\ntarget-pid=71\nauthorization-offset-millis=9\nmemory-limit-exceeded=false\ndeadline-exceeded=false\nassignment-verified=true\nnamespaces-verified=true\ncredentials-verified=true\ncapabilities-empty=true\ndescriptors-verified=true\ncgroup-view-denied=true\nguardian-ready-before-authorization=true\nfrontend-loss-authority-verified=true\ncgroup-kill-invoked=true\ncgroup-empty=true\ninit-reaped=true\nguardian-reaped=true\nboundary-retired=true\n"
+        concat!(
+            "schema-version=2\n",
+            "mechanism=linux-pid-namespace-cgroup-v2\n",
+            "status={status}\n",
+            "exec-status={exec_status}\n",
+            "exec-os-code={os_code}\n",
+            "spawn-error-reported=true\n",
+            "target-pid=71\n",
+            "authorization-offset-millis=9\n",
+            "memory-limit-exceeded=false\n",
+            "deadline-exceeded=false\n",
+            "assignment-verified=true\n",
+            "namespaces-verified=true\n",
+            "target-initial-credentials-verified=true\n",
+            "initial-provider-capabilities-absent=true\n",
+            "caller-envelope-digest={caller_envelope_digest}\n",
+            "caller-no-new-privs=false\n",
+            "target-no-new-privs-matched=true\n",
+            "caller-capability-bounding-set-digest={caller_capability_bounding_set_digest}\n",
+            "target-capability-bounding-set-matched=true\n",
+            "caller-mount-namespace-digest={caller_mount_namespace_digest}\n",
+            "target-mount-context-derived-from-caller=true\n",
+            "credential-transition-disposition=preserve-caller-envelope\n",
+            "boundary-independent-of-credentials=true\n",
+            "descriptors-verified=true\n",
+            "writable-ancestor-cgroup-denied=true\n",
+            "parent-namespace-handles-denied=true\n",
+            "recursive-provider-request-denied=true\n",
+            "guardian-ready-before-authorization=true\n",
+            "frontend-loss-authority-verified=true\n",
+            "cgroup-kill-invoked=true\n",
+            "cgroup-empty=true\n",
+            "init-reaped=true\n",
+            "guardian-reaped=true\n",
+            "boundary-retired=true\n",
+        ),
+        status = status,
+        exec_status = exec_status,
+        os_code = os_code,
+        caller_envelope_digest = CALLER_ENVELOPE_DIGEST,
+        caller_capability_bounding_set_digest = CALLER_CAPABILITY_BOUNDING_SET_DIGEST,
+        caller_mount_namespace_digest = CALLER_MOUNT_NAMESPACE_DIGEST,
     )
     .into_bytes()
 }
@@ -68,7 +115,121 @@ fn enoent_and_eacces_retain_typed_authenticated_spawn_provenance() {
 }
 
 #[test]
+fn request_validation_rejection_is_typed_and_unknown_phases_fail_closed() {
+    let payload = br#"{
+        "schema_version": 1,
+        "code": "MCSEALED-PACKAGE-LEASE",
+        "phase": "request-validation",
+        "detail": "stable package lease is unavailable",
+        "os_code": 30,
+        "target_created": false,
+        "target_released": false,
+        "cleanup": {
+            "attempted": false,
+            "direct_child_reaped": false,
+            "workload_empty": null,
+            "helpers_reaped": false,
+            "containment_removed": false,
+            "sealed_boundary_retired": false,
+            "errors": []
+        }
+    }"#;
+    let rejection = memcordon_platform::test_support::sealed_rejection_v1(payload)
+        .expect("request-validation must be part of the strict provider vocabulary");
+    assert_eq!(rejection.code, "MCSEALED-PACKAGE-LEASE");
+    assert_eq!(
+        rejection.phase,
+        memcordon_core::BoundarySetupPhase::RequestValidation
+    );
+    assert_eq!(rejection.detail, "stable package lease is unavailable");
+    assert_eq!(rejection.os_code, Some(30));
+    assert!(!rejection.target_created);
+    assert!(!rejection.target_released);
+    assert!(!rejection.cleanup_attempted);
+    assert_eq!(
+        rejection.restart_safety,
+        memcordon_core::RestartSafetyProof::default()
+    );
+
+    let unknown = String::from_utf8(payload.to_vec())
+        .unwrap()
+        .replace("request-validation", "future-request-validation");
+    assert!(
+        memcordon_platform::test_support::sealed_rejection_v1(unknown.as_bytes())
+            .unwrap_err()
+            .contains("unknown variant")
+    );
+}
+
+#[test]
 fn terminal_spawn_provenance_is_strict_and_fail_closed() {
+    let missing_schema = String::from_utf8(terminal(0, "success", "none"))
+        .unwrap()
+        .replace("schema-version=2\n", "");
+    assert!(
+        memcordon_platform::test_support::sealed_terminal_v2_is_valid(missing_schema.as_bytes())
+            .unwrap_err()
+            .contains("schema-version missing")
+    );
+
+    let wrong_schema = String::from_utf8(terminal(0, "success", "none"))
+        .unwrap()
+        .replace("schema-version=2", "schema-version=1");
+    assert!(
+        memcordon_platform::test_support::sealed_terminal_v2_is_valid(wrong_schema.as_bytes())
+            .unwrap_err()
+            .contains("incompatible")
+    );
+
+    let missing_mechanism = String::from_utf8(terminal(0, "success", "none"))
+        .unwrap()
+        .replace("mechanism=linux-pid-namespace-cgroup-v2\n", "");
+    assert!(
+        memcordon_platform::test_support::sealed_terminal_v2_is_valid(missing_mechanism.as_bytes())
+            .unwrap_err()
+            .contains("mechanism missing")
+    );
+
+    let wrong_mechanism = String::from_utf8(terminal(0, "success", "none"))
+        .unwrap()
+        .replace(
+            "mechanism=linux-pid-namespace-cgroup-v2",
+            "mechanism=legacy-credential-boundary",
+        );
+    assert!(
+        memcordon_platform::test_support::sealed_terminal_v2_is_valid(wrong_mechanism.as_bytes())
+            .unwrap_err()
+            .contains("incompatible")
+    );
+
+    let mut obsolete_v1_field = terminal(0, "success", "none");
+    obsolete_v1_field.extend_from_slice(b"credentials-verified=true\n");
+    assert!(
+        memcordon_platform::test_support::sealed_terminal_v2_is_valid(&obsolete_v1_field)
+            .unwrap_err()
+            .contains("unknown fields")
+    );
+
+    let mut unknown_field = terminal(0, "success", "none");
+    unknown_field.extend_from_slice(b"unexpected-proof=true\n");
+    assert!(
+        memcordon_platform::test_support::sealed_terminal_v2_is_valid(&unknown_field)
+            .unwrap_err()
+            .contains("unknown fields")
+    );
+
+    let invalid_digest = String::from_utf8(terminal(0, "success", "none"))
+        .unwrap()
+        .replace(
+            "caller-envelope-digest=0000000000000000000000000000000000000000000000000000000000000000",
+            "caller-envelope-digest=not-a-sha256-digest",
+        );
+    assert!(
+        memcordon_platform::test_support::sealed_terminal_v2_is_valid(invalid_digest.as_bytes())
+            .unwrap_err()
+            .contains("digest is invalid")
+    );
+
     let mismatch = terminal(126, "not-found", &libc::ENOENT.to_string());
     assert!(
         memcordon_platform::test_support::sealed_terminal_spawn_error(&mismatch)
@@ -89,6 +250,14 @@ fn terminal_spawn_provenance_is_strict_and_fail_closed() {
         memcordon_platform::test_support::sealed_terminal_spawn_error(&duplicate)
             .unwrap_err()
             .contains("duplicate")
+    );
+
+    let mut not_newline_terminated = terminal(0, "success", "none");
+    assert_eq!(not_newline_terminated.pop(), Some(b'\n'));
+    assert!(
+        memcordon_platform::test_support::sealed_terminal_v2_is_valid(&not_newline_terminated)
+            .unwrap_err()
+            .contains("not newline terminated")
     );
 
     let omitted_proof = String::from_utf8(terminal(0, "success", "none"))

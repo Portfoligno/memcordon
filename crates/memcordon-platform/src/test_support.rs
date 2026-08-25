@@ -74,6 +74,13 @@ pub fn sealed_qualification_v2_is_valid(payload: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn sealed_rejection_v1(
+    payload: &[u8],
+) -> Result<memcordon_core::ProviderRejectionEvidence, String> {
+    crate::sealed::client::parse_rejection(payload)
+}
+
+#[cfg(target_os = "linux")]
 pub fn linux_launcher_status_timeout() -> io::ErrorKind {
     crate::linux_cgroup::test_launcher_status_timeout()
 }

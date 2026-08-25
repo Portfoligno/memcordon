@@ -34,6 +34,8 @@ fn setpriv_transition_uses_numeric_ids_and_drops_supplementary_authority() {
             "--reuid=1001",
             "--regid=998",
             "--clear-groups",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
             "--no-new-privs",
             "--",
             program.to_str().unwrap(),
@@ -73,25 +75,54 @@ fn frontend_identity_requires_exact_nonroot_user_and_provider_group() {
 
 #[test]
 fn proc_status_readback_requires_all_ids_empty_groups_and_no_new_privs() {
-    let status = b"Name:\tcat\nUid:\t1001\t1001\t1001\t1001\nGid:\t998\t998\t998\t998\nGroups:\t\nNoNewPrivs:\t1\n";
-    let readback = parse_credential_readback(&identity(), status).unwrap();
+    const STATUS: &str = "Name:\tcat\nUid:\t1001\t1001\t1001\t1001\nGid:\t998\t998\t998\t998\nGroups:\t\nNoNewPrivs:\t1\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapAmb:\t0000000000000000\n";
+    let readback = parse_credential_readback(&identity(), STATUS.as_bytes()).unwrap();
+    assert_eq!(readback.schema_version, 2);
     assert_eq!(readback.uid, 1001);
     assert_eq!(readback.gid, 998);
     assert!(readback.supplementary_groups.is_empty());
     assert!(readback.no_new_privs);
+    assert_eq!(readback.capability_inheritable, 0);
+    assert_eq!(readback.capability_permitted, 0);
+    assert_eq!(readback.capability_effective, 0);
+    assert_eq!(readback.capability_ambient, 0);
 
-    let retained_group =
-        b"Uid:\t1001\t1001\t1001\t1001\nGid:\t998\t998\t998\t998\nGroups:\t27\nNoNewPrivs:\t1\n";
-    assert!(parse_credential_readback(&identity(), retained_group).is_err());
-    let privileges_allowed =
-        b"Uid:\t1001\t1001\t1001\t1001\nGid:\t998\t998\t998\t998\nGroups:\t\nNoNewPrivs:\t0\n";
-    assert!(parse_credential_readback(&identity(), privileges_allowed).is_err());
-    let wrong_uid =
-        b"Uid:\t1001\t1001\t0\t1001\nGid:\t998\t998\t998\t998\nGroups:\t\nNoNewPrivs:\t1\n";
-    assert!(parse_credential_readback(&identity(), wrong_uid).is_err());
-    let wrong_gid =
-        b"Uid:\t1001\t1001\t1001\t1001\nGid:\t998\t998\t998\t0\nGroups:\t\nNoNewPrivs:\t1\n";
-    assert!(parse_credential_readback(&identity(), wrong_gid).is_err());
-    let duplicate_uid = b"Uid:\t1001\t1001\t1001\t1001\nUid:\t1001\t1001\t1001\t1001\nGid:\t998\t998\t998\t998\nGroups:\t\nNoNewPrivs:\t1\n";
-    assert!(parse_credential_readback(&identity(), duplicate_uid).is_err());
+    for invalid in [
+        STATUS.replace("Groups:\t\n", "Groups:\t27\n"),
+        STATUS.replace("NoNewPrivs:\t1\n", "NoNewPrivs:\t0\n"),
+        STATUS.replace(
+            "Uid:\t1001\t1001\t1001\t1001\n",
+            "Uid:\t1001\t1001\t0\t1001\n",
+        ),
+        STATUS.replace("Gid:\t998\t998\t998\t998\n", "Gid:\t998\t998\t998\t0\n"),
+        STATUS.replace(
+            "Uid:\t1001\t1001\t1001\t1001\n",
+            "Uid:\t1001\t1001\t1001\t1001\nUid:\t1001\t1001\t1001\t1001\n",
+        ),
+    ] {
+        assert!(parse_credential_readback(&identity(), invalid.as_bytes()).is_err());
+    }
+
+    for field in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+        let zero = format!("{field}:\t0000000000000000\n");
+        let active = STATUS.replace(&zero, &format!("{field}:\t0000000000000001\n"));
+        assert!(
+            parse_credential_readback(&identity(), active.as_bytes()).is_err(),
+            "active {field} must be rejected"
+        );
+    }
+
+    let capability_line = "CapInh:\t0000000000000000\n";
+    for invalid in [
+        STATUS.replace(capability_line, ""),
+        STATUS.replace(
+            capability_line,
+            "CapInh:\t0000000000000000\nCapInh:\t0000000000000000\n",
+        ),
+        STATUS.replace(capability_line, "CapInh:\tnot-hex\n"),
+        STATUS.replace(capability_line, "CapInh:\t0 0\n"),
+        STATUS.replace(capability_line, "CapInh:\t10000000000000000\n"),
+    ] {
+        assert!(parse_credential_readback(&identity(), invalid.as_bytes()).is_err());
+    }
 }

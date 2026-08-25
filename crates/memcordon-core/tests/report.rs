@@ -1145,6 +1145,106 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
 }
 
 #[test]
+fn request_validation_provider_rejection_round_trips_in_schema_eight() {
+    let provider_rejection = memcordon_core::ProviderRejectionEvidence {
+        schema_version: 1,
+        code: "MCSEALED-PACKAGE-LEASE".to_owned(),
+        phase: memcordon_core::BoundarySetupPhase::RequestValidation,
+        detail: "stable package lease is unavailable".to_owned(),
+        os_code: Some(30),
+        target_created: false,
+        target_released: false,
+        cleanup_attempted: false,
+        restart_safety: RestartSafetyProof::default(),
+    };
+    let error = SupervisionErrorRecord {
+        category: "setup".to_owned(),
+        code: "MCSEALED-PROVIDER-REJECTION".to_owned(),
+        message: "provider rejected launch".to_owned(),
+        os_code: Some(30),
+        attempt_number: Some(1),
+        supervision_phase: SupervisionPhase::AttemptSetup,
+        launch_phase: Some("request-validation".to_owned()),
+        target_released: false,
+        workload_may_be_alive: false,
+        initial_spawn_failure: None,
+        provider_rejection: Some(provider_rejection),
+    };
+    let mut history = AttemptHistory::default();
+    let mut aggregates = SupervisionAggregates::default();
+    history
+        .append(
+            attempt_record(1, None, Some(error.clone())),
+            &mut aggregates,
+        )
+        .expect("append");
+    let execution = SupervisionExecution::new(
+        BackendCapabilityReport::default(),
+        SupervisionTerminal::Error {
+            attempt_number: Some(1),
+            error,
+        },
+        history,
+        aggregates,
+        RestartSummary::default(),
+        None,
+        4,
+        0,
+    )
+    .expect("pre-target provider rejection must remain reportable");
+    let value = serde_json::to_value(report_from_execution(execution)).expect("json");
+    assert_eq!(value["schema_version"], EXECUTION_REPORT_SCHEMA_VERSION);
+    assert_eq!(
+        value["attempts"][0]["error"]["provider_rejection"]["code"],
+        "MCSEALED-PACKAGE-LEASE"
+    );
+    assert_eq!(
+        value["attempts"][0]["error"]["provider_rejection"]["phase"],
+        "request-validation"
+    );
+    assert_eq!(
+        value["attempts"][0]["error"]["provider_rejection"]["detail"],
+        "stable package lease is unavailable"
+    );
+    assert_eq!(
+        value["attempts"][0]["error"]["launch_phase"],
+        "request-validation"
+    );
+    assert_eq!(
+        value["attempts"][0]["error"]["provider_rejection"]["target_created"],
+        false
+    );
+    assert_eq!(
+        value["attempts"][0]["error"]["provider_rejection"]["cleanup_attempted"],
+        false
+    );
+    assert_eq!(
+        value["attempts"][0]["error"]["provider_rejection"]["restart_safety"],
+        serde_json::json!({
+            "direct_child_reaped": false,
+            "workload_empty": null,
+            "helpers_reaped": false,
+            "containment_removed": false,
+            "containment_incapable_of_live_members": false,
+            "sealed_boundary_retired": false,
+            "errors": [],
+        })
+    );
+    assert_eq!(
+        value["attempts"][0]["error"]["workload_may_be_alive"],
+        false
+    );
+    let decoded: MemcordonReport =
+        serde_json::from_value(value.clone()).expect("request-validation round trip");
+    assert_eq!(serde_json::to_value(decoded).expect("json"), value);
+
+    let mut unknown = value;
+    unknown["attempts"][0]["error"]["provider_rejection"]["phase"] =
+        serde_json::json!("future-request-validation");
+    assert!(serde_json::from_value::<MemcordonReport>(unknown).is_err());
+}
+
+#[test]
 fn supervision_constructor_rejects_mismatched_or_misclassified_error_terminal() {
     let mut error = SupervisionErrorRecord {
         category: "spawn".to_owned(),

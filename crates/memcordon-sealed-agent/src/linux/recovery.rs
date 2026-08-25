@@ -57,7 +57,7 @@ fn recover_records(
         };
         let Some(identity) = name_text
             .strip_suffix(".new")
-            .filter(|name| valid_identity(name))
+            .filter(|name| super::cgroup::valid_attempt_identity(name))
         else {
             continue;
         };
@@ -76,13 +76,16 @@ fn recover_records(
 
     for entry in entries {
         let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| name.strip_suffix(".new").is_some_and(valid_identity))
-        {
+        if name.to_str().is_some_and(|name| {
+            name.strip_suffix(".new")
+                .is_some_and(super::cgroup::valid_attempt_identity)
+        }) {
             continue;
         }
-        let Some(identity) = name.to_str().filter(|name| valid_identity(name)) else {
+        let Some(identity) = name
+            .to_str()
+            .filter(|name| super::cgroup::valid_attempt_identity(name))
+        else {
             ambiguous.push(name.to_string_lossy().into_owned());
             continue;
         };
@@ -227,27 +230,28 @@ fn inspect_cgroup_root(
     }
     for entry in fs::read_dir(cgroup_root).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
-        let file_type = entry.file_type().map_err(|error| error.to_string())?;
-        if file_type.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        if file_type.is_dir() {
-            if name.to_str().is_none_or(|name| !valid_identity(name)) {
+        match super::cgroup::classify_attempt_root_entry(&entry)
+            .map_err(|error| format!("MCSEALED-RECOVERY: {error}"))?
+        {
+            super::cgroup::AttemptRootEntry::KernelControl => continue,
+            super::cgroup::AttemptRootEntry::Attempt { name, .. } => {
+                if !authenticated.contains(&name) {
+                    ambiguous.push(name.to_string_lossy().into_owned());
+                }
+            }
+            super::cgroup::AttemptRootEntry::InvalidDirectory(name) => {
                 return Err(format!(
                     "MCSEALED-RECOVERY: invalid attempt directory {}",
                     name.to_string_lossy()
                 ));
             }
-            if !authenticated.contains(&name) {
-                ambiguous.push(name.to_string_lossy().into_owned());
+            super::cgroup::AttemptRootEntry::Unsafe(name) => {
+                return Err(format!(
+                    "MCSEALED-RECOVERY: unsafe cgroup entry {}",
+                    name.to_string_lossy()
+                ));
             }
-            continue;
         }
-        return Err(format!(
-            "MCSEALED-RECOVERY: unsafe cgroup entry {}",
-            name.to_string_lossy()
-        ));
     }
     Ok(())
 }
@@ -274,13 +278,6 @@ fn read_record_no_follow(path: &Path) -> Result<String, String> {
         return Err("MCSEALED-RECOVERY: attempt record exceeds size limit".to_owned());
     }
     Ok(record)
-}
-
-fn valid_identity(identity: &str) -> bool {
-    identity.len() == 32
-        && identity
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn integrity_valid(record: &str) -> bool {

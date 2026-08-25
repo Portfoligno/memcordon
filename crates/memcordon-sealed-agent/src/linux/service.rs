@@ -182,7 +182,7 @@ fn launch_response(
     credentials: PeerCredentials,
     groups: Vec<libc::gid_t>,
 ) -> Result<Frame, RejectionV1> {
-    let _launch_lease = acquire_lease(libc::LOCK_SH | libc::LOCK_NB)
+    let _launch_lease = acquire_shared_package_lease()
         .map_err(|error| RejectionV1::request_error("MCSEALED-PACKAGE-LEASE", &error))?;
     let launch = crate::request::decode_launch_request(&request.payload).map_err(|error| {
         RejectionV1::request_error(
@@ -341,26 +341,54 @@ fn journal_rejection(attempt_id: [u8; 16], rejection: &RejectionV1) {
     eprintln!("sealed provider launch rejection: {diagnostic}");
 }
 
+pub(crate) const PACKAGE_LEASE: &str = "/run/memcordon-sealed-package.lock";
+const LEGACY_PACKAGE_LEASE: &str = "/run/memcordon/sealed-package.lock";
+
+#[derive(Clone, Copy)]
+enum LeaseAccess {
+    SharedExisting,
+    ExclusiveCreate,
+}
+
+pub fn acquire_shared_package_lease() -> Result<std::fs::File, String> {
+    acquire_lease(PACKAGE_LEASE, LeaseAccess::SharedExisting)
+}
+
 pub fn acquire_package_lease() -> Result<std::fs::File, String> {
-    acquire_lease(libc::LOCK_EX | libc::LOCK_NB)
+    acquire_lease(PACKAGE_LEASE, LeaseAccess::ExclusiveCreate)
+}
+
+pub fn acquire_legacy_package_lease() -> Result<std::fs::File, String> {
+    acquire_lease(LEGACY_PACKAGE_LEASE, LeaseAccess::ExclusiveCreate)
 }
 
 pub fn acquire_qualification_lease() -> Result<std::fs::File, String> {
-    acquire_lease(libc::LOCK_EX | libc::LOCK_NB).map_err(|error| {
+    acquire_lease(PACKAGE_LEASE, LeaseAccess::ExclusiveCreate).map_err(|error| {
         format!("MCSEALED-QUALIFICATION-LEASE: provider attempt is active: {error}")
     })
 }
 
-fn acquire_lease(operation: libc::c_int) -> Result<std::fs::File, String> {
-    let file = std::fs::OpenOptions::new()
+fn acquire_lease(path: &str, access: LeaseAccess) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options
         .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open("/run/memcordon/sealed-package.lock")
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let operation = match access {
+        LeaseAccess::SharedExisting => libc::LOCK_SH | libc::LOCK_NB,
+        LeaseAccess::ExclusiveCreate => {
+            options.write(true).create(true).truncate(false).mode(0o600);
+            libc::LOCK_EX | libc::LOCK_NB
+        }
+    };
+    let file = options
+        .open(path)
         .map_err(|error| format!("MCSEALED-PACKAGE-LEASE: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("MCSEALED-PACKAGE-LEASE: {error}"))?;
+    if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o7777 != 0o600 {
+        return Err("MCSEALED-PACKAGE-LEASE: unsafe lock-file identity or mode".to_owned());
+    }
     // SAFETY: `file` owns a live descriptor for the duration of the advisory lock; flock has no
     // pointer arguments and reports contention/error without changing Rust ownership.
     if unsafe { libc::flock(file.as_raw_fd(), operation) } == -1 {
@@ -469,7 +497,28 @@ fn namespace_identity(metadata: &std::fs::Metadata) -> crate::request::Namespace
 }
 
 fn peer_inside_active_attempt(pid: libc::pid_t) -> Result<bool, String> {
-    let process = std::path::Path::new("/proc").join(pid.to_string());
+    peer_inside_active_attempt_at(
+        pid,
+        std::path::Path::new("/proc"),
+        std::path::Path::new(super::CGROUP_ROOT),
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub fn peer_inside_active_attempt_for_test(
+    pid: libc::pid_t,
+    proc_root: &std::path::Path,
+    cgroup_root: &std::path::Path,
+) -> Result<bool, String> {
+    peer_inside_active_attempt_at(pid, proc_root, cgroup_root)
+}
+
+fn peer_inside_active_attempt_at(
+    pid: libc::pid_t,
+    proc_root: &std::path::Path,
+    cgroup_root: &std::path::Path,
+) -> Result<bool, String> {
+    let process = proc_root.join(pid.to_string());
     let cgroup = std::fs::read_to_string(process.join("cgroup"))
         .map_err(|error| format!("recursive provider cgroup readback failed: {error}"))?;
     if cgroup_membership_is_sealed(&cgroup)? {
@@ -487,24 +536,63 @@ fn peer_inside_active_attempt(pid: libc::pid_t) -> Result<bool, String> {
                 .expect("three peer namespaces were captured"),
         )
     });
-    let root = std::path::Path::new(super::CGROUP_ROOT);
-    let attempts = match std::fs::read_dir(root) {
-        Ok(attempts) => attempts,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(format!("recursive provider inventory failed: {error}")),
-    };
+    match std::fs::symlink_metadata(cgroup_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(
+                "recursive provider inventory root is not a no-follow directory".to_owned(),
+            );
+        }
+        Err(error) => return Err(format!("recursive provider inventory root failed: {error}")),
+    }
+    let attempts = std::fs::read_dir(cgroup_root)
+        .map_err(|error| format!("recursive provider inventory failed: {error}"))?;
     for attempt in attempts {
-        let attempt = attempt.map_err(|error| error.to_string())?;
-        let members = match std::fs::read_to_string(attempt.path().join("cgroup.procs")) {
+        let attempt = match attempt {
+            Ok(attempt) => attempt,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "recursive provider inventory entry failed: {error}"
+                ));
+            }
+        };
+        let attempt = match super::cgroup::classify_attempt_root_entry(&attempt) {
+            Ok(super::cgroup::AttemptRootEntry::KernelControl) => continue,
+            Ok(super::cgroup::AttemptRootEntry::Attempt { path, .. }) => path,
+            Ok(super::cgroup::AttemptRootEntry::InvalidDirectory(name)) => {
+                return Err(format!(
+                    "recursive provider inventory contained invalid attempt directory {}",
+                    name.to_string_lossy()
+                ));
+            }
+            Ok(super::cgroup::AttemptRootEntry::Unsafe(name)) => {
+                return Err(format!(
+                    "recursive provider inventory contained unsafe entry {}",
+                    name.to_string_lossy()
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "recursive provider inventory entry classification failed: {error}"
+                ));
+            }
+        };
+        let members = match std::fs::read_to_string(attempt.join("cgroup.procs")) {
             Ok(members) => members,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("recursive provider inventory failed: {error}")),
+            Err(error) => {
+                return Err(format!(
+                    "recursive provider attempt membership readback failed: {error}"
+                ));
+            }
         };
         for member in members.lines() {
             let member = member
                 .parse::<libc::pid_t>()
                 .map_err(|_| "recursive provider inventory contained an invalid pid".to_owned())?;
-            let member = std::path::Path::new("/proc").join(member.to_string());
+            let member = proc_root.join(member.to_string());
             let mut metadata = Vec::with_capacity(3);
             for kind in ["pid", "mnt", "cgroup"] {
                 match std::fs::metadata(member.join("ns").join(kind)) {
@@ -513,7 +601,11 @@ fn peer_inside_active_attempt(pid: libc::pid_t) -> Result<bool, String> {
                         metadata.clear();
                         break;
                     }
-                    Err(error) => return Err(error.to_string()),
+                    Err(error) => {
+                        return Err(format!(
+                            "recursive provider member namespace readback failed: {error}"
+                        ));
+                    }
                 }
             }
             if metadata.len() == 3 {

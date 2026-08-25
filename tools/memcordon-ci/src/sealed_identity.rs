@@ -23,6 +23,10 @@ pub struct FrontendCredentialReadback {
     pub gid: u32,
     pub supplementary_groups: Vec<u32>,
     pub no_new_privs: bool,
+    pub capability_inheritable: u64,
+    pub capability_permitted: u64,
+    pub capability_effective: u64,
+    pub capability_ambient: u64,
 }
 
 pub fn parse_frontend_identity(
@@ -90,6 +94,8 @@ pub fn setpriv_sudo_arguments(
         OsString::from(format!("--reuid={}", identity.uid)),
         OsString::from(format!("--regid={}", identity.provider_gid)),
         OsString::from("--clear-groups"),
+        OsString::from("--inh-caps=-all"),
+        OsString::from("--ambient-caps=-all"),
         OsString::from("--no-new-privs"),
         OsString::from("--"),
         program.as_os_str().to_os_string(),
@@ -121,13 +127,21 @@ pub fn parse_credential_readback(
             "setpriv did not enable no_new_privs".to_owned(),
         ));
     }
+    let capability_inheritable = parse_inactive_capability_mask(status, "CapInh")?;
+    let capability_permitted = parse_inactive_capability_mask(status, "CapPrm")?;
+    let capability_effective = parse_inactive_capability_mask(status, "CapEff")?;
+    let capability_ambient = parse_inactive_capability_mask(status, "CapAmb")?;
     Ok(FrontendCredentialReadback {
-        schema_version: 1,
+        schema_version: 2,
         username: identity.username.clone(),
         uid,
         gid,
         supplementary_groups,
         no_new_privs: true,
+        capability_inheritable,
+        capability_permitted,
+        capability_effective,
+        capability_ambient,
     })
 }
 
@@ -169,6 +183,27 @@ fn parse_status_ids(status: &str, field: &str, expected: u32) -> Result<u32> {
         )));
     }
     Ok(expected)
+}
+
+fn parse_inactive_capability_mask(status: &str, field: &str) -> Result<u64> {
+    let values = parse_status_values(status, field)?;
+    if values.len() != 1
+        || values[0].is_empty()
+        || !values[0].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(CiError::Message(format!(
+            "frontend {field} readback is not one hexadecimal mask"
+        )));
+    }
+    let value = u64::from_str_radix(values[0], 16).map_err(|error| {
+        CiError::Message(format!("frontend {field} readback is invalid: {error}"))
+    })?;
+    if value != 0 {
+        return Err(CiError::Message(format!(
+            "setpriv retained active {field} capability mask {value:#x}"
+        )));
+    }
+    Ok(value)
 }
 
 fn parse_status_values<'a>(status: &'a str, field: &str) -> Result<Vec<&'a str>> {

@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::process::Command;
 
 const AGENT: &str = "/usr/libexec/memcordon-sealed-agent";
@@ -44,33 +44,150 @@ impl Drop for AttemptRecordCleanup {
     }
 }
 
-fn assert_successful_public_execution(execution: &memcordon_core::SupervisionExecution) {
-    let terminal = serde_json::to_string(execution.terminal())
-        .expect("typed supervision terminal must be serializable");
-    let typed_failure = match execution.terminal() {
+fn load_legacy_runtime_directory_units() {
+    for path in [
+        "/usr/lib/systemd/system/memcordon-sealed-agent.service",
+        "/usr/lib/systemd/system/memcordon-sealed-launcher.service",
+    ] {
+        let current = std::fs::read_to_string(path).unwrap();
+        assert!(!current.contains("RuntimeDirectory="));
+        let legacy = current.replacen(
+            "KillMode=process\n",
+            "KillMode=process\nRuntimeDirectory=memcordon\nRuntimeDirectoryMode=0750\n",
+            1,
+        );
+        assert_ne!(legacy, current);
+        std::fs::write(path, legacy).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let reload = Command::new("/usr/bin/systemctl")
+        .arg("daemon-reload")
+        .status()
+        .unwrap();
+    assert!(reload.success());
+    for service in [
+        "memcordon-sealed-launcher.service",
+        "memcordon-sealed-agent.service",
+    ] {
+        let restart = Command::new("/usr/bin/systemctl")
+            .args(["restart", service])
+            .status()
+            .unwrap();
+        assert!(restart.success());
+    }
+}
+
+fn assert_runtime_directory_contract() {
+    let directory = std::fs::symlink_metadata("/run/memcordon").unwrap();
+    assert!(directory.file_type().is_dir());
+    assert_eq!(directory.uid(), 0);
+    assert_eq!(directory.mode() & 0o7777, 0o750);
+
+    let public_socket = std::fs::symlink_metadata("/run/memcordon/sealed-agent.sock").unwrap();
+    assert!(public_socket.file_type().is_socket());
+    assert_eq!(public_socket.uid(), 0);
+    assert_eq!(public_socket.gid(), directory.gid());
+    assert_eq!(public_socket.mode() & 0o7777, 0o660);
+
+    let launcher_socket = std::fs::symlink_metadata("/run/memcordon/sealed-launcher.sock").unwrap();
+    assert!(launcher_socket.file_type().is_socket());
+    assert_eq!(launcher_socket.uid(), 0);
+    assert_eq!(launcher_socket.gid(), 0);
+    assert_eq!(launcher_socket.mode() & 0o7777, 0o600);
+
+    let stable_lease = std::fs::symlink_metadata("/run/memcordon-sealed-package.lock").unwrap();
+    assert!(stable_lease.file_type().is_file());
+    assert_eq!(stable_lease.uid(), 0);
+    assert_eq!(stable_lease.gid(), 0);
+    assert_eq!(stable_lease.mode() & 0o7777, 0o600);
+}
+
+fn assert_active_capability_caller_rejected(execution: &memcordon_core::SupervisionExecution) {
+    assert_eq!(execution.wrapper_exit_code(), 125);
+    assert_eq!(execution.targets_authorized(), 0);
+    assert_eq!(execution.attempts().total, 1);
+    match execution.terminal() {
         memcordon_core::SupervisionTerminal::Error {
             attempt_number,
             error,
-        } => format!(
-            "attempt={attempt_number:?}; category={}; code={}; spawn-class={:?}; os-code={:?}; supervision-phase={:?}; launch-phase={:?}; target-released={}; workload-may-be-alive={}; provider-rejection={:?}",
-            error.category,
-            error.code,
-            error.initial_spawn_failure,
-            error.os_code,
-            error.supervision_phase,
-            error.launch_phase,
-            error.target_released,
-            error.workload_may_be_alive,
-            error.provider_rejection
-        ),
-        _ => "no typed spawn failure".to_owned(),
-    };
-    assert_eq!(
-        execution.wrapper_exit_code(),
-        0,
-        "post-upgrade public launch failed: wrapper-status={}; typed-failure={typed_failure}; typed-terminal={terminal}",
-        execution.wrapper_exit_code()
-    );
+        } => {
+            assert_eq!(*attempt_number, Some(1));
+            assert_eq!(error.attempt_number, Some(1));
+            assert_eq!(error.category, "setup");
+            assert_eq!(error.code, "MCSEALED-PROVIDER-REJECTION");
+            assert_eq!(
+                error.supervision_phase,
+                memcordon_core::SupervisionPhase::AttemptSetup
+            );
+            assert_eq!(error.launch_phase.as_deref(), Some("request-validation"));
+            assert!(!error.target_released);
+            assert!(!error.workload_may_be_alive);
+            assert!(error.initial_spawn_failure.is_none());
+            let rejection = error
+                .provider_rejection
+                .as_ref()
+                .expect("active-capability rejection must retain typed provider evidence");
+            assert_eq!(rejection.schema_version, 1);
+            assert_eq!(rejection.code, "MCSEALED-CALLER-ENVELOPE-CAPTURE");
+            assert_eq!(
+                rejection.phase,
+                memcordon_core::BoundarySetupPhase::RequestValidation
+            );
+            assert_eq!(
+                rejection.detail,
+                "MCSEALED-CREDENTIAL-TRANSITION-POLICY: callers with active capability sets are unsupported"
+            );
+            assert!(!rejection.target_created);
+            assert!(!rejection.target_released);
+            assert!(!rejection.cleanup_attempted);
+            assert_eq!(
+                rejection.restart_safety,
+                memcordon_core::RestartSafetyProof::default()
+            );
+        }
+        terminal => panic!("active-capability caller produced unexpected terminal: {terminal:?}"),
+    }
+}
+
+fn active_provider_unit_states() -> Vec<(&'static str, Vec<u8>)> {
+    [
+        "memcordon-sealed-agent.service",
+        "memcordon-sealed-launcher.service",
+        "memcordon-sealed-agent.socket",
+        "memcordon-sealed-launcher.socket",
+    ]
+    .into_iter()
+    .map(|unit| {
+        let output = Command::new("/usr/bin/systemctl")
+            .args(["is-active", unit])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "provider unit is not active: unit={unit}; status={}; stdout={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"active\n");
+        assert!(output.stderr.is_empty());
+        (unit, output.stdout)
+    })
+    .collect()
+}
+
+fn installed_package_bytes() -> Vec<(&'static str, Vec<u8>)> {
+    [
+        AGENT,
+        "/usr/lib/systemd/system/memcordon-sealed-agent.service",
+        "/usr/lib/systemd/system/memcordon-sealed-agent.socket",
+        "/usr/lib/systemd/system/memcordon-sealed-launcher.service",
+        "/usr/lib/systemd/system/memcordon-sealed-launcher.socket",
+        "/usr/lib/tmpfiles.d/memcordon.conf",
+    ]
+    .into_iter()
+    .map(|path| (path, std::fs::read(path).unwrap()))
+    .collect()
 }
 
 #[test]
@@ -107,7 +224,31 @@ fn sealed_package_identity_rejects_tampered_provider() {
 
 #[test]
 #[ignore = "requires privileged Linux sealed certification"]
+fn sealed_package_stable_lease_survives_legacy_inode_replacement() {
+    let stable = memcordon_sealed_agent::linux::service::acquire_package_lease().unwrap();
+    let legacy = memcordon_sealed_agent::linux::service::acquire_legacy_package_lease().unwrap();
+    std::fs::remove_file("/run/memcordon/sealed-package.lock").unwrap();
+    let replacement =
+        memcordon_sealed_agent::linux::service::acquire_legacy_package_lease().unwrap();
+
+    assert!(memcordon_sealed_agent::linux::service::acquire_package_lease().is_err());
+    assert!(memcordon_sealed_agent::linux::service::acquire_qualification_lease().is_err());
+    assert!(memcordon_sealed_agent::linux::service::acquire_shared_package_lease().is_err());
+
+    drop(replacement);
+    drop(legacy);
+    drop(stable);
+    let shared = memcordon_sealed_agent::linux::service::acquire_shared_package_lease().unwrap();
+    assert!(memcordon_sealed_agent::linux::service::acquire_package_lease().is_err());
+    assert!(memcordon_sealed_agent::linux::service::acquire_qualification_lease().is_err());
+    drop(shared);
+    assert!(memcordon_sealed_agent::linux::service::acquire_package_lease().is_ok());
+}
+
+#[test]
+#[ignore = "requires privileged Linux sealed certification"]
 fn sealed_package_upgrade_recovers_before_advertising() {
+    load_legacy_runtime_directory_units();
     let identity = "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2".to_owned();
     let record_path =
         std::path::Path::new(memcordon_sealed_agent::linux::STATE_ROOT).join(&identity);
@@ -136,6 +277,12 @@ fn sealed_package_upgrade_recovers_before_advertising() {
         .status()
         .unwrap();
     assert!(status.success());
+    assert_runtime_directory_contract();
+    let verification = Command::new(AGENT)
+        .args(["package", "verify"])
+        .status()
+        .unwrap();
+    assert!(verification.success());
     assert!(
         !record_path.exists(),
         "upgrade advertised before retiring the authenticated stale record"
@@ -204,31 +351,11 @@ fn sealed_package_upgrade_recovers_before_advertising() {
         memcordon_executable: None,
         resolved_backend: Some(backend_capabilities),
     })
-    .expect("installed socket-activated provider must supervise end to end");
-    assert_successful_public_execution(&execution);
-    assert_eq!(execution.targets_authorized(), 1);
-    assert_eq!(execution.attempts().total, 1);
-    let attempt = execution.attempts().records().next().unwrap();
-    assert!(attempt.launch.target_released);
-    assert!(attempt.launch.boundary_assignment_verified);
-    assert!(attempt.launch.inherited_resources_restricted);
-    assert!(attempt.restart_safety.sealed_boundary_retired);
-    assert!(matches!(
-        &attempt.boundary_detail,
-        memcordon_core::BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2(evidence)
-            if evidence.schema_version == 2
-                && receipt["provider_identity"].as_str()
-                    == Some(evidence.provider_identity.as_str())
-                && receipt["receipt_digest"].as_str()
-                    == Some(evidence.cgroup_identity_digest.as_str())
-                && evidence.cgroup_empty_verified
-                && evidence.namespace_init_reaped
-                && evidence.guardian_reaped
-                && evidence.cgroup_removed
-    ));
+    .expect("typed provider rejection must remain a supervision result");
+    assert_active_capability_caller_rejected(&execution);
     let wire = serde_json::to_value(&execution).unwrap();
-    assert_eq!(wire["wrapper_exit_code"], 0);
-    assert_eq!(wire["targets_authorized"], 1);
+    assert_eq!(wire["wrapper_exit_code"], 125);
+    assert_eq!(wire["targets_authorized"], 0);
     assert_eq!(wire["attempts"]["total"], 1);
 
     let service = Command::new("/usr/bin/systemctl")
@@ -246,6 +373,8 @@ fn sealed_package_upgrade_recovers_before_advertising() {
 #[test]
 #[ignore = "requires privileged Linux sealed certification"]
 fn sealed_package_uninstall_refuses_live_authenticated_attempt() {
+    let unit_states_before = active_provider_unit_states();
+    let package_before = installed_package_bytes();
     let identity = "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1".to_owned();
     let record_path =
         std::path::Path::new(memcordon_sealed_agent::linux::STATE_ROOT).join(&identity);
@@ -290,6 +419,8 @@ fn sealed_package_uninstall_refuses_live_authenticated_attempt() {
     // SAFETY: signal zero confirms the refused mutation did not terminate the live frontend.
     assert_eq!(unsafe { libc::kill(frontend_pid, 0) }, 0);
     assert_eq!(std::fs::read(&record_path).unwrap(), authenticated_before);
+    assert_eq!(active_provider_unit_states(), unit_states_before);
+    assert_eq!(installed_package_bytes(), package_before);
     assert!(
         !cgroup_path.exists(),
         "record-only live-attempt fixture must not fabricate a cgroup"
@@ -310,4 +441,14 @@ fn sealed_package_uninstall_refuses_live_authenticated_attempt() {
     assert!(retained.stderr.is_empty());
     live_record.record.take().unwrap().retire().unwrap();
     assert!(!record_path.exists());
+    let probe = Command::new(AGENT).arg("probe").output().unwrap();
+    assert!(
+        probe.status.success(),
+        "refused uninstall left the provider unusable: status={}; stdout={}; stderr={}",
+        probe.status,
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    assert!(!probe.stdout.is_empty());
+    assert!(probe.stderr.is_empty());
 }

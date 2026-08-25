@@ -16,5 +16,19 @@ fn installed_provider_package_selectors_use_provider_visible_targets() {
             "installed-provider package selectors must not use workspace target {forbidden}"
         );
     }
-    assert!(PACKAGE_SELECTORS.contains("memcordon_core::CommandSpec::new(\"/usr/bin/true\")"));
+    for required in [
+        "assert_active_capability_caller_rejected(&execution)",
+        "MCSEALED-PROVIDER-REJECTION",
+        "MCSEALED-CALLER-ENVELOPE-CAPTURE",
+        "MCSEALED-CREDENTIAL-TRANSITION-POLICY: callers with active capability sets are unsupported",
+        "BoundarySetupPhase::RequestValidation",
+        "assert!(!rejection.target_created)",
+        "assert!(!rejection.target_released)",
+        "assert!(!rejection.cleanup_attempted)",
+    ] {
+        assert!(
+            PACKAGE_SELECTORS.contains(required),
+            "privileged package selector omitted active-capability rejection proof {required}"
+        );
+    }
 }

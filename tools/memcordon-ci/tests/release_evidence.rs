@@ -587,16 +587,18 @@ fn fixture() -> (TempDir, Value, Value, Value) {
     write_report(
         &input.join("release-certification-linux/provider-package-verification.json"),
         &json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "mechanism": "linux-pid-namespace-cgroup-v2",
             "result": "passed",
             "package_verified": true,
             "artifacts": [
-                "memcordon-sealed-agent.service",
-                "memcordon-sealed-agent.socket",
-                "memcordon-sealed-launcher.service",
-                "memcordon-sealed-launcher.socket",
-                "memcordon.conf"
+                "/usr/libexec/memcordon-sealed-agent",
+                "/usr/lib/systemd/system/memcordon-sealed-agent.service",
+                "/usr/lib/systemd/system/memcordon-sealed-agent.socket",
+                "/usr/lib/systemd/system/memcordon-sealed-launcher.service",
+                "/usr/lib/systemd/system/memcordon-sealed-launcher.socket",
+                "/usr/lib/tmpfiles.d/memcordon.conf",
+                "/run/memcordon-sealed-package.lock"
             ],
             "control": {
                 "User": "root",
@@ -877,6 +879,32 @@ fn linux_fault_evidence_mutations_fail_closed() {
 #[test]
 fn promoted_linux_evidence_mutations_fail_closed() {
     let cases: &[(&str, &str, ReportMutation)] = &[
+        (
+            "package-schema",
+            "provider-package-verification.json",
+            |report| report["schema_version"] = json!(2),
+        ),
+        (
+            "package-binary-inventory",
+            "provider-package-verification.json",
+            |report| {
+                report["artifacts"].as_array_mut().unwrap().remove(0);
+            },
+        ),
+        (
+            "package-lease-inventory",
+            "provider-package-verification.json",
+            |report| {
+                report["artifacts"].as_array_mut().unwrap().pop();
+            },
+        ),
+        (
+            "package-lease-identity",
+            "provider-package-verification.json",
+            |report| {
+                report["artifacts"][6] = json!("/run/memcordon-sealed-package.lock.backup");
+            },
+        ),
         (
             "privilege-user",
             "provider-package-verification.json",
@@ -1239,10 +1267,11 @@ fn promoted_linux_inventory_is_exact_and_failure_inventory_is_not_releasable() {
         "provider-qualification-v2.json",
         ".platform-environment.json",
         ".sealed-concurrency-report.json",
+        ".sealed-post-scenario-public-launch.json",
     ];
     assert_eq!(
         late_package_failure_inventory.len(),
-        8,
+        9,
         "late package failure diagnostics must not resemble the success inventory"
     );
     for name in late_package_failure_inventory {
@@ -1252,7 +1281,7 @@ fn promoted_linux_inventory_is_exact_and_failure_inventory_is_not_releasable() {
         fs::read_dir(&linux)
             .expect("late failed Linux inventory should be readable")
             .count(),
-        8,
+        9,
     );
     assert!(
         collect_certification(

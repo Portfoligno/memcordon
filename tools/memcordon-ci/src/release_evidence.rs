@@ -75,6 +75,7 @@ pub const LINUX_SEALED_TESTS: &[&str] = &[
     "sealed_namespace_init_reap_delay_blocks_result",
     "sealed_guardian_reap_failure_blocks_result",
     "sealed_package_identity_rejects_tampered_provider",
+    "sealed_package_stable_lease_survives_legacy_inode_replacement",
     "sealed_package_upgrade_recovers_before_advertising",
     "sealed_package_uninstall_refuses_live_authenticated_attempt",
 ];
@@ -865,13 +866,15 @@ fn validate_linux_provider_package(report: &LinuxProviderPackageVerification) ->
     let control_capabilities = control_tokens.iter().cloned().collect::<BTreeSet<_>>();
     let launcher_capabilities = launcher_tokens.iter().cloned().collect::<BTreeSet<_>>();
     let expected_artifacts = [
-        "memcordon-sealed-agent.service",
-        "memcordon-sealed-agent.socket",
-        "memcordon-sealed-launcher.service",
-        "memcordon-sealed-launcher.socket",
-        "memcordon.conf",
+        "/usr/libexec/memcordon-sealed-agent",
+        "/usr/lib/systemd/system/memcordon-sealed-agent.service",
+        "/usr/lib/systemd/system/memcordon-sealed-agent.socket",
+        "/usr/lib/systemd/system/memcordon-sealed-launcher.service",
+        "/usr/lib/systemd/system/memcordon-sealed-launcher.socket",
+        "/usr/lib/tmpfiles.d/memcordon.conf",
+        "/run/memcordon-sealed-package.lock",
     ];
-    report.schema_version == 2
+    report.schema_version == 3
         && report.mechanism == "linux-pid-namespace-cgroup-v2"
         && report.result == "passed"
         && report.package_verified

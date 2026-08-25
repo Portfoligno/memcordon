@@ -430,6 +430,7 @@ impl SupervisionErrorRecord {
 
 const fn boundary_setup_phase_name(value: crate::BoundarySetupPhase) -> &'static str {
     match value {
+        crate::BoundarySetupPhase::RequestValidation => "request-validation",
         crate::BoundarySetupPhase::ProviderConnection => "provider-connection",
         crate::BoundarySetupPhase::ProviderIdentity => "provider-identity",
         crate::BoundarySetupPhase::CallerEnvelopeCapture => "caller-envelope-capture",

@@ -64,13 +64,13 @@ pub fn serve() -> Result<(), String> {
 }
 
 pub fn probe() -> Result<super::qualification::QualificationReceipt, String> {
-    let mut stream = connect_authenticated()?;
     let request = Frame {
         kind: MessageKind::BrokerProbe,
         nonce: nonce()?,
         attempt_id: [0; 16],
         payload: Vec::new(),
     };
+    let mut stream = connect_authenticated(request.nonce, request.attempt_id)?;
     write_frame(&mut stream, &request).map_err(|error| error.to_string())?;
     let response = read_frame(&mut stream).map_err(|error| error.to_string())?;
     if response.kind != MessageKind::ProbeReceipt
@@ -98,7 +98,7 @@ pub fn launch(
             "MCSEALED-LAUNCHER-DESCRIPTOR-SET: exact descriptor inventory required".to_owned(),
         );
     }
-    let mut stream = connect_authenticated()?;
+    let mut stream = connect_authenticated(request.nonce, request.attempt_id)?;
     let broker_frame = Frame {
         kind: MessageKind::BrokerLaunch,
         nonce: request.nonce,
@@ -124,22 +124,59 @@ fn handle(
     qualification: &super::qualification::QualificationReceipt,
 ) -> Result<(), String> {
     let peer = authenticate_peer(stream, CONTROL_UNIT)?;
+    // The listener belongs to systemd, so the client authenticates this accepted-stream worker
+    // from kernel-supplied message credentials before it sends the broker request.
+    let (authentication, authentication_descriptors) = super::transport::receive(stream)?;
+    if authentication.kind != MessageKind::BrokerAuthenticate
+        || !authentication.payload.is_empty()
+        || !authentication_descriptors.is_empty()
+    {
+        let response = rejected(
+            &authentication,
+            &RejectionV1::request_error(
+                "MCSEALED-LAUNCHER-SERVICE-AUTHENTICATION",
+                "launcher authentication request is invalid",
+            ),
+        )?;
+        return write_authentication_response(stream, &response);
+    }
+    let authenticated = Frame {
+        kind: MessageKind::BrokerAuthenticated,
+        nonce: authentication.nonce,
+        attempt_id: authentication.attempt_id,
+        payload: Vec::new(),
+    };
+    write_authentication_response(stream, &authenticated)?;
     let (request, descriptors) = super::transport::receive(stream)?;
-    let response = match request.kind {
-        MessageKind::BrokerProbe if descriptors.is_empty() && request.payload.is_empty() => Frame {
-            kind: MessageKind::ProbeReceipt,
-            nonce: request.nonce,
-            attempt_id: request.attempt_id,
-            payload: qualification.render().into_bytes(),
-        },
-        MessageKind::BrokerLaunch => launch_response(&request, descriptors, peer)?,
-        _ => rejected(
+    let response = if request.nonce != authentication.nonce
+        || request.attempt_id != authentication.attempt_id
+    {
+        rejected(
             &request,
             &RejectionV1::request_error(
-                "MCSEALED-LAUNCHER-AUTHORIZATION",
-                "private launcher accepts only bounded broker protocol v2 requests",
+                "MCSEALED-LAUNCHER-REQUEST-BINDING",
+                "broker request does not match authenticated launcher exchange",
             ),
-        )?,
+        )?
+    } else {
+        match request.kind {
+            MessageKind::BrokerProbe if descriptors.is_empty() && request.payload.is_empty() => {
+                Frame {
+                    kind: MessageKind::ProbeReceipt,
+                    nonce: request.nonce,
+                    attempt_id: request.attempt_id,
+                    payload: qualification.render().into_bytes(),
+                }
+            }
+            MessageKind::BrokerLaunch => launch_response(&request, descriptors, peer)?,
+            _ => rejected(
+                &request,
+                &RejectionV1::request_error(
+                    "MCSEALED-LAUNCHER-AUTHORIZATION",
+                    "private launcher accepts only bounded broker protocol v2 requests",
+                ),
+            )?,
+        }
     };
     write_frame(stream, &response).map_err(|error| error.to_string())
 }
@@ -257,11 +294,71 @@ fn rejected(request: &Frame, rejection: &RejectionV1) -> Result<Frame, String> {
     })
 }
 
-fn connect_authenticated() -> Result<UnixStream, String> {
-    let stream = UnixStream::connect(SOCKET_PATH)
+fn connect_authenticated(nonce: [u8; 16], attempt_id: [u8; 16]) -> Result<UnixStream, String> {
+    let mut stream = UnixStream::connect(SOCKET_PATH)
         .map_err(|error| format!("MCSEALED-LAUNCHER-CONNECTION: {error}"))?;
-    let _ = authenticate_peer(&stream, LAUNCHER_UNIT)?;
+    // SO_PEERCRED identifies systemd for an activation-owned listener. SCM_CREDENTIALS on the
+    // response instead identifies the launcher worker that holds this accepted connection.
+    set_receive_credentials(&stream, true)?;
+    let authentication = Frame {
+        kind: MessageKind::BrokerAuthenticate,
+        nonce,
+        attempt_id,
+        payload: Vec::new(),
+    };
+    write_frame(&mut stream, &authentication).map_err(|error| error.to_string())?;
+    let credentials = receive_authentication_response(&stream, &authentication)?;
+    let _ = authenticate_credentials(credentials, LAUNCHER_UNIT)?;
+    set_receive_credentials(&stream, false)?;
     Ok(stream)
+}
+
+fn write_authentication_response(stream: &UnixStream, response: &Frame) -> Result<(), String> {
+    let mut encoded = Vec::new();
+    write_frame(&mut encoded, response).map_err(|error| error.to_string())?;
+    // One sendmsg transaction keeps the kernel credential record aligned with the complete frame.
+    super::transport::send(stream, &encoded, &[])
+}
+
+fn receive_authentication_response(
+    stream: &UnixStream,
+    request: &Frame,
+) -> Result<libc::ucred, String> {
+    let (response, descriptors, credentials) = super::transport::receive_with_credentials(stream)?;
+    if response.kind != MessageKind::BrokerAuthenticated
+        || response.nonce != request.nonce
+        || response.attempt_id != request.attempt_id
+        || !response.payload.is_empty()
+        || !descriptors.is_empty()
+    {
+        return Err(
+            "MCSEALED-LAUNCHER-SERVICE-AUTHENTICATION: invalid authentication response".to_owned(),
+        );
+    }
+    credentials.ok_or_else(|| {
+        "MCSEALED-LAUNCHER-SERVICE-AUTHENTICATION: authenticated credentials missing".to_owned()
+    })
+}
+
+fn set_receive_credentials(stream: &UnixStream, enabled: bool) -> Result<(), String> {
+    let value: libc::c_int = i32::from(enabled);
+    // SAFETY: setsockopt reads one initialized integer through a live socket descriptor.
+    let status = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            (&raw const value).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if status == -1 {
+        return Err(format!(
+            "MCSEALED-LAUNCHER-SERVICE-AUTHENTICATION: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -275,6 +372,13 @@ fn authenticate_peer(
     expected_unit: &str,
 ) -> Result<AuthenticatedPeer, String> {
     let credentials = peer_credentials(stream)?;
+    authenticate_credentials(credentials, expected_unit)
+}
+
+fn authenticate_credentials(
+    credentials: libc::ucred,
+    expected_unit: &str,
+) -> Result<AuthenticatedPeer, String> {
     if credentials.uid != 0 || credentials.pid <= 0 {
         return Err("MCSEALED-LAUNCHER-SERVICE-AUTHENTICATION: peer uid is not root".to_owned());
     }
@@ -306,6 +410,32 @@ fn authenticate_peer(
         pid: credentials.pid,
         process_start_time,
     })
+}
+
+#[cfg(feature = "test-support")]
+pub fn set_receive_credentials_for_test(stream: &UnixStream, enabled: bool) -> Result<(), String> {
+    set_receive_credentials(stream, enabled)
+}
+
+#[cfg(feature = "test-support")]
+pub fn write_authentication_response_for_test(
+    stream: &UnixStream,
+    response: &Frame,
+) -> Result<(), String> {
+    write_authentication_response(stream, response)
+}
+
+#[cfg(feature = "test-support")]
+pub fn receive_authentication_response_for_test(
+    stream: &UnixStream,
+    request: &Frame,
+) -> Result<libc::pid_t, String> {
+    receive_authentication_response(stream, request).map(|credentials| credentials.pid)
+}
+
+#[cfg(feature = "test-support")]
+pub fn socket_peer_pid_for_test(stream: &UnixStream) -> Result<libc::pid_t, String> {
+    peer_credentials(stream).map(|credentials| credentials.pid)
 }
 
 fn peer_credentials(stream: &UnixStream) -> Result<libc::ucred, String> {

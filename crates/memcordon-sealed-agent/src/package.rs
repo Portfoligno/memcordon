@@ -1,10 +1,10 @@
 use std::ffi::OsStr;
 
-const SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision control provider\nRequires=memcordon-sealed-agent.socket memcordon-sealed-launcher.socket\nAfter=local-fs.target memcordon-sealed-launcher.socket\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent serve\nUser=root\nGroup=memcordon\nKillMode=process\nRuntimeDirectory=memcordon\nRuntimeDirectoryMode=0750\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/run/memcordon /var/lib/memcordon/sealed\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
+const SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision control provider\nRequires=memcordon-sealed-agent.socket memcordon-sealed-launcher.socket\nAfter=local-fs.target systemd-tmpfiles-setup.service memcordon-sealed-launcher.socket\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent serve\nUser=root\nGroup=memcordon\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/run/memcordon /var/lib/memcordon/sealed\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
 const SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision control socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-agent.sock\nDirectoryMode=0755\nSocketMode=0660\nSocketUser=root\nSocketGroup=memcordon\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
-const LAUNCHER_SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker\nRequires=memcordon-sealed-launcher.socket\nAfter=local-fs.target\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent launch-broker\nUser=root\nGroup=root\nDelegate=yes\nKillMode=process\nRuntimeDirectory=memcordon\nRuntimeDirectoryMode=0750\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=no\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
+const LAUNCHER_SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker\nRequires=memcordon-sealed-launcher.socket\nAfter=local-fs.target\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent launch-broker\nUser=root\nGroup=root\nDelegate=yes\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=no\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
 const LAUNCHER_SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-launcher.sock\nDirectoryMode=0750\nSocketMode=0600\nSocketUser=root\nSocketGroup=root\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
-const TMPFILES: &str = "d /run/memcordon 0750 root memcordon -\n";
+const TMPFILES: &str = "d /run/memcordon 0750 root memcordon -\nf /run/memcordon-sealed-package.lock 0600 root root -\n";
 #[cfg(target_os = "linux")]
 const BINARY: &str = "/usr/libexec/memcordon-sealed-agent";
 #[cfg(target_os = "linux")]
@@ -43,6 +43,8 @@ pub(crate) fn verify() -> Result<(), String> {
 fn verify_compiled_metadata() -> Result<(), String> {
     const CONTROL_CAPABILITY_BOUNDING_SET: &str =
         "CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE";
+    const CONTROL_READ_WRITE_PATHS: &str =
+        "ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed";
     let control_capabilities = SERVICE
         .lines()
         .filter(|line| line.starts_with("CapabilityBoundingSet="))
@@ -50,6 +52,10 @@ fn verify_compiled_metadata() -> Result<(), String> {
     let control_ambient = SERVICE
         .lines()
         .filter(|line| line.starts_with("AmbientCapabilities="))
+        .collect::<Vec<_>>();
+    let control_read_write_paths = SERVICE
+        .lines()
+        .filter(|line| line.starts_with("ReadWritePaths="))
         .collect::<Vec<_>>();
     let launcher_capabilities = LAUNCHER_SERVICE
         .lines()
@@ -79,8 +85,14 @@ fn verify_compiled_metadata() -> Result<(), String> {
         && SERVICE.contains("NoNewPrivileges=yes")
         && SERVICE.contains("PrivateTmp=yes")
         && SERVICE.contains("ProtectSystem=strict")
+        && SERVICE.contains(
+            "After=local-fs.target systemd-tmpfiles-setup.service memcordon-sealed-launcher.socket",
+        )
+        && !SERVICE.contains("RuntimeDirectory=")
+        && !SERVICE.contains("RuntimeDirectoryMode=")
         && control_capabilities == [CONTROL_CAPABILITY_BOUNDING_SET]
         && control_ambient == ["AmbientCapabilities="]
+        && control_read_write_paths == [CONTROL_READ_WRITE_PATHS]
         && SOCKET.contains("ListenStream=/run/memcordon/sealed-agent.sock")
         && SOCKET.contains("After=systemd-tmpfiles-setup.service")
         && SOCKET.contains("SocketMode=0660")
@@ -90,6 +102,8 @@ fn verify_compiled_metadata() -> Result<(), String> {
         && LAUNCHER_SERVICE.contains("User=root")
         && LAUNCHER_SERVICE.contains("Group=root")
         && LAUNCHER_SERVICE.contains("NoNewPrivileges=no")
+        && !LAUNCHER_SERVICE.contains("RuntimeDirectory=")
+        && !LAUNCHER_SERVICE.contains("RuntimeDirectoryMode=")
         && launcher_capabilities.is_empty()
         && launcher_ambient == ["AmbientCapabilities="]
         && !launcher_changes_target_mounts
@@ -99,7 +113,8 @@ fn verify_compiled_metadata() -> Result<(), String> {
         && LAUNCHER_SOCKET.contains("SocketMode=0600")
         && LAUNCHER_SOCKET.contains("SocketUser=root")
         && LAUNCHER_SOCKET.contains("SocketGroup=root")
-        && TMPFILES == "d /run/memcordon 0750 root memcordon -\n"
+        && TMPFILES
+            == "d /run/memcordon 0750 root memcordon -\nf /run/memcordon-sealed-package.lock 0600 root root -\n"
     {
         Ok(())
     } else {
@@ -108,9 +123,232 @@ fn verify_compiled_metadata() -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn verify_installed_package() -> Result<(), String> {
+fn prepare_runtime_directory() -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::symlink_metadata("/run/memcordon") {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err("provider runtime path is not a real directory".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir("/run/memcordon").map_err(|error| error.to_string())?;
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    std::fs::set_permissions("/run/memcordon", std::fs::Permissions::from_mode(0o750))
+        .map_err(|error| error.to_string())?;
+    let metadata = std::fs::symlink_metadata("/run/memcordon")
+        .map_err(|error| format!("provider runtime directory unavailable: {error}"))?;
+    if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o7777 != 0o750 {
+        return Err("provider runtime directory identity or mode is unsafe".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_runtime_directory_owner(service_gid: libc::gid_t) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata("/run/memcordon")
+        .map_err(|error| format!("provider runtime directory unavailable: {error}"))?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != 0
+        || metadata.gid() != service_gid
+        || metadata.mode() & 0o7777 != 0o750
+    {
+        return Err("provider runtime directory identity or permissions are unsafe".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum ArtifactAccess {
+    MetadataOnly,
+    Readable,
+}
+
+#[cfg(target_os = "linux")]
+fn open_artifact_descriptor(
+    path: &std::path::Path,
+    access: ArtifactAccess,
+) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let access_flag = match access {
+        ArtifactAccess::MetadataOnly => libc::O_PATH,
+        ArtifactAccess::Readable => 0,
+    };
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(access_flag | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err("MCSEALED-PACKAGE-VERIFY: installed package is incomplete".to_owned())
+        }
+        Err(error) => Err(format!(
+            "MCSEALED-PACKAGE-VERIFY: {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_open_artifact(
+    file: &mut std::fs::File,
+    path: &std::path::Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+    expected_bytes: Option<&[u8]>,
+) -> Result<(), String> {
     use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("MCSEALED-PACKAGE-VERIFY: {}: {error}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "MCSEALED-PACKAGE-VERIFY: {} is not a no-follow regular file",
+            path.display()
+        ));
+    }
+    if metadata.uid() != expected_uid || metadata.gid() != expected_gid {
+        let expected_owner = if expected_uid == 0 && expected_gid == 0 {
+            "root:root".to_owned()
+        } else {
+            format!("{expected_uid}:{expected_gid}")
+        };
+        return Err(format!(
+            "MCSEALED-PACKAGE-VERIFY: {} is not owned by {expected_owner}",
+            path.display(),
+        ));
+    }
+    if metadata.mode() & 0o7777 != expected_mode {
+        return Err(format!(
+            "MCSEALED-PACKAGE-VERIFY: {} mode is not {expected_mode:04o}",
+            path.display()
+        ));
+    }
+    if let Some(expected_bytes) = expected_bytes {
+        let mut actual = Vec::with_capacity(expected_bytes.len() + 1);
+        file.by_ref()
+            .take((expected_bytes.len() + 1) as u64)
+            .read_to_end(&mut actual)
+            .map_err(|error| format!("MCSEALED-PACKAGE-VERIFY: {}: {error}", path.display()))?;
+        if actual != expected_bytes {
+            return Err(format!(
+                "MCSEALED-PACKAGE-VERIFY: {} content differs from the packaged artifact",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_metadata_artifact(
+    path: &std::path::Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+) -> Result<(), String> {
+    let mut file = open_artifact_descriptor(path, ArtifactAccess::MetadataOnly)?;
+    verify_open_artifact(
+        &mut file,
+        path,
+        expected_uid,
+        expected_gid,
+        expected_mode,
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn verify_readable_artifact(
+    path: &std::path::Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+    expected_bytes: Option<&[u8]>,
+) -> Result<(), String> {
+    let mut file = open_artifact_descriptor(path, ArtifactAccess::Readable)?;
+    verify_open_artifact(
+        &mut file,
+        path,
+        expected_uid,
+        expected_gid,
+        expected_mode,
+        expected_bytes,
+    )
+}
+
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+pub fn verify_metadata_artifact_for_test(
+    path: &std::path::Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+) -> Result<(), String> {
+    verify_metadata_artifact(path, expected_uid, expected_gid, expected_mode)
+}
+
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+pub fn verify_readable_artifact_for_test(
+    path: &std::path::Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+    expected_bytes: Option<&[u8]>,
+) -> Result<(), String> {
+    verify_readable_artifact(
+        path,
+        expected_uid,
+        expected_gid,
+        expected_mode,
+        expected_bytes,
+    )
+}
+
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+pub fn open_metadata_artifact_for_test(path: &std::path::Path) -> Result<std::fs::File, String> {
+    open_artifact_descriptor(path, ArtifactAccess::MetadataOnly)
+}
+
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+pub fn open_readable_artifact_for_test(path: &std::path::Path) -> Result<std::fs::File, String> {
+    open_artifact_descriptor(path, ArtifactAccess::Readable)
+}
+
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+pub fn verify_open_artifact_for_test(
+    file: &mut std::fs::File,
+    path: &std::path::Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_mode: u32,
+    expected_bytes: Option<&[u8]>,
+) -> Result<(), String> {
+    verify_open_artifact(
+        file,
+        path,
+        expected_uid,
+        expected_gid,
+        expected_mode,
+        expected_bytes,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn verify_installed_package() -> Result<(), String> {
+    verify_metadata_artifact(
+        std::path::Path::new(crate::linux::service::PACKAGE_LEASE),
+        0,
+        0,
+        0o600,
+    )?;
 
     let artifacts = [
         (BINARY, 0o755, None),
@@ -125,49 +363,13 @@ fn verify_installed_package() -> Result<(), String> {
         (TMPFILES_FILE, 0o644, Some(TMPFILES.as_bytes())),
     ];
     for (path, expected_mode, expected_bytes) in artifacts {
-        let mut file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err("MCSEALED-PACKAGE-VERIFY: installed package is incomplete".to_owned());
-            }
-            Err(error) => {
-                return Err(format!("MCSEALED-PACKAGE-VERIFY: {path}: {error}"));
-            }
-        };
-        let metadata = file
-            .metadata()
-            .map_err(|error| format!("MCSEALED-PACKAGE-VERIFY: {path}: {error}"))?;
-        if !metadata.file_type().is_file() {
-            return Err(format!(
-                "MCSEALED-PACKAGE-VERIFY: {path} is not a no-follow regular file"
-            ));
-        }
-        if metadata.uid() != 0 || metadata.gid() != 0 {
-            return Err(format!(
-                "MCSEALED-PACKAGE-VERIFY: {path} is not owned by root:root"
-            ));
-        }
-        if metadata.mode() & 0o7777 != expected_mode {
-            return Err(format!(
-                "MCSEALED-PACKAGE-VERIFY: {path} mode is not {expected_mode:04o}"
-            ));
-        }
-        if let Some(expected_bytes) = expected_bytes {
-            let mut actual = Vec::with_capacity(expected_bytes.len() + 1);
-            file.by_ref()
-                .take((expected_bytes.len() + 1) as u64)
-                .read_to_end(&mut actual)
-                .map_err(|error| format!("MCSEALED-PACKAGE-VERIFY: {path}: {error}"))?;
-            if actual != expected_bytes {
-                return Err(format!(
-                    "MCSEALED-PACKAGE-VERIFY: {path} content differs from the packaged artifact"
-                ));
-            }
-        }
+        verify_readable_artifact(
+            std::path::Path::new(path),
+            0,
+            0,
+            expected_mode,
+            expected_bytes,
+        )?;
     }
     Ok(())
 }
@@ -186,13 +388,19 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     if operation != "install" && operation != "upgrade" && operation != "uninstall" {
         return Err("unknown package operation".to_owned());
     }
-    fs::create_dir_all("/run/memcordon").map_err(|error| error.to_string())?;
-    fs::set_permissions("/run/memcordon", fs::Permissions::from_mode(0o750))
-        .map_err(|error| error.to_string())?;
     let _package_lease = crate::linux::service::acquire_package_lease().map_err(|error| {
         format!("refusing package mutation while a sealed provider attempt is active: {error}")
     })?;
+    prepare_runtime_directory()?;
+    let _legacy_package_lease = crate::linux::service::acquire_legacy_package_lease().map_err(
+        |error| {
+            format!(
+                "refusing package mutation while a legacy sealed provider attempt is active: {error}"
+            )
+        },
+    )?;
     if operation == "uninstall" {
+        ensure_recovery_idle("uninstall")?;
         stop_unit("memcordon-sealed-agent.service")?;
         stop_unit("memcordon-sealed-launcher.service")?;
         stop_unit("memcordon-sealed-agent.socket")?;
@@ -201,18 +409,7 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         ensure_unit_inactive("memcordon-sealed-launcher.service")?;
         ensure_unit_inactive("memcordon-sealed-agent.socket")?;
         ensure_unit_inactive("memcordon-sealed-launcher.socket")?;
-        let ambiguous = crate::linux::recovery::recover()?;
-        if !ambiguous.is_empty() {
-            return Err(format!(
-                "refusing to uninstall while sealed recovery is ambiguous: {}",
-                ambiguous.join(",")
-            ));
-        }
-        if live_attempt_exists()? {
-            return Err(
-                "refusing to uninstall while an authenticated attempt record exists".to_owned(),
-            );
-        }
+        ensure_recovery_idle("uninstall")?;
         for path in [
             SOCKET_UNIT,
             UNIT,
@@ -231,6 +428,7 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         return Ok(());
     }
     if operation == "upgrade" {
+        ensure_recovery_idle("upgrade")?;
         stop_unit("memcordon-sealed-agent.service")?;
         stop_unit("memcordon-sealed-launcher.service")?;
         stop_unit("memcordon-sealed-agent.socket")?;
@@ -239,21 +437,14 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         ensure_unit_inactive("memcordon-sealed-launcher.service")?;
         ensure_unit_inactive("memcordon-sealed-agent.socket")?;
         ensure_unit_inactive("memcordon-sealed-launcher.socket")?;
-        let ambiguous = crate::linux::recovery::recover()?;
-        if !ambiguous.is_empty() {
-            return Err(format!(
-                "refusing to upgrade while sealed recovery is ambiguous: {}",
-                ambiguous.join(",")
-            ));
-        }
-        if live_attempt_exists()? {
-            return Err(
-                "refusing to upgrade while an authenticated attempt record exists".to_owned(),
-            );
-        }
+        ensure_recovery_idle("upgrade")?;
     }
     verify_compiled_metadata()?;
     let service_gid = ensure_service_group()?;
+    // Already-loaded pre-transition units can remove their shared RuntimeDirectory while upgrade
+    // quiesces both services. Re-establish the tmpfiles contract after all stop/recovery checks and
+    // immediately before assigning the reviewed ownership. Successful uninstall returns above.
+    prepare_runtime_directory()?;
     let runtime_directory =
         std::ffi::CString::new("/run/memcordon").expect("static runtime path has no NUL");
     // SAFETY: runtime_directory is a live NUL-terminated path and service_gid came from the
@@ -264,6 +455,7 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
             std::io::Error::last_os_error()
         ));
     }
+    verify_runtime_directory_owner(service_gid)?;
     let source = std::env::current_exe().map_err(|error| error.to_string())?;
     let installations = [
         (
@@ -326,6 +518,23 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     systemctl(["restart", "memcordon-sealed-agent.service"])?;
     wait_provider_ready()?;
     verify_client_access()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_recovery_idle(operation: &str) -> Result<(), String> {
+    let ambiguous = crate::linux::recovery::recover()?;
+    if !ambiguous.is_empty() {
+        return Err(format!(
+            "refusing to {operation} while sealed recovery is ambiguous: {}",
+            ambiguous.join(",")
+        ));
+    }
+    if live_attempt_exists()? {
+        return Err(format!(
+            "refusing to {operation} while an authenticated attempt record exists"
+        ));
+    }
     Ok(())
 }
 

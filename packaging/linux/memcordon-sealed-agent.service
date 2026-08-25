@@ -1,7 +1,7 @@
 [Unit]
 Description=MemCordon sealed supervision control provider
 Requires=memcordon-sealed-agent.socket memcordon-sealed-launcher.socket
-After=local-fs.target memcordon-sealed-launcher.socket
+After=local-fs.target systemd-tmpfiles-setup.service memcordon-sealed-launcher.socket
 
 [Service]
 Type=simple
@@ -9,8 +9,6 @@ ExecStart=/usr/libexec/memcordon-sealed-agent serve
 User=root
 Group=memcordon
 KillMode=process
-RuntimeDirectory=memcordon
-RuntimeDirectoryMode=0750
 StateDirectory=memcordon/sealed
 StateDirectoryMode=0700
 NoNewPrivileges=yes

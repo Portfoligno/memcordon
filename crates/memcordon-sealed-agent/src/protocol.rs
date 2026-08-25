@@ -16,12 +16,14 @@ pub enum MessageKind {
     Query = 4,
     BrokerProbe = 5,
     BrokerLaunch = 6,
+    BrokerAuthenticate = 7,
     ProbeReceipt = 101,
     LaunchPrepared = 102,
     Authorized = 103,
     Progress = 104,
     Terminal = 105,
     Rejected = 106,
+    BrokerAuthenticated = 107,
 }
 
 impl TryFrom<u16> for MessageKind {
@@ -35,12 +37,14 @@ impl TryFrom<u16> for MessageKind {
             4 => Ok(Self::Query),
             5 => Ok(Self::BrokerProbe),
             6 => Ok(Self::BrokerLaunch),
+            7 => Ok(Self::BrokerAuthenticate),
             101 => Ok(Self::ProbeReceipt),
             102 => Ok(Self::LaunchPrepared),
             103 => Ok(Self::Authorized),
             104 => Ok(Self::Progress),
             105 => Ok(Self::Terminal),
             106 => Ok(Self::Rejected),
+            107 => Ok(Self::BrokerAuthenticated),
             _ => Err(ProtocolError::UnknownKind(value)),
         }
     }

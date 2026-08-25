@@ -676,22 +676,36 @@ fn check_certification_job(
             .ok_or_else(|| failure(format!("{context} artifact lacks inputs")))?,
         context,
     )?;
-    exact_mapping_keys(
-        inputs,
+    let is_linux_artifact = artifact_name.contains("linux");
+    let expected_input_keys: &[&str] = if is_linux_artifact {
         &[
             "name",
             "path",
             "if-no-files-found",
             "retention-days",
             "compression-level",
-        ],
-        context,
-    )?;
+            "include-hidden-files",
+        ]
+    } else {
+        &[
+            "name",
+            "path",
+            "if-no-files-found",
+            "retention-days",
+            "compression-level",
+        ]
+    };
+    exact_mapping_keys(inputs, expected_input_keys, context)?;
     if scalar(inputs, "name") != Some(artifact_name)
         || scalar(inputs, "path") != Some(artifact_path)
         || scalar(inputs, "if-no-files-found") != Some("error")
         || inputs.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
         || inputs.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
+        || (is_linux_artifact
+            && inputs
+                .get(key("include-hidden-files"))
+                .and_then(Value::as_bool)
+                != Some(true))
     {
         return Err(failure(format!("{context} artifact inputs differ")));
     }
@@ -1796,6 +1810,7 @@ fn is_reviewed_raw_fork_boundary(relative: &Path) -> bool {
                 )
             || path == Path::new("crates/memcordon-sealed-agent/tests/linux_faults.rs")
             || path == Path::new("crates/memcordon-sealed-agent/tests/linux_sealed.rs")
+            || path == Path::new("crates/memcordon-sealed-agent/tests/launcher_activation.rs")
     )
 }
 
@@ -2216,7 +2231,10 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
     require_credential_transition_fragments(
         root,
         "packaging/linux/memcordon.conf",
-        &["d /run/memcordon 0750 root memcordon -"],
+        &[
+            "d /run/memcordon 0750 root memcordon -",
+            "f /run/memcordon-sealed-package.lock 0600 root root -",
+        ],
         &[],
     )?;
     require_credential_transition_fragments(root, "spec/sealed-linux-v2.md", &artifacts, &[])?;

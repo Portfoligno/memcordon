@@ -26,6 +26,8 @@ const DEADLINE: Duration = Duration::from_secs(60 * 60);
 const MECHANISM: &str = "linux-pid-namespace-cgroup-v2";
 const PROVIDER_BINARY: &str = "target/ci/sealed-agent/debug/memcordon-sealed-agent";
 const REPORT_DIRECTORY: &str = "target/ci/reports/linux-sealed-v2";
+const PRE_SCENARIO_PUBLIC_REPORT: &str = ".sealed-public-launch.json";
+const POST_UPGRADE_PUBLIC_REPORT: &str = ".sealed-post-scenario-public-launch.json";
 const CONCURRENCY_EVIDENCE_PREFIX: &str = "MCSEALED-CONCURRENCY-EVIDENCE:";
 const MAXIMUM_CONCURRENCY_EVIDENCE_BYTES: usize = 32 * 1024;
 const FAULT_EVIDENCE_PREFIX: &str = "MCSEALED-FAULT-EVIDENCE:";
@@ -272,6 +274,11 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         test_binary: "linux_package",
         name: "sealed_package_identity_rejects_tampered_provider",
+        class: "package",
+    },
+    Scenario {
+        test_binary: "linux_package",
+        name: "sealed_package_stable_lease_survives_legacy_inode_replacement",
         class: "package",
     },
     Scenario {
@@ -1352,10 +1359,32 @@ fn validate_doctor(
         ));
     }
     write_json(&report_dir.join(".platform-environment.json"), &value)?;
-    let public_report = report_dir.join(".sealed-public-launch.json");
-    let launch = authorized_nonroot_memcordon(
+    let public_report = report_dir.join(PRE_SCENARIO_PUBLIC_REPORT);
+    validate_public_launch(
         root,
         &identity,
+        &public_report,
+        &receipt.provider_identity,
+        active_digest,
+    )?;
+    Ok(value)
+}
+
+fn validate_public_launch(
+    root: &Path,
+    identity: &FrontendIdentity,
+    public_report: &Path,
+    provider_identity: &str,
+    receipt_digest: &str,
+) -> Result<()> {
+    match fs::remove_file(public_report) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let launch = authorized_nonroot_memcordon(
+        root,
+        identity,
         [
             OsString::from("--sealed"),
             OsString::from("--report"),
@@ -1366,9 +1395,9 @@ fn validate_doctor(
     );
     if let Err(launch_error) = launch {
         return match validate_public_rejection_report(
-            &public_report,
-            &receipt.provider_identity,
-            active_digest,
+            public_report,
+            provider_identity,
+            receipt_digest,
         ) {
             Ok(()) => Err(launch_error),
             Err(report_error) => Err(CiError::Message(format!(
@@ -1376,12 +1405,33 @@ fn validate_doctor(
             ))),
         };
     }
-    validate_public_execution_report(
-        &public_report,
-        &receipt.provider_identity,
-        &receipt.receipt_digest,
-    )?;
-    Ok(value)
+    validate_public_execution_report(public_report, provider_identity, receipt_digest)
+}
+
+fn validate_post_upgrade_public_proof(
+    root: &Path,
+    identity: &FrontendIdentity,
+    report_dir: &Path,
+    receipt: &QualificationReceipt,
+) -> Result<()> {
+    verify_frontend_credentials(root, identity)?;
+    let qualification = authorized_nonroot(root, identity, &root.join(PROVIDER_BINARY), ["probe"])?;
+    let post_upgrade_receipt: QualificationReceipt = serde_json::from_slice(&qualification)?;
+    post_upgrade_receipt.validate()?;
+    if post_upgrade_receipt.provider_identity != receipt.provider_identity
+        || post_upgrade_receipt.receipt_digest != receipt.receipt_digest
+    {
+        return Err(CiError::Message(
+            "post-upgrade provider qualification differs from the pre-scenario identity".to_owned(),
+        ));
+    }
+    validate_public_launch(
+        root,
+        identity,
+        &report_dir.join(POST_UPGRADE_PUBLIC_REPORT),
+        &post_upgrade_receipt.provider_identity,
+        &post_upgrade_receipt.receipt_digest,
+    )
 }
 
 fn validate_public_execution_report(
@@ -1583,6 +1633,7 @@ fn validate_public_rejection_report(
 
 fn boundary_phase_name(phase: memcordon_core::BoundarySetupPhase) -> &'static str {
     match phase {
+        memcordon_core::BoundarySetupPhase::RequestValidation => "request-validation",
         memcordon_core::BoundarySetupPhase::ProviderConnection => "provider-connection",
         memcordon_core::BoundarySetupPhase::ProviderIdentity => "provider-identity",
         memcordon_core::BoundarySetupPhase::CallerEnvelopeCapture => "caller-envelope-capture",
@@ -1706,16 +1757,18 @@ fn validate_service_privilege_readback(root: &Path, report_dir: &Path) -> Result
     write_json(
         &report_dir.join("provider-package-verification.json"),
         &serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "mechanism": MECHANISM,
             "result": "passed",
             "package_verified": true,
             "artifacts": [
-                "memcordon-sealed-agent.service",
-                "memcordon-sealed-agent.socket",
-                "memcordon-sealed-launcher.service",
-                "memcordon-sealed-launcher.socket",
-                "memcordon.conf"
+                "/usr/libexec/memcordon-sealed-agent",
+                "/usr/lib/systemd/system/memcordon-sealed-agent.service",
+                "/usr/lib/systemd/system/memcordon-sealed-agent.socket",
+                "/usr/lib/systemd/system/memcordon-sealed-launcher.service",
+                "/usr/lib/systemd/system/memcordon-sealed-launcher.socket",
+                "/usr/lib/tmpfiles.d/memcordon.conf",
+                "/run/memcordon-sealed-package.lock"
             ],
             "control": control,
             "launcher": launcher,
@@ -1790,7 +1843,16 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
     for (index, scenario) in SCENARIOS.iter().enumerate() {
         progress[index].state = ScenarioProgressState::Running;
         write_scenario_progress(report_dir, commit, &progress)?;
-        let scenario_result = run_exact(root, stable, *scenario, report_dir, commit);
+        let scenario_result =
+            run_exact(root, stable, *scenario, report_dir, commit).and_then(|evidence| {
+                if scenario.name == "sealed_package_upgrade_recovers_before_advertising" {
+                    validate_post_upgrade_public_proof(root, &identity, report_dir, &receipt)
+                        .map_err(|error| {
+                            ScenarioRunFailure::setup("post-upgrade-public-proof", error)
+                        })?;
+                }
+                Ok(evidence)
+            });
         let scenario_evidence = match scenario_result {
             Ok(evidence) => evidence,
             Err(failure) => {
@@ -1826,6 +1888,7 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
             result: "passed",
         });
     }
+    let post_upgrade_public_path = report_dir.join(POST_UPGRADE_PUBLIC_REPORT);
     let concurrency_path = report_dir.join(".sealed-concurrency-report.json");
     if !concurrency_path.is_file() {
         return Err(CiError::Message(
@@ -1833,7 +1896,7 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
         ));
     }
     let concurrency: Value = serde_json::from_slice(&fs::read(&concurrency_path)?)?;
-    let public_path = report_dir.join(".sealed-public-launch.json");
+    let public_path = post_upgrade_public_path;
     let public_launch: Value = serde_json::from_slice(&fs::read(&public_path)?)?;
     let fixture_bytes =
         fs::read(root.join("target/ci/sealed-agent/debug/memcordon-sealed-test-fixture"))?;
@@ -1936,6 +1999,7 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
     )?;
     fs::remove_file(concurrency_path)?;
     fs::remove_file(report_dir.join(".platform-environment.json"))?;
+    fs::remove_file(report_dir.join(PRE_SCENARIO_PUBLIC_REPORT))?;
     fs::remove_file(public_path)?;
     fs::remove_file(report_dir.join("sealed-scenario-progress.json"))?;
     Ok(())
@@ -1976,7 +2040,13 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
         .err()
         .map(|_| collect_provider_service_diagnostics(root));
     let (public_execution_report, public_execution_report_error) = if result.is_err() {
-        collect_public_execution_report(&report_dir.join(".sealed-public-launch.json"))
+        let post_upgrade_report = report_dir.join(POST_UPGRADE_PUBLIC_REPORT);
+        let diagnostic_report = if post_upgrade_report.is_file() {
+            post_upgrade_report
+        } else {
+            report_dir.join(PRE_SCENARIO_PUBLIC_REPORT)
+        };
+        collect_public_execution_report(&diagnostic_report)
     } else {
         (None, None)
     };

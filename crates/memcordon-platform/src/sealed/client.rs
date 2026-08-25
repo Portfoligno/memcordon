@@ -543,7 +543,9 @@ pub(crate) fn launch(
     parse_terminal(&payload).map_err(LaunchError::Transport)
 }
 
-fn parse_rejection(payload: &[u8]) -> Result<memcordon_core::ProviderRejectionEvidence, String> {
+pub(crate) fn parse_rejection(
+    payload: &[u8],
+) -> Result<memcordon_core::ProviderRejectionEvidence, String> {
     const MAX_CODE_BYTES: usize = 128;
     const MAX_DETAIL_BYTES: usize = 8 * 1024;
     const MAX_CLEANUP_ERRORS: usize = 16;
@@ -611,6 +613,7 @@ fn parse_rejection(payload: &[u8]) -> Result<memcordon_core::ProviderRejectionEv
 
 fn boundary_phase_name(phase: memcordon_core::BoundarySetupPhase) -> &'static str {
     match phase {
+        memcordon_core::BoundarySetupPhase::RequestValidation => "request-validation",
         memcordon_core::BoundarySetupPhase::ProviderConnection => "provider-connection",
         memcordon_core::BoundarySetupPhase::ProviderIdentity => "provider-identity",
         memcordon_core::BoundarySetupPhase::CallerEnvelopeCapture => "caller-envelope-capture",

@@ -4,6 +4,12 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Preserved typed `request-validation` provider rejections in public reports and
+  made the stable Linux package lease boot-safe without widening the hardened
+  control service's write access.
+
 ## [0.5.0-rc.4] - 2026-08-24
 
 ### Added
