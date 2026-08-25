@@ -13,8 +13,8 @@ clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
 libc.workspace = true
-memcordon-core = { path = "../../crates/memcordon-core", version = "=0.5.1-dev" }
-memcordon-testkit = { path = "../../crates/memcordon-testkit", version = "=0.5.1-dev" }
+memcordon-core = { path = "../../crates/memcordon-core", version = "=0.5.1-rc.2" }
+memcordon-testkit = { path = "../../crates/memcordon-testkit", version = "=0.5.1-rc.2" }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

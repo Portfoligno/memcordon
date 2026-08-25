@@ -27,6 +27,6 @@ path = "src/main.rs"
 workspace = true
 
 [dev-dependencies]
-memcordon-core = { path = "../memcordon-core", version = "=0.5.1-dev" }
-memcordon-platform = { path = "../memcordon-platform", version = "=0.5.1-dev", features = ["test-support"] }
+memcordon-core = { path = "../memcordon-core", version = "=0.5.1-rc.2" }
+memcordon-platform = { path = "../memcordon-platform", version = "=0.5.1-rc.2", features = ["test-support"] }
 tempfile.workspace = true

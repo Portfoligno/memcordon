@@ -4,6 +4,8 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+## [0.5.1-rc.2] - 2026-08-25
+
 ### Added
 
 - Added credential-transition-aware Linux sealed supervision. Before
