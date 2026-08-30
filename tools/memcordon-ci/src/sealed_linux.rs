@@ -36,12 +36,16 @@ const MAXIMUM_FAULT_EVIDENCE_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy)]
 struct Scenario {
-    test_binary: &'static str,
+    test_module: &'static str,
     name: &'static str,
     class: &'static str,
 }
 
 impl Scenario {
+    fn exact_name(self) -> String {
+        memcordon_ci::sealed_selector::exact_test_name(self.test_module, self.name)
+    }
+
     fn privileged(self) -> bool {
         !matches!(
             self.name,
@@ -53,242 +57,242 @@ impl Scenario {
 
 const SCENARIOS: &[Scenario] = &[
     Scenario {
-        test_binary: "linux_provider",
+        test_module: "linux_provider",
         name: "qualification_fails_closed_without_root_provider",
         class: "qualification",
     },
     Scenario {
-        test_binary: "linux_provider",
+        test_module: "linux_provider",
         name: "qualification_receipt_requires_complete_retirement",
         class: "qualification",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_direct_exit_retires_fresh_boundary",
         class: "lifecycle",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_staged_fixture_is_isolated_and_removed_after_retirement",
         class: "fixture",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_future_deadline_authorizes_and_retires",
         class: "deadline",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_expired_deadline_never_authorizes_and_retires",
         class: "deadline",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_child_outlives_direct_target_until_cleanup",
         class: "lifecycle",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_double_fork_remains_in_pid_namespace_and_cgroup",
         class: "escape",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_setsid_daemon_remains_contained",
         class: "escape",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_setid_transition_preserves_boundary",
         class: "setid-transition",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_sudo_transition_preserves_boundary",
         class: "sudo-transition",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_file_capability_transition_preserves_boundary",
         class: "file-capability-transition",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_caller_no_new_privs_is_reproduced",
         class: "caller-envelope",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_caller_capability_bounding_set_is_reproduced",
         class: "caller-envelope",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_caller_mount_context_is_reproduced",
         class: "mount-context",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_recursive_provider_request_is_rejected",
         class: "recursive-provider",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_retained_streams_do_not_finish_before_retirement",
         class: "lifecycle",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_fork_storm_is_empty_before_result",
         class: "stress",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_fork_during_cleanup_cannot_survive",
         class: "stress",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_target_cannot_move_to_parent_or_sibling_cgroup",
         class: "escape",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_target_cannot_setns_into_host_namespace",
         class: "escape",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_target_cannot_mount_writable_cgroup_view",
         class: "escape",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_target_inherits_only_verified_descriptors",
         class: "inheritance",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_target_cannot_disable_namespace_init",
         class: "escape",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_frontend_loss_before_authorization_never_runs_target",
         class: "crash",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_frontend_loss_after_authorization_triggers_guardian",
         class: "crash",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_provider_worker_loss_triggers_guardian",
         class: "crash",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_guardian_loss_before_authorization_fails_closed",
         class: "crash",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_guardian_loss_after_authorization_cannot_report_success",
         class: "crash",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_native_nonzero_exit_preserves_provenance",
         class: "launch",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_native_exit_126_and_127_are_not_exec_failures",
         class: "launch",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_missing_target_preserves_enoent_exec_provenance",
         class: "launch",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_non_executable_target_preserves_eacces_exec_provenance",
         class: "launch",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_restart_uses_fresh_retired_boundary",
         class: "restart",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_simultaneous_attempts_have_disjoint_boundaries",
         class: "concurrency",
     },
     Scenario {
-        test_binary: "linux_recovery",
+        test_module: "linux_recovery",
         name: "sealed_recovery_removes_authenticated_stale_record_without_cgroup",
         class: "recovery",
     },
     Scenario {
-        test_binary: "linux_recovery",
+        test_module: "linux_recovery",
         name: "sealed_recovery_quarantines_cgroup_without_authenticated_record",
         class: "recovery",
     },
     Scenario {
-        test_binary: "linux_recovery",
+        test_module: "linux_recovery",
         name: "sealed_recovery_blocks_capability_while_live_state_is_ambiguous",
         class: "recovery",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_faults_before_authorization_never_create_marker",
         class: "fault",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_namespace_init_failure_is_typed_prompt_and_retired",
         class: "fault",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_cgroup_kill_failure_never_reports_retirement",
         class: "fault",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_persistent_populated_state_blocks_restart",
         class: "fault",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_namespace_init_reap_delay_blocks_result",
         class: "fault",
     },
     Scenario {
-        test_binary: "linux_sealed",
+        test_module: "linux_sealed",
         name: "sealed_guardian_reap_failure_blocks_result",
         class: "fault",
     },
     Scenario {
-        test_binary: "linux_package",
+        test_module: "linux_package",
         name: "sealed_package_identity_rejects_tampered_provider",
         class: "package",
     },
     Scenario {
-        test_binary: "linux_package",
+        test_module: "linux_package",
         name: "sealed_package_stable_lease_survives_legacy_inode_replacement",
         class: "package",
     },
     Scenario {
-        test_binary: "linux_package",
+        test_module: "linux_package",
         name: "sealed_package_upgrade_recovers_before_advertising",
         class: "package",
     },
     Scenario {
-        test_binary: "linux_package",
+        test_module: "linux_package",
         name: "sealed_package_uninstall_refuses_live_authenticated_attempt",
         class: "package",
     },
@@ -1174,10 +1178,16 @@ fn run_exact(
         .ok_or_else(|| {
             ScenarioRunFailure::setup(
                 "test-executable",
-                format!("cargo omitted executable for {}", scenario.test_binary),
+                "cargo omitted executable for consolidated sealed_agent test target",
             )
         })?;
-    let mut test_arguments = vec![scenario.name, "--exact", "--nocapture", "--test-threads=1"];
+    let exact_name = scenario.exact_name();
+    let mut test_arguments = vec![
+        exact_name.as_str(),
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+    ];
     if scenario.privileged() {
         test_arguments.push("--ignored");
     }

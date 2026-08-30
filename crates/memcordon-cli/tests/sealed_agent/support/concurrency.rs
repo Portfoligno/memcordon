@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use super::support;
 
 const WORKER_REQUEST: &str = "worker-request";
+pub(super) const WORKER_TEST_NAME: &str =
+    "linux_sealed::sealed_simultaneous_attempts_have_disjoint_boundaries";
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const OVERLAP_TIMEOUT: Duration = Duration::from_secs(5);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -64,7 +66,7 @@ impl WorkerChild {
         let child = Command::new(executable)
             .args([
                 OsStr::new("--exact"),
-                OsStr::new("sealed_simultaneous_attempts_have_disjoint_boundaries"),
+                OsStr::new(WORKER_TEST_NAME),
                 OsStr::new("--ignored"),
                 OsStr::new("--nocapture"),
                 OsStr::new("--test-threads=1"),
@@ -94,7 +96,7 @@ impl WorkerChild {
             .map_err(|error| error.to_string())
     }
 
-    fn collect(&mut self, status: ExitStatus) -> Result<(), String> {
+    fn collect(&mut self, status: ExitStatus) -> Result<(Vec<u8>, Vec<u8>), String> {
         let mut child = self
             .child
             .take()
@@ -128,7 +130,7 @@ impl WorkerChild {
                 String::from_utf8_lossy(&stderr)
             ));
         }
-        Ok(())
+        Ok((stdout, stderr))
     }
 }
 
@@ -323,9 +325,12 @@ fn wait_for_ready(workers: &mut [WorkerChild; 2]) -> Result<[WorkerReady; 2], St
                 if path.exists() {
                     ready[index] = Some(read_json(&path)?);
                 } else if let Some(status) = worker.status()? {
+                    let (stdout, stderr) = worker.collect(status)?;
                     return Err(format!(
-                        "{} worker exited before readiness: {status}",
-                        worker.label
+                        "{} worker exited before readiness: {status}; stdout={}; stderr={}",
+                        worker.label,
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr)
                     ));
                 }
             }

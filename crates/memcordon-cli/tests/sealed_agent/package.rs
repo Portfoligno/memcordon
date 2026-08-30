@@ -2,6 +2,16 @@ fn semantic_lines(value: &str) -> Vec<&str> {
     value.lines().collect()
 }
 
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    source
+        .split_once(start)
+        .unwrap_or_else(|| panic!("missing source boundary {start:?}"))
+        .1
+        .split_once(end)
+        .unwrap_or_else(|| panic!("missing source boundary {end:?}"))
+        .0
+}
+
 #[test]
 fn installed_provider_digest_must_match_the_invoked_package() {
     let invoked = "current-package-digest";
@@ -11,6 +21,22 @@ fn installed_provider_digest_must_match_the_invoked_package() {
             .expect_err("an older installed provider must not verify against a newer package");
     assert!(mismatch.contains("MCSEALED-PACKAGE-VERSION-MISMATCH"));
     assert!(mismatch.contains("package upgrade"));
+}
+
+#[test]
+fn installed_verification_uses_captured_source_digest_after_source_removal() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let source = temporary.path().join("invoked-agent");
+    let installed = temporary.path().join("installed-agent");
+    let source_bytes = b"exact package executable payload";
+    std::fs::write(&source, source_bytes).expect("source executable should be writable");
+    let captured_bytes = std::fs::read(&source).expect("source executable should be captured");
+    let captured_digest = crate::package::sha256_bytes(&captured_bytes);
+    std::fs::write(&installed, captured_bytes).expect("captured executable should be installed");
+    std::fs::remove_file(&source).expect("source pathname should be removable");
+
+    crate::package::verify_installed_executable_against(&installed, &captured_digest)
+        .expect("installed verification must not reopen the removed source pathname");
 }
 
 #[test]
@@ -137,4 +163,54 @@ fn package_metadata_semantics_are_identical_with_crlf_checkout() {
             "f /run/memcordon-sealed-package.lock 0600 root root -",
         ]
     );
+}
+
+#[test]
+fn windows_final_root_removal_does_not_require_list_authority() {
+    let source = include_str!("../../src/bin/memcordon-sealed-agent/windows/package.rs");
+    let provider_removal = source_between(
+        source,
+        "fn remove_provider_state(",
+        "fn remove_file_if_present(",
+    );
+    assert!(
+        provider_removal.contains("remove_state_root_with_kernel_empty_proof(&state, context)?")
+    );
+    assert!(
+        !provider_removal
+            .contains("remove_directory_if_present(&state, StateDirectory::StateRoot, context)?")
+    );
+
+    let exact_removal = source_between(
+        source,
+        "enum ExactPathDirectoryRemovalFailure {",
+        "fn bounded_residual_inventory(",
+    );
+    assert!(exact_removal.contains("std::fs::symlink_metadata(path)"));
+    assert!(exact_removal.contains("FILE_ATTRIBUTE_REPARSE_POINT"));
+    assert!(exact_removal.contains("std::fs::remove_dir(path)"));
+    assert!(exact_removal.contains("ERROR_DIR_NOT_EMPTY"));
+    assert!(exact_removal.contains("ERROR_ACCESS_DENIED"));
+    assert!(exact_removal.contains("residual-present-but-not-enumerable"));
+    assert!(exact_removal.contains("access-denied"));
+    assert!(exact_removal.contains("inspection=kernel-empty-proof-no-list-authority"));
+    assert!(!exact_removal.contains("read_dir"));
+    assert!(!exact_removal.contains("bounded_residual_inventory"));
+    assert!(!source.contains("remove_dir_all"));
+}
+
+#[test]
+fn windows_fresh_rollback_and_uninstall_share_the_exact_root_removal() {
+    let source = include_str!("../../src/bin/memcordon-sealed-agent/windows/package.rs");
+    let fresh_rollback = source_between(source, "fn rollback_fresh_install(", "#[derive(Default)]");
+    let uninstall = source_between(source, "fn uninstall(", "fn scm_ownership_marker_present(");
+    let provider_files = source_between(
+        source,
+        "fn remove_provider_files(",
+        "pub(crate) fn remove_installed_binary_with_convergence(",
+    );
+
+    assert!(fresh_rollback.contains("remove_provider_files(ProviderRemovalContext"));
+    assert!(uninstall.contains("remove_provider_files(ProviderRemovalContext"));
+    assert!(provider_files.contains("remove_provider_state(context)?"));
 }

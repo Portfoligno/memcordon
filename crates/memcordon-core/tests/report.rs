@@ -100,6 +100,8 @@ fn typed_provider_rejection_round_trips_with_cleanup_proof() {
             sealed_boundary_retired: true,
             errors: Vec::new(),
         },
+        terminal_ack_required: false,
+        terminal_receipt: None,
     };
     let error = ExecutionErrorReport {
         category: "setup".to_owned(),
@@ -1099,6 +1101,8 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
         target_released: true,
         cleanup_attempted: true,
         restart_safety,
+        terminal_ack_required: false,
+        terminal_receipt: None,
     };
     let error = SupervisionErrorRecord {
         category: "spawn".to_owned(),
@@ -1156,6 +1160,8 @@ fn request_validation_provider_rejection_round_trips_in_schema_eight() {
         target_released: false,
         cleanup_attempted: false,
         restart_safety: RestartSafetyProof::default(),
+        terminal_ack_required: false,
+        terminal_receipt: None,
     };
     let error = SupervisionErrorRecord {
         category: "setup".to_owned(),

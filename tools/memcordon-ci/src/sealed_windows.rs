@@ -9,7 +9,7 @@ use memcordon_ci::command::{CommandSpec, git, rustup_cargo};
 use memcordon_ci::runtime_manifest::{RuntimeManifestV1, SealedRuntimeV1};
 use memcordon_ci::{CiError, Result};
 use memcordon_core::{
-    BoundaryMechanismEvidence, CredentialTransitionDisposition, MemcordonReport,
+    BoundaryClass, BoundaryMechanismEvidence, CredentialTransitionDisposition, MemcordonReport,
     WINDOWS_QUALIFICATION_SCHEMA_VERSION, WINDOWS_RELEASE_MUTANT_VARIANTS, WINDOWS_RELEASE_MUTANTS,
     WindowsAuthorityLossEvidenceV1, WindowsCertificationObservationsV1,
     WindowsMutantKillEvidenceV1, WindowsMutantObservationV1, WindowsQualificationReceiptV1,
@@ -25,7 +25,9 @@ use crate::release::{create_package_archives, extract_crate_source};
 const DEADLINE: Duration = Duration::from_secs(30 * 60);
 const REPORT_DIRECTORY: &str = "target/ci/reports/windows-sealed-v2";
 const WINDOWS_TESTS: &[&str] = &[
+    "fresh_qualification_failure_rollback_is_repeatable",
     "package_install_verify_probe_and_same_version_upgrade",
+    "stale_low_integrity_workspace_upgrade_and_uninstall_cleanup",
     "active_attempt_upgrade_and_uninstall_are_refused",
     "public_sealed_launch_preserves_status_and_native_evidence",
     "frontend_loss_retires_the_job_and_durable_record",
@@ -59,6 +61,7 @@ struct CertificationTest {
 struct WindowsRuntimeEvidence<'a> {
     qualification: &'a WindowsQualificationReceiptV1,
     public_launch: &'a MemcordonReport,
+    fresh_install_rollback_verified: bool,
     active_attempt_upgrade_refused: bool,
     active_attempt_uninstall_refused: bool,
     frontend_loss_record_retired: bool,
@@ -178,6 +181,7 @@ struct ChannelFingerprint {
     package_identity: Value,
     qualification_schema: u32,
     provider_identity: String,
+    qualification_receipt_digest: String,
     provider_protocol_schema: u32,
     execution_report_schema: u32,
     boundary_evidence_schema: u32,
@@ -188,6 +192,7 @@ struct ChannelFingerprint {
 pub fn certify(root: &Path, stable: &str) -> Result<()> {
     require_windows()?;
     require_native_architecture()?;
+    certify_qualification_preflight_regressions(root, stable)?;
     let native = native_channel_binaries(root, stable)?;
     let reports = report_directory(root);
     if reports.exists() {
@@ -196,6 +201,10 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
     fs::create_dir_all(&reports)?;
     let agent = native.root.join("memcordon-sealed-agent.exe");
     let cli = native.root.join("memcordon.exe");
+    let bootstrap = native.root.join("memcordon-target-desktop-bootstrap.exe");
+    let session_broker = native.root.join("memcordon-session-broker.exe");
+    verify_target_desktop_bootstrap(&bootstrap)?;
+    verify_session_broker(&session_broker)?;
     let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
         .map_err(|error| CiError::Message(format!("git commit identity was not UTF-8: {error}")))?;
     let commit = commit.trim_end_matches(['\r', '\n']);
@@ -203,9 +212,8 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
     let package =
         run_json(&CommandSpec::new(&agent, root, DEADLINE).args(["package", "inspect", "--json"]))?;
     write_json(&reports.join("windows-package-inspection.json"), &package)?;
-    CommandSpec::new(&agent, root, DEADLINE)
-        .args(["package", "install", "--ephemeral-ci"])
-        .run()?;
+    certify_cold_install(root, &agent)?;
+    let fresh_install_rollback_verified = certify_fresh_install_rollback(root, &agent)?;
     let installed =
         run_json(&CommandSpec::new(&agent, root, DEADLINE).args(["package", "verify", "--json"]))?;
     write_json(&reports.join("windows-installed-provider.json"), &installed)?;
@@ -256,6 +264,7 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
         "sealed",
     ]))?;
 
+    seed_retired_certification_workspace(root, &agent)?;
     CommandSpec::new(&agent, root, DEADLINE)
         .args(["package", "upgrade", "--ephemeral-ci"])
         .run()?;
@@ -293,9 +302,16 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
         .args(arguments)
         .run()?;
     let public_launch: MemcordonReport = serde_json::from_slice(&fs::read(&public_report_path)?)?;
-    validate_public_launch(&public_launch)?;
-    let status_matrix =
-        certify_status_matrix(root, &cli, &agent, &reports, &fault_matrix, &public_launch)?;
+    validate_public_launch(&public_launch, &qualification)?;
+    let status_matrix = certify_status_matrix(
+        root,
+        &cli,
+        &agent,
+        &reports,
+        &fault_matrix,
+        &public_launch,
+        &qualification,
+    )?;
 
     write_auxiliary_reports(
         &reports,
@@ -308,24 +324,28 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
         &public_launch,
     )?;
 
+    seed_retired_certification_workspace(root, &agent)?;
     CommandSpec::new(&agent, root, DEADLINE)
         .args(["package", "uninstall", "--ephemeral-ci"])
         .run()?;
-    certify_production_lifecycle(root, &agent, &cli, &reports)?;
+    let stale_workspace_cleanup_verified = provider_state_absent(root, &agent)?;
+    certify_production_lifecycle(root, &agent, &cli, &reports, &qualification)?;
     let provider_state_removed = provider_state_absent(root, &agent)?;
     if !provider_state_removed {
         return Err(CiError::Message(
             "Windows package uninstall left provider files or state".to_owned(),
         ));
     }
-    let tests = certification_test_results(
-        &qualification,
-        &public_launch,
+    let tests = certification_test_results(CertificationTestContext {
+        qualification: &qualification,
+        public_launch: &public_launch,
+        fresh_install_rollback_verified,
+        stale_workspace_cleanup_verified,
         upgrade_refused,
         uninstall_refused,
         provider_state_removed,
-        native.target.is_some(),
-    )?;
+        native_archive_bound: native.target.is_some(),
+    })?;
     let summary = CertificationSummary {
         schema: 2,
         backend: "windows-job-object-v2",
@@ -341,6 +361,7 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
         runtime: WindowsRuntimeEvidence {
             qualification: &qualification,
             public_launch: &public_launch,
+            fresh_install_rollback_verified,
             active_attempt_upgrade_refused: upgrade_refused,
             active_attempt_uninstall_refused: uninstall_refused,
             frontend_loss_record_retired: qualification.frontend_loss_cleanup_verified,
@@ -358,6 +379,215 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
         fs::remove_file(active_report)?;
     }
     Ok(())
+}
+
+fn certify_qualification_preflight_regressions(root: &Path, stable: &str) -> Result<()> {
+    rustup_cargo(
+        root,
+        stable,
+        [
+            "test",
+            "--locked",
+            "--target-dir",
+            "target/ci/windows-sealed",
+            "--package",
+            "memcordon",
+            "--test",
+            "sealed_agent",
+            "windows_token::qualification_fixture_snapshots_and_canaries_are_prepared_before_impersonation",
+            "--",
+            "--exact",
+        ],
+        DEADLINE,
+    )
+    .run()?;
+    rustup_cargo(
+        root,
+        stable,
+        [
+            "test",
+            "--locked",
+            "--target-dir",
+            "target/ci/windows-sealed",
+            "--package",
+            "memcordon",
+            "--test",
+            "sealed_agent",
+            "windows_security::target_desktop_bootstrap_peer_exit_diagnostic_preserves_operation_and_status",
+            "--",
+            "--exact",
+        ],
+        DEADLINE,
+    )
+    .run()?;
+    rustup_cargo(
+        root,
+        stable,
+        [
+            "test",
+            "--locked",
+            "--target-dir",
+            "target/ci/windows-sealed",
+            "--package",
+            "memcordon",
+            "--test",
+            "sealed_agent",
+            "windows_security::desktop_resultant_sacl_auto_inherited_is_the_only_user_object_exception",
+            "--",
+            "--exact",
+        ],
+        DEADLINE,
+    )
+    .run()?;
+    rustup_cargo(
+        root,
+        stable,
+        [
+            "test",
+            "--locked",
+            "--target-dir",
+            "target/ci/windows-sealed",
+            "--package",
+            "memcordon",
+            "--test",
+            "sealed_agent",
+            "windows_security::target_user_object_policy_fingerprint_is_canonical_and_label_bound",
+            "--",
+            "--exact",
+        ],
+        DEADLINE,
+    )
+    .run()?;
+    rustup_cargo(
+        root,
+        stable,
+        [
+            "test",
+            "--locked",
+            "--target-dir",
+            "target/ci/windows-sealed",
+            "--package",
+            "memcordon",
+            "--test",
+            "sealed_agent",
+            "windows_security::target_user_object_resultant_fingerprint_keeps_the_desktop_exception_narrow",
+            "--",
+            "--exact",
+        ],
+        DEADLINE,
+    )
+    .run()?;
+    Ok(())
+}
+
+fn certify_fresh_install_rollback(root: &Path, agent: &Path) -> Result<bool> {
+    const STRESS_ITERATIONS: u32 = 20;
+    const INJECTED: &str =
+        "MCSEALED-WINDOWS-CERTIFICATION-FAULT: injected fresh qualification rollback";
+    const BROKER_INJECTED: &str =
+        "MCSEALED-WINDOWS-CERTIFICATION-FAULT: injected session-broker configuration fault after";
+    for operation in [
+        "install-broker-registration-rollback-certification",
+        "install-broker-privileges-rollback-certification",
+        "install-broker-sid-rollback-certification",
+        "install-broker-failure-actions-rollback-certification",
+        "install-broker-security-rollback-certification",
+    ] {
+        let output = CommandSpec::new(agent, root, DEADLINE)
+            .args(["package", operation, "--ephemeral-ci"])
+            .output()?;
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        if output.status.success()
+            || !diagnostic.contains(BROKER_INJECTED)
+            || diagnostic.contains("MCSEALED-WINDOWS-INSTALL-ROLLBACK-FAILED")
+        {
+            return Err(CiError::Message(format!(
+                "Windows session-broker rollback fault {operation} had an invalid result: status={:?} stderr={diagnostic}",
+                output.status.code()
+            )));
+        }
+        if !provider_state_absent(root, agent)? {
+            return Err(CiError::Message(format!(
+                "Windows session-broker rollback fault {operation} left provider residue"
+            )));
+        }
+    }
+    for iteration in 0..STRESS_ITERATIONS {
+        let output = CommandSpec::new(agent, root, DEADLINE)
+            .args([
+                "package",
+                "install-rollback-certification",
+                "--ephemeral-ci",
+            ])
+            .output()?;
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        if output.status.success()
+            || !diagnostic.contains(INJECTED)
+            || diagnostic.contains("MCSEALED-WINDOWS-INSTALL-ROLLBACK-FAILED")
+        {
+            return Err(CiError::Message(format!(
+                "Windows fresh-install rollback fault iteration {iteration} had an invalid result: status={:?} stderr={diagnostic}",
+                output.status.code()
+            )));
+        }
+        if !provider_state_absent(root, agent)? {
+            return Err(CiError::Message(format!(
+                "Windows fresh-install rollback fault iteration {iteration} left provider residue"
+            )));
+        }
+    }
+    CommandSpec::new(agent, root, DEADLINE)
+        .args(["package", "install", "--ephemeral-ci"])
+        .run()?;
+    Ok(true)
+}
+
+fn certify_cold_install(root: &Path, agent: &Path) -> Result<()> {
+    CommandSpec::new(agent, root, DEADLINE)
+        .args(["package", "install", "--ephemeral-ci"])
+        .run()?;
+    let qualification: WindowsQualificationReceiptV1 = serde_json::from_value(run_json(
+        &CommandSpec::new(agent, root, DEADLINE).arg("qualify"),
+    )?)?;
+    if !qualification.qualified || !qualification.is_consistent() {
+        return Err(CiError::Message(
+            "cold Windows target desktop bootstrap qualification is incomplete".to_owned(),
+        ));
+    }
+    CommandSpec::new(agent, root, DEADLINE)
+        .args(["package", "uninstall", "--ephemeral-ci"])
+        .run()?;
+    if !provider_state_absent(root, agent)? {
+        return Err(CiError::Message(
+            "cold Windows target desktop bootstrap qualification left provider residue".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_target_desktop_bootstrap(path: &Path) -> Result<()> {
+    let bytes = fs::read(path)?;
+    memcordon_core::verify_target_desktop_bootstrap_pe(&bytes)
+        .map(|_| ())
+        .map_err(CiError::Message)
+}
+
+fn verify_session_broker(path: &Path) -> Result<()> {
+    let bytes = fs::read(path)?;
+    memcordon_core::verify_session_broker_pe(&bytes)
+        .map(|_| ())
+        .map_err(CiError::Message)
+}
+
+fn seed_retired_certification_workspace(root: &Path, agent: &Path) -> Result<()> {
+    CommandSpec::new(agent, root, DEADLINE)
+        .args([
+            "package",
+            "seed-retired-certification-workspace",
+            "--ephemeral-ci",
+        ])
+        .run()
+        .map(|_| ())
 }
 
 fn collect_mutant_kill_evidence(root: &Path, agent: &Path) -> Result<WindowsMutantKillEvidenceV1> {
@@ -429,14 +659,30 @@ fn collect_mutant_kill_evidence(root: &Path, agent: &Path) -> Result<WindowsMuta
     Ok(evidence)
 }
 
-fn certification_test_results(
-    qualification: &WindowsQualificationReceiptV1,
-    public_launch: &MemcordonReport,
+struct CertificationTestContext<'a> {
+    qualification: &'a WindowsQualificationReceiptV1,
+    public_launch: &'a MemcordonReport,
+    fresh_install_rollback_verified: bool,
+    stale_workspace_cleanup_verified: bool,
     upgrade_refused: bool,
     uninstall_refused: bool,
     provider_state_removed: bool,
     native_archive_bound: bool,
+}
+
+fn certification_test_results(
+    context: CertificationTestContext<'_>,
 ) -> Result<Vec<CertificationTest>> {
+    let CertificationTestContext {
+        qualification,
+        public_launch,
+        fresh_install_rollback_verified,
+        stale_workspace_cleanup_verified,
+        upgrade_refused,
+        uninstall_refused,
+        provider_state_removed,
+        native_archive_bound,
+    } = context;
     let attempt = public_launch
         .attempts
         .last()
@@ -450,9 +696,11 @@ fn certification_test_results(
         }
     };
     let observed = [
+        fresh_install_rollback_verified,
         qualification.qualified,
+        stale_workspace_cleanup_verified,
         upgrade_refused && uninstall_refused,
-        validate_public_launch(public_launch).is_ok(),
+        validate_public_launch(public_launch, qualification).is_ok(),
         qualification.frontend_loss_cleanup_verified,
         provider_state_removed,
         qualification.active_processes_zero_verified,
@@ -505,6 +753,7 @@ fn certify_production_lifecycle(
     agent: &Path,
     cli: &Path,
     reports: &Path,
+    qualification: &WindowsQualificationReceiptV1,
 ) -> Result<()> {
     CommandSpec::new(agent, root, DEADLINE)
         .args(["package", "install"])
@@ -532,7 +781,7 @@ fn certify_production_lifecycle(
         ])
         .run()?;
     let report: MemcordonReport = serde_json::from_slice(&fs::read(&report_path)?)?;
-    validate_public_launch(&report)?;
+    validate_public_launch(&report, qualification)?;
     fs::remove_file(report_path)?;
     CommandSpec::new(agent, root, DEADLINE)
         .args(["package", "upgrade"])
@@ -555,16 +804,20 @@ fn certify_status_matrix(
     reports: &Path,
     fault_matrix: &WindowsCertificationObservationsV1,
     public_launch: &MemcordonReport,
+    qualification: &WindowsQualificationReceiptV1,
 ) -> Result<StatusMatrixEvidence> {
+    let runner = StatusScenarioRunner {
+        root,
+        cli,
+        agent,
+        reports,
+        qualification,
+    };
     let mut ordinary_exit_codes = Vec::with_capacity(usize::from(u8::MAX) + 1);
     for code in u8::MIN..=u8::MAX {
-        let outcome = run_status_scenario_args(
-            root,
-            cli,
-            reports,
+        let outcome = runner.run_args(
             &format!("exit-{code}"),
             None,
-            agent,
             &[
                 OsString::from("windows-certification-exit"),
                 OsString::from(code.to_string()),
@@ -582,54 +835,16 @@ fn certify_status_matrix(
             }
         }
     }
-    let deadline = run_status_scenario(
-        root,
-        cli,
-        agent,
-        reports,
-        "deadline",
-        Some("+100ms"),
-        "windows-certification-hold",
-    )?;
-    let memory = run_status_scenario(
-        root,
-        cli,
-        agent,
-        reports,
-        "memory",
-        Some("+8MiB"),
-        "windows-certification-memory",
-    )?;
-    let ntstatus = run_status_scenario(
-        root,
-        cli,
-        agent,
-        reports,
-        "ntstatus",
-        None,
-        "windows-certification-ntstatus",
-    )?;
-    let orphan = run_status_scenario(
-        root,
-        cli,
-        agent,
-        reports,
-        "orphan",
-        None,
-        "windows-certification-orphan",
-    )?;
+    let deadline = runner.run("deadline", Some("+100ms"), "windows-certification-hold")?;
+    let memory = runner.run("memory", Some("+8MiB"), "windows-certification-memory")?;
+    let ntstatus = runner.run("ntstatus", None, "windows-certification-ntstatus")?;
+    let orphan = runner.run("orphan", None, "windows-certification-orphan")?;
     let missing = reports.join("windows-certification-missing.exe");
-    let command_not_found =
-        run_spawn_failure_scenario(root, cli, reports, "command-not-found", &missing)?;
+    let command_not_found = runner.run_spawn_failure("command-not-found", &missing)?;
     let non_executable = reports.join("windows-certification-non-executable.txt");
     fs::write(&non_executable, b"not a Windows executable\n")?;
-    let command_not_executable = run_spawn_failure_scenario(
-        root,
-        cli,
-        reports,
-        "command-not-executable",
-        &non_executable,
-    )?;
+    let command_not_executable =
+        runner.run_spawn_failure("command-not-executable", &non_executable)?;
     fs::remove_file(non_executable)?;
     let public_report = serde_json::to_vec(public_launch)?;
     let mut truncated = public_report.clone();
@@ -723,87 +938,82 @@ fn status_matrix_is_complete(evidence: &StatusMatrixEvidence) -> bool {
         && evidence.report_consistency_verified
 }
 
-fn run_status_scenario(
-    root: &Path,
-    cli: &Path,
-    agent: &Path,
-    reports: &Path,
-    name: &str,
-    budget: Option<&str>,
-    target_command: &str,
-) -> Result<memcordon_core::RunOutcome> {
-    run_status_scenario_args(
-        root,
-        cli,
-        reports,
-        name,
-        budget,
-        agent,
-        &[OsString::from(target_command)],
-    )
+struct StatusScenarioRunner<'a> {
+    root: &'a Path,
+    cli: &'a Path,
+    agent: &'a Path,
+    reports: &'a Path,
+    qualification: &'a WindowsQualificationReceiptV1,
 }
 
-fn run_status_scenario_args(
-    root: &Path,
-    cli: &Path,
-    reports: &Path,
-    name: &str,
-    budget: Option<&str>,
-    target_program: &Path,
-    target_arguments: &[OsString],
-) -> Result<memcordon_core::RunOutcome> {
-    let report_path = reports.join(format!("status-{name}.json"));
-    let mut arguments = Vec::new();
-    if let Some(budget) = budget {
-        arguments.push(OsString::from(budget));
+impl StatusScenarioRunner<'_> {
+    fn run(
+        &self,
+        name: &str,
+        budget: Option<&str>,
+        target_command: &str,
+    ) -> Result<memcordon_core::RunOutcome> {
+        self.run_args(name, budget, &[OsString::from(target_command)])
     }
-    arguments.extend([
-        OsString::from("--sealed"),
-        OsString::from("--report"),
-        report_path.as_os_str().to_os_string(),
-        OsString::from("--"),
-        target_program.as_os_str().to_os_string(),
-    ]);
-    arguments.extend(target_arguments.iter().cloned());
-    let _ = CommandSpec::new(cli, root, DEADLINE)
-        .args(arguments)
-        .output()?;
-    let report: MemcordonReport = serde_json::from_slice(&fs::read(&report_path)?)?;
-    validate_public_launch(&report)?;
-    let outcome = report
-        .attempts
-        .last()
-        .and_then(|attempt| attempt.outcome.clone())
-        .ok_or_else(|| CiError::Message(format!("Windows {name} report has no outcome")))?;
-    fs::remove_file(report_path)?;
-    Ok(outcome)
-}
 
-fn run_spawn_failure_scenario(
-    root: &Path,
-    cli: &Path,
-    reports: &Path,
-    name: &str,
-    target_program: &Path,
-) -> Result<memcordon_core::SupervisionErrorRecord> {
-    let report_path = reports.join(format!("status-{name}.json"));
-    let _ = CommandSpec::new(cli, root, DEADLINE)
-        .args([
+    fn run_args(
+        &self,
+        name: &str,
+        budget: Option<&str>,
+        target_arguments: &[OsString],
+    ) -> Result<memcordon_core::RunOutcome> {
+        let report_path = self.reports.join(format!("status-{name}.json"));
+        let mut arguments = Vec::new();
+        if let Some(budget) = budget {
+            arguments.push(OsString::from(budget));
+        }
+        arguments.extend([
             OsString::from("--sealed"),
             OsString::from("--report"),
             report_path.as_os_str().to_os_string(),
             OsString::from("--"),
-            target_program.as_os_str().to_os_string(),
-        ])
-        .output()?;
-    let report: MemcordonReport = serde_json::from_slice(&fs::read(&report_path)?)?;
-    let error = report
-        .attempts
-        .last()
-        .and_then(|attempt| attempt.error.clone())
-        .ok_or_else(|| CiError::Message(format!("Windows {name} report has no typed error")))?;
-    fs::remove_file(report_path)?;
-    Ok(error)
+            self.agent.as_os_str().to_os_string(),
+        ]);
+        arguments.extend(target_arguments.iter().cloned());
+        let _ = CommandSpec::new(self.cli, self.root, DEADLINE)
+            .args(arguments)
+            .output()?;
+        let report: MemcordonReport = serde_json::from_slice(&fs::read(&report_path)?)?;
+        validate_public_launch(&report, self.qualification)?;
+        let outcome = report
+            .attempts
+            .last()
+            .and_then(|attempt| attempt.outcome.clone())
+            .ok_or_else(|| CiError::Message(format!("Windows {name} report has no outcome")))?;
+        fs::remove_file(report_path)?;
+        Ok(outcome)
+    }
+
+    fn run_spawn_failure(
+        &self,
+        name: &str,
+        target_program: &Path,
+    ) -> Result<memcordon_core::SupervisionErrorRecord> {
+        let report_path = self.reports.join(format!("status-{name}.json"));
+        let _ = CommandSpec::new(self.cli, self.root, DEADLINE)
+            .args([
+                OsString::from("--sealed"),
+                OsString::from("--report"),
+                report_path.as_os_str().to_os_string(),
+                OsString::from("--"),
+                target_program.as_os_str().to_os_string(),
+            ])
+            .output()?;
+        let report: MemcordonReport = serde_json::from_slice(&fs::read(&report_path)?)?;
+        validate_public_qualification_binding(&report, self.qualification)?;
+        let error = report
+            .attempts
+            .last()
+            .and_then(|attempt| attempt.error.clone())
+            .ok_or_else(|| CiError::Message(format!("Windows {name} report has no typed error")))?;
+        fs::remove_file(report_path)?;
+        Ok(error)
+    }
 }
 
 pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
@@ -861,6 +1071,16 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
     .run()?;
     let agent = install_root.join("bin").join("memcordon-sealed-agent.exe");
     let cli = install_root.join("bin").join("memcordon.exe");
+    verify_target_desktop_bootstrap(
+        &install_root
+            .join("bin")
+            .join("memcordon-target-desktop-bootstrap.exe"),
+    )?;
+    verify_session_broker(
+        &install_root
+            .join("bin")
+            .join("memcordon-session-broker.exe"),
+    )?;
     let cargo_fingerprint = channel_smoke(root, &agent, &cli, &channel)?;
     let native_fingerprint = fingerprint_from_reports(&report_directory(root))?;
     if cargo_fingerprint != native_fingerprint {
@@ -901,6 +1121,10 @@ fn write_packaged_source_configuration(sources: &Path, core: &Path, platform: &P
     patch_table.insert("crates-io".to_owned(), toml::Value::Table(crates_io));
     let mut configuration = toml::Table::new();
     configuration.insert("patch".to_owned(), toml::Value::Table(patch_table));
+    configuration.insert(
+        "target".to_owned(),
+        windows_static_crt_target_configuration(),
+    );
     fs::write(
         cargo_configuration.join("config.toml"),
         toml::to_string(&toml::Value::Table(configuration)).map_err(|error| {
@@ -910,6 +1134,22 @@ fn write_packaged_source_configuration(sources: &Path, core: &Path, platform: &P
         })?,
     )?;
     Ok(())
+}
+
+fn windows_static_crt_target_configuration() -> toml::Value {
+    let rustflags = || {
+        toml::Value::Array(vec![
+            toml::Value::String("-C".to_owned()),
+            toml::Value::String("target-feature=+crt-static".to_owned()),
+        ])
+    };
+    let mut targets = toml::Table::new();
+    for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+        let mut specification = toml::Table::new();
+        specification.insert("rustflags".to_owned(), rustflags());
+        targets.insert(target.to_owned(), toml::Value::Table(specification));
+    }
+    toml::Value::Table(targets)
 }
 
 struct NativeChannel {
@@ -1113,7 +1353,7 @@ fn channel_smoke(
         ])
         .run()?;
     let report: MemcordonReport = serde_json::from_slice(&fs::read(&report_path)?)?;
-    validate_public_launch(&report)?;
+    validate_public_launch(&report, &qualification)?;
     let fingerprint = channel_fingerprint(package, &qualification, &report)?;
     CommandSpec::new(agent, root, DEADLINE)
         .args(["package", "uninstall", "--ephemeral-ci"])
@@ -1148,6 +1388,7 @@ fn channel_fingerprint(
     qualification: &WindowsQualificationReceiptV1,
     report: &MemcordonReport,
 ) -> Result<ChannelFingerprint> {
+    validate_public_launch(report, qualification)?;
     package
         .as_object_mut()
         .ok_or_else(|| CiError::Message("Windows package inspection is not an object".to_owned()))?
@@ -1165,6 +1406,7 @@ fn channel_fingerprint(
         package_identity: package,
         qualification_schema: qualification.schema_version,
         provider_identity: qualification.provider_identity.clone(),
+        qualification_receipt_digest: qualification_receipt_digest(qualification)?,
         provider_protocol_schema: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
         execution_report_schema: memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
         boundary_evidence_schema: native.schema_version,
@@ -1319,7 +1561,46 @@ fn wait_for_attempt_state(
     }
 }
 
-fn validate_public_launch(report: &MemcordonReport) -> Result<()> {
+fn qualification_receipt_digest(qualification: &WindowsQualificationReceiptV1) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
+        qualification,
+    )?)))
+}
+
+fn validate_public_qualification_binding(
+    report: &MemcordonReport,
+    qualification: &WindowsQualificationReceiptV1,
+) -> Result<()> {
+    if !qualification.qualified || !qualification.is_consistent() {
+        return Err(CiError::Message(
+            "Windows sealed launch qualification is incomplete or contradictory".to_owned(),
+        ));
+    }
+    let backend = report.backend.as_ref().ok_or_else(|| {
+        CiError::Message("Windows sealed launch has no backend capability".to_owned())
+    })?;
+    let binding = backend.boundary_qualification.as_ref().ok_or_else(|| {
+        CiError::Message("Windows sealed launch has no qualification binding".to_owned())
+    })?;
+    if backend.name != "windows-job-object"
+        || backend.boundary.class != BoundaryClass::Sealed
+        || backend.boundary.mechanism != "windows-job-object-v2"
+        || binding.provider_identity != qualification.provider_identity
+        || binding.receipt_digest != qualification_receipt_digest(qualification)?
+        || binding.mechanism != "windows-job-object-v2"
+    {
+        return Err(CiError::Message(
+            "Windows sealed launch backend and qualification binding are inconsistent".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_launch(
+    report: &MemcordonReport,
+    qualification: &WindowsQualificationReceiptV1,
+) -> Result<()> {
+    validate_public_qualification_binding(report, qualification)?;
     let attempt = report.attempts.last().ok_or_else(|| {
         CiError::Message("Windows sealed launch has no attempt evidence".to_owned())
     })?;

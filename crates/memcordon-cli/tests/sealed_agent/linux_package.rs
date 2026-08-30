@@ -417,7 +417,7 @@ fn sealed_package_uninstall_refuses_live_authenticated_attempt() {
     );
     assert!(std::path::Path::new(AGENT).exists());
     let retained = Command::new(AGENT)
-        .args(["package", "verify"])
+        .args(["package", "verify", "--json"])
         .output()
         .unwrap();
     assert!(
@@ -427,8 +427,27 @@ fn sealed_package_uninstall_refuses_live_authenticated_attempt() {
         String::from_utf8_lossy(&retained.stdout),
         String::from_utf8_lossy(&retained.stderr)
     );
-    assert!(retained.stdout.is_empty());
     assert!(retained.stderr.is_empty());
+    let inspection: serde_json::Value = serde_json::from_slice(&retained.stdout)
+        .expect("retained installed-provider inspection should be JSON");
+    assert_eq!(inspection["schema_version"], 3);
+    assert_eq!(inspection["installed_artifacts_valid"], true);
+    assert_eq!(inspection["provider_reachable"], true);
+    assert_eq!(inspection["qualification_complete"], true);
+    assert_eq!(
+        inspection["installed_executable_sha256"],
+        inspection["agent"]["executable_sha256"]
+    );
+    let provider_identity = inspection["provider_identity"]
+        .as_str()
+        .expect("retained provider identity should be present");
+    assert!(!provider_identity.is_empty());
+    assert_eq!(inspection["agent"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        inspection["agent"]["mechanism"],
+        "linux-pid-namespace-cgroup-v2"
+    );
+    assert_eq!(inspection["agent"]["platform"], "linux-systemd");
     live_record.record.take().unwrap().retire().unwrap();
     assert!(!record_path.exists());
     let probe = Command::new(AGENT).arg("probe").output().unwrap();

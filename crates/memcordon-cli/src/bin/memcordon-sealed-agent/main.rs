@@ -32,6 +32,9 @@ Provider installation and mutation require root. Inspection is credential-free.
 ";
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    let entry_thread_token_transition =
+        windows::token::revert_entry_thread_token().unwrap_or_else(|_| std::process::abort());
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
     let result = match arguments.as_slice() {
         [command] if command == "--version" || command == "-V" => {
@@ -51,8 +54,16 @@ fn main() {
         #[cfg(target_os = "windows")]
         [command] if command == "windows-launcher" => windows::launcher(),
         #[cfg(target_os = "windows")]
+        [command, slot] if command == "windows-guardian-service" => windows::guardian_service(slot),
+        #[cfg(target_os = "windows")]
         [command, guardian_arguments @ ..] if command == "windows-guardian" => {
-            windows::guardian(guardian_arguments)
+            match windows::guardian(guardian_arguments) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code() as i32);
+                }
+            }
         }
         #[cfg(target_os = "windows")]
         [command] if command == "windows-certification-hold" => {
@@ -170,9 +181,22 @@ fn main() {
             windows::qualification::certification_nested_target_canary(canary_handles)
         }
         #[cfg(target_os = "windows")]
-        [command] if command == "windows-certification-delay" => {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            Ok(())
+        [
+            command,
+            receipt,
+            attempt_binding,
+            stdin,
+            stdout,
+            stderr,
+            session,
+        ] if command == "windows-certification-nested-child" => {
+            windows::qualification::certification_nested_child(
+                &entry_thread_token_transition,
+                receipt,
+                attempt_binding,
+                [stdin, stdout, stderr],
+                session,
+            )
         }
         [package, operation] if package == "package" => package::run(operation, false, false),
         [package, operation, option] if package == "package" && option == "--json" => {

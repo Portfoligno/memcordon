@@ -186,18 +186,39 @@ enum AgentPackagePlatform {
     WindowsService {
         control_service_name: String,
         launcher_service_name: String,
+        session_broker_service_name: String,
+        guardian_slot_count: usize,
         control_service_config_sha256: String,
         launcher_service_config_sha256: String,
+        session_broker_service_config_sha256: String,
+        guardian_slot_config_sha256: String,
         control_pipe: String,
         launcher_pipe: String,
+        session_broker_pipe: String,
+        guardian_pipe_prefix: String,
         binary_install_path: String,
+        target_desktop_bootstrap_install_path: String,
+        target_desktop_bootstrap_sha256: String,
+        target_desktop_bootstrap_crt_static: bool,
+        target_desktop_bootstrap_normal_imports: Vec<String>,
+        target_desktop_bootstrap_delayed_imports: Vec<String>,
+        target_desktop_bootstrap_loader_contract_sha256: String,
+        session_broker_install_path: String,
+        session_broker_sha256: String,
         state_root: String,
         control_service_sid_type: String,
         launcher_service_sid_type: String,
+        session_broker_service_sid_type: String,
+        guardian_slot_service_sid_type: String,
         control_required_privileges: Vec<String>,
         launcher_required_privileges: Vec<String>,
+        session_broker_required_privileges: Vec<String>,
+        guardian_slot_required_privileges: Vec<String>,
         control_pipe_security_sha256: String,
         launcher_pipe_security_sha256: String,
+        session_broker_service_security_sha256: String,
+        session_broker_pipe_security_sha256: String,
+        guardian_pipe_security_contract_sha256: String,
         install_directory_security_sha256: String,
         state_directory_security_sha256: String,
     },
@@ -1250,18 +1271,39 @@ fn validate_agent_package_inspection(
         AgentPackagePlatform::WindowsService {
             control_service_name,
             launcher_service_name,
+            session_broker_service_name,
+            guardian_slot_count,
             control_service_config_sha256,
             launcher_service_config_sha256,
+            session_broker_service_config_sha256,
+            guardian_slot_config_sha256,
             control_pipe,
             launcher_pipe,
+            session_broker_pipe,
+            guardian_pipe_prefix,
             binary_install_path,
+            target_desktop_bootstrap_install_path,
+            target_desktop_bootstrap_sha256,
+            target_desktop_bootstrap_crt_static,
+            target_desktop_bootstrap_normal_imports,
+            target_desktop_bootstrap_delayed_imports,
+            target_desktop_bootstrap_loader_contract_sha256,
+            session_broker_install_path,
+            session_broker_sha256,
             state_root,
             control_service_sid_type,
             launcher_service_sid_type,
+            session_broker_service_sid_type,
+            guardian_slot_service_sid_type,
             control_required_privileges,
             launcher_required_privileges,
+            session_broker_required_privileges,
+            guardian_slot_required_privileges,
             control_pipe_security_sha256,
             launcher_pipe_security_sha256,
+            session_broker_service_security_sha256,
+            session_broker_pipe_security_sha256,
+            guardian_pipe_security_contract_sha256,
             install_directory_security_sha256,
             state_directory_security_sha256,
         } => {
@@ -1269,19 +1311,49 @@ fn validate_agent_package_inspection(
                 && inspection.mechanism == "windows-job-object-v2"
                 && control_service_name == "MemCordonSealedControl"
                 && launcher_service_name == "MemCordonSealedLauncher"
+                && session_broker_service_name == "MemCordonSealedSessionBroker"
+                && *guardian_slot_count == memcordon_core::WINDOWS_GUARDIAN_SLOT_COUNT
                 && control_pipe == r"\\.\pipe\memcordon-sealed-agent-v1"
                 && launcher_pipe == r"\\.\pipe\memcordon-sealed-launcher-v1"
+                && session_broker_pipe == r"\\.\pipe\memcordon-sealed-session-broker-v1"
+                && guardian_pipe_prefix == memcordon_core::WINDOWS_GUARDIAN_PIPE_PREFIX
                 && !binary_install_path.is_empty()
+                && !target_desktop_bootstrap_install_path.is_empty()
+                && target_desktop_bootstrap_sha256.len() == Sha256::output_size() * 2
+                && target_desktop_bootstrap_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+                && *target_desktop_bootstrap_crt_static
+                && !target_desktop_bootstrap_normal_imports.is_empty()
+                && target_desktop_bootstrap_normal_imports.is_sorted()
+                && target_desktop_bootstrap_delayed_imports.is_sorted()
+                && valid_digest(target_desktop_bootstrap_loader_contract_sha256)
+                && !session_broker_install_path.is_empty()
+                && valid_digest(session_broker_sha256)
                 && !state_root.is_empty()
                 && control_service_sid_type == "restricted"
                 && launcher_service_sid_type == "restricted"
+                && session_broker_service_sid_type == "unrestricted"
+                && guardian_slot_service_sid_type == "restricted"
                 && !control_required_privileges.is_empty()
                 && !launcher_required_privileges.is_empty()
+                && session_broker_required_privileges
+                    == &[
+                        "SeAssignPrimaryTokenPrivilege",
+                        "SeIncreaseQuotaPrivilege",
+                        "SeTcbPrivilege",
+                    ]
+                && guardian_slot_required_privileges.is_empty()
                 && [
                     control_service_config_sha256,
                     launcher_service_config_sha256,
+                    session_broker_service_config_sha256,
+                    guardian_slot_config_sha256,
                     control_pipe_security_sha256,
                     launcher_pipe_security_sha256,
+                    session_broker_service_security_sha256,
+                    session_broker_pipe_security_sha256,
+                    guardian_pipe_security_contract_sha256,
                     install_directory_security_sha256,
                     state_directory_security_sha256,
                 ]
@@ -1289,7 +1361,7 @@ fn validate_agent_package_inspection(
                 .all(valid_digest)
         }
     };
-    if inspection.schema_version != 2
+    if inspection.schema_version != 3
         || inspection.version != expected_version
         || inspection.source_commit != expected_source_commit
         || inspection.execution_report_schema != memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION
@@ -1371,6 +1443,10 @@ fn smoke_packaged_memcordon_install(
     patch_table.insert("crates-io".to_owned(), toml::Value::Table(crates_io));
     let mut configuration = toml::Table::new();
     configuration.insert("patch".to_owned(), toml::Value::Table(patch_table));
+    configuration.insert(
+        "target".to_owned(),
+        windows_static_crt_target_configuration(),
+    );
     fs::write(
         cargo_configuration.join("config.toml"),
         toml::to_string(&toml::Value::Table(configuration)).map_err(|error| {
@@ -1461,6 +1537,22 @@ fn smoke_packaged_memcordon_install(
     Ok(())
 }
 
+fn windows_static_crt_target_configuration() -> toml::Value {
+    let rustflags = || {
+        toml::Value::Array(vec![
+            toml::Value::String("-C".to_owned()),
+            toml::Value::String("target-feature=+crt-static".to_owned()),
+        ])
+    };
+    let mut targets = toml::Table::new();
+    for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+        let mut specification = toml::Table::new();
+        specification.insert("rustflags".to_owned(), rustflags());
+        targets.insert(target.to_owned(), toml::Value::Table(specification));
+    }
+    toml::Value::Table(targets)
+}
+
 fn host_target(targets: &[AssetTarget]) -> Result<&AssetTarget> {
     let wanted = config::release_target_id_for_host(std::env::consts::OS, std::env::consts::ARCH)?;
     targets
@@ -1523,6 +1615,8 @@ fn runtime_component_id(role: RuntimeComponentRole) -> &'static str {
     match role {
         RuntimeComponentRole::PublicCli => "public-cli",
         RuntimeComponentRole::SealedAgent => "sealed-agent",
+        RuntimeComponentRole::DesktopBootstrap => "target-desktop-bootstrap",
+        RuntimeComponentRole::SessionBroker => "session-broker",
     }
 }
 
@@ -1557,7 +1651,7 @@ fn runtime_manifest(
             execution_report_schema: memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
             plan_report_schema: memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
             doctor_report_schema: memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
-            qualification_schema: 1,
+            qualification_schema: memcordon_core::WINDOWS_QUALIFICATION_SCHEMA_VERSION,
         },
         (SealedAssetPolicy::Included, false) => SealedRuntimeV1::Included {
             agent_component: "sealed-agent".to_owned(),
@@ -1793,6 +1887,22 @@ fn inspect_extract_and_smoke(
         );
     }
     validate_markdown_documents(&documents)?;
+    if let Some(bootstrap) = target
+        .executable
+        .iter()
+        .find(|component| component.role == RuntimeComponentRole::DesktopBootstrap)
+    {
+        let image = temporary.path().join(&top).join(&bootstrap.archive_path);
+        memcordon_core::verify_target_desktop_bootstrap_pe(&fs::read(image)?).map_err(failure)?;
+    }
+    if let Some(broker) = target
+        .executable
+        .iter()
+        .find(|component| component.role == RuntimeComponentRole::SessionBroker)
+    {
+        let image = temporary.path().join(&top).join(&broker.archive_path);
+        memcordon_core::verify_session_broker_pe(&fs::read(image)?).map_err(failure)?;
+    }
     let public = target
         .executable
         .iter()
@@ -2144,6 +2254,14 @@ pub fn native_asset(root: &Path) -> Result<()> {
                 CommandSpec::new(&executable, root, Duration::from_secs(30))
                     .args(["package", "inspect", "--json"])
                     .run()?;
+            }
+            RuntimeComponentRole::DesktopBootstrap => {
+                let bytes = fs::read(&executable)?;
+                memcordon_core::verify_target_desktop_bootstrap_pe(&bytes).map_err(failure)?;
+            }
+            RuntimeComponentRole::SessionBroker => {
+                let bytes = fs::read(&executable)?;
+                memcordon_core::verify_session_broker_pe(&bytes).map_err(failure)?;
             }
         }
     }
@@ -4051,7 +4169,7 @@ mod tests {
     fn package_inspection_fixture() -> serde_json::Value {
         let digest = sha256_bytes(b"package-inspection-fixture");
         serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "version": "1.2.3",
             "source_commit": "source-commit",
             "executable_sha256": digest,
@@ -4068,6 +4186,36 @@ mod tests {
             "tmpfiles_sha256": digest,
             "compiled_metadata_valid": true
         })
+    }
+
+    #[test]
+    fn windows_runtime_manifest_uses_shared_qualification_schema() {
+        let (_temporary, release) = release_fixture();
+        let target = release
+            .assets
+            .target
+            .iter()
+            .find(|target| target.rust_target == "x86_64-pc-windows-msvc")
+            .expect("release policy should contain the Windows x64 target");
+        let identity = ReleaseIdentity {
+            tag: "1.2.3".to_owned(),
+            version: Version::parse("1.2.3").expect("version should parse"),
+            commit: "0123456789abcdef".to_owned(),
+            changelog_section: "notes".to_owned(),
+            source_date: "2025-01-01T00:00:00Z".to_owned(),
+        };
+        let manifest = runtime_manifest(&identity, target, Vec::new());
+        let SealedRuntimeV1::Included {
+            qualification_schema,
+            ..
+        } = manifest.sealed
+        else {
+            panic!("Windows release target should include its sealed provider");
+        };
+        assert_eq!(
+            qualification_schema,
+            memcordon_core::WINDOWS_QUALIFICATION_SCHEMA_VERSION
+        );
     }
 
     #[test]

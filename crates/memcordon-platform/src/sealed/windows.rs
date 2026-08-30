@@ -6,22 +6,24 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use memcordon_core::{
     BoundaryCapability, BoundaryClass, BoundaryRequirement, CommandSpec, Error, ErrorCategory,
     LaunchEvidence, NativeWindowsCommandV1, Policy, WINDOWS_CONTROL_PIPE, WINDOWS_MAX_FRAME_BYTES,
     WINDOWS_PUBLIC_PROTOCOL_VERSION, WindowsEnvironmentEntryV1, WindowsLaunchPolicyV1,
     WindowsLaunchRequestV1, WindowsLifetimeV1, WindowsProviderRequestV1, WindowsProviderResponseV1,
-    WindowsQualificationReceiptV1, WindowsRemoteStreamV1, WindowsStreamRoleV1,
-    validate_windows_stream_manifest,
+    WindowsPublicFrameFailureV1, WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1,
+    WindowsQualificationReceiptV1, WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsRemoteStreamV1,
+    WindowsStreamRoleV1, WindowsTerminalReplayDecisionV1, validate_windows_stream_manifest,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_NOT_FOUND, ERROR_PIPE_BUSY, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
-    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_NOT_FOUND, ERROR_PIPE_BUSY,
+    ERROR_PIPE_NOT_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -263,7 +265,7 @@ pub fn run(
             missing_provider_message(&detail),
         )
     })?;
-    let pipe = connect().map_err(transport_error)?;
+    let mut pipe = connect().map_err(transport_error)?;
     authenticate_peer(pipe.raw()).map_err(transport_error)?;
     let nonce = launch_nonce(command);
     let request = WindowsLaunchRequestV1 {
@@ -316,6 +318,11 @@ pub fn run(
         }
     };
     let mut relays = Relays::start(streams, relay_retired_event_handle).map_err(transport_error)?;
+    let mut terminal_recovery = WindowsPublicTerminalRecoveryV1::default();
+    terminal_recovery
+        .bind_attempt()
+        .map_err(|error| transport_error(error.to_owned()))?;
+    let mut recovery_transcript = TerminalRecoveryTranscript::default();
     write_frame(
         pipe.raw(),
         &WindowsProviderRequestV1::RelaysReady {
@@ -330,9 +337,131 @@ pub fn run(
     let mut cancel_sent = false;
     let mut target_authorized = false;
     let mut target_retired = false;
+    let mut relay_phase = WindowsRelayPhaseV1::AwaitStreams;
+    relay_phase
+        .advance(WindowsRelayEventV1::StreamsPrepared)
+        .and_then(|()| relay_phase.advance(WindowsRelayEventV1::RelaysReady))
+        .map_err(|error| transport_error(error.to_owned()))?;
     let terminal = loop {
-        if frame_available(pipe.raw()).map_err(transport_error)? {
-            match read_frame::<WindowsProviderResponseV1>(pipe.raw()).map_err(transport_error)? {
+        let response = match frame_available(pipe.raw()) {
+            Ok(false) => {
+                if terminal_recovery.replay_consumed()
+                    && recovery_transcript
+                        .deadline
+                        .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(transport_error(format!(
+                        "{}; secondary terminal replay response deadline expired",
+                        recovery_transcript
+                            .primary
+                            .as_deref()
+                            .unwrap_or("terminal replay")
+                    )));
+                }
+                None
+            }
+            Ok(true) => match read_frame_detailed::<WindowsProviderResponseV1>(pipe.raw()) {
+                Ok(response) => Some(response),
+                Err(error) => Some(
+                    recover_public_terminal_pipe(
+                        &mut pipe,
+                        &mut relays,
+                        &mut terminal_recovery,
+                        &mut recovery_transcript,
+                        TerminalReplayBinding::new(
+                            &attempt_id,
+                            &nonce,
+                            &request_sha256,
+                            relay_phase,
+                        ),
+                        error,
+                    )
+                    .map_err(transport_error)?,
+                ),
+            },
+            Err(error) => Some(
+                recover_public_terminal_pipe(
+                    &mut pipe,
+                    &mut relays,
+                    &mut terminal_recovery,
+                    &mut recovery_transcript,
+                    TerminalReplayBinding::new(&attempt_id, &nonce, &request_sha256, relay_phase),
+                    error,
+                )
+                .map_err(transport_error)?,
+            ),
+        };
+        if let Some(response) = response {
+            let response_sha256 = digest_bytes(
+                &serde_json::to_vec(&response)
+                    .map_err(|error| transport_error(error.to_string()))?,
+            );
+            match response {
+                WindowsProviderResponseV1::ReplayPending(pending)
+                    if pending.is_consistent_for(
+                        &attempt_id,
+                        &nonce,
+                        &request_sha256,
+                        relay_phase,
+                    ) =>
+                {
+                    if !terminal_recovery.replay_consumed() {
+                        if terminal_recovery.begin_replay_after_bound_pending()
+                            != WindowsTerminalReplayDecisionV1::ReplayOnce
+                        {
+                            return Err(transport_error(
+                                "bound terminal replay pending response was not admissible"
+                                    .to_owned(),
+                            ));
+                        }
+                        if terminal_recovery.retire_local_relays_once() {
+                            relays.retire().map_err(transport_error)?;
+                        }
+                        recovery_transcript.deadline =
+                            Some(Instant::now() + Duration::from_secs(30));
+                        recovery_transcript.primary = Some(format!(
+                            "typed replay pending before durable outbox: {}",
+                            pending.detail
+                        ));
+                        pipe = reconnect_for_terminal_replay(
+                            &attempt_id,
+                            &nonce,
+                            &request_sha256,
+                            relay_phase,
+                            recovery_transcript
+                                .primary
+                                .as_deref()
+                                .expect("pending replay records its primary"),
+                        )
+                        .map_err(transport_error)?;
+                    } else {
+                        if recovery_transcript
+                            .deadline
+                            .is_none_or(|deadline| Instant::now() >= deadline)
+                        {
+                            return Err(transport_error(format!(
+                                "{}; secondary terminal replay deadline expired at state={:?} cleanup_complete={} outbox={:?}",
+                                recovery_transcript
+                                    .primary
+                                    .as_deref()
+                                    .unwrap_or("terminal replay pending"),
+                                pending.durable_state,
+                                pending.cleanup_complete,
+                                pending.outbox_stage,
+                            )));
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                        write_terminal_replay_request(
+                            pipe.raw(),
+                            &attempt_id,
+                            &nonce,
+                            &request_sha256,
+                            relay_phase,
+                        )
+                        .map_err(transport_error)?;
+                    }
+                    continue;
+                }
                 WindowsProviderResponseV1::TargetAuthorized {
                     schema_version,
                     attempt_id: returned,
@@ -346,6 +475,9 @@ pub fn run(
                     && !target_authorized
                     && !target_retired =>
                 {
+                    relay_phase
+                        .advance(WindowsRelayEventV1::TargetAuthorized)
+                        .map_err(|error| transport_error(error.to_owned()))?;
                     target_authorized = true;
                 }
                 WindowsProviderResponseV1::TargetRetired {
@@ -360,6 +492,9 @@ pub fn run(
                     && target_authorized
                     && !target_retired =>
                 {
+                    relay_phase
+                        .advance(WindowsRelayEventV1::TargetRetired)
+                        .map_err(|error| transport_error(error.to_owned()))?;
                     relays.retire().map_err(transport_error)?;
                     write_frame(
                         pipe.raw(),
@@ -371,6 +506,9 @@ pub fn run(
                         },
                     )
                     .map_err(transport_error)?;
+                    relay_phase
+                        .advance(WindowsRelayEventV1::RelaysRetired)
+                        .map_err(|error| transport_error(error.to_owned()))?;
                     target_retired = true;
                 }
                 WindowsProviderResponseV1::RelaysAbort {
@@ -385,6 +523,9 @@ pub fn run(
                     && !target_authorized
                     && !target_retired =>
                 {
+                    relay_phase
+                        .advance(WindowsRelayEventV1::RelaysAbort)
+                        .map_err(|error| transport_error(error.to_owned()))?;
                     relays.retire().map_err(transport_error)?;
                     write_frame(
                         pipe.raw(),
@@ -396,16 +537,32 @@ pub fn run(
                         },
                     )
                     .map_err(transport_error)?;
+                    relay_phase
+                        .advance(WindowsRelayEventV1::RelaysRetired)
+                        .map_err(|error| transport_error(error.to_owned()))?;
                     target_retired = true;
                 }
                 WindowsProviderResponseV1::Terminal(receipt)
                     if receipt.attempt_id == attempt_id
                         && receipt.nonce == nonce
                         && receipt.request_sha256 == request_sha256
-                        && target_authorized
-                        && target_retired
+                        && ((target_authorized && target_retired)
+                            || terminal_recovery.replay_consumed())
                         && receipt.process_identity_inventory_is_bounded() =>
                 {
+                    if !terminal_recovery.replay_consumed() {
+                        relay_phase
+                            .advance(WindowsRelayEventV1::Terminal)
+                            .map_err(|error| transport_error(error.to_owned()))?;
+                    }
+                    acknowledge_terminal_retirement(
+                        pipe.raw(),
+                        &attempt_id,
+                        &nonce,
+                        &request_sha256,
+                        &response_sha256,
+                    )
+                    .map_err(transport_error)?;
                     break receipt;
                 }
                 WindowsProviderResponseV1::Reject {
@@ -417,9 +574,51 @@ pub fn run(
                 } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
                     && returned_attempt == attempt_id
                     && returned_nonce == nonce
-                    && returned_digest == request_sha256 =>
+                    && returned_digest == request_sha256
+                    && rejection.is_consistent()
+                    && rejection.terminal_receipt.as_ref().is_none_or(|terminal| {
+                        terminal.attempt_id == returned_attempt
+                            && terminal.nonce == returned_nonce
+                            && terminal.request_sha256 == returned_digest
+                    }) =>
                 {
-                    return Err(rejection_error(rejection));
+                    relay_phase
+                        .advance(WindowsRelayEventV1::Reject)
+                        .map_err(|error| transport_error(error.to_owned()))?;
+                    let terminal_ack_required = rejection.terminal_ack_required;
+                    let mut primary = rejection_error(rejection);
+                    if terminal_ack_required {
+                        if let Err(acknowledgment) = acknowledge_terminal_retirement(
+                            pipe.raw(),
+                            &attempt_id,
+                            &nonce,
+                            &request_sha256,
+                            &response_sha256,
+                        ) {
+                            primary.message = format!(
+                                "{}; secondary terminal acknowledgment failure: {}",
+                                primary.message, acknowledgment
+                            );
+                        }
+                    }
+                    return Err(primary);
+                }
+                WindowsProviderResponseV1::AttemptRetained(retained)
+                    if retained.is_consistent_for(
+                        &attempt_id,
+                        &nonce,
+                        &request_sha256,
+                        relay_phase,
+                    ) =>
+                {
+                    return Err(transport_error(format!(
+                        "MCSEALED-WINDOWS-ATTEMPT-RETAINED: relay_phase={:?} cleanup_complete={} terminal_replay_available={} primary={} secondary={}",
+                        retained.relay_phase,
+                        retained.cleanup_complete,
+                        retained.terminal_replay_available,
+                        retained.primary_detail,
+                        retained.secondary_failures.join(" | "),
+                    )));
                 }
                 _ => {
                     return Err(transport_error(
@@ -925,19 +1124,41 @@ fn write_frame<T: Serialize>(handle: HANDLE, value: &T) -> Result<(), String> {
     write_all(handle, &payload)
 }
 
-fn read_frame<T: DeserializeOwned>(handle: HANDLE) -> Result<T, String> {
-    let mut length = [0_u8; 4];
-    read_exact(handle, &mut length)?;
-    let length = u32::from_le_bytes(length) as usize;
-    if length > WINDOWS_MAX_FRAME_BYTES {
-        return Err("provider frame exceeds bound".to_owned());
-    }
-    let mut payload = vec![0_u8; length];
-    read_exact(handle, &mut payload)?;
-    serde_json::from_slice(&payload).map_err(|error| error.to_string())
+#[derive(Debug)]
+struct PublicFrameError {
+    failure: WindowsPublicFrameFailureV1,
+    detail: String,
 }
 
-fn frame_available(handle: HANDLE) -> Result<bool, String> {
+impl std::fmt::Display for PublicFrameError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?}: {}", self.failure, self.detail)
+    }
+}
+
+fn read_frame<T: DeserializeOwned>(handle: HANDLE) -> Result<T, String> {
+    read_frame_detailed(handle).map_err(|error| error.to_string())
+}
+
+fn read_frame_detailed<T: DeserializeOwned>(handle: HANDLE) -> Result<T, PublicFrameError> {
+    let mut length = [0_u8; 4];
+    read_exact_detailed(handle, &mut length, WindowsPublicFramePhaseV1::Length)?;
+    let length = u32::from_le_bytes(length) as usize;
+    if length > WINDOWS_MAX_FRAME_BYTES {
+        return Err(PublicFrameError {
+            failure: WindowsPublicFrameFailureV1::Protocol(WindowsPublicFramePhaseV1::Length),
+            detail: "provider frame exceeds bound".to_owned(),
+        });
+    }
+    let mut payload = vec![0_u8; length];
+    read_exact_detailed(handle, &mut payload, WindowsPublicFramePhaseV1::Payload)?;
+    serde_json::from_slice(&payload).map_err(|error| PublicFrameError {
+        failure: WindowsPublicFrameFailureV1::Protocol(WindowsPublicFramePhaseV1::Decode),
+        detail: error.to_string(),
+    })
+}
+
+fn frame_available(handle: HANDLE) -> Result<bool, PublicFrameError> {
     let mut available = 0_u32;
     // SAFETY: output count is live and no read buffer is requested.
     if unsafe {
@@ -951,7 +1172,24 @@ fn frame_available(handle: HANDLE) -> Result<bool, String> {
         )
     } == 0
     {
-        Err(io::Error::last_os_error().to_string())
+        let error = io::Error::last_os_error();
+        let peer_closed = error
+            .raw_os_error()
+            .and_then(|value| u32::try_from(value).ok())
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED
+                )
+            });
+        Err(PublicFrameError {
+            failure: if peer_closed {
+                WindowsPublicFrameFailureV1::PeerClosed(WindowsPublicFramePhaseV1::Availability)
+            } else {
+                WindowsPublicFrameFailureV1::Protocol(WindowsPublicFramePhaseV1::Availability)
+            },
+            detail: error.to_string(),
+        })
     } else {
         Ok(available >= 4)
     }
@@ -981,7 +1219,11 @@ fn write_all(handle: HANDLE, mut bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn read_exact(handle: HANDLE, mut bytes: &mut [u8]) -> Result<(), String> {
+fn read_exact_detailed(
+    handle: HANDLE,
+    mut bytes: &mut [u8],
+    phase: WindowsPublicFramePhaseV1,
+) -> Result<(), PublicFrameError> {
     while !bytes.is_empty() {
         let mut read = 0_u32;
         // SAFETY: slice and count remain live for synchronous IO.
@@ -995,10 +1237,30 @@ fn read_exact(handle: HANDLE, mut bytes: &mut [u8]) -> Result<(), String> {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error().to_string());
+            let error = io::Error::last_os_error();
+            let peer_closed = error
+                .raw_os_error()
+                .and_then(|value| u32::try_from(value).ok())
+                .is_some_and(|code| {
+                    matches!(
+                        code,
+                        ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED
+                    )
+                });
+            return Err(PublicFrameError {
+                failure: if peer_closed {
+                    WindowsPublicFrameFailureV1::PeerClosed(phase)
+                } else {
+                    WindowsPublicFrameFailureV1::Protocol(phase)
+                },
+                detail: error.to_string(),
+            });
         }
         if read == 0 {
-            return Err("unexpected end of provider frame".to_owned());
+            return Err(PublicFrameError {
+                failure: WindowsPublicFrameFailureV1::PeerClosed(phase),
+                detail: "unexpected end of provider frame".to_owned(),
+            });
         }
         let (_, rest) = bytes.split_at_mut(read as usize);
         bytes = rest;
@@ -1087,6 +1349,181 @@ fn launch_nonce(command: &CommandSpec) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn reconnect_for_terminal_replay(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    relay_phase: WindowsRelayPhaseV1,
+    primary: &str,
+) -> Result<OwnedHandle, String> {
+    let pipe = connect().map_err(|secondary| {
+        format!("{primary}; secondary terminal replay reconnect failure: {secondary}")
+    })?;
+    authenticate_peer(pipe.raw()).map_err(|secondary| {
+        format!("{primary}; secondary terminal replay authentication failure: {secondary}")
+    })?;
+    write_terminal_replay_request(pipe.raw(), attempt_id, nonce, request_sha256, relay_phase)
+        .map_err(|secondary| {
+            format!("{primary}; secondary exact terminal replay request failure: {secondary}")
+        })?;
+    Ok(pipe)
+}
+
+fn write_terminal_replay_request(
+    pipe: HANDLE,
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    relay_phase: WindowsRelayPhaseV1,
+) -> Result<(), String> {
+    write_frame(
+        pipe,
+        &WindowsProviderRequestV1::ReplayTerminal {
+            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            attempt_id: attempt_id.to_owned(),
+            nonce: nonce.to_owned(),
+            request_sha256: request_sha256.to_owned(),
+            relay_phase,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct TerminalReplayBinding<'a> {
+    attempt_id: &'a str,
+    nonce: &'a str,
+    request_sha256: &'a str,
+    relay_phase: WindowsRelayPhaseV1,
+}
+
+impl<'a> TerminalReplayBinding<'a> {
+    const fn new(
+        attempt_id: &'a str,
+        nonce: &'a str,
+        request_sha256: &'a str,
+        relay_phase: WindowsRelayPhaseV1,
+    ) -> Self {
+        Self {
+            attempt_id,
+            nonce,
+            request_sha256,
+            relay_phase,
+        }
+    }
+}
+
+#[derive(Default)]
+struct TerminalRecoveryTranscript {
+    deadline: Option<Instant>,
+    primary: Option<String>,
+}
+
+fn recover_public_terminal_pipe(
+    pipe: &mut OwnedHandle,
+    relays: &mut Relays,
+    recovery: &mut WindowsPublicTerminalRecoveryV1,
+    transcript: &mut TerminalRecoveryTranscript,
+    binding: TerminalReplayBinding<'_>,
+    error: PublicFrameError,
+) -> Result<WindowsProviderResponseV1, String> {
+    if recovery.observe_failure(error.failure) != WindowsTerminalReplayDecisionV1::ReplayOnce {
+        return Err(error.to_string());
+    }
+    let primary = error.to_string();
+    transcript.primary = Some(primary.clone());
+    if recovery.retire_local_relays_once() {
+        relays.retire().map_err(|secondary| {
+            format!("{primary}; secondary relay retirement failure: {secondary}")
+        })?;
+    }
+    transcript.deadline = Some(Instant::now() + Duration::from_secs(30));
+    *pipe = reconnect_for_terminal_replay(
+        binding.attempt_id,
+        binding.nonce,
+        binding.request_sha256,
+        binding.relay_phase,
+        &primary,
+    )?;
+    loop {
+        if transcript
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(format!(
+                "{primary}; secondary exact terminal replay response deadline expired"
+            ));
+        }
+        match frame_available(pipe.raw()) {
+            Ok(true) => {
+                return read_frame_detailed::<WindowsProviderResponseV1>(pipe.raw()).map_err(
+                    |secondary| {
+                        format!("{primary}; secondary exact terminal replay failure: {secondary}")
+                    },
+                );
+            }
+            Ok(false) => std::thread::sleep(Duration::from_millis(10)),
+            Err(secondary) => {
+                return Err(format!(
+                    "{primary}; secondary exact terminal replay availability failure: {secondary}"
+                ));
+            }
+        }
+    }
+}
+
+fn acknowledge_terminal_retirement(
+    pipe: HANDLE,
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    terminal_response_sha256: &str,
+) -> Result<(), String> {
+    write_frame(
+        pipe,
+        &WindowsProviderRequestV1::TerminalAcknowledged {
+            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            attempt_id: attempt_id.to_owned(),
+            nonce: nonce.to_owned(),
+            request_sha256: request_sha256.to_owned(),
+            terminal_response_sha256: terminal_response_sha256.to_owned(),
+        },
+    )?;
+    match read_frame::<WindowsProviderResponseV1>(pipe)? {
+        WindowsProviderResponseV1::TerminalRetired(retired)
+            if retired.is_consistent_for(
+                attempt_id,
+                nonce,
+                request_sha256,
+                terminal_response_sha256,
+            ) =>
+        {
+            Ok(())
+        }
+        WindowsProviderResponseV1::AttemptRetained(retained)
+            if retained.is_consistent_for(
+                attempt_id,
+                nonce,
+                request_sha256,
+                WindowsRelayPhaseV1::Terminal,
+            ) =>
+        {
+            Err(format!(
+                "terminal ACK retained attempt authority: primary={} secondary={}",
+                retained.primary_detail,
+                retained.secondary_failures.join(" | ")
+            ))
+        }
+        _ => Err("provider did not confirm exact terminal retirement".to_owned()),
+    }
 }
 
 fn rejection_error(rejection: memcordon_core::ProviderRejectionEvidence) -> Error {

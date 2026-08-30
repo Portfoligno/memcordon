@@ -26,6 +26,16 @@ path = "src/bin/memcordon-sealed-agent/main.rs"
 doc = false
 
 [[bin]]
+name = "memcordon-target-desktop-bootstrap"
+path = "src/bin/memcordon-target-desktop-bootstrap.rs"
+doc = false
+
+[[bin]]
+name = "memcordon-session-broker"
+path = "src/bin/memcordon-session-broker.rs"
+doc = false
+
+[[bin]]
 name = "memcordon-test-fixture"
 path = "src/bin/memcordon-test-fixture.rs"
 required-features = ["test-fixtures"]
@@ -54,20 +64,29 @@ sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
+    "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_Security_Isolation",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_Environment",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_Services",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }

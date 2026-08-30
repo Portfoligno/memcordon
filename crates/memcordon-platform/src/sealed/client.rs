@@ -465,6 +465,8 @@ pub(crate) fn terminal_spawn_error(
         target_released: true,
         cleanup_attempted: true,
         restart_safety: restart_safety.clone(),
+        terminal_ack_required: false,
+        terminal_receipt: None,
     };
     let mut error = memcordon_core::Error::new(memcordon_core::ErrorCategory::Spawn, code, detail)
         .with_provider_rejection(provider_rejection)
@@ -611,6 +613,8 @@ pub(crate) fn parse_rejection(
             sealed_boundary_retired: receipt.cleanup.sealed_boundary_retired,
             errors: receipt.cleanup.errors,
         },
+        terminal_ack_required: false,
+        terminal_receipt: None,
     })
 }
 

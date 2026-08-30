@@ -10,6 +10,7 @@ pub mod release_evidence;
 pub mod runtime_manifest;
 pub mod scenario_diagnostic;
 pub mod sealed_identity;
+pub mod sealed_selector;
 
 use thiserror::Error;
 

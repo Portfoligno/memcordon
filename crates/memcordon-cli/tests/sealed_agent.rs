@@ -63,3 +63,21 @@ mod protocol_tests;
 mod rejection_tests;
 #[path = "sealed_agent/request.rs"]
 mod request_tests;
+#[cfg(target_os = "windows")]
+#[path = "sealed_agent/windows_guardian_startup.rs"]
+mod windows_guardian_startup;
+#[cfg(target_os = "windows")]
+#[path = "sealed_agent/windows_handle_provenance.rs"]
+mod windows_handle_provenance;
+#[cfg(target_os = "windows")]
+#[path = "sealed_agent/windows_qualification.rs"]
+mod windows_qualification;
+#[cfg(target_os = "windows")]
+#[path = "sealed_agent/windows_security.rs"]
+mod windows_security;
+#[cfg(target_os = "windows")]
+#[path = "sealed_agent/windows_service_manager.rs"]
+mod windows_service_manager;
+#[cfg(target_os = "windows")]
+#[path = "sealed_agent/windows_token.rs"]
+mod windows_token;

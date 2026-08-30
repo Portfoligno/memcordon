@@ -119,14 +119,24 @@ fn canonical_release_targets_match_native_hosts() {
                 "x86_64-pc-windows-msvc",
                 "zip",
                 true,
-                vec!["memcordon.exe", "memcordon-sealed-agent.exe"],
+                vec![
+                    "memcordon.exe",
+                    "memcordon-sealed-agent.exe",
+                    "memcordon-target-desktop-bootstrap.exe",
+                    "memcordon-session-broker.exe",
+                ],
             ),
             (
                 "windows-arm64",
                 "aarch64-pc-windows-msvc",
                 "zip",
                 true,
-                vec!["memcordon.exe", "memcordon-sealed-agent.exe"],
+                vec![
+                    "memcordon.exe",
+                    "memcordon-sealed-agent.exe",
+                    "memcordon-target-desktop-bootstrap.exe",
+                    "memcordon-session-broker.exe",
+                ],
             ),
         ]
     );

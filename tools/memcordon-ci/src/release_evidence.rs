@@ -95,7 +95,9 @@ const WINDOWS_SEALED_FILES: &[&str] = &[
     "windows-cleanup.json",
 ];
 const WINDOWS_TESTS: &[&str] = &[
+    "fresh_qualification_failure_rollback_is_repeatable",
     "package_install_verify_probe_and_same_version_upgrade",
+    "stale_low_integrity_workspace_upgrade_and_uninstall_cleanup",
     "active_attempt_upgrade_and_uninstall_are_refused",
     "public_sealed_launch_preserves_status_and_native_evidence",
     "frontend_loss_retires_the_job_and_durable_record",
@@ -579,6 +581,7 @@ struct LinuxConcurrencyReport {
 struct WindowsRuntimeEvidence {
     qualification: WindowsQualificationReceiptV1,
     public_launch: MemcordonReport,
+    fresh_install_rollback_verified: bool,
     active_attempt_upgrade_refused: bool,
     active_attempt_uninstall_refused: bool,
     frontend_loss_record_retired: bool,
@@ -618,18 +621,35 @@ struct WindowsPackageInspection {
     platform: String,
     control_service_name: String,
     launcher_service_name: String,
+    session_broker_service_name: String,
+    guardian_slot_count: usize,
     control_service_config_sha256: String,
     launcher_service_config_sha256: String,
+    session_broker_service_config_sha256: String,
+    guardian_slot_config_sha256: String,
     control_pipe: String,
     launcher_pipe: String,
+    session_broker_pipe: String,
+    guardian_pipe_prefix: String,
     binary_install_path: String,
+    target_desktop_bootstrap_install_path: String,
+    target_desktop_bootstrap_sha256: String,
+    session_broker_install_path: String,
+    session_broker_sha256: String,
     state_root: String,
     control_service_sid_type: String,
     launcher_service_sid_type: String,
+    session_broker_service_sid_type: String,
+    guardian_slot_service_sid_type: String,
     control_required_privileges: Vec<String>,
     launcher_required_privileges: Vec<String>,
+    session_broker_required_privileges: Vec<String>,
+    guardian_slot_required_privileges: Vec<String>,
     control_pipe_security_sha256: String,
     launcher_pipe_security_sha256: String,
+    session_broker_service_security_sha256: String,
+    session_broker_pipe_security_sha256: String,
+    guardian_pipe_security_contract_sha256: String,
     install_directory_security_sha256: String,
     state_directory_security_sha256: String,
     compiled_metadata_valid: bool,
@@ -649,7 +669,7 @@ struct WindowsInstalledProviderInspection {
 
 impl WindowsPackageInspection {
     fn valid(&self, expected_commit: &str) -> bool {
-        self.schema_version == 2
+        self.schema_version == 3
             && self.version == env!("CARGO_PKG_VERSION")
             && self.source_commit == expected_commit
             && valid_sha256(&self.executable_sha256)
@@ -661,22 +681,53 @@ impl WindowsPackageInspection {
             && self.platform == "windows-service"
             && self.control_service_name == memcordon_core::WINDOWS_CONTROL_SERVICE_NAME
             && self.launcher_service_name == memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME
+            && self.session_broker_service_name
+                == memcordon_core::WINDOWS_SESSION_BROKER_SERVICE_NAME
+            && self.guardian_slot_count == memcordon_core::WINDOWS_GUARDIAN_SLOT_COUNT
             && self.control_pipe == memcordon_core::WINDOWS_CONTROL_PIPE
             && self.launcher_pipe == memcordon_core::WINDOWS_LAUNCHER_PIPE
+            && self.session_broker_pipe == memcordon_core::WINDOWS_SESSION_BROKER_PIPE
+            && self.guardian_pipe_prefix == memcordon_core::WINDOWS_GUARDIAN_PIPE_PREFIX
             && self
                 .binary_install_path
                 .ends_with("MemCordon\\memcordon-sealed-agent.exe")
+            && self
+                .target_desktop_bootstrap_install_path
+                .ends_with("MemCordon\\memcordon-target-desktop-bootstrap.exe")
+            && valid_sha256(&self.target_desktop_bootstrap_sha256)
+            && self
+                .session_broker_install_path
+                .ends_with("MemCordon\\memcordon-session-broker.exe")
+            && valid_sha256(&self.session_broker_sha256)
             && self.state_root.ends_with("MemCordon\\sealed")
             && self.control_service_sid_type == "restricted"
             && self.launcher_service_sid_type == "restricted"
+            && self.session_broker_service_sid_type == "unrestricted"
+            && self.guardian_slot_service_sid_type == "restricted"
             && self.control_required_privileges == ["SeImpersonatePrivilege"]
             && self.launcher_required_privileges
-                == ["SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"]
+                == [
+                    "SeAssignPrimaryTokenPrivilege",
+                    "SeIncreaseQuotaPrivilege",
+                    "SeTcbPrivilege",
+                ]
+            && self.session_broker_required_privileges
+                == [
+                    "SeAssignPrimaryTokenPrivilege",
+                    "SeIncreaseQuotaPrivilege",
+                    "SeTcbPrivilege",
+                ]
+            && self.guardian_slot_required_privileges.is_empty()
             && [
                 &self.control_service_config_sha256,
                 &self.launcher_service_config_sha256,
+                &self.session_broker_service_config_sha256,
+                &self.guardian_slot_config_sha256,
                 &self.control_pipe_security_sha256,
                 &self.launcher_pipe_security_sha256,
+                &self.session_broker_service_security_sha256,
+                &self.session_broker_pipe_security_sha256,
+                &self.guardian_pipe_security_contract_sha256,
                 &self.install_directory_security_sha256,
                 &self.state_directory_security_sha256,
             ]
@@ -701,7 +752,8 @@ impl WindowsRuntimeEvidence {
     fn complete(&self) -> bool {
         self.qualification.qualified
             && self.qualification.is_consistent()
-            && validate_windows_public_launch(&self.public_launch)
+            && validate_windows_public_launch(&self.public_launch, &self.qualification)
+            && self.fresh_install_rollback_verified
             && self.active_attempt_upgrade_refused
             && self.active_attempt_uninstall_refused
             && self.frontend_loss_record_retired
@@ -756,14 +808,32 @@ impl WindowsStatusMatrixEvidence {
     }
 }
 
-fn validate_windows_public_launch(report: &MemcordonReport) -> bool {
+fn validate_windows_public_launch(
+    report: &MemcordonReport,
+    qualification: &WindowsQualificationReceiptV1,
+) -> bool {
+    let Some(backend) = report.backend.as_ref() else {
+        return false;
+    };
+    let Some(binding) = backend.boundary_qualification.as_ref() else {
+        return false;
+    };
+    let Ok(receipt) = serde_json::to_vec(qualification) else {
+        return false;
+    };
     let Some(attempt) = report.attempts.last() else {
         return false;
     };
     let BoundaryMechanismEvidence::WindowsJobObjectV2(native) = &attempt.boundary_detail else {
         return false;
     };
-    attempt.launch.target_released
+    backend.name == "windows-job-object"
+        && backend.boundary.class == BoundaryClass::Sealed
+        && backend.boundary.mechanism == "windows-job-object-v2"
+        && binding.provider_identity == qualification.provider_identity
+        && binding.receipt_digest == sha256_bytes(&receipt)
+        && binding.mechanism == "windows-job-object-v2"
+        && attempt.launch.target_released
         && attempt.launch.containment_verified_before_authorization
         && attempt.launch.guardian_started_before_authorization
         && attempt.launch.boundary_assignment_verified
@@ -807,18 +877,11 @@ fn validate_windows_auxiliary(
         }
         "windows-installed-provider.json" => {
             let inspection: WindowsInstalledProviderInspection = serde_json::from_slice(bytes)?;
-            if inspection.schema_version != 2
+            if inspection.schema_version != 3
                 || !inspection.agent.valid(expected_commit)
                 || inspection.installed_executable_sha256 != inspection.agent.executable_sha256
                 || !inspection.installed_artifacts_valid
-                || inspection.provider_identity.as_deref()
-                    != Some(
-                        format!(
-                            "memcordon-sealed-agent-windows-v1:{}",
-                            env!("CARGO_PKG_VERSION")
-                        )
-                        .as_str(),
-                    )
+                || inspection.provider_identity.is_none()
                 || !inspection.provider_reachable
                 || !inspection.qualification_complete
             {
@@ -972,6 +1035,32 @@ fn validate_windows_auxiliary(
                 _ => return Err(failure("unexpected Windows sealed v2 evidence file")),
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_windows_cross_report_bindings(directory: &Path, cleanup: &[u8]) -> Result<()> {
+    let cleanup: HardCertificationReport<WindowsRuntimeEvidence> = serde_json::from_slice(cleanup)?;
+    let package: WindowsPackageInspection = serde_json::from_slice(&read_report(
+        &directory.join("windows-package-inspection.json"),
+    )?)?;
+    let installed: WindowsInstalledProviderInspection = serde_json::from_slice(&read_report(
+        &directory.join("windows-installed-provider.json"),
+    )?)?;
+    let qualification: WindowsQualificationReceiptV1 =
+        serde_json::from_slice(&read_report(&directory.join("windows-qualification.json"))?)?;
+    if package != installed.agent
+        || qualification != cleanup.runtime.qualification
+        || installed.provider_identity.as_deref()
+            != Some(cleanup.runtime.qualification.provider_identity.as_str())
+        || !validate_windows_public_launch(
+            &cleanup.runtime.public_launch,
+            &cleanup.runtime.qualification,
+        )
+    {
+        return Err(failure(
+            "Windows release evidence does not share one package and qualification identity",
+        ));
     }
     Ok(())
 }
@@ -1963,6 +2052,10 @@ pub fn collect_certification(
                     let auxiliary = read_report(&input.join(spec.artifact_directory).join(name))?;
                     validate_windows_auxiliary(name, &auxiliary, expected_commit, architecture)?;
                 }
+                validate_windows_cross_report_bindings(
+                    &input.join(spec.artifact_directory),
+                    &bytes,
+                )?;
             }
             ReportKind::Macos => validate_macos_report(&bytes, *spec, expected_commit)?,
         }

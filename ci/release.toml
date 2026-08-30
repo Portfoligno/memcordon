@@ -103,6 +103,20 @@ archive_path = "memcordon-sealed-agent.exe"
 mode = 493
 role = "sealed-agent"
 
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-target-desktop-bootstrap"
+archive_path = "memcordon-target-desktop-bootstrap.exe"
+mode = 493
+role = "desktop-bootstrap"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-session-broker"
+archive_path = "memcordon-session-broker.exe"
+mode = 493
+role = "session-broker"
+
 [[assets.target]]
 id = "windows-arm64"
 rust_target = "aarch64-pc-windows-msvc"
@@ -122,6 +136,20 @@ binary = "memcordon-sealed-agent"
 archive_path = "memcordon-sealed-agent.exe"
 mode = 493
 role = "sealed-agent"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-target-desktop-bootstrap"
+archive_path = "memcordon-target-desktop-bootstrap.exe"
+mode = 493
+role = "desktop-bootstrap"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-session-broker"
+archive_path = "memcordon-session-broker.exe"
+mode = 493
+role = "session-broker"
 
 [registry_wait]
 initial_milliseconds = 500

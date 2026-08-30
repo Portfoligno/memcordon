@@ -1173,6 +1173,37 @@ fn sealed_simultaneous_attempts_have_disjoint_boundaries() {
 }
 
 #[test]
+fn sealed_concurrency_worker_selector_names_exact_consolidated_test() {
+    let executable = std::env::args_os()
+        .next()
+        .expect("consolidated sealed-agent test executable path must be available");
+    let output = std::process::Command::new(executable)
+        .args([
+            concurrency::WORKER_TEST_NAME,
+            "--exact",
+            "--ignored",
+            "--list",
+        ])
+        .output()
+        .expect("consolidated sealed-agent test executable must support list mode");
+    assert!(
+        output.status.success(),
+        "listing the concurrency worker selector failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("libtest list output must be UTF-8");
+    let listed = stdout
+        .lines()
+        .filter(|line| line.ends_with(": test"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        [format!("{}: test", concurrency::WORKER_TEST_NAME)],
+        "the nested worker selector must name exactly one consolidated test"
+    );
+}
+
+#[test]
 fn sealed_concurrency_evidence_starts_on_an_independent_line() {
     let output = format!(
         "running 1 test\ntest sealed_simultaneous_attempts_have_disjoint_boundaries ... {}ok\n",

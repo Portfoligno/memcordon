@@ -6,7 +6,11 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{BoundaryMechanismEvidence, ProviderRejectionEvidence, RestartSafetyProof, RunOutcome};
+use crate::{
+    BoundaryMechanismEvidence, BoundaryRequirement, ChildTermination,
+    CredentialTransitionDisposition, ProviderRejectionEvidence, RestartSafetyProof, RunOutcome,
+    WindowsSealedEvidenceV2,
+};
 
 pub const WINDOWS_PUBLIC_PROTOCOL_VERSION: u32 = 1;
 pub const WINDOWS_PRIVATE_PROTOCOL_VERSION: u32 = 1;
@@ -16,8 +20,159 @@ pub const WINDOWS_MAX_JOB_PROCESS_IDENTITIES: usize = 256;
 
 pub const WINDOWS_CONTROL_SERVICE_NAME: &str = "MemCordonSealedControl";
 pub const WINDOWS_LAUNCHER_SERVICE_NAME: &str = "MemCordonSealedLauncher";
+pub const WINDOWS_SESSION_BROKER_SERVICE_NAME: &str = "MemCordonSealedSessionBroker";
+pub const WINDOWS_GUARDIAN_SERVICE_PREFIX: &str = "MemCordonSealedGuardian-";
+pub const WINDOWS_GUARDIAN_SLOT_COUNT: usize = 8;
 pub const WINDOWS_CONTROL_PIPE: &str = r"\\.\pipe\memcordon-sealed-agent-v1";
 pub const WINDOWS_LAUNCHER_PIPE: &str = r"\\.\pipe\memcordon-sealed-launcher-v1";
+pub const WINDOWS_SESSION_BROKER_PIPE: &str = r"\\.\pipe\memcordon-sealed-session-broker-v1";
+pub const WINDOWS_GUARDIAN_PIPE_PREFIX: &str = r"\\.\pipe\memcordon-sealed-guardian-v1-";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsRelayPhaseV1 {
+    AwaitStreams,
+    AwaitRelaysReady,
+    AwaitAuthorizationOrAbort,
+    Authorized,
+    AwaitRelayAck,
+    AwaitAbortRelayAck,
+    AwaitTerminal,
+    AwaitAbortRejection,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsRelayEventV1 {
+    StreamsPrepared,
+    RelaysReady,
+    TargetAuthorized,
+    TargetRetired,
+    RelaysAbort,
+    RelaysRetired,
+    Terminal,
+    Reject,
+    MutantHook,
+    MutantTerminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsPublicFramePhaseV1 {
+    Availability,
+    Length,
+    Payload,
+    Decode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsPublicFrameFailureV1 {
+    PeerClosed(WindowsPublicFramePhaseV1),
+    Protocol(WindowsPublicFramePhaseV1),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsTerminalReplayDecisionV1 {
+    ReplayOnce,
+    FailClosed,
+}
+
+/// Transport-independent replay eligibility shared by every public frontend.
+///
+/// A transport loss is recoverable only after `StreamsPrepared` established an
+/// exact attempt binding, and the reconnect budget is consumed before the
+/// reconnect begins. Protocol/decode failures never cross a new trust boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WindowsPublicTerminalRecoveryV1 {
+    attempt_bound: bool,
+    replay_consumed: bool,
+    local_relays_retired: bool,
+}
+
+impl WindowsPublicTerminalRecoveryV1 {
+    pub fn bind_attempt(&mut self) -> Result<(), &'static str> {
+        if self.attempt_bound {
+            return Err("Windows public terminal recovery binding is already active");
+        }
+        self.attempt_bound = true;
+        Ok(())
+    }
+
+    pub fn observe_failure(
+        &mut self,
+        failure: WindowsPublicFrameFailureV1,
+    ) -> WindowsTerminalReplayDecisionV1 {
+        if matches!(failure, WindowsPublicFrameFailureV1::PeerClosed(_))
+            && self.attempt_bound
+            && !self.replay_consumed
+        {
+            self.replay_consumed = true;
+            WindowsTerminalReplayDecisionV1::ReplayOnce
+        } else {
+            WindowsTerminalReplayDecisionV1::FailClosed
+        }
+    }
+
+    pub fn begin_replay_after_bound_pending(&mut self) -> WindowsTerminalReplayDecisionV1 {
+        if self.attempt_bound && !self.replay_consumed {
+            self.replay_consumed = true;
+            WindowsTerminalReplayDecisionV1::ReplayOnce
+        } else {
+            WindowsTerminalReplayDecisionV1::FailClosed
+        }
+    }
+
+    pub const fn replay_consumed(self) -> bool {
+        self.replay_consumed
+    }
+
+    /// Returns true exactly once, assigning local handle/event retirement to
+    /// one owner even if recovery and Drop both try to retire the relays.
+    pub fn retire_local_relays_once(&mut self) -> bool {
+        if self.local_relays_retired {
+            false
+        } else {
+            self.local_relays_retired = true;
+            true
+        }
+    }
+}
+
+impl WindowsRelayPhaseV1 {
+    pub fn advance(&mut self, event: WindowsRelayEventV1) -> Result<(), &'static str> {
+        use WindowsRelayEventV1 as Event;
+        use WindowsRelayPhaseV1 as Phase;
+
+        *self = match (*self, event) {
+            (Phase::AwaitStreams, Event::StreamsPrepared) => Phase::AwaitRelaysReady,
+            (Phase::AwaitRelaysReady, Event::RelaysReady) => Phase::AwaitAuthorizationOrAbort,
+            (Phase::AwaitAuthorizationOrAbort, Event::TargetAuthorized) => Phase::Authorized,
+            (Phase::AwaitAuthorizationOrAbort, Event::RelaysAbort) => Phase::AwaitAbortRelayAck,
+            (Phase::AwaitAuthorizationOrAbort, Event::MutantHook) => {
+                Phase::AwaitAuthorizationOrAbort
+            }
+            (Phase::Authorized, Event::TargetRetired) => Phase::AwaitRelayAck,
+            (Phase::AwaitRelayAck, Event::RelaysRetired) => Phase::AwaitTerminal,
+            (Phase::AwaitAbortRelayAck, Event::RelaysRetired) => Phase::AwaitAbortRejection,
+            (Phase::AwaitTerminal, Event::Terminal) => Phase::Terminal,
+            (Phase::AwaitStreams, Event::Reject)
+            | (Phase::AwaitRelaysReady, Event::Reject)
+            | (Phase::AwaitAuthorizationOrAbort, Event::Reject)
+            | (Phase::Authorized, Event::Reject)
+            | (Phase::AwaitRelayAck, Event::Reject)
+            | (Phase::AwaitAbortRelayAck, Event::Reject)
+            | (Phase::AwaitTerminal, Event::Reject)
+            | (Phase::AwaitAbortRejection, Event::Reject)
+            | (Phase::AwaitStreams, Event::MutantTerminal)
+            | (Phase::AwaitRelaysReady, Event::MutantTerminal)
+            | (Phase::AwaitAuthorizationOrAbort, Event::MutantTerminal)
+            | (Phase::Authorized, Event::MutantTerminal)
+            | (Phase::AwaitRelayAck, Event::MutantTerminal)
+            | (Phase::AwaitTerminal, Event::MutantTerminal) => Phase::Terminal,
+            _ => return Err("invalid Windows relay protocol transition"),
+        };
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -195,6 +350,7 @@ impl WindowsMutantNativeReceiptV1 {
         self.schema_version == 1
             && self.attempt_id == attempt_id
             && self.nonce == nonce
+            && !self.nonce.is_empty()
             && self.request_sha256 == request_sha256
     }
 }
@@ -660,7 +816,9 @@ pub struct WindowsTokenScenarioEvidenceV1 {
     pub name: String,
     pub caller_envelope: WindowsCallerTokenEnvelopeV1,
     pub restricted_sid_count: u32,
+    pub restricting_sids: Vec<String>,
     pub token_is_restricted: bool,
+    pub write_restricted: bool,
     pub enabled_sensitive_privilege_count: u32,
     pub administrator_deny_only: bool,
     pub initial_target_token_matches_caller: bool,
@@ -687,33 +845,72 @@ impl WindowsTokenMatrixEvidenceV1 {
             "deny-only-admin",
             "low-integrity",
         ];
-        self.schema_version == 1
+        self.schema_version == 2
             && self.scenarios.len() == REQUIRED.len()
             && self
                 .scenarios
                 .iter()
                 .zip(REQUIRED)
                 .all(|(scenario, required)| {
+                    let token_representation_valid = if required == "elevated-admin" {
+                        scenario.caller_envelope.token_type == 1
+                            && scenario.caller_envelope.impersonation_level == 0
+                    } else {
+                        scenario.caller_envelope.token_type == 2
+                            && (2..=3).contains(&scenario.caller_envelope.impersonation_level)
+                    };
                     if scenario.name != required
                         || !scenario.initial_target_token_matches_caller
                         || scenario.caller_envelope.appcontainer
+                        || !token_representation_valid
                     {
                         return false;
                     }
                     match required {
-                        "elevated-admin" => scenario.caller_envelope.elevated,
-                        "ordinary-user" => !scenario.caller_envelope.elevated,
-                        "restricted" | "write-restricted" => {
-                            scenario.token_is_restricted && scenario.restricted_sid_count != 0
+                        "elevated-admin" => {
+                            scenario.caller_envelope.elevated
+                                && !scenario.token_is_restricted
+                                && !scenario.write_restricted
+                                && scenario.restricted_sid_count == 0
+                                && scenario.restricting_sids.is_empty()
                         }
-                        "disabled-privileges" => scenario.enabled_sensitive_privilege_count == 0,
+                        "ordinary-user" => {
+                            !scenario.caller_envelope.elevated
+                                && !scenario.write_restricted
+                                && scenario.restricted_sid_count == 0
+                                && scenario.restricting_sids.is_empty()
+                        }
+                        "restricted" => {
+                            scenario.token_is_restricted
+                                && !scenario.write_restricted
+                                && scenario.restricted_sid_count == 1
+                                && scenario.restricting_sids == ["S-1-5-12"]
+                        }
+                        "write-restricted" => {
+                            scenario.token_is_restricted
+                                && scenario.write_restricted
+                                && scenario.restricted_sid_count == 1
+                                && scenario.restricting_sids == ["S-1-5-33"]
+                        }
+                        "disabled-privileges" => {
+                            scenario.enabled_sensitive_privilege_count == 0
+                                && scenario.write_restricted
+                                && scenario.restricted_sid_count == 1
+                                && scenario.restricting_sids == ["S-1-5-33"]
+                        }
                         "deny-only-admin" => {
                             scenario.administrator_deny_only
                                 && scenario.token_is_restricted
-                                && scenario.restricted_sid_count != 0
+                                && !scenario.write_restricted
+                                && scenario.restricted_sid_count == 1
+                                && scenario.restricting_sids == ["S-1-5-12"]
                         }
                         "low-integrity" => {
                             scenario.caller_envelope.integrity_level == "S-1-16-4096"
+                                && scenario.token_is_restricted
+                                && !scenario.write_restricted
+                                && scenario.restricted_sid_count == 1
+                                && scenario.restricting_sids == ["S-1-5-12"]
                         }
                         _ => false,
                     }
@@ -729,6 +926,52 @@ impl WindowsCertificationObservationsV1 {
             && self.preauthorization.is_complete()
             && self.retirement.is_complete()
     }
+}
+
+pub const WINDOWS_CERTIFICATION_FRONTEND_CANARY_COUNT: usize = 6;
+
+pub fn windows_certification_argument_prelude_len(mode: &[u16]) -> Option<usize> {
+    if mode
+        .iter()
+        .copied()
+        .eq("windows-certification-target".encode_utf16())
+    {
+        Some(3)
+    } else if mode
+        .iter()
+        .copied()
+        .eq("windows-certification-nested-target".encode_utf16())
+    {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+pub fn parse_windows_certification_frontend_handle_values(
+    arguments: &[Vec<u16>],
+) -> Result<Option<[u64; WINDOWS_CERTIFICATION_FRONTEND_CANARY_COUNT]>, String> {
+    let Some(mode) = arguments.first() else {
+        return Ok(None);
+    };
+    String::from_utf16(mode).map_err(|error| error.to_string())?;
+    let Some(prefix) = windows_certification_argument_prelude_len(mode) else {
+        return Ok(None);
+    };
+    let values = arguments
+        .get(prefix..)
+        .ok_or_else(|| "frontend handle-canary arguments are absent".to_owned())?;
+    if values.len() != WINDOWS_CERTIFICATION_FRONTEND_CANARY_COUNT {
+        return Err("frontend handle-canary inventory is not exact".to_owned());
+    }
+    let mut parsed = [0_u64; WINDOWS_CERTIFICATION_FRONTEND_CANARY_COUNT];
+    for (index, value) in values.iter().enumerate() {
+        parsed[index] = String::from_utf16(value)
+            .map_err(|error| error.to_string())?
+            .parse::<u64>()
+            .map_err(|error| format!("frontend handle-canary value is invalid: {error}"))?;
+    }
+    Ok(Some(parsed))
 }
 
 pub fn encode_windows_command_line(arguments: &[Vec<u16>]) -> Vec<u16> {
@@ -894,6 +1137,13 @@ pub enum WindowsAttemptStateV1 {
     Empty,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsAttemptTerminalDispositionV1 {
+    PreauthorizationAbort,
+    Posttarget,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsDurableCleanupStateV1 {
@@ -926,6 +1176,10 @@ pub struct WindowsDurableAttemptRecordV1 {
     pub resume_attempted: bool,
     pub target_released: bool,
     pub cleanup_state: WindowsDurableCleanupStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_response_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_disposition: Option<WindowsAttemptTerminalDispositionV1>,
     pub integrity_sha256: String,
 }
 
@@ -1027,6 +1281,51 @@ fn windows_durable_attempt_state_is_consistent(record: &WindowsDurableAttemptRec
                 && record.cleanup_state.active_processes_zero
                 && record.cleanup_state.guardian_reaped
                 && record.state == WindowsAttemptStateV1::Empty))
+        && record.terminal_response_json.as_ref().is_none_or(|json| {
+            json.len() <= WINDOWS_MAX_FRAME_BYTES / 2
+                && record.state == WindowsAttemptStateV1::Empty
+                && record.terminal_disposition.is_some()
+                && serde_json::from_str::<WindowsLauncherResponseV1>(json)
+                    .is_ok_and(|response| windows_terminal_outbox_is_bound(record, &response))
+        })
+}
+
+fn windows_terminal_outbox_is_bound(
+    record: &WindowsDurableAttemptRecordV1,
+    response: &WindowsLauncherResponseV1,
+) -> bool {
+    match response {
+        WindowsLauncherResponseV1::Terminal(receipt) => {
+            record.terminal_disposition == Some(WindowsAttemptTerminalDispositionV1::Posttarget)
+                && receipt.attempt_id == record.attempt_id
+                && receipt.request_sha256 == record.request_sha256
+                && receipt.process_identity_inventory_shape_is_bounded()
+        }
+        WindowsLauncherResponseV1::Reject {
+            attempt_id,
+            request_sha256,
+            rejection,
+            ..
+        } => {
+            let disposition_matches = match record.terminal_disposition {
+                Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort) => {
+                    rejection.terminal_ack_required && rejection.terminal_receipt.is_none()
+                }
+                Some(WindowsAttemptTerminalDispositionV1::Posttarget) => {
+                    rejection.terminal_receipt.as_ref().is_some_and(|receipt| {
+                        receipt.attempt_id == record.attempt_id
+                            && receipt.request_sha256 == record.request_sha256
+                    })
+                }
+                None => false,
+            };
+            attempt_id == &record.attempt_id
+                && request_sha256 == &record.request_sha256
+                && rejection.is_consistent()
+                && disposition_matches
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1112,21 +1411,55 @@ pub const fn windows_attempt_transition_allowed(
 }
 
 pub fn validate_windows_security_descriptor_text(value: &str) -> Result<(), &'static str> {
-    let dacl = if let Some(without_owner) = value.strip_prefix("O:") {
-        let Some((owner, dacl)) = without_owner.split_once("D:") else {
-            return Err("Windows security descriptor owner is missing a DACL");
-        };
-        if owner.is_empty() || owner.contains(['(', ')', ':']) {
-            return Err("Windows security descriptor owner is malformed");
-        }
-        dacl
-    } else if let Some(dacl) = value.strip_prefix("D:") {
-        dacl
-    } else {
-        return Err("Windows security descriptor text has an invalid prefix or NUL");
-    };
     if value.is_empty() || value.contains('\0') {
         return Err("Windows security descriptor text has an invalid prefix or NUL");
+    }
+
+    fn component<'a>(
+        value: &'a str,
+        following: &[&str],
+        malformed: &'static str,
+    ) -> Result<(&'a str, &'a str), &'static str> {
+        let boundary = following
+            .iter()
+            .filter_map(|marker| value.find(marker))
+            .min()
+            .ok_or(malformed)?;
+        let (component, remaining) = value.split_at(boundary);
+        if component.is_empty() || component.contains(['(', ')', ':']) {
+            return Err(malformed);
+        }
+        Ok((component, remaining))
+    }
+
+    let mut remaining = value;
+    if let Some(without_owner) = remaining.strip_prefix("O:") {
+        let (_, after_owner) = component(
+            without_owner,
+            &["G:", "D:"],
+            "Windows security descriptor owner is malformed",
+        )?;
+        remaining = after_owner;
+    }
+    if let Some(without_group) = remaining.strip_prefix("G:") {
+        let (_, after_group) = component(
+            without_group,
+            &["D:"],
+            "Windows security descriptor group is malformed",
+        )?;
+        remaining = after_group;
+    }
+    let Some(mut dacl) = remaining.strip_prefix("D:") else {
+        return Err("Windows security descriptor text is missing an ordered DACL");
+    };
+    if let Some((before_sacl, sacl)) = dacl.split_once("S:") {
+        if sacl.contains(':') {
+            return Err("Windows security descriptor SACL has a malformed component delimiter");
+        }
+        dacl = before_sacl;
+    }
+    if dacl.contains(':') {
+        return Err("Windows security descriptor DACL has a malformed component delimiter");
     }
     let mut depth = 0_u32;
     let mut ace_count = 0_u32;
@@ -1179,6 +1512,70 @@ pub enum WindowsLifetimeV1 {
 pub struct WindowsProcessIdentityV1 {
     pub process_id: u32,
     pub creation_time_100ns: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsServiceSelfAttestationV1 {
+    pub schema_version: u32,
+    pub challenge: String,
+    pub service_name: String,
+    pub process_identity: WindowsProcessIdentityV1,
+    pub service_sid: String,
+    pub service_sid_enabled: bool,
+    pub service_sid_restricted: bool,
+    pub token_session_id: u32,
+    pub required_privileges: Vec<String>,
+}
+
+impl WindowsServiceSelfAttestationV1 {
+    pub fn validate_for(
+        &self,
+        expected_challenge: &str,
+        expected_service_name: &str,
+        expected_process_identity: &WindowsProcessIdentityV1,
+        expected_service_sid: &str,
+        expected_privileges: &[&str],
+    ) -> Result<(), &'static str> {
+        if self.schema_version != 1 {
+            return Err("service attestation has the wrong schema version");
+        }
+        if !windows_sha256_text_is_valid(expected_challenge) || self.challenge != expected_challenge
+        {
+            return Err("service attestation challenge does not match");
+        }
+        if self.service_name != expected_service_name {
+            return Err("service attestation service name does not match");
+        }
+        if self.process_identity != *expected_process_identity
+            || !windows_process_identity_is_valid(&self.process_identity)
+        {
+            return Err("service attestation process identity does not match");
+        }
+        if self.service_sid != expected_service_sid {
+            return Err("service attestation service SID does not match");
+        }
+        if !self.service_sid_enabled {
+            return Err("service attestation lacks the enabled service SID");
+        }
+        if !self.service_sid_restricted {
+            return Err("service attestation lacks the restricting service SID");
+        }
+        if self.required_privileges.len() != expected_privileges.len()
+            || !self
+                .required_privileges
+                .iter()
+                .zip(expected_privileges)
+                .all(|(actual, expected)| actual == expected)
+        {
+            return Err("service attestation required privileges do not match");
+        }
+        Ok(())
+    }
+}
+
+pub fn windows_service_attestation_challenge_is_valid(challenge: &str) -> bool {
+    windows_sha256_text_is_valid(challenge)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1284,13 +1681,16 @@ pub enum WindowsProviderRequestV1 {
     },
     RecoveryStatus {
         schema_version: u32,
+        challenge: String,
     },
     PackageCleanup {
         schema_version: u32,
+        challenge: String,
     },
     QualificationBegin {
         schema_version: u32,
         scope: String,
+        challenge: String,
     },
     QualificationAuthorizeChild {
         schema_version: u32,
@@ -1341,6 +1741,143 @@ pub enum WindowsProviderRequestV1 {
         nonce: String,
         request_sha256: String,
     },
+    TerminalAcknowledged {
+        schema_version: u32,
+        attempt_id: String,
+        nonce: String,
+        request_sha256: String,
+        terminal_response_sha256: String,
+    },
+    ReplayTerminal {
+        schema_version: u32,
+        attempt_id: String,
+        nonce: String,
+        request_sha256: String,
+        relay_phase: WindowsRelayPhaseV1,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsControlRequestStatusV1 {
+    Ready,
+    Active,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsAttemptRetainedV1 {
+    pub schema_version: u32,
+    pub attempt_id: String,
+    pub nonce: String,
+    pub request_sha256: String,
+    pub relay_phase: WindowsRelayPhaseV1,
+    pub durable_state: Option<WindowsAttemptStateV1>,
+    pub terminal_disposition: Option<WindowsAttemptTerminalDispositionV1>,
+    pub cleanup_complete: bool,
+    pub terminal_replay_available: bool,
+    pub authority_retained: bool,
+    pub primary_detail: String,
+    pub secondary_failures: Vec<String>,
+}
+
+impl WindowsAttemptRetainedV1 {
+    pub fn is_consistent_for(
+        &self,
+        attempt_id: &str,
+        nonce: &str,
+        request_sha256: &str,
+        relay_phase: WindowsRelayPhaseV1,
+    ) -> bool {
+        self.schema_version == 1
+            && self.attempt_id == attempt_id
+            && self.nonce == nonce
+            && !self.nonce.is_empty()
+            && self.request_sha256 == request_sha256
+            && self.relay_phase == relay_phase
+            && windows_sha256_text_is_valid(&self.attempt_id)
+            && windows_sha256_text_is_valid(&self.request_sha256)
+            && self.authority_retained
+            && !self.primary_detail.is_empty()
+            && self
+                .secondary_failures
+                .iter()
+                .all(|failure| !failure.is_empty())
+            && (!self.cleanup_complete || self.durable_state == Some(WindowsAttemptStateV1::Empty))
+            && (!self.terminal_replay_available
+                || (self.cleanup_complete && self.terminal_disposition.is_some()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsReplayOutboxStageV1 {
+    NotStaged,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsReplayPendingV1 {
+    pub schema_version: u32,
+    pub attempt_id: String,
+    pub nonce: String,
+    pub request_sha256: String,
+    pub relay_phase: WindowsRelayPhaseV1,
+    pub durable_state: WindowsAttemptStateV1,
+    pub cleanup_complete: bool,
+    pub outbox_stage: WindowsReplayOutboxStageV1,
+    pub detail: String,
+}
+
+impl WindowsReplayPendingV1 {
+    pub fn is_consistent_for(
+        &self,
+        attempt_id: &str,
+        nonce: &str,
+        request_sha256: &str,
+        relay_phase: WindowsRelayPhaseV1,
+    ) -> bool {
+        self.schema_version == 1
+            && self.attempt_id == attempt_id
+            && self.nonce == nonce
+            && self.request_sha256 == request_sha256
+            && self.relay_phase == relay_phase
+            && windows_sha256_text_is_valid(&self.attempt_id)
+            && windows_sha256_text_is_valid(&self.request_sha256)
+            && !self.detail.is_empty()
+            && (!self.cleanup_complete || self.durable_state == WindowsAttemptStateV1::Empty)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsTerminalRetiredV1 {
+    pub schema_version: u32,
+    pub attempt_id: String,
+    pub nonce: String,
+    pub request_sha256: String,
+    pub terminal_response_sha256: String,
+    pub disposition: WindowsAttemptTerminalDispositionV1,
+}
+
+impl WindowsTerminalRetiredV1 {
+    pub fn is_consistent_for(
+        &self,
+        attempt_id: &str,
+        nonce: &str,
+        request_sha256: &str,
+        terminal_response_sha256: &str,
+    ) -> bool {
+        self.schema_version == 1
+            && self.attempt_id == attempt_id
+            && self.nonce == nonce
+            && self.request_sha256 == request_sha256
+            && self.terminal_response_sha256 == terminal_response_sha256
+            && windows_sha256_text_is_valid(&self.attempt_id)
+            && windows_sha256_text_is_valid(&self.request_sha256)
+            && windows_sha256_text_is_valid(&self.terminal_response_sha256)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1361,16 +1898,26 @@ pub enum WindowsProviderResponseV1 {
     },
     RecoveryStatus {
         schema_version: u32,
-        attempts_empty: bool,
+        challenge: String,
+        status: WindowsControlRequestStatusV1,
+        attempts_empty: Option<bool>,
+        detail: String,
     },
-    PackageCleanupReady {
+    PackageCleanupResult {
         schema_version: u32,
+        challenge: String,
+        status: WindowsControlRequestStatusV1,
+        attempts_empty: Option<bool>,
+        terminal_outboxes: Option<u32>,
+        detail: String,
     },
     QualificationReady {
         schema_version: u32,
     },
     QualificationAuthenticated {
         schema_version: u32,
+        control_attestation: WindowsServiceSelfAttestationV1,
+        launcher_attestation: WindowsServiceSelfAttestationV1,
     },
     QualificationChildAuthorized {
         schema_version: u32,
@@ -1411,6 +1958,9 @@ pub enum WindowsProviderResponseV1 {
         request_sha256: String,
         rejection: ProviderRejectionEvidence,
     },
+    AttemptRetained(WindowsAttemptRetainedV1),
+    ReplayPending(WindowsReplayPendingV1),
+    TerminalRetired(WindowsTerminalRetiredV1),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1419,6 +1969,7 @@ pub enum WindowsProviderResponseV1 {
 pub enum WindowsLauncherRequestV1 {
     Probe {
         schema_version: u32,
+        challenge: String,
     },
     CertificationMachineRestart {
         schema_version: u32,
@@ -1450,6 +2001,22 @@ pub enum WindowsLauncherRequestV1 {
         nonce: String,
         request_sha256: String,
     },
+    TerminalAcknowledged {
+        schema_version: u32,
+        attempt_id: String,
+        nonce: String,
+        request_sha256: String,
+        terminal_response_sha256: String,
+    },
+    ReplayTerminal {
+        schema_version: u32,
+        attempt_id: String,
+        nonce: String,
+        request_sha256: String,
+        relay_phase: WindowsRelayPhaseV1,
+        caller_process_identity: WindowsProcessIdentityV1,
+        caller_token_sha256: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1458,7 +2025,7 @@ pub enum WindowsLauncherRequestV1 {
 pub enum WindowsLauncherResponseV1 {
     Probe {
         schema_version: u32,
-        process_identity: WindowsProcessIdentityV1,
+        attestation: WindowsServiceSelfAttestationV1,
     },
     CertificationMachineRestart {
         schema_version: u32,
@@ -1508,9 +2075,12 @@ pub enum WindowsLauncherResponseV1 {
         request_sha256: String,
         rejection: ProviderRejectionEvidence,
     },
+    AttemptRetained(WindowsAttemptRetainedV1),
+    ReplayPending(WindowsReplayPendingV1),
+    TerminalRetired(WindowsTerminalRetiredV1),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsTerminalReceiptV1 {
     pub schema_version: u32,
@@ -1533,9 +2103,11 @@ pub struct WindowsTerminalReceiptV1 {
 #[serde(deny_unknown_fields)]
 pub struct WindowsCleanupProcessCreationEvidenceV1 {
     pub schema_version: u32,
+    pub attempt_binding: String,
     pub attempted_after_terminating_transition: bool,
     pub child_created: bool,
     pub child_job_membership_verified: bool,
+    pub child_identity: WindowsProcessIdentityV1,
     pub total_processes_before: u32,
     pub total_processes_after: u32,
     pub final_active_processes_zero: bool,
@@ -1544,16 +2116,27 @@ pub struct WindowsCleanupProcessCreationEvidenceV1 {
 impl WindowsCleanupProcessCreationEvidenceV1 {
     pub fn is_consistent(&self) -> bool {
         self.schema_version == 1
+            && self
+                .attempt_binding
+                .strip_prefix("attempt-")
+                .is_some_and(windows_sha256_text_is_valid)
             && self.attempted_after_terminating_transition
             && self.child_created
             && self.child_job_membership_verified
+            && self.child_identity.process_id != 0
+            && self.child_identity.creation_time_100ns != 0
             && self.total_processes_after > self.total_processes_before
             && self.final_active_processes_zero
     }
 }
 
+#[derive(Debug)]
+pub struct ValidatedWindowsCertificationTerminal<'a> {
+    pub native: &'a WindowsSealedEvidenceV2,
+}
+
 impl WindowsTerminalReceiptV1 {
-    pub fn process_identity_inventory_is_bounded(&self) -> bool {
+    pub fn process_identity_inventory_shape_is_bounded(&self) -> bool {
         self.job_process_identities.len() <= WINDOWS_MAX_JOB_PROCESS_IDENTITIES
             && self
                 .job_process_identities
@@ -1564,10 +2147,182 @@ impl WindowsTerminalReceiptV1 {
                 .iter()
                 .enumerate()
                 .all(|(index, identity)| !self.job_process_identities[..index].contains(identity))
+    }
+
+    pub fn process_identity_inventory_is_bounded(&self) -> bool {
+        self.process_identity_inventory_shape_is_bounded()
             && self
                 .cleanup_process_creation
                 .as_ref()
                 .is_none_or(WindowsCleanupProcessCreationEvidenceV1::is_consistent)
+    }
+
+    pub fn validate_for_certification(
+        &self,
+        expected_attempt_binding: &str,
+        required_job_total_processes: u32,
+    ) -> Result<ValidatedWindowsCertificationTerminal<'_>, String> {
+        if self.schema_version != 1 {
+            return Err("schema_version".to_owned());
+        }
+        if !self.process_identity_inventory_shape_is_bounded() {
+            return Err("job_process_identities".to_owned());
+        }
+        if !self.restart_safety.is_safe_for(BoundaryRequirement::Sealed) {
+            return Err("restart_safety".to_owned());
+        }
+        let cleanup = self
+            .cleanup_process_creation
+            .as_ref()
+            .ok_or_else(|| "cleanup_process_creation".to_owned())?;
+        if cleanup.attempt_binding != expected_attempt_binding {
+            return Err("cleanup_process_creation.attempt_binding".to_owned());
+        }
+        for (complete, field) in [
+            (
+                cleanup.schema_version == 1,
+                "cleanup_process_creation.schema_version",
+            ),
+            (
+                cleanup.attempted_after_terminating_transition,
+                "cleanup_process_creation.attempted_after_terminating_transition",
+            ),
+            (
+                cleanup.child_created,
+                "cleanup_process_creation.child_created",
+            ),
+            (
+                cleanup.child_job_membership_verified,
+                "cleanup_process_creation.child_job_membership_verified",
+            ),
+            (
+                cleanup.child_identity.process_id != 0,
+                "cleanup_process_creation.child_identity.process_id",
+            ),
+            (
+                cleanup.child_identity.creation_time_100ns != 0,
+                "cleanup_process_creation.child_identity.creation_time_100ns",
+            ),
+            (
+                cleanup.total_processes_after > cleanup.total_processes_before,
+                "cleanup_process_creation.total_processes_after",
+            ),
+            (
+                cleanup.final_active_processes_zero,
+                "cleanup_process_creation.final_active_processes_zero",
+            ),
+            (
+                self.job_total_processes >= cleanup.total_processes_after,
+                "job_total_processes.cleanup_floor",
+            ),
+            (
+                self.job_total_processes >= required_job_total_processes,
+                "job_total_processes.qualification_minimum",
+            ),
+        ] {
+            if !complete {
+                return Err(field.to_owned());
+            }
+        }
+        if !matches!(
+            self.outcome,
+            RunOutcome::Exited {
+                child: ChildTermination::ExitCode { code: 0 },
+                ..
+            }
+        ) {
+            return Err("outcome.child".to_owned());
+        }
+        let BoundaryMechanismEvidence::WindowsJobObjectV2(native) = &self.boundary_detail else {
+            return Err("boundary_detail.variant".to_owned());
+        };
+        for (complete, field) in [
+            (native.schema_version == 2, "boundary_detail.schema_version"),
+            (
+                native.service_identity == "MemCordonSealedControl+MemCordonSealedLauncher:v1",
+                "boundary_detail.service_identity",
+            ),
+            (
+                native.caller_token_authenticated,
+                "boundary_detail.caller_token_authenticated",
+            ),
+            (
+                native.initial_target_token_matches_caller,
+                "boundary_detail.initial_target_token_matches_caller",
+            ),
+            (
+                native.credential_transition_disposition
+                    == CredentialTransitionDisposition::PreserveCallerEnvelope,
+                "boundary_detail.credential_transition_disposition",
+            ),
+            (
+                native.job_membership_independent_of_token,
+                "boundary_detail.job_membership_independent_of_token",
+            ),
+            (native.job_created, "boundary_detail.job_created"),
+            (
+                native.job_limits_verified,
+                "boundary_detail.job_limits_verified",
+            ),
+            (
+                native.kill_on_close_verified,
+                "boundary_detail.kill_on_close_verified",
+            ),
+            (native.breakaway_denied, "boundary_detail.breakaway_denied"),
+            (
+                native.completion_port_associated,
+                "boundary_detail.completion_port_associated",
+            ),
+            (native.guardian_ready, "boundary_detail.guardian_ready"),
+            (
+                native.target_created_suspended,
+                "boundary_detail.target_created_suspended",
+            ),
+            (
+                native.job_list_applied_at_creation,
+                "boundary_detail.job_list_applied_at_creation",
+            ),
+            (
+                native.handle_list_applied_at_creation,
+                "boundary_detail.handle_list_applied_at_creation",
+            ),
+            (
+                native.target_job_membership_verified,
+                "boundary_detail.target_job_membership_verified",
+            ),
+            (
+                native.target_still_suspended_during_verification,
+                "boundary_detail.target_still_suspended_during_verification",
+            ),
+            (
+                native.inherited_handles_verified,
+                "boundary_detail.inherited_handles_verified",
+            ),
+            (native.target_released, "boundary_detail.target_released"),
+            (
+                native.terminate_job_invoked,
+                "boundary_detail.terminate_job_invoked",
+            ),
+            (
+                native.active_processes_zero,
+                "boundary_detail.active_processes_zero",
+            ),
+            (
+                native.direct_target_reaped,
+                "boundary_detail.direct_target_reaped",
+            ),
+            (native.relays_retired, "boundary_detail.relays_retired"),
+            (native.guardian_reaped, "boundary_detail.guardian_reaped"),
+            (
+                native.final_job_handles_closed,
+                "boundary_detail.final_job_handles_closed",
+            ),
+        ] {
+            if !complete {
+                return Err(field.to_owned());
+            }
+        }
+        Ok(ValidatedWindowsCertificationTerminal { native })
     }
 }
 
@@ -1578,11 +2333,15 @@ pub struct WindowsQualificationReceiptV1 {
     pub provider_identity: String,
     pub control_service_identity: String,
     pub launcher_service_identity: String,
+    pub guardian_pool_identity: String,
     pub package_verified: bool,
     pub public_pipe_security_verified: bool,
     pub private_pipe_security_verified: bool,
     pub control_service_privileges_verified: bool,
     pub launcher_service_privileges_verified: bool,
+    pub guardian_slot_tokens_verified: bool,
+    pub guardian_slot_loader_verified: bool,
+    pub guardian_capacity_verified: bool,
     pub caller_token_authentication_verified: bool,
     pub restricted_caller_token_verified: bool,
     pub primary_token_duplication_verified: bool,
@@ -1621,12 +2380,17 @@ impl WindowsQualificationReceiptV1 {
                 )
             && self.control_service_identity == "MemCordonSealedControl:LocalService:restricted"
             && self.launcher_service_identity == "MemCordonSealedLauncher:LocalSystem:restricted"
+            && self.guardian_pool_identity
+                == "MemCordonSealedGuardian-000..007:LocalSystem:restricted:demand"
             && (!self.qualified
                 || (self.package_verified
                     && self.public_pipe_security_verified
                     && self.private_pipe_security_verified
                     && self.control_service_privileges_verified
                     && self.launcher_service_privileges_verified
+                    && self.guardian_slot_tokens_verified
+                    && self.guardian_slot_loader_verified
+                    && self.guardian_capacity_verified
                     && self.caller_token_authentication_verified
                     && self.restricted_caller_token_verified
                     && self.primary_token_duplication_verified

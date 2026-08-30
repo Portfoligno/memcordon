@@ -61,14 +61,14 @@ fn watch_git_identity(manifest: &Path) {
     };
     let head_path = git.join("HEAD");
     println!("cargo:rerun-if-changed={}", head_path.display());
-    if let Ok(head) = fs::read_to_string(&head_path)
-        && let Some(reference) = head.trim().strip_prefix("ref: ")
-    {
-        println!("cargo:rerun-if-changed={}", git.join(reference).display());
-        println!(
-            "cargo:rerun-if-changed={}",
-            git.join("packed-refs").display()
-        );
+    if let Ok(head) = fs::read_to_string(&head_path) {
+        if let Some(reference) = head.trim().strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed={}", git.join(reference).display());
+            println!(
+                "cargo:rerun-if-changed={}",
+                git.join("packed-refs").display()
+            );
+        }
     }
 }
 

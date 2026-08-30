@@ -6,12 +6,14 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
 use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus};
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_JOB_MEMORY,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
-    JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
-    JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectAssociateCompletionPortInformation, JobObjectBasicAccountingInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
 
 use super::pipe::OwnedHandle;
@@ -36,6 +38,12 @@ pub enum JobNotification {
     Other(u32),
 }
 
+enum JobObjectSecurity {
+    LauncherService,
+    NestedCanaryCreator,
+    SessionHolder,
+}
+
 impl Job {
     pub fn process_is_in_any_job(process: HANDLE) -> Result<bool, String> {
         let mut inside = 0_i32;
@@ -52,16 +60,53 @@ impl Job {
         certification_fault: Option<WindowsSealedFault>,
         certification_mutant: Option<WindowsSealedMutant>,
     ) -> Result<Self, String> {
+        Self::create_with_security(
+            memory_limit,
+            certification_fault,
+            certification_mutant,
+            JobObjectSecurity::LauncherService,
+        )
+    }
+
+    pub fn create_nested_canary(memory_limit: Option<u64>) -> Result<Self, String> {
+        Self::create_with_security(
+            memory_limit,
+            None,
+            None,
+            JobObjectSecurity::NestedCanaryCreator,
+        )
+    }
+
+    pub fn create_session_holder() -> Result<Self, String> {
+        let job = Self::create_with_security(None, None, None, JobObjectSecurity::SessionHolder)?;
+        job.configure_session_holder()?;
+        job.verify_session_holder_configuration()?;
+        if job.active_processes()? != 0 || job.total_processes()? != 0 {
+            return Err("session-holder Job was not empty at creation".to_owned());
+        }
+        Ok(job)
+    }
+
+    fn create_with_security(
+        memory_limit: Option<u64>,
+        certification_fault: Option<WindowsSealedFault>,
+        certification_mutant: Option<WindowsSealedMutant>,
+        object_security: JobObjectSecurity,
+    ) -> Result<Self, String> {
         reject_fault(certification_fault, WindowsSealedFault::JobCreate)?;
-        let security = super::security::SecurityDescriptor::from_sddl(
-            &super::security::launcher_process_sddl()?,
-        )?;
+        let sddl = match object_security {
+            JobObjectSecurity::LauncherService => super::security::launcher_job_sddl()?,
+            JobObjectSecurity::NestedCanaryCreator => super::security::nested_canary_job_sddl()?,
+            JobObjectSecurity::SessionHolder => super::security::session_holder_job_sddl()?,
+        };
+        let security = super::security::SecurityDescriptor::from_sddl(&sddl)?;
         let attributes = security.attributes(false);
-        // SAFETY: attributes holds the exact restrictive descriptor and null
-        // name creates a private unnamed Job transferred into OwnedHandle.
+        // SAFETY: attributes holds the exact role-appropriate descriptor and
+        // remains live for the call. The unnamed Job handle is transferred
+        // into OwnedHandle.
         let handle =
             OwnedHandle::new(unsafe { CreateJobObjectW(&raw const attributes, ptr::null()) })?;
-        security.verify_kernel_object(handle.raw())?;
+        security.verify_kernel_object(handle.raw(), super::security::SecurityObjectKind::Job)?;
         // SAFETY: INVALID_HANDLE_VALUE requests a new completion port; the
         // returned handle is independently owned.
         let completion_port = OwnedHandle::new(unsafe {
@@ -155,6 +200,79 @@ impl Job {
         } else {
             Ok(limits)
         }
+    }
+
+    fn configure_session_holder(&self) -> Result<(), String> {
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        limits.BasicLimitInformation.ActiveProcessLimit = 1;
+        // SAFETY: structure and size match the requested Job information class.
+        if unsafe {
+            SetInformationJobObject(
+                self.handle(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            Err(io::Error::last_os_error().to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn verify_session_holder_configuration(&self) -> Result<(), String> {
+        Self::verify_session_holder_handle(self.handle())
+    }
+
+    pub fn verify_session_holder_handle(handle: HANDLE) -> Result<(), String> {
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // SAFETY: handle is a live Job query capability and output is writable.
+        if unsafe {
+            QueryInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&raw mut limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let expected = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        if limits.BasicLimitInformation.LimitFlags != expected
+            || limits.BasicLimitInformation.ActiveProcessLimit != 1
+        {
+            return Err("session-holder Job policy differs from the exact one-process crash-containment contract".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn verify_session_holder_empty_handle(handle: HANDLE) -> Result<(), String> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: handle is a live Job query capability and output is writable.
+        if unsafe {
+            QueryInformationJobObject(
+                handle,
+                JobObjectBasicAccountingInformation,
+                (&raw mut accounting).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        if accounting.ActiveProcesses != 0 || accounting.TotalProcesses != 0 {
+            return Err("session-holder Job is not empty at broker adoption".to_owned());
+        }
+        Ok(())
     }
 
     pub fn breakaway_allowed(&self) -> Result<bool, String> {

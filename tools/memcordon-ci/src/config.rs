@@ -145,6 +145,8 @@ pub struct AssetExecutable {
 pub enum RuntimeComponentRole {
     PublicCli,
     SealedAgent,
+    DesktopBootstrap,
+    SessionBroker,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -282,7 +284,8 @@ fn validate_target_executables(target: &AssetTarget, sealed: bool) -> bool {
     } else {
         "memcordon"
     };
-    let expected_count = usize::from(sealed) + 1;
+    let windows_sealed = sealed && target.archive == "zip";
+    let expected_count = usize::from(sealed) + usize::from(windows_sealed) * 2 + 1;
     if target.executable.len() != expected_count {
         return false;
     }
@@ -307,6 +310,26 @@ fn validate_target_executables(target: &AssetTarget, sealed: bool) -> bool {
             || agent.archive_path != expected_agent_path
             || agent.mode != 0o755
             || agent.role != RuntimeComponentRole::SealedAgent
+        {
+            return false;
+        }
+    }
+    if windows_sealed {
+        let bootstrap = &target.executable[2];
+        if bootstrap.package != "memcordon"
+            || bootstrap.binary != "memcordon-target-desktop-bootstrap"
+            || bootstrap.archive_path != "memcordon-target-desktop-bootstrap.exe"
+            || bootstrap.mode != 0o755
+            || bootstrap.role != RuntimeComponentRole::DesktopBootstrap
+        {
+            return false;
+        }
+        let broker = &target.executable[3];
+        if broker.package != "memcordon"
+            || broker.binary != "memcordon-session-broker"
+            || broker.archive_path != "memcordon-session-broker.exe"
+            || broker.mode != 0o755
+            || broker.role != RuntimeComponentRole::SessionBroker
         {
             return false;
         }

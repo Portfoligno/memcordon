@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
@@ -12,7 +14,8 @@ use memcordon_core::{
     MemcordonReport, NativeArgument, PolicyEnvelopeReport, RequestedPolicyReport,
     RequestedRestartPolicyReport, RestartConditions, RestartDecisionRecord, RestartLimit,
     RestartSafetyProof, RestartSummary, RunOutcome, SupervisionAggregates, SupervisionExecution,
-    SupervisionTerminal, ToolReport,
+    SupervisionTerminal, ToolReport, WINDOWS_QUALIFICATION_SCHEMA_VERSION,
+    WindowsQualificationReceiptV1,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -23,7 +26,9 @@ const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 type ReportMutation = fn(&mut Value);
 
 const WINDOWS_TESTS: &[&str] = &[
+    "fresh_qualification_failure_rollback_is_repeatable",
     "package_install_verify_probe_and_same_version_upgrade",
+    "stale_low_integrity_workspace_upgrade_and_uninstall_cleanup",
     "active_attempt_upgrade_and_uninstall_are_refused",
     "public_sealed_launch_preserves_status_and_native_evidence",
     "frontend_loss_retires_the_job_and_durable_record",
@@ -311,43 +316,48 @@ fn public_launch_report() -> Value {
     serde_json::to_value(report).expect("public launch report should serialize")
 }
 
-fn windows_qualification() -> Value {
-    let mut value = json!({
-        "schema_version": 1,
-        "provider_identity": format!("memcordon-sealed-agent-windows-v1:{}", env!("CARGO_PKG_VERSION")),
-        "control_service_identity": "MemCordonSealedControl:LocalService:restricted",
-        "launcher_service_identity": "MemCordonSealedLauncher:LocalSystem:restricted"
-    });
-    for field in [
-        "package_verified",
-        "public_pipe_security_verified",
-        "private_pipe_security_verified",
-        "control_service_privileges_verified",
-        "launcher_service_privileges_verified",
-        "caller_token_authentication_verified",
-        "restricted_caller_token_verified",
-        "primary_token_duplication_verified",
-        "create_process_as_user_verified",
-        "job_list_supported",
-        "handle_list_supported",
-        "nested_host_job_supported",
-        "kill_on_close_verified",
-        "breakaway_denied",
-        "completion_port_verified",
-        "guardian_verified",
-        "frontend_loss_cleanup_verified",
-        "alternate_token_child_contained",
-        "nested_child_job_contained",
-        "recursive_provider_request_denied",
-        "exact_handle_inheritance_verified",
-        "active_processes_zero_verified",
-        "relays_retired_verified",
-        "recovery_complete",
-        "qualified",
-    ] {
-        value[field] = json!(true);
-    }
-    value
+fn windows_qualification() -> WindowsQualificationReceiptV1 {
+    let receipt = WindowsQualificationReceiptV1 {
+        schema_version: WINDOWS_QUALIFICATION_SCHEMA_VERSION,
+        provider_identity: format!(
+            "memcordon-sealed-agent-windows-v1:{}",
+            env!("CARGO_PKG_VERSION")
+        ),
+        control_service_identity: "MemCordonSealedControl:LocalService:restricted".to_owned(),
+        launcher_service_identity: "MemCordonSealedLauncher:LocalSystem:restricted".to_owned(),
+        guardian_pool_identity: "MemCordonSealedGuardian-000..007:LocalSystem:restricted:demand"
+            .to_owned(),
+        package_verified: true,
+        public_pipe_security_verified: true,
+        private_pipe_security_verified: true,
+        control_service_privileges_verified: true,
+        launcher_service_privileges_verified: true,
+        guardian_slot_tokens_verified: true,
+        guardian_slot_loader_verified: true,
+        guardian_capacity_verified: true,
+        caller_token_authentication_verified: true,
+        restricted_caller_token_verified: true,
+        primary_token_duplication_verified: true,
+        create_process_as_user_verified: true,
+        job_list_supported: true,
+        handle_list_supported: true,
+        nested_host_job_supported: true,
+        kill_on_close_verified: true,
+        breakaway_denied: true,
+        completion_port_verified: true,
+        guardian_verified: true,
+        frontend_loss_cleanup_verified: true,
+        alternate_token_child_contained: true,
+        nested_child_job_contained: true,
+        recursive_provider_request_denied: true,
+        exact_handle_inheritance_verified: true,
+        active_processes_zero_verified: true,
+        relays_retired_verified: true,
+        recovery_complete: true,
+        qualified: true,
+    };
+    assert!(receipt.qualified && receipt.is_consistent());
+    receipt
 }
 
 fn windows_authority_loss() -> Value {
@@ -476,12 +486,16 @@ fn windows_mutant_kills() -> Value {
     })
 }
 
-fn windows_public_launch_report() -> Value {
+fn windows_public_launch_report(qualification: &WindowsQualificationReceiptV1) -> Value {
     let mut value = public_launch_report();
     value["backend"]["name"] = json!("windows-job-object");
     value["backend"]["boundary"]["mechanism"] = json!("windows-job-object-v2");
     value["backend"]["boundary_qualification"]["provider_identity"] =
-        json!("memcordon-sealed-agent-windows-v1:test");
+        json!(qualification.provider_identity);
+    value["backend"]["boundary_qualification"]["receipt_digest"] =
+        json!(hex::encode(Sha256::digest(
+            serde_json::to_vec(qualification).expect("Windows qualification should serialize")
+        )));
     value["backend"]["boundary_qualification"]["mechanism"] = json!("windows-job-object-v2");
     value["attempts"][0]["launch"]["mechanism"] = json!("windows-job-object-v2");
     value["attempts"][0]["boundary_detail"] = json!({
@@ -550,18 +564,40 @@ fn windows_token_matrix() -> Value {
     .into_iter()
     .map(|name| {
         let mut scenario_envelope = envelope.clone();
+        if name != "elevated-admin" {
+            scenario_envelope["token_type"] = json!(2);
+            scenario_envelope["impersonation_level"] = json!(2);
+        }
         if name == "ordinary-user" {
             scenario_envelope["elevated"] = json!(false);
+            scenario_envelope["elevation_type"] = json!(3);
         }
         if name == "low-integrity" {
             scenario_envelope["integrity_level"] = json!("S-1-16-4096");
         }
-        let restricted = matches!(name, "restricted" | "write-restricted" | "deny-only-admin");
+        let restricted = matches!(
+            name,
+            "restricted"
+                | "write-restricted"
+                | "disabled-privileges"
+                | "deny-only-admin"
+                | "low-integrity"
+        );
+        let write_restricted = matches!(name, "write-restricted" | "disabled-privileges");
+        let restricting_sids = if write_restricted {
+            vec!["S-1-5-33"]
+        } else if restricted {
+            vec!["S-1-5-12"]
+        } else {
+            Vec::new()
+        };
         json!({
             "name": name,
             "caller_envelope": scenario_envelope,
             "restricted_sid_count": u32::from(restricted),
+            "restricting_sids": restricting_sids,
             "token_is_restricted": restricted,
+            "write_restricted": write_restricted,
             "enabled_sensitive_privilege_count": if name == "disabled-privileges" { 0 } else { 1 },
             "administrator_deny_only": name == "deny-only-admin",
             "initial_target_token_matches_caller": true
@@ -569,7 +605,7 @@ fn windows_token_matrix() -> Value {
     })
     .collect::<Vec<_>>();
     json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "scenarios": scenarios,
         "appcontainer_rejected_before_target": true,
         "different_session_supported": true,
@@ -577,7 +613,11 @@ fn windows_token_matrix() -> Value {
     })
 }
 
-fn windows_report(architecture: &str, runner_label: &str) -> Value {
+fn windows_report(
+    architecture: &str,
+    runner_label: &str,
+    qualification: &WindowsQualificationReceiptV1,
+) -> Value {
     json!({
         "schema": 2,
         "backend": "windows-job-object-v2",
@@ -595,8 +635,9 @@ fn windows_report(architecture: &str, runner_label: &str) -> Value {
             _ => "unsupported",
         },
         "runtime": {
-            "qualification": windows_qualification(),
-            "public_launch": windows_public_launch_report(),
+            "qualification": qualification,
+            "public_launch": windows_public_launch_report(qualification),
+            "fresh_install_rollback_verified": true,
             "active_attempt_upgrade_refused": true,
             "active_attempt_uninstall_refused": true,
             "frontend_loss_record_retired": true,
@@ -742,7 +783,7 @@ fn windows_spawn_error(code: &str, os_code: i32, failure: &str) -> Value {
 
 fn windows_package_inspection() -> Value {
     json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "version": env!("CARGO_PKG_VERSION"),
         "source_commit": COMMIT,
         "executable_sha256": "56".repeat(32),
@@ -754,18 +795,43 @@ fn windows_package_inspection() -> Value {
         "platform": "windows-service",
         "control_service_name": memcordon_core::WINDOWS_CONTROL_SERVICE_NAME,
         "launcher_service_name": memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME,
+        "session_broker_service_name": memcordon_core::WINDOWS_SESSION_BROKER_SERVICE_NAME,
+        "guardian_slot_count": memcordon_core::WINDOWS_GUARDIAN_SLOT_COUNT,
         "control_service_config_sha256": "10".repeat(32),
         "launcher_service_config_sha256": "20".repeat(32),
+        "session_broker_service_config_sha256": "22".repeat(32),
+        "guardian_slot_config_sha256": "25".repeat(32),
         "control_pipe": memcordon_core::WINDOWS_CONTROL_PIPE,
         "launcher_pipe": memcordon_core::WINDOWS_LAUNCHER_PIPE,
+        "session_broker_pipe": memcordon_core::WINDOWS_SESSION_BROKER_PIPE,
+        "guardian_pipe_prefix": memcordon_core::WINDOWS_GUARDIAN_PIPE_PREFIX,
         "binary_install_path": r"C:\Program Files\MemCordon\memcordon-sealed-agent.exe",
+        "target_desktop_bootstrap_install_path": r"C:\Program Files\MemCordon\memcordon-target-desktop-bootstrap.exe",
+        "target_desktop_bootstrap_sha256": "57".repeat(32),
+        "session_broker_install_path": r"C:\Program Files\MemCordon\memcordon-session-broker.exe",
+        "session_broker_sha256": "58".repeat(32),
         "state_root": r"C:\ProgramData\MemCordon\sealed",
         "control_service_sid_type": "restricted",
         "launcher_service_sid_type": "restricted",
+        "session_broker_service_sid_type": "unrestricted",
+        "guardian_slot_service_sid_type": "restricted",
         "control_required_privileges": ["SeImpersonatePrivilege"],
-        "launcher_required_privileges": ["SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"],
+        "launcher_required_privileges": [
+            "SeAssignPrimaryTokenPrivilege",
+            "SeIncreaseQuotaPrivilege",
+            "SeTcbPrivilege"
+        ],
+        "session_broker_required_privileges": [
+            "SeAssignPrimaryTokenPrivilege",
+            "SeIncreaseQuotaPrivilege",
+            "SeTcbPrivilege"
+        ],
+        "guardian_slot_required_privileges": [],
         "control_pipe_security_sha256": "30".repeat(32),
         "launcher_pipe_security_sha256": "40".repeat(32),
+        "session_broker_service_security_sha256": "42".repeat(32),
+        "session_broker_pipe_security_sha256": "43".repeat(32),
+        "guardian_pipe_security_contract_sha256": "45".repeat(32),
         "install_directory_security_sha256": "50".repeat(32),
         "state_directory_security_sha256": "60".repeat(32),
         "compiled_metadata_valid": true
@@ -796,12 +862,14 @@ fn write_report(path: &Path, value: &Value) {
 fn write_windows_artifact(input: &Path, id: &str, architecture: &str, runner_label: &str) {
     let directory = input.join(format!("release-certification-windows-{id}"));
     let qualification = windows_qualification();
+    let qualification_value =
+        serde_json::to_value(&qualification).expect("Windows qualification should serialize");
     let package = windows_package_inspection();
     write_report(&directory.join("windows-package-inspection.json"), &package);
     write_report(
         &directory.join("windows-installed-provider.json"),
         &json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "agent": package,
             "installed_executable_sha256": "56".repeat(32),
             "installed_artifacts_valid": true,
@@ -812,7 +880,7 @@ fn write_windows_artifact(input: &Path, id: &str, architecture: &str, runner_lab
     );
     write_report(
         &directory.join("windows-qualification.json"),
-        &qualification,
+        &qualification_value,
     );
     for (name, evidence) in [
         (
@@ -946,7 +1014,7 @@ fn write_windows_artifact(input: &Path, id: &str, architecture: &str, runner_lab
     }
     write_report(
         &directory.join("windows-cleanup.json"),
-        &windows_report(architecture, runner_label),
+        &windows_report(architecture, runner_label, &qualification),
     );
 }
 
@@ -955,7 +1023,7 @@ fn fixture() -> (TempDir, Value, Value, Value) {
     let input = temporary.path().join("input");
     fs::create_dir_all(&input).expect("input directory should exist");
     let linux = linux_report();
-    let windows = windows_report("x86_64", "windows-2025");
+    let windows = windows_report("x86_64", "windows-2025", &windows_qualification());
     let macos = macos_report();
     write_report(
         &input
@@ -1348,6 +1416,205 @@ fn valid_reports_are_copied_and_digest_bound() {
 }
 
 #[test]
+fn windows_public_qualification_binding_mutations_fail_closed() {
+    for (name, pointer, replacement) in [
+        (
+            "backend name",
+            "/runtime/public_launch/backend/name",
+            Some(json!("standard")),
+        ),
+        (
+            "boundary class",
+            "/runtime/public_launch/backend/boundary/class",
+            Some(json!("standard")),
+        ),
+        (
+            "boundary mechanism",
+            "/runtime/public_launch/backend/boundary/mechanism",
+            Some(json!("standard")),
+        ),
+        (
+            "provider identity",
+            "/runtime/public_launch/backend/boundary_qualification/provider_identity",
+            Some(json!("memcordon-sealed-agent-windows-v1:other")),
+        ),
+        (
+            "well-formed receipt digest",
+            "/runtime/public_launch/backend/boundary_qualification/receipt_digest",
+            Some(json!("cd".repeat(32))),
+        ),
+        (
+            "qualification mechanism",
+            "/runtime/public_launch/backend/boundary_qualification/mechanism",
+            Some(json!("standard")),
+        ),
+        (
+            "missing qualification binding",
+            "/runtime/public_launch/backend/boundary_qualification",
+            None,
+        ),
+    ] {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-windows-x64/windows-cleanup.json");
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        *report.pointer_mut(pointer).expect("binding pointer exists") =
+            replacement.unwrap_or(Value::Null);
+        write_report(&path, &report);
+        assert!(
+            collect_certification(
+                &temporary.path().join("input"),
+                &temporary.path().join("output"),
+                COMMIT,
+            )
+            .is_err(),
+            "{name} mutation must fail closed"
+        );
+    }
+}
+
+#[test]
+fn windows_cross_report_identity_mutations_fail_closed() {
+    for (name, report_name, pointer, replacement) in [
+        (
+            "standalone package digest",
+            "windows-package-inspection.json",
+            "/guardian_slot_config_sha256",
+            json!("26".repeat(32)),
+        ),
+        (
+            "installed package digest",
+            "windows-installed-provider.json",
+            "/agent/guardian_slot_config_sha256",
+            json!("27".repeat(32)),
+        ),
+        (
+            "standalone qualification",
+            "windows-qualification.json",
+            "/guardian_capacity_verified",
+            json!(false),
+        ),
+        (
+            "installed provider identity",
+            "windows-installed-provider.json",
+            "/provider_identity",
+            json!("memcordon-sealed-agent-windows-v1:other"),
+        ),
+    ] {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-windows-x64")
+            .join(report_name);
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        *report
+            .pointer_mut(pointer)
+            .expect("identity pointer exists") = replacement;
+        write_report(&path, &report);
+        assert!(
+            collect_certification(
+                &temporary.path().join("input"),
+                &temporary.path().join("output"),
+                COMMIT,
+            )
+            .is_err(),
+            "{name} mutation must fail closed"
+        );
+    }
+}
+
+#[test]
+fn windows_token_matrix_rejects_incoherent_token_representations() {
+    for (name, pointer, replacement) in [
+        (
+            "primary token with an impersonation level",
+            "/evidence/token_matrix/scenarios/0/caller_envelope/impersonation_level",
+            json!(2),
+        ),
+        (
+            "impersonation scenario represented by a primary token",
+            "/evidence/token_matrix/scenarios/1/caller_envelope/token_type",
+            json!(1),
+        ),
+        (
+            "identification-level scenario",
+            "/evidence/token_matrix/scenarios/1/caller_envelope/impersonation_level",
+            json!(1),
+        ),
+        (
+            "unknown token type",
+            "/evidence/token_matrix/scenarios/1/caller_envelope/token_type",
+            json!(99),
+        ),
+    ] {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-windows-x64/windows-token-envelope.json");
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        *report
+            .pointer_mut(pointer)
+            .expect("token representation pointer exists") = replacement;
+        write_report(&path, &report);
+        assert!(
+            collect_certification(
+                &temporary.path().join("input"),
+                &temporary.path().join("output"),
+                COMMIT,
+            )
+            .is_err(),
+            "{name} mutation must fail closed"
+        );
+    }
+}
+
+#[test]
+fn windows_token_matrix_rejects_incoherent_write_restricted_evidence() {
+    for (name, pointer, replacement) in [
+        (
+            "write-restricted mode absent",
+            "/evidence/token_matrix/scenarios/3/write_restricted",
+            json!(false),
+        ),
+        (
+            "Restricted Code substituted for Write Restricted Code",
+            "/evidence/token_matrix/scenarios/3/restricting_sids",
+            json!(["S-1-5-12"]),
+        ),
+        (
+            "RC and WR union",
+            "/evidence/token_matrix/scenarios/3/restricting_sids",
+            json!(["S-1-5-12", "S-1-5-33"]),
+        ),
+        (
+            "duplicated WR SID",
+            "/evidence/token_matrix/scenarios/3/restricting_sids",
+            json!(["S-1-5-33", "S-1-5-33"]),
+        ),
+    ] {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-windows-x64/windows-token-envelope.json");
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        *report
+            .pointer_mut(pointer)
+            .expect("WR evidence pointer exists") = replacement;
+        write_report(&path, &report);
+        assert!(
+            collect_certification(
+                &temporary.path().join("input"),
+                &temporary.path().join("output"),
+                COMMIT,
+            )
+            .is_err(),
+            "{name} mutation must fail closed"
+        );
+    }
+}
+
+#[test]
 fn required_windows_mutants_are_mapped_and_killed_by_promoted_evidence() {
     for (mutant, mapped_test) in memcordon_core::WINDOWS_RELEASE_MUTANTS {
         assert!(
@@ -1433,6 +1700,184 @@ fn required_windows_mutants_are_mapped_and_killed_by_promoted_evidence() {
 }
 
 #[test]
+fn windows_new_required_fields_cannot_be_omitted() {
+    for (report_name, object_pointer, field) in [
+        ("windows-qualification.json", "", "guardian_pool_identity"),
+        (
+            "windows-qualification.json",
+            "",
+            "guardian_slot_tokens_verified",
+        ),
+        (
+            "windows-qualification.json",
+            "",
+            "guardian_slot_loader_verified",
+        ),
+        (
+            "windows-qualification.json",
+            "",
+            "guardian_capacity_verified",
+        ),
+        ("windows-package-inspection.json", "", "guardian_slot_count"),
+        (
+            "windows-package-inspection.json",
+            "",
+            "session_broker_service_name",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "session_broker_service_config_sha256",
+        ),
+        ("windows-package-inspection.json", "", "session_broker_pipe"),
+        (
+            "windows-package-inspection.json",
+            "",
+            "session_broker_install_path",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "session_broker_sha256",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "session_broker_service_sid_type",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "session_broker_required_privileges",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "session_broker_service_security_sha256",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "session_broker_pipe_security_sha256",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "guardian_slot_config_sha256",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "guardian_pipe_prefix",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "guardian_slot_service_sid_type",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "guardian_slot_required_privileges",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "guardian_pipe_security_contract_sha256",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "target_desktop_bootstrap_install_path",
+        ),
+        (
+            "windows-package-inspection.json",
+            "",
+            "target_desktop_bootstrap_sha256",
+        ),
+        (
+            "windows-cleanup.json",
+            "/runtime",
+            "fresh_install_rollback_verified",
+        ),
+    ] {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-windows-x64")
+            .join(report_name);
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        report
+            .pointer_mut(object_pointer)
+            .expect("fixture object pointer exists")
+            .as_object_mut()
+            .expect("fixture pointer identifies an object")
+            .remove(field)
+            .expect("required fixture field exists");
+        write_report(&path, &report);
+        assert!(
+            collect_certification(
+                &temporary.path().join("input"),
+                &temporary.path().join("output"),
+                COMMIT,
+            )
+            .is_err(),
+            "omitting {field} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn windows_guardian_qualification_mutations_fail_closed() {
+    for (field, replacement) in [
+        (
+            "guardian_pool_identity",
+            json!("MemCordonSealedGuardian:wrong"),
+        ),
+        ("guardian_slot_tokens_verified", json!(false)),
+        ("guardian_slot_loader_verified", json!(false)),
+        ("guardian_capacity_verified", json!(false)),
+    ] {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-windows-x64/windows-qualification.json");
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        report[field] = replacement;
+        write_report(&path, &report);
+        assert!(
+            collect_certification(
+                &temporary.path().join("input"),
+                &temporary.path().join("output"),
+                COMMIT,
+            )
+            .is_err(),
+            "mutating {field} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn windows_fresh_install_rollback_false_fails_closed() {
+    let (temporary, _, _, _) = fixture();
+    let path = temporary
+        .path()
+        .join("input/release-certification-windows-x64/windows-cleanup.json");
+    let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    report["runtime"]["fresh_install_rollback_verified"] = json!(false);
+    write_report(&path, &report);
+    assert!(
+        collect_certification(
+            &temporary.path().join("input"),
+            &temporary.path().join("output"),
+            COMMIT,
+        )
+        .is_err(),
+        "false fresh-install rollback proof must fail closed"
+    );
+}
+
+#[test]
 fn windows_package_identity_mutations_fail_closed() {
     for (name, report_name, pointer, replacement) in [
         (
@@ -1458,6 +1903,48 @@ fn windows_package_identity_mutations_fail_closed() {
             "windows-package-inspection.json",
             "/control_service_name",
             json!("OtherService"),
+        ),
+        (
+            "guardian slot count",
+            "windows-package-inspection.json",
+            "/guardian_slot_count",
+            json!(7),
+        ),
+        (
+            "guardian slot config digest",
+            "windows-package-inspection.json",
+            "/guardian_slot_config_sha256",
+            json!("invalid"),
+        ),
+        (
+            "guardian pipe prefix",
+            "windows-package-inspection.json",
+            "/guardian_pipe_prefix",
+            json!(r"\\.\pipe\other-guardian-v1-"),
+        ),
+        (
+            "guardian service SID type",
+            "windows-package-inspection.json",
+            "/guardian_slot_service_sid_type",
+            json!("unrestricted"),
+        ),
+        (
+            "guardian privilege inventory",
+            "windows-package-inspection.json",
+            "/guardian_slot_required_privileges",
+            json!(["SeDebugPrivilege"]),
+        ),
+        (
+            "guardian pipe security contract digest",
+            "windows-package-inspection.json",
+            "/guardian_pipe_security_contract_sha256",
+            json!("invalid"),
+        ),
+        (
+            "installed guardian slot count",
+            "windows-installed-provider.json",
+            "/agent/guardian_slot_count",
+            json!(7),
         ),
         (
             "privilege inventory",

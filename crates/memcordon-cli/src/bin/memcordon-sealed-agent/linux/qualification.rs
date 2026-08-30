@@ -18,12 +18,28 @@ fn certification_digest(scenario: &str, expected: &[&str]) -> String {
 }
 
 pub fn qualify() -> Result<QualificationReceipt, String> {
+    verify_provider_identity()?;
+    crate::package::verify()?;
+    qualify_after_package_verification()
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn qualify_after_package_verification_for_test() -> Result<QualificationReceipt, String>
+{
+    verify_provider_identity()?;
+    qualify_after_package_verification()
+}
+
+fn verify_provider_identity() -> Result<(), String> {
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     let provider_uid = unsafe { libc::geteuid() };
     if provider_uid != 0 {
         return Err("MCSEALED-PROVIDER-IDENTITY: provider must run as root".to_owned());
     }
-    crate::package::verify()?;
+    Ok(())
+}
+
+fn qualify_after_package_verification() -> Result<QualificationReceipt, String> {
     // SAFETY: PR_GET_NO_NEW_PRIVS has no pointer arguments.
     let launcher_no_new_privs_disabled =
         unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } == 0;
@@ -41,7 +57,8 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
     };
     let close_range = syscall_present(libc::SYS_close_range);
     let ambiguous_recovery = super::recovery::recover()?;
-    let recovery_complete = ambiguous_recovery.is_empty();
+    require_unambiguous_recovery(&ambiguous_recovery)?;
+    let recovery_complete = true;
     let sacrificial = sacrificial_attempt(b"/usr/bin/true");
     let missing_target = b"/run/memcordon/sealed-qualification-target-must-not-exist";
     let missing_target_path = std::path::Path::new(
@@ -188,18 +205,6 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
         Ok(receipt)
     } else {
         let mut causes = Vec::new();
-        if !ambiguous_recovery.is_empty() {
-            let examples = ambiguous_recovery
-                .iter()
-                .take(16)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(",");
-            causes.push(format!(
-                "recovery-ambiguous-count={}; examples={examples}",
-                ambiguous_recovery.len()
-            ));
-        }
         if let Some(error) = sacrificial_error {
             causes.push(format!("sacrificial-error={error}"));
         }
@@ -214,6 +219,22 @@ pub fn qualify() -> Result<QualificationReceipt, String> {
             causes.join("; "),
         ))
     }
+}
+
+pub(crate) fn require_unambiguous_recovery(ambiguous_recovery: &[String]) -> Result<(), String> {
+    if ambiguous_recovery.is_empty() {
+        return Ok(());
+    }
+    let examples = ambiguous_recovery
+        .iter()
+        .take(16)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    Err(format!(
+        "MCSEALED-PROVIDER-UNAVAILABLE: recovery-ambiguous-count={}; examples={examples}",
+        ambiguous_recovery.len()
+    ))
 }
 
 fn sacrificial_attempt(program: &[u8]) -> Result<super::launch::TerminalFacts, String> {

@@ -4,8 +4,8 @@ use std::io::Read;
 use sha2::{Digest, Sha256};
 
 #[cfg(not(target_os = "windows"))]
-use crate::inspection_schema::ProviderPackageMetadataV2;
-use crate::inspection_schema::{AgentPackageInspectionV2, InstalledProviderInspectionV2};
+use crate::inspection_schema::ProviderPackageMetadataV3;
+use crate::inspection_schema::{AgentPackageInspectionV3, InstalledProviderInspectionV3};
 
 const SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision control provider\nRequires=memcordon-sealed-agent.socket memcordon-sealed-launcher.socket\nAfter=local-fs.target systemd-tmpfiles-setup.service memcordon-sealed-launcher.socket\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent serve\nUser=root\nGroup=memcordon\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/run/memcordon /var/lib/memcordon/sealed\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
 const SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision control socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-agent.sock\nDirectoryMode=0755\nSocketMode=0660\nSocketUser=root\nSocketGroup=memcordon\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
@@ -70,7 +70,7 @@ pub(crate) fn verify() -> Result<(), String> {
     Ok(())
 }
 
-fn render_inspection(inspection: &AgentPackageInspectionV2, json: bool) -> Result<(), String> {
+fn render_inspection(inspection: &AgentPackageInspectionV3, json: bool) -> Result<(), String> {
     if json {
         println!(
             "{}",
@@ -88,7 +88,7 @@ fn render_inspection(inspection: &AgentPackageInspectionV2, json: bool) -> Resul
 }
 
 fn render_installed_inspection(
-    inspection: &InstalledProviderInspectionV2,
+    inspection: &InstalledProviderInspectionV3,
     json: bool,
 ) -> Result<(), String> {
     if json {
@@ -118,7 +118,7 @@ fn render_installed_inspection(
     Ok(())
 }
 
-pub(crate) fn inspect() -> Result<AgentPackageInspectionV2, String> {
+pub(crate) fn inspect() -> Result<AgentPackageInspectionV3, String> {
     verify_compiled_metadata()?;
     let executable = std::env::current_exe()
         .map_err(|error| format!("MCSEALED-PACKAGE-INSPECT: current executable: {error}"))?;
@@ -126,7 +126,7 @@ pub(crate) fn inspect() -> Result<AgentPackageInspectionV2, String> {
     #[cfg(not(target_os = "windows"))]
     let (mechanism, platform) = (
         "linux-pid-namespace-cgroup-v2".to_owned(),
-        ProviderPackageMetadataV2::LinuxSystemd {
+        ProviderPackageMetadataV3::LinuxSystemd {
             control_service_sha256: sha256_bytes(SERVICE.as_bytes()),
             control_socket_sha256: sha256_bytes(SOCKET.as_bytes()),
             launcher_service_sha256: sha256_bytes(LAUNCHER_SERVICE.as_bytes()),
@@ -139,8 +139,8 @@ pub(crate) fn inspect() -> Result<AgentPackageInspectionV2, String> {
         "windows-job-object-v2".to_owned(),
         crate::windows::package::compiled_metadata()?,
     );
-    Ok(AgentPackageInspectionV2 {
-        schema_version: 2,
+    Ok(AgentPackageInspectionV3 {
+        schema_version: 3,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         source_commit: crate::SOURCE_COMMIT.to_owned(),
         executable_sha256,
@@ -158,7 +158,7 @@ pub(crate) fn inspect() -> Result<AgentPackageInspectionV2, String> {
     })
 }
 
-fn installed_inspection() -> Result<InstalledProviderInspectionV2, String> {
+fn installed_inspection() -> Result<InstalledProviderInspectionV3, String> {
     let agent = inspect()?;
     #[cfg(target_os = "linux")]
     {
@@ -168,8 +168,8 @@ fn installed_inspection() -> Result<InstalledProviderInspectionV2, String> {
         let provider_reachable = qualification.is_some();
         let qualification_complete = qualification.as_ref().is_some_and(|value| value.complete());
         let provider_identity = qualification.map(|value| value.provider_identity);
-        Ok(InstalledProviderInspectionV2 {
-            schema_version: 2,
+        Ok(InstalledProviderInspectionV3 {
+            schema_version: 3,
             agent,
             installed_executable_sha256,
             installed_artifacts_valid: true,
@@ -184,8 +184,8 @@ fn installed_inspection() -> Result<InstalledProviderInspectionV2, String> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        Ok(InstalledProviderInspectionV2 {
-            schema_version: 2,
+        Ok(InstalledProviderInspectionV3 {
+            schema_version: 3,
             agent,
             installed_executable_sha256: String::new(),
             installed_artifacts_valid: false,
@@ -564,6 +564,12 @@ pub fn verify_open_artifact_for_test(
 
 #[cfg(target_os = "linux")]
 fn verify_installed_package() -> Result<(), String> {
+    let packaged_executable = inspect()?;
+    verify_installed_package_against(&packaged_executable.executable_sha256)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_installed_package_against(packaged_executable_sha256: &str) -> Result<(), String> {
     verify_metadata_artifact(
         std::path::Path::new(crate::linux::service::PACKAGE_LEASE),
         0,
@@ -571,12 +577,7 @@ fn verify_installed_package() -> Result<(), String> {
         0o600,
     )?;
 
-    let packaged_executable = inspect()?;
-    let installed_executable_sha256 = sha256_regular_no_follow(std::path::Path::new(BINARY))?;
-    verify_installed_executable_digest(
-        &packaged_executable.executable_sha256,
-        &installed_executable_sha256,
-    )?;
+    verify_installed_executable_against(std::path::Path::new(BINARY), packaged_executable_sha256)?;
 
     let artifacts = [
         (BINARY, 0o755, None),
@@ -600,6 +601,15 @@ fn verify_installed_package() -> Result<(), String> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn verify_installed_executable_against(
+    installed_executable: &std::path::Path,
+    packaged_executable_sha256: &str,
+) -> Result<(), String> {
+    let installed_executable_sha256 = sha256_regular_no_follow(installed_executable)?;
+    verify_installed_executable_digest(packaged_executable_sha256, &installed_executable_sha256)
 }
 
 #[cfg(target_os = "linux")]
@@ -696,12 +706,10 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     }
     verify_runtime_directory_owner(service_gid)?;
     let source = std::env::current_exe().map_err(|error| error.to_string())?;
+    let source_bytes = fs::read(&source).map_err(|error| error.to_string())?;
+    let source_digest = sha256_bytes(&source_bytes);
     let installations = [
-        (
-            Path::new(BINARY),
-            fs::read(source).map_err(|error| error.to_string())?,
-            0o755,
-        ),
+        (Path::new(BINARY), source_bytes, 0o755),
         (Path::new(UNIT), SERVICE.as_bytes().to_vec(), 0o644),
         (Path::new(SOCKET_UNIT), SOCKET.as_bytes().to_vec(), 0o644),
         (
@@ -744,7 +752,7 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         fs::rename(temporary, path).map_err(|error| error.to_string())?;
     }
-    verify_installed_package()?;
+    verify_installed_package_against(&source_digest)?;
     systemctl(["daemon-reload"])?;
     if ephemeral_ci {
         systemctl(["start", "memcordon-sealed-launcher.socket"])?;

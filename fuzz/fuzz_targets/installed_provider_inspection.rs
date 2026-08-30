@@ -6,5 +6,5 @@ use libfuzzer_sys::fuzz_target;
 mod inspection_schema;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = serde_json::from_slice::<inspection_schema::InstalledProviderInspectionV2>(data);
+    let _ = serde_json::from_slice::<inspection_schema::InstalledProviderInspectionV3>(data);
 });

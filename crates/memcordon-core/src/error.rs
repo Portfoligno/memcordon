@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::{BoundaryRequirement, CleanupSummary, RestartSafetyProof};
+use crate::{BoundaryRequirement, CleanupSummary, RestartSafetyProof, WindowsTerminalReceiptV1};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -47,6 +47,13 @@ pub struct ProviderRejectionEvidence {
     pub target_released: bool,
     pub cleanup_attempted: bool,
     pub restart_safety: RestartSafetyProof,
+    /// The provider durably retained this exact rejection until the caller
+    /// acknowledges it. This is independent of `terminal_receipt`: a launch
+    /// can fail after its streams became visible but before a target exists.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_ack_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_receipt: Option<Box<WindowsTerminalReceiptV1>>,
 }
 
 impl ProviderRejectionEvidence {
@@ -75,6 +82,18 @@ impl ProviderRejectionEvidence {
             && (self.cleanup_attempted || self.restart_safety == RestartSafetyProof::default())
             && (!self.restart_safety.sealed_boundary_retired
                 || self.restart_safety.is_safe_for(BoundaryRequirement::Sealed))
+            && (!self.terminal_ack_required
+                || (self.cleanup_attempted
+                    && self.restart_safety.is_safe_for(BoundaryRequirement::Sealed)))
+            && self.terminal_receipt.as_ref().is_none_or(|terminal| {
+                self.terminal_ack_required
+                    && self.target_created
+                    && self.target_released
+                    && self.cleanup_attempted
+                    && terminal.schema_version == 1
+                    && terminal.restart_safety == self.restart_safety
+                    && terminal.process_identity_inventory_shape_is_bounded()
+            })
     }
 }
 
