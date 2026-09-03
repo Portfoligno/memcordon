@@ -33,7 +33,7 @@ use windows_sys::Win32::System::Threading::{
 
 use super::pipe::OwnedHandle;
 
-pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 5;
+pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;
 const BROKER_ROLE: u8 = 3;
 const BROKER_TRANSACTION_DEADLINE: Duration = Duration::from_secs(30);
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
@@ -65,6 +65,8 @@ pub(crate) const BROKER_FAILURE_TOKEN_READBACK: u32 = 0x4d43_071d;
 pub(crate) const BROKER_FAILURE_SOURCE_PRIVILEGE_NORMALIZATION: u32 = 0x4d43_071e;
 static BROKER_TRANSACTION_LEASE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 const LOADER_SNAPS_SCHEMA_VERSION: u32 = 2;
+const TRACE_SESSION_CAPABILITY_SCHEMA_VERSION: u32 = 1;
+const TRACE_SESSION_CAPABILITY_DEADLINE: Duration = Duration::from_secs(5);
 const LOADER_SNAPS_REGISTRY_PARENT: &str =
     r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
 const LOADER_SNAPS_IMAGE_NAME: &str = "memcordon-target-desktop-bootstrap.exe";
@@ -1637,6 +1639,185 @@ impl LoaderSnapsRequestV2 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TraceSessionCapabilityTriggerReasonV1 {
+    StableModuleZeroPrefixNonlocalizing,
+}
+
+impl TraceSessionCapabilityTriggerReasonV1 {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::StableModuleZeroPrefixNonlocalizing => "stable-module-zero-prefix-nonlocalizing",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TraceSessionCapabilityRequestV1 {
+    capability_schema_version: u32,
+    broker_schema_version: u32,
+    start_nonce: String,
+    challenge: String,
+    transaction_nonce: String,
+    launcher_identity: WindowsProcessIdentityV1,
+    broker_identity: WindowsProcessIdentityV1,
+    broker_source_sha256: String,
+    trigger_reason: TraceSessionCapabilityTriggerReasonV1,
+    trigger_sha256: String,
+    ephemeral_ci: bool,
+    request_binding_sha256: String,
+}
+
+impl TraceSessionCapabilityRequestV1 {
+    fn calculated_sha256(&self) -> Result<String, String> {
+        let mut copy = self.clone();
+        copy.request_binding_sha256.clear();
+        let mut canonical = b"memcordon-session-broker-trace-capability-request-v1\0".to_vec();
+        canonical.extend(serde_json::to_vec(&copy).map_err(|error| error.to_string())?);
+        Ok(super::record::digest(&canonical))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum TraceSessionCapabilityStateV1 {
+    BrokerSessionAvailable,
+    BrokerSessionUnavailable,
+    BrokerSessionInvalid,
+}
+
+impl TraceSessionCapabilityStateV1 {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::BrokerSessionAvailable => "broker-session-available",
+            Self::BrokerSessionUnavailable => "broker-session-unavailable",
+            Self::BrokerSessionInvalid => "broker-session-invalid",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TraceSessionCapabilityReceiptV1 {
+    capability_schema_version: u32,
+    broker_schema_version: u32,
+    transaction_sha256: String,
+    trigger_reason: TraceSessionCapabilityTriggerReasonV1,
+    trigger_sha256: String,
+    request_binding_sha256: String,
+    broker_identity: WindowsProcessIdentityV1,
+    broker_source_sha256: String,
+    authority_before_sha256: String,
+    authority_after_sha256: String,
+    authority_equal: bool,
+    session_name_sha256: String,
+    state: TraceSessionCapabilityStateV1,
+    stage: String,
+    start_status: u32,
+    session_created: bool,
+    stop_attempted: bool,
+    stop_status: Option<u32>,
+    cleanup_count: u32,
+    session_absence_proven: bool,
+    elapsed_ms: u64,
+    deadline_exceeded: bool,
+    provider_enable_attempted: bool,
+    consumer_opened: bool,
+    process_trace_started: bool,
+    child_bound: bool,
+    events_collected: u32,
+    receipt_sha256: String,
+}
+
+impl TraceSessionCapabilityReceiptV1 {
+    fn seal(mut self) -> Result<Self, String> {
+        self.receipt_sha256.clear();
+        let mut canonical = b"memcordon-session-broker-trace-capability-receipt-v1\0".to_vec();
+        canonical.extend(serde_json::to_vec(&self).map_err(|error| error.to_string())?);
+        self.receipt_sha256 = super::record::digest(&canonical);
+        Ok(self)
+    }
+
+    fn validate_seal(&self) -> Result<(), String> {
+        if self.clone().seal()?.receipt_sha256 != self.receipt_sha256 {
+            return Err("trace-session capability receipt seal is invalid".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TraceSessionCapabilityFailureV1 {
+    capability_schema_version: u32,
+    request_binding_sha256: String,
+    stage: String,
+    detail_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TraceSessionCapabilityEvidenceV1 {
+    receipt: Option<TraceSessionCapabilityReceiptV1>,
+    retirement: &'static str,
+    failure_stage: Option<&'static str>,
+    failure_sha256: Option<String>,
+    retirement_failure_sha256: Option<String>,
+}
+
+impl TraceSessionCapabilityEvidenceV1 {
+    const REDACTION: &'static str = "session_name_redacted=true transaction_nonce_redacted=true broker_source_values_redacted=true token_values_redacted=true object_values_redacted=true";
+
+    pub(crate) fn diagnostic(&self) -> String {
+        let Some(receipt) = &self.receipt else {
+            return format!(
+                "broker_trace_session_capability=v1 state=broker-session-invalid trigger=stable-module-zero-prefix-nonlocalizing trigger_sha256=none request_binding_sha256=none receipt_sha256=none transaction_sha256=none broker_source_sha256=none broker_pid=0 broker_creation_time_100ns=0 authority_before_sha256=none authority_after_sha256=none session_name_sha256=none start_status=none session_created=false stop_attempted=false stop_status=none cleanup_count=0 session_absence_proven=false retirement={} elapsed_ms=0 failure_stage={} failure_sha256={} retirement_failure_sha256={} provider_enable_attempted=false consumer_opened=false process_trace_started=false child_bound=false events_collected=0 requested_access_available=false exact_resource_identified=false acl_fix_identified=false primary_failure=original-a release_sent=false workload_executed=false qualification_promoted=false {}",
+                self.retirement,
+                self.failure_stage.unwrap_or("broker-protocol"),
+                self.failure_sha256.as_deref().unwrap_or("none"),
+                self.retirement_failure_sha256.as_deref().unwrap_or("none"),
+                Self::REDACTION,
+            );
+        };
+        let effective_state = if self.retirement == "retired" {
+            receipt.state
+        } else {
+            TraceSessionCapabilityStateV1::BrokerSessionInvalid
+        };
+        format!(
+            "broker_trace_session_capability=v1 state={} broker_receipt_state={} trigger={} trigger_sha256={} request_binding_sha256={} receipt_sha256={} transaction_sha256={} broker_source_sha256={} broker_pid={} broker_creation_time_100ns={} authority_before_sha256={} authority_after_sha256={} session_name_sha256={} start_status={} session_created={} stop_attempted={} stop_status={} cleanup_count={} session_absence_proven={} retirement={} elapsed_ms={} failure_stage={} failure_sha256={} retirement_failure_sha256={} provider_enable_attempted=false consumer_opened=false process_trace_started=false child_bound=false events_collected=0 requested_access_available=false exact_resource_identified=false acl_fix_identified=false primary_failure=original-a release_sent=false workload_executed=false qualification_promoted=false {}",
+            effective_state.diagnostic(),
+            receipt.state.diagnostic(),
+            receipt.trigger_reason.diagnostic(),
+            receipt.trigger_sha256,
+            receipt.request_binding_sha256,
+            receipt.receipt_sha256,
+            receipt.transaction_sha256,
+            receipt.broker_source_sha256,
+            receipt.broker_identity.process_id,
+            receipt.broker_identity.creation_time_100ns,
+            receipt.authority_before_sha256,
+            receipt.authority_after_sha256,
+            receipt.session_name_sha256,
+            receipt.start_status,
+            receipt.session_created,
+            receipt.stop_attempted,
+            receipt
+                .stop_status
+                .map_or_else(|| "none".to_owned(), |status| status.to_string()),
+            receipt.cleanup_count,
+            receipt.session_absence_proven,
+            self.retirement,
+            receipt.elapsed_ms,
+            self.failure_stage.unwrap_or("none"),
+            self.failure_sha256.as_deref().unwrap_or("none"),
+            self.retirement_failure_sha256.as_deref().unwrap_or("none"),
+            Self::REDACTION,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LoaderSnapsArmedReceiptV2 {
@@ -1772,6 +1953,9 @@ enum SessionBrokerFrameV1 {
     Hello(SessionBrokerHelloV1),
     Request(SessionBrokerRequestV1),
     LoaderSnapsRequest(LoaderSnapsRequestV2),
+    TraceSessionCapabilityRequest(TraceSessionCapabilityRequestV1),
+    TraceSessionCapabilityReceipt(TraceSessionCapabilityReceiptV1),
+    TraceSessionCapabilityFailed(TraceSessionCapabilityFailureV1),
     Launched(SessionBrokerLaunchedV1),
     Ack {
         binding_sha256: String,
@@ -1863,6 +2047,7 @@ pub(crate) struct LoaderSnapsControlLease {
 enum BrokerClientOperation {
     Holder,
     LoaderSnaps,
+    TraceSessionCapability,
 }
 
 impl BrokerClientOperation {
@@ -1870,6 +2055,7 @@ impl BrokerClientOperation {
         match self {
             Self::Holder => "holder",
             Self::LoaderSnaps => "loader-snaps",
+            Self::TraceSessionCapability => "trace-session-capability",
         }
     }
 
@@ -2490,6 +2676,18 @@ unsafe fn broker_service_transaction(
                 SessionBrokerServiceError::startup(SessionBrokerStartupStage::Transaction, error)
             });
         }
+        SessionBrokerFrameV1::TraceSessionCapabilityRequest(request) => {
+            return run_trace_session_capability_authority_transaction(
+                pipe.raw(),
+                launcher_process.raw(),
+                &hello,
+                &launcher_identity,
+                request,
+            )
+            .map_err(|error| {
+                SessionBrokerServiceError::startup(SessionBrokerStartupStage::Transaction, error)
+            });
+        }
         _ => {
             return Err("session broker expected Request after Hello"
                 .to_owned()
@@ -2846,6 +3044,250 @@ fn run_loader_snaps_authority_transaction(
         Instant::now() + BROKER_TRANSACTION_DEADLINE,
         super::pipe::TargetDesktopBootstrapPipeOperation::BrokerLoaderSnapsRestoredWrite,
         &SessionBrokerFrameV1::LoaderSnapsRestored(restored),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn trace_session_capability_source_sha256(
+    identity: &WindowsProcessIdentityV1,
+    source: &super::token::TokenAttestationSnapshot,
+    query: &super::token::TokenQueryAttestationSnapshot,
+) -> Result<String, String> {
+    let mut canonical = b"memcordon-session-broker-trace-capability-authority-v1\0".to_vec();
+    canonical
+        .extend(serde_json::to_vec(&(identity, source, query)).map_err(|error| error.to_string())?);
+    Ok(super::record::digest(&canonical))
+}
+
+fn attest_trace_session_capability_authority(
+    hello: &SessionBrokerHelloV1,
+) -> Result<String, String> {
+    if !super::package::ephemeral_ci_enabled() {
+        return Err("trace-session capability requires ephemeral qualification mode".to_owned());
+    }
+    super::token::require_thread_token_absent(unsafe { GetCurrentThread() })?;
+    let identity = super::process::process_identity(unsafe { GetCurrentProcess() })?;
+    if identity != hello.broker_identity {
+        return Err("trace-session capability broker process identity changed".to_owned());
+    }
+    let token = super::token::current_process_token_for_attestation()?;
+    let source = super::token::token_attestation_snapshot(token.raw())?;
+    super::token::validate_normalized_session_broker_source_snapshot(&source)
+        .map_err(|error| error.to_string())?;
+    if source != hello.broker_source {
+        return Err("trace-session capability normalized broker source changed".to_owned());
+    }
+    let query = super::token::process_token_query_attestation(unsafe { GetCurrentProcess() })?;
+    super::token::require_same_process_token_query(
+        "trace-session-capability-live-source",
+        &source.query_evidence(),
+        &query,
+    )
+    .map_err(|error| error.to_string())?;
+    trace_session_capability_source_sha256(&identity, &source, &query)
+}
+
+fn trace_session_capability_failure(
+    request_binding_sha256: &str,
+    stage: &'static str,
+    detail: impl ToString,
+) -> TraceSessionCapabilityFailureV1 {
+    TraceSessionCapabilityFailureV1 {
+        capability_schema_version: TRACE_SESSION_CAPABILITY_SCHEMA_VERSION,
+        request_binding_sha256: request_binding_sha256.to_owned(),
+        stage: stage.to_owned(),
+        detail_sha256: super::record::digest(detail.to_string().as_bytes()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_trace_session_capability_native(
+    authority_equal: bool,
+    deadline_exceeded: bool,
+    start_status: u32,
+    session_created: bool,
+    stop_attempted: bool,
+    stop_status: Option<u32>,
+    cleanup_count: u32,
+    session_absence_proven: bool,
+) -> TraceSessionCapabilityStateV1 {
+    if authority_equal
+        && !deadline_exceeded
+        && start_status == ERROR_SUCCESS
+        && session_created
+        && stop_attempted
+        && stop_status == Some(ERROR_SUCCESS)
+        && cleanup_count == 1
+        && session_absence_proven
+    {
+        TraceSessionCapabilityStateV1::BrokerSessionAvailable
+    } else if authority_equal
+        && !deadline_exceeded
+        && start_status != ERROR_SUCCESS
+        && start_status != ERROR_ALREADY_EXISTS
+        && !session_created
+        && !stop_attempted
+        && stop_status.is_none()
+        && cleanup_count == 0
+        && session_absence_proven
+    {
+        TraceSessionCapabilityStateV1::BrokerSessionUnavailable
+    } else {
+        TraceSessionCapabilityStateV1::BrokerSessionInvalid
+    }
+}
+
+fn validate_trace_session_capability_request(
+    request: &TraceSessionCapabilityRequestV1,
+    hello: &SessionBrokerHelloV1,
+    launcher_identity: &WindowsProcessIdentityV1,
+) -> Result<(), String> {
+    if request.capability_schema_version != TRACE_SESSION_CAPABILITY_SCHEMA_VERSION
+        || request.broker_schema_version != SESSION_BROKER_SCHEMA_VERSION
+        || request.start_nonce != hello.start_nonce
+        || request.challenge != hello.challenge
+        || &request.launcher_identity != launcher_identity
+        || request.broker_identity != hello.broker_identity
+        || request.trigger_reason
+            != TraceSessionCapabilityTriggerReasonV1::StableModuleZeroPrefixNonlocalizing
+        || !request.ephemeral_ci
+        || !super::package::ephemeral_ci_enabled()
+        || request.calculated_sha256()? != request.request_binding_sha256
+    {
+        return Err("trace-session capability request binding is invalid".to_owned());
+    }
+    if request.launcher_identity.process_id == 0
+        || request.launcher_identity.creation_time_100ns == 0
+        || request.broker_identity.process_id == 0
+        || request.broker_identity.creation_time_100ns == 0
+        || request.launcher_identity == request.broker_identity
+    {
+        return Err("trace-session capability process identities are invalid".to_owned());
+    }
+    if !memcordon_core::windows_service_attestation_challenge_is_valid(&request.transaction_nonce) {
+        return Err("trace-session capability transaction nonce is invalid".to_owned());
+    }
+    for digest in [
+        &request.broker_source_sha256,
+        &request.trigger_sha256,
+        &request.request_binding_sha256,
+    ] {
+        super::record::validate_attempt_id(digest)?;
+    }
+    Ok(())
+}
+
+fn run_trace_session_capability_authority_transaction(
+    pipe: HANDLE,
+    launcher_process: HANDLE,
+    hello: &SessionBrokerHelloV1,
+    launcher_identity: &WindowsProcessIdentityV1,
+    request: TraceSessionCapabilityRequestV1,
+) -> Result<(), String> {
+    let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
+    let send_failure = |stage: &'static str, detail: &str| {
+        let _ = super::pipe::write_frame_bounded(
+            pipe,
+            Some(launcher_process),
+            deadline,
+            super::pipe::TargetDesktopBootstrapPipeOperation::BrokerTraceSessionCapabilityReceiptWrite,
+            &SessionBrokerFrameV1::TraceSessionCapabilityFailed(
+                trace_session_capability_failure(&request.request_binding_sha256, stage, detail),
+            ),
+        );
+    };
+    if let Err(error) =
+        validate_trace_session_capability_request(&request, hello, launcher_identity)
+    {
+        send_failure("request-validation", &error);
+        return Err(error);
+    }
+    let expected_source = trace_session_capability_source_sha256(
+        &hello.broker_identity,
+        &hello.broker_source,
+        &hello.broker_source.query_evidence(),
+    )?;
+    if request.broker_source_sha256 != expected_source {
+        let error = "trace-session capability Hello source binding is invalid".to_owned();
+        send_failure("source-binding", &error);
+        return Err(error);
+    }
+    let authority_before_sha256 = match attest_trace_session_capability_authority(hello) {
+        Ok(value) => value,
+        Err(error) => {
+            send_failure("authority-before", &error);
+            return Err(error);
+        }
+    };
+    if authority_before_sha256 != request.broker_source_sha256 {
+        let error = "trace-session capability before-authority binding is invalid".to_owned();
+        send_failure("authority-before", &error);
+        return Err(error);
+    }
+    let started = Instant::now();
+    let native = super::access_trace::run_trace_session_capability(
+        &request.start_nonce,
+        &request.transaction_nonce,
+        hello.broker_identity.process_id,
+        hello.broker_identity.creation_time_100ns,
+    )?;
+    let authority_after_sha256 =
+        attest_trace_session_capability_authority(hello).unwrap_or_else(|error| {
+            let mut material =
+                b"memcordon-session-broker-trace-capability-authority-error-v1\0".to_vec();
+            material.extend_from_slice(error.as_bytes());
+            super::record::digest(&material)
+        });
+    let authority_equal = authority_before_sha256 == authority_after_sha256;
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let deadline_exceeded = trace_session_capability_deadline_exceeded(elapsed_ms);
+    let state = classify_trace_session_capability_native(
+        authority_equal,
+        deadline_exceeded,
+        native.start_status,
+        native.session_created,
+        native.stop_attempted,
+        native.stop_status,
+        native.cleanup_count,
+        native.session_absence_proven,
+    );
+    let receipt = TraceSessionCapabilityReceiptV1 {
+        capability_schema_version: TRACE_SESSION_CAPABILITY_SCHEMA_VERSION,
+        broker_schema_version: SESSION_BROKER_SCHEMA_VERSION,
+        transaction_sha256: super::record::digest(request.transaction_nonce.as_bytes()),
+        trigger_reason: request.trigger_reason,
+        trigger_sha256: request.trigger_sha256.clone(),
+        request_binding_sha256: request.request_binding_sha256.clone(),
+        broker_identity: hello.broker_identity.clone(),
+        broker_source_sha256: request.broker_source_sha256.clone(),
+        authority_before_sha256,
+        authority_after_sha256,
+        authority_equal,
+        session_name_sha256: native.session_name_sha256,
+        state,
+        stage: native.stage.diagnostic().to_owned(),
+        start_status: native.start_status,
+        session_created: native.session_created,
+        stop_attempted: native.stop_attempted,
+        stop_status: native.stop_status,
+        cleanup_count: native.cleanup_count,
+        session_absence_proven: native.session_absence_proven,
+        elapsed_ms,
+        deadline_exceeded,
+        provider_enable_attempted: false,
+        consumer_opened: false,
+        process_trace_started: false,
+        child_bound: false,
+        events_collected: 0,
+        receipt_sha256: String::new(),
+    }
+    .seal()?;
+    super::pipe::write_frame_bounded(
+        pipe,
+        Some(launcher_process),
+        deadline,
+        super::pipe::TargetDesktopBootstrapPipeOperation::BrokerTraceSessionCapabilityReceiptWrite,
+        &SessionBrokerFrameV1::TraceSessionCapabilityReceipt(receipt),
     )
     .map_err(|error| error.to_string())
 }
@@ -3330,6 +3772,454 @@ pub(crate) fn request_loader_snaps(
             }
         },
     }
+}
+
+fn trace_session_capability_receipt_valid(
+    receipt: &TraceSessionCapabilityReceiptV1,
+    request: &TraceSessionCapabilityRequestV1,
+    hello: &SessionBrokerHelloV1,
+) -> Result<bool, String> {
+    trace_session_capability_receipt_valid_for_binding(receipt, request, &hello.broker_identity)
+}
+
+fn trace_session_capability_receipt_valid_for_binding(
+    receipt: &TraceSessionCapabilityReceiptV1,
+    request: &TraceSessionCapabilityRequestV1,
+    broker_identity: &WindowsProcessIdentityV1,
+) -> Result<bool, String> {
+    receipt.validate_seal()?;
+    for digest in [
+        &receipt.transaction_sha256,
+        &receipt.trigger_sha256,
+        &receipt.request_binding_sha256,
+        &receipt.broker_source_sha256,
+        &receipt.authority_before_sha256,
+        &receipt.authority_after_sha256,
+        &receipt.session_name_sha256,
+        &receipt.receipt_sha256,
+    ] {
+        super::record::validate_attempt_id(digest)?;
+    }
+    let expected_session_name_sha256 = super::access_trace::trace_session_capability_name_sha256(
+        &request.start_nonce,
+        &request.transaction_nonce,
+        broker_identity.process_id,
+        broker_identity.creation_time_100ns,
+    );
+    let common = receipt.capability_schema_version == TRACE_SESSION_CAPABILITY_SCHEMA_VERSION
+        && receipt.broker_schema_version == SESSION_BROKER_SCHEMA_VERSION
+        && receipt.transaction_sha256
+            == super::record::digest(request.transaction_nonce.as_bytes())
+        && receipt.trigger_reason == request.trigger_reason
+        && receipt.trigger_sha256 == request.trigger_sha256
+        && receipt.request_binding_sha256 == request.request_binding_sha256
+        && &receipt.broker_identity == broker_identity
+        && receipt.broker_source_sha256 == request.broker_source_sha256
+        && receipt.authority_before_sha256 == request.broker_source_sha256
+        && receipt.session_name_sha256 == expected_session_name_sha256
+        && !receipt.provider_enable_attempted
+        && !receipt.consumer_opened
+        && !receipt.process_trace_started
+        && !receipt.child_bound
+        && receipt.events_collected == 0;
+    Ok(common
+        && trace_session_capability_receipt_state_relation(receipt, &request.broker_source_sha256))
+}
+
+fn trace_session_capability_deadline_exceeded(elapsed_ms: u64) -> bool {
+    u128::from(elapsed_ms) > TRACE_SESSION_CAPABILITY_DEADLINE.as_millis()
+}
+
+fn trace_session_capability_native_shape(receipt: &TraceSessionCapabilityReceiptV1) -> bool {
+    if receipt.start_status == ERROR_SUCCESS {
+        receipt.stage == "session-stop"
+            && receipt.session_created
+            && receipt.stop_attempted
+            && receipt.stop_status.is_some()
+            && receipt.cleanup_count == 1
+            && receipt.session_absence_proven == (receipt.stop_status == Some(ERROR_SUCCESS))
+    } else {
+        receipt.stage == "session-start"
+            && !receipt.session_created
+            && !receipt.stop_attempted
+            && receipt.stop_status.is_none()
+            && receipt.cleanup_count == 0
+            && receipt.session_absence_proven == (receipt.start_status != ERROR_ALREADY_EXISTS)
+    }
+}
+
+fn trace_session_capability_receipt_state_relation(
+    receipt: &TraceSessionCapabilityReceiptV1,
+    expected_broker_source_sha256: &str,
+) -> bool {
+    let authority_digest_equal = receipt.authority_before_sha256 == receipt.authority_after_sha256
+        && receipt.authority_before_sha256 == expected_broker_source_sha256;
+    let authority_relation = receipt.authority_equal == authority_digest_equal;
+    let deadline_relation =
+        receipt.deadline_exceeded == trace_session_capability_deadline_exceeded(receipt.elapsed_ms);
+    let recomputed_state = classify_trace_session_capability_native(
+        receipt.authority_equal,
+        receipt.deadline_exceeded,
+        receipt.start_status,
+        receipt.session_created,
+        receipt.stop_attempted,
+        receipt.stop_status,
+        receipt.cleanup_count,
+        receipt.session_absence_proven,
+    );
+    let accepted_state_relation = match receipt.state {
+        TraceSessionCapabilityStateV1::BrokerSessionAvailable
+        | TraceSessionCapabilityStateV1::BrokerSessionUnavailable => {
+            authority_digest_equal && receipt.authority_equal && !receipt.deadline_exceeded
+        }
+        TraceSessionCapabilityStateV1::BrokerSessionInvalid => true,
+    };
+    authority_relation
+        && deadline_relation
+        && trace_session_capability_native_shape(receipt)
+        && receipt.state == recomputed_state
+        && accepted_state_relation
+}
+
+pub(crate) fn request_trace_session_capability(
+    trigger_sha256: String,
+) -> TraceSessionCapabilityEvidenceV1 {
+    if super::record::validate_attempt_id(&trigger_sha256).is_err()
+        || !super::package::ephemeral_ci_enabled()
+    {
+        return TraceSessionCapabilityEvidenceV1 {
+            receipt: None,
+            retirement: "not-started",
+            failure_stage: Some("typed-gate"),
+            failure_sha256: Some(super::record::digest(b"invalid-typed-trigger")),
+            retirement_failure_sha256: None,
+        };
+    }
+    let authenticated =
+        match start_authenticated_broker(BrokerClientOperation::TraceSessionCapability) {
+            Ok(value) => value,
+            Err(error) => {
+                return TraceSessionCapabilityEvidenceV1 {
+                    receipt: None,
+                    retirement: "startup-failed",
+                    failure_stage: Some(error.stage.diagnostic()),
+                    failure_sha256: Some(super::record::digest(error.detail.as_bytes())),
+                    retirement_failure_sha256: None,
+                };
+            }
+        };
+    let result = (|| -> Result<TraceSessionCapabilityReceiptV1, String> {
+        let pipe = authenticated.pipe();
+        let broker = authenticated.broker();
+        let hello = &authenticated.hello;
+        let launcher_identity = super::process::process_identity(unsafe { GetCurrentProcess() })?;
+        let transaction_nonce =
+            super::token::service_attestation_challenge("trace-session-capability-transaction")
+                .map_err(|error| error.to_string())?;
+        let broker_source_sha256 = trace_session_capability_source_sha256(
+            &hello.broker_identity,
+            &hello.broker_source,
+            &authenticated.broker_source_query,
+        )?;
+        let mut request = TraceSessionCapabilityRequestV1 {
+            capability_schema_version: TRACE_SESSION_CAPABILITY_SCHEMA_VERSION,
+            broker_schema_version: SESSION_BROKER_SCHEMA_VERSION,
+            start_nonce: hello.start_nonce.clone(),
+            challenge: hello.challenge.clone(),
+            transaction_nonce,
+            launcher_identity,
+            broker_identity: hello.broker_identity.clone(),
+            broker_source_sha256,
+            trigger_reason:
+                TraceSessionCapabilityTriggerReasonV1::StableModuleZeroPrefixNonlocalizing,
+            trigger_sha256,
+            ephemeral_ci: true,
+            request_binding_sha256: String::new(),
+        };
+        request.request_binding_sha256 = request.calculated_sha256()?;
+        let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
+        super::pipe::write_frame_bounded(
+            pipe.raw(),
+            Some(broker.handle.raw()),
+            deadline,
+            super::pipe::TargetDesktopBootstrapPipeOperation::BrokerTraceSessionCapabilityRequestWrite,
+            &SessionBrokerFrameV1::TraceSessionCapabilityRequest(request.clone()),
+        )
+        .map_err(|error| error.to_string())?;
+        let receipt = match super::pipe::read_frame_bounded(
+            pipe.raw(),
+            Some(broker.handle.raw()),
+            deadline,
+            super::pipe::TargetDesktopBootstrapPipeOperation::BrokerTraceSessionCapabilityReceiptRead,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            SessionBrokerFrameV1::TraceSessionCapabilityReceipt(receipt) => receipt,
+            SessionBrokerFrameV1::TraceSessionCapabilityFailed(failure)
+                if failure.capability_schema_version
+                    == TRACE_SESSION_CAPABILITY_SCHEMA_VERSION
+                    && failure.request_binding_sha256 == request.request_binding_sha256
+                    && super::record::validate_attempt_id(&failure.detail_sha256).is_ok() =>
+            {
+                return Err(format!(
+                    "capability-failed stage={} detail_sha256={}",
+                    bounded_broker_detail(failure.stage),
+                    failure.detail_sha256,
+                ));
+            }
+            _ => return Err("session broker returned an invalid capability frame".to_owned()),
+        };
+        if !trace_session_capability_receipt_valid(&receipt, &request, hello)? {
+            return Err("trace-session capability receipt relation is invalid".to_owned());
+        }
+        Ok(receipt)
+    })();
+    match result {
+        Ok(receipt) => match authenticated.retire() {
+            Ok(()) => TraceSessionCapabilityEvidenceV1 {
+                receipt: Some(receipt),
+                retirement: "retired",
+                failure_stage: None,
+                failure_sha256: None,
+                retirement_failure_sha256: None,
+            },
+            Err(error) => TraceSessionCapabilityEvidenceV1 {
+                receipt: Some(receipt),
+                retirement: "retirement-failed",
+                failure_stage: Some("broker-retire"),
+                failure_sha256: None,
+                retirement_failure_sha256: Some(super::record::digest(error.as_bytes())),
+            },
+        },
+        Err(error) => {
+            let (retirement, retirement_failure) = match authenticated.retire() {
+                Ok(()) => ("retired", None),
+                Err(retirement) => (
+                    "retirement-failed",
+                    Some(super::record::digest(retirement.as_bytes())),
+                ),
+            };
+            TraceSessionCapabilityEvidenceV1 {
+                receipt: None,
+                retirement,
+                failure_stage: Some("broker-protocol"),
+                failure_sha256: Some(super::record::digest(error.as_bytes())),
+                retirement_failure_sha256: retirement_failure,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn trace_session_capability_state_for_test(
+    authority_equal: bool,
+    deadline_exceeded: bool,
+    start_status: u32,
+    session_created: bool,
+    stop_attempted: bool,
+    stop_status: Option<u32>,
+    cleanup_count: u32,
+    session_absence_proven: bool,
+) -> &'static str {
+    classify_trace_session_capability_native(
+        authority_equal,
+        deadline_exceeded,
+        start_status,
+        session_created,
+        stop_attempted,
+        stop_status,
+        cleanup_count,
+        session_absence_proven,
+    )
+    .diagnostic()
+}
+
+#[cfg(test)]
+pub(crate) fn trace_session_capability_schema_versions_for_test() -> (u32, u32) {
+    (
+        SESSION_BROKER_SCHEMA_VERSION,
+        TRACE_SESSION_CAPABILITY_SCHEMA_VERSION,
+    )
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TraceSessionCapabilityReceiptMutationForTest {
+    Available,
+    Unavailable,
+    ClosedInvalidStopFailure,
+    ContradictoryInvalid,
+    WrongAfterAuthority,
+    AuthorityEqualFalse,
+    DeadlineExceeded,
+    ElapsedPastDeadline,
+    WrongTransaction,
+    WrongTrigger,
+    WrongRequestBinding,
+    WrongBrokerSource,
+    WrongBrokerIdentity,
+    WrongSessionName,
+    CorruptSeal,
+    RetirementFailure,
+}
+
+#[cfg(test)]
+pub(crate) fn trace_session_capability_receipt_for_test(
+    mutation: TraceSessionCapabilityReceiptMutationForTest,
+) -> (bool, bool, String) {
+    let launcher_identity = WindowsProcessIdentityV1 {
+        process_id: 41,
+        creation_time_100ns: 42,
+    };
+    let broker_identity = WindowsProcessIdentityV1 {
+        process_id: 43,
+        creation_time_100ns: 44,
+    };
+    let broker_source_sha256 = super::record::digest(b"test-normalized-broker-source");
+    let mut request = TraceSessionCapabilityRequestV1 {
+        capability_schema_version: TRACE_SESSION_CAPABILITY_SCHEMA_VERSION,
+        broker_schema_version: SESSION_BROKER_SCHEMA_VERSION,
+        start_nonce: "test-start-nonce-not-rendered".to_owned(),
+        challenge: "test-challenge-not-rendered".to_owned(),
+        transaction_nonce: "test-transaction-nonce-not-rendered".to_owned(),
+        launcher_identity,
+        broker_identity: broker_identity.clone(),
+        broker_source_sha256: broker_source_sha256.clone(),
+        trigger_reason: TraceSessionCapabilityTriggerReasonV1::StableModuleZeroPrefixNonlocalizing,
+        trigger_sha256: super::record::digest(b"test-typed-trigger"),
+        ephemeral_ci: true,
+        request_binding_sha256: String::new(),
+    };
+    request.request_binding_sha256 = request
+        .calculated_sha256()
+        .expect("synthetic capability request must seal");
+    let mut receipt = TraceSessionCapabilityReceiptV1 {
+        capability_schema_version: TRACE_SESSION_CAPABILITY_SCHEMA_VERSION,
+        broker_schema_version: SESSION_BROKER_SCHEMA_VERSION,
+        transaction_sha256: super::record::digest(request.transaction_nonce.as_bytes()),
+        trigger_reason: request.trigger_reason,
+        trigger_sha256: request.trigger_sha256.clone(),
+        request_binding_sha256: request.request_binding_sha256.clone(),
+        broker_identity: broker_identity.clone(),
+        broker_source_sha256: broker_source_sha256.clone(),
+        authority_before_sha256: broker_source_sha256.clone(),
+        authority_after_sha256: broker_source_sha256.clone(),
+        authority_equal: true,
+        session_name_sha256: super::access_trace::trace_session_capability_name_sha256(
+            &request.start_nonce,
+            &request.transaction_nonce,
+            broker_identity.process_id,
+            broker_identity.creation_time_100ns,
+        ),
+        state: TraceSessionCapabilityStateV1::BrokerSessionAvailable,
+        stage: "session-stop".to_owned(),
+        start_status: ERROR_SUCCESS,
+        session_created: true,
+        stop_attempted: true,
+        stop_status: Some(ERROR_SUCCESS),
+        cleanup_count: 1,
+        session_absence_proven: true,
+        elapsed_ms: 1,
+        deadline_exceeded: false,
+        provider_enable_attempted: false,
+        consumer_opened: false,
+        process_trace_started: false,
+        child_bound: false,
+        events_collected: 0,
+        receipt_sha256: String::new(),
+    };
+    match mutation {
+        TraceSessionCapabilityReceiptMutationForTest::Available
+        | TraceSessionCapabilityReceiptMutationForTest::RetirementFailure
+        | TraceSessionCapabilityReceiptMutationForTest::CorruptSeal => {}
+        TraceSessionCapabilityReceiptMutationForTest::Unavailable => {
+            receipt.state = TraceSessionCapabilityStateV1::BrokerSessionUnavailable;
+            receipt.stage = "session-start".to_owned();
+            receipt.start_status = 5;
+            receipt.session_created = false;
+            receipt.stop_attempted = false;
+            receipt.stop_status = None;
+            receipt.cleanup_count = 0;
+        }
+        TraceSessionCapabilityReceiptMutationForTest::ClosedInvalidStopFailure => {
+            receipt.state = TraceSessionCapabilityStateV1::BrokerSessionInvalid;
+            receipt.stop_status = Some(5);
+            receipt.session_absence_proven = false;
+        }
+        TraceSessionCapabilityReceiptMutationForTest::ContradictoryInvalid => {
+            receipt.state = TraceSessionCapabilityStateV1::BrokerSessionInvalid;
+        }
+        TraceSessionCapabilityReceiptMutationForTest::WrongAfterAuthority => {
+            receipt.authority_after_sha256 = super::record::digest(b"changed-authority");
+        }
+        TraceSessionCapabilityReceiptMutationForTest::AuthorityEqualFalse => {
+            receipt.authority_equal = false;
+        }
+        TraceSessionCapabilityReceiptMutationForTest::DeadlineExceeded => {
+            receipt.deadline_exceeded = true;
+        }
+        TraceSessionCapabilityReceiptMutationForTest::ElapsedPastDeadline => {
+            receipt.elapsed_ms = u64::try_from(TRACE_SESSION_CAPABILITY_DEADLINE.as_millis())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+        }
+        TraceSessionCapabilityReceiptMutationForTest::WrongTransaction => {
+            receipt.transaction_sha256 = super::record::digest(b"wrong-transaction");
+        }
+        TraceSessionCapabilityReceiptMutationForTest::WrongTrigger => {
+            receipt.trigger_sha256 = super::record::digest(b"wrong-trigger");
+        }
+        TraceSessionCapabilityReceiptMutationForTest::WrongRequestBinding => {
+            receipt.request_binding_sha256 = super::record::digest(b"wrong-request");
+        }
+        TraceSessionCapabilityReceiptMutationForTest::WrongBrokerSource => {
+            receipt.broker_source_sha256 = super::record::digest(b"wrong-source");
+        }
+        TraceSessionCapabilityReceiptMutationForTest::WrongBrokerIdentity => {
+            receipt.broker_identity.process_id += 1;
+        }
+        TraceSessionCapabilityReceiptMutationForTest::WrongSessionName => {
+            receipt.session_name_sha256 = super::record::digest(b"wrong-session-name");
+        }
+    }
+    receipt = receipt
+        .seal()
+        .expect("synthetic capability receipt must seal");
+    if mutation == TraceSessionCapabilityReceiptMutationForTest::CorruptSeal {
+        receipt.receipt_sha256 = super::record::digest(b"corrupt-receipt-seal");
+    }
+    let seal_valid = receipt.validate_seal().is_ok();
+    let admission_valid =
+        trace_session_capability_receipt_valid_for_binding(&receipt, &request, &broker_identity)
+            .unwrap_or(false);
+    let retirement_failed =
+        mutation == TraceSessionCapabilityReceiptMutationForTest::RetirementFailure;
+    let evidence = TraceSessionCapabilityEvidenceV1 {
+        receipt: Some(receipt),
+        retirement: if retirement_failed {
+            "retirement-failed"
+        } else {
+            "retired"
+        },
+        failure_stage: retirement_failed.then_some("broker-retire"),
+        failure_sha256: None,
+        retirement_failure_sha256: retirement_failed
+            .then(|| super::record::digest(b"test-retirement-failure")),
+    };
+    (admission_valid, seal_valid, evidence.diagnostic())
+}
+
+#[cfg(test)]
+pub(crate) fn trace_session_capability_dual_failure_diagnostic_for_test() -> String {
+    TraceSessionCapabilityEvidenceV1 {
+        receipt: None,
+        retirement: "retirement-failed",
+        failure_stage: Some("broker-protocol"),
+        failure_sha256: Some(super::record::digest(b"test-primary-protocol-failure")),
+        retirement_failure_sha256: Some(super::record::digest(b"test-retirement-failure")),
+    }
+    .diagnostic()
 }
 
 #[allow(clippy::too_many_arguments)]

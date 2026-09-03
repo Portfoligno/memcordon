@@ -1,5 +1,5 @@
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::c_void;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,10 +15,12 @@ use memcordon_core::{
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::Foundation::{
     CompareObjectHandles, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle,
-    ERROR_INVALID_HANDLE, FILETIME, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE,
-    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE,
+    ERROR_PATH_NOT_FOUND, FILETIME, GENERIC_READ, GENERIC_WRITE, GetHandleInformation, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
@@ -26,9 +28,10 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
 };
 use windows_sys::Win32::Security::{
-    DuplicateTokenEx, FreeSid, RevertToSelf, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
-    SecurityImpersonation, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
-    TOKEN_QUERY_SOURCE, TokenImpersonation,
+    DuplicateTokenEx, EqualSid, FreeSid, LookupAccountNameW, LookupAccountSidW, RevertToSelf,
+    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_NAME_USE, SecurityImpersonation, SidTypeUser,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_QUERY_SOURCE,
+    TokenImpersonation,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR,
@@ -42,6 +45,9 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Pipes::{
     GetNamedPipeClientProcessId, GetNamedPipeClientSessionId, GetNamedPipeServerProcessId,
     GetNamedPipeServerSessionId,
+};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_USERS, KEY_READ, RegCloseKey, RegOpenKeyExW,
 };
 use windows_sys::Win32::System::Services::{
     SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_STOP,
@@ -98,11 +104,28 @@ const CWF_CREATE_ONLY_FLAG: u32 = 0x0000_0001;
 const UOI_HEAPSIZE_CLASS: i32 = 5;
 const LOADER_ENVIRONMENT_MAX_UNITS: usize = 32_767;
 const LOADER_REQUIRED_ENVIRONMENT_KEYS: [&str; 3] = ["SystemDrive", "SystemRoot", "windir"];
+const STATUS_DLL_INIT_FAILED: i32 = 0xC000_0142_u32 as i32;
+const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
 
 #[link(name = "userenv")]
 unsafe extern "system" {
     fn CreateEnvironmentBlock(environment: *mut *mut c_void, token: HANDLE, inherit: i32) -> i32;
     fn DestroyEnvironmentBlock(environment: *const c_void) -> i32;
+    fn GetUserProfileDirectoryW(token: HANDLE, profile: *mut u16, size: *mut u32) -> i32;
+    fn LoadUserProfileW(token: HANDLE, profile: *mut ProfileInfoW) -> i32;
+    fn UnloadUserProfile(token: HANDLE, profile: HANDLE) -> i32;
+}
+
+#[repr(C)]
+struct ProfileInfoW {
+    size: u32,
+    flags: u32,
+    user_name: *mut u16,
+    profile_path: *mut u16,
+    default_path: *mut u16,
+    server_name: *mut u16,
+    policy_path: *mut u16,
+    profile: HANDLE,
 }
 
 #[link(name = "kernel32")]
@@ -1725,9 +1748,44 @@ struct TargetDesktopLease {
     startup_name: Vec<u16>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderLaunchFailurePhaseV1 {
+    PreCreate,
+    CreateProcessReturn,
+    PreResumeAttestation,
+    PostResumePreLoaderReady,
+    PreInitialBreakpointStaticLoader,
+    PostLoaderReadyContainment,
+    ExitDrain,
+    Unknown,
+}
+
+impl LoaderLaunchFailurePhaseV1 {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::PreCreate => "pre-create",
+            Self::CreateProcessReturn => "create-process-return",
+            Self::PreResumeAttestation => "pre-resume-attestation",
+            Self::PostResumePreLoaderReady => "post-resume-pre-loader-ready",
+            Self::PreInitialBreakpointStaticLoader => "pre-initial-breakpoint-static-loader",
+            Self::PostLoaderReadyContainment => "post-loader-ready-containment",
+            Self::ExitDrain => "exit-drain",
+            Self::Unknown => "unclassified",
+        }
+    }
+}
+
 struct TargetDesktopLeaseCreateError {
     detail: String,
     os_code: Option<i32>,
+    loader_phase: LoaderLaunchFailurePhaseV1,
+}
+
+impl TargetDesktopLeaseCreateError {
+    fn at_loader_phase(mut self, loader_phase: LoaderLaunchFailurePhaseV1) -> Self {
+        self.loader_phase = loader_phase;
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -1790,6 +1848,7 @@ impl TargetDesktopBootstrapLaunchContext {
     ) -> TargetDesktopLeaseCreateError {
         TargetDesktopLeaseCreateError {
             os_code: error.native_code(),
+            loader_phase: LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady,
             detail: format!(
                 "bootstrap_role={} policy_role={} scenario={} launch_phase=resumed bootstrap_pid={bootstrap_pid} bootstrap_image_sha256={bootstrap_image_sha256} target_token_restricted={} target_token_write_restricted={} target_integrity={} target_restricting_sid_sha256={} desktop_mode={desktop_mode} {evidence} detail={error}",
                 role.diagnostic(),
@@ -1809,6 +1868,7 @@ impl From<String> for TargetDesktopLeaseCreateError {
         Self {
             detail,
             os_code: None,
+            loader_phase: LoaderLaunchFailurePhaseV1::Unknown,
         }
     }
 }
@@ -1818,6 +1878,7 @@ impl From<super::token::LauncherHolderTokenDerivationError> for TargetDesktopLea
         Self {
             os_code: error.native_code,
             detail: error.to_string(),
+            loader_phase: LoaderLaunchFailurePhaseV1::Unknown,
         }
     }
 }
@@ -1827,6 +1888,7 @@ impl From<super::security::TargetUserObjectPolicyError> for TargetDesktopLeaseCr
         Self {
             os_code: None,
             detail: error.to_string(),
+            loader_phase: LoaderLaunchFailurePhaseV1::Unknown,
         }
     }
 }
@@ -1836,6 +1898,7 @@ impl From<super::token::TokenAttestationRelationError> for TargetDesktopLeaseCre
         Self {
             os_code: None,
             detail: error.to_string(),
+            loader_phase: LoaderLaunchFailurePhaseV1::Unknown,
         }
     }
 }
@@ -1853,6 +1916,7 @@ impl From<super::pipe::TargetDesktopBootstrapPipeError> for TargetDesktopLeaseCr
         Self {
             os_code: error.native_code(),
             detail: error.to_string(),
+            loader_phase: LoaderLaunchFailurePhaseV1::Unknown,
         }
     }
 }
@@ -2346,6 +2410,7 @@ impl TargetDesktopLease {
     fn create(
         token: HANDLE,
         policy_role: super::security::TargetUserObjectPolicyRoleV1,
+        loader_restriction_canary: Option<&LoaderRestrictionCanaryTokens>,
     ) -> Result<Self, TargetDesktopLeaseCreateError> {
         let target_envelope = super::token::envelope(token)?;
         let target_snapshot = super::token::token_attestation_snapshot(token)?;
@@ -2588,6 +2653,7 @@ impl TargetDesktopLease {
             &expected_desktop_policy_sha256,
             &launch_context,
             &lease,
+            loader_restriction_canary,
         )?;
         lease.attest_live()?;
         Ok(lease)
@@ -3086,61 +3152,5037 @@ impl LoaderDebuggerRelationV5 {
 
 impl LoaderControlMatrixCellV4 {
     const PRODUCTION: Self = Self {
-        environment: LoaderEnvironmentModeV4::Empty,
+        environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,
         debugger: LoaderDebuggerRelationV5::None,
+        loader_snaps: false,
+    };
+    const RESTRICTION_FULL_OBSERVER_SNAPS_OFF: Self = Self {
+        environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,
+        debugger: LoaderDebuggerRelationV5::FullObserver,
         loader_snaps: false,
     };
     const CERTIFICATION: [Self; 6] = [
         Self {
-            environment: LoaderEnvironmentModeV4::Empty,
+            environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,
             debugger: LoaderDebuggerRelationV5::None,
             loader_snaps: false,
         },
         Self {
-            environment: LoaderEnvironmentModeV4::Empty,
+            environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,
             debugger: LoaderDebuggerRelationV5::MandatoryPump,
             loader_snaps: false,
         },
         Self {
-            environment: LoaderEnvironmentModeV4::Empty,
+            environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,
             debugger: LoaderDebuggerRelationV5::FullObserver,
             loader_snaps: false,
         },
         Self {
-            environment: LoaderEnvironmentModeV4::Empty,
+            environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,
             debugger: LoaderDebuggerRelationV5::None,
             loader_snaps: true,
         },
         Self {
-            environment: LoaderEnvironmentModeV4::Empty,
+            environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,
             debugger: LoaderDebuggerRelationV5::MandatoryPump,
             loader_snaps: true,
         },
         Self {
-            environment: LoaderEnvironmentModeV4::Empty,
+            environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,
             debugger: LoaderDebuggerRelationV5::FullObserver,
             loader_snaps: true,
         },
     ];
 
     const fn diagnostic(self) -> &'static str {
-        match (self.debugger, self.loader_snaps) {
-            (LoaderDebuggerRelationV5::None, false) => "explicit-empty-none-snaps-off",
-            (LoaderDebuggerRelationV5::MandatoryPump, false) => {
+        match (self.environment, self.debugger, self.loader_snaps) {
+            (LoaderEnvironmentModeV4::Empty, LoaderDebuggerRelationV5::None, false) => {
+                "explicit-empty-none-snaps-off"
+            }
+            (LoaderEnvironmentModeV4::Empty, LoaderDebuggerRelationV5::MandatoryPump, false) => {
                 "explicit-empty-minimal-pump-snaps-off"
             }
-            (LoaderDebuggerRelationV5::FullObserver, false) => {
+            (LoaderEnvironmentModeV4::Empty, LoaderDebuggerRelationV5::FullObserver, false) => {
                 "explicit-empty-full-observer-snaps-off"
             }
-            (LoaderDebuggerRelationV5::None, true) => "explicit-empty-none-snaps-on",
-            (LoaderDebuggerRelationV5::MandatoryPump, true) => {
+            (LoaderEnvironmentModeV4::Empty, LoaderDebuggerRelationV5::None, true) => {
+                "explicit-empty-none-snaps-on"
+            }
+            (LoaderEnvironmentModeV4::Empty, LoaderDebuggerRelationV5::MandatoryPump, true) => {
                 "explicit-empty-minimal-pump-snaps-on"
             }
-            (LoaderDebuggerRelationV5::FullObserver, true) => {
+            (LoaderEnvironmentModeV4::Empty, LoaderDebuggerRelationV5::FullObserver, true) => {
                 "explicit-empty-full-observer-snaps-on"
             }
+            (
+                LoaderEnvironmentModeV4::CanonicalMinimalSystem,
+                LoaderDebuggerRelationV5::None,
+                false,
+            ) => "canonical-minimal-system-none-snaps-off",
+            (
+                LoaderEnvironmentModeV4::CanonicalMinimalSystem,
+                LoaderDebuggerRelationV5::MandatoryPump,
+                false,
+            ) => "canonical-minimal-system-minimal-pump-snaps-off",
+            (
+                LoaderEnvironmentModeV4::CanonicalMinimalSystem,
+                LoaderDebuggerRelationV5::FullObserver,
+                false,
+            ) => "canonical-minimal-system-full-observer-snaps-off",
+            (
+                LoaderEnvironmentModeV4::CanonicalMinimalSystem,
+                LoaderDebuggerRelationV5::None,
+                true,
+            ) => "canonical-minimal-system-none-snaps-on",
+            (
+                LoaderEnvironmentModeV4::CanonicalMinimalSystem,
+                LoaderDebuggerRelationV5::MandatoryPump,
+                true,
+            ) => "canonical-minimal-system-minimal-pump-snaps-on",
+            (
+                LoaderEnvironmentModeV4::CanonicalMinimalSystem,
+                LoaderDebuggerRelationV5::FullObserver,
+                true,
+            ) => "canonical-minimal-system-full-observer-snaps-on",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum LoaderFailureEvidenceRankV6 {
+    Unclassified,
+    NativeExit,
+    MandatoryPumpSnapsOff,
+    MandatoryPumpSnapsOn,
+    FullObserverSnapsOff,
+    FullObserverSnapsOn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderControlMatrixOutcomeKindV6 {
+    Passed,
+    Failed,
+}
+
+impl LoaderControlMatrixOutcomeKindV6 {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoaderControlMatrixOutcomeV6 {
+    cell: &'static str,
+    outcome: LoaderControlMatrixOutcomeKindV6,
+    native_status: Option<i32>,
+    failure_phase: &'static str,
+    child_trace: bool,
+    detail_sha256: String,
+}
+
+const LOADER_RESTRICTION_CANARY_DETAIL_MAX_BYTES: usize = 512;
+
+pub(crate) struct LoaderRestrictionCanaryTokens {
+    baseline: OwnedHandle,
+    comparison: OwnedHandle,
+    no_restricting_sid: OwnedHandle,
+    profile: OwnedHandle,
+    source_binding_sha256: String,
+    pair_invariants_sha256: String,
+    restriction_presence_binding_sha256: String,
+    profile_binding_sha256: String,
+}
+
+impl LoaderRestrictionCanaryTokens {
+    pub(crate) fn from_transferred(
+        effective: HANDLE,
+        baseline: OwnedHandle,
+        comparison: OwnedHandle,
+        no_restricting_sid: OwnedHandle,
+        profile: OwnedHandle,
+        source_binding_sha256: String,
+        pair_invariants_sha256: String,
+        restriction_presence_binding_sha256: String,
+        profile_binding_sha256: String,
+    ) -> Result<Self, String> {
+        let digest_length = super::record::digest(&[]).len();
+        if source_binding_sha256.len() != digest_length
+            || pair_invariants_sha256.len() != digest_length
+            || restriction_presence_binding_sha256.len() != digest_length
+            || profile_binding_sha256.len() != digest_length
+        {
+            return Err("loader restriction canary binding digest has invalid length".to_owned());
+        }
+        super::token::validate_transferred_loader_restriction_diagnostic_pair(
+            effective,
+            baseline.raw(),
+            comparison.raw(),
+            &pair_invariants_sha256,
+        )?;
+        super::token::validate_transferred_loader_restriction_presence_pair(
+            baseline.raw(),
+            no_restricting_sid.raw(),
+            &source_binding_sha256,
+            &restriction_presence_binding_sha256,
+        )?;
+        super::token::validate_transferred_loader_profile_capability(
+            effective,
+            profile.raw(),
+            &source_binding_sha256,
+            &pair_invariants_sha256,
+            &profile_binding_sha256,
+        )?;
+        Ok(Self {
+            baseline,
+            comparison,
+            no_restricting_sid,
+            profile,
+            source_binding_sha256,
+            pair_invariants_sha256,
+            restriction_presence_binding_sha256,
+            profile_binding_sha256,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoaderRestrictionCanaryOutcomeV1 {
+    restriction: &'static str,
+    outcome: LoaderControlMatrixOutcomeKindV6,
+    native_status: Option<i32>,
+    failure_phase: &'static str,
+    detail_sha256: String,
+    detail: String,
+}
+
+struct LoaderRestrictionCanaryEvaluationV1 {
+    diagnostic: String,
+    target_environment_required: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoaderEnvironmentCanaryOutcomeV1 {
+    environment: &'static str,
+    outcome: LoaderControlMatrixOutcomeKindV6,
+    native_status: Option<i32>,
+    failure_phase: &'static str,
+    detail_sha256: String,
+    detail: String,
+}
+
+struct LoaderEnvironmentPrerequisiteEvaluationV1 {
+    diagnostic: String,
+    profile_required: bool,
+    comparison: LoaderEnvironmentCanaryOutcomeV1,
+}
+
+struct LoaderProfilePrerequisiteEvaluationV1 {
+    diagnostic: String,
+    object_security_required: bool,
+    comparison: Option<Result<String, TargetDesktopLeaseCreateError>>,
+}
+
+struct LoaderObjectSecurityPrerequisiteEvaluationV1 {
+    diagnostic: String,
+    restriction_presence_required: bool,
+}
+
+struct LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+    diagnostic: String,
+}
+
+impl LoaderEnvironmentCanaryOutcomeV1 {
+    fn diagnostic(&self) -> String {
+        format!(
+            "environment={}:outcome={}:native={}:phase={}:detail_sha256={}:detail={}",
+            self.environment,
+            self.outcome.diagnostic(),
+            self.native_status.map_or_else(
+                || "unavailable".to_owned(),
+                |code| format!("0x{:08x}", code as u32)
+            ),
+            self.failure_phase,
+            self.detail_sha256,
+            self.detail,
+        )
+    }
+}
+
+impl LoaderRestrictionCanaryOutcomeV1 {
+    fn diagnostic(&self) -> String {
+        format!(
+            "restriction={}:outcome={}:native={}:phase={}:detail_sha256={}:detail={}",
+            self.restriction,
+            self.outcome.diagnostic(),
+            self.native_status.map_or_else(
+                || "unavailable".to_owned(),
+                |code| format!("0x{:08x}", code as u32)
+            ),
+            self.failure_phase,
+            self.detail_sha256,
+            self.detail,
+        )
+    }
+}
+
+fn bounded_loader_restriction_canary_detail(detail: &str) -> String {
+    let mut bounded = detail.replace('\0', "\\0");
+    if bounded.len() > LOADER_RESTRICTION_CANARY_DETAIL_MAX_BYTES {
+        let mut boundary = LOADER_RESTRICTION_CANARY_DETAIL_MAX_BYTES;
+        while !bounded.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        bounded.truncate(boundary);
+    }
+    bounded
+}
+
+fn loader_restriction_canary_outcome(
+    restriction: &'static str,
+    result: &Result<String, TargetDesktopLeaseCreateError>,
+) -> LoaderRestrictionCanaryOutcomeV1 {
+    match result {
+        Ok(evidence) => LoaderRestrictionCanaryOutcomeV1 {
+            restriction,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: super::record::digest(evidence.as_bytes()),
+            detail: "passed".to_owned(),
+        },
+        Err(error) => LoaderRestrictionCanaryOutcomeV1 {
+            restriction,
+            outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+            native_status: error.os_code,
+            failure_phase: loader_failure_phase(error),
+            detail_sha256: super::record::digest(error.detail.as_bytes()),
+            detail: bounded_loader_restriction_canary_detail(&error.detail),
+        },
+    }
+}
+
+fn loader_restriction_canary_preflight_failure(
+    stage: &'static str,
+    error: String,
+) -> LoaderRestrictionCanaryOutcomeV1 {
+    LoaderRestrictionCanaryOutcomeV1 {
+        restriction: "write-restricted-same-sid",
+        outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+        native_status: None,
+        failure_phase: stage,
+        detail_sha256: super::record::digest(error.as_bytes()),
+        detail: bounded_loader_restriction_canary_detail(&error),
+    }
+}
+
+fn loader_restriction_canary_is_required(results: &[LoaderControlMatrixOutcomeV6]) -> bool {
+    results.len() == LoaderControlMatrixCellV4::CERTIFICATION.len()
+        && results
+            .iter()
+            .all(|result| result.outcome == LoaderControlMatrixOutcomeKindV6::Failed)
+}
+
+#[cfg(test)]
+pub(crate) fn loader_restriction_canary_required_for_test(failed_cells: usize) -> bool {
+    let results = LoaderControlMatrixCellV4::CERTIFICATION
+        .iter()
+        .enumerate()
+        .map(|(index, cell)| LoaderControlMatrixOutcomeV6 {
+            cell: cell.diagnostic(),
+            outcome: if index < failed_cells {
+                LoaderControlMatrixOutcomeKindV6::Failed
+            } else {
+                LoaderControlMatrixOutcomeKindV6::Passed
+            },
+            native_status: (index < failed_cells).then_some(0xc000_0142_u32 as i32),
+            failure_phase: if index < failed_cells {
+                "pre-initial-breakpoint-static-loader"
+            } else {
+                "none"
+            },
+            child_trace: index < failed_cells,
+            detail_sha256: super::record::digest(cell.diagnostic().as_bytes()),
+        })
+        .collect::<Vec<_>>();
+    loader_restriction_canary_is_required(&results)
+}
+
+#[cfg(test)]
+pub(crate) fn render_loader_restriction_canary_for_test(
+    comparison_passes: bool,
+    comparison_detail: &str,
+) -> (String, String, bool) {
+    let primary_detail = "authoritative full-restricted failure".to_owned();
+    let baseline = Err(TargetDesktopLeaseCreateError {
+        detail: primary_detail.clone(),
+        os_code: Some(0xc000_0142_u32 as i32),
+        loader_phase: LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady,
+    });
+    let comparison = if comparison_passes {
+        Ok(comparison_detail.to_owned())
+    } else {
+        Err(TargetDesktopLeaseCreateError {
+            detail: comparison_detail.to_owned(),
+            os_code: Some(0xc000_0142_u32 as i32),
+            loader_phase: LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady,
+        })
+    };
+    let diagnostic = format!(
+        "loader_init_prerequisite_canary=v1 baseline=[{}] comparison=[{}] selected_failure=[{}]",
+        loader_restriction_canary_outcome("full-restricted", &baseline).diagnostic(),
+        loader_restriction_canary_outcome("write-restricted", &comparison).diagnostic(),
+        primary_detail,
+    );
+    (diagnostic, primary_detail, false)
+}
+
+impl LoaderControlMatrixOutcomeV6 {
+    fn diagnostic(&self) -> String {
+        format!(
+            "cell={}:outcome={}:native={}:phase={}:child_trace={}:detail_sha256={}",
+            self.cell,
+            self.outcome.diagnostic(),
+            self.native_status.map_or_else(
+                || "unavailable".to_owned(),
+                |code| format!("0x{:08x}", code as u32)
+            ),
+            self.failure_phase,
+            self.child_trace,
+            self.detail_sha256,
+        )
+    }
+}
+
+fn loader_failure_phase(error: &TargetDesktopLeaseCreateError) -> &'static str {
+    error.loader_phase.diagnostic()
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LoaderLaunchFailureBoundaryForTest {
+    PreCreate,
+    PostResumePreLoaderReady,
+    PostLoaderReadyContainment,
+    ExitDrain,
+    Unknown,
+}
+
+#[cfg(test)]
+pub(crate) fn loader_failure_phase_for_test(
+    boundary: LoaderLaunchFailureBoundaryForTest,
+    _untrusted_detail: &str,
+) -> &'static str {
+    match boundary {
+        LoaderLaunchFailureBoundaryForTest::PreCreate => LoaderLaunchFailurePhaseV1::PreCreate,
+        LoaderLaunchFailureBoundaryForTest::PostResumePreLoaderReady => {
+            LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady
+        }
+        LoaderLaunchFailureBoundaryForTest::PostLoaderReadyContainment => {
+            LoaderLaunchFailurePhaseV1::PostLoaderReadyContainment
+        }
+        LoaderLaunchFailureBoundaryForTest::ExitDrain => LoaderLaunchFailurePhaseV1::ExitDrain,
+        LoaderLaunchFailureBoundaryForTest::Unknown => LoaderLaunchFailurePhaseV1::Unknown,
+    }
+    .diagnostic()
+}
+
+impl LoaderFailureEvidenceRankV6 {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Unclassified => "unclassified",
+            Self::NativeExit => "native-exit",
+            Self::MandatoryPumpSnapsOff => "mandatory-pump-snaps-off",
+            Self::MandatoryPumpSnapsOn => "mandatory-pump-snaps-on",
+            Self::FullObserverSnapsOff => "full-observer-snaps-off",
+            Self::FullObserverSnapsOn => "full-observer-snaps-on",
+        }
+    }
+}
+
+fn loader_failure_evidence_rank(
+    cell: LoaderControlMatrixCellV4,
+    error: &TargetDesktopLeaseCreateError,
+) -> LoaderFailureEvidenceRankV6 {
+    let has_native_trace = error.os_code.is_some() && error.detail.contains("loader_trace=v4");
+    if !has_native_trace {
+        return if error.os_code.is_some() {
+            LoaderFailureEvidenceRankV6::NativeExit
+        } else {
+            LoaderFailureEvidenceRankV6::Unclassified
+        };
+    }
+    match (cell.debugger, cell.loader_snaps) {
+        (LoaderDebuggerRelationV5::FullObserver, true) => {
+            LoaderFailureEvidenceRankV6::FullObserverSnapsOn
+        }
+        (LoaderDebuggerRelationV5::FullObserver, false) => {
+            LoaderFailureEvidenceRankV6::FullObserverSnapsOff
+        }
+        (LoaderDebuggerRelationV5::MandatoryPump, true) => {
+            LoaderFailureEvidenceRankV6::MandatoryPumpSnapsOn
+        }
+        (LoaderDebuggerRelationV5::MandatoryPump, false) => {
+            LoaderFailureEvidenceRankV6::MandatoryPumpSnapsOff
+        }
+        (LoaderDebuggerRelationV5::None, _) => LoaderFailureEvidenceRankV6::NativeExit,
+    }
+}
+
+fn loader_failure_should_replace(
+    selected: Option<LoaderFailureEvidenceRankV6>,
+    candidate: LoaderFailureEvidenceRankV6,
+) -> bool {
+    selected.map_or(true, |selected| candidate > selected)
+}
+
+fn loader_control_matrix_failure_detail(
+    selected_cell: &'static str,
+    selected_rank: LoaderFailureEvidenceRankV6,
+    selected_native: Option<i32>,
+    results: &[LoaderControlMatrixOutcomeV6],
+    selected_detail: &str,
+) -> String {
+    format!(
+        "loader_control_matrix=v6 dimensions=debugger-relation-x-loader-snaps environment={} selected_cell={} selected_rank={} selected_native={} completed={} results=[{}] selected_failure=[{}]",
+        LoaderEnvironmentModeV4::CanonicalMinimalSystem.diagnostic(),
+        selected_cell,
+        selected_rank.diagnostic(),
+        selected_native.map_or_else(
+            || "unavailable".to_owned(),
+            |code| format!("0x{:08x}", code as u32)
+        ),
+        results.len(),
+        results
+            .iter()
+            .map(LoaderControlMatrixOutcomeV6::diagnostic)
+            .collect::<Vec<_>>()
+            .join(","),
+        selected_detail,
+    )
+}
+
+fn loader_result_detail(result: &Result<String, TargetDesktopLeaseCreateError>) -> &str {
+    match result {
+        Ok(evidence) => evidence,
+        Err(error) => &error.detail,
+    }
+}
+
+fn loader_result_field(
+    result: &Result<String, TargetDesktopLeaseCreateError>,
+    field: &str,
+) -> Option<String> {
+    let prefix = format!("{field}=");
+    loader_result_detail(result)
+        .split_ascii_whitespace()
+        .find_map(|value| value.strip_prefix(&prefix))
+        .map(|value| value.trim_end_matches([',', ']', ';']).to_owned())
+}
+
+fn loader_common_result_field(
+    baseline: &Result<String, TargetDesktopLeaseCreateError>,
+    comparison: &Result<String, TargetDesktopLeaseCreateError>,
+    field: &str,
+) -> Result<String, String> {
+    let baseline = loader_result_field(baseline, field)
+        .ok_or_else(|| format!("baseline {field} is unavailable"))?;
+    let comparison = loader_result_field(comparison, field)
+        .ok_or_else(|| format!("comparison {field} is unavailable"))?;
+    if baseline != comparison {
+        return Err(format!("{field} differs across the one-factor pair"));
+    }
+    Ok(baseline)
+}
+
+fn loader_control_cell_job_empty_attested(
+    result: &Result<String, TargetDesktopLeaseCreateError>,
+) -> bool {
+    let detail = loader_result_detail(result);
+    if let Some(cleanup) = detail
+        .rsplit_once(" profile_child_cleanup=[")
+        .and_then(|(_, cleanup)| cleanup.strip_suffix(']'))
+    {
+        return cleanup
+            .split(',')
+            .rev()
+            .find_map(|field| field.strip_prefix("job_empty_after_cleanup="))
+            == Some("true");
+    }
+    loader_result_field(result, "job_empty").as_deref() == Some("true")
+}
+
+const LOADER_OBJECT_SECURITY_COMMON_FIELDS_V1: [&str; 16] = [
+    "matrix_cell",
+    "debug_mode",
+    "environment_classification",
+    "environment_sha256",
+    "environment_keys_sha256",
+    "environment_profile_loaded",
+    "source_token_sha256",
+    "source_token_id",
+    "source_modified_id",
+    "source_authentication_id",
+    "source_session_id",
+    "desktop_sha256",
+    "binary_sha256",
+    "current_directory_sha256",
+    "creation_flags",
+    "job_membership_attested",
+];
+
+const LOADER_OBJECT_SECURITY_LIVE_FIELDS_V1: [&str; 8] = [
+    "live_sha256",
+    "dacl_protected",
+    "ace_count",
+    "requested",
+    "target_allowed",
+    "target_granted",
+    "launcher_allowed",
+    "launcher_granted",
+];
+
+struct LoaderObjectSecurityEvidenceValidityV1 {
+    common_evidence_valid: bool,
+    descriptor_evidence_present: bool,
+    invariants_valid: bool,
+    invariant_error: Option<String>,
+}
+
+fn loader_object_security_evidence_validity(
+    results: &[&Result<String, TargetDesktopLeaseCreateError>],
+    profile_stable: bool,
+    authority_binding_valid: bool,
+) -> LoaderObjectSecurityEvidenceValidityV1 {
+    let common_error = results.split_first().and_then(|(baseline, comparisons)| {
+        comparisons.iter().find_map(|comparison| {
+            LOADER_OBJECT_SECURITY_COMMON_FIELDS_V1
+                .iter()
+                .find_map(|field| {
+                    loader_common_result_field(baseline, comparison, field)
+                        .err()
+                        .map(|error| format!("{field}:{error}"))
+                })
+        })
+    });
+    let profile_authority_exact = !results.is_empty()
+        && results.iter().all(|result| {
+            loader_result_field(result, "environment_profile_loaded").as_deref() == Some("true")
+        });
+    let common_evidence_valid = results.len() >= 2
+        && profile_stable
+        && common_error.is_none()
+        && authority_binding_valid
+        && profile_authority_exact;
+    let descriptor_evidence_present = !results.is_empty()
+        && results.iter().all(|result| {
+            ["process_object", "thread_object"].into_iter().all(|role| {
+                LOADER_OBJECT_SECURITY_LIVE_FIELDS_V1
+                    .iter()
+                    .all(|field| loader_result_field(result, &format!("{role}_{field}")).is_some())
+            })
+        });
+    let invariant_error = common_error
+        .or_else(|| {
+            (!profile_authority_exact).then(|| {
+                "environment_profile_loaded is not present and exactly true for every cell"
+                    .to_owned()
+            })
+        })
+        .or_else(|| (!profile_stable).then(|| "profile observation changed".to_owned()))
+        .or_else(|| {
+            (!authority_binding_valid)
+                .then(|| "object security authority binding differs".to_owned())
+        })
+        .or_else(|| {
+            (results.len() < 2).then(|| "object security comparison evidence is absent".to_owned())
+        })
+        .or_else(|| {
+            (!descriptor_evidence_present)
+                .then(|| "live object security evidence is incomplete".to_owned())
+        });
+    LoaderObjectSecurityEvidenceValidityV1 {
+        common_evidence_valid,
+        descriptor_evidence_present,
+        invariants_valid: common_evidence_valid && descriptor_evidence_present,
+        invariant_error,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loader_restriction_canary_diagnostic(
+    tokens: &LoaderRestrictionCanaryTokens,
+    exact_desktop: &str,
+    launch_context: &TargetDesktopBootstrapLaunchContext,
+    association_preflight: &TargetUserObjectOpenPreflightV1,
+    holder_identity: &WindowsProcessIdentityV1,
+) -> LoaderRestrictionCanaryEvaluationV1 {
+    let baseline_envelope = super::token::envelope(tokens.baseline.raw());
+    let baseline_snapshot = super::token::token_attestation_snapshot(tokens.baseline.raw());
+    let comparison_envelope = super::token::envelope(tokens.comparison.raw());
+    let comparison_snapshot = super::token::token_attestation_snapshot(tokens.comparison.raw());
+    let pair = match (
+        baseline_envelope,
+        baseline_snapshot,
+        comparison_envelope,
+        comparison_snapshot,
+    ) {
+        (
+            Ok(baseline_envelope),
+            Ok(baseline_snapshot),
+            Ok(comparison_envelope),
+            Ok(comparison_snapshot),
+        ) => Some((
+            baseline_envelope,
+            baseline_snapshot,
+            comparison_envelope,
+            comparison_snapshot,
+        )),
+        results => {
+            let error = format!("loader restriction pair re-attestation failed: {results:?}");
+            return LoaderRestrictionCanaryEvaluationV1 {
+                diagnostic: format!(
+                    "loader_init_prerequisite_canary=v1 state=invalid source_binding_sha256={} pair_invariants_sha256={} error_sha256={} error={}",
+                    tokens.source_binding_sha256,
+                    tokens.pair_invariants_sha256,
+                    super::record::digest(error.as_bytes()),
+                    bounded_loader_restriction_canary_detail(&error),
+                ),
+                target_environment_required: false,
+            };
+        }
+    };
+    let (baseline_envelope, baseline_snapshot, comparison_envelope, comparison_snapshot) =
+        pair.expect("loader restriction pair is present after successful re-attestation");
+    let cell = LoaderControlMatrixCellV4::PRODUCTION;
+    let baseline = launch_target_desktop_loader_control_cell(
+        tokens.baseline.raw(),
+        &baseline_envelope,
+        &baseline_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        cell,
+    );
+    let comparison = launch_target_desktop_loader_control_cell(
+        tokens.comparison.raw(),
+        &comparison_envelope,
+        &comparison_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        cell,
+    );
+    let baseline_outcome = loader_restriction_canary_outcome("full-restricted", &baseline);
+    let comparison_outcome = loader_restriction_canary_outcome("write-restricted", &comparison);
+    let common_fields = [
+        "environment_sha256",
+        "desktop_sha256",
+        "binary_sha256",
+        "current_directory_sha256",
+        "command_semantics_sha256",
+        "command_dynamic_fields",
+        "creation_flags",
+    ]
+    .map(|field| {
+        loader_common_result_field(&baseline, &comparison, field).map(|value| (field, value))
+    });
+    let common_error = common_fields
+        .iter()
+        .find_map(|result| result.as_ref().err());
+    let state = if common_error.is_some() {
+        "invalid"
+    } else {
+        "classified"
+    };
+    let common = common_fields
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .map(|(field, value)| format!("{field}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let process_sddl_sha256 = super::security::launcher_process_sddl()
+        .map(|sddl| super::record::digest(sddl.as_bytes()))
+        .unwrap_or_else(|error| super::record::digest(error.as_bytes()));
+    let thread_sddl_sha256 = super::security::launcher_thread_sddl()
+        .map(|sddl| super::record::digest(sddl.as_bytes()))
+        .unwrap_or_else(|error| super::record::digest(error.as_bytes()));
+    let baseline_modules_sha256 = loader_result_field(&baseline, "candidate_modules_sha256")
+        .unwrap_or_else(|| "unavailable-no-debugger".to_owned());
+    let comparison_modules_sha256 = loader_result_field(&comparison, "candidate_modules_sha256")
+        .unwrap_or_else(|| "unavailable-no-debugger".to_owned());
+    let baseline_unloads_sha256 = loader_result_field(&baseline, "unload_tail_sha256")
+        .unwrap_or_else(|| "unavailable-no-debugger".to_owned());
+    let comparison_unloads_sha256 = loader_result_field(&comparison, "unload_tail_sha256")
+        .unwrap_or_else(|| "unavailable-no-debugger".to_owned());
+    let invariant_error = common_error.map_or_else(
+        || "none".to_owned(),
+        |error| bounded_loader_restriction_canary_detail(error),
+    );
+    let target_environment_required = loader_target_environment_is_required(
+        common_error.is_none(),
+        &baseline_outcome,
+        &comparison_outcome,
+    );
+    LoaderRestrictionCanaryEvaluationV1 {
+        diagnostic: format!(
+            "loader_init_prerequisite_canary=v1 state={state} baseline_semantics=full-restricted comparison_semantics=write-restricted differing_fields=[write_restricted] source_binding_sha256={} pair_invariants_sha256={} baseline=[{}] comparison=[{}] baseline_modules_sha256={} comparison_modules_sha256={} baseline_unloads_sha256={} comparison_unloads_sha256={} {} process_sddl_sha256={} thread_sddl_sha256={} job_policy_sha256={} invariant_error={}",
+            tokens.source_binding_sha256,
+            tokens.pair_invariants_sha256,
+            baseline_outcome.diagnostic(),
+            comparison_outcome.diagnostic(),
+            baseline_modules_sha256,
+            comparison_modules_sha256,
+            baseline_unloads_sha256,
+            comparison_unloads_sha256,
+            common,
+            process_sddl_sha256,
+            thread_sddl_sha256,
+            super::record::digest(b"Job::create(None,None,None)+PROC_THREAD_ATTRIBUTE_JOB_LIST"),
+            invariant_error,
+        ),
+        target_environment_required,
+    }
+}
+
+fn clone_loader_control_result(
+    result: &Result<String, TargetDesktopLeaseCreateError>,
+) -> Result<String, TargetDesktopLeaseCreateError> {
+    match result {
+        Ok(evidence) => Ok(evidence.clone()),
+        Err(error) => Err(TargetDesktopLeaseCreateError {
+            detail: error.detail.clone(),
+            os_code: error.os_code,
+            loader_phase: error.loader_phase,
+        }),
+    }
+}
+
+fn loader_environment_canary_outcome(
+    environment: &'static str,
+    result: &Result<String, TargetDesktopLeaseCreateError>,
+) -> LoaderEnvironmentCanaryOutcomeV1 {
+    match result {
+        Ok(evidence) => LoaderEnvironmentCanaryOutcomeV1 {
+            environment,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: super::record::digest(evidence.as_bytes()),
+            detail: "passed".to_owned(),
+        },
+        Err(error) => LoaderEnvironmentCanaryOutcomeV1 {
+            environment,
+            outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+            native_status: error.os_code,
+            failure_phase: loader_failure_phase(error),
+            detail_sha256: super::record::digest(error.detail.as_bytes()),
+            detail: bounded_loader_restriction_canary_detail(&error.detail),
+        },
+    }
+}
+
+fn loader_target_environment_is_required(
+    invariants_valid: bool,
+    baseline: &LoaderRestrictionCanaryOutcomeV1,
+    comparison: &LoaderRestrictionCanaryOutcomeV1,
+) -> bool {
+    invariants_valid
+        && baseline.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && comparison.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && baseline.native_status == Some(STATUS_DLL_INIT_FAILED)
+        && comparison.native_status == Some(STATUS_DLL_INIT_FAILED)
+        && baseline.failure_phase == comparison.failure_phase
+}
+
+#[cfg(test)]
+pub(crate) fn loader_target_environment_required_for_test(
+    invariants_valid: bool,
+    baseline_failed: bool,
+    baseline_native_status: Option<i32>,
+    baseline_phase: &'static str,
+    comparison_failed: bool,
+    comparison_native_status: Option<i32>,
+    comparison_phase: &'static str,
+) -> bool {
+    let outcome =
+        |restriction, failed, native_status, failure_phase| LoaderRestrictionCanaryOutcomeV1 {
+            restriction,
+            outcome: if failed {
+                LoaderControlMatrixOutcomeKindV6::Failed
+            } else {
+                LoaderControlMatrixOutcomeKindV6::Passed
+            },
+            native_status,
+            failure_phase,
+            detail_sha256: super::record::digest(b"test-loader-restriction-outcome"),
+            detail: "test".to_owned(),
+        };
+    loader_target_environment_is_required(
+        invariants_valid,
+        &outcome(
+            "full-restricted",
+            baseline_failed,
+            baseline_native_status,
+            baseline_phase,
+        ),
+        &outcome(
+            "write-restricted",
+            comparison_failed,
+            comparison_native_status,
+            comparison_phase,
+        ),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loader_environment_prerequisite_canary_diagnostic(
+    target_token: HANDLE,
+    target_envelope: &WindowsCallerTokenEnvelopeV1,
+    target_snapshot: &super::token::TokenAttestationSnapshot,
+    exact_desktop: &str,
+    launch_context: &TargetDesktopBootstrapLaunchContext,
+    association_preflight: &TargetUserObjectOpenPreflightV1,
+    holder_identity: &WindowsProcessIdentityV1,
+    tokens: &LoaderRestrictionCanaryTokens,
+    baseline: &Result<String, TargetDesktopLeaseCreateError>,
+) -> LoaderEnvironmentPrerequisiteEvaluationV1 {
+    let comparison = launch_target_desktop_loader_control_cell_with_environment_authority(
+        target_token,
+        target_envelope,
+        target_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        LoaderControlMatrixCellV4::PRODUCTION,
+        LoaderEnvironmentAuthorityV5::TargetTokenUserenv,
+        LoaderObjectSecurityAuthorityV1::LauncherExplicit,
+    );
+    let baseline_outcome = loader_environment_canary_outcome("canonical-minimal-system", baseline);
+    let comparison_outcome =
+        loader_environment_canary_outcome("target-token-userenv-v1", &comparison);
+    let common_fields = [
+        "matrix_cell",
+        "debug_mode",
+        "source_token_sha256",
+        "source_token_id",
+        "source_modified_id",
+        "source_authentication_id",
+        "source_session_id",
+        "desktop_sha256",
+        "binary_sha256",
+        "current_directory_sha256",
+        "command_semantics_sha256",
+        "command_dynamic_fields",
+        "creation_flags",
+        "job_membership_attested",
+    ]
+    .map(|field| {
+        loader_common_result_field(baseline, &comparison, field).map(|value| (field, value))
+    });
+    let common_error = common_fields
+        .iter()
+        .find_map(|result| result.as_ref().err());
+    let common = common_fields
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .map(|(field, value)| format!("{field}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let state = if common_error.is_some() {
+        "invalid"
+    } else if baseline_outcome.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && comparison_outcome.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && baseline_outcome.native_status == comparison_outcome.native_status
+        && baseline_outcome.failure_phase == comparison_outcome.failure_phase
+    {
+        "classified-common-failure"
+    } else {
+        "classified"
+    };
+    let invariant_error = common_error.map_or_else(
+        || "none".to_owned(),
+        |error| bounded_loader_restriction_canary_detail(error),
+    );
+    let target_token_instance_sha256 = loader_snapshot_digest(
+        b"memcordon-loader-target-environment-token-v1\0",
+        target_snapshot,
+    )
+    .unwrap_or_else(|error| super::record::digest(error.detail.as_bytes()));
+    let baseline_environment_sha256 = loader_result_field(baseline, "environment_sha256")
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let comparison_environment_sha256 = loader_result_field(&comparison, "environment_sha256")
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let comparison_environment_keys_sha256 =
+        loader_result_field(&comparison, "environment_keys_sha256")
+            .unwrap_or_else(|| "unavailable".to_owned());
+    let comparison_environment_units = loader_result_field(&comparison, "environment_units")
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let comparison_environment_entries = loader_result_field(&comparison, "environment_entries")
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let diagnostic = render_loader_environment_prerequisite_canary(
+        state,
+        &baseline_outcome,
+        &comparison_outcome,
+        &tokens.source_binding_sha256,
+        &tokens.pair_invariants_sha256,
+        &target_token_instance_sha256,
+        &baseline_environment_sha256,
+        &comparison_environment_sha256,
+        &comparison_environment_keys_sha256,
+        &comparison_environment_units,
+        &comparison_environment_entries,
+        &common,
+        &invariant_error,
+    );
+    LoaderEnvironmentPrerequisiteEvaluationV1 {
+        profile_required: state == "classified-common-failure"
+            && comparison_outcome.native_status == Some(STATUS_DLL_INIT_FAILED),
+        diagnostic,
+        comparison: comparison_outcome,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn loader_profile_prerequisite_canary_diagnostic(
+    exact_desktop: &str,
+    launch_context: &TargetDesktopBootstrapLaunchContext,
+    association_preflight: &TargetUserObjectOpenPreflightV1,
+    holder_identity: &WindowsProcessIdentityV1,
+    tokens: &LoaderRestrictionCanaryTokens,
+    environment_baseline: &LoaderEnvironmentCanaryOutcomeV1,
+) -> LoaderProfilePrerequisiteEvaluationV1 {
+    let target_snapshot = match super::token::token_attestation_snapshot(tokens.baseline.raw()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return LoaderProfilePrerequisiteEvaluationV1 {
+                diagnostic: format!(
+                    "loader_profile_prerequisite_canary=v1 state=invalid stage=target-attestation error_sha256={} workload_executed=false qualification_promoted=false",
+                    super::record::digest(error.as_bytes())
+                ),
+                object_security_required: false,
+                comparison: None,
+            };
+        }
+    };
+    let target_envelope = target_snapshot.behavior.envelope.clone();
+    let before = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);
+    let run = |authority| {
+        launch_target_desktop_loader_control_cell_with_environment_authority(
+            tokens.baseline.raw(),
+            &target_envelope,
+            &target_snapshot,
+            exact_desktop,
+            launch_context,
+            association_preflight,
+            holder_identity,
+            LoaderControlMatrixCellV4::PRODUCTION,
+            authority,
+            LoaderObjectSecurityAuthorityV1::LauncherExplicit,
+        )
+    };
+    let mut lifecycle = Vec::new();
+    lifecycle.push(format!("observed-before={}", before.state.diagnostic()));
+    let (comparison, after, state) = match before.state {
+        LoaderProfileHiveStateV1::AlreadyLoadedBorrowed => {
+            let comparison = run(LoaderEnvironmentAuthorityV5::TargetTokenUserenvBorrowedProfile);
+            let after = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);
+            let state = classify_loader_profile_observations(
+                before.state,
+                None,
+                after.state,
+                after == before,
+            );
+            lifecycle.push("borrowed-no-load=true".to_owned());
+            lifecycle.push("borrowed-no-unload=true".to_owned());
+            (Some(comparison), after, state)
+        }
+        LoaderProfileHiveStateV1::Absent => {
+            let lease = match TargetUserProfileLease::acquire(
+                tokens.profile.raw(),
+                &target_envelope.user_sid,
+            ) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    lifecycle.push(format!(
+                        "load-error-sha256={}",
+                        super::record::digest(error.as_bytes())
+                    ));
+                    return LoaderProfilePrerequisiteEvaluationV1 {
+                        diagnostic: render_loader_profile_prerequisite_canary(
+                            "invalid-load-failed",
+                            environment_baseline,
+                            None,
+                            &before,
+                            &before,
+                            &tokens.profile_binding_sha256,
+                            &lifecycle,
+                        ),
+                        object_security_required: false,
+                        comparison: None,
+                    };
+                }
+            };
+            let loaded = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);
+            lifecycle.push(format!("observed-loaded={}", loaded.state.diagnostic()));
+            if loaded.state != LoaderProfileHiveStateV1::AlreadyLoadedBorrowed {
+                let unload = lease.unload();
+                lifecycle.push(format!(
+                    "unload-after-invalid-load-sha256={}",
+                    super::record::digest(format!("{unload:?}").as_bytes())
+                ));
+                return LoaderProfilePrerequisiteEvaluationV1 {
+                    diagnostic: render_loader_profile_prerequisite_canary(
+                        "invalid-load-not-observed",
+                        environment_baseline,
+                        None,
+                        &before,
+                        &loaded,
+                        &tokens.profile_binding_sha256,
+                        &lifecycle,
+                    ),
+                    object_security_required: false,
+                    comparison: None,
+                };
+            }
+            let comparison = run(LoaderEnvironmentAuthorityV5::TargetTokenUserenvProfileLease);
+            let unload = lease.unload();
+            lifecycle.push(format!(
+                "unload-sha256={}",
+                super::record::digest(format!("{unload:?}").as_bytes())
+            ));
+            let after = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);
+            let state = classify_loader_profile_observations(
+                before.state,
+                Some(loaded.state),
+                after.state,
+                unload.is_ok(),
+            );
+            (Some(comparison), after, state)
+        }
+        LoaderProfileHiveStateV1::AccessDenied | LoaderProfileHiveStateV1::QueryFailed(_) => {
+            lifecycle.push(format!(
+                "observation_native={}",
+                before
+                    .state
+                    .native_code()
+                    .map_or_else(|| "unavailable".to_owned(), |code| code.to_string())
+            ));
+            return LoaderProfilePrerequisiteEvaluationV1 {
+                diagnostic: render_loader_profile_prerequisite_canary(
+                    "invalid-profile-observation",
+                    environment_baseline,
+                    None,
+                    &before,
+                    &before,
+                    &tokens.profile_binding_sha256,
+                    &lifecycle,
+                ),
+                object_security_required: false,
+                comparison: None,
+            };
+        }
+    };
+    let comparison_outcome = comparison
+        .as_ref()
+        .map(|result| loader_environment_canary_outcome("target-token-userenv-profile-v1", result));
+    let object_security_required =
+        loader_object_security_required(state, environment_baseline, comparison_outcome.as_ref());
+    LoaderProfilePrerequisiteEvaluationV1 {
+        diagnostic: render_loader_profile_prerequisite_canary(
+            state,
+            environment_baseline,
+            comparison_outcome.as_ref(),
+            &before,
+            &after,
+            &tokens.profile_binding_sha256,
+            &lifecycle,
+        ),
+        object_security_required,
+        comparison,
+    }
+}
+
+fn loader_object_security_required(
+    profile_state: &str,
+    baseline: &LoaderEnvironmentCanaryOutcomeV1,
+    comparison: Option<&LoaderEnvironmentCanaryOutcomeV1>,
+) -> bool {
+    profile_state == "classified-borrowed-stable"
+        && baseline.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && comparison.is_some_and(|comparison| {
+            comparison.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+                && comparison.native_status == Some(STATUS_DLL_INIT_FAILED)
+                && comparison.native_status == baseline.native_status
+                && comparison.failure_phase == baseline.failure_phase
+        })
+}
+
+fn render_loader_profile_prerequisite_canary(
+    state: &str,
+    baseline: &LoaderEnvironmentCanaryOutcomeV1,
+    comparison: Option<&LoaderEnvironmentCanaryOutcomeV1>,
+    before: &LoaderProfileObservationV1,
+    after: &LoaderProfileObservationV1,
+    profile_binding_sha256: &str,
+    lifecycle: &[String],
+) -> String {
+    let outcome = |value: &LoaderEnvironmentCanaryOutcomeV1| {
+        format!(
+            "outcome={} native={} phase={} detail_sha256={}",
+            value.outcome.diagnostic(),
+            value.native_status.map_or_else(
+                || "unavailable".to_owned(),
+                |code| format!("0x{:08x}", code as u32)
+            ),
+            value.failure_phase,
+            value.detail_sha256
+        )
+    };
+    format!(
+        "loader_profile_prerequisite_canary=v1 state={state} before_state={} after_state={} before_profile_directory_sha256={} after_profile_directory_sha256={} before_profile_directory_exists={} after_profile_directory_exists={} profile_binding_sha256={} baseline=[{}] comparison=[{}] lifecycle=[{}] profile_values_redacted=true workload_executed=false qualification_promoted=false",
+        before.state.diagnostic(),
+        after.state.diagnostic(),
+        before.profile_directory_sha256,
+        after.profile_directory_sha256,
+        before.profile_directory_exists,
+        after.profile_directory_exists,
+        profile_binding_sha256,
+        outcome(baseline),
+        comparison.map_or_else(|| "not-run".to_owned(), outcome),
+        lifecycle.join(","),
+    )
+}
+
+fn classify_loader_object_security_outcomes(
+    baseline: &LoaderEnvironmentCanaryOutcomeV1,
+    process: &LoaderEnvironmentCanaryOutcomeV1,
+    thread: &LoaderEnvironmentCanaryOutcomeV1,
+    combined: Option<&LoaderEnvironmentCanaryOutcomeV1>,
+    evidence_valid: bool,
+) -> &'static str {
+    if !evidence_valid
+        || baseline.outcome != LoaderControlMatrixOutcomeKindV6::Failed
+        || baseline.native_status != Some(STATUS_DLL_INIT_FAILED)
+    {
+        return "invalid";
+    }
+    if process.outcome == LoaderControlMatrixOutcomeKindV6::Passed
+        && thread.outcome == LoaderControlMatrixOutcomeKindV6::Passed
+    {
+        return "process-and-thread-object-security-causal";
+    }
+    if process.outcome == LoaderControlMatrixOutcomeKindV6::Passed {
+        return "process-object-security-causal";
+    }
+    if thread.outcome == LoaderControlMatrixOutcomeKindV6::Passed {
+        return "thread-object-security-causal";
+    }
+    let singles_common = [process, thread].into_iter().all(|outcome| {
+        outcome.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+            && outcome.native_status == baseline.native_status
+            && outcome.failure_phase == baseline.failure_phase
+    });
+    if !singles_common {
+        return "differing-inconclusive";
+    }
+    match combined {
+        Some(outcome) if outcome.outcome == LoaderControlMatrixOutcomeKindV6::Passed => {
+            "combined-object-security-causal"
+        }
+        Some(outcome)
+            if outcome.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+                && outcome.native_status == baseline.native_status
+                && outcome.failure_phase == baseline.failure_phase =>
+        {
+            "classified-common-failure"
+        }
+        Some(_) => "differing-inconclusive",
+        None => "invalid",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loader_object_security_prerequisite_canary_diagnostic(
+    exact_desktop: &str,
+    launch_context: &TargetDesktopBootstrapLaunchContext,
+    association_preflight: &TargetUserObjectOpenPreflightV1,
+    holder_identity: &WindowsProcessIdentityV1,
+    tokens: &LoaderRestrictionCanaryTokens,
+    baseline: &Result<String, TargetDesktopLeaseCreateError>,
+) -> LoaderObjectSecurityPrerequisiteEvaluationV1 {
+    let target_snapshot = match super::token::token_attestation_snapshot(tokens.baseline.raw()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return LoaderObjectSecurityPrerequisiteEvaluationV1 {
+                diagnostic: format!(
+                    "loader_object_security_prerequisite_canary=v1 state=invalid stage=target-attestation error_sha256={} workload_executed=false qualification_promoted=false",
+                    super::record::digest(error.as_bytes())
+                ),
+                restriction_presence_required: false,
+            };
+        }
+    };
+    let target_envelope = target_snapshot.behavior.envelope.clone();
+    let before = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);
+    if before.state != LoaderProfileHiveStateV1::AlreadyLoadedBorrowed {
+        return LoaderObjectSecurityPrerequisiteEvaluationV1 {
+            diagnostic: format!(
+                "loader_object_security_prerequisite_canary=v1 state=invalid stage=profile-precondition profile_state={} workload_executed=false qualification_promoted=false",
+                before.state.diagnostic()
+            ),
+            restriction_presence_required: false,
+        };
+    }
+    let policy = match super::security::TargetKernelObjectPolicyV1::capture(tokens.baseline.raw()) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return LoaderObjectSecurityPrerequisiteEvaluationV1 {
+                diagnostic: format!(
+                    "loader_object_security_prerequisite_canary=v1 state=invalid stage=policy-capture error_sha256={} workload_executed=false qualification_promoted=false",
+                    super::record::digest(error.as_bytes())
+                ),
+                restriction_presence_required: false,
+            };
+        }
+    };
+    let run = |authority| {
+        launch_target_desktop_loader_control_cell_with_environment_authority(
+            tokens.baseline.raw(),
+            &target_envelope,
+            &target_snapshot,
+            exact_desktop,
+            launch_context,
+            association_preflight,
+            holder_identity,
+            LoaderControlMatrixCellV4::PRODUCTION,
+            LoaderEnvironmentAuthorityV5::TargetTokenUserenvBorrowedProfile,
+            authority,
+        )
+    };
+    let process_result = run(LoaderObjectSecurityAuthorityV1::TargetAwareProcess);
+    let thread_result = run(LoaderObjectSecurityAuthorityV1::TargetAwareThread);
+    let baseline_outcome = loader_environment_canary_outcome("launcher-explicit-v1", baseline);
+    let process_outcome =
+        loader_environment_canary_outcome("target-aware-process-v1", &process_result);
+    let thread_outcome =
+        loader_environment_canary_outcome("target-aware-thread-v1", &thread_result);
+    let singles_common = [&process_outcome, &thread_outcome]
+        .into_iter()
+        .all(|outcome| {
+            outcome.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+                && outcome.native_status == baseline_outcome.native_status
+                && outcome.failure_phase == baseline_outcome.failure_phase
+        });
+    let combined_result =
+        singles_common.then(|| run(LoaderObjectSecurityAuthorityV1::TargetAwareBoth));
+    let combined_outcome = combined_result
+        .as_ref()
+        .map(|result| loader_environment_canary_outcome("target-aware-both-v1", result));
+    let after = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);
+    let results = [
+        Some(baseline),
+        Some(&process_result),
+        Some(&thread_result),
+        combined_result.as_ref(),
+    ];
+    let authority_exact =
+        loader_result_field(baseline, "object_security_authority").is_some_and(|value| {
+            value == LoaderObjectSecurityAuthorityV1::LauncherExplicit.diagnostic()
+        }) && loader_result_field(&process_result, "object_security_authority").is_some_and(
+            |value| value == LoaderObjectSecurityAuthorityV1::TargetAwareProcess.diagnostic(),
+        ) && loader_result_field(&thread_result, "object_security_authority").is_some_and(
+            |value| value == LoaderObjectSecurityAuthorityV1::TargetAwareThread.diagnostic(),
+        ) && combined_result.as_ref().is_none_or(|combined| {
+            loader_result_field(combined, "object_security_authority").is_some_and(|value| {
+                value == LoaderObjectSecurityAuthorityV1::TargetAwareBoth.diagnostic()
+            })
+        });
+    let executed_results = results.into_iter().flatten().collect::<Vec<_>>();
+    let evidence = loader_object_security_evidence_validity(
+        &executed_results,
+        after == before,
+        authority_exact,
+    );
+    let state = classify_loader_object_security_outcomes(
+        &baseline_outcome,
+        &process_outcome,
+        &thread_outcome,
+        combined_outcome.as_ref(),
+        evidence.invariants_valid,
+    );
+    let outcome = |value: &LoaderEnvironmentCanaryOutcomeV1| {
+        format!(
+            "authority={} outcome={} native={} phase={} detail_sha256={}",
+            value.environment,
+            value.outcome.diagnostic(),
+            value.native_status.map_or_else(
+                || "unavailable".to_owned(),
+                |code| format!("0x{:08x}", code as u32)
+            ),
+            value.failure_phase,
+            value.detail_sha256,
+        )
+    };
+    let live = |result: &Result<String, TargetDesktopLeaseCreateError>| {
+        [
+            "process_object_live_sha256",
+            "thread_object_live_sha256",
+            "process_object_target_allowed",
+            "process_object_target_granted",
+            "thread_object_target_allowed",
+            "thread_object_target_granted",
+            "process_object_launcher_allowed",
+            "thread_object_launcher_allowed",
+        ]
+        .into_iter()
+        .map(|field| {
+            format!(
+                "{field}={}",
+                loader_result_field(result, field).unwrap_or_else(|| "unavailable".to_owned())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+    };
+    let diagnostic = format!(
+        "loader_object_security_prerequisite_canary=v1 state={state} workload_executed=false qualification_promoted=false object_security_values_redacted=true differing_fields=[process_object_dacl]|[thread_object_dacl]|[process_object_dacl,thread_object_dacl] profile_state=already-loaded-borrowed common_evidence_valid={} descriptor_evidence_present={} invariants_valid={} baseline=[{}] process=[{}] thread=[{}] combined=[{}] baseline_live=[{}] process_live=[{}] thread_live=[{}] combined_live=[{}] process_policy_sha256={} thread_policy_sha256={} target_logon_trustee=true restricting_trustee_count={} descriptor_readback={} job_empty=true invariant_error_sha256={}",
+        evidence.common_evidence_valid,
+        evidence.descriptor_evidence_present,
+        evidence.invariants_valid,
+        outcome(&baseline_outcome),
+        outcome(&process_outcome),
+        outcome(&thread_outcome),
+        combined_outcome
+            .as_ref()
+            .map_or_else(|| "not-run".to_owned(), outcome),
+        live(baseline),
+        live(&process_result),
+        live(&thread_result),
+        combined_result
+            .as_ref()
+            .map_or_else(|| "not-run".to_owned(), live),
+        policy.process_policy_sha256,
+        policy.thread_policy_sha256,
+        policy.restricting_trustee_count,
+        evidence.descriptor_evidence_present,
+        evidence.invariant_error.as_ref().map_or_else(
+            || "none".to_owned(),
+            |error| super::record::digest(error.as_bytes())
+        ),
+    );
+    LoaderObjectSecurityPrerequisiteEvaluationV1 {
+        diagnostic,
+        restriction_presence_required: loader_restriction_presence_required(
+            state,
+            evidence.common_evidence_valid,
+            evidence.descriptor_evidence_present,
+            evidence.invariants_valid,
+        ),
+    }
+}
+
+fn classify_loader_restriction_presence_outcomes(
+    baseline: &LoaderEnvironmentCanaryOutcomeV1,
+    comparison: &LoaderEnvironmentCanaryOutcomeV1,
+    invariants_valid: bool,
+) -> &'static str {
+    if !invariants_valid
+        || baseline.outcome != LoaderControlMatrixOutcomeKindV6::Failed
+        || baseline.native_status != Some(STATUS_DLL_INIT_FAILED)
+    {
+        return "invalid";
+    }
+    if comparison.outcome == LoaderControlMatrixOutcomeKindV6::Passed {
+        return "restricting-sid-presence-causal";
+    }
+    if comparison.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && comparison.native_status == baseline.native_status
+        && comparison.failure_phase == baseline.failure_phase
+    {
+        return "classified-common-failure";
+    }
+    "differing-inconclusive"
+}
+
+fn classify_loader_restriction_identity_outcomes(
+    baseline: &LoaderEnvironmentCanaryOutcomeV1,
+    no_restricting_sid: &LoaderEnvironmentCanaryOutcomeV1,
+    same_access_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    invariants_valid: bool,
+) -> &'static str {
+    let presence_state = classify_loader_restriction_presence_outcomes(
+        baseline,
+        no_restricting_sid,
+        invariants_valid,
+    );
+    if presence_state != "restricting-sid-presence-causal" {
+        return presence_state;
+    }
+    if same_access_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed {
+        return "restricted-code-sid-narrowing-causal";
+    }
+    if same_access_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && same_access_restricted.native_status == baseline.native_status
+        && same_access_restricted.failure_phase == baseline.failure_phase
+    {
+        return "restricted-token-or-canonical-inventory-causal";
+    }
+    "differing-inconclusive"
+}
+
+fn classify_loader_restriction_logon_outcomes(
+    baseline: &LoaderEnvironmentCanaryOutcomeV1,
+    no_restricting_sid: &LoaderEnvironmentCanaryOutcomeV1,
+    same_access_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    logon_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    invariants_valid: bool,
+) -> &'static str {
+    let identity_state = classify_loader_restriction_identity_outcomes(
+        baseline,
+        no_restricting_sid,
+        same_access_restricted,
+        invariants_valid,
+    );
+    if identity_state != "restricted-code-sid-narrowing-causal" {
+        return identity_state;
+    }
+    if logon_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed {
+        return "restricted-code-sid-narrowing-logon-ceiling-compatible";
+    }
+    if logon_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && logon_restricted.native_status == baseline.native_status
+        && logon_restricted.failure_phase == baseline.failure_phase
+    {
+        return "canonical-broader-group-or-union-required";
+    }
+    "differing-inconclusive"
+}
+
+fn classify_loader_restriction_authenticated_users_outcomes(
+    baseline: &LoaderEnvironmentCanaryOutcomeV1,
+    no_restricting_sid: &LoaderEnvironmentCanaryOutcomeV1,
+    same_access_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    logon_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    authenticated_users_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    invariants_valid: bool,
+) -> &'static str {
+    let identity_state = classify_loader_restriction_identity_outcomes(
+        baseline,
+        no_restricting_sid,
+        same_access_restricted,
+        invariants_valid,
+    );
+    if identity_state == "invalid" {
+        return "invalid";
+    }
+    if identity_state != "restricted-code-sid-narrowing-causal"
+        || logon_restricted.outcome != LoaderControlMatrixOutcomeKindV6::Failed
+    {
+        return "authenticated-users-inconclusive";
+    }
+    if authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed {
+        return "authenticated-users-restriction-compatible-logon-too-narrow";
+    }
+    let matches_logon_access_failure = authenticated_users_restricted.native_status
+        == Some(STATUS_ACCESS_DENIED)
+        && authenticated_users_restricted.native_status == logon_restricted.native_status
+        && authenticated_users_restricted.failure_phase == logon_restricted.failure_phase;
+    let matches_baseline_init_failure = authenticated_users_restricted.native_status
+        == Some(STATUS_DLL_INIT_FAILED)
+        && authenticated_users_restricted.native_status == baseline.native_status
+        && authenticated_users_restricted.failure_phase == baseline.failure_phase;
+    if authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && (matches_logon_access_failure || matches_baseline_init_failure)
+    {
+        return "canonical-group-union-or-other-trustee-required";
+    }
+    "authenticated-users-inconclusive"
+}
+
+fn classify_loader_restriction_target_user_outcomes(
+    baseline: &LoaderEnvironmentCanaryOutcomeV1,
+    no_restricting_sid: &LoaderEnvironmentCanaryOutcomeV1,
+    same_access_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    logon_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    authenticated_users_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    target_user_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    invariants_valid: bool,
+) -> &'static str {
+    let identity_state = classify_loader_restriction_identity_outcomes(
+        baseline,
+        no_restricting_sid,
+        same_access_restricted,
+        invariants_valid,
+    );
+    if identity_state == "invalid" {
+        return "invalid";
+    }
+    let prior_singletons_match = logon_restricted.outcome
+        == LoaderControlMatrixOutcomeKindV6::Failed
+        && logon_restricted.native_status == Some(STATUS_ACCESS_DENIED)
+        && authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && authenticated_users_restricted.native_status == logon_restricted.native_status
+        && authenticated_users_restricted.failure_phase == logon_restricted.failure_phase;
+    if identity_state != "restricted-code-sid-narrowing-causal" || !prior_singletons_match {
+        return "target-user-singleton-inconclusive";
+    }
+    if target_user_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed {
+        return "target-user-restriction-bootstrap-compatible-group-singletons-too-narrow";
+    }
+    let matches_prior_singleton_access_failure = target_user_restricted.native_status
+        == Some(STATUS_ACCESS_DENIED)
+        && target_user_restricted.native_status == logon_restricted.native_status
+        && target_user_restricted.failure_phase == logon_restricted.failure_phase
+        && target_user_restricted.native_status == authenticated_users_restricted.native_status
+        && target_user_restricted.failure_phase == authenticated_users_restricted.failure_phase;
+    if target_user_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && matches_prior_singleton_access_failure
+    {
+        return "no-tested-singleton-sufficient-trace-required";
+    }
+    let matches_baseline_init_failure = target_user_restricted.native_status
+        == Some(STATUS_DLL_INIT_FAILED)
+        && target_user_restricted.native_status == baseline.native_status
+        && target_user_restricted.failure_phase == baseline.failure_phase;
+    if target_user_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && matches_baseline_init_failure
+    {
+        return "target-user-singleton-a-like-failure";
+    }
+    "target-user-singleton-inconclusive"
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loader_restriction_original_sext_reproduction_valid(
+    baseline: &LoaderEnvironmentCanaryOutcomeV1,
+    no_restricting_sid: &LoaderEnvironmentCanaryOutcomeV1,
+    same_access_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    logon_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    authenticated_users_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    target_user_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    invariants_valid: bool,
+) -> bool {
+    invariants_valid
+        && baseline.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && baseline.native_status == Some(STATUS_DLL_INIT_FAILED)
+        && baseline.failure_phase == "post-resume-pre-loader-ready"
+        && no_restricting_sid.outcome == LoaderControlMatrixOutcomeKindV6::Passed
+        && same_access_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed
+        && logon_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && logon_restricted.native_status == Some(STATUS_ACCESS_DENIED)
+        && logon_restricted.failure_phase == "post-resume-pre-loader-ready"
+        && authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && authenticated_users_restricted.native_status == logon_restricted.native_status
+        && authenticated_users_restricted.failure_phase == logon_restricted.failure_phase
+        && target_user_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && target_user_restricted.native_status == logon_restricted.native_status
+        && target_user_restricted.failure_phase == logon_restricted.failure_phase
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoaderFullObserverTraceReceiptV1 {
+    trace_sha256: String,
+    candidate_modules_sha256: String,
+    candidate_modules_count: u64,
+    stable_modules: Vec<LoaderFullObserverStableModuleIdentityV1>,
+    stable_module_sequence_sha256: String,
+    unload_tail_sha256: String,
+    exception_tail_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoaderFullObserverStableModuleIdentityV1 {
+    sha256: String,
+    stable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderFullObserverModulePathSourceV1 {
+    FileHandle,
+    MappedFile,
+    EventImageNameUntrusted,
+    Unavailable,
+}
+
+impl LoaderFullObserverModulePathSourceV1 {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "file-handle" => Some(Self::FileHandle),
+            "mapped-file" => Some(Self::MappedFile),
+            "event-image-name-untrusted" => Some(Self::EventImageNameUntrusted),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::FileHandle => "file-handle",
+            Self::MappedFile => "mapped-file",
+            Self::EventImageNameUntrusted => "event-image-name-untrusted",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn stable(self) -> bool {
+        matches!(self, Self::FileHandle | Self::MappedFile)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderFullObserverModulePathProvenanceV1 {
+    FileHandle,
+    MappedFileFallback,
+    EventWideFallback,
+    EventAnsiFallback,
+    Unavailable,
+}
+
+impl LoaderFullObserverModulePathProvenanceV1 {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::FileHandle => "file-handle",
+            Self::MappedFileFallback => "mapped-file-fallback",
+            Self::EventWideFallback => "event-wide-fallback",
+            Self::EventAnsiFallback => "event-ansi-fallback",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn stable(self) -> bool {
+        matches!(self, Self::FileHandle | Self::MappedFileFallback)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderFullObserverTailV1 {
+    CandidateModules,
+    Unload,
+    UnknownEvent,
+    Exception,
+}
+
+impl LoaderFullObserverTailV1 {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::CandidateModules => "candidate-modules",
+            Self::Unload => "unload",
+            Self::UnknownEvent => "unknown-event",
+            Self::Exception => "exception",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderFullObserverTraceRejectionV1 {
+    MissingTraceRecord,
+    DuplicateTraceRecord,
+    MissingScalar,
+    DuplicateScalar,
+    InvalidUnsigned,
+    Version,
+    Gate,
+    Drain,
+    DebugCleanup,
+    CreateEvent,
+    ExitEvent,
+    CommandDeclaration,
+    EventAccounting,
+    EventBound,
+    DebugStringCount,
+    DebugStringBytes,
+    DebugStringOverflow,
+    TailCountRetained(LoaderFullObserverTailV1),
+    TailOverflow(LoaderFullObserverTailV1),
+    TailCapacity(LoaderFullObserverTailV1),
+    LoaderSnapCount,
+    LoaderSnapRetained,
+    LoaderSnapOverflow,
+    CandidateModuleTailMalformed,
+    CandidateModuleTailDigest,
+    DigestShape,
+    EmptySnapDigest,
+}
+
+impl LoaderFullObserverTraceRejectionV1 {
+    fn diagnostic(self) -> String {
+        match self {
+            Self::MissingTraceRecord => "rejected-missing-trace-record".to_owned(),
+            Self::DuplicateTraceRecord => "rejected-duplicate-trace-record".to_owned(),
+            Self::MissingScalar => "rejected-missing-scalar".to_owned(),
+            Self::DuplicateScalar => "rejected-duplicate-scalar".to_owned(),
+            Self::InvalidUnsigned => "rejected-invalid-unsigned".to_owned(),
+            Self::Version => "rejected-version".to_owned(),
+            Self::Gate => "rejected-gate".to_owned(),
+            Self::Drain => "rejected-drain".to_owned(),
+            Self::DebugCleanup => "rejected-debug-cleanup".to_owned(),
+            Self::CreateEvent => "rejected-create-event".to_owned(),
+            Self::ExitEvent => "rejected-exit-event".to_owned(),
+            Self::CommandDeclaration => "rejected-command-declaration".to_owned(),
+            Self::EventAccounting => "rejected-event-accounting".to_owned(),
+            Self::EventBound => "rejected-event-bound".to_owned(),
+            Self::DebugStringCount => "rejected-debug-string-count".to_owned(),
+            Self::DebugStringBytes => "rejected-debug-string-bytes".to_owned(),
+            Self::DebugStringOverflow => "rejected-debug-string-overflow".to_owned(),
+            Self::TailCountRetained(tail) => {
+                format!("rejected-{}-tail-count-retained", tail.diagnostic())
+            }
+            Self::TailOverflow(tail) => {
+                format!("rejected-{}-tail-overflow", tail.diagnostic())
+            }
+            Self::TailCapacity(tail) => {
+                format!("rejected-{}-tail-capacity", tail.diagnostic())
+            }
+            Self::LoaderSnapCount => "rejected-loader-snap-count".to_owned(),
+            Self::LoaderSnapRetained => "rejected-loader-snap-retained".to_owned(),
+            Self::LoaderSnapOverflow => "rejected-loader-snap-overflow".to_owned(),
+            Self::CandidateModuleTailMalformed => {
+                "rejected-candidate-module-tail-malformed".to_owned()
+            }
+            Self::CandidateModuleTailDigest => "rejected-candidate-module-tail-digest".to_owned(),
+            Self::DigestShape => "rejected-digest-shape".to_owned(),
+            Self::EmptySnapDigest => "rejected-empty-snap-digest".to_owned(),
+        }
+    }
+}
+
+fn loader_full_observer_trace_record(
+    detail: &str,
+) -> Result<&str, LoaderFullObserverTraceRejectionV1> {
+    let marker = "loader_trace=";
+    let mut markers = detail.match_indices(marker).filter_map(|(start, _)| {
+        let token_start = start == 0
+            || detail[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+        token_start.then_some(start)
+    });
+    let start = markers
+        .next()
+        .ok_or(LoaderFullObserverTraceRejectionV1::MissingTraceRecord)?;
+    if markers.next().is_some() {
+        return Err(LoaderFullObserverTraceRejectionV1::DuplicateTraceRecord);
+    }
+    let trace = &detail[start..];
+    if trace.split_ascii_whitespace().next() != Some("loader_trace=v4") {
+        return Err(LoaderFullObserverTraceRejectionV1::Version);
+    }
+    Ok(trace)
+}
+
+fn loader_trace_scalar<'a>(
+    detail: &'a str,
+    field: &str,
+) -> Result<&'a str, LoaderFullObserverTraceRejectionV1> {
+    let prefix = format!("{field}=");
+    let mut matches = detail
+        .split_ascii_whitespace()
+        .filter_map(|value| value.strip_prefix(&prefix))
+        .map(|value| value.trim_end_matches([',', ']', ';']));
+    let value = matches
+        .next()
+        .ok_or(LoaderFullObserverTraceRejectionV1::MissingScalar)?;
+    if matches.next().is_some() {
+        return Err(LoaderFullObserverTraceRejectionV1::DuplicateScalar);
+    }
+    Ok(value)
+}
+
+fn loader_trace_list_scalar<'a>(
+    detail: &'a str,
+    field: &str,
+) -> Result<&'a str, LoaderFullObserverTraceRejectionV1> {
+    let prefix = format!("{field}=");
+    let mut matches = detail
+        .split_ascii_whitespace()
+        .filter_map(|value| value.strip_prefix(&prefix));
+    let value = matches
+        .next()
+        .ok_or(LoaderFullObserverTraceRejectionV1::MissingScalar)?;
+    if matches.next().is_some() {
+        return Err(LoaderFullObserverTraceRejectionV1::DuplicateScalar);
+    }
+    value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed)
+}
+
+fn loader_trace_status_with_numeric_suffix(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|suffix| {
+        suffix
+            .parse::<i32>()
+            .is_ok_and(|parsed| parsed.to_string() == suffix)
+    })
+}
+
+fn loader_trace_status_numeric_suffix(value: &str, prefixes: &[&str]) -> Option<i32> {
+    prefixes.iter().find_map(|prefix| {
+        value
+            .strip_prefix(prefix)
+            .and_then(|suffix| suffix.parse::<i32>().ok())
+            .filter(|parsed| parsed.to_string() == value.strip_prefix(prefix).unwrap_or_default())
+    })
+}
+
+fn loader_trace_file_failure_status_valid(value: &str) -> bool {
+    matches!(value, "file-null" | "file-invalid" | "file-overflow")
+        || loader_trace_status_with_numeric_suffix(value, "file-os-")
+}
+
+fn loader_trace_mapped_failure_status_valid(value: &str) -> bool {
+    matches!(value, "mapped-null-base" | "mapped-overflow")
+        || loader_trace_status_with_numeric_suffix(value, "mapped-os-")
+}
+
+fn loader_trace_event_failure_status_valid(value: &str) -> bool {
+    matches!(
+        value,
+        "event-pointer-null"
+            | "event-string-null"
+            | "event-wide-unterminated"
+            | "event-wide-empty"
+            | "event-wide-invalid"
+            | "event-ansi-unterminated"
+            | "event-ansi-empty"
+            | "event-ansi-invalid"
+    ) || [
+        "event-pointer-os-",
+        "event-pointer-partial-",
+        "event-wide-os-",
+        "event-wide-partial-",
+        "event-ansi-os-",
+        "event-ansi-partial-",
+    ]
+    .into_iter()
+    .any(|prefix| loader_trace_status_with_numeric_suffix(value, prefix))
+}
+
+fn loader_trace_module_provenance(
+    source: LoaderFullObserverModulePathSourceV1,
+    value: &str,
+) -> Option<(
+    LoaderFullObserverModulePathProvenanceV1,
+    Option<Option<i32>>,
+)> {
+    let fields = value.split('>').collect::<Vec<_>>();
+    match (source, fields.as_slice()) {
+        (LoaderFullObserverModulePathSourceV1::FileHandle, ["file-ok"]) => Some((
+            LoaderFullObserverModulePathProvenanceV1::FileHandle,
+            Some(None),
+        )),
+        (LoaderFullObserverModulePathSourceV1::MappedFile, [file, "mapped-ok"])
+            if loader_trace_file_failure_status_valid(file) =>
+        {
+            Some((
+                LoaderFullObserverModulePathProvenanceV1::MappedFileFallback,
+                Some(None),
+            ))
+        }
+        (
+            LoaderFullObserverModulePathSourceV1::EventImageNameUntrusted,
+            [file, mapped, "event-wide-ok"],
+        ) if loader_trace_file_failure_status_valid(file)
+            && loader_trace_mapped_failure_status_valid(mapped) =>
+        {
+            Some((
+                LoaderFullObserverModulePathProvenanceV1::EventWideFallback,
+                Some(None),
+            ))
+        }
+        (
+            LoaderFullObserverModulePathSourceV1::EventImageNameUntrusted,
+            [file, mapped, "event-ansi-ok"],
+        ) if loader_trace_file_failure_status_valid(file)
+            && loader_trace_mapped_failure_status_valid(mapped) =>
+        {
+            Some((
+                LoaderFullObserverModulePathProvenanceV1::EventAnsiFallback,
+                Some(None),
+            ))
+        }
+        (LoaderFullObserverModulePathSourceV1::Unavailable, [file, mapped, event])
+            if loader_trace_file_failure_status_valid(file)
+                && loader_trace_mapped_failure_status_valid(mapped)
+                && loader_trace_event_failure_status_valid(event) =>
+        {
+            let event_error = loader_trace_status_numeric_suffix(
+                event,
+                &[
+                    "event-pointer-os-",
+                    "event-pointer-partial-",
+                    "event-wide-os-",
+                    "event-wide-partial-",
+                    "event-ansi-os-",
+                    "event-ansi-partial-",
+                ],
+            );
+            let mapped_error = loader_trace_status_numeric_suffix(mapped, &["mapped-os-"]);
+            let file_error = if *file == "file-invalid" {
+                Some(6)
+            } else {
+                loader_trace_status_numeric_suffix(file, &["file-os-"])
+            };
+            let partial_error_unobservable = [
+                "event-pointer-partial-",
+                "event-wide-partial-",
+                "event-ansi-partial-",
+            ]
+            .into_iter()
+            .any(|prefix| event.starts_with(prefix));
+            Some((
+                LoaderFullObserverModulePathProvenanceV1::Unavailable,
+                (!partial_error_unobservable)
+                    .then_some(event_error.or(mapped_error).or(file_error)),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn loader_trace_stable_module_identity(
+    basename: &str,
+    path_source: LoaderFullObserverModulePathSourceV1,
+    path_sha256: &str,
+    path_error: Option<i32>,
+    path_provenance: LoaderFullObserverModulePathProvenanceV1,
+) -> LoaderFullObserverStableModuleIdentityV1 {
+    let mut basename_material = b"memcordon-loader-module-basename-v1\0".to_vec();
+    basename_material.extend_from_slice(basename.to_ascii_lowercase().as_bytes());
+    let basename_sha256 = super::record::digest(&basename_material);
+    let mut identity_material = b"memcordon-loader-stable-module-identity-v1\0".to_vec();
+    identity_material.extend_from_slice(basename_sha256.as_bytes());
+    identity_material.extend_from_slice(path_sha256.as_bytes());
+    identity_material.extend_from_slice(path_source.diagnostic().as_bytes());
+    identity_material.push(0);
+    identity_material.extend_from_slice(&path_error.unwrap_or_default().to_le_bytes());
+    identity_material.push(u8::from(path_error.is_some()));
+    identity_material.extend_from_slice(path_provenance.diagnostic().as_bytes());
+    LoaderFullObserverStableModuleIdentityV1 {
+        sha256: super::record::digest(&identity_material),
+        stable: !basename.contains('?')
+            && basename != "unavailable"
+            && path_source.stable()
+            && path_provenance.stable(),
+    }
+}
+
+fn loader_stable_module_sequence_digest(
+    modules: &[LoaderFullObserverStableModuleIdentityV1],
+) -> String {
+    let mut material = b"memcordon-loader-stable-module-sequence-v1\0".to_vec();
+    for module in modules {
+        material.extend_from_slice(module.sha256.as_bytes());
+        material.push(u8::from(module.stable));
+    }
+    super::record::digest(&material)
+}
+
+fn loader_trace_candidate_modules(
+    detail: &str,
+    declared_sha256: &str,
+    retained: u64,
+) -> Result<Vec<LoaderFullObserverStableModuleIdentityV1>, LoaderFullObserverTraceRejectionV1> {
+    let serialized = loader_trace_list_scalar(detail, "candidate_modules")?;
+    let mut canonical_entries = Vec::new();
+    let mut identities = Vec::new();
+    let mut stable_identity_set = BTreeSet::new();
+    let mut previous_ordinal = None;
+    if !serialized.is_empty() {
+        for entry in serialized.split(',') {
+            let fields = entry.split(':').collect::<Vec<_>>();
+            let [
+                ordinal_base,
+                basename,
+                path_source,
+                path_sha256,
+                path_error,
+                path_provenance,
+            ] = fields.as_slice()
+            else {
+                return Err(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed);
+            };
+            let (ordinal, base) = ordinal_base
+                .split_once("@0x")
+                .ok_or(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed)?;
+            let ordinal = ordinal
+                .parse::<u64>()
+                .map_err(|_| LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed)?;
+            if ordinal == 0 || previous_ordinal.is_some_and(|previous| ordinal <= previous) {
+                return Err(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed);
+            }
+            previous_ordinal = Some(ordinal);
+            let base = u64::from_str_radix(base, 16)
+                .map_err(|_| LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed)?;
+            if base == 0 {
+                return Err(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed);
+            }
+            let basename = *basename;
+            let path_sha256 = *path_sha256;
+            let path_error = *path_error;
+            let path_provenance = *path_provenance;
+            if basename.is_empty()
+                || basename.len() > super::loader_debug::MODULE_BASENAME_MAX_BYTES
+                || !basename.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '?')
+                })
+                || !loader_trace_sha256_valid(path_sha256)
+            {
+                return Err(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed);
+            }
+            let path_source = LoaderFullObserverModulePathSourceV1::parse(path_source)
+                .ok_or(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed)?;
+            let parsed_path_error = if path_error == "ok" {
+                None
+            } else {
+                Some(
+                    path_error
+                        .strip_prefix("os-")
+                        .and_then(|value| value.parse::<i32>().ok())
+                        .ok_or(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed)?,
+                )
+            };
+            let (parsed_provenance, expected_path_error) =
+                loader_trace_module_provenance(path_source, path_provenance)
+                    .ok_or(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed)?;
+            if expected_path_error.is_some_and(|expected| parsed_path_error != expected) {
+                return Err(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed);
+            }
+            let canonical_path_error =
+                parsed_path_error.map_or_else(|| "ok".to_owned(), |code| format!("os-{code}"));
+            canonical_entries.push(format!(
+                "{ordinal}@0x{base:x}:{basename}:{}:{path_sha256}:{canonical_path_error}:{path_provenance}",
+                path_source.diagnostic(),
+            ));
+            let identity = loader_trace_stable_module_identity(
+                basename,
+                path_source,
+                path_sha256,
+                parsed_path_error,
+                parsed_provenance,
+            );
+            if !stable_identity_set.insert(identity.sha256.clone()) {
+                return Err(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed);
+            }
+            identities.push(identity);
+        }
+    }
+    if identities.len() as u64 != retained {
+        return Err(LoaderFullObserverTraceRejectionV1::CandidateModuleTailMalformed);
+    }
+    let canonical = canonical_entries.join(",");
+    if super::loader_debug::candidate_modules_tail_digest(&canonical) != declared_sha256 {
+        return Err(LoaderFullObserverTraceRejectionV1::CandidateModuleTailDigest);
+    }
+    Ok(identities)
+}
+
+fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {
+    loader_trace_scalar(detail, field)?
+        .parse()
+        .map_err(|_| LoaderFullObserverTraceRejectionV1::InvalidUnsigned)
+}
+
+fn loader_trace_bounded_tail_valid(
+    detail: &str,
+    count_field: &str,
+    retained_field: &str,
+    overflow_field: &str,
+    capacity: usize,
+    tail: LoaderFullObserverTailV1,
+) -> Result<(), LoaderFullObserverTraceRejectionV1> {
+    let count = loader_trace_u64(detail, count_field)?;
+    let retained = loader_trace_u64(detail, retained_field)?;
+    let overflow = loader_trace_u64(detail, overflow_field)?;
+    if overflow != 0 {
+        return Err(LoaderFullObserverTraceRejectionV1::TailOverflow(tail));
+    }
+    if count != retained {
+        return Err(LoaderFullObserverTraceRejectionV1::TailCountRetained(tail));
+    }
+    if retained > capacity as u64 {
+        return Err(LoaderFullObserverTraceRejectionV1::TailCapacity(tail));
+    }
+    Ok(())
+}
+
+fn loader_trace_sha256_valid(value: &str) -> bool {
+    value.len() == super::record::digest(b"").len()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn admit_loader_full_observer_trace(
+    result: &Result<String, TargetDesktopLeaseCreateError>,
+) -> Result<LoaderFullObserverTraceReceiptV1, LoaderFullObserverTraceRejectionV1> {
+    let detail = loader_full_observer_trace_record(loader_result_detail(result))?;
+    if loader_trace_scalar(detail, "loader_trace")? != "v4" {
+        return Err(LoaderFullObserverTraceRejectionV1::Version);
+    }
+    if loader_trace_scalar(detail, "gate")? != "ephemeral-ci" {
+        return Err(LoaderFullObserverTraceRejectionV1::Gate);
+    }
+    if loader_trace_scalar(detail, "drained")? != "true" {
+        return Err(LoaderFullObserverTraceRejectionV1::Drain);
+    }
+    if loader_trace_scalar(detail, "debug_cleanup")? != "exit-process-event-continued" {
+        return Err(LoaderFullObserverTraceRejectionV1::DebugCleanup);
+    }
+    if loader_trace_scalar(detail, "create_event")? != "true" {
+        return Err(LoaderFullObserverTraceRejectionV1::CreateEvent);
+    }
+    if loader_trace_scalar(detail, "exit_event")? != "true" {
+        return Err(LoaderFullObserverTraceRejectionV1::ExitEvent);
+    }
+    if loader_trace_scalar(detail, "command_dynamic_fields")?
+        != "authenticated-private-pipe,authenticated-nonce"
+    {
+        return Err(LoaderFullObserverTraceRejectionV1::CommandDeclaration);
+    }
+    let events = loader_trace_u64(detail, "events")?;
+    let accounted_events = loader_trace_u64(detail, "accounted_events")?;
+    if events != accounted_events {
+        return Err(LoaderFullObserverTraceRejectionV1::EventAccounting);
+    }
+    if events > super::loader_debug::LOADER_TRACE_EVENT_ADMISSION_MAX {
+        return Err(LoaderFullObserverTraceRejectionV1::EventBound);
+    }
+    if loader_trace_u64(detail, "debug_strings")? != 0 {
+        return Err(LoaderFullObserverTraceRejectionV1::DebugStringCount);
+    }
+    if loader_trace_u64(detail, "debug_string_bytes")? != 0 {
+        return Err(LoaderFullObserverTraceRejectionV1::DebugStringBytes);
+    }
+    if loader_trace_u64(detail, "debug_string_overflow")? != 0 {
+        return Err(LoaderFullObserverTraceRejectionV1::DebugStringOverflow);
+    }
+    loader_trace_bounded_tail_valid(
+        detail,
+        "candidate_modules_count",
+        "candidate_modules_retained",
+        "candidate_modules_overflow",
+        super::loader_debug::MODULE_TAIL_CAPACITY,
+        LoaderFullObserverTailV1::CandidateModules,
+    )?;
+    let candidate_modules_count = loader_trace_u64(detail, "candidate_modules_count")?;
+    let candidate_modules_retained = loader_trace_u64(detail, "candidate_modules_retained")?;
+    loader_trace_bounded_tail_valid(
+        detail,
+        "unload_tail_count",
+        "unload_tail_retained",
+        "unload_tail_overflow",
+        super::loader_debug::UNLOAD_TAIL_CAPACITY,
+        LoaderFullObserverTailV1::Unload,
+    )?;
+    loader_trace_bounded_tail_valid(
+        detail,
+        "unknown_event_tail_count",
+        "unknown_event_tail_retained",
+        "unknown_event_tail_overflow",
+        super::loader_debug::UNKNOWN_EVENT_TAIL_CAPACITY,
+        LoaderFullObserverTailV1::UnknownEvent,
+    )?;
+    loader_trace_bounded_tail_valid(
+        detail,
+        "exception_tail_count",
+        "exception_tail_retained",
+        "exception_tail_overflow",
+        super::loader_debug::EXCEPTION_TAIL_CAPACITY,
+        LoaderFullObserverTailV1::Exception,
+    )?;
+    if loader_trace_u64(detail, "loader_snap_tail_count")? != 0 {
+        return Err(LoaderFullObserverTraceRejectionV1::LoaderSnapCount);
+    }
+    if loader_trace_u64(detail, "loader_snap_tail_retained")? != 0 {
+        return Err(LoaderFullObserverTraceRejectionV1::LoaderSnapRetained);
+    }
+    if loader_trace_u64(detail, "loader_snap_tail_overflow")? != 0 {
+        return Err(LoaderFullObserverTraceRejectionV1::LoaderSnapOverflow);
+    }
+    let trace_sha256 = loader_trace_scalar(detail, "trace_sha256")?.to_owned();
+    let candidate_modules_sha256 =
+        loader_trace_scalar(detail, "candidate_modules_sha256")?.to_owned();
+    let unload_tail_sha256 = loader_trace_scalar(detail, "unload_tail_sha256")?.to_owned();
+    let unknown_event_tail_sha256 = loader_trace_scalar(detail, "unknown_event_tail_sha256")?;
+    let exception_tail_sha256 = loader_trace_scalar(detail, "exception_tail_sha256")?.to_owned();
+    let loader_snap_tail_sha256 = loader_trace_scalar(detail, "loader_snap_tail_sha256")?;
+    let command_semantics_sha256 = loader_trace_scalar(detail, "command_semantics_sha256")?;
+    if [
+        trace_sha256.as_str(),
+        candidate_modules_sha256.as_str(),
+        unload_tail_sha256.as_str(),
+        unknown_event_tail_sha256,
+        exception_tail_sha256.as_str(),
+        loader_snap_tail_sha256,
+        command_semantics_sha256,
+    ]
+    .into_iter()
+    .any(|value| !loader_trace_sha256_valid(value))
+    {
+        return Err(LoaderFullObserverTraceRejectionV1::DigestShape);
+    }
+    if loader_snap_tail_sha256 != super::record::digest(b"") {
+        return Err(LoaderFullObserverTraceRejectionV1::EmptySnapDigest);
+    }
+    let stable_modules = loader_trace_candidate_modules(
+        detail,
+        &candidate_modules_sha256,
+        candidate_modules_retained,
+    )?;
+    let stable_module_sequence_sha256 = loader_stable_module_sequence_digest(&stable_modules);
+    Ok(LoaderFullObserverTraceReceiptV1 {
+        trace_sha256,
+        candidate_modules_sha256,
+        candidate_modules_count,
+        stable_modules,
+        stable_module_sequence_sha256,
+        unload_tail_sha256,
+        exception_tail_sha256,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoaderFullObserverModuleFrontierV1 {
+    debug_c_total: u64,
+    debug_c_retained: usize,
+    debug_c_sequence_sha256: String,
+    debug_f_total: u64,
+    debug_f_retained: usize,
+    debug_f_sequence_sha256: String,
+    common_prefix: usize,
+    last_common_identity_sha256: Option<String>,
+    first_c_only_identity_sha256: Option<String>,
+    useful: bool,
+}
+
+fn loader_full_observer_module_frontier(
+    debug_c: &LoaderFullObserverTraceReceiptV1,
+    debug_f: &LoaderFullObserverTraceReceiptV1,
+) -> LoaderFullObserverModuleFrontierV1 {
+    let common_prefix = debug_c
+        .stable_modules
+        .iter()
+        .zip(debug_f.stable_modules.iter())
+        .take_while(|(canonical, target)| canonical.sha256 == target.sha256)
+        .count();
+    let identities_unique_and_stable = |modules: &[LoaderFullObserverStableModuleIdentityV1]| {
+        let mut seen = BTreeSet::new();
+        modules
+            .iter()
+            .all(|module| module.stable && seen.insert(module.sha256.as_str()))
+    };
+    let useful = identities_unique_and_stable(&debug_c.stable_modules)
+        && identities_unique_and_stable(&debug_f.stable_modules)
+        && debug_f.stable_modules.len() < debug_c.stable_modules.len()
+        && common_prefix == debug_f.stable_modules.len();
+    let projected_identity_digest = |domain: &[u8], identity: &str| {
+        let mut material = domain.to_vec();
+        material.extend_from_slice(identity.as_bytes());
+        super::record::digest(&material)
+    };
+    LoaderFullObserverModuleFrontierV1 {
+        debug_c_total: debug_c.candidate_modules_count,
+        debug_c_retained: debug_c.stable_modules.len(),
+        debug_c_sequence_sha256: debug_c.stable_module_sequence_sha256.clone(),
+        debug_f_total: debug_f.candidate_modules_count,
+        debug_f_retained: debug_f.stable_modules.len(),
+        debug_f_sequence_sha256: debug_f.stable_module_sequence_sha256.clone(),
+        common_prefix,
+        last_common_identity_sha256: common_prefix
+            .checked_sub(1)
+            .and_then(|index| debug_c.stable_modules.get(index))
+            .map(|identity| {
+                projected_identity_digest(
+                    b"memcordon-loader-stable-module-last-common-v1\0",
+                    &identity.sha256,
+                )
+            }),
+        first_c_only_identity_sha256: useful.then(|| {
+            projected_identity_digest(
+                b"memcordon-loader-stable-module-first-c-only-v1\0",
+                &debug_c.stable_modules[common_prefix].sha256,
+            )
+        }),
+        useful,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loader_trace_session_capability_allowed(
+    ephemeral_ci: bool,
+    passive_setup_admitted: bool,
+    original_reproduction_valid: bool,
+    original_invariants_valid: bool,
+    debug_c: &LoaderEnvironmentCanaryOutcomeV1,
+    debug_f: &LoaderEnvironmentCanaryOutcomeV1,
+    debug_c_trace: &LoaderFullObserverTraceReceiptV1,
+    debug_f_trace: &LoaderFullObserverTraceReceiptV1,
+    frontier: &LoaderFullObserverModuleFrontierV1,
+    invariants: &LoaderFullObserverInvariantReceiptV1,
+    after_debug_c_stable: bool,
+    after_debug_f_stable: bool,
+) -> bool {
+    ephemeral_ci
+        && passive_setup_admitted
+        && original_reproduction_valid
+        && original_invariants_valid
+        && invariants.valid()
+        && debug_c.outcome == LoaderControlMatrixOutcomeKindV6::Passed
+        && debug_c.native_status.is_none()
+        && debug_c.failure_phase == "none"
+        && debug_f.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && debug_f.native_status == Some(STATUS_ACCESS_DENIED)
+        && debug_f.failure_phase == "post-resume-pre-loader-ready"
+        && !debug_c_trace.stable_modules.is_empty()
+        && !debug_f_trace.stable_modules.is_empty()
+        && debug_c_trace.candidate_modules_count == debug_c_trace.stable_modules.len() as u64
+        && debug_f_trace.candidate_modules_count == debug_f_trace.stable_modules.len() as u64
+        && after_debug_c_stable
+        && after_debug_f_stable
+        && !frontier.useful
+        && frontier.common_prefix == 0
+        && frontier.last_common_identity_sha256.is_none()
+        && frontier.first_c_only_identity_sha256.is_none()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loader_trace_session_capability_trigger_sha256(
+    ephemeral_ci: bool,
+    passive_setup_sha256: Option<&str>,
+    original_reproduction_valid: bool,
+    original_invariants_valid: bool,
+    source_binding_sha256: &str,
+    pair_invariants_sha256: &str,
+    restriction_presence_binding_sha256: &str,
+    restriction_identity_binding_sha256: &str,
+    logon_restriction_binding_sha256: &str,
+    authenticated_users_restriction_binding_sha256: &str,
+    target_user_restriction_binding_sha256: &str,
+    profile_binding_sha256: &str,
+    shared_evidence_sha256: &str,
+    baseline: &LoaderEnvironmentCanaryOutcomeV1,
+    no_restricting_sid: &LoaderEnvironmentCanaryOutcomeV1,
+    same_access_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    logon_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    authenticated_users_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    target_user_restricted: &LoaderEnvironmentCanaryOutcomeV1,
+    debug_c: &LoaderEnvironmentCanaryOutcomeV1,
+    debug_f: &LoaderEnvironmentCanaryOutcomeV1,
+    debug_c_trace: &LoaderFullObserverTraceReceiptV1,
+    debug_f_trace: &LoaderFullObserverTraceReceiptV1,
+    frontier: &LoaderFullObserverModuleFrontierV1,
+    invariants: &LoaderFullObserverInvariantReceiptV1,
+    after_debug_c: &SharedEnvironmentObservationV1,
+    after_debug_f: &SharedEnvironmentObservationV1,
+) -> Option<String> {
+    if !loader_trace_session_capability_allowed(
+        ephemeral_ci,
+        passive_setup_sha256.is_some(),
+        original_reproduction_valid,
+        original_invariants_valid,
+        debug_c,
+        debug_f,
+        debug_c_trace,
+        debug_f_trace,
+        frontier,
+        invariants,
+        after_debug_c.stable(),
+        after_debug_f.stable(),
+    ) {
+        return None;
+    }
+    if [
+        passive_setup_sha256.unwrap_or_default(),
+        source_binding_sha256,
+        pair_invariants_sha256,
+        restriction_presence_binding_sha256,
+        restriction_identity_binding_sha256,
+        logon_restriction_binding_sha256,
+        authenticated_users_restriction_binding_sha256,
+        target_user_restriction_binding_sha256,
+        profile_binding_sha256,
+        shared_evidence_sha256,
+        debug_c_trace.trace_sha256.as_str(),
+        debug_f_trace.trace_sha256.as_str(),
+        debug_c_trace.stable_module_sequence_sha256.as_str(),
+        debug_f_trace.stable_module_sequence_sha256.as_str(),
+        after_debug_c.detail_sha256.as_str(),
+        after_debug_f.detail_sha256.as_str(),
+    ]
+    .into_iter()
+    .filter(|digest| *digest != "none")
+    .any(|digest| super::record::validate_attempt_id(digest).is_err())
+        || [
+            baseline,
+            no_restricting_sid,
+            same_access_restricted,
+            logon_restricted,
+            authenticated_users_restricted,
+            target_user_restricted,
+            debug_c,
+            debug_f,
+        ]
+        .into_iter()
+        .any(|outcome| super::record::validate_attempt_id(&outcome.detail_sha256).is_err())
+    {
+        return None;
+    }
+    let mut material = b"memcordon-loader-trace-session-capability-trigger-v1\0".to_vec();
+    for field in [
+        passive_setup_sha256.unwrap_or_default(),
+        source_binding_sha256,
+        pair_invariants_sha256,
+        restriction_presence_binding_sha256,
+        restriction_identity_binding_sha256,
+        logon_restriction_binding_sha256,
+        authenticated_users_restriction_binding_sha256,
+        target_user_restriction_binding_sha256,
+        profile_binding_sha256,
+        shared_evidence_sha256,
+        &debug_c_trace.trace_sha256,
+        &debug_f_trace.trace_sha256,
+        &debug_c_trace.stable_module_sequence_sha256,
+        &debug_f_trace.stable_module_sequence_sha256,
+        &after_debug_c.detail_sha256,
+        &after_debug_f.detail_sha256,
+    ] {
+        material.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        material.extend_from_slice(field.as_bytes());
+    }
+    for value in [
+        debug_c_trace.candidate_modules_count,
+        debug_f_trace.candidate_modules_count,
+        debug_c_trace.stable_modules.len() as u64,
+        debug_f_trace.stable_modules.len() as u64,
+        frontier.common_prefix as u64,
+    ] {
+        material.extend_from_slice(&value.to_le_bytes());
+    }
+    for outcome in [
+        baseline,
+        no_restricting_sid,
+        same_access_restricted,
+        logon_restricted,
+        authenticated_users_restricted,
+        target_user_restricted,
+        debug_c,
+        debug_f,
+    ] {
+        material.extend_from_slice(&(outcome.detail_sha256.len() as u64).to_le_bytes());
+        material.extend_from_slice(outcome.detail_sha256.as_bytes());
+        material.push(match outcome.outcome {
+            LoaderControlMatrixOutcomeKindV6::Passed => 1,
+            LoaderControlMatrixOutcomeKindV6::Failed => 2,
+        });
+        material.extend_from_slice(&outcome.native_status.unwrap_or(i32::MIN).to_le_bytes());
+        material.extend_from_slice(&(outcome.failure_phase.len() as u64).to_le_bytes());
+        material.extend_from_slice(outcome.failure_phase.as_bytes());
+    }
+    for (name, state) in invariants.named_states() {
+        material.extend_from_slice(name.as_bytes());
+        material.push(0);
+        material.push(match state {
+            LoaderFullObserverInvariantStateV1::Passed => 1,
+            LoaderFullObserverInvariantStateV1::Failed => 2,
+            LoaderFullObserverInvariantStateV1::NotRun => 3,
+        });
+    }
+    Some(super::record::digest(&material))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loader_trace_session_capability_shared_evidence_sha256(
+    admitted_environment: &UserEnvironmentInventoryV1,
+    observations: &[&SharedEnvironmentObservationV1],
+    profile_before: &LoaderProfileObservationV1,
+    profile_after_original: &LoaderProfileObservationV1,
+    profile_after_all: &LoaderProfileObservationV1,
+    launcher_authority_exact: bool,
+    containment_exact: bool,
+    job_empty_exact: bool,
+    environment_destruction_sha256: &str,
+) -> Option<String> {
+    if observations.len() != 8
+        || !admitted_environment.missing_required.is_empty()
+        || [
+            admitted_environment.sha256.as_str(),
+            admitted_environment.keys_sha256.as_str(),
+            profile_before.profile_directory_sha256.as_str(),
+            profile_after_original.profile_directory_sha256.as_str(),
+            profile_after_all.profile_directory_sha256.as_str(),
+            environment_destruction_sha256,
+        ]
+        .into_iter()
+        .any(|digest| super::record::validate_attempt_id(digest).is_err())
+    {
+        return None;
+    }
+    let mut material = b"memcordon-loader-trace-session-capability-shared-evidence-v1\0".to_vec();
+    for field in [
+        admitted_environment.sha256.as_str(),
+        admitted_environment.keys_sha256.as_str(),
+        environment_destruction_sha256,
+    ] {
+        material.extend_from_slice(&(field.len() as u64).to_le_bytes());
+        material.extend_from_slice(field.as_bytes());
+    }
+    material.extend_from_slice(&(admitted_environment.units as u64).to_le_bytes());
+    material.extend_from_slice(&(admitted_environment.entries as u64).to_le_bytes());
+    for observation in observations {
+        for field in [observation.scan, observation.detail_sha256.as_str()] {
+            material.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            material.extend_from_slice(field.as_bytes());
+        }
+        material.push(u8::from(observation.metadata_match));
+    }
+    for profile in [profile_before, profile_after_original, profile_after_all] {
+        let state = profile.state.diagnostic();
+        material.extend_from_slice(&(state.len() as u64).to_le_bytes());
+        material.extend_from_slice(state.as_bytes());
+        material.extend_from_slice(
+            &profile
+                .state
+                .native_code()
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        material.extend_from_slice(profile.profile_directory_sha256.as_bytes());
+        material.push(u8::from(profile.profile_directory_exists));
+    }
+    material.extend_from_slice(&[
+        u8::from(launcher_authority_exact),
+        u8::from(containment_exact),
+        u8::from(job_empty_exact),
+    ]);
+    Some(super::record::digest(&material))
+}
+
+fn classify_loader_full_observer_pair(
+    debug_c: &LoaderEnvironmentCanaryOutcomeV1,
+    debug_f: &LoaderEnvironmentCanaryOutcomeV1,
+    invariants_valid: bool,
+    useful_frontier_differential: Option<bool>,
+) -> &'static str {
+    let reproduction_valid = invariants_valid
+        && debug_c.outcome == LoaderControlMatrixOutcomeKindV6::Passed
+        && debug_f.outcome == LoaderControlMatrixOutcomeKindV6::Failed
+        && debug_f.native_status == Some(STATUS_ACCESS_DENIED)
+        && debug_f.failure_phase == "post-resume-pre-loader-ready";
+    if !reproduction_valid || useful_frontier_differential.is_none() {
+        "observer-perturbed-inconclusive"
+    } else if useful_frontier_differential == Some(true) {
+        "observer-perturbed-differential"
+    } else {
+        "observer-perturbed-nonlocalizing"
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderFullObserverInvariantStateV1 {
+    Passed,
+    Failed,
+    NotRun,
+}
+
+impl LoaderFullObserverInvariantStateV1 {
+    fn evaluated(value: bool) -> Self {
+        if value { Self::Passed } else { Self::Failed }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoaderFullObserverInvariantReceiptV1 {
+    fallback_authority: LoaderFullObserverInvariantStateV1,
+    original_reproduction: LoaderFullObserverInvariantStateV1,
+    original_invariants: LoaderFullObserverInvariantStateV1,
+    original_projection: LoaderFullObserverInvariantStateV1,
+    debug_pair_common: LoaderFullObserverInvariantStateV1,
+    debug_mode: LoaderFullObserverInvariantStateV1,
+    debug_c_trace_admission: LoaderFullObserverInvariantStateV1,
+    debug_f_trace_admission: LoaderFullObserverInvariantStateV1,
+    debug_containment: LoaderFullObserverInvariantStateV1,
+    post_debug_c_environment: LoaderFullObserverInvariantStateV1,
+    post_debug_f_environment: LoaderFullObserverInvariantStateV1,
+    profile_stability: LoaderFullObserverInvariantStateV1,
+    environment_destruction_once: LoaderFullObserverInvariantStateV1,
+}
+
+impl LoaderFullObserverInvariantReceiptV1 {
+    #[allow(clippy::too_many_arguments)]
+    fn evaluated(
+        fallback_authority: bool,
+        original_reproduction: bool,
+        original_invariants: bool,
+        original_projection: bool,
+        debug_pair_common: bool,
+        debug_mode: bool,
+        debug_c_trace_admission: bool,
+        debug_f_trace_admission: bool,
+        debug_containment: bool,
+        post_debug_c_environment: bool,
+        post_debug_f_environment: bool,
+        profile_stability: bool,
+        environment_destruction_once: bool,
+    ) -> Self {
+        Self {
+            fallback_authority: LoaderFullObserverInvariantStateV1::evaluated(fallback_authority),
+            original_reproduction: LoaderFullObserverInvariantStateV1::evaluated(
+                original_reproduction,
+            ),
+            original_invariants: LoaderFullObserverInvariantStateV1::evaluated(original_invariants),
+            original_projection: LoaderFullObserverInvariantStateV1::evaluated(original_projection),
+            debug_pair_common: LoaderFullObserverInvariantStateV1::evaluated(debug_pair_common),
+            debug_mode: LoaderFullObserverInvariantStateV1::evaluated(debug_mode),
+            debug_c_trace_admission: LoaderFullObserverInvariantStateV1::evaluated(
+                debug_c_trace_admission,
+            ),
+            debug_f_trace_admission: LoaderFullObserverInvariantStateV1::evaluated(
+                debug_f_trace_admission,
+            ),
+            debug_containment: LoaderFullObserverInvariantStateV1::evaluated(debug_containment),
+            post_debug_c_environment: LoaderFullObserverInvariantStateV1::evaluated(
+                post_debug_c_environment,
+            ),
+            post_debug_f_environment: LoaderFullObserverInvariantStateV1::evaluated(
+                post_debug_f_environment,
+            ),
+            profile_stability: LoaderFullObserverInvariantStateV1::evaluated(profile_stability),
+            environment_destruction_once: LoaderFullObserverInvariantStateV1::evaluated(
+                environment_destruction_once,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn after_debug_c_rejection(
+        fallback_authority: bool,
+        original_reproduction: bool,
+        original_invariants: bool,
+        debug_c_trace_admission: bool,
+        post_debug_c_environment: bool,
+        profile_stability: bool,
+        environment_destruction_once: bool,
+    ) -> Self {
+        Self {
+            fallback_authority: LoaderFullObserverInvariantStateV1::evaluated(fallback_authority),
+            original_reproduction: LoaderFullObserverInvariantStateV1::evaluated(
+                original_reproduction,
+            ),
+            original_invariants: LoaderFullObserverInvariantStateV1::evaluated(original_invariants),
+            original_projection: LoaderFullObserverInvariantStateV1::NotRun,
+            debug_pair_common: LoaderFullObserverInvariantStateV1::NotRun,
+            debug_mode: LoaderFullObserverInvariantStateV1::NotRun,
+            debug_c_trace_admission: LoaderFullObserverInvariantStateV1::evaluated(
+                debug_c_trace_admission,
+            ),
+            debug_f_trace_admission: LoaderFullObserverInvariantStateV1::NotRun,
+            debug_containment: LoaderFullObserverInvariantStateV1::NotRun,
+            post_debug_c_environment: LoaderFullObserverInvariantStateV1::evaluated(
+                post_debug_c_environment,
+            ),
+            post_debug_f_environment: LoaderFullObserverInvariantStateV1::NotRun,
+            profile_stability: LoaderFullObserverInvariantStateV1::evaluated(profile_stability),
+            environment_destruction_once: LoaderFullObserverInvariantStateV1::evaluated(
+                environment_destruction_once,
+            ),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.named_states()
+            .into_iter()
+            .all(|(_, state)| state == LoaderFullObserverInvariantStateV1::Passed)
+    }
+
+    fn failed_diagnostic(&self) -> String {
+        self.named_states()
+            .into_iter()
+            .filter_map(|(name, state)| {
+                (state == LoaderFullObserverInvariantStateV1::Failed).then_some(name)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn named_states(&self) -> [(&'static str, LoaderFullObserverInvariantStateV1); 13] {
+        [
+            ("fallback-authority", self.fallback_authority),
+            ("original-reproduction", self.original_reproduction),
+            ("original-invariants", self.original_invariants),
+            ("original-projection", self.original_projection),
+            ("debug-pair-common", self.debug_pair_common),
+            ("debug-mode", self.debug_mode),
+            ("debug-c-trace-admission", self.debug_c_trace_admission),
+            ("debug-f-trace-admission", self.debug_f_trace_admission),
+            ("debug-containment", self.debug_containment),
+            ("post-debug-c-environment", self.post_debug_c_environment),
+            ("post-debug-f-environment", self.post_debug_f_environment),
+            ("profile-stability", self.profile_stability),
+            (
+                "environment-destruction-once",
+                self.environment_destruction_once,
+            ),
+        ]
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_loader_full_observer_diagnostic(
+    state: &str,
+    debug_c: &LoaderEnvironmentCanaryOutcomeV1,
+    debug_f: Option<&LoaderEnvironmentCanaryOutcomeV1>,
+    debug_c_detail_sha256: &str,
+    debug_f_detail_sha256: Option<&str>,
+    debug_c_trace: &Result<LoaderFullObserverTraceReceiptV1, LoaderFullObserverTraceRejectionV1>,
+    debug_f_trace: Option<
+        &Result<LoaderFullObserverTraceReceiptV1, LoaderFullObserverTraceRejectionV1>,
+    >,
+    module_frontier: Option<&LoaderFullObserverModuleFrontierV1>,
+    after_debug_c: &SharedEnvironmentObservationV1,
+    after_debug_f: Option<&SharedEnvironmentObservationV1>,
+    environment_destroyed_once: bool,
+    original_reproduction_valid: bool,
+    invariants: &LoaderFullObserverInvariantReceiptV1,
+    job_empty: bool,
+) -> String {
+    let frontier = |receipt: Option<
+        &Result<LoaderFullObserverTraceReceiptV1, LoaderFullObserverTraceRejectionV1>,
+    >,
+                    field: &str| {
+        if state == "observer-perturbed-inconclusive" {
+            return "none".to_owned();
+        }
+        let Some(Ok(receipt)) = receipt else {
+            return "none".to_owned();
+        };
+        match field {
+            "trace" => receipt.trace_sha256.clone(),
+            "modules" => receipt.candidate_modules_sha256.clone(),
+            "unloads" => receipt.unload_tail_sha256.clone(),
+            "exceptions" => receipt.exception_tail_sha256.clone(),
+            _ => "none".to_owned(),
+        }
+    };
+    let native = |outcome: &LoaderEnvironmentCanaryOutcomeV1| {
+        outcome.native_status.map_or_else(
+            || "unavailable".to_owned(),
+            |code| format!("0x{:08x}", code as u32),
+        )
+    };
+    let debug_f_outcome = debug_f.map_or("not-run", |outcome| outcome.outcome.diagnostic());
+    let debug_f_native = debug_f.map_or_else(|| "unavailable".to_owned(), &native);
+    let debug_f_phase = debug_f.map_or("none", |outcome| outcome.failure_phase);
+    let after_debug_f_scan = after_debug_f.map_or("not-run", |observation| observation.scan);
+    let after_debug_f_metadata =
+        after_debug_f.map_or(false, |observation| observation.metadata_match);
+    let after_debug_f_sha256 =
+        after_debug_f.map_or("none", |observation| observation.detail_sha256.as_str());
+    let trace_admission = |trace: Option<
+        &Result<LoaderFullObserverTraceReceiptV1, LoaderFullObserverTraceRejectionV1>,
+    >| {
+        trace.map_or_else(
+            || "not-run".to_owned(),
+            |trace| match trace {
+                Ok(_) => "admitted".to_owned(),
+                Err(rejection) => rejection.diagnostic(),
+            },
+        )
+    };
+    let failed_invariants = invariants.failed_diagnostic();
+    let module_frontier_visible = state != "observer-perturbed-inconclusive";
+    let module_frontier_state = if !module_frontier_visible {
+        "suppressed"
+    } else {
+        module_frontier.map_or("unavailable", |frontier| {
+            if frontier.useful {
+                "strict-f-prefix-c-extension"
+            } else {
+                "nonlocalizing"
+            }
+        })
+    };
+    let module_frontier_count = |field: &str| {
+        if !module_frontier_visible {
+            return "none".to_owned();
+        }
+        module_frontier.map_or_else(
+            || "none".to_owned(),
+            |frontier| match field {
+                "c-total" => frontier.debug_c_total.to_string(),
+                "c-retained" => frontier.debug_c_retained.to_string(),
+                "f-total" => frontier.debug_f_total.to_string(),
+                "f-retained" => frontier.debug_f_retained.to_string(),
+                "common-prefix" => frontier.common_prefix.to_string(),
+                _ => "none".to_owned(),
+            },
+        )
+    };
+    let module_frontier_hash = |field: &str| {
+        if !module_frontier_visible {
+            return "none".to_owned();
+        }
+        module_frontier
+            .and_then(|frontier| match field {
+                "c-sequence" => Some(&frontier.debug_c_sequence_sha256),
+                "f-sequence" => Some(&frontier.debug_f_sequence_sha256),
+                "last-common" if frontier.useful => frontier.last_common_identity_sha256.as_ref(),
+                "first-c-only" if frontier.useful => frontier.first_c_only_identity_sha256.as_ref(),
+                _ => None,
+            })
+            .cloned()
+            .unwrap_or_else(|| "none".to_owned())
+    };
+    format!(
+        "loader_observer_perturbation=v1 state={state} observer_perturbed=true changed_fields=[debugger_relation,debug_creation_flag] debug_c_observer=full-observer-v4 debug_f_observer=full-observer-v4 debug_c_loader_snaps=false debug_f_loader_snaps=false loader_snap_evidence=expected-empty ifeo_changed=false debug_c=[outcome={} native={} phase={} detail_sha256={debug_c_detail_sha256}] debug_f=[outcome={debug_f_outcome} native={debug_f_native} phase={debug_f_phase} detail_sha256={}] debug_c_trace_admission={} debug_f_trace_admission={} failed_invariants=[{failed_invariants}] debug_c_trace_sha256={} debug_f_trace_sha256={} debug_c_modules_sha256={} debug_f_modules_sha256={} debug_c_unloads_sha256={} debug_f_unloads_sha256={} debug_c_exceptions_sha256={} debug_f_exceptions_sha256={} stable_module_frontier={module_frontier_state} stable_module_c_total={} stable_module_c_retained={} stable_module_c_sequence_sha256={} stable_module_f_total={} stable_module_f_retained={} stable_module_f_sequence_sha256={} stable_module_common_prefix={} stable_module_last_common_sha256={} stable_module_first_c_only_sha256={} after_debug_c_scan={} after_debug_c_metadata_match={} after_debug_c_observation_sha256={} after_debug_f_scan={after_debug_f_scan} after_debug_f_metadata_match={after_debug_f_metadata} after_debug_f_observation_sha256={after_debug_f_sha256} shared_environment_owner=original-baseline shared_environment_destroyed_once={environment_destroyed_once} original_reproduction_valid={original_reproduction_valid} invariants_valid={} candidate_frontier_only=true requested_access_available=false exact_resource_identified=false acl_fix_identified=false primary_failure=original-a debugger_values_redacted=true environment_values_redacted=true token_values_redacted=true job_empty={job_empty} release_sent=false workload_executed=false qualification_promoted=false",
+        debug_c.outcome.diagnostic(),
+        native(debug_c),
+        debug_c.failure_phase,
+        debug_f_detail_sha256.unwrap_or("none"),
+        trace_admission(Some(debug_c_trace)),
+        trace_admission(debug_f_trace),
+        frontier(Some(debug_c_trace), "trace"),
+        frontier(debug_f_trace, "trace"),
+        frontier(Some(debug_c_trace), "modules"),
+        frontier(debug_f_trace, "modules"),
+        frontier(Some(debug_c_trace), "unloads"),
+        frontier(debug_f_trace, "unloads"),
+        frontier(Some(debug_c_trace), "exceptions"),
+        frontier(debug_f_trace, "exceptions"),
+        module_frontier_count("c-total"),
+        module_frontier_count("c-retained"),
+        module_frontier_hash("c-sequence"),
+        module_frontier_count("f-total"),
+        module_frontier_count("f-retained"),
+        module_frontier_hash("f-sequence"),
+        module_frontier_count("common-prefix"),
+        module_frontier_hash("last-common"),
+        module_frontier_hash("first-c-only"),
+        after_debug_c.scan,
+        after_debug_c.metadata_match,
+        after_debug_c.detail_sha256,
+        invariants.valid(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn loader_full_observer_invariants_valid(
+    fallback_allowed: bool,
+    original_reproduction_valid: bool,
+    original_invariants_valid: bool,
+    original_projection_exact: bool,
+    debug_pair_common_exact: bool,
+    debug_mode_exact: bool,
+    debug_traces_admitted: bool,
+    debug_containment_exact: bool,
+    after_debug_c_stable: bool,
+    after_debug_f_stable: bool,
+    profile_stable: bool,
+    environment_destroyed_once: bool,
+) -> bool {
+    LoaderFullObserverInvariantReceiptV1::evaluated(
+        fallback_allowed,
+        original_reproduction_valid,
+        original_invariants_valid,
+        original_projection_exact,
+        debug_pair_common_exact,
+        debug_mode_exact,
+        debug_traces_admitted,
+        debug_traces_admitted,
+        debug_containment_exact,
+        after_debug_c_stable,
+        after_debug_f_stable,
+        profile_stable,
+        environment_destroyed_once,
+    )
+    .valid()
+}
+
+fn loader_full_observer_debug_f_allowed(
+    fallback_allowed: bool,
+    after_debug_c: &SharedEnvironmentObservationV1,
+) -> bool {
+    fallback_allowed && after_debug_c.stable()
+}
+
+fn loader_restriction_presence_required(
+    object_security_state: &str,
+    object_security_common_evidence_valid: bool,
+    object_security_descriptor_evidence_present: bool,
+    object_security_invariants_valid: bool,
+) -> bool {
+    object_security_state == "classified-common-failure"
+        && object_security_common_evidence_valid
+        && object_security_descriptor_evidence_present
+        && object_security_invariants_valid
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loader_restriction_presence_prerequisite_canary_diagnostic(
+    exact_desktop: &str,
+    launch_context: &TargetDesktopBootstrapLaunchContext,
+    association_preflight: &TargetUserObjectOpenPreflightV1,
+    holder_identity: &WindowsProcessIdentityV1,
+    tokens: &LoaderRestrictionCanaryTokens,
+) -> LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+    if let Err(error) = super::token::validate_transferred_loader_restriction_presence_pair(
+        tokens.baseline.raw(),
+        tokens.no_restricting_sid.raw(),
+        &tokens.source_binding_sha256,
+        &tokens.restriction_presence_binding_sha256,
+    ) {
+        return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+            diagnostic: format!(
+                "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=restriction-presence-reattestation restriction_presence_binding_sha256={} error_sha256={} token_values_redacted=true workload_executed=false qualification_promoted=false",
+                tokens.restriction_presence_binding_sha256,
+                super::record::digest(error.as_bytes()),
+            ),
+        };
+    }
+    let baseline_snapshot = match super::token::token_attestation_snapshot(tokens.baseline.raw()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+                diagnostic: format!(
+                    "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=baseline-attestation restriction_presence_binding_sha256={} error_sha256={} token_values_redacted=true workload_executed=false qualification_promoted=false",
+                    tokens.restriction_presence_binding_sha256,
+                    super::record::digest(error.as_bytes()),
+                ),
+            };
+        }
+    };
+    let comparison_snapshot = match super::token::token_attestation_snapshot(
+        tokens.no_restricting_sid.raw(),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+                diagnostic: format!(
+                    "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=comparison-attestation restriction_presence_binding_sha256={} error_sha256={} token_values_redacted=true workload_executed=false qualification_promoted=false",
+                    tokens.restriction_presence_binding_sha256,
+                    super::record::digest(error.as_bytes()),
+                ),
+            };
+        }
+    };
+    let (same_access_restricted, same_access_snapshot, restriction_identity_binding_sha256) =
+        match super::token::loader_restriction_identity_sibling_from_presence_comparison(
+            tokens.baseline.raw(),
+            tokens.no_restricting_sid.raw(),
+            &tokens.source_binding_sha256,
+            &tokens.restriction_presence_binding_sha256,
+        ) {
+            Ok(sibling) => sibling,
+            Err(error) => {
+                return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+                    diagnostic: format!(
+                        "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=same-access-restriction-derivation restriction_presence_binding_sha256={} error_sha256={} token_values_redacted=true workload_executed=false qualification_promoted=false",
+                        tokens.restriction_presence_binding_sha256,
+                        super::record::digest(error.as_bytes()),
+                    ),
+                };
+            }
+        };
+    let (logon_restricted, logon_snapshot, logon_restriction_binding_sha256) =
+        match super::token::loader_logon_restriction_sibling_from_identity_comparison(
+            tokens.baseline.raw(),
+            tokens.no_restricting_sid.raw(),
+            same_access_restricted.raw(),
+            &tokens.source_binding_sha256,
+            &tokens.restriction_presence_binding_sha256,
+            &restriction_identity_binding_sha256,
+        ) {
+            Ok(sibling) => sibling,
+            Err(error) => {
+                return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+                    diagnostic: format!(
+                        "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=logon-restriction-derivation restriction_presence_binding_sha256={} restriction_identity_binding_sha256={} error_sha256={} token_values_redacted=true workload_executed=false qualification_promoted=false",
+                        tokens.restriction_presence_binding_sha256,
+                        restriction_identity_binding_sha256,
+                        super::record::digest(error.as_bytes()),
+                    ),
+                };
+            }
+        };
+    let (
+        authenticated_users_restricted,
+        authenticated_users_snapshot,
+        authenticated_users_restriction_binding_sha256,
+    ) = match super::token::loader_authenticated_users_restriction_sibling_from_logon_comparison(
+        tokens.baseline.raw(),
+        tokens.no_restricting_sid.raw(),
+        same_access_restricted.raw(),
+        logon_restricted.raw(),
+        &tokens.source_binding_sha256,
+        &tokens.restriction_presence_binding_sha256,
+        &restriction_identity_binding_sha256,
+        &logon_restriction_binding_sha256,
+    ) {
+        Ok(sibling) => sibling,
+        Err(error) => {
+            return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+                diagnostic: format!(
+                    "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=authenticated-users-restriction-derivation restriction_presence_binding_sha256={} restriction_identity_binding_sha256={} logon_restriction_binding_sha256={} error_sha256={} token_values_redacted=true workload_executed=false qualification_promoted=false",
+                    tokens.restriction_presence_binding_sha256,
+                    restriction_identity_binding_sha256,
+                    logon_restriction_binding_sha256,
+                    super::record::digest(error.as_bytes()),
+                ),
+            };
+        }
+    };
+    let (target_user_restricted, target_user_snapshot, target_user_restriction_binding_sha256) =
+        match super::token::loader_target_user_restriction_sibling_from_authenticated_users_comparison(
+            tokens.baseline.raw(),
+            tokens.no_restricting_sid.raw(),
+            same_access_restricted.raw(),
+            logon_restricted.raw(),
+            authenticated_users_restricted.raw(),
+            &tokens.source_binding_sha256,
+            &tokens.restriction_presence_binding_sha256,
+            &restriction_identity_binding_sha256,
+            &logon_restriction_binding_sha256,
+            &authenticated_users_restriction_binding_sha256,
+        ) {
+            Ok(sibling) => sibling,
+            Err(error) => {
+                return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+                    diagnostic: format!(
+                        "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=target-user-restriction-derivation restriction_presence_binding_sha256={} restriction_identity_binding_sha256={} logon_restriction_binding_sha256={} authenticated_users_restriction_binding_sha256={} error_sha256={} token_values_redacted=true workload_executed=false qualification_promoted=false",
+                        tokens.restriction_presence_binding_sha256,
+                        restriction_identity_binding_sha256,
+                        logon_restriction_binding_sha256,
+                        authenticated_users_restriction_binding_sha256,
+                        super::record::digest(error.as_bytes()),
+                    ),
+                };
+            }
+        };
+    let baseline_envelope = baseline_snapshot.behavior.envelope.clone();
+    let comparison_envelope = comparison_snapshot.behavior.envelope.clone();
+    let same_access_envelope = same_access_snapshot.behavior.envelope.clone();
+    let logon_envelope = logon_snapshot.behavior.envelope.clone();
+    let authenticated_users_envelope = authenticated_users_snapshot.behavior.envelope.clone();
+    let target_user_envelope = target_user_snapshot.behavior.envelope.clone();
+    let before = observe_loader_profile(tokens.profile.raw(), &baseline_envelope.user_sid);
+    if before.state != LoaderProfileHiveStateV1::AlreadyLoadedBorrowed {
+        return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+            diagnostic: format!(
+                "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=profile-precondition profile_state={} restriction_presence_binding_sha256={} token_values_redacted=true workload_executed=false qualification_promoted=false",
+                before.state.diagnostic(),
+                tokens.restriction_presence_binding_sha256,
+            ),
+        };
+    }
+    let mut shared_environment = match OwnedUserEnvironmentBlock::create(tokens.baseline.raw()) {
+        Ok(environment) => environment,
+        Err(error) => {
+            return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+                diagnostic: format!(
+                    "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=shared-environment-create restriction_presence_binding_sha256={} error_sha256={} environment_values_redacted=true token_values_redacted=true workload_executed=false qualification_promoted=false",
+                    tokens.restriction_presence_binding_sha256,
+                    super::record::digest(error.detail.as_bytes()),
+                ),
+            };
+        }
+    };
+    let admitted_environment = match shared_environment.inventory() {
+        Ok(inventory) if inventory.missing_required.is_empty() => inventory,
+        Ok(inventory) => {
+            let detail = format!(
+                "shared environment is missing {} required keys",
+                inventory.missing_required.len()
+            );
+            let destruction = shared_environment.destroy_after_create();
+            let destruction_sha256 = destruction.as_ref().map_or_else(
+                |error| super::record::digest(error.detail.as_bytes()),
+                |()| super::record::digest(b"ok"),
+            );
+            return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+                diagnostic: format!(
+                    "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=shared-environment-admission restriction_presence_binding_sha256={} error_sha256={} destruction_sha256={} environment_values_redacted=true token_values_redacted=true workload_executed=false qualification_promoted=false",
+                    tokens.restriction_presence_binding_sha256,
+                    super::record::digest(detail.as_bytes()),
+                    destruction_sha256,
+                ),
+            };
+        }
+        Err(error) => {
+            let destruction = shared_environment.destroy_after_create();
+            let destruction_sha256 = destruction.as_ref().map_or_else(
+                |error| super::record::digest(error.detail.as_bytes()),
+                |()| super::record::digest(b"ok"),
+            );
+            return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+                diagnostic: format!(
+                    "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=shared-environment-admission restriction_presence_binding_sha256={} error_sha256={} destruction_sha256={} environment_values_redacted=true token_values_redacted=true workload_executed=false qualification_promoted=false",
+                    tokens.restriction_presence_binding_sha256,
+                    super::record::digest(error.detail.as_bytes()),
+                    destruction_sha256,
+                ),
+            };
+        }
+    };
+    let baseline = launch_target_desktop_loader_control_cell_with_shared_environment(
+        tokens.baseline.raw(),
+        &baseline_envelope,
+        &baseline_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        LoaderControlMatrixCellV4::PRODUCTION,
+        &mut shared_environment,
+        &admitted_environment,
+        LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+        None,
+    );
+    let after_baseline_environment = shared_environment.inventory();
+    let after_baseline_observation = shared_environment_observation(
+        &admitted_environment,
+        &after_baseline_environment,
+        "after-baseline",
+    );
+    if !after_baseline_observation.stable() {
+        let destruction = shared_environment.destroy_after_create();
+        let destruction_sha256 = destruction.as_ref().map_or_else(
+            |error| super::record::digest(error.detail.as_bytes()),
+            |()| super::record::digest(b"ok"),
+        );
+        return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+            diagnostic: format!(
+                "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=shared-environment-after-baseline restriction_presence_binding_sha256={} shared_environment_scan={} shared_environment_metadata_match={} shared_environment_observation_sha256={} destruction_sha256={} environment_values_redacted=true token_values_redacted=true workload_executed=false qualification_promoted=false",
+                tokens.restriction_presence_binding_sha256,
+                after_baseline_observation.scan,
+                after_baseline_observation.metadata_match,
+                after_baseline_observation.detail_sha256,
+                destruction_sha256,
+            ),
+        };
+    }
+    let comparison = launch_target_desktop_loader_control_cell_with_shared_environment(
+        tokens.no_restricting_sid.raw(),
+        &comparison_envelope,
+        &comparison_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        LoaderControlMatrixCellV4::PRODUCTION,
+        &mut shared_environment,
+        &admitted_environment,
+        LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+        None,
+    );
+    let after_comparison_environment = shared_environment.inventory();
+    let after_comparison_observation = shared_environment_observation(
+        &admitted_environment,
+        &after_comparison_environment,
+        "after-comparison",
+    );
+    if !after_comparison_observation.stable() {
+        let destruction = shared_environment.destroy_after_create();
+        let destruction_sha256 = destruction.as_ref().map_or_else(
+            |error| super::record::digest(error.detail.as_bytes()),
+            |()| super::record::digest(b"ok"),
+        );
+        return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+            diagnostic: format!(
+                "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=shared-environment-after-comparison restriction_presence_binding_sha256={} shared_environment_scan={} shared_environment_metadata_match={} shared_environment_observation_sha256={} destruction_sha256={} environment_values_redacted=true token_values_redacted=true workload_executed=false qualification_promoted=false",
+                tokens.restriction_presence_binding_sha256,
+                after_comparison_observation.scan,
+                after_comparison_observation.metadata_match,
+                after_comparison_observation.detail_sha256,
+                destruction_sha256,
+            ),
+        };
+    }
+    let passive_access_localization =
+        super::access_trace::PassiveAccessLocalizationObserverV1::start_ready_before_child_creation(
+        );
+    let same_access = launch_target_desktop_loader_control_cell_with_shared_environment(
+        same_access_restricted.raw(),
+        &same_access_envelope,
+        &same_access_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        LoaderControlMatrixCellV4::PRODUCTION,
+        &mut shared_environment,
+        &admitted_environment,
+        LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+        passive_access_localization.as_ref().ok().map(|observer| {
+            (
+                observer,
+                super::access_trace::PassiveAccessLocalizationCellV1::CanonicalSameAccess,
+            )
+        }),
+    );
+    let after_same_access_environment = shared_environment.inventory();
+    let after_same_access_observation = shared_environment_observation(
+        &admitted_environment,
+        &after_same_access_environment,
+        "after-same-access",
+    );
+    if !after_same_access_observation.stable() {
+        let destruction = shared_environment.destroy_after_create();
+        let destruction_sha256 = destruction.as_ref().map_or_else(
+            |error| super::record::digest(error.detail.as_bytes()),
+            |()| super::record::digest(b"ok"),
+        );
+        return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+            diagnostic: format!(
+                "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=shared-environment-after-same-access restriction_presence_binding_sha256={} restriction_identity_binding_sha256={} shared_environment_scan={} shared_environment_metadata_match={} shared_environment_observation_sha256={} destruction_sha256={} environment_values_redacted=true token_values_redacted=true workload_executed=false qualification_promoted=false",
+                tokens.restriction_presence_binding_sha256,
+                restriction_identity_binding_sha256,
+                after_same_access_observation.scan,
+                after_same_access_observation.metadata_match,
+                after_same_access_observation.detail_sha256,
+                destruction_sha256,
+            ),
+        };
+    }
+    let logon = launch_target_desktop_loader_control_cell_with_shared_environment(
+        logon_restricted.raw(),
+        &logon_envelope,
+        &logon_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        LoaderControlMatrixCellV4::PRODUCTION,
+        &mut shared_environment,
+        &admitted_environment,
+        LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+        None,
+    );
+    let after_logon_environment = shared_environment.inventory();
+    let after_logon_observation = shared_environment_observation(
+        &admitted_environment,
+        &after_logon_environment,
+        "after-logon",
+    );
+    if !after_logon_observation.stable() {
+        let destruction = shared_environment.destroy_after_create();
+        let destruction_sha256 = destruction.as_ref().map_or_else(
+            |error| super::record::digest(error.detail.as_bytes()),
+            |()| super::record::digest(b"ok"),
+        );
+        return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+            diagnostic: format!(
+                "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=shared-environment-after-logon restriction_presence_binding_sha256={} restriction_identity_binding_sha256={} logon_restriction_binding_sha256={} shared_environment_scan={} shared_environment_metadata_match={} shared_environment_observation_sha256={} destruction_sha256={} environment_values_redacted=true token_values_redacted=true workload_executed=false qualification_promoted=false",
+                tokens.restriction_presence_binding_sha256,
+                restriction_identity_binding_sha256,
+                logon_restriction_binding_sha256,
+                after_logon_observation.scan,
+                after_logon_observation.metadata_match,
+                after_logon_observation.detail_sha256,
+                destruction_sha256,
+            ),
+        };
+    }
+    let authenticated_users = launch_target_desktop_loader_control_cell_with_shared_environment(
+        authenticated_users_restricted.raw(),
+        &authenticated_users_envelope,
+        &authenticated_users_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        LoaderControlMatrixCellV4::PRODUCTION,
+        &mut shared_environment,
+        &admitted_environment,
+        LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+        None,
+    );
+    let after_authenticated_users_environment = shared_environment.inventory();
+    let after_authenticated_users_observation = shared_environment_observation(
+        &admitted_environment,
+        &after_authenticated_users_environment,
+        "after-authenticated-users",
+    );
+    if !after_authenticated_users_observation.stable() {
+        let destruction = shared_environment.destroy_after_create();
+        let destruction_sha256 = destruction.as_ref().map_or_else(
+            |error| super::record::digest(error.detail.as_bytes()),
+            |()| super::record::digest(b"ok"),
+        );
+        return LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+            diagnostic: format!(
+                "loader_restriction_presence_prerequisite_canary=v2 state=invalid stage=shared-environment-after-authenticated-users restriction_presence_binding_sha256={} restriction_identity_binding_sha256={} logon_restriction_binding_sha256={} authenticated_users_restriction_binding_sha256={} shared_environment_scan={} shared_environment_metadata_match={} shared_environment_observation_sha256={} destruction_sha256={} environment_values_redacted=true token_values_redacted=true workload_executed=false qualification_promoted=false",
+                tokens.restriction_presence_binding_sha256,
+                restriction_identity_binding_sha256,
+                logon_restriction_binding_sha256,
+                authenticated_users_restriction_binding_sha256,
+                after_authenticated_users_observation.scan,
+                after_authenticated_users_observation.metadata_match,
+                after_authenticated_users_observation.detail_sha256,
+                destruction_sha256,
+            ),
+        };
+    }
+    let target_user = launch_target_desktop_loader_control_cell_with_shared_environment(
+        target_user_restricted.raw(),
+        &target_user_envelope,
+        &target_user_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        LoaderControlMatrixCellV4::PRODUCTION,
+        &mut shared_environment,
+        &admitted_environment,
+        LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+        passive_access_localization.as_ref().ok().map(|observer| {
+            (
+                observer,
+                super::access_trace::PassiveAccessLocalizationCellV1::TargetUser,
+            )
+        }),
+    );
+    let after_target_user_environment = shared_environment.inventory();
+    let after_target_user_observation = shared_environment_observation(
+        &admitted_environment,
+        &after_target_user_environment,
+        "after-target-user",
+    );
+    let original_environment_stable = after_baseline_observation.stable()
+        && after_comparison_observation.stable()
+        && after_same_access_observation.stable()
+        && after_logon_observation.stable()
+        && after_authenticated_users_observation.stable()
+        && after_target_user_observation.stable();
+    let baseline_outcome = loader_environment_canary_outcome("full-restricted", &baseline);
+    let comparison_outcome =
+        loader_environment_canary_outcome("privilege-disabled/no-restricting-SID", &comparison);
+    let same_access_outcome = loader_environment_canary_outcome(
+        "privilege-disabled/canonical-same-access-restricted",
+        &same_access,
+    );
+    let logon_outcome =
+        loader_environment_canary_outcome("privilege-disabled/target-logon-SID-restricted", &logon);
+    let authenticated_users_outcome = loader_environment_canary_outcome(
+        "privilege-disabled/authenticated-users-SID-restricted",
+        &authenticated_users,
+    );
+    let target_user_outcome = loader_environment_canary_outcome(
+        "privilege-disabled/target-user-SID-restricted",
+        &target_user,
+    );
+    let common_field_names = [
+        "matrix_cell",
+        "debug_mode",
+        "environment_classification",
+        "environment_sha256",
+        "environment_keys_sha256",
+        "environment_units",
+        "environment_entries",
+        "environment_profile_loaded",
+        "source_authentication_id",
+        "source_session_id",
+        "desktop_sha256",
+        "binary_sha256",
+        "current_directory_sha256",
+        "command_semantics_sha256",
+        "command_dynamic_fields",
+        "creation_flags",
+        "job_membership_attested",
+        "object_security_authority",
+        "process_policy_sha256",
+        "thread_policy_sha256",
+        "process_object_live_sha256",
+        "thread_object_live_sha256",
+        "descriptor_readback",
+    ];
+    let common_fields: [Result<(&str, String), String>; 23] = common_field_names.map(|field| {
+        let value = loader_common_result_field(&baseline, &comparison, field)?;
+        loader_common_result_field(&baseline, &same_access, field)?;
+        loader_common_result_field(&baseline, &logon, field)?;
+        loader_common_result_field(&baseline, &authenticated_users, field)?;
+        loader_common_result_field(&baseline, &target_user, field)?;
+        Ok((field, value))
+    });
+    let common_error = common_fields
+        .iter()
+        .find_map(|result| result.as_ref().err());
+    let launcher_authority_exact = [
+        &baseline,
+        &comparison,
+        &same_access,
+        &logon,
+        &authenticated_users,
+        &target_user,
+    ]
+    .into_iter()
+    .all(|result| {
+        loader_result_field(result, "object_security_authority").as_deref()
+            == Some(LoaderObjectSecurityAuthorityV1::LauncherExplicit.diagnostic())
+    });
+    let job_empty_exact = [
+        &baseline,
+        &comparison,
+        &same_access,
+        &logon,
+        &authenticated_users,
+        &target_user,
+    ]
+    .into_iter()
+    .all(loader_control_cell_job_empty_attested);
+    let containment_exact = [
+        &baseline,
+        &comparison,
+        &same_access,
+        &logon,
+        &authenticated_users,
+        &target_user,
+    ]
+    .into_iter()
+    .all(|result| {
+        loader_result_field(result, "environment_profile_loaded").as_deref() == Some("true")
+            && loader_result_field(result, "job_membership_attested").as_deref() == Some("true")
+            && loader_result_field(result, "descriptor_readback").as_deref() == Some("true")
+    }) && job_empty_exact;
+    let after_original = observe_loader_profile(tokens.profile.raw(), &baseline_envelope.user_sid);
+    let original_invariants_valid = common_error.is_none()
+        && after_original == before
+        && launcher_authority_exact
+        && containment_exact
+        && original_environment_stable;
+    let original_reproduction_valid = loader_restriction_original_sext_reproduction_valid(
+        &baseline_outcome,
+        &comparison_outcome,
+        &same_access_outcome,
+        &logon_outcome,
+        &authenticated_users_outcome,
+        &target_user_outcome,
+        original_invariants_valid,
+    );
+    let passive_setup_evidence = passive_access_localization
+        .as_ref()
+        .err()
+        .map(super::access_trace::PassiveAccessLocalizationEvidenceV1::observer_unavailable);
+    let full_observer_fallback_allowed = original_reproduction_valid
+        && matches!(
+            passive_setup_evidence.as_ref(),
+            Some(evidence) if evidence.exact_session_start_access_denied()
+        );
+    let debug_pair = if full_observer_fallback_allowed {
+        let debug_c = launch_target_desktop_loader_control_cell_with_shared_environment(
+            same_access_restricted.raw(),
+            &same_access_envelope,
+            &same_access_snapshot,
+            exact_desktop,
+            launch_context,
+            association_preflight,
+            holder_identity,
+            LoaderControlMatrixCellV4::RESTRICTION_FULL_OBSERVER_SNAPS_OFF,
+            &mut shared_environment,
+            &admitted_environment,
+            LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+            None,
+        );
+        let after_debug_c_environment = shared_environment.inventory();
+        let after_debug_c_observation = shared_environment_observation(
+            &admitted_environment,
+            &after_debug_c_environment,
+            "after-debug-c",
+        );
+        let debug_f = if loader_full_observer_debug_f_allowed(
+            full_observer_fallback_allowed,
+            &after_debug_c_observation,
+        ) {
+            let result = launch_target_desktop_loader_control_cell_with_shared_environment(
+                target_user_restricted.raw(),
+                &target_user_envelope,
+                &target_user_snapshot,
+                exact_desktop,
+                launch_context,
+                association_preflight,
+                holder_identity,
+                LoaderControlMatrixCellV4::RESTRICTION_FULL_OBSERVER_SNAPS_OFF,
+                &mut shared_environment,
+                &admitted_environment,
+                LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+                None,
+            );
+            let after_environment = shared_environment.inventory();
+            let after_observation = shared_environment_observation(
+                &admitted_environment,
+                &after_environment,
+                "after-debug-f",
+            );
+            Some((result, after_observation))
+        } else {
+            None
+        };
+        Some((debug_c, after_debug_c_observation, debug_f))
+    } else {
+        None
+    };
+    let debug_environment_stable = match debug_pair.as_ref() {
+        Some((_, after_debug_c, Some((_, after_debug_f)))) => {
+            after_debug_c.stable() && after_debug_f.stable()
+        }
+        Some((_, _, None)) => false,
+        None => true,
+    };
+    let environment_stable = original_environment_stable && debug_environment_stable;
+    let environment_destruction = shared_environment.destroy_after_create();
+    let environment_destruction_sha256 = environment_destruction.as_ref().map_or_else(
+        |error| super::record::digest(error.detail.as_bytes()),
+        |()| super::record::digest(b"shared-userenv-destroyed-once"),
+    );
+    let after = observe_loader_profile(tokens.profile.raw(), &baseline_envelope.user_sid);
+    let shared_environment_valid = environment_stable && environment_destruction.is_ok();
+    let invariants_valid = common_error.is_none()
+        && after == before
+        && launcher_authority_exact
+        && containment_exact
+        && shared_environment_valid;
+    let presence_state = classify_loader_restriction_presence_outcomes(
+        &baseline_outcome,
+        &comparison_outcome,
+        invariants_valid,
+    );
+    let identity_state = classify_loader_restriction_identity_outcomes(
+        &baseline_outcome,
+        &comparison_outcome,
+        &same_access_outcome,
+        invariants_valid,
+    );
+    let logon_state = classify_loader_restriction_logon_outcomes(
+        &baseline_outcome,
+        &comparison_outcome,
+        &same_access_outcome,
+        &logon_outcome,
+        invariants_valid,
+    );
+    let authenticated_users_state = classify_loader_restriction_authenticated_users_outcomes(
+        &baseline_outcome,
+        &comparison_outcome,
+        &same_access_outcome,
+        &logon_outcome,
+        &authenticated_users_outcome,
+        invariants_valid,
+    );
+    let state = classify_loader_restriction_target_user_outcomes(
+        &baseline_outcome,
+        &comparison_outcome,
+        &same_access_outcome,
+        &logon_outcome,
+        &authenticated_users_outcome,
+        &target_user_outcome,
+        invariants_valid,
+    );
+    let passive_access_reproduction_valid = loader_restriction_original_sext_reproduction_valid(
+        &baseline_outcome,
+        &comparison_outcome,
+        &same_access_outcome,
+        &logon_outcome,
+        &authenticated_users_outcome,
+        &target_user_outcome,
+        invariants_valid,
+    ) && state
+        == "no-tested-singleton-sufficient-trace-required";
+    let passive_access_localization = match passive_access_localization {
+        Ok(observer) => observer.finish(passive_access_reproduction_valid),
+        Err(error) => {
+            super::access_trace::PassiveAccessLocalizationEvidenceV1::observer_unavailable(&error)
+        }
+    };
+    let debug_preserved_field_names = [
+        "environment_classification",
+        "environment_sha256",
+        "environment_keys_sha256",
+        "environment_units",
+        "environment_entries",
+        "environment_profile_loaded",
+        "source_token_sha256",
+        "source_token_id",
+        "source_modified_id",
+        "source_authentication_id",
+        "source_session_id",
+        "desktop_sha256",
+        "binary_sha256",
+        "current_directory_sha256",
+        "command_semantics_sha256",
+        "command_dynamic_fields",
+        "job_membership_attested",
+        "object_security_authority",
+        "process_policy_sha256",
+        "thread_policy_sha256",
+        "process_object_live_sha256",
+        "thread_object_live_sha256",
+        "descriptor_readback",
+        "target_logon_trustee",
+        "restricting_trustee_count",
+    ];
+    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair
+        .as_ref()
+    {
+        Some((debug_c, after_debug_c, Some((debug_f, after_debug_f)))) => {
+            let debug_c_outcome = loader_environment_canary_outcome(
+                "canonical-same-access/full-observer-snaps-off",
+                debug_c,
+            );
+            let debug_f_outcome = loader_environment_canary_outcome(
+                "target-user-singleton/full-observer-snaps-off",
+                debug_f,
+            );
+            let original_projection_exact = debug_preserved_field_names.iter().all(|field| {
+                loader_common_result_field(&same_access, debug_c, field).is_ok()
+                    && loader_common_result_field(&target_user, debug_f, field).is_ok()
+            });
+            let debug_pair_common_exact = common_field_names
+                .iter()
+                .all(|field| loader_common_result_field(debug_c, debug_f, field).is_ok());
+            let debug_mode_exact = [&debug_c, &debug_f].into_iter().all(|result| {
+                loader_result_field(result, "matrix_cell").as_deref()
+                    == Some(
+                        LoaderControlMatrixCellV4::RESTRICTION_FULL_OBSERVER_SNAPS_OFF.diagnostic(),
+                    )
+                    && loader_result_field(result, "debug_mode").as_deref() == Some("true")
+                    && loader_result_field(result, "creation_flags").as_deref()
+                        == Some("0x00080406")
+            });
+            let debug_pair_job_empty_exact = [&debug_c, &debug_f]
+                .into_iter()
+                .all(|result| loader_control_cell_job_empty_attested(result));
+            let debug_containment_exact = debug_pair_job_empty_exact
+                && [&debug_c, &debug_f].into_iter().all(|result| {
+                    loader_result_field(result, "environment_profile_loaded").as_deref()
+                        == Some("true")
+                        && loader_result_field(result, "job_membership_attested").as_deref()
+                            == Some("true")
+                        && loader_result_field(result, "descriptor_readback").as_deref()
+                            == Some("true")
+                        && loader_result_field(result, "object_security_authority").as_deref()
+                            == Some(LoaderObjectSecurityAuthorityV1::LauncherExplicit.diagnostic())
+                });
+            let debug_c_trace = admit_loader_full_observer_trace(debug_c);
+            let debug_f_trace = admit_loader_full_observer_trace(debug_f);
+            let debug_invariants = LoaderFullObserverInvariantReceiptV1::evaluated(
+                full_observer_fallback_allowed,
+                original_reproduction_valid,
+                original_invariants_valid,
+                original_projection_exact,
+                debug_pair_common_exact,
+                debug_mode_exact,
+                debug_c_trace.is_ok(),
+                debug_f_trace.is_ok(),
+                debug_containment_exact,
+                after_debug_c.stable(),
+                after_debug_f.stable(),
+                after == before,
+                environment_destruction.is_ok(),
+            );
+            let debug_invariants_valid = debug_invariants.valid();
+            let module_frontier = debug_c_trace
+                .as_ref()
+                .ok()
+                .zip(debug_f_trace.as_ref().ok())
+                .map(|(canonical, target)| loader_full_observer_module_frontier(canonical, target));
+            let observer_state = classify_loader_full_observer_pair(
+                &debug_c_outcome,
+                &debug_f_outcome,
+                debug_invariants_valid,
+                module_frontier.as_ref().map(|frontier| frontier.useful),
+            );
+            let detail_hash =
+                |label: &[u8], result: &Result<String, TargetDesktopLeaseCreateError>| {
+                    let mut material =
+                        b"memcordon-loader-observer-perturbation-detail-v1\0".to_vec();
+                    material.extend_from_slice(label);
+                    material.extend_from_slice(loader_result_detail(result).as_bytes());
+                    super::record::digest(&material)
+                };
+            let debug_c_detail_sha256 = detail_hash(b"debug-c", debug_c);
+            let debug_f_detail_sha256 = detail_hash(b"debug-f", debug_f);
+            let shared_evidence_sha256 = loader_trace_session_capability_shared_evidence_sha256(
+                &admitted_environment,
+                &[
+                    &after_baseline_observation,
+                    &after_comparison_observation,
+                    &after_same_access_observation,
+                    &after_logon_observation,
+                    &after_authenticated_users_observation,
+                    &after_target_user_observation,
+                    after_debug_c,
+                    after_debug_f,
+                ],
+                &before,
+                &after_original,
+                &after,
+                launcher_authority_exact,
+                containment_exact,
+                job_empty_exact,
+                &environment_destruction_sha256,
+            );
+            let trigger_sha256 = debug_c_trace
+                .as_ref()
+                .ok()
+                .zip(debug_f_trace.as_ref().ok())
+                .zip(module_frontier.as_ref())
+                .and_then(|((debug_c_trace, debug_f_trace), module_frontier)| {
+                    loader_trace_session_capability_trigger_sha256(
+                        super::package::ephemeral_ci_enabled(),
+                        passive_setup_evidence
+                            .as_ref()
+                            .and_then(|evidence| {
+                                evidence.exact_session_start_access_denied_sha256()
+                            })
+                            .as_deref(),
+                        original_reproduction_valid,
+                        original_invariants_valid,
+                        &tokens.source_binding_sha256,
+                        &tokens.pair_invariants_sha256,
+                        &tokens.restriction_presence_binding_sha256,
+                        &restriction_identity_binding_sha256,
+                        &logon_restriction_binding_sha256,
+                        &authenticated_users_restriction_binding_sha256,
+                        &target_user_restriction_binding_sha256,
+                        &tokens.profile_binding_sha256,
+                        shared_evidence_sha256.as_deref()?,
+                        &baseline_outcome,
+                        &comparison_outcome,
+                        &same_access_outcome,
+                        &logon_outcome,
+                        &authenticated_users_outcome,
+                        &target_user_outcome,
+                        &debug_c_outcome,
+                        &debug_f_outcome,
+                        debug_c_trace,
+                        debug_f_trace,
+                        module_frontier,
+                        &debug_invariants,
+                        after_debug_c,
+                        after_debug_f,
+                    )
+                });
+            (
+                render_loader_full_observer_diagnostic(
+                    observer_state,
+                    &debug_c_outcome,
+                    Some(&debug_f_outcome),
+                    &debug_c_detail_sha256,
+                    Some(&debug_f_detail_sha256),
+                    &debug_c_trace,
+                    Some(&debug_f_trace),
+                    module_frontier.as_ref(),
+                    after_debug_c,
+                    Some(after_debug_f),
+                    environment_destruction.is_ok(),
+                    original_reproduction_valid,
+                    &debug_invariants,
+                    debug_pair_job_empty_exact,
+                ),
+                trigger_sha256,
+            )
+        }
+        Some((debug_c, after_debug_c, None)) => {
+            let debug_c_outcome = loader_environment_canary_outcome(
+                "canonical-same-access/full-observer-snaps-off",
+                debug_c,
+            );
+            let mut material = b"memcordon-loader-observer-perturbation-detail-v1\0".to_vec();
+            material.extend_from_slice(b"debug-c");
+            material.extend_from_slice(loader_result_detail(debug_c).as_bytes());
+            let debug_c_detail_sha256 = super::record::digest(&material);
+            let debug_c_trace = admit_loader_full_observer_trace(debug_c);
+            let debug_invariants = LoaderFullObserverInvariantReceiptV1::after_debug_c_rejection(
+                full_observer_fallback_allowed,
+                original_reproduction_valid,
+                original_invariants_valid,
+                debug_c_trace.is_ok(),
+                after_debug_c.stable(),
+                after == before,
+                environment_destruction.is_ok(),
+            );
+            (
+                render_loader_full_observer_diagnostic(
+                    "observer-perturbed-inconclusive",
+                    &debug_c_outcome,
+                    None,
+                    &debug_c_detail_sha256,
+                    None,
+                    &debug_c_trace,
+                    None,
+                    None,
+                    after_debug_c,
+                    None,
+                    environment_destruction.is_ok(),
+                    original_reproduction_valid,
+                    &debug_invariants,
+                    loader_control_cell_job_empty_attested(debug_c),
+                ),
+                None,
+            )
+        }
+        None => (
+            format!(
+                "loader_observer_perturbation=v1 state=not-run observer_perturbed=false changed_fields=[] fallback_allowed={full_observer_fallback_allowed} original_reproduction_valid={original_reproduction_valid} debug_c=none debug_f=none after_debug_c_scan=not-run after_debug_f_scan=not-run shared_environment_owner=original-baseline shared_environment_destroyed_once={} candidate_frontier_only=true requested_access_available=false exact_resource_identified=false acl_fix_identified=false primary_failure=original-a debugger_values_redacted=true environment_values_redacted=true token_values_redacted=true release_sent=false workload_executed=false qualification_promoted=false",
+                environment_destruction.is_ok(),
+            ),
+            None,
+        ),
+    };
+    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {
+        Some(trigger_sha256) => format!(
+            "{} {}",
+            debug_observer_diagnostic,
+            super::session_broker::request_trace_session_capability(trigger_sha256).diagnostic(),
+        ),
+        None => format!(
+            "{} broker_trace_session_capability=v1 state=not-run trigger=none primary_failure=original-a release_sent=false workload_executed=false qualification_promoted=false",
+            debug_observer_diagnostic,
+        ),
+    };
+    let common = common_fields
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .map(|(field, value)| format!("{field}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let failed_common_fields = common_field_names
+        .iter()
+        .zip(common_fields.iter())
+        .filter_map(|(field, result)| result.is_err().then_some(*field))
+        .collect::<Vec<_>>()
+        .join(",");
+    let invariant_error_sha256 = common_error.map_or_else(
+        || {
+            if after != before {
+                super::record::digest(b"profile observation changed")
+            } else if !launcher_authority_exact {
+                super::record::digest(b"launcher-explicit authority binding changed")
+            } else if !containment_exact {
+                super::record::digest(b"diagnostic containment evidence is incomplete")
+            } else if !environment_stable {
+                after_target_user_observation.detail_sha256.clone()
+            } else if let Err(error) = &environment_destruction {
+                super::record::digest(error.detail.as_bytes())
+            } else {
+                "none".to_owned()
+            }
+        },
+        |error| super::record::digest(error.as_bytes()),
+    );
+    let outcome = |value: &LoaderEnvironmentCanaryOutcomeV1| {
+        format!(
+            "restriction={} outcome={} native={} phase={} detail_sha256={}",
+            value.environment,
+            value.outcome.diagnostic(),
+            value.native_status.map_or_else(
+                || "unavailable".to_owned(),
+                |code| format!("0x{:08x}", code as u32)
+            ),
+            value.failure_phase,
+            value.detail_sha256,
+        )
+    };
+    LoaderRestrictionPresencePrerequisiteEvaluationV1 {
+        diagnostic: format!(
+            "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state={presence_state} identity_state={identity_state} logon_state={logon_state} authenticated_users_state={authenticated_users_state} baseline_semantics=full-restricted comparison_semantics=privilege-disabled/no-restricting-SID same_access_semantics=privilege-disabled/canonical-same-access-restricted logon_semantics=privilege-disabled/target-logon-SID-restricted authenticated_users_semantics=privilege-disabled/authenticated-users-SID-restricted target_user_semantics=privilege-disabled/target-user-SID-restricted differing_fields=[restricting_sid_inventory,token_is_restricted,token_instance_ids] failed_common_fields=[{failed_common_fields}] source_binding_sha256={} restriction_presence_binding_sha256={} restriction_identity_binding_sha256={} logon_restriction_binding_sha256={} authenticated_users_restriction_binding_sha256={} target_user_restriction_binding_sha256={} shared_environment_sha256={} shared_environment_keys_sha256={} shared_environment_units={} shared_environment_entries={} shared_environment_profile_loaded=true after_baseline_scan={} after_baseline_metadata_match={} after_baseline_observation_sha256={} after_comparison_scan={} after_comparison_metadata_match={} after_comparison_observation_sha256={} after_same_access_scan={} after_same_access_metadata_match={} after_same_access_observation_sha256={} after_logon_scan={} after_logon_metadata_match={} after_logon_observation_sha256={} after_authenticated_users_scan={} after_authenticated_users_metadata_match={} after_authenticated_users_observation_sha256={} after_target_user_scan={} after_target_user_metadata_match={} after_target_user_observation_sha256={} shared_environment_scan={} shared_environment_metadata_match={} shared_environment_observation_sha256={} shared_environment_stable={} shared_environment_destroyed={} baseline=[{}] comparison=[{}] same_access=[{}] logon=[{}] authenticated_users=[{}] target_user=[{}] profile_state=already-loaded-borrowed profile_stable={} launcher_explicit={} invariants_valid={} {} invariant_error_sha256={} {} {} environment_values_redacted=true token_values_redacted=true job_empty={job_empty_exact} workload_executed=false qualification_promoted=false",
+            tokens.source_binding_sha256,
+            tokens.restriction_presence_binding_sha256,
+            restriction_identity_binding_sha256,
+            logon_restriction_binding_sha256,
+            authenticated_users_restriction_binding_sha256,
+            target_user_restriction_binding_sha256,
+            admitted_environment.sha256,
+            admitted_environment.keys_sha256,
+            admitted_environment.units,
+            admitted_environment.entries,
+            after_baseline_observation.scan,
+            after_baseline_observation.metadata_match,
+            after_baseline_observation.detail_sha256,
+            after_comparison_observation.scan,
+            after_comparison_observation.metadata_match,
+            after_comparison_observation.detail_sha256,
+            after_same_access_observation.scan,
+            after_same_access_observation.metadata_match,
+            after_same_access_observation.detail_sha256,
+            after_logon_observation.scan,
+            after_logon_observation.metadata_match,
+            after_logon_observation.detail_sha256,
+            after_authenticated_users_observation.scan,
+            after_authenticated_users_observation.metadata_match,
+            after_authenticated_users_observation.detail_sha256,
+            after_target_user_observation.scan,
+            after_target_user_observation.metadata_match,
+            after_target_user_observation.detail_sha256,
+            after_target_user_observation.scan,
+            after_target_user_observation.metadata_match,
+            after_target_user_observation.detail_sha256,
+            environment_stable,
+            environment_destruction.is_ok(),
+            outcome(&baseline_outcome),
+            outcome(&comparison_outcome),
+            outcome(&same_access_outcome),
+            outcome(&logon_outcome),
+            outcome(&authenticated_users_outcome),
+            outcome(&target_user_outcome),
+            after == before,
+            launcher_authority_exact,
+            invariants_valid,
+            common,
+            invariant_error_sha256,
+            passive_access_localization.diagnostic(),
+            debug_observer_diagnostic,
+        ),
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum LoaderObjectSecurityOutcomeForTest {
+    Passed,
+    Failed { native: i32, phase: &'static str },
+}
+
+#[cfg(test)]
+pub(crate) fn loader_restriction_presence_gate_for_test(
+    object_security_state: &str,
+    object_security_common_evidence_valid: bool,
+    object_security_descriptor_evidence_present: bool,
+    object_security_invariants_valid: bool,
+) -> bool {
+    loader_restriction_presence_required(
+        object_security_state,
+        object_security_common_evidence_valid,
+        object_security_descriptor_evidence_present,
+        object_security_invariants_valid,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn loader_control_cell_job_empty_attested_for_test(detail: &str) -> bool {
+    loader_control_cell_job_empty_attested(&Ok(detail.to_owned()))
+}
+
+#[cfg(test)]
+pub(crate) fn classify_loader_restriction_presence_for_test(
+    baseline: LoaderObjectSecurityOutcomeForTest,
+    comparison: LoaderObjectSecurityOutcomeForTest,
+    invariants_valid: bool,
+) -> &'static str {
+    let outcome = |restriction, value| match value {
+        LoaderObjectSecurityOutcomeForTest::Passed => LoaderEnvironmentCanaryOutcomeV1 {
+            environment: restriction,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: String::new(),
+            detail: String::new(),
+        },
+        LoaderObjectSecurityOutcomeForTest::Failed { native, phase } => {
+            LoaderEnvironmentCanaryOutcomeV1 {
+                environment: restriction,
+                outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+                native_status: Some(native),
+                failure_phase: phase,
+                detail_sha256: String::new(),
+                detail: String::new(),
+            }
+        }
+    };
+    classify_loader_restriction_presence_outcomes(
+        &outcome("full-restricted", baseline),
+        &outcome("privilege-disabled/no-restricting-SID", comparison),
+        invariants_valid,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn classify_loader_restriction_identity_for_test(
+    baseline: LoaderObjectSecurityOutcomeForTest,
+    no_restricting_sid: LoaderObjectSecurityOutcomeForTest,
+    same_access_restricted: LoaderObjectSecurityOutcomeForTest,
+    invariants_valid: bool,
+) -> &'static str {
+    let outcome = |restriction, value| match value {
+        LoaderObjectSecurityOutcomeForTest::Passed => LoaderEnvironmentCanaryOutcomeV1 {
+            environment: restriction,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: String::new(),
+            detail: String::new(),
+        },
+        LoaderObjectSecurityOutcomeForTest::Failed { native, phase } => {
+            LoaderEnvironmentCanaryOutcomeV1 {
+                environment: restriction,
+                outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+                native_status: Some(native),
+                failure_phase: phase,
+                detail_sha256: String::new(),
+                detail: String::new(),
+            }
+        }
+    };
+    classify_loader_restriction_identity_outcomes(
+        &outcome("full-restricted", baseline),
+        &outcome("privilege-disabled/no-restricting-SID", no_restricting_sid),
+        &outcome(
+            "privilege-disabled/canonical-same-access-restricted",
+            same_access_restricted,
+        ),
+        invariants_valid,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn classify_loader_restriction_logon_for_test(
+    baseline: LoaderObjectSecurityOutcomeForTest,
+    no_restricting_sid: LoaderObjectSecurityOutcomeForTest,
+    same_access_restricted: LoaderObjectSecurityOutcomeForTest,
+    logon_restricted: LoaderObjectSecurityOutcomeForTest,
+    invariants_valid: bool,
+) -> &'static str {
+    let outcome = |restriction, value| match value {
+        LoaderObjectSecurityOutcomeForTest::Passed => LoaderEnvironmentCanaryOutcomeV1 {
+            environment: restriction,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: String::new(),
+            detail: String::new(),
+        },
+        LoaderObjectSecurityOutcomeForTest::Failed { native, phase } => {
+            LoaderEnvironmentCanaryOutcomeV1 {
+                environment: restriction,
+                outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+                native_status: Some(native),
+                failure_phase: phase,
+                detail_sha256: String::new(),
+                detail: String::new(),
+            }
+        }
+    };
+    classify_loader_restriction_logon_outcomes(
+        &outcome("full-restricted", baseline),
+        &outcome("privilege-disabled/no-restricting-SID", no_restricting_sid),
+        &outcome(
+            "privilege-disabled/canonical-same-access-restricted",
+            same_access_restricted,
+        ),
+        &outcome(
+            "privilege-disabled/target-logon-SID-restricted",
+            logon_restricted,
+        ),
+        invariants_valid,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn classify_loader_restriction_authenticated_users_for_test(
+    baseline: LoaderObjectSecurityOutcomeForTest,
+    no_restricting_sid: LoaderObjectSecurityOutcomeForTest,
+    same_access_restricted: LoaderObjectSecurityOutcomeForTest,
+    logon_restricted: LoaderObjectSecurityOutcomeForTest,
+    authenticated_users_restricted: LoaderObjectSecurityOutcomeForTest,
+    invariants_valid: bool,
+) -> &'static str {
+    let outcome = |restriction, value| match value {
+        LoaderObjectSecurityOutcomeForTest::Passed => LoaderEnvironmentCanaryOutcomeV1 {
+            environment: restriction,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: String::new(),
+            detail: String::new(),
+        },
+        LoaderObjectSecurityOutcomeForTest::Failed { native, phase } => {
+            LoaderEnvironmentCanaryOutcomeV1 {
+                environment: restriction,
+                outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+                native_status: Some(native),
+                failure_phase: phase,
+                detail_sha256: String::new(),
+                detail: String::new(),
+            }
+        }
+    };
+    classify_loader_restriction_authenticated_users_outcomes(
+        &outcome("full-restricted", baseline),
+        &outcome("privilege-disabled/no-restricting-SID", no_restricting_sid),
+        &outcome(
+            "privilege-disabled/canonical-same-access-restricted",
+            same_access_restricted,
+        ),
+        &outcome(
+            "privilege-disabled/target-logon-SID-restricted",
+            logon_restricted,
+        ),
+        &outcome(
+            "privilege-disabled/authenticated-users-SID-restricted",
+            authenticated_users_restricted,
+        ),
+        invariants_valid,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn classify_loader_restriction_target_user_for_test(
+    baseline: LoaderObjectSecurityOutcomeForTest,
+    no_restricting_sid: LoaderObjectSecurityOutcomeForTest,
+    same_access_restricted: LoaderObjectSecurityOutcomeForTest,
+    logon_restricted: LoaderObjectSecurityOutcomeForTest,
+    authenticated_users_restricted: LoaderObjectSecurityOutcomeForTest,
+    target_user_restricted: LoaderObjectSecurityOutcomeForTest,
+    invariants_valid: bool,
+) -> &'static str {
+    let outcome = |restriction, value| match value {
+        LoaderObjectSecurityOutcomeForTest::Passed => LoaderEnvironmentCanaryOutcomeV1 {
+            environment: restriction,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: String::new(),
+            detail: String::new(),
+        },
+        LoaderObjectSecurityOutcomeForTest::Failed { native, phase } => {
+            LoaderEnvironmentCanaryOutcomeV1 {
+                environment: restriction,
+                outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+                native_status: Some(native),
+                failure_phase: phase,
+                detail_sha256: String::new(),
+                detail: String::new(),
+            }
+        }
+    };
+    classify_loader_restriction_target_user_outcomes(
+        &outcome("full-restricted", baseline),
+        &outcome("privilege-disabled/no-restricting-SID", no_restricting_sid),
+        &outcome(
+            "privilege-disabled/canonical-same-access-restricted",
+            same_access_restricted,
+        ),
+        &outcome(
+            "privilege-disabled/target-logon-SID-restricted",
+            logon_restricted,
+        ),
+        &outcome(
+            "privilege-disabled/authenticated-users-SID-restricted",
+            authenticated_users_restricted,
+        ),
+        &outcome(
+            "privilege-disabled/target-user-SID-restricted",
+            target_user_restricted,
+        ),
+        invariants_valid,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loader_restriction_original_sext_reproduction_for_test(
+    baseline: LoaderObjectSecurityOutcomeForTest,
+    no_restricting_sid: LoaderObjectSecurityOutcomeForTest,
+    same_access_restricted: LoaderObjectSecurityOutcomeForTest,
+    logon_restricted: LoaderObjectSecurityOutcomeForTest,
+    authenticated_users_restricted: LoaderObjectSecurityOutcomeForTest,
+    target_user_restricted: LoaderObjectSecurityOutcomeForTest,
+    invariants_valid: bool,
+) -> bool {
+    let outcome = |restriction, value| match value {
+        LoaderObjectSecurityOutcomeForTest::Passed => LoaderEnvironmentCanaryOutcomeV1 {
+            environment: restriction,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: String::new(),
+            detail: String::new(),
+        },
+        LoaderObjectSecurityOutcomeForTest::Failed { native, phase } => {
+            LoaderEnvironmentCanaryOutcomeV1 {
+                environment: restriction,
+                outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+                native_status: Some(native),
+                failure_phase: phase,
+                detail_sha256: String::new(),
+                detail: String::new(),
+            }
+        }
+    };
+    loader_restriction_original_sext_reproduction_valid(
+        &outcome("a", baseline),
+        &outcome("b", no_restricting_sid),
+        &outcome("c", same_access_restricted),
+        &outcome("d", logon_restricted),
+        &outcome("e", authenticated_users_restricted),
+        &outcome("f", target_user_restricted),
+        invariants_valid,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn classify_loader_full_observer_for_test(
+    debug_c: LoaderObjectSecurityOutcomeForTest,
+    debug_f: LoaderObjectSecurityOutcomeForTest,
+    invariants_valid: bool,
+    useful_frontier_differential: Option<bool>,
+) -> &'static str {
+    let outcome = |restriction, value| match value {
+        LoaderObjectSecurityOutcomeForTest::Passed => LoaderEnvironmentCanaryOutcomeV1 {
+            environment: restriction,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: String::new(),
+            detail: String::new(),
+        },
+        LoaderObjectSecurityOutcomeForTest::Failed { native, phase } => {
+            LoaderEnvironmentCanaryOutcomeV1 {
+                environment: restriction,
+                outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+                native_status: Some(native),
+                failure_phase: phase,
+                detail_sha256: String::new(),
+                detail: String::new(),
+            }
+        }
+    };
+    classify_loader_full_observer_pair(
+        &outcome("canonical-same-access/full-observer-snaps-off", debug_c),
+        &outcome("target-user-singleton/full-observer-snaps-off", debug_f),
+        invariants_valid,
+        useful_frontier_differential,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn loader_full_observer_fallback_gate_for_test(
+    original_reproduction_valid: bool,
+    setup: &super::access_trace::PassiveAccessLocalizationEvidenceV1,
+) -> bool {
+    original_reproduction_valid && setup.exact_session_start_access_denied()
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loader_full_observer_invariants_for_test(
+    fallback_allowed: bool,
+    original_reproduction_valid: bool,
+    original_invariants_valid: bool,
+    original_projection_exact: bool,
+    debug_pair_common_exact: bool,
+    debug_mode_exact: bool,
+    debug_traces_admitted: bool,
+    debug_containment_exact: bool,
+    after_debug_c_stable: bool,
+    after_debug_f_stable: bool,
+    profile_stable: bool,
+    environment_destroyed_once: bool,
+) -> bool {
+    loader_full_observer_invariants_valid(
+        fallback_allowed,
+        original_reproduction_valid,
+        original_invariants_valid,
+        original_projection_exact,
+        debug_pair_common_exact,
+        debug_mode_exact,
+        debug_traces_admitted,
+        debug_containment_exact,
+        after_debug_c_stable,
+        after_debug_f_stable,
+        profile_stable,
+        environment_destroyed_once,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn loader_full_observer_trace_admitted_for_test(detail: &str) -> bool {
+    admit_loader_full_observer_trace(&Ok(detail.to_owned())).is_ok()
+}
+
+#[cfg(test)]
+pub(crate) fn loader_full_observer_trace_admission_for_test(detail: &str) -> String {
+    match admit_loader_full_observer_trace(&Ok(detail.to_owned())) {
+        Ok(_) => "admitted".to_owned(),
+        Err(rejection) => rejection.diagnostic(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn loader_full_observer_candidate_tail_digest_for_test(serialized: &str) -> String {
+    super::loader_debug::candidate_modules_tail_digest(serialized)
+}
+
+#[cfg(test)]
+pub(crate) fn loader_full_observer_failed_invariants_for_test(
+    values: [bool; 13],
+) -> (bool, String) {
+    let receipt = LoaderFullObserverInvariantReceiptV1::evaluated(
+        values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7],
+        values[8], values[9], values[10], values[11], values[12],
+    );
+    (receipt.valid(), receipt.failed_diagnostic())
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loader_trace_session_capability_gate_for_test(
+    ephemeral_ci: bool,
+    passive_setup_admitted: bool,
+    original_reproduction_valid: bool,
+    original_invariants_valid: bool,
+    debug_c: LoaderObjectSecurityOutcomeForTest,
+    debug_f: LoaderObjectSecurityOutcomeForTest,
+    debug_c_detail: &str,
+    debug_f_detail: &str,
+    invariant_values: [bool; 13],
+    after_debug_c_stable: bool,
+    after_debug_f_stable: bool,
+) -> bool {
+    let outcome = |environment, value| match value {
+        LoaderObjectSecurityOutcomeForTest::Passed => LoaderEnvironmentCanaryOutcomeV1 {
+            environment,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: super::record::digest(b"passed"),
+            detail: String::new(),
+        },
+        LoaderObjectSecurityOutcomeForTest::Failed { native, phase } => {
+            LoaderEnvironmentCanaryOutcomeV1 {
+                environment,
+                outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+                native_status: Some(native),
+                failure_phase: phase,
+                detail_sha256: super::record::digest(b"failed"),
+                detail: String::new(),
+            }
+        }
+    };
+    let debug_c = outcome("debug-c", debug_c);
+    let debug_f = outcome("debug-f", debug_f);
+    let Ok(debug_c_trace) = admit_loader_full_observer_trace(&Ok(debug_c_detail.to_owned())) else {
+        return false;
+    };
+    let Ok(debug_f_trace) = admit_loader_full_observer_trace(&Ok(debug_f_detail.to_owned())) else {
+        return false;
+    };
+    let frontier = loader_full_observer_module_frontier(&debug_c_trace, &debug_f_trace);
+    let invariants = LoaderFullObserverInvariantReceiptV1::evaluated(
+        invariant_values[0],
+        invariant_values[1],
+        invariant_values[2],
+        invariant_values[3],
+        invariant_values[4],
+        invariant_values[5],
+        invariant_values[6],
+        invariant_values[7],
+        invariant_values[8],
+        invariant_values[9],
+        invariant_values[10],
+        invariant_values[11],
+        invariant_values[12],
+    );
+    loader_trace_session_capability_allowed(
+        ephemeral_ci,
+        passive_setup_admitted,
+        original_reproduction_valid,
+        original_invariants_valid,
+        &debug_c,
+        &debug_f,
+        &debug_c_trace,
+        &debug_f_trace,
+        &frontier,
+        &invariants,
+        after_debug_c_stable,
+        after_debug_f_stable,
+    )
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TraceSessionCapabilityTriggerMutationForTest {
+    Pristine,
+    RestrictionIdentity,
+    LogonRestriction,
+    AuthenticatedUsersRestriction,
+    TargetUserRestriction,
+    SharedEvidence,
+    CellDetail,
+}
+
+#[cfg(test)]
+pub(crate) fn loader_trace_session_capability_trigger_binding_for_test(
+    debug_c_detail: &str,
+    debug_f_detail: &str,
+    mutation: TraceSessionCapabilityTriggerMutationForTest,
+) -> Option<String> {
+    let outcome =
+        |environment: &'static str, seed: &'static [u8]| LoaderEnvironmentCanaryOutcomeV1 {
+            environment,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: super::record::digest(seed),
+            detail: String::new(),
+        };
+    let baseline = outcome("baseline", b"baseline");
+    let comparison = outcome("comparison", b"comparison");
+    let same_access = outcome("same-access", b"same-access");
+    let logon = outcome("logon", b"logon");
+    let authenticated_users = outcome("authenticated-users", b"authenticated-users");
+    let mut target_user = outcome("target-user", b"target-user");
+    if mutation == TraceSessionCapabilityTriggerMutationForTest::CellDetail {
+        target_user.detail_sha256 = super::record::digest(b"changed-target-user-detail");
+    }
+    let debug_c = outcome("debug-c", b"debug-c");
+    let debug_f = LoaderEnvironmentCanaryOutcomeV1 {
+        environment: "debug-f",
+        outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+        native_status: Some(STATUS_ACCESS_DENIED),
+        failure_phase: "post-resume-pre-loader-ready",
+        detail_sha256: super::record::digest(b"debug-f"),
+        detail: String::new(),
+    };
+    let debug_c_trace = admit_loader_full_observer_trace(&Ok(debug_c_detail.to_owned())).ok()?;
+    let debug_f_trace = admit_loader_full_observer_trace(&Ok(debug_f_detail.to_owned())).ok()?;
+    let frontier = loader_full_observer_module_frontier(&debug_c_trace, &debug_f_trace);
+    let invariants = LoaderFullObserverInvariantReceiptV1::evaluated(
+        true, true, true, true, true, true, true, true, true, true, true, true, true,
+    );
+    let after_debug_c = SharedEnvironmentObservationV1 {
+        scan: "ok",
+        metadata_match: true,
+        detail_sha256: "none".to_owned(),
+    };
+    let after_debug_f = SharedEnvironmentObservationV1 {
+        scan: "ok",
+        metadata_match: true,
+        detail_sha256: "none".to_owned(),
+    };
+    let changed = super::record::digest(b"changed-binding");
+    let restriction_identity =
+        if mutation == TraceSessionCapabilityTriggerMutationForTest::RestrictionIdentity {
+            changed.clone()
+        } else {
+            super::record::digest(b"restriction-identity")
+        };
+    let logon_restriction =
+        if mutation == TraceSessionCapabilityTriggerMutationForTest::LogonRestriction {
+            changed.clone()
+        } else {
+            super::record::digest(b"logon-restriction")
+        };
+    let authenticated_users_restriction = if mutation
+        == TraceSessionCapabilityTriggerMutationForTest::AuthenticatedUsersRestriction
+    {
+        changed.clone()
+    } else {
+        super::record::digest(b"authenticated-users-restriction")
+    };
+    let target_user_restriction =
+        if mutation == TraceSessionCapabilityTriggerMutationForTest::TargetUserRestriction {
+            changed.clone()
+        } else {
+            super::record::digest(b"target-user-restriction")
+        };
+    let shared_evidence =
+        if mutation == TraceSessionCapabilityTriggerMutationForTest::SharedEvidence {
+            changed
+        } else {
+            super::record::digest(b"shared-evidence")
+        };
+    loader_trace_session_capability_trigger_sha256(
+        true,
+        Some(&super::record::digest(b"passive-setup-denied")),
+        true,
+        true,
+        &super::record::digest(b"source-binding"),
+        &super::record::digest(b"pair-invariants"),
+        &super::record::digest(b"restriction-presence"),
+        &restriction_identity,
+        &logon_restriction,
+        &authenticated_users_restriction,
+        &target_user_restriction,
+        &super::record::digest(b"profile-binding"),
+        &shared_evidence,
+        &baseline,
+        &comparison,
+        &same_access,
+        &logon,
+        &authenticated_users,
+        &target_user,
+        &debug_c,
+        &debug_f,
+        &debug_c_trace,
+        &debug_f_trace,
+        &frontier,
+        &invariants,
+        &after_debug_c,
+        &after_debug_f,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn loader_full_observer_debug_f_gate_for_test(
+    fallback_allowed: bool,
+    admitted: &[u16],
+    after_debug_c: &[u16],
+) -> Result<bool, String> {
+    let admitted = user_environment_inventory_from_units(admitted).map_err(|error| error.detail)?;
+    let after_debug_c = user_environment_inventory_from_units(after_debug_c);
+    let observation = shared_environment_observation(&admitted, &after_debug_c, "after-debug-c");
+    Ok(loader_full_observer_debug_f_allowed(
+        fallback_allowed,
+        &observation,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn render_loader_full_observer_canary_for_test(
+    debug_c_detail: &str,
+    debug_f_detail: &str,
+    containment_valid: bool,
+    job_empty: bool,
+) -> String {
+    let detail_hash = |label: &[u8], detail: &str| {
+        let mut material = b"memcordon-loader-observer-perturbation-detail-v1\0".to_vec();
+        material.extend_from_slice(label);
+        material.extend_from_slice(detail.as_bytes());
+        super::record::digest(&material)
+    };
+    let debug_c_result = Ok(debug_c_detail.to_owned());
+    let debug_f_result = Ok(debug_f_detail.to_owned());
+    let debug_c_trace = admit_loader_full_observer_trace(&debug_c_result);
+    let debug_f_trace = admit_loader_full_observer_trace(&debug_f_result);
+    let module_frontier = debug_c_trace
+        .as_ref()
+        .ok()
+        .zip(debug_f_trace.as_ref().ok())
+        .map(|(canonical, target)| loader_full_observer_module_frontier(canonical, target));
+    let debug_c = LoaderEnvironmentCanaryOutcomeV1 {
+        environment: "canonical-same-access/full-observer-snaps-off",
+        outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+        native_status: None,
+        failure_phase: "none",
+        detail_sha256: String::new(),
+        detail: String::new(),
+    };
+    let debug_f = LoaderEnvironmentCanaryOutcomeV1 {
+        environment: "target-user-singleton/full-observer-snaps-off",
+        outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+        native_status: Some(STATUS_ACCESS_DENIED),
+        failure_phase: "post-resume-pre-loader-ready",
+        detail_sha256: String::new(),
+        detail: String::new(),
+    };
+    let invariants = LoaderFullObserverInvariantReceiptV1::evaluated(
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        debug_c_trace.is_ok(),
+        debug_f_trace.is_ok(),
+        containment_valid,
+        true,
+        true,
+        true,
+        true,
+    );
+    let invariants_valid = invariants.valid();
+    let state = classify_loader_full_observer_pair(
+        &debug_c,
+        &debug_f,
+        invariants_valid,
+        module_frontier.as_ref().map(|frontier| frontier.useful),
+    );
+    let observation = SharedEnvironmentObservationV1 {
+        scan: "ok",
+        metadata_match: true,
+        detail_sha256: "none".to_owned(),
+    };
+    render_loader_full_observer_diagnostic(
+        state,
+        &debug_c,
+        Some(&debug_f),
+        &detail_hash(b"debug-c", debug_c_detail),
+        Some(&detail_hash(b"debug-f", debug_f_detail)),
+        &debug_c_trace,
+        Some(&debug_f_trace),
+        module_frontier.as_ref(),
+        &observation,
+        Some(&observation),
+        true,
+        true,
+        &invariants,
+        job_empty,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn render_loader_restriction_presence_canary_for_test(
+    state: &str,
+    primary_detail: &str,
+    comparison_detail: &str,
+    same_access_detail: &str,
+) -> String {
+    format!(
+        "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state=restricting-sid-presence-causal baseline_semantics=full-restricted comparison_semantics=privilege-disabled/no-restricting-SID same_access_semantics=privilege-disabled/canonical-same-access-restricted differing_fields=[restricting_sid_inventory,token_is_restricted,token_instance_ids] failed_common_fields=[] restriction_identity_binding_sha256={} shared_environment_sha256={} shared_environment_keys_sha256={} shared_environment_units=4 shared_environment_entries=1 shared_environment_profile_loaded=true after_baseline_scan=ok after_baseline_metadata_match=true after_baseline_observation_sha256=none after_comparison_scan=ok after_comparison_metadata_match=true after_comparison_observation_sha256=none shared_environment_scan=ok shared_environment_metadata_match=true shared_environment_observation_sha256=none shared_environment_stable=true shared_environment_destroyed=true primary_sha256={} comparison_sha256={} same_access_sha256={} environment_values_redacted=true token_values_redacted=true job_empty=true workload_executed=false qualification_promoted=false",
+        super::record::digest(b"test-restriction-identity-binding"),
+        super::record::digest(b"test-shared-environment"),
+        super::record::digest(b"test-shared-environment-keys"),
+        super::record::digest(primary_detail.as_bytes()),
+        super::record::digest(comparison_detail.as_bytes()),
+        super::record::digest(same_access_detail.as_bytes()),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn render_loader_restriction_logon_canary_for_test(
+    state: &str,
+    primary_detail: &str,
+    comparison_detail: &str,
+    same_access_detail: &str,
+    logon_detail: &str,
+) -> String {
+    format!(
+        "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state=restricting-sid-presence-causal identity_state=restricted-code-sid-narrowing-causal baseline_semantics=full-restricted comparison_semantics=privilege-disabled/no-restricting-SID same_access_semantics=privilege-disabled/canonical-same-access-restricted logon_semantics=privilege-disabled/target-logon-SID-restricted differing_fields=[restricting_sid_inventory,token_is_restricted,token_instance_ids] failed_common_fields=[] restriction_identity_binding_sha256={} logon_restriction_binding_sha256={} shared_environment_sha256={} shared_environment_keys_sha256={} shared_environment_units=4 shared_environment_entries=1 shared_environment_profile_loaded=true after_baseline_scan=ok after_baseline_metadata_match=true after_baseline_observation_sha256=none after_comparison_scan=ok after_comparison_metadata_match=true after_comparison_observation_sha256=none after_same_access_scan=ok after_same_access_metadata_match=true after_same_access_observation_sha256=none after_logon_scan=ok after_logon_metadata_match=true after_logon_observation_sha256=none shared_environment_scan=ok shared_environment_metadata_match=true shared_environment_observation_sha256=none shared_environment_stable=true shared_environment_destroyed=true primary_sha256={} comparison_sha256={} same_access_sha256={} logon_sha256={} environment_values_redacted=true token_values_redacted=true job_empty=true workload_executed=false qualification_promoted=false",
+        super::record::digest(b"test-restriction-identity-binding"),
+        super::record::digest(b"test-logon-restriction-binding"),
+        super::record::digest(b"test-shared-environment"),
+        super::record::digest(b"test-shared-environment-keys"),
+        super::record::digest(primary_detail.as_bytes()),
+        super::record::digest(comparison_detail.as_bytes()),
+        super::record::digest(same_access_detail.as_bytes()),
+        super::record::digest(logon_detail.as_bytes()),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn render_loader_restriction_authenticated_users_canary_for_test(
+    state: &str,
+    primary_detail: &str,
+    comparison_detail: &str,
+    same_access_detail: &str,
+    logon_detail: &str,
+    authenticated_users_detail: &str,
+) -> String {
+    format!(
+        "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state=restricting-sid-presence-causal identity_state=restricted-code-sid-narrowing-causal logon_state=differing-inconclusive baseline_semantics=full-restricted comparison_semantics=privilege-disabled/no-restricting-SID same_access_semantics=privilege-disabled/canonical-same-access-restricted logon_semantics=privilege-disabled/target-logon-SID-restricted authenticated_users_semantics=privilege-disabled/authenticated-users-SID-restricted differing_fields=[restricting_sid_inventory,token_is_restricted,token_instance_ids] failed_common_fields=[] restriction_identity_binding_sha256={} logon_restriction_binding_sha256={} authenticated_users_restriction_binding_sha256={} shared_environment_sha256={} shared_environment_keys_sha256={} shared_environment_units=4 shared_environment_entries=1 shared_environment_profile_loaded=true after_baseline_scan=ok after_baseline_metadata_match=true after_baseline_observation_sha256=none after_comparison_scan=ok after_comparison_metadata_match=true after_comparison_observation_sha256=none after_same_access_scan=ok after_same_access_metadata_match=true after_same_access_observation_sha256=none after_logon_scan=ok after_logon_metadata_match=true after_logon_observation_sha256=none after_authenticated_users_scan=ok after_authenticated_users_metadata_match=true after_authenticated_users_observation_sha256=none shared_environment_scan=ok shared_environment_metadata_match=true shared_environment_observation_sha256=none shared_environment_stable=true shared_environment_destroyed=true primary_sha256={} comparison_sha256={} same_access_sha256={} logon_sha256={} authenticated_users_sha256={} environment_values_redacted=true token_values_redacted=true job_empty=true workload_executed=false qualification_promoted=false",
+        super::record::digest(b"test-restriction-identity-binding"),
+        super::record::digest(b"test-logon-restriction-binding"),
+        super::record::digest(b"test-authenticated-users-restriction-binding"),
+        super::record::digest(b"test-shared-environment"),
+        super::record::digest(b"test-shared-environment-keys"),
+        super::record::digest(primary_detail.as_bytes()),
+        super::record::digest(comparison_detail.as_bytes()),
+        super::record::digest(same_access_detail.as_bytes()),
+        super::record::digest(logon_detail.as_bytes()),
+        super::record::digest(authenticated_users_detail.as_bytes()),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_loader_restriction_target_user_canary_for_test(
+    state: &str,
+    primary_detail: &str,
+    comparison_detail: &str,
+    same_access_detail: &str,
+    logon_detail: &str,
+    authenticated_users_detail: &str,
+    target_user_detail: &str,
+) -> String {
+    format!(
+        "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state=restricting-sid-presence-causal identity_state=restricted-code-sid-narrowing-causal logon_state=differing-inconclusive authenticated_users_state=canonical-group-union-or-other-trustee-required baseline_semantics=full-restricted comparison_semantics=privilege-disabled/no-restricting-SID same_access_semantics=privilege-disabled/canonical-same-access-restricted logon_semantics=privilege-disabled/target-logon-SID-restricted authenticated_users_semantics=privilege-disabled/authenticated-users-SID-restricted target_user_semantics=privilege-disabled/target-user-SID-restricted differing_fields=[restricting_sid_inventory,token_is_restricted,token_instance_ids] failed_common_fields=[] restriction_identity_binding_sha256={} logon_restriction_binding_sha256={} authenticated_users_restriction_binding_sha256={} target_user_restriction_binding_sha256={} shared_environment_sha256={} shared_environment_keys_sha256={} shared_environment_units=4 shared_environment_entries=1 shared_environment_profile_loaded=true after_baseline_scan=ok after_baseline_metadata_match=true after_baseline_observation_sha256=none after_comparison_scan=ok after_comparison_metadata_match=true after_comparison_observation_sha256=none after_same_access_scan=ok after_same_access_metadata_match=true after_same_access_observation_sha256=none after_logon_scan=ok after_logon_metadata_match=true after_logon_observation_sha256=none after_authenticated_users_scan=ok after_authenticated_users_metadata_match=true after_authenticated_users_observation_sha256=none after_target_user_scan=ok after_target_user_metadata_match=true after_target_user_observation_sha256=none shared_environment_scan=ok shared_environment_metadata_match=true shared_environment_observation_sha256=none shared_environment_stable=true shared_environment_destroyed=true primary_sha256={} comparison_sha256={} same_access_sha256={} logon_sha256={} authenticated_users_sha256={} target_user_sha256={} environment_values_redacted=true token_values_redacted=true job_empty=true workload_executed=false qualification_promoted=false",
+        super::record::digest(b"test-restriction-identity-binding"),
+        super::record::digest(b"test-logon-restriction-binding"),
+        super::record::digest(b"test-authenticated-users-restriction-binding"),
+        super::record::digest(b"test-target-user-restriction-binding"),
+        super::record::digest(b"test-shared-environment"),
+        super::record::digest(b"test-shared-environment-keys"),
+        super::record::digest(primary_detail.as_bytes()),
+        super::record::digest(comparison_detail.as_bytes()),
+        super::record::digest(same_access_detail.as_bytes()),
+        super::record::digest(logon_detail.as_bytes()),
+        super::record::digest(authenticated_users_detail.as_bytes()),
+        super::record::digest(target_user_detail.as_bytes()),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn loader_object_security_authority_labels_for_test() -> [&'static str; 4] {
+    [
+        LoaderObjectSecurityAuthorityV1::LauncherExplicit.diagnostic(),
+        LoaderObjectSecurityAuthorityV1::TargetAwareProcess.diagnostic(),
+        LoaderObjectSecurityAuthorityV1::TargetAwareThread.diagnostic(),
+        LoaderObjectSecurityAuthorityV1::TargetAwareBoth.diagnostic(),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn classify_loader_object_security_for_test(
+    baseline: LoaderObjectSecurityOutcomeForTest,
+    process: LoaderObjectSecurityOutcomeForTest,
+    thread: LoaderObjectSecurityOutcomeForTest,
+    combined: Option<LoaderObjectSecurityOutcomeForTest>,
+    evidence_valid: bool,
+) -> &'static str {
+    let outcome = |authority, value| match value {
+        LoaderObjectSecurityOutcomeForTest::Passed => LoaderEnvironmentCanaryOutcomeV1 {
+            environment: authority,
+            outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+            native_status: None,
+            failure_phase: "none",
+            detail_sha256: String::new(),
+            detail: String::new(),
+        },
+        LoaderObjectSecurityOutcomeForTest::Failed { native, phase } => {
+            LoaderEnvironmentCanaryOutcomeV1 {
+                environment: authority,
+                outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+                native_status: Some(native),
+                failure_phase: phase,
+                detail_sha256: String::new(),
+                detail: String::new(),
+            }
+        }
+    };
+    let baseline = outcome("baseline", baseline);
+    let process = outcome("process", process);
+    let thread = outcome("thread", thread);
+    let combined = combined.map(|value| outcome("combined", value));
+    classify_loader_object_security_outcomes(
+        &baseline,
+        &process,
+        &thread,
+        combined.as_ref(),
+        evidence_valid,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn loader_object_security_gate_for_test(
+    profile_state: &str,
+    baseline_native: Option<i32>,
+    comparison_native: Option<i32>,
+    same_phase: bool,
+) -> bool {
+    let baseline = LoaderEnvironmentCanaryOutcomeV1 {
+        environment: "baseline",
+        outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+        native_status: baseline_native,
+        failure_phase: "baseline-phase",
+        detail_sha256: String::new(),
+        detail: String::new(),
+    };
+    let comparison = LoaderEnvironmentCanaryOutcomeV1 {
+        environment: "comparison",
+        outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+        native_status: comparison_native,
+        failure_phase: if same_phase {
+            "baseline-phase"
+        } else {
+            "other-phase"
+        },
+        detail_sha256: String::new(),
+        detail: String::new(),
+    };
+    loader_object_security_required(profile_state, &baseline, Some(&comparison))
+}
+
+#[cfg(test)]
+pub(crate) struct LoaderObjectSecurityEvidenceValidityForTest {
+    pub common_evidence_valid: bool,
+    pub descriptor_evidence_present: bool,
+    pub invariants_valid: bool,
+    pub invariant_error: Option<String>,
+}
+
+#[cfg(test)]
+pub(crate) fn loader_object_security_evidence_validity_for_test(
+    baseline_detail: &str,
+    comparison_details: &[&str],
+    profile_stable: bool,
+    authority_binding_valid: bool,
+) -> LoaderObjectSecurityEvidenceValidityForTest {
+    let baseline = Ok(baseline_detail.to_owned());
+    let comparisons = comparison_details
+        .iter()
+        .map(|detail| Ok((*detail).to_owned()))
+        .collect::<Vec<Result<String, TargetDesktopLeaseCreateError>>>();
+    let results = std::iter::once(&baseline)
+        .chain(comparisons.iter())
+        .collect::<Vec<_>>();
+    let evidence =
+        loader_object_security_evidence_validity(&results, profile_stable, authority_binding_valid);
+    LoaderObjectSecurityEvidenceValidityForTest {
+        common_evidence_valid: evidence.common_evidence_valid,
+        descriptor_evidence_present: evidence.descriptor_evidence_present,
+        invariants_valid: evidence.invariants_valid,
+        invariant_error: evidence.invariant_error,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn render_loader_object_security_canary_for_test(
+    state: &str,
+    primary_detail: &str,
+    comparison_detail: &str,
+) -> String {
+    format!(
+        "loader_object_security_prerequisite_canary=v1 state={state} primary_sha256={} comparison_sha256={} object_security_values_redacted=true workload_executed=false qualification_promoted=false",
+        super::record::digest(primary_detail.as_bytes()),
+        super::record::digest(comparison_detail.as_bytes()),
+    )
+}
+
+fn preserve_loader_profile_primary_detail(primary: &str, cleanup: &[String]) -> String {
+    if cleanup.is_empty() {
+        primary.to_owned()
+    } else {
+        format!("{primary} profile_child_cleanup=[{}]", cleanup.join(","))
+    }
+}
+
+pub(crate) fn preserve_loader_profile_primary_for_test(
+    primary: &str,
+    cleanup_error: Option<&str>,
+) -> String {
+    let cleanup = cleanup_error
+        .map(|error| {
+            vec![format!(
+                "cleanup_error_sha256={}",
+                super::record::digest(error.as_bytes())
+            )]
+        })
+        .unwrap_or_default();
+    preserve_loader_profile_primary_detail(primary, &cleanup)
+}
+
+pub(crate) fn render_loader_profile_canary_for_test(
+    state: &str,
+    before_state: LoaderProfileHiveStateV1,
+    after_state: LoaderProfileHiveStateV1,
+    primary_detail: &str,
+    comparison_detail: &str,
+    cleanup_detail: &str,
+) -> String {
+    let outcome = |environment, detail: &str| LoaderEnvironmentCanaryOutcomeV1 {
+        environment,
+        outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+        native_status: Some(STATUS_DLL_INIT_FAILED),
+        failure_phase: "pre-initial-breakpoint-static-loader",
+        detail_sha256: super::record::digest(detail.as_bytes()),
+        detail: String::new(),
+    };
+    let before = LoaderProfileObservationV1 {
+        state: before_state,
+        profile_directory_sha256: super::record::digest(b"before-profile-directory"),
+        profile_directory_exists: true,
+    };
+    let after = LoaderProfileObservationV1 {
+        state: after_state,
+        profile_directory_sha256: super::record::digest(b"after-profile-directory"),
+        profile_directory_exists: true,
+    };
+    render_loader_profile_prerequisite_canary(
+        state,
+        &outcome("target-token-userenv-v1", primary_detail),
+        Some(&outcome(
+            "target-token-userenv-profile-v1",
+            comparison_detail,
+        )),
+        &before,
+        &after,
+        &super::record::digest(b"profile-binding"),
+        &[format!(
+            "cleanup_detail_sha256={}",
+            super::record::digest(cleanup_detail.as_bytes())
+        )],
+    )
+}
+
+fn render_loader_environment_prerequisite_canary(
+    state: &str,
+    baseline_outcome: &LoaderEnvironmentCanaryOutcomeV1,
+    comparison_outcome: &LoaderEnvironmentCanaryOutcomeV1,
+    source_binding_sha256: &str,
+    pair_invariants_sha256: &str,
+    target_token_instance_sha256: &str,
+    baseline_environment_sha256: &str,
+    comparison_environment_sha256: &str,
+    comparison_environment_keys_sha256: &str,
+    comparison_environment_units: &str,
+    comparison_environment_entries: &str,
+    common: &str,
+    invariant_error: &str,
+) -> String {
+    format!(
+        "loader_environment_prerequisite_canary=v1 state={state} baseline_environment=canonical-minimal-system comparison_environment=target-token-userenv-v1 differing_fields=[environment] baseline=[{}] comparison=[{}] source_binding_sha256={} pair_invariants_sha256={} target_token_instance_sha256={} baseline_environment_sha256={} comparison_environment_sha256={} comparison_environment_keys_sha256={} comparison_environment_units={} comparison_environment_entries={} profile_loaded=false {} process_sddl_sha256={} thread_sddl_sha256={} job_policy_sha256={} invariant_error={} workload_executed=false qualification_promoted=false",
+        baseline_outcome.diagnostic(),
+        comparison_outcome.diagnostic(),
+        source_binding_sha256,
+        pair_invariants_sha256,
+        target_token_instance_sha256,
+        baseline_environment_sha256,
+        comparison_environment_sha256,
+        comparison_environment_keys_sha256,
+        comparison_environment_units,
+        comparison_environment_entries,
+        common,
+        super::security::launcher_process_sddl()
+            .map(|sddl| super::record::digest(sddl.as_bytes()))
+            .unwrap_or_else(|error| super::record::digest(error.as_bytes())),
+        super::security::launcher_thread_sddl()
+            .map(|sddl| super::record::digest(sddl.as_bytes()))
+            .unwrap_or_else(|error| super::record::digest(error.as_bytes())),
+        super::record::digest(b"Job::create(None,None,None)+PROC_THREAD_ATTRIBUTE_JOB_LIST"),
+        invariant_error,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn render_loader_environment_prerequisite_canary_for_test(
+    baseline_environment_sha256: &str,
+    comparison_environment_sha256: &str,
+    comparison_environment_keys_sha256: &str,
+    comparison_environment_units: usize,
+    comparison_environment_entries: usize,
+) -> String {
+    let outcome = |environment| LoaderEnvironmentCanaryOutcomeV1 {
+        environment,
+        outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+        native_status: Some(STATUS_DLL_INIT_FAILED),
+        failure_phase: "pre-initial-breakpoint-static-loader",
+        detail_sha256: super::record::digest(b"bounded-redacted-loader-detail"),
+        detail: "redacted".to_owned(),
+    };
+    render_loader_environment_prerequisite_canary(
+        "classified-common-failure",
+        &outcome("canonical-minimal-system"),
+        &outcome("target-token-userenv-v1"),
+        &super::record::digest(b"test-source-binding"),
+        &super::record::digest(b"test-pair-binding"),
+        &super::record::digest(b"test-target-token-instance"),
+        baseline_environment_sha256,
+        comparison_environment_sha256,
+        comparison_environment_keys_sha256,
+        &comparison_environment_units.to_string(),
+        &comparison_environment_entries.to_string(),
+        "matrix_cell=canonical-minimal-system-none-snaps-off debug_mode=false creation_flags=0x00080404",
+        "none",
+    )
 }
 
 struct LoaderEnvironmentBlockV4 {
@@ -3161,6 +8203,1183 @@ impl Drop for SystemEnvironmentBlock {
             unsafe { DestroyEnvironmentBlock(self.0) };
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LoaderProfileHiveStateV1 {
+    AlreadyLoadedBorrowed,
+    Absent,
+    AccessDenied,
+    QueryFailed(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LoaderProfileLifecycleEventV1 {
+    ObservedBefore,
+    ProfileLoaded,
+    EnvironmentCreated,
+    ProcessCompleted,
+    EnvironmentDestroyed,
+    JobEmpty,
+    ProfileUnloaded,
+    ObservedAfter,
+}
+
+fn classify_loader_profile_observations(
+    before: LoaderProfileHiveStateV1,
+    loaded: Option<LoaderProfileHiveStateV1>,
+    after: LoaderProfileHiveStateV1,
+    unload_ok: bool,
+) -> &'static str {
+    match (before, loaded, after, unload_ok) {
+        (
+            LoaderProfileHiveStateV1::AlreadyLoadedBorrowed,
+            None,
+            LoaderProfileHiveStateV1::AlreadyLoadedBorrowed,
+            true,
+        ) => "classified-borrowed-stable",
+        (
+            LoaderProfileHiveStateV1::Absent,
+            Some(LoaderProfileHiveStateV1::AlreadyLoadedBorrowed),
+            LoaderProfileHiveStateV1::Absent,
+            true,
+        ) => "classified-owned-loaded-unloaded",
+        (LoaderProfileHiveStateV1::AccessDenied, _, _, _)
+        | (LoaderProfileHiveStateV1::QueryFailed(_), _, _, _) => "invalid-profile-observation",
+        (LoaderProfileHiveStateV1::AlreadyLoadedBorrowed, _, _, _) => {
+            "invalid-unstable-borrowed-profile"
+        }
+        (LoaderProfileHiveStateV1::Absent, Some(_), _, _) => "invalid-owned-profile-cleanup",
+        (LoaderProfileHiveStateV1::Absent, None, _, _) => "invalid-load-not-observed",
+    }
+}
+
+pub(crate) fn classify_loader_profile_observations_for_test(
+    before: LoaderProfileHiveStateV1,
+    loaded: Option<LoaderProfileHiveStateV1>,
+    after: LoaderProfileHiveStateV1,
+    unload_ok: bool,
+) -> &'static str {
+    classify_loader_profile_observations(before, loaded, after, unload_ok)
+}
+
+fn loader_profile_lifecycle_is_valid(
+    events: &[LoaderProfileLifecycleEventV1],
+    borrowed: bool,
+) -> bool {
+    let expected_borrowed = [
+        LoaderProfileLifecycleEventV1::ObservedBefore,
+        LoaderProfileLifecycleEventV1::EnvironmentCreated,
+        LoaderProfileLifecycleEventV1::EnvironmentDestroyed,
+        LoaderProfileLifecycleEventV1::ProcessCompleted,
+        LoaderProfileLifecycleEventV1::JobEmpty,
+        LoaderProfileLifecycleEventV1::ObservedAfter,
+    ];
+    let expected_owned = [
+        LoaderProfileLifecycleEventV1::ObservedBefore,
+        LoaderProfileLifecycleEventV1::ProfileLoaded,
+        LoaderProfileLifecycleEventV1::EnvironmentCreated,
+        LoaderProfileLifecycleEventV1::EnvironmentDestroyed,
+        LoaderProfileLifecycleEventV1::ProcessCompleted,
+        LoaderProfileLifecycleEventV1::JobEmpty,
+        LoaderProfileLifecycleEventV1::ProfileUnloaded,
+        LoaderProfileLifecycleEventV1::ObservedAfter,
+    ];
+    events
+        == if borrowed {
+            expected_borrowed.as_slice()
+        } else {
+            expected_owned.as_slice()
+        }
+}
+
+pub(crate) fn loader_profile_lifecycle_valid_for_test(
+    events: &[LoaderProfileLifecycleEventV1],
+    borrowed: bool,
+) -> bool {
+    loader_profile_lifecycle_is_valid(events, borrowed)
+}
+
+impl LoaderProfileHiveStateV1 {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::AlreadyLoadedBorrowed => "already-loaded-borrowed",
+            Self::Absent => "absent",
+            Self::AccessDenied => "access-denied",
+            Self::QueryFailed(_) => "query-failed",
+        }
+    }
+
+    const fn native_code(self) -> Option<u32> {
+        match self {
+            Self::QueryFailed(code) => Some(code),
+            Self::AccessDenied => Some(ERROR_ACCESS_DENIED),
+            Self::AlreadyLoadedBorrowed | Self::Absent => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoaderProfileObservationV1 {
+    state: LoaderProfileHiveStateV1,
+    profile_directory_sha256: String,
+    profile_directory_exists: bool,
+}
+
+fn loader_profile_directory(token: HANDLE) -> Result<(String, bool), String> {
+    let mut chars = 0_u32;
+    unsafe { GetUserProfileDirectoryW(token, ptr::null_mut(), &raw mut chars) };
+    if chars == 0
+        || unsafe { windows_sys::Win32::Foundation::GetLastError() } != ERROR_INSUFFICIENT_BUFFER
+    {
+        return Err(format!(
+            "profile directory size query failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let mut path = vec![0_u16; chars as usize];
+    if unsafe { GetUserProfileDirectoryW(token, path.as_mut_ptr(), &raw mut chars) } == 0 {
+        return Err(format!(
+            "profile directory query failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    path.truncate(chars as usize);
+    if path.last() == Some(&0) {
+        path.pop();
+    }
+    use std::os::windows::ffi::OsStringExt;
+    let filesystem_path = PathBuf::from(std::ffi::OsString::from_wide(&path));
+    let path_bytes = path
+        .iter()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect::<Vec<_>>();
+    Ok((super::record::digest(&path_bytes), filesystem_path.is_dir()))
+}
+
+fn observe_loader_profile(
+    token: HANDLE,
+    authenticated_user_sid: &str,
+) -> LoaderProfileObservationV1 {
+    let (profile_directory_sha256, profile_directory_exists) = match loader_profile_directory(token)
+    {
+        Ok(observation) => observation,
+        Err(error) => {
+            return LoaderProfileObservationV1 {
+                state: LoaderProfileHiveStateV1::QueryFailed(
+                    io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or_default() as u32,
+                ),
+                profile_directory_sha256: super::record::digest(error.as_bytes()),
+                profile_directory_exists: false,
+            };
+        }
+    };
+    let key_name = super::pipe::wide_null(authenticated_user_sid);
+    let mut key: HKEY = ptr::null_mut();
+    let status = unsafe { RegOpenKeyExW(HKEY_USERS, key_name.as_ptr(), 0, KEY_READ, &raw mut key) };
+    let state = if status == 0 {
+        unsafe { RegCloseKey(key) };
+        LoaderProfileHiveStateV1::AlreadyLoadedBorrowed
+    } else if matches!(status, ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) {
+        LoaderProfileHiveStateV1::Absent
+    } else if status == ERROR_ACCESS_DENIED {
+        LoaderProfileHiveStateV1::AccessDenied
+    } else {
+        LoaderProfileHiveStateV1::QueryFailed(status)
+    };
+    LoaderProfileObservationV1 {
+        state,
+        profile_directory_sha256,
+        profile_directory_exists,
+    }
+}
+
+struct LocalProfileSid(*mut c_void);
+
+impl Drop for LocalProfileSid {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { LocalFree(self.0) };
+        }
+    }
+}
+
+fn resolve_loader_profile_account_name(user_sid: &str) -> Result<(Vec<u16>, String), String> {
+    let wide_sid = super::pipe::wide_null(user_sid);
+    let mut raw_sid = ptr::null_mut();
+    if unsafe { ConvertStringSidToSidW(wide_sid.as_ptr(), &raw mut raw_sid) } == 0 {
+        return Err(format!(
+            "profile SID conversion failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let sid = LocalProfileSid(raw_sid);
+    let mut name_chars = 0_u32;
+    let mut domain_chars = 0_u32;
+    let mut use_kind: SID_NAME_USE = 0;
+    unsafe {
+        LookupAccountSidW(
+            ptr::null(),
+            sid.0,
+            ptr::null_mut(),
+            &raw mut name_chars,
+            ptr::null_mut(),
+            &raw mut domain_chars,
+            &raw mut use_kind,
+        )
+    };
+    if name_chars == 0
+        || unsafe { windows_sys::Win32::Foundation::GetLastError() } != ERROR_INSUFFICIENT_BUFFER
+    {
+        return Err(format!(
+            "profile account size query failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let mut name = vec![0_u16; name_chars as usize];
+    let mut domain = vec![0_u16; domain_chars as usize];
+    if unsafe {
+        LookupAccountSidW(
+            ptr::null(),
+            sid.0,
+            name.as_mut_ptr(),
+            &raw mut name_chars,
+            domain.as_mut_ptr(),
+            &raw mut domain_chars,
+            &raw mut use_kind,
+        )
+    } == 0
+        || use_kind != SidTypeUser
+    {
+        return Err("profile account resolution failed or was not a user SID".to_owned());
+    }
+    name.truncate(name_chars as usize);
+    domain.truncate(domain_chars as usize);
+    if name.last() == Some(&0) {
+        name.pop();
+    }
+    if domain.last() == Some(&0) {
+        domain.pop();
+    }
+    let mut qualified = domain;
+    if !qualified.is_empty() {
+        qualified.push('\\' as u16);
+    }
+    qualified.extend_from_slice(&name);
+    qualified.push(0);
+    let mut sid_bytes = 0_u32;
+    let mut roundtrip_domain_chars = 0_u32;
+    let mut roundtrip_use: SID_NAME_USE = 0;
+    unsafe {
+        LookupAccountNameW(
+            ptr::null(),
+            qualified.as_ptr(),
+            ptr::null_mut(),
+            &raw mut sid_bytes,
+            ptr::null_mut(),
+            &raw mut roundtrip_domain_chars,
+            &raw mut roundtrip_use,
+        )
+    };
+    if sid_bytes == 0
+        || unsafe { windows_sys::Win32::Foundation::GetLastError() } != ERROR_INSUFFICIENT_BUFFER
+    {
+        return Err("profile account round-trip size query failed".to_owned());
+    }
+    let mut roundtrip_sid = vec![0_u32; (sid_bytes as usize).div_ceil(4)];
+    let mut roundtrip_domain = vec![0_u16; roundtrip_domain_chars as usize];
+    if unsafe {
+        LookupAccountNameW(
+            ptr::null(),
+            qualified.as_ptr(),
+            roundtrip_sid.as_mut_ptr().cast(),
+            &raw mut sid_bytes,
+            roundtrip_domain.as_mut_ptr(),
+            &raw mut roundtrip_domain_chars,
+            &raw mut roundtrip_use,
+        )
+    } == 0
+        || roundtrip_use != SidTypeUser
+        || unsafe { EqualSid(sid.0, roundtrip_sid.as_mut_ptr().cast()) } == 0
+    {
+        return Err("profile account did not round-trip to the authenticated SID".to_owned());
+    }
+    let qualified_bytes = qualified
+        .iter()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect::<Vec<_>>();
+    name.push(0);
+    Ok((name, super::record::digest(&qualified_bytes)))
+}
+
+struct TargetUserProfileLease {
+    token: OwnedHandle,
+    profile: HANDLE,
+    account_binding_sha256: String,
+    profile_directory_sha256: String,
+    active: bool,
+}
+
+impl TargetUserProfileLease {
+    fn acquire(profile_capability: HANDLE, authenticated_user_sid: &str) -> Result<Self, String> {
+        const PROFILE_ACCESS: u32 = TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE;
+        let token = duplicate_local_handle_with_access(
+            profile_capability,
+            PROFILE_ACCESS,
+            PROFILE_ACCESS,
+            "loader-profile-capability-lease",
+        )?;
+        let (mut user_name, account_binding_sha256) =
+            resolve_loader_profile_account_name(authenticated_user_sid)?;
+        let (profile_directory_sha256, _) = loader_profile_directory(token.raw())?;
+        let mut profile = ProfileInfoW {
+            size: std::mem::size_of::<ProfileInfoW>() as u32,
+            flags: 1,
+            user_name: user_name.as_mut_ptr(),
+            profile_path: ptr::null_mut(),
+            default_path: ptr::null_mut(),
+            server_name: ptr::null_mut(),
+            policy_path: ptr::null_mut(),
+            profile: ptr::null_mut(),
+        };
+        super::token::with_scoped_loader_profile_privileges(|| {
+            if unsafe { LoadUserProfileW(token.raw(), &raw mut profile) } == 0 {
+                Err(format!(
+                    "LoadUserProfileW failed: {}",
+                    io::Error::last_os_error()
+                ))
+            } else {
+                Ok(())
+            }
+        })?;
+        if profile.profile.is_null() {
+            return Err("LoadUserProfileW returned an empty profile authority".to_owned());
+        }
+        Ok(Self {
+            token,
+            profile: profile.profile,
+            account_binding_sha256,
+            profile_directory_sha256,
+            active: true,
+        })
+    }
+
+    fn unload(mut self) -> Result<String, String> {
+        let result = super::token::with_scoped_loader_profile_privileges(|| {
+            if unsafe { UnloadUserProfile(self.token.raw(), self.profile) } == 0 {
+                Err(format!(
+                    "UnloadUserProfile failed: {}",
+                    io::Error::last_os_error()
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        self.active = false;
+        result.map(|()| {
+            format!(
+                "owned-unloaded account_binding_sha256={} profile_directory_sha256={}",
+                self.account_binding_sha256, self.profile_directory_sha256
+            )
+        })
+    }
+}
+
+impl Drop for TargetUserProfileLease {
+    fn drop(&mut self) {
+        if self.active {
+            eprintln!(
+                "MCSEALED-WINDOWS-LOADER-PROFILE-RETAINED: owned profile lease dropped before UnloadUserProfile"
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderEnvironmentAuthorityV5 {
+    MatrixProjection,
+    TargetTokenUserenv,
+    TargetTokenUserenvBorrowedProfile,
+    TargetTokenUserenvProfileLease,
+}
+
+enum LoaderCellEnvironmentSourceV6<'a> {
+    Create(LoaderEnvironmentAuthorityV5),
+    BorrowedUserenv {
+        block: &'a mut OwnedUserEnvironmentBlock,
+        inventory: UserEnvironmentInventoryV1,
+    },
+}
+
+impl<'a> LoaderCellEnvironmentSourceV6<'a> {
+    const fn authority(&self) -> LoaderEnvironmentAuthorityV5 {
+        match self {
+            Self::Create(authority) => *authority,
+            Self::BorrowedUserenv { .. } => {
+                LoaderEnvironmentAuthorityV5::TargetTokenUserenvBorrowedProfile
+            }
+        }
+    }
+
+    fn into_environment(
+        self,
+        target_token: HANDLE,
+        matrix_mode: LoaderEnvironmentModeV4,
+    ) -> Result<LoaderLaunchEnvironmentV5<'a>, TargetDesktopLeaseCreateError> {
+        match self {
+            Self::Create(authority) => {
+                LoaderLaunchEnvironmentV5::create(target_token, matrix_mode, authority)
+            }
+            Self::BorrowedUserenv { block, inventory } => Ok(
+                LoaderLaunchEnvironmentV5::borrowed_userenv(block, &inventory),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoaderObjectSecurityAuthorityV1 {
+    LauncherExplicit,
+    LauncherExplicitRestrictingSidCanary,
+    TargetAwareProcess,
+    TargetAwareThread,
+    TargetAwareBoth,
+}
+
+impl LoaderObjectSecurityAuthorityV1 {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::LauncherExplicit => "launcher-explicit-v1",
+            Self::LauncherExplicitRestrictingSidCanary => "launcher-explicit-v1",
+            Self::TargetAwareProcess => "target-aware-process-v1",
+            Self::TargetAwareThread => "target-aware-thread-v1",
+            Self::TargetAwareBoth => "target-aware-both-v1",
+        }
+    }
+
+    const fn uses_target_policy(self) -> bool {
+        matches!(
+            self,
+            Self::TargetAwareProcess | Self::TargetAwareThread | Self::TargetAwareBoth
+        )
+    }
+
+    const fn diagnostic_only(self) -> bool {
+        !matches!(self, Self::LauncherExplicit)
+    }
+}
+
+struct OwnedUserEnvironmentBlock {
+    raw: *mut c_void,
+    units: usize,
+    entries: usize,
+    sha256: String,
+    keys_sha256: String,
+    missing_required: Vec<String>,
+}
+
+impl OwnedUserEnvironmentBlock {
+    fn create(target_token: HANDLE) -> Result<Self, TargetDesktopLeaseCreateError> {
+        let mut raw = ptr::null_mut();
+        // SAFETY: target_token is the exact live authenticated primary token, inherit is FALSE,
+        // and ownership of a successful allocation transfers to this RAII object.
+        if unsafe { CreateEnvironmentBlock(&raw mut raw, target_token, 0) } == 0 {
+            return Err(format!(
+                "target-token environment creation failed: {}",
+                io::Error::last_os_error()
+            )
+            .into());
+        }
+        if raw.is_null() {
+            return Err("target-token environment creation returned a null block"
+                .to_owned()
+                .into());
+        }
+        let mut block = Self {
+            raw,
+            units: 0,
+            entries: 0,
+            sha256: String::new(),
+            keys_sha256: String::new(),
+            missing_required: Vec::new(),
+        };
+        let inventory = bounded_user_environment_inventory(block.raw)?;
+        block.units = inventory.units;
+        block.entries = inventory.entries;
+        block.sha256 = inventory.sha256;
+        block.keys_sha256 = inventory.keys_sha256;
+        block.missing_required = inventory.missing_required;
+        Ok(block)
+    }
+
+    fn pointer(&mut self) -> *mut c_void {
+        self.raw
+    }
+
+    fn inventory(&self) -> Result<UserEnvironmentInventoryV1, TargetDesktopLeaseCreateError> {
+        bounded_user_environment_inventory(self.raw)
+    }
+
+    fn destroy_after_create(&mut self) -> Result<(), TargetDesktopLeaseCreateError> {
+        let raw = std::mem::replace(&mut self.raw, ptr::null_mut());
+        if raw.is_null() {
+            return Err("target-token environment block was already destroyed"
+                .to_owned()
+                .into());
+        }
+        // SAFETY: raw is the exact live allocation returned by CreateEnvironmentBlock and this
+        // method consumes its ownership before making the sole destruction call.
+        if unsafe { DestroyEnvironmentBlock(raw) } == 0 {
+            return Err(format!(
+                "target-token environment destruction failed: {}",
+                io::Error::last_os_error()
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OwnedUserEnvironmentBlock {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            let raw = std::mem::replace(&mut self.raw, ptr::null_mut());
+            // SAFETY: this is the still-owned CreateEnvironmentBlock allocation. This fallback
+            // covers construction/pre-creation unwinds; the launch path destroys it explicitly.
+            unsafe { DestroyEnvironmentBlock(raw) };
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UserEnvironmentInventoryV1 {
+    units: usize,
+    entries: usize,
+    sha256: String,
+    keys_sha256: String,
+    missing_required: Vec<String>,
+}
+
+struct SharedEnvironmentObservationV1 {
+    scan: &'static str,
+    metadata_match: bool,
+    detail_sha256: String,
+}
+
+impl SharedEnvironmentObservationV1 {
+    fn stable(&self) -> bool {
+        self.scan == "ok" && self.metadata_match
+    }
+}
+
+fn shared_environment_observation(
+    admitted: &UserEnvironmentInventoryV1,
+    observed: &Result<UserEnvironmentInventoryV1, TargetDesktopLeaseCreateError>,
+    checkpoint: &str,
+) -> SharedEnvironmentObservationV1 {
+    match observed {
+        Ok(observed) if observed == admitted => SharedEnvironmentObservationV1 {
+            scan: "ok",
+            metadata_match: true,
+            detail_sha256: "none".to_owned(),
+        },
+        Ok(observed) => {
+            let detail = format!(
+                "checkpoint={checkpoint} classification=metadata-mismatch admitted_sha256={} admitted_keys_sha256={} admitted_units={} admitted_entries={} admitted_missing_required_sha256={} observed_sha256={} observed_keys_sha256={} observed_units={} observed_entries={} observed_missing_required_sha256={}",
+                admitted.sha256,
+                admitted.keys_sha256,
+                admitted.units,
+                admitted.entries,
+                super::record::digest(admitted.missing_required.join("\0").as_bytes()),
+                observed.sha256,
+                observed.keys_sha256,
+                observed.units,
+                observed.entries,
+                super::record::digest(observed.missing_required.join("\0").as_bytes()),
+            );
+            SharedEnvironmentObservationV1 {
+                scan: "ok",
+                metadata_match: false,
+                detail_sha256: super::record::digest(detail.as_bytes()),
+            }
+        }
+        Err(error) => {
+            let detail = format!(
+                "checkpoint={checkpoint} classification=scan-error detail={}",
+                error.detail
+            );
+            SharedEnvironmentObservationV1 {
+                scan: "error",
+                metadata_match: false,
+                detail_sha256: super::record::digest(detail.as_bytes()),
+            }
+        }
+    }
+}
+
+enum LoaderLaunchEnvironmentStorageV5<'a> {
+    Projected(Vec<u16>),
+    Userenv(OwnedUserEnvironmentBlock),
+    BorrowedUserenv(&'a mut OwnedUserEnvironmentBlock),
+}
+
+struct LoaderLaunchEnvironmentV5<'a> {
+    storage: LoaderLaunchEnvironmentStorageV5<'a>,
+    classification: &'static str,
+    sha256: String,
+    visible_keys: Vec<String>,
+    keys_sha256: String,
+    missing_required: Vec<String>,
+    units: usize,
+    entries: usize,
+    profile_loaded: bool,
+}
+
+impl<'a> LoaderLaunchEnvironmentV5<'a> {
+    fn create(
+        target_token: HANDLE,
+        matrix_mode: LoaderEnvironmentModeV4,
+        authority: LoaderEnvironmentAuthorityV5,
+    ) -> Result<Self, TargetDesktopLeaseCreateError> {
+        match authority {
+            LoaderEnvironmentAuthorityV5::MatrixProjection => {
+                let projected = loader_environment_block(matrix_mode)?;
+                let keys_sha256 = loader_environment_keys_sha256(&projected.keys);
+                let units = projected.units.len();
+                let entries = projected.keys.len();
+                Ok(Self {
+                    storage: LoaderLaunchEnvironmentStorageV5::Projected(projected.units),
+                    classification: projected.classification,
+                    sha256: projected.sha256,
+                    visible_keys: projected.keys,
+                    keys_sha256,
+                    missing_required: projected.missing_required,
+                    units,
+                    entries,
+                    profile_loaded: false,
+                })
+            }
+            LoaderEnvironmentAuthorityV5::TargetTokenUserenv => {
+                let block = OwnedUserEnvironmentBlock::create(target_token)?;
+                Ok(Self {
+                    classification: "target-token-userenv-v1",
+                    sha256: block.sha256.clone(),
+                    visible_keys: Vec::new(),
+                    keys_sha256: block.keys_sha256.clone(),
+                    missing_required: block.missing_required.clone(),
+                    units: block.units,
+                    entries: block.entries,
+                    profile_loaded: false,
+                    storage: LoaderLaunchEnvironmentStorageV5::Userenv(block),
+                })
+            }
+            LoaderEnvironmentAuthorityV5::TargetTokenUserenvProfileLease => {
+                let block = OwnedUserEnvironmentBlock::create(target_token)?;
+                Ok(Self {
+                    classification: "target-token-userenv-owned-profile-v1",
+                    sha256: block.sha256.clone(),
+                    visible_keys: Vec::new(),
+                    keys_sha256: block.keys_sha256.clone(),
+                    missing_required: block.missing_required.clone(),
+                    units: block.units,
+                    entries: block.entries,
+                    profile_loaded: true,
+                    storage: LoaderLaunchEnvironmentStorageV5::Userenv(block),
+                })
+            }
+            LoaderEnvironmentAuthorityV5::TargetTokenUserenvBorrowedProfile => {
+                let block = OwnedUserEnvironmentBlock::create(target_token)?;
+                Ok(Self {
+                    classification: "target-token-userenv-borrowed-profile-v1",
+                    sha256: block.sha256.clone(),
+                    visible_keys: Vec::new(),
+                    keys_sha256: block.keys_sha256.clone(),
+                    missing_required: block.missing_required.clone(),
+                    units: block.units,
+                    entries: block.entries,
+                    profile_loaded: true,
+                    storage: LoaderLaunchEnvironmentStorageV5::Userenv(block),
+                })
+            }
+        }
+    }
+}
+
+impl<'a> LoaderLaunchEnvironmentV5<'a> {
+    fn borrowed_userenv(
+        block: &'a mut OwnedUserEnvironmentBlock,
+        inventory: &UserEnvironmentInventoryV1,
+    ) -> Self {
+        Self {
+            classification: "target-token-userenv-borrowed-profile-v1",
+            sha256: inventory.sha256.clone(),
+            visible_keys: Vec::new(),
+            keys_sha256: inventory.keys_sha256.clone(),
+            missing_required: inventory.missing_required.clone(),
+            units: inventory.units,
+            entries: inventory.entries,
+            profile_loaded: true,
+            storage: LoaderLaunchEnvironmentStorageV5::BorrowedUserenv(block),
+        }
+    }
+
+    fn pointer(&mut self) -> *mut c_void {
+        match &mut self.storage {
+            LoaderLaunchEnvironmentStorageV5::Projected(units) => units.as_mut_ptr().cast(),
+            LoaderLaunchEnvironmentStorageV5::Userenv(block) => block.pointer(),
+            LoaderLaunchEnvironmentStorageV5::BorrowedUserenv(block) => block.pointer(),
+        }
+    }
+
+    fn destroy_userenv_after_create(&mut self) -> Result<(), TargetDesktopLeaseCreateError> {
+        match &mut self.storage {
+            LoaderLaunchEnvironmentStorageV5::Projected(_) => Ok(()),
+            LoaderLaunchEnvironmentStorageV5::Userenv(block) => block.destroy_after_create(),
+            LoaderLaunchEnvironmentStorageV5::BorrowedUserenv(_) => Ok(()),
+        }
+    }
+}
+
+fn loader_environment_keys_sha256(keys: &[String]) -> String {
+    let mut keys = keys
+        .iter()
+        .map(|key| key.to_ascii_uppercase())
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    let mut canonical = b"memcordon-loader-environment-keys-v1\0".to_vec();
+    for key in &keys {
+        canonical.extend_from_slice(key.as_bytes());
+        canonical.push(0);
+    }
+    super::record::digest(&canonical)
+}
+
+fn bounded_user_environment_inventory(
+    raw: *mut c_void,
+) -> Result<UserEnvironmentInventoryV1, TargetDesktopLeaseCreateError> {
+    if raw.is_null() {
+        return Err("target-token environment block is null".to_owned().into());
+    }
+    let pointer = raw.cast::<u16>();
+    let mut length = None;
+    for index in 0..LOADER_ENVIRONMENT_MAX_UNITS.saturating_sub(1) {
+        // SAFETY: Userenv promises a double-NUL block; the scan is bounded by the documented
+        // native environment limit and stops before reading beyond that bound.
+        let current = unsafe { *pointer.add(index) };
+        let next = unsafe { *pointer.add(index + 1) };
+        if current == 0 && next == 0 {
+            length = Some(index + 2);
+            break;
+        }
+    }
+    let length = length.ok_or_else(|| {
+        TargetDesktopLeaseCreateError::from(
+            "target-token environment is not double-NUL terminated within its native bound"
+                .to_owned(),
+        )
+    })?;
+    // SAFETY: the bounded scan proved the full slice readable through its terminal double NUL.
+    user_environment_inventory_from_units(unsafe { std::slice::from_raw_parts(pointer, length) })
+}
+
+fn user_environment_inventory_from_units(
+    units: &[u16],
+) -> Result<UserEnvironmentInventoryV1, TargetDesktopLeaseCreateError> {
+    if units.len() < 2
+        || units.len() > LOADER_ENVIRONMENT_MAX_UNITS
+        || units[units.len() - 2..] != [0, 0]
+    {
+        return Err(
+            "target-token environment units are not a bounded double-NUL block"
+                .to_owned()
+                .into(),
+        );
+    }
+    if units[..units.len() - 2]
+        .windows(2)
+        .any(|pair| pair == [0, 0])
+    {
+        return Err(
+            "target-token environment contains a premature terminal double NUL"
+                .to_owned()
+                .into(),
+        );
+    }
+    let mut block_digest = b"memcordon-target-token-userenv-v1\0".to_vec();
+    for unit in units {
+        block_digest.extend_from_slice(&unit.to_le_bytes());
+    }
+    let mut keys = BTreeSet::new();
+    let mut start = 0_usize;
+    while start + 1 < units.len() && units[start] != 0 {
+        let end = units[start..]
+            .iter()
+            .position(|unit| *unit == 0)
+            .map(|offset| start + offset)
+            .ok_or_else(|| {
+                TargetDesktopLeaseCreateError::from(
+                    "target-token environment entry is unterminated".to_owned(),
+                )
+            })?;
+        let entry = &units[start..end];
+        String::from_utf16(entry).map_err(|_| {
+            TargetDesktopLeaseCreateError::from(
+                "target-token environment entry is not valid UTF-16".to_owned(),
+            )
+        })?;
+        let search = entry.strip_prefix(&[b'=' as u16]).unwrap_or(entry);
+        let relative_separator = search.iter().position(|unit| *unit == b'=' as u16);
+        let separator = relative_separator
+            .map(|offset| entry.len().saturating_sub(search.len()) + offset)
+            .filter(|separator| *separator != 0)
+            .ok_or_else(|| {
+                TargetDesktopLeaseCreateError::from(
+                    "target-token environment entry has no key separator".to_owned(),
+                )
+            })?;
+        let key = String::from_utf16(&entry[..separator])
+            .map_err(|_| {
+                TargetDesktopLeaseCreateError::from(
+                    "target-token environment key is not valid UTF-16".to_owned(),
+                )
+            })?
+            .to_ascii_uppercase();
+        if !keys.insert(key) {
+            return Err(
+                "target-token environment contains a duplicate case-insensitive key"
+                    .to_owned()
+                    .into(),
+            );
+        }
+        start = end + 1;
+    }
+    let keys = keys.into_iter().collect::<Vec<_>>();
+    let missing_required = LOADER_REQUIRED_ENVIRONMENT_KEYS
+        .iter()
+        .filter(|required| !keys.iter().any(|key| key.eq_ignore_ascii_case(required)))
+        .map(|required| (*required).to_owned())
+        .collect();
+    Ok(UserEnvironmentInventoryV1 {
+        units: units.len(),
+        entries: keys.len(),
+        sha256: super::record::digest(&block_digest),
+        keys_sha256: loader_environment_keys_sha256(&keys),
+        missing_required,
+    })
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserEnvironmentInventoryForTest {
+    pub units: usize,
+    pub entries: usize,
+    pub sha256: String,
+    pub keys_sha256: String,
+    pub missing_required: Vec<String>,
+}
+
+#[cfg(test)]
+pub(crate) fn bounded_user_environment_inventory_for_test(
+    units: Option<&[u16]>,
+) -> Result<UserEnvironmentInventoryForTest, String> {
+    let units = units.ok_or_else(|| "target-token environment block is null".to_owned())?;
+    user_environment_inventory_from_units(units)
+        .map(|inventory| UserEnvironmentInventoryForTest {
+            units: inventory.units,
+            entries: inventory.entries,
+            sha256: inventory.sha256,
+            keys_sha256: inventory.keys_sha256,
+            missing_required: inventory.missing_required,
+        })
+        .map_err(|error| error.detail)
+}
+
+#[cfg(test)]
+pub(crate) fn loader_shared_environment_pair_valid_for_test(
+    admitted: &[u16],
+    baseline: &[u16],
+    comparison: &[u16],
+    after_baseline: &[u16],
+    after_comparison: &[u16],
+    destroyed: bool,
+) -> Result<bool, String> {
+    let admitted = user_environment_inventory_from_units(admitted).map_err(|error| error.detail)?;
+    let inventories = [baseline, comparison, after_baseline, after_comparison]
+        .map(user_environment_inventory_from_units);
+    Ok(destroyed
+        && admitted.missing_required.is_empty()
+        && inventories.iter().enumerate().all(|(index, inventory)| {
+            shared_environment_observation(
+                &admitted,
+                inventory,
+                [
+                    "baseline",
+                    "comparison",
+                    "after-baseline",
+                    "after-comparison",
+                ][index],
+            )
+            .stable()
+        }))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loader_shared_environment_triplet_valid_for_test(
+    admitted: &[u16],
+    baseline: &[u16],
+    after_baseline: &[u16],
+    comparison: &[u16],
+    after_comparison: &[u16],
+    same_access: &[u16],
+    after_same_access: &[u16],
+    destroyed: bool,
+) -> Result<bool, String> {
+    let admitted = user_environment_inventory_from_units(admitted).map_err(|error| error.detail)?;
+    let inventories = [
+        baseline,
+        after_baseline,
+        comparison,
+        after_comparison,
+        same_access,
+        after_same_access,
+    ]
+    .map(user_environment_inventory_from_units);
+    Ok(destroyed
+        && admitted.missing_required.is_empty()
+        && inventories.iter().enumerate().all(|(index, inventory)| {
+            shared_environment_observation(
+                &admitted,
+                inventory,
+                [
+                    "baseline",
+                    "after-baseline",
+                    "comparison",
+                    "after-comparison",
+                    "same-access",
+                    "after-same-access",
+                ][index],
+            )
+            .stable()
+        }))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loader_shared_environment_quad_valid_for_test(
+    admitted: &[u16],
+    baseline: &[u16],
+    after_baseline: &[u16],
+    comparison: &[u16],
+    after_comparison: &[u16],
+    same_access: &[u16],
+    after_same_access: &[u16],
+    logon: &[u16],
+    after_logon: &[u16],
+    destroyed: bool,
+) -> Result<bool, String> {
+    let admitted = user_environment_inventory_from_units(admitted).map_err(|error| error.detail)?;
+    let inventories = [
+        baseline,
+        after_baseline,
+        comparison,
+        after_comparison,
+        same_access,
+        after_same_access,
+        logon,
+        after_logon,
+    ]
+    .map(user_environment_inventory_from_units);
+    Ok(destroyed
+        && admitted.missing_required.is_empty()
+        && inventories.iter().enumerate().all(|(index, inventory)| {
+            shared_environment_observation(
+                &admitted,
+                inventory,
+                [
+                    "baseline",
+                    "after-baseline",
+                    "comparison",
+                    "after-comparison",
+                    "same-access",
+                    "after-same-access",
+                    "logon",
+                    "after-logon",
+                ][index],
+            )
+            .stable()
+        }))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loader_shared_environment_quint_valid_for_test(
+    admitted: &[u16],
+    baseline: &[u16],
+    after_baseline: &[u16],
+    comparison: &[u16],
+    after_comparison: &[u16],
+    same_access: &[u16],
+    after_same_access: &[u16],
+    logon: &[u16],
+    after_logon: &[u16],
+    authenticated_users: &[u16],
+    after_authenticated_users: &[u16],
+    destroyed: bool,
+) -> Result<bool, String> {
+    let admitted = user_environment_inventory_from_units(admitted).map_err(|error| error.detail)?;
+    let inventories = [
+        baseline,
+        after_baseline,
+        comparison,
+        after_comparison,
+        same_access,
+        after_same_access,
+        logon,
+        after_logon,
+        authenticated_users,
+        after_authenticated_users,
+    ]
+    .map(user_environment_inventory_from_units);
+    Ok(destroyed
+        && admitted.missing_required.is_empty()
+        && inventories.iter().enumerate().all(|(index, inventory)| {
+            shared_environment_observation(
+                &admitted,
+                inventory,
+                [
+                    "baseline",
+                    "after-baseline",
+                    "comparison",
+                    "after-comparison",
+                    "same-access",
+                    "after-same-access",
+                    "logon",
+                    "after-logon",
+                    "authenticated-users",
+                    "after-authenticated-users",
+                ][index],
+            )
+            .stable()
+        }))
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loader_shared_environment_sext_valid_for_test(
+    admitted: &[u16],
+    baseline: &[u16],
+    after_baseline: &[u16],
+    comparison: &[u16],
+    after_comparison: &[u16],
+    same_access: &[u16],
+    after_same_access: &[u16],
+    logon: &[u16],
+    after_logon: &[u16],
+    authenticated_users: &[u16],
+    after_authenticated_users: &[u16],
+    target_user: &[u16],
+    after_target_user: &[u16],
+    destroyed: bool,
+) -> Result<bool, String> {
+    let admitted = user_environment_inventory_from_units(admitted).map_err(|error| error.detail)?;
+    let inventories = [
+        baseline,
+        after_baseline,
+        comparison,
+        after_comparison,
+        same_access,
+        after_same_access,
+        logon,
+        after_logon,
+        authenticated_users,
+        after_authenticated_users,
+        target_user,
+        after_target_user,
+    ]
+    .map(user_environment_inventory_from_units);
+    Ok(destroyed
+        && admitted.missing_required.is_empty()
+        && inventories.iter().enumerate().all(|(index, inventory)| {
+            shared_environment_observation(
+                &admitted,
+                inventory,
+                [
+                    "baseline",
+                    "after-baseline",
+                    "comparison",
+                    "after-comparison",
+                    "same-access",
+                    "after-same-access",
+                    "logon",
+                    "after-logon",
+                    "authenticated-users",
+                    "after-authenticated-users",
+                    "target-user",
+                    "after-target-user",
+                ][index],
+            )
+            .stable()
+        }))
+}
+
+#[cfg(test)]
+pub(crate) fn loader_shared_environment_octet_valid_for_test(
+    admitted: &[u16],
+    observations: [&[u16]; 16],
+    destroyed: bool,
+) -> Result<bool, String> {
+    let admitted = user_environment_inventory_from_units(admitted).map_err(|error| error.detail)?;
+    let inventories = observations.map(user_environment_inventory_from_units);
+    Ok(destroyed
+        && admitted.missing_required.is_empty()
+        && inventories.iter().enumerate().all(|(index, inventory)| {
+            shared_environment_observation(
+                &admitted,
+                inventory,
+                [
+                    "baseline",
+                    "after-baseline",
+                    "comparison",
+                    "after-comparison",
+                    "same-access",
+                    "after-same-access",
+                    "logon",
+                    "after-logon",
+                    "authenticated-users",
+                    "after-authenticated-users",
+                    "target-user",
+                    "after-target-user",
+                    "debug-c",
+                    "after-debug-c",
+                    "debug-f",
+                    "after-debug-f",
+                ][index],
+            )
+            .stable()
+        }))
+}
+
+#[cfg(test)]
+pub(crate) fn render_loader_shared_environment_observation_for_test(
+    admitted: &[u16],
+    observed: &[u16],
+    checkpoint: &str,
+) -> Result<String, String> {
+    let admitted = user_environment_inventory_from_units(admitted).map_err(|error| error.detail)?;
+    let observed = user_environment_inventory_from_units(observed);
+    let evidence = shared_environment_observation(&admitted, &observed, checkpoint);
+    Ok(format!(
+        "shared_environment_scan={} shared_environment_metadata_match={} shared_environment_observation_sha256={} environment_values_redacted=true",
+        evidence.scan, evidence.metadata_match, evidence.detail_sha256,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) const fn loader_environment_max_units_for_test() -> usize {
+    LOADER_ENVIRONMENT_MAX_UNITS
 }
 
 fn loader_environment_block(
@@ -3210,6 +9429,123 @@ fn loader_environment_block(
         sha256: super::record::digest(&canonical),
         keys,
         missing_required,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn loader_control_matrix_contract_for_test() -> (
+    (&'static str, &'static str),
+    [(&'static str, &'static str); 6],
+) {
+    (
+        (
+            LoaderControlMatrixCellV4::PRODUCTION
+                .environment
+                .diagnostic(),
+            LoaderControlMatrixCellV4::PRODUCTION.diagnostic(),
+        ),
+        LoaderControlMatrixCellV4::CERTIFICATION
+            .map(|cell| (cell.environment.diagnostic(), cell.diagnostic())),
+    )
+}
+
+#[cfg(test)]
+fn loader_failure_for_test(cell: LoaderControlMatrixCellV4) -> TargetDesktopLeaseCreateError {
+    TargetDesktopLeaseCreateError {
+        detail: if cell.debugger == LoaderDebuggerRelationV5::None {
+            "failure_phase=pre-initial-breakpoint-static-loader".to_owned()
+        } else {
+            "failure_phase=pre-initial-breakpoint-static-loader loader_trace=v4".to_owned()
+        },
+        os_code: Some(0xc000_0142_u32 as i32),
+        loader_phase: LoaderLaunchFailurePhaseV1::PreInitialBreakpointStaticLoader,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn loader_failure_evidence_ranks_for_test() -> [(&'static str, &'static str); 6] {
+    LoaderControlMatrixCellV4::CERTIFICATION.map(|cell| {
+        let error = loader_failure_for_test(cell);
+        (
+            cell.diagnostic(),
+            loader_failure_evidence_rank(cell, &error).diagnostic(),
+        )
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn select_loader_failure_evidence_for_test(
+    order: &[usize],
+) -> Result<&'static str, String> {
+    let mut selected = None;
+    for index in order {
+        let cell = *LoaderControlMatrixCellV4::CERTIFICATION
+            .get(*index)
+            .ok_or_else(|| format!("loader matrix test index {index} is out of range"))?;
+        let rank = loader_failure_evidence_rank(cell, &loader_failure_for_test(cell));
+        if loader_failure_should_replace(selected.map(|(rank, _)| rank), rank) {
+            selected = Some((rank, cell.diagnostic()));
+        }
+    }
+    selected
+        .map(|(_, cell)| cell)
+        .ok_or_else(|| "loader matrix test order is empty".to_owned())
+}
+
+#[cfg(test)]
+pub(crate) fn render_loader_control_matrix_failure_for_test(
+    order: &[usize],
+    selected_detail: &str,
+) -> Result<String, String> {
+    let mut outcomes = Vec::with_capacity(order.len());
+    for index in order {
+        let cell = *LoaderControlMatrixCellV4::CERTIFICATION
+            .get(*index)
+            .ok_or_else(|| format!("loader matrix test index {index} is out of range"))?;
+        let error = loader_failure_for_test(cell);
+        outcomes.push(LoaderControlMatrixOutcomeV6 {
+            cell: cell.diagnostic(),
+            outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+            native_status: error.os_code,
+            failure_phase: loader_failure_phase(&error),
+            child_trace: error.detail.contains("loader_trace=v4"),
+            detail_sha256: super::record::digest(cell.diagnostic().as_bytes()),
+        });
+    }
+    let selected_cell = select_loader_failure_evidence_for_test(order)?;
+    Ok(loader_control_matrix_failure_detail(
+        selected_cell,
+        LoaderFailureEvidenceRankV6::FullObserverSnapsOn,
+        Some(0xc000_0142_u32 as i32),
+        &outcomes,
+        selected_detail,
+    ))
+}
+
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct LoaderEnvironmentBlockForTest {
+    pub(crate) units: Vec<u16>,
+    pub(crate) classification: &'static str,
+    pub(crate) keys: Vec<String>,
+    pub(crate) missing_required: Vec<String>,
+}
+
+#[cfg(test)]
+pub(crate) fn loader_environment_block_for_test(
+    canonical_minimal_system: bool,
+) -> Result<LoaderEnvironmentBlockForTest, String> {
+    let mode = if canonical_minimal_system {
+        LoaderEnvironmentModeV4::CanonicalMinimalSystem
+    } else {
+        LoaderEnvironmentModeV4::Empty
+    };
+    let block = loader_environment_block(mode).map_err(|error| error.detail)?;
+    Ok(LoaderEnvironmentBlockForTest {
+        units: block.units,
+        classification: block.classification,
+        keys: block.keys,
+        missing_required: block.missing_required,
     })
 }
 
@@ -3334,6 +9670,31 @@ fn loader_snapshot_digest<T: Serialize>(
     Ok(super::record::digest(&canonical))
 }
 
+fn loader_control_command_semantics_sha256(
+    executable: &Path,
+    action: &str,
+    exact_desktop: &str,
+    binary_sha256: &str,
+) -> String {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut material = b"memcordon-loader-control-command-semantics-v1\0".to_vec();
+    for unit in executable.as_os_str().encode_wide() {
+        material.extend_from_slice(&unit.to_le_bytes());
+    }
+    material.push(0);
+    material.extend_from_slice(action.as_bytes());
+    material.push(0);
+    material.extend_from_slice(b"dynamic:authenticated-private-pipe\0");
+    material.extend_from_slice(b"dynamic:authenticated-nonce\0");
+    for unit in exact_desktop.encode_utf16() {
+        material.extend_from_slice(&unit.to_le_bytes());
+    }
+    material.push(0);
+    material.extend_from_slice(binary_sha256.as_bytes());
+    super::record::digest(&material)
+}
+
 fn launch_target_desktop_loader_control(
     target_token: HANDLE,
     target_envelope: &WindowsCallerTokenEnvelopeV1,
@@ -3342,6 +9703,7 @@ fn launch_target_desktop_loader_control(
     launch_context: &TargetDesktopBootstrapLaunchContext,
     association_preflight: &TargetUserObjectOpenPreflightV1,
     holder_identity: &WindowsProcessIdentityV1,
+    loader_restriction_canary: Option<&LoaderRestrictionCanaryTokens>,
 ) -> Result<(), TargetDesktopLeaseCreateError> {
     if !super::loader_debug::enabled(TargetDesktopBootstrapRoleV1::LoaderControl) {
         return launch_target_desktop_loader_control_cell(
@@ -3358,10 +9720,10 @@ fn launch_target_desktop_loader_control(
     }
 
     let mut results = Vec::with_capacity(LoaderControlMatrixCellV4::CERTIFICATION.len());
-    let mut first_failure = None;
-    let mut selected_failure_has_child_trace = false;
+    let mut selected_failure = None;
+    let mut canonical_baseline = None;
     for cell in LoaderControlMatrixCellV4::CERTIFICATION {
-        match launch_target_desktop_loader_control_cell(
+        let result = launch_target_desktop_loader_control_cell(
             target_token,
             target_envelope,
             target_snapshot,
@@ -3370,40 +9732,157 @@ fn launch_target_desktop_loader_control(
             association_preflight,
             holder_identity,
             cell,
-        ) {
-            Ok(evidence) => results.push(format!(
-                "{}:passed:{}",
-                cell.diagnostic(),
-                super::record::digest(evidence.as_bytes())
-            )),
+        );
+        if cell == LoaderControlMatrixCellV4::PRODUCTION {
+            canonical_baseline = Some(clone_loader_control_result(&result));
+        }
+        match result {
+            Ok(evidence) => results.push(LoaderControlMatrixOutcomeV6 {
+                cell: cell.diagnostic(),
+                outcome: LoaderControlMatrixOutcomeKindV6::Passed,
+                native_status: None,
+                failure_phase: "none",
+                child_trace: false,
+                detail_sha256: super::record::digest(evidence.as_bytes()),
+            }),
             Err(error) => {
-                results.push(format!(
-                    "{}:failed:native={}:detail_sha256={}",
-                    cell.diagnostic(),
-                    error.os_code.map_or_else(
-                        || "unavailable".to_owned(),
-                        |code| format!("0x{:08x}", code as u32)
-                    ),
-                    super::record::digest(error.detail.as_bytes())
-                ));
-                let has_child_trace = cell.debugger != LoaderDebuggerRelationV5::None
-                    && error.os_code.is_some()
-                    && error.detail.contains("loader_trace=v4");
-                if first_failure.is_none() || (has_child_trace && !selected_failure_has_child_trace)
-                {
-                    first_failure = Some(error);
-                    selected_failure_has_child_trace = has_child_trace;
+                let child_trace = error.detail.contains("loader_trace=v4");
+                results.push(LoaderControlMatrixOutcomeV6 {
+                    cell: cell.diagnostic(),
+                    outcome: LoaderControlMatrixOutcomeKindV6::Failed,
+                    native_status: error.os_code,
+                    failure_phase: loader_failure_phase(&error),
+                    child_trace,
+                    detail_sha256: super::record::digest(error.detail.as_bytes()),
+                });
+                let rank = loader_failure_evidence_rank(cell, &error);
+                if loader_failure_should_replace(
+                    selected_failure
+                        .as_ref()
+                        .map(|(selected_rank, _, _)| *selected_rank),
+                    rank,
+                ) {
+                    selected_failure = Some((rank, cell.diagnostic(), error));
                 }
             }
         }
     }
-    if let Some(mut failure) = first_failure {
-        failure.detail = format!(
-            "{} loader_control_matrix=v5 dimensions=debugger-relation-x-loader-snaps environment=explicit-empty completed={} results=[{}]",
-            failure.detail,
-            LoaderControlMatrixCellV4::CERTIFICATION.len(),
-            results.join(",")
+    let restriction_canary = loader_restriction_canary_is_required(&results).then(|| {
+        loader_restriction_canary.map_or_else(
+            || {
+                LoaderRestrictionCanaryEvaluationV1 {
+                    diagnostic: "loader_init_prerequisite_canary=v1 state=invalid error=authenticated-control-derived-token-pair-unavailable"
+                        .to_owned(),
+                    target_environment_required: false,
+                }
+            },
+            |tokens| {
+                loader_restriction_canary_diagnostic(
+                    tokens,
+                    exact_desktop,
+                    launch_context,
+                    association_preflight,
+                    holder_identity,
+                )
+            },
+        )
+    });
+    let environment_canary = restriction_canary
+        .as_ref()
+        .filter(|evaluation| evaluation.target_environment_required)
+        .and_then(
+            |_| match (loader_restriction_canary, canonical_baseline.as_ref()) {
+                (Some(tokens), Some(baseline)) => {
+                    Some(loader_environment_prerequisite_canary_diagnostic(
+                        target_token,
+                        target_envelope,
+                        target_snapshot,
+                        exact_desktop,
+                        launch_context,
+                        association_preflight,
+                        holder_identity,
+                        tokens,
+                        baseline,
+                    ))
+                }
+                _ => None,
+            },
         );
+    let profile_canary = environment_canary
+        .as_ref()
+        .filter(|evaluation| evaluation.profile_required)
+        .and_then(|environment| {
+            loader_restriction_canary.map(|tokens| {
+                loader_profile_prerequisite_canary_diagnostic(
+                    exact_desktop,
+                    launch_context,
+                    association_preflight,
+                    holder_identity,
+                    tokens,
+                    &environment.comparison,
+                )
+            })
+        });
+    let object_security_canary = profile_canary
+        .as_ref()
+        .filter(|evaluation| evaluation.object_security_required)
+        .and_then(|profile| {
+            loader_restriction_canary.and_then(|tokens| {
+                profile.comparison.as_ref().map(|baseline| {
+                    loader_object_security_prerequisite_canary_diagnostic(
+                        exact_desktop,
+                        launch_context,
+                        association_preflight,
+                        holder_identity,
+                        tokens,
+                        baseline,
+                    )
+                })
+            })
+        });
+    let restriction_presence_canary = object_security_canary
+        .as_ref()
+        .filter(|evaluation| evaluation.restriction_presence_required)
+        .and_then(|_| {
+            loader_restriction_canary.map(|tokens| {
+                loader_restriction_presence_prerequisite_canary_diagnostic(
+                    exact_desktop,
+                    launch_context,
+                    association_preflight,
+                    holder_identity,
+                    tokens,
+                )
+            })
+        });
+    if let Some((rank, cell, mut failure)) = selected_failure {
+        let matrix_detail = loader_control_matrix_failure_detail(
+            cell,
+            rank,
+            failure.os_code,
+            &results,
+            &failure.detail,
+        );
+        let mut prerequisites = Vec::new();
+        if let Some(restriction_presence) = restriction_presence_canary {
+            prerequisites.push(restriction_presence.diagnostic);
+        }
+        if let Some(object_security) = object_security_canary {
+            prerequisites.push(object_security.diagnostic);
+        }
+        if let Some(profile) = profile_canary {
+            prerequisites.push(profile.diagnostic);
+        }
+        if let Some(environment) = environment_canary {
+            prerequisites.push(environment.diagnostic);
+        }
+        if let Some(restriction) = restriction_canary {
+            prerequisites.push(restriction.diagnostic);
+        }
+        failure.detail = if prerequisites.is_empty() {
+            matrix_detail
+        } else {
+            format!("{} {matrix_detail}", prerequisites.join(" "))
+        };
         Err(failure)
     } else {
         Ok(())
@@ -3419,6 +9898,101 @@ fn launch_target_desktop_loader_control_cell(
     association_preflight: &TargetUserObjectOpenPreflightV1,
     holder_identity: &WindowsProcessIdentityV1,
     matrix_cell: LoaderControlMatrixCellV4,
+) -> Result<String, TargetDesktopLeaseCreateError> {
+    launch_target_desktop_loader_control_cell_with_environment_authority(
+        target_token,
+        target_envelope,
+        target_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        matrix_cell,
+        LoaderEnvironmentAuthorityV5::MatrixProjection,
+        LoaderObjectSecurityAuthorityV1::LauncherExplicit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_target_desktop_loader_control_cell_with_environment_authority(
+    target_token: HANDLE,
+    target_envelope: &WindowsCallerTokenEnvelopeV1,
+    target_snapshot: &super::token::TokenAttestationSnapshot,
+    exact_desktop: &str,
+    launch_context: &TargetDesktopBootstrapLaunchContext,
+    association_preflight: &TargetUserObjectOpenPreflightV1,
+    holder_identity: &WindowsProcessIdentityV1,
+    matrix_cell: LoaderControlMatrixCellV4,
+    environment_authority: LoaderEnvironmentAuthorityV5,
+    object_security_authority: LoaderObjectSecurityAuthorityV1,
+) -> Result<String, TargetDesktopLeaseCreateError> {
+    launch_target_desktop_loader_control_cell_with_environment_source(
+        target_token,
+        target_envelope,
+        target_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        matrix_cell,
+        LoaderCellEnvironmentSourceV6::Create(environment_authority),
+        object_security_authority,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_target_desktop_loader_control_cell_with_shared_environment(
+    target_token: HANDLE,
+    target_envelope: &WindowsCallerTokenEnvelopeV1,
+    target_snapshot: &super::token::TokenAttestationSnapshot,
+    exact_desktop: &str,
+    launch_context: &TargetDesktopBootstrapLaunchContext,
+    association_preflight: &TargetUserObjectOpenPreflightV1,
+    holder_identity: &WindowsProcessIdentityV1,
+    matrix_cell: LoaderControlMatrixCellV4,
+    environment: &mut OwnedUserEnvironmentBlock,
+    admitted_inventory: &UserEnvironmentInventoryV1,
+    object_security_authority: LoaderObjectSecurityAuthorityV1,
+    passive_access_localization: Option<(
+        &super::access_trace::PassiveAccessLocalizationObserverV1,
+        super::access_trace::PassiveAccessLocalizationCellV1,
+    )>,
+) -> Result<String, TargetDesktopLeaseCreateError> {
+    launch_target_desktop_loader_control_cell_with_environment_source(
+        target_token,
+        target_envelope,
+        target_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        matrix_cell,
+        LoaderCellEnvironmentSourceV6::BorrowedUserenv {
+            block: environment,
+            inventory: admitted_inventory.clone(),
+        },
+        object_security_authority,
+        passive_access_localization,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_target_desktop_loader_control_cell_with_environment_source(
+    target_token: HANDLE,
+    target_envelope: &WindowsCallerTokenEnvelopeV1,
+    target_snapshot: &super::token::TokenAttestationSnapshot,
+    exact_desktop: &str,
+    launch_context: &TargetDesktopBootstrapLaunchContext,
+    association_preflight: &TargetUserObjectOpenPreflightV1,
+    holder_identity: &WindowsProcessIdentityV1,
+    matrix_cell: LoaderControlMatrixCellV4,
+    environment_source: LoaderCellEnvironmentSourceV6<'_>,
+    object_security_authority: LoaderObjectSecurityAuthorityV1,
+    passive_access_localization: Option<(
+        &super::access_trace::PassiveAccessLocalizationObserverV1,
+        super::access_trace::PassiveAccessLocalizationCellV1,
+    )>,
 ) -> Result<String, TargetDesktopLeaseCreateError> {
     super::token::require_thread_token_absent(unsafe { GetCurrentThread() }).map_err(|error| {
         TargetDesktopLeaseCreateError::from(format!(
@@ -3462,6 +10036,7 @@ fn launch_target_desktop_loader_control_cell(
         .map_err(|failure| TargetDesktopLeaseCreateError {
             os_code: failure.native_code,
             detail: failure.diagnostic(),
+            loader_phase: LoaderLaunchFailurePhaseV1::PreCreate,
         })?;
     let armed_diagnostic = loader_snaps
         .as_ref()
@@ -3474,6 +10049,9 @@ fn launch_target_desktop_loader_control_cell(
         launch_context,
         association_preflight,
         matrix_cell,
+        environment_source,
+        object_security_authority,
+        passive_access_localization,
     );
     let child_outcome_sha256 = match &result {
         Ok(evidence) => {
@@ -3498,6 +10076,7 @@ fn launch_target_desktop_loader_control_cell(
                 Some(TargetDesktopLeaseCreateError {
                     os_code: restoration.native_code,
                     detail: restoration.diagnostic(),
+                    loader_phase: LoaderLaunchFailurePhaseV1::ExitDrain,
                 }),
             );
         }
@@ -3537,10 +10116,12 @@ pub(crate) fn loader_snaps_failure_precedence_for_test() -> Result<(), String> {
     let primary = TargetDesktopLeaseCreateError {
         os_code: Some(0xc000_0142_u32 as i32),
         detail: "primary-child-failure".to_owned(),
+        loader_phase: LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady,
     };
     let secondary = TargetDesktopLeaseCreateError {
         os_code: Some(5),
         detail: "restore-failure".to_owned(),
+        loader_phase: LoaderLaunchFailurePhaseV1::ExitDrain,
     };
     let failure = preserve_loader_snaps_primary::<()>(Err(primary), Some(secondary))
         .expect_err("primary failure must remain terminal");
@@ -3566,6 +10147,12 @@ fn launch_target_desktop_loader_control_cell_inner(
     launch_context: &TargetDesktopBootstrapLaunchContext,
     association_preflight: &TargetUserObjectOpenPreflightV1,
     matrix_cell: LoaderControlMatrixCellV4,
+    environment_source: LoaderCellEnvironmentSourceV6<'_>,
+    object_security_authority: LoaderObjectSecurityAuthorityV1,
+    passive_access_localization: Option<(
+        &super::access_trace::PassiveAccessLocalizationObserverV1,
+        super::access_trace::PassiveAccessLocalizationCellV1,
+    )>,
 ) -> Result<String, TargetDesktopLeaseCreateError> {
     let loader_debug_observer = matrix_cell.debugger.observer();
     let loader_debug_trace = loader_debug_observer.is_some();
@@ -3589,224 +10176,345 @@ fn launch_target_desktop_loader_control_cell_inner(
     clear_inherit(prepared_pipe.raw())?;
     verify_not_inheritable(prepared_pipe.raw())?;
     let control_job = Job::create(None, None, None)?;
-    let jobs = [control_job.handle()];
-    let attributes = AttributeList::new(
-        &[Attribute::new(
-            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-            jobs.as_ptr().cast(),
-            std::mem::size_of_val(&jobs),
-        )],
-        None,
-    )?;
-    let process_security =
-        SecurityDescriptor::from_sddl(&super::security::launcher_process_sddl()?)?;
-    let process_attributes = process_security.attributes(false);
-    let thread_security = SecurityDescriptor::from_sddl(&super::security::launcher_thread_sddl()?)?;
-    let thread_attributes = thread_security.attributes(false);
-    let executable = super::package::installed_target_desktop_bootstrap();
-    let bootstrap_image_sha256 =
-        super::package::validate_installed_target_desktop_bootstrap_loader_control()?;
-    use std::os::windows::ffi::OsStrExt;
-    let mut application = executable.as_os_str().encode_wide().collect::<Vec<_>>();
-    application.push(0);
-    let mut command_line = encode_command_line(&[
-        executable.as_os_str().encode_wide().collect(),
-        "loader-control".encode_utf16().collect(),
-        pipe_name.encode_utf16().collect(),
-        nonce.encode_utf16().collect(),
-        exact_desktop.encode_utf16().collect(),
-    ]);
-    command_line.push(0);
-    let mut startup = STARTUPINFOEXW::default();
-    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    let mut loader_control_desktop = exact_desktop.encode_utf16().collect::<Vec<_>>();
-    loader_control_desktop.push(0);
-    startup.StartupInfo.lpDesktop = loader_control_desktop.as_mut_ptr();
-    startup.lpAttributeList = attributes.raw();
-    let mut environment = loader_environment_block(matrix_cell.environment)?;
-    let install_root = super::package::install_root();
-    let mut current_directory = install_root.as_os_str().encode_wide().collect::<Vec<_>>();
-    current_directory.push(0);
-    let mut process = PROCESS_INFORMATION::default();
-    let creation_flags = if loader_debug_trace {
-        CREATE_SUSPENDED
-            | EXTENDED_STARTUPINFO_PRESENT
-            | CREATE_UNICODE_ENVIRONMENT
-            | DEBUG_ONLY_THIS_PROCESS
-    } else {
-        CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
-    };
-    if unsafe {
-        CreateProcessAsUserW(
-            target_token,
-            application.as_ptr(),
-            command_line.as_mut_ptr(),
-            &raw const process_attributes,
-            &raw const thread_attributes,
-            0,
-            creation_flags,
-            environment.units.as_mut_ptr().cast(),
-            current_directory.as_ptr(),
-            &raw const startup.StartupInfo,
-            &raw mut process,
-        )
-    } == 0
-    {
-        return Err(format!(
-            "CreateProcessAsUserW failed for exact-token loader-control: {}",
-            io::Error::last_os_error(),
-        )
-        .into());
-    }
-    let control_process = OwnedHandle::new(process.hProcess)?;
-    let control_thread = OwnedHandle::new(process.hThread)?;
-    let mut debug_session = loader_debug_observer.map(|observer| {
-        super::loader_debug::LoaderDebugSession::attach(
-            control_process.raw(),
-            &association_preflight.native_loader_access,
-            observer,
-        )
-    });
-    if let Some(session) = debug_session.as_mut() {
-        if let Err(error) = session.assert_kill_on_exit() {
-            let _ = session.terminate_and_drain(&control_job, control_process.raw());
-            return Err(format!(
-                "loader-control certification debug setup failed: {error} {}",
-                session.trace().diagnostic()
-            )
-            .into());
-        }
-    }
-    let pre_resume_proof = (|| -> Result<_, TargetDesktopLeaseCreateError> {
-        if !control_job.contains(control_process.raw())? {
-            return Err("loader-control is absent from its atomic Job"
-                .to_owned()
-                .into());
-        }
-        process_security.verify_kernel_object(
-            control_process.raw(),
-            super::security::SecurityObjectKind::Process,
+    let environment_authority = environment_source.authority();
+    let profile_lease_cell = matches!(
+        environment_authority,
+        LoaderEnvironmentAuthorityV5::TargetTokenUserenvBorrowedProfile
+            | LoaderEnvironmentAuthorityV5::TargetTokenUserenvProfileLease
+    );
+    let mut cell_result = (|| -> Result<String, TargetDesktopLeaseCreateError> {
+        let jobs = [control_job.handle()];
+        let attributes = AttributeList::new(
+            &[Attribute::new(
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                jobs.as_ptr().cast(),
+                std::mem::size_of_val(&jobs),
+            )],
+            None,
         )?;
-        thread_security.verify_kernel_object(
-            control_thread.raw(),
-            super::security::SecurityObjectKind::Thread,
-        )?;
-        let observed_control_snapshot =
-            super::token::process_token_query_attestation(control_process.raw())?;
-        let target_source_after = super::token::token_attestation_snapshot(target_token)?;
-        super::token::require_same_token_instance(
-            "loader-control-target-request-invariance",
-            &target_source_before,
-            &target_source_after,
-        )?;
-        let _assignment = super::token::require_assigned_process_authority(
-            "target-request-to-loader-control-process",
-            &target_source_before,
-            &observed_control_snapshot,
-        )?;
-        if observed_control_snapshot.behavior.envelope != *target_envelope {
-            return Err("loader-control token envelope changed".to_owned().into());
-        }
-        let control_identity = process_identity(control_process.raw())?;
-        verify_image_path(control_process.raw(), &executable)?;
-        let target_pre_resume = super::token::token_attestation_snapshot(target_token)?;
-        super::token::require_same_token_instance(
-            "loader-control-target-request-pre-resume",
-            target_snapshot,
-            &target_pre_resume,
-        )?;
-        let launch_evidence = super::loader_debug::LoaderLaunchEvidenceV4 {
-            matrix_cell: matrix_cell.diagnostic(),
-            debug_mode: loader_debug_trace,
-            environment_classification: environment.classification,
-            environment_sha256: environment.sha256.clone(),
-            environment_keys: environment.keys.clone(),
-            missing_required_environment: environment.missing_required.clone(),
-            source_token_sha256: loader_snapshot_digest(
-                b"memcordon-loader-source-token-v4\0",
-                &target_source_before,
-            )?,
-            child_token_sha256: loader_snapshot_digest(
-                b"memcordon-loader-child-token-v4\0",
-                &observed_control_snapshot,
-            )?,
-            source_token_id: target_source_before.instance.token_id,
-            child_token_id: observed_control_snapshot.instance.token_id,
-            source_modified_id: target_source_before.instance.modified_id,
-            child_modified_id: observed_control_snapshot.instance.modified_id,
-            source_authentication_id: target_source_before.lineage.authentication_id,
-            child_authentication_id: observed_control_snapshot.lineage.authentication_id,
-            source_session_id: target_source_before.lineage.session_id,
-            child_session_id: observed_control_snapshot.lineage.session_id,
-            assigned_authority_attested: true,
-            mitigation_diagnostic: mitigation_policy_diagnostic(control_process.raw()),
-            job_membership_attested: true,
-            desktop_sha256: super::record::digest(exact_desktop.as_bytes()),
-            binary_sha256: bootstrap_image_sha256.clone(),
-            current_directory_sha256: super::record::digest(
-                install_root
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .as_bytes(),
-            ),
-            creation_flags,
+        let target_policy = object_security_authority
+            .uses_target_policy()
+            .then(|| super::security::TargetKernelObjectPolicyV1::capture(target_token))
+            .transpose()?;
+        let process_sddl = match object_security_authority {
+            LoaderObjectSecurityAuthorityV1::TargetAwareProcess
+            | LoaderObjectSecurityAuthorityV1::TargetAwareBoth => target_policy
+                .as_ref()
+                .expect("target-aware process policy is captured")
+                .process_sddl()
+                .to_owned(),
+            LoaderObjectSecurityAuthorityV1::LauncherExplicit
+            | LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary
+            | LoaderObjectSecurityAuthorityV1::TargetAwareThread => {
+                super::security::launcher_process_sddl()?
+            }
         };
-        Ok((observed_control_snapshot, control_identity, launch_evidence))
-    })();
-    let (observed_control_snapshot, control_identity, launch_evidence) = match pre_resume_proof {
-        Ok(proof) => proof,
-        Err(error) => {
+        let thread_sddl = match object_security_authority {
+            LoaderObjectSecurityAuthorityV1::TargetAwareThread
+            | LoaderObjectSecurityAuthorityV1::TargetAwareBoth => target_policy
+                .as_ref()
+                .expect("target-aware thread policy is captured")
+                .thread_sddl()
+                .to_owned(),
+            LoaderObjectSecurityAuthorityV1::LauncherExplicit
+            | LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary
+            | LoaderObjectSecurityAuthorityV1::TargetAwareProcess => {
+                super::security::launcher_thread_sddl()?
+            }
+        };
+        let process_policy_sha256 = super::record::digest(process_sddl.as_bytes());
+        let thread_policy_sha256 = super::record::digest(thread_sddl.as_bytes());
+        let restricting_trustee_count = target_policy
+            .as_ref()
+            .map_or(0, |policy| policy.restricting_trustee_count);
+        let target_logon_trustee = target_policy.is_some();
+        let process_security = SecurityDescriptor::from_sddl(&process_sddl)?;
+        let process_attributes = process_security.attributes(false);
+        let thread_security = SecurityDescriptor::from_sddl(&thread_sddl)?;
+        let thread_attributes = thread_security.attributes(false);
+        let executable = super::package::installed_target_desktop_bootstrap();
+        let bootstrap_image_sha256 =
+            super::package::validate_installed_target_desktop_bootstrap_loader_control()?;
+        let loader_control_action = "loader-control";
+        let command_semantics_sha256 = loader_control_command_semantics_sha256(
+            &executable,
+            loader_control_action,
+            exact_desktop,
+            &bootstrap_image_sha256,
+        );
+        use std::os::windows::ffi::OsStrExt;
+        let mut application = executable.as_os_str().encode_wide().collect::<Vec<_>>();
+        application.push(0);
+        let mut command_line = encode_command_line(&[
+            executable.as_os_str().encode_wide().collect(),
+            loader_control_action.encode_utf16().collect(),
+            pipe_name.encode_utf16().collect(),
+            nonce.encode_utf16().collect(),
+            exact_desktop.encode_utf16().collect(),
+        ]);
+        command_line.push(0);
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        let mut loader_control_desktop = exact_desktop.encode_utf16().collect::<Vec<_>>();
+        loader_control_desktop.push(0);
+        startup.StartupInfo.lpDesktop = loader_control_desktop.as_mut_ptr();
+        startup.lpAttributeList = attributes.raw();
+        let mut environment =
+            environment_source.into_environment(target_token, matrix_cell.environment)?;
+        let install_root = super::package::install_root();
+        let mut current_directory = install_root.as_os_str().encode_wide().collect::<Vec<_>>();
+        current_directory.push(0);
+        let mut process = PROCESS_INFORMATION::default();
+        let creation_flags = if loader_debug_trace {
+            CREATE_SUSPENDED
+                | EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_UNICODE_ENVIRONMENT
+                | DEBUG_ONLY_THIS_PROCESS
+        } else {
+            CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
+        };
+        let created = unsafe {
+            CreateProcessAsUserW(
+                target_token,
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                &raw const process_attributes,
+                &raw const thread_attributes,
+                0,
+                creation_flags,
+                environment.pointer(),
+                current_directory.as_ptr(),
+                &raw const startup.StartupInfo,
+                &raw mut process,
+            )
+        };
+        let creation_error = (created == 0).then(io::Error::last_os_error);
+        let environment_destruction = environment.destroy_userenv_after_create();
+        if let Some(error) = creation_error {
+            let destruction = environment_destruction
+                .err()
+                .map_or_else(|| "ok".to_owned(), |error| error.detail);
+            return Err(TargetDesktopLeaseCreateError::from(format!(
+                "CreateProcessAsUserW failed for exact-token loader-control: {error}; environment_destruction={destruction}",
+            ))
+            .at_loader_phase(LoaderLaunchFailurePhaseV1::CreateProcessReturn));
+        }
+        if let Err(error) = environment_destruction {
+            let _control_process = OwnedHandle::new(process.hProcess)?;
+            let _control_thread = OwnedHandle::new(process.hThread)?;
+            return Err(error);
+        }
+        let control_process = OwnedHandle::new(process.hProcess)?;
+        let control_thread = OwnedHandle::new(process.hThread)?;
+        let mut debug_session = loader_debug_observer.map(|observer| {
+            super::loader_debug::LoaderDebugSession::attach(
+                control_process.raw(),
+                &association_preflight.native_loader_access,
+                observer,
+            )
+        });
+        if let Some(session) = debug_session.as_mut() {
+            if let Err(error) = session.assert_kill_on_exit() {
+                let _ = session.terminate_and_drain(&control_job, control_process.raw());
+                return Err(TargetDesktopLeaseCreateError::from(format!(
+                    "loader-control certification debug setup failed: {error} {}",
+                    session.trace().diagnostic()
+                ))
+                .at_loader_phase(LoaderLaunchFailurePhaseV1::PreResumeAttestation));
+            }
+        }
+        let pre_resume_proof = (|| -> Result<_, TargetDesktopLeaseCreateError> {
+            if !control_job.contains(control_process.raw())? {
+                return Err("loader-control is absent from its atomic Job"
+                    .to_owned()
+                    .into());
+            }
+            process_security.verify_kernel_object(
+                control_process.raw(),
+                super::security::SecurityObjectKind::Process,
+            )?;
+            thread_security.verify_kernel_object(
+                control_thread.raw(),
+                super::security::SecurityObjectKind::Thread,
+            )?;
+            let process_object_security = SecurityDescriptor::live_kernel_object_security_evidence(
+                control_process.raw(),
+                super::security::SecurityObjectKind::Process,
+                target_token,
+                super::security::TARGET_KERNEL_PROCESS_DIAGNOSTIC_ACCESS,
+            )?;
+            let thread_object_security = SecurityDescriptor::live_kernel_object_security_evidence(
+                control_thread.raw(),
+                super::security::SecurityObjectKind::Thread,
+                target_token,
+                super::security::TARGET_KERNEL_THREAD_DIAGNOSTIC_ACCESS,
+            )?;
+            let observed_control_snapshot =
+                super::token::process_token_query_attestation(control_process.raw())?;
+            let target_source_after = super::token::token_attestation_snapshot(target_token)?;
+            super::token::require_same_token_instance(
+                "loader-control-target-request-invariance",
+                &target_source_before,
+                &target_source_after,
+            )?;
+            let _assignment = super::token::require_assigned_process_authority(
+                "target-request-to-loader-control-process",
+                &target_source_before,
+                &observed_control_snapshot,
+            )?;
+            if observed_control_snapshot.behavior.envelope != *target_envelope {
+                return Err("loader-control token envelope changed".to_owned().into());
+            }
+            let control_identity = process_identity(control_process.raw())?;
+            verify_image_path(control_process.raw(), &executable)?;
+            let target_pre_resume = super::token::token_attestation_snapshot(target_token)?;
+            super::token::require_same_token_instance(
+                "loader-control-target-request-pre-resume",
+                target_snapshot,
+                &target_pre_resume,
+            )?;
+            let launch_evidence = super::loader_debug::LoaderLaunchEvidenceV4 {
+                matrix_cell: matrix_cell.diagnostic(),
+                debug_mode: loader_debug_trace,
+                environment_classification: environment.classification,
+                environment_sha256: environment.sha256.clone(),
+                environment_keys: environment.visible_keys.clone(),
+                environment_keys_sha256: environment.keys_sha256.clone(),
+                environment_units: environment.units,
+                environment_entries: environment.entries,
+                environment_profile_loaded: environment.profile_loaded,
+                missing_required_environment: environment.missing_required.clone(),
+                source_token_sha256: loader_snapshot_digest(
+                    b"memcordon-loader-source-token-v4\0",
+                    &target_source_before,
+                )?,
+                child_token_sha256: loader_snapshot_digest(
+                    b"memcordon-loader-child-token-v4\0",
+                    &observed_control_snapshot,
+                )?,
+                source_token_id: target_source_before.instance.token_id,
+                child_token_id: observed_control_snapshot.instance.token_id,
+                source_modified_id: target_source_before.instance.modified_id,
+                child_modified_id: observed_control_snapshot.instance.modified_id,
+                source_authentication_id: target_source_before.lineage.authentication_id,
+                child_authentication_id: observed_control_snapshot.lineage.authentication_id,
+                source_session_id: target_source_before.lineage.session_id,
+                child_session_id: observed_control_snapshot.lineage.session_id,
+                assigned_authority_attested: true,
+                mitigation_diagnostic: mitigation_policy_diagnostic(control_process.raw()),
+                job_membership_attested: true,
+                desktop_sha256: super::record::digest(exact_desktop.as_bytes()),
+                binary_sha256: bootstrap_image_sha256.clone(),
+                current_directory_sha256: super::record::digest(
+                    install_root
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .as_bytes(),
+                ),
+                command_semantics_sha256,
+                creation_flags,
+            };
+            Ok((
+                observed_control_snapshot,
+                control_identity,
+                launch_evidence,
+                process_object_security,
+                thread_object_security,
+            ))
+        })();
+        let (
+            observed_control_snapshot,
+            control_identity,
+            launch_evidence,
+            process_object_security,
+            thread_object_security,
+        ) = match pre_resume_proof {
+            Ok(proof) => proof,
+            Err(error) => {
+                if let Some(session) = debug_session.as_mut() {
+                    let cleanup = session
+                        .terminate_and_drain(&control_job, control_process.raw())
+                        .err()
+                        .map_or_else(|| "ok".to_owned(), |error| error);
+                    return Err(format!(
+                        "loader-control pre-resume proof failed detail={} cleanup={cleanup} {}",
+                        error.detail,
+                        session.trace().diagnostic()
+                    )
+                    .into());
+                }
+                return Err(error.at_loader_phase(LoaderLaunchFailurePhaseV1::PreResumeAttestation));
+            }
+        };
+        if let Some(session) = debug_session.as_mut() {
+            session.bind_launch_evidence(launch_evidence.clone());
+        }
+        let _passive_access_subject = passive_access_localization
+            .map(|(observer, cell)| {
+                observer.bind_suspended_child(
+                    cell,
+                    control_process.raw(),
+                    control_identity.process_id,
+                    control_identity.creation_time_100ns,
+                )
+            })
+            .transpose()
+            .map_err(|error| {
+                TargetDesktopLeaseCreateError::from(error)
+                    .at_loader_phase(LoaderLaunchFailurePhaseV1::PreResumeAttestation)
+            })?;
+        if unsafe { ResumeThread(control_thread.raw()) } != 1 {
+            let error = format!(
+                "loader-control primary thread did not resume exactly once: {}",
+                io::Error::last_os_error(),
+            );
             if let Some(session) = debug_session.as_mut() {
                 let cleanup = session
                     .terminate_and_drain(&control_job, control_process.raw())
                     .err()
                     .map_or_else(|| "ok".to_owned(), |error| error);
-                return Err(format!(
-                    "loader-control pre-resume proof failed detail={} cleanup={cleanup} {}",
-                    error.detail,
+                return Err(TargetDesktopLeaseCreateError::from(format!(
+                    "{error} cleanup={cleanup} {}",
                     session.trace().diagnostic()
-                )
-                .into());
+                ))
+                .at_loader_phase(LoaderLaunchFailurePhaseV1::PreResumeAttestation));
             }
-            return Err(error);
+            return Err(TargetDesktopLeaseCreateError::from(error)
+                .at_loader_phase(LoaderLaunchFailurePhaseV1::PreResumeAttestation));
         }
-    };
-    if let Some(session) = debug_session.as_mut() {
-        session.bind_launch_evidence(launch_evidence.clone());
-    }
-    if unsafe { ResumeThread(control_thread.raw()) } != 1 {
-        let error = format!(
-            "loader-control primary thread did not resume exactly once: {}",
-            io::Error::last_os_error(),
-        );
-        if let Some(session) = debug_session.as_mut() {
-            let cleanup = session
-                .terminate_and_drain(&control_job, control_process.raw())
-                .err()
-                .map_or_else(|| "ok".to_owned(), |error| error);
-            return Err(
-                format!("{error} cleanup={cleanup} {}", session.trace().diagnostic()).into(),
-            );
-        }
-        return Err(error.into());
-    }
-    drop(control_thread);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let connection_result = if let Some(session) = debug_session.as_mut() {
-        match super::pipe::PendingTargetDesktopBootstrapAccept::start(prepared_pipe) {
-            Ok(pending) => match session.accept_pipe(pending, control_process.raw(), deadline) {
-                Ok(super::loader_debug::LoaderDebugAcceptOutcome::Connected(connection)) => {
-                    Ok(connection)
+        drop(control_thread);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let connection_result = if let Some(session) = debug_session.as_mut() {
+            match super::pipe::PendingTargetDesktopBootstrapAccept::start(prepared_pipe) {
+                Ok(pending) => {
+                    match session.accept_pipe(pending, control_process.raw(), deadline) {
+                        Ok(super::loader_debug::LoaderDebugAcceptOutcome::Connected(
+                            connection,
+                        )) => Ok(connection),
+                        Ok(super::loader_debug::LoaderDebugAcceptOutcome::Exited(exit_code)) => {
+                            Err(super::pipe::target_desktop_bootstrap_peer_exit_error(
+                                super::pipe::TargetDesktopBootstrapPipeOperation::Accept,
+                                "connect",
+                                0,
+                                exit_code,
+                            ))
+                        }
+                        Err(detail) => {
+                            let cleanup = session
+                                .terminate_and_drain(&control_job, control_process.raw())
+                                .err()
+                                .map_or_else(|| "ok".to_owned(), |error| error);
+                            Err(super::pipe::TargetDesktopBootstrapPipeError::protocol(
+                                super::pipe::TargetDesktopBootstrapPipeOperation::Accept,
+                                format!(
+                                    "loader debug accept failed detail={detail} cleanup={cleanup} {}",
+                                    session.trace().diagnostic()
+                                ),
+                            ))
+                        }
+                    }
                 }
-                Ok(super::loader_debug::LoaderDebugAcceptOutcome::Exited(exit_code)) => {
-                    Err(super::pipe::target_desktop_bootstrap_peer_exit_error(
-                        super::pipe::TargetDesktopBootstrapPipeOperation::Accept,
-                        "connect",
-                        0,
-                        exit_code,
-                    ))
-                }
-                Err(detail) => {
+                Err(error) => {
                     let cleanup = session
                         .terminate_and_drain(&control_job, control_process.raw())
                         .err()
@@ -3814,166 +10522,243 @@ fn launch_target_desktop_loader_control_cell_inner(
                     Err(super::pipe::TargetDesktopBootstrapPipeError::protocol(
                         super::pipe::TargetDesktopBootstrapPipeOperation::Accept,
                         format!(
-                            "loader debug accept failed detail={detail} cleanup={cleanup} {}",
+                            "pending debug accept failed detail={error} cleanup={cleanup} {}",
                             session.trace().diagnostic()
                         ),
                     ))
                 }
-            },
-            Err(error) => {
+            }
+        } else {
+            super::pipe::accept_target_desktop_bootstrap_pipe(
+                prepared_pipe,
+                control_process.raw(),
+                deadline,
+            )
+        };
+        let connection = connection_result.map_err(|error| {
+            let outcome = error.native_code().map_or_else(
+                || "pre-bootstrap-connect-exit:unavailable".to_owned(),
+                |code| format!("pre-bootstrap-connect-exit:{:#010x}", code as u32),
+            );
+            launch_context.accept_error(
+                TargetDesktopBootstrapRoleV1::LoaderControl,
+                control_identity.process_id,
+                &bootstrap_image_sha256,
+                &format!(
+                    "attested-private-sha256:{}",
+                    super::record::digest(exact_desktop.as_bytes())
+                ),
+                &format!(
+                    "loader_control={outcome} object_security_authority={} process_policy_sha256={} thread_policy_sha256={} target_logon_trustee={} restricting_trustee_count={} descriptor_readback=true {} {} {} {}{}",
+                    object_security_authority.diagnostic(),
+                    process_policy_sha256,
+                    thread_policy_sha256,
+                    target_logon_trustee,
+                    restricting_trustee_count,
+                    association_preflight.diagnostic(),
+                    launch_evidence.diagnostic(),
+                    process_object_security.diagnostic("process_object"),
+                    thread_object_security.diagnostic("thread_object"),
+                    debug_session
+                        .as_ref()
+                        .map_or_else(String::new, |session| format!(
+                            " {}",
+                            session.trace().diagnostic()
+                        )),
+                ),
+                error,
+            )
+        })?;
+        let protocol_result = (|| -> Result<(), TargetDesktopLeaseCreateError> {
+            authenticate_target_desktop_bootstrap_client(
+                connection.raw(),
+                control_process.raw(),
+                &control_job,
+                &control_identity,
+                target_envelope,
+                &observed_control_snapshot,
+                &executable,
+            )?;
+            let loader_ready: TargetDesktopBootstrapMessageV1 = super::pipe::read_frame_bounded(
+                connection.raw(),
+                Some(control_process.raw()),
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::LoaderReadyRead,
+            )?;
+            match loader_ready {
+                TargetDesktopBootstrapMessageV1::LoaderReady {
+                    schema_version,
+                    nonce: observed_nonce,
+                    expected_desktop: observed_desktop,
+                    bootstrap_identity,
+                    process_envelope,
+                    process_snapshot,
+                } if schema_version == TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION
+                    && observed_nonce == nonce
+                    && observed_desktop.as_deref() == Some(exact_desktop)
+                    && bootstrap_identity == control_identity
+                    && process_envelope == *target_envelope
+                    && process_snapshot == observed_control_snapshot => {}
+                _ => {
+                    return Err("loader-control LoaderReady frame is invalid"
+                        .to_owned()
+                        .into());
+                }
+            }
+            if object_security_authority.diagnostic_only() {
+                control_job.terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS)?;
+                return Ok(());
+            }
+            super::pipe::write_frame_bounded(
+                connection.raw(),
+                Some(control_process.raw()),
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::LoaderControlReleaseWrite,
+                &TargetDesktopBootstrapMessageV1::LoaderControlRelease {
+                    schema_version: TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION,
+                    nonce,
+                    expected_desktop: exact_desktop.to_owned(),
+                },
+            )?;
+            Ok(())
+        })();
+        drop(connection);
+        if let Err(error) = protocol_result {
+            if let Some(session) = debug_session.as_mut() {
                 let cleanup = session
                     .terminate_and_drain(&control_job, control_process.raw())
                     .err()
                     .map_or_else(|| "ok".to_owned(), |error| error);
-                Err(super::pipe::TargetDesktopBootstrapPipeError::protocol(
-                    super::pipe::TargetDesktopBootstrapPipeOperation::Accept,
-                    format!(
-                        "pending debug accept failed detail={error} cleanup={cleanup} {}",
-                        session.trace().diagnostic()
-                    ),
-                ))
+                return Err(format!(
+                    "loader-control debug protocol failed detail={} cleanup={cleanup} {}",
+                    error.detail,
+                    session.trace().diagnostic()
+                )
+                .into());
             }
+            return Err(error.at_loader_phase(LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady));
         }
-    } else {
-        super::pipe::accept_target_desktop_bootstrap_pipe(
-            prepared_pipe,
-            control_process.raw(),
-            deadline,
-        )
-    };
-    let connection = connection_result.map_err(|error| {
-        let outcome = error.native_code().map_or_else(
-            || "pre-bootstrap-connect-exit:unavailable".to_owned(),
-            |code| format!("pre-bootstrap-connect-exit:{:#010x}", code as u32),
-        );
-        launch_context.accept_error(
-            TargetDesktopBootstrapRoleV1::LoaderControl,
-            control_identity.process_id,
-            &bootstrap_image_sha256,
-            &format!(
-                "attested-private-sha256:{}",
-                super::record::digest(exact_desktop.as_bytes())
-            ),
-            &format!(
-                "loader_control={outcome} {} {}{}",
-                association_preflight.diagnostic(),
+        if object_security_authority.diagnostic_only() {
+            if let Some(session) = debug_session.as_mut() {
+                if let Err(error) = session.drain_until_exit(
+                    control_process.raw(),
+                    Instant::now() + Duration::from_secs(30),
+                ) {
+                    let cleanup = session
+                        .terminate_and_drain(&control_job, control_process.raw())
+                        .err()
+                        .map_or_else(|| "ok".to_owned(), |error| error);
+                    return Err(TargetDesktopLeaseCreateError::from(format!(
+                        "diagnostic loader-control debug drain failed detail={error} cleanup={cleanup} {}",
+                        session.trace().diagnostic()
+                    ))
+                    .at_loader_phase(LoaderLaunchFailurePhaseV1::PostLoaderReadyContainment));
+                }
+            } else if unsafe { WaitForSingleObject(control_process.raw(), 30_000) } != WAIT_OBJECT_0
+            {
+                return Err(TargetDesktopLeaseCreateError::from(
+                    "object-security canary did not terminate after LoaderReady".to_owned(),
+                )
+                .at_loader_phase(LoaderLaunchFailurePhaseV1::PostLoaderReadyContainment));
+            }
+            if !control_job.wait_empty(Instant::now() + Duration::from_secs(30))? {
+                return Err(TargetDesktopLeaseCreateError::from(
+                    "object-security canary Job did not become empty".to_owned(),
+                )
+                .at_loader_phase(LoaderLaunchFailurePhaseV1::PostLoaderReadyContainment));
+            }
+            return Ok(format!(
+                "loader_control_cell=v5 cell={} debug_observer={} object_security_authority={} process_policy_sha256={} thread_policy_sha256={} target_logon_trustee={} restricting_trustee_count={} phase=loader-ready-contained {} {} {} descriptor_readback=true job_empty=true workload_executed=false qualification_promoted=false{}",
+                matrix_cell.diagnostic(),
+                loader_debug_observer.map_or("none", |observer| observer.diagnostic()),
+                object_security_authority.diagnostic(),
+                process_policy_sha256,
+                thread_policy_sha256,
+                target_logon_trustee,
+                restricting_trustee_count,
                 launch_evidence.diagnostic(),
-                debug_session
-                    .as_ref()
-                    .map_or_else(String::new, |session| format!(
-                        " {}",
-                        session.trace().diagnostic()
-                    )),
-            ),
-            error,
-        )
-    })?;
-    let protocol_result = (|| -> Result<(), TargetDesktopLeaseCreateError> {
-        authenticate_target_desktop_bootstrap_client(
-            connection.raw(),
-            control_process.raw(),
-            &control_job,
-            &control_identity,
-            target_envelope,
-            &observed_control_snapshot,
-            &executable,
-        )?;
-        let loader_ready: TargetDesktopBootstrapMessageV1 = super::pipe::read_frame_bounded(
-            connection.raw(),
-            Some(control_process.raw()),
-            deadline,
-            super::pipe::TargetDesktopBootstrapPipeOperation::LoaderReadyRead,
-        )?;
-        match loader_ready {
-            TargetDesktopBootstrapMessageV1::LoaderReady {
-                schema_version,
-                nonce: observed_nonce,
-                expected_desktop: observed_desktop,
-                bootstrap_identity,
-                process_envelope,
-                process_snapshot,
-            } if schema_version == TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION
-                && observed_nonce == nonce
-                && observed_desktop.as_deref() == Some(exact_desktop)
-                && bootstrap_identity == control_identity
-                && process_envelope == *target_envelope
-                && process_snapshot == observed_control_snapshot => {}
-            _ => {
-                return Err("loader-control LoaderReady frame is invalid"
-                    .to_owned()
-                    .into());
-            }
+                process_object_security.diagnostic("process_object"),
+                thread_object_security.diagnostic("thread_object"),
+                debug_session.as_ref().map_or_else(String::new, |session| {
+                    format!(" {}", session.trace().diagnostic())
+                }),
+            ));
         }
-        super::pipe::write_frame_bounded(
-            connection.raw(),
-            Some(control_process.raw()),
-            deadline,
-            super::pipe::TargetDesktopBootstrapPipeOperation::LoaderControlReleaseWrite,
-            &TargetDesktopBootstrapMessageV1::LoaderControlRelease {
-                schema_version: TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION,
-                nonce,
-                expected_desktop: exact_desktop.to_owned(),
-            },
-        )?;
-        Ok(())
-    })();
-    drop(connection);
-    if let Err(error) = protocol_result {
         if let Some(session) = debug_session.as_mut() {
-            let cleanup = session
-                .terminate_and_drain(&control_job, control_process.raw())
-                .err()
-                .map_or_else(|| "ok".to_owned(), |error| error);
-            return Err(format!(
-                "loader-control debug protocol failed detail={} cleanup={cleanup} {}",
-                error.detail,
-                session.trace().diagnostic()
+            if let Err(error) = session.drain_until_exit(
+                control_process.raw(),
+                Instant::now() + Duration::from_secs(30),
+            ) {
+                let cleanup = session
+                    .terminate_and_drain(&control_job, control_process.raw())
+                    .err()
+                    .map_or_else(|| "ok".to_owned(), |error| error);
+                return Err(TargetDesktopLeaseCreateError::from(format!(
+                    "loader-control debug exit drain failed detail={error} cleanup={cleanup} {}",
+                    session.trace().diagnostic()
+                ))
+                .at_loader_phase(LoaderLaunchFailurePhaseV1::ExitDrain));
+            }
+        } else if unsafe { WaitForSingleObject(control_process.raw(), 30_000) } != WAIT_OBJECT_0 {
+            return Err(TargetDesktopLeaseCreateError::from(
+                "loader-control did not exit after release".to_owned(),
             )
-            .into());
+            .at_loader_phase(LoaderLaunchFailurePhaseV1::ExitDrain));
         }
-        return Err(error);
-    }
-    if let Some(session) = debug_session.as_mut() {
-        if let Err(error) = session.drain_until_exit(
-            control_process.raw(),
-            Instant::now() + Duration::from_secs(30),
-        ) {
-            let cleanup = session
-                .terminate_and_drain(&control_job, control_process.raw())
-                .err()
-                .map_or_else(|| "ok".to_owned(), |error| error);
-            return Err(format!(
-                "loader-control debug exit drain failed detail={error} cleanup={cleanup} {}",
-                session.trace().diagnostic()
-            )
-            .into());
+        let mut exit_code = 0_u32;
+        if unsafe { GetExitCodeProcess(control_process.raw(), &raw mut exit_code) } == 0
+            || exit_code != 0
+        {
+            return Err(TargetDesktopLeaseCreateError::from(format!(
+                "loader-control exited unsuccessfully: {exit_code:#010x}"
+            ))
+            .at_loader_phase(LoaderLaunchFailurePhaseV1::ExitDrain));
         }
-    } else if unsafe { WaitForSingleObject(control_process.raw(), 30_000) } != WAIT_OBJECT_0 {
-        return Err("loader-control did not exit after release"
-            .to_owned()
-            .into());
+        if !control_job.wait_empty(Instant::now() + Duration::from_secs(30))? {
+            return Err("loader-control Job did not become empty".to_owned().into());
+        }
+        Ok(format!(
+            "loader_control_cell=v5 cell={} debug_observer={} object_security_authority={} process_policy_sha256={} thread_policy_sha256={} target_logon_trustee={} restricting_trustee_count={} phase=loader-ready-and-clean-exit exit=0x00000000 exit_status_symbol=STATUS_SUCCESS {} {} {}{}",
+            matrix_cell.diagnostic(),
+            loader_debug_observer.map_or("none", |observer| observer.diagnostic()),
+            object_security_authority.diagnostic(),
+            process_policy_sha256,
+            thread_policy_sha256,
+            target_logon_trustee,
+            restricting_trustee_count,
+            launch_evidence.diagnostic(),
+            process_object_security.diagnostic("process_object"),
+            thread_object_security.diagnostic("thread_object"),
+            debug_session
+                .as_ref()
+                .map_or_else(String::new, |session| format!(
+                    " {}",
+                    session.trace().diagnostic()
+                )),
+        ))
+    })();
+    if profile_lease_cell && cell_result.is_err() {
+        let mut cleanup = Vec::new();
+        match control_job.wait_empty(Instant::now()) {
+            Ok(true) => cleanup.push("job_empty_before_termination=true".to_owned()),
+            Ok(false) => {
+                cleanup.push("job_empty_before_termination=false".to_owned());
+                if let Err(error) = control_job.terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS) {
+                    cleanup.push(format!("terminate_error={error}"));
+                }
+            }
+            Err(error) => cleanup.push(format!("job_empty_query_error={error}")),
+        }
+        match control_job.wait_empty(Instant::now() + Duration::from_secs(30)) {
+            Ok(true) => cleanup.push("job_empty_after_cleanup=true".to_owned()),
+            Ok(false) => cleanup.push("job_empty_after_cleanup=false".to_owned()),
+            Err(error) => cleanup.push(format!("job_empty_wait_error={error}")),
+        }
+        if let Err(error) = &mut cell_result {
+            error.detail = preserve_loader_profile_primary_detail(&error.detail, &cleanup);
+        }
     }
-    let mut exit_code = 0_u32;
-    if unsafe { GetExitCodeProcess(control_process.raw(), &raw mut exit_code) } == 0
-        || exit_code != 0
-    {
-        return Err(format!("loader-control exited unsuccessfully: {exit_code:#010x}").into());
-    }
-    if !control_job.wait_empty(Instant::now() + Duration::from_secs(30))? {
-        return Err("loader-control Job did not become empty".to_owned().into());
-    }
-    Ok(format!(
-        "loader_control_cell=v5 cell={} debug_observer={} phase=loader-ready-and-clean-exit exit=0x00000000 exit_status_symbol=STATUS_SUCCESS {}{}",
-        matrix_cell.diagnostic(),
-        loader_debug_observer.map_or("none", |observer| observer.diagnostic()),
-        launch_evidence.diagnostic(),
-        debug_session
-            .as_ref()
-            .map_or_else(String::new, |session| format!(
-                " {}",
-                session.trace().diagnostic()
-            )),
-    ))
+    cell_result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3994,6 +10779,7 @@ fn launch_target_desktop_probe(
     expected_desktop_policy_sha256: &str,
     launch_context: &TargetDesktopBootstrapLaunchContext,
     holder_lease: &TargetDesktopLease,
+    loader_restriction_canary: Option<&LoaderRestrictionCanaryTokens>,
 ) -> Result<(), TargetDesktopLeaseCreateError> {
     let target_source_before = super::token::token_attestation_snapshot(target_token)?;
     super::token::require_same_token_instance(
@@ -4021,6 +10807,7 @@ fn launch_target_desktop_probe(
         launch_context,
         &association_preflight,
         &holder_lease.bootstrap_identity,
+        loader_restriction_canary,
     )?;
     holder_lease
         .attest_live()
@@ -4542,6 +11329,7 @@ fn validate_target_desktop_bootstrap_failure_evidence(
             phase.diagnostic(),
         ),
         os_code: native_code,
+        loader_phase: LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady,
     }
 }
 
@@ -6836,6 +13624,7 @@ impl SuspendedTarget {
     #[allow(clippy::too_many_arguments)] // Native creation requires each authority input explicitly.
     pub fn create(
         token: HANDLE,
+        loader_restriction_canary: Option<&LoaderRestrictionCanaryTokens>,
         job: &Job,
         command: &NativeWindowsCommandV1,
         environment: &[WindowsEnvironmentEntryV1],
@@ -6847,6 +13636,7 @@ impl SuspendedTarget {
     ) -> Result<Self, TargetCreateError> {
         Self::create_with_object_security(
             token,
+            loader_restriction_canary,
             job,
             command,
             environment,
@@ -6874,6 +13664,7 @@ impl SuspendedTarget {
                 .map_err(TargetCreateError::from)?;
         let target = Self::create_with_object_security(
             token,
+            None,
             job,
             command,
             environment,
@@ -6935,6 +13726,7 @@ impl SuspendedTarget {
     #[allow(clippy::too_many_arguments)] // Native creation requires each authority input explicitly.
     fn create_with_object_security(
         token: HANDLE,
+        loader_restriction_canary: Option<&LoaderRestrictionCanaryTokens>,
         job: &Job,
         command: &NativeWindowsCommandV1,
         environment: &[WindowsEnvironmentEntryV1],
@@ -6953,9 +13745,12 @@ impl SuspendedTarget {
         match object_security {
             TargetObjectSecurity::LauncherService => {
                 let policy_role = target_user_object_policy_role(command);
-                desktop_lease = Some(TargetDesktopLease::create(token, policy_role).map_err(
-                    |error| TargetCreateError::loader_context_with_os(error.detail, error.os_code),
-                )?);
+                desktop_lease = Some(
+                    TargetDesktopLease::create(token, policy_role, loader_restriction_canary)
+                        .map_err(|error| {
+                            TargetCreateError::loader_context_with_os(error.detail, error.os_code)
+                        })?,
+                );
             }
             TargetObjectSecurity::NestedCanaryCreator => {
                 captured_desktop = Some(

@@ -214,3 +214,35 @@ fn windows_fresh_rollback_and_uninstall_share_the_exact_root_removal() {
     assert!(uninstall.contains("remove_provider_files(ProviderRemovalContext"));
     assert!(provider_files.contains("remove_provider_state(context)?"));
 }
+
+#[test]
+fn windows_package_cleanup_terminates_jobs_before_empty_state_deletion() {
+    let control = include_str!("../../src/bin/memcordon-sealed-agent/windows/control_service.rs");
+    let launcher = include_str!("../../src/bin/memcordon-sealed-agent/windows/launcher_service.rs");
+    let package = include_str!("../../src/bin/memcordon-sealed-agent/windows/package.rs");
+    let record = include_str!("../../src/bin/memcordon-sealed-agent/windows/record.rs");
+
+    let cleanup = source_between(
+        control,
+        "WindowsProviderRequestV1::PackageCleanup {",
+        "WindowsProviderRequestV1::QualificationBegin {",
+    );
+    assert!(cleanup.contains("converge_launcher_package_cleanup(deadline_millis)"));
+    assert!(cleanup.contains("and_then(|()| super::record::remove_empty_attempt_state())"));
+
+    let convergence = source_between(
+        launcher,
+        "fn converge_package_cleanup(",
+        "fn control_authentication_subphase(",
+    );
+    assert!(convergence.contains("active.job.terminate()"));
+    assert!(convergence.contains("super::record::converge_package_cleanup(deadline)?"));
+
+    let barrier = source_between(
+        package,
+        "fn service_owned_cleanup_barrier(",
+        "#[derive(Default)]",
+    );
+    assert!(barrier.contains("prepare_package_cleanup(deadline_millis)"));
+    assert!(record.contains("fn recover_until(deadline: Instant)"));
+}

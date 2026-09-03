@@ -89,6 +89,10 @@ pub enum TargetDesktopBootstrapPipeOperation {
     BrokerLoaderSnapsRestoreWrite,
     BrokerLoaderSnapsRestoredRead,
     BrokerLoaderSnapsRestoredWrite,
+    BrokerTraceSessionCapabilityRequestRead,
+    BrokerTraceSessionCapabilityRequestWrite,
+    BrokerTraceSessionCapabilityReceiptRead,
+    BrokerTraceSessionCapabilityReceiptWrite,
 }
 
 impl TargetDesktopBootstrapPipeOperation {
@@ -148,6 +152,18 @@ impl TargetDesktopBootstrapPipeOperation {
             Self::BrokerLoaderSnapsRestoreWrite => "broker-loader-snaps-restore-write",
             Self::BrokerLoaderSnapsRestoredRead => "broker-loader-snaps-restored-read",
             Self::BrokerLoaderSnapsRestoredWrite => "broker-loader-snaps-restored-write",
+            Self::BrokerTraceSessionCapabilityRequestRead => {
+                "broker-trace-session-capability-request-read"
+            }
+            Self::BrokerTraceSessionCapabilityRequestWrite => {
+                "broker-trace-session-capability-request-write"
+            }
+            Self::BrokerTraceSessionCapabilityReceiptRead => {
+                "broker-trace-session-capability-receipt-read"
+            }
+            Self::BrokerTraceSessionCapabilityReceiptWrite => {
+                "broker-trace-session-capability-receipt-write"
+            }
         }
     }
 }

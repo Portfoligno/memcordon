@@ -26,21 +26,29 @@ use windows_sys::Win32::System::Threading::{
 use super::pipe::{OwnedHandle, PendingTargetDesktopBootstrapAccept};
 
 const DEBUG_EVENT_SLICE_MILLIS: u32 = 20;
-const MODULE_TAIL_CAPACITY: usize = 8;
-const EXCEPTION_TAIL_CAPACITY: usize = 4;
-const UNLOAD_TAIL_CAPACITY: usize = 4;
-const UNKNOWN_EVENT_TAIL_CAPACITY: usize = 4;
+pub(crate) const MODULE_TAIL_CAPACITY: usize = 8;
+pub(crate) const EXCEPTION_TAIL_CAPACITY: usize = 4;
+pub(crate) const UNLOAD_TAIL_CAPACITY: usize = 4;
+pub(crate) const UNKNOWN_EVENT_TAIL_CAPACITY: usize = 4;
 const OBSERVED_HOST_CAPACITY: usize = 32;
-const MODULE_BASENAME_MAX_BYTES: usize = 96;
+pub(crate) const MODULE_BASENAME_MAX_BYTES: usize = 96;
 const MODULE_PATH_BUFFER_WCHARS: usize = 32_768;
 const REMOTE_IMAGE_NAME_MAX_UNITS: usize = 512;
 const HOST_SET_DIAGNOSTIC_MAX_BYTES: usize = 160;
+const ROOT_FRONTIER_DIAGNOSTIC_MAX_BYTES: usize = 2_048;
 const LOADER_TRACE_DIAGNOSTIC_MAX_BYTES: usize = 8_192;
 const EXCEPTION_PARAMETER_CAPACITY: usize = 15;
 const LOADER_SNAP_EVENT_MAX_BYTES: usize = 1_024;
-const LOADER_SNAP_TOTAL_MAX_BYTES: usize = 8_192;
-const LOADER_SNAP_TAIL_CAPACITY: usize = 4;
+pub(crate) const LOADER_SNAP_TOTAL_MAX_BYTES: usize = 8_192;
+pub(crate) const LOADER_SNAP_TAIL_CAPACITY: usize = 4;
 const LOADER_SNAP_RENDER_MAX_BYTES: usize = 256;
+pub(crate) const LOADER_TRACE_EVENT_ADMISSION_MAX: u64 = 65_536;
+
+pub(crate) fn candidate_modules_tail_digest(serialized: &str) -> String {
+    let mut material = b"memcordon-loader-candidate-modules-tail-v1\0".to_vec();
+    material.extend_from_slice(serialized.as_bytes());
+    super::record::digest(&material)
+}
 
 pub(super) fn enabled(role: super::process::TargetDesktopBootstrapRoleV1) -> bool {
     super::package::ephemeral_ci_enabled()
@@ -173,6 +181,10 @@ pub(crate) struct LoaderLaunchEvidenceV4 {
     pub(crate) environment_classification: &'static str,
     pub(crate) environment_sha256: String,
     pub(crate) environment_keys: Vec<String>,
+    pub(crate) environment_keys_sha256: String,
+    pub(crate) environment_units: usize,
+    pub(crate) environment_entries: usize,
+    pub(crate) environment_profile_loaded: bool,
     pub(crate) missing_required_environment: Vec<String>,
     pub(crate) source_token_sha256: String,
     pub(crate) child_token_sha256: String,
@@ -190,18 +202,23 @@ pub(crate) struct LoaderLaunchEvidenceV4 {
     pub(crate) desktop_sha256: String,
     pub(crate) binary_sha256: String,
     pub(crate) current_directory_sha256: String,
+    pub(crate) command_semantics_sha256: String,
     pub(crate) creation_flags: u32,
 }
 
 impl LoaderLaunchEvidenceV4 {
     pub(crate) fn diagnostic(&self) -> String {
         format!(
-            "loader_launch=v4 matrix_cell={} debug_mode={} environment_classification={} environment_sha256={} environment_keys=[{}] missing_required_environment=[{}] source_token_sha256={} child_token_sha256={} source_token_id={:016x} child_token_id={:016x} source_modified_id={:016x} child_modified_id={:016x} source_authentication_id={:016x} child_authentication_id={:016x} source_session_id={} child_session_id={} assigned_authority_attested={} mitigations=[{}] job_membership_attested={} desktop_sha256={} binary_sha256={} current_directory_sha256={} creation_flags=0x{:08x} holder_resources=identity-access-attestation-and-mutation-pin child_inherited_resources=false child_loader_consumption=unproven",
+            "loader_launch=v4 matrix_cell={} debug_mode={} environment_classification={} environment_sha256={} environment_keys=[{}] environment_keys_sha256={} environment_units={} environment_entries={} environment_profile_loaded={} missing_required_environment=[{}] source_token_sha256={} child_token_sha256={} source_token_id={:016x} child_token_id={:016x} source_modified_id={:016x} child_modified_id={:016x} source_authentication_id={:016x} child_authentication_id={:016x} source_session_id={} child_session_id={} assigned_authority_attested={} mitigations=[{}] job_membership_attested={} desktop_sha256={} binary_sha256={} current_directory_sha256={} command_semantics_sha256={} command_dynamic_fields=authenticated-private-pipe,authenticated-nonce creation_flags=0x{:08x} holder_resources=identity-access-attestation-and-mutation-pin child_inherited_resources=false child_loader_consumption=unproven",
             self.matrix_cell,
             self.debug_mode,
             self.environment_classification,
             self.environment_sha256,
             self.environment_keys.join(","),
+            self.environment_keys_sha256,
+            self.environment_units,
+            self.environment_entries,
+            self.environment_profile_loaded,
             self.missing_required_environment.join(","),
             self.source_token_sha256,
             self.child_token_sha256,
@@ -219,6 +236,7 @@ impl LoaderLaunchEvidenceV4 {
             self.desktop_sha256,
             self.binary_sha256,
             self.current_directory_sha256,
+            self.command_semantics_sha256,
             self.creation_flags,
         )
     }
@@ -935,59 +953,102 @@ impl LoaderDebugTraceV4 {
             || "loader_launch=v4 unavailable=true".to_owned(),
             LoaderLaunchEvidenceV4::diagnostic,
         );
+        let header = format!(
+            "loader_trace=v4 gate=ephemeral-ci trace_sha256={} drained={} debug_cleanup={} events={} accounted_events={} modules={} dll_loads={} unloads={} exceptions={} threads={} exit_threads={} debug_strings={} debug_string_bytes={} debug_string_overflow={} rip_events={} unknown_events={} create_event={} initial_breakpoint={} exit_event={} exit={} exit_status_symbol={} pre_initial_breakpoint={} static_closure_complete={} application_entry_possible={} failure_phase={} resolution_vs_initialization={}",
+            trace_sha256,
+            self.drained,
+            if self.drained {
+                "exit-process-event-continued"
+            } else {
+                "pending"
+            },
+            self.event_count,
+            accounted_events,
+            self.module_count,
+            self.load_dll_count,
+            self.unload_count,
+            self.exception_count,
+            self.thread_count,
+            self.exit_thread_count,
+            self.output_debug_string_count,
+            self.output_debug_string_bytes,
+            self.output_debug_string_overflow,
+            self.rip_count,
+            self.unknown_event_count,
+            self.create_event,
+            self.initial_breakpoint,
+            self.exit_event,
+            self.exit_code
+                .map_or_else(|| "unavailable".to_owned(), |code| format!("0x{code:08x}")),
+            exit_status_symbol,
+            self.exit_event && !self.initial_breakpoint,
+            missing_hosts.is_empty() && self.observed_host_overflow == 0,
+            !self.exit_event || self.initial_breakpoint,
+            failure_phase,
+            resolution,
+        );
+        let causal_frontier = format!(
+            "candidate_modules_count={} candidate_modules_retained={} candidate_modules_overflow={} candidate_modules_sha256={} candidate_modules=[{}] unload_tail_count={} unload_tail_retained={} unload_tail_overflow={} unload_tail_sha256={} unload_tail=[{}] loader_snap_tail_count={} loader_snap_tail_retained={} loader_snap_tail_overflow={} loader_snap_tail_sha256={} loader_snap_tail=[{}] unknown_event_tail_count={} unknown_event_tail_retained={} unknown_event_tail_overflow={} unknown_event_tail_sha256={} unknown_event_tail=[{}] exception_tail_count={} exception_tail_retained={} exception_tail_overflow={} exception_tail_sha256={} exception_tail=[{}]",
+            self.module_count,
+            self.modules.len(),
+            self.module_count.saturating_sub(self.modules.len() as u64),
+            candidate_modules_tail_digest(&modules),
+            modules,
+            self.unload_count,
+            self.unloads.len(),
+            self.unload_count.saturating_sub(self.unloads.len() as u64),
+            super::record::digest(unloads.as_bytes()),
+            unloads,
+            self.output_debug_string_count,
+            self.loader_snaps.len(),
+            self.output_debug_string_count
+                .saturating_sub(self.loader_snaps.len() as u64),
+            super::record::digest(loader_snaps.as_bytes()),
+            loader_snaps,
+            self.unknown_event_count,
+            self.unknown_events.len(),
+            self.unknown_event_count
+                .saturating_sub(self.unknown_events.len() as u64),
+            super::record::digest(unknown_events.as_bytes()),
+            unknown_events,
+            self.exception_count,
+            self.exceptions.len(),
+            self.exception_count
+                .saturating_sub(self.exceptions.len() as u64),
+            super::record::digest(exceptions.as_bytes()),
+            exceptions,
+        );
+        let bounded_root_frontier = bounded(&root_frontier, ROOT_FRONTIER_DIAGNOSTIC_MAX_BYTES);
+        let root_detail = format!(
+            "observed_host_overflow={} ordered_root_sha256={} loader_graph_sha256={} expected_hosts_sha256={} ever_mapped_sha256={} active_at_exit_sha256={} missing_hosts_sha256={} extra_hosts_sha256={} missing_direct_roots_count={} missing_direct_roots_retained_bytes={} missing_direct_roots_overflow_bytes={} missing_direct_roots_sha256={} missing_direct_roots=[{}] edge_frontier=[{}] blocked_descendants=[{}] expected_hosts=[{}] observed_order=[{}] ever_mapped=[{}] active_at_exit=[{}] missing_hosts=[{}] extra_hosts=[{}]",
+            self.observed_host_overflow,
+            self.ordered_root_sha256,
+            self.loader_graph_sha256,
+            host_set_digest(&self.expected_hosts),
+            host_set_digest(&observed_admitted),
+            host_set_digest(&active_at_exit),
+            host_set_digest(&missing_hosts),
+            host_set_digest(&extra_hosts),
+            missing_direct_roots.len(),
+            bounded_root_frontier.len(),
+            root_frontier
+                .len()
+                .saturating_sub(bounded_root_frontier.len()),
+            super::record::digest(root_frontier.as_bytes()),
+            bounded_root_frontier,
+            edge_frontier,
+            host_set_diagnostic(&blocked_descendants),
+            host_set_diagnostic(&self.expected_hosts),
+            observed_order,
+            host_set_diagnostic(&observed_admitted),
+            host_set_diagnostic(&active_at_exit),
+            host_set_diagnostic(&missing_hosts),
+            host_set_diagnostic(&extra_hosts),
+        );
         bounded(
             &format!(
-                "loader_trace=v4 gate=ephemeral-ci trace_sha256={} drained={} events={} accounted_events={} modules={} dll_loads={} unloads={} exceptions={} threads={} exit_threads={} debug_strings={} debug_string_bytes={} debug_string_overflow={} rip_events={} unknown_events={} create_event={} initial_breakpoint={} exit_event={} exit={} exit_status_symbol={} pre_initial_breakpoint={} static_closure_complete={} application_entry_possible={} failure_phase={} resolution_vs_initialization={} observed_host_overflow={} ordered_root_sha256={} loader_graph_sha256={} expected_hosts_sha256={} ever_mapped_sha256={} active_at_exit_sha256={} missing_hosts_sha256={} extra_hosts_sha256={} missing_direct_roots=[{}] edge_frontier=[{}] blocked_descendants=[{}] expected_hosts=[{}] observed_order=[{}] ever_mapped=[{}] active_at_exit=[{}] missing_hosts=[{}] extra_hosts=[{}] exact_token_import_tier_canary=core-ntdll-kernel32:read-execute-map-attested,advapi32:read-execute-map-attested canary_attested={} canary_execution_scope=holder-effective-thread-under-exact-target-impersonation canary_child_startup=unproven {} loader_snap_tail=[{}] candidate_modules=[{}] unload_tail=[{}] unknown_event_tail=[{}] exception_tail=[{}]",
-                trace_sha256,
-                self.drained,
-                self.event_count,
-                accounted_events,
-                self.module_count,
-                self.load_dll_count,
-                self.unload_count,
-                self.exception_count,
-                self.thread_count,
-                self.exit_thread_count,
-                self.output_debug_string_count,
-                self.output_debug_string_bytes,
-                self.output_debug_string_overflow,
-                self.rip_count,
-                self.unknown_event_count,
-                self.create_event,
-                self.initial_breakpoint,
-                self.exit_event,
-                self.exit_code
-                    .map_or_else(|| "unavailable".to_owned(), |code| format!("0x{code:08x}")),
-                exit_status_symbol,
-                self.exit_event && !self.initial_breakpoint,
-                missing_hosts.is_empty() && self.observed_host_overflow == 0,
-                !self.exit_event || self.initial_breakpoint,
-                failure_phase,
-                resolution,
-                self.observed_host_overflow,
-                self.ordered_root_sha256,
-                self.loader_graph_sha256,
-                host_set_digest(&self.expected_hosts),
-                host_set_digest(&observed_admitted),
-                host_set_digest(&active_at_exit),
-                host_set_digest(&missing_hosts),
-                host_set_digest(&extra_hosts),
-                root_frontier,
-                edge_frontier,
-                host_set_diagnostic(&blocked_descendants),
-                host_set_diagnostic(&self.expected_hosts),
-                observed_order,
-                host_set_diagnostic(&observed_admitted),
-                host_set_diagnostic(&active_at_exit),
-                host_set_diagnostic(&missing_hosts),
-                host_set_diagnostic(&extra_hosts),
+                "{header} {causal_frontier} exact_token_import_tier_canary=core-ntdll-kernel32:read-execute-map-attested,advapi32:read-execute-map-attested canary_attested={} canary_execution_scope=holder-effective-thread-under-exact-target-impersonation canary_child_startup=unproven {launch_evidence} {root_detail}",
                 self.exact_target_import_tier_canary_attested,
-                launch_evidence,
-                loader_snaps,
-                modules,
-                unloads,
-                unknown_events,
-                exceptions,
             ),
             LOADER_TRACE_DIAGNOSTIC_MAX_BYTES,
         )
@@ -1686,6 +1747,82 @@ pub(crate) fn reduce_loader_root_frontier_for_test(
     for host in observed_hosts {
         trace.record_observed_host(host);
     }
+    trace.diagnostic()
+}
+
+#[cfg(test)]
+pub(crate) fn reduce_loader_causal_frontier_for_test(root_count: usize) -> String {
+    let expected_hosts = (0..root_count)
+        .map(|index| format!("ROOT{index:04}.DLL"))
+        .collect::<Vec<_>>();
+    let mut trace = LoaderDebugTraceV4::new(expected_hosts.iter().cloned());
+    trace.graph_roots = expected_hosts
+        .iter()
+        .enumerate()
+        .map(|(index, host)| LoaderGraphTraceRootV4 {
+            descriptor_ordinal: index as u32,
+            import_contract: host.clone(),
+            concrete_host: host.clone(),
+            expected_resolution: "physical-direct".to_owned(),
+            physical_selection: "known-dll-section".to_owned(),
+            preflight_nt_status: 0,
+            object_name_sha256: super::record::digest(format!(r"\KnownDlls\{host}").as_bytes()),
+            source_target_object_attested: true,
+            read_map_attested: true,
+            execute_map_attested: true,
+            path_sha256: "11".repeat(32),
+            volume_serial: 1,
+            file_id_sha256: "22".repeat(32),
+            image_sha256: "33".repeat(32),
+            loader_contract_sha256: "44".repeat(32),
+        })
+        .collect();
+    for (base, name, main_image) in [
+        (0x1000, "bootstrap.exe", true),
+        (0x2000, "NTDLL.DLL", false),
+        (0x3000, "KERNELBASE.DLL", false),
+        (0x4000, "FAILING-INITIALIZER.DLL", false),
+    ] {
+        trace.event_count += 1;
+        if main_image {
+            trace.create_event = true;
+        } else {
+            trace.load_dll_count += 1;
+            trace.active_modules.insert(base, name.to_owned());
+        }
+        trace.module_count += 1;
+        trace.modules.push_back(LoaderModuleTailV2 {
+            ordinal: trace.module_count,
+            base,
+            basename: name.to_owned(),
+            path_source: "mapped-file".to_owned(),
+            path_sha256: super::record::digest(name.as_bytes()),
+            path_error: None,
+            path_provenance: "test-ok".to_owned(),
+        });
+    }
+    for base in [0x3000, 0x4000] {
+        trace.event_count += 1;
+        trace.record_unload(base);
+    }
+    let snap = "LdrpCallInitRoutine returned STATUS_DLL_INIT_FAILED";
+    trace.event_count += 1;
+    trace.output_debug_string_count = 1;
+    trace.output_debug_string_bytes = snap.len();
+    trace.loader_snaps.push_back(LoaderSnapTailV4 {
+        ordinal: 1,
+        unicode: true,
+        declared_bytes: snap.len(),
+        captured_bytes: snap.len(),
+        raw_sha256: super::record::digest(snap.as_bytes()),
+        status: "captured".to_owned(),
+        sanitized: snap.to_owned(),
+    });
+    trace.event_count += 1;
+    trace.exit_event = true;
+    trace.drained = true;
+    trace.exit_code = Some(0xc000_0142);
+    trace.canonical_field(EXIT_PROCESS_DEBUG_EVENT, &[0xc000_0142]);
     trace.diagnostic()
 }
 

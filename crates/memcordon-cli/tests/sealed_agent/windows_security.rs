@@ -2914,7 +2914,7 @@ fn write_restricted_behavior_attestation_requires_a_duplicable_primary_token() {
     let error =
         crate::windows::security::write_restricted_behavior_attested(query_only.raw()).unwrap_err();
     assert!(
-        error.contains("write-restricted oracle user-only/read"),
+        error.contains("write-restricted S-1-5-33 oracle user-only/read"),
         "unexpected oracle stage: {error}"
     );
     assert!(
@@ -5624,8 +5624,10 @@ fn assert_abrupt_frame_read_phase(
                 0
             );
             assert_eq!(written, 4);
+            crate::windows::pipe::finish_server_response(connection.raw()).unwrap();
+        } else {
+            crate::windows::pipe::disconnect(connection.raw());
         }
-        crate::windows::pipe::disconnect(connection.raw());
     });
 
     let client = crate::windows::pipe::connect(&pipe_name).unwrap();
@@ -5768,7 +5770,7 @@ fn pipe_preparation_errors_have_stable_service_subphases() {
 }
 
 #[test]
-fn service_process_owners_match_their_configured_accounts_without_restore_privilege() {
+fn service_process_owners_match_their_configured_accounts_and_scope_profile_privileges() {
     let control = service_process_sddl(memcordon_core::WINDOWS_CONTROL_SERVICE_NAME).unwrap();
     let launcher = service_process_sddl(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME).unwrap();
 
@@ -5781,7 +5783,9 @@ fn service_process_owners_match_their_configured_accounts_without_restore_privil
         LAUNCHER_PRIVILEGES,
         &[
             "SeAssignPrimaryTokenPrivilege",
+            "SeBackupPrivilege",
             "SeIncreaseQuotaPrivilege",
+            "SeRestorePrivilege",
             "SeTcbPrivilege",
         ]
     );

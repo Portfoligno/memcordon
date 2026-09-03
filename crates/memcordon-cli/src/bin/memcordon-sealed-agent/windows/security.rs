@@ -379,6 +379,75 @@ pub fn package_mutex_sddl() -> Result<String, String> {
     Ok(format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{control})"))
 }
 
+pub(crate) const TARGET_KERNEL_PROCESS_DIAGNOSTIC_ACCESS: u32 = 0x0010_1040;
+pub(crate) const TARGET_KERNEL_THREAD_DIAGNOSTIC_ACCESS: u32 = 0x0012_1800;
+
+pub(crate) struct TargetKernelObjectPolicyV1 {
+    process_sddl: String,
+    thread_sddl: String,
+    pub(crate) process_policy_sha256: String,
+    pub(crate) thread_policy_sha256: String,
+    pub(crate) restricting_trustee_count: usize,
+}
+
+impl TargetKernelObjectPolicyV1 {
+    pub(crate) fn capture(token: windows_sys::Win32::Foundation::HANDLE) -> Result<Self, String> {
+        let target =
+            TargetUserObjectPolicy::capture(token, TargetUserObjectPolicyRoleV1::DirectTarget)
+                .map_err(|error| error.to_string())?;
+        let restricting_sids = match &target.restriction {
+            TargetRestrictionSemantics::Restricted { restricting_sids } => restricting_sids,
+            TargetRestrictionSemantics::Unrestricted => {
+                return Err(
+                    "target-aware kernel-object policy requires a restricted target".to_owned(),
+                );
+            }
+            TargetRestrictionSemantics::WriteRestricted { .. } => {
+                return Err(
+                    "target-aware kernel-object policy requires full-restricted semantics"
+                        .to_owned(),
+                );
+            }
+        };
+        if restricting_sids.is_empty() {
+            return Err(
+                "target-aware kernel-object policy requires restricting trustees".to_owned(),
+            );
+        }
+        let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME)?;
+        let broker = service_sid(memcordon_core::WINDOWS_SESSION_BROKER_SERVICE_NAME)?;
+        let mut target_trustees = BTreeSet::from([target.target_logon_sid.clone()]);
+        target_trustees.extend(restricting_sids.iter().cloned());
+
+        let mut process_sddl =
+            format!("O:SYD:P(A;;GA;;;SY)(A;;GA;;;{launcher})(A;;0x00101040;;;{broker})");
+        let mut thread_sddl = format!("O:SYD:P(A;;GA;;;SY)(A;;GA;;;{launcher})");
+        for trustee in target_trustees {
+            process_sddl.push_str(&format!(
+                "(A;;0x{TARGET_KERNEL_PROCESS_DIAGNOSTIC_ACCESS:08x};;;{trustee})"
+            ));
+            thread_sddl.push_str(&format!(
+                "(A;;0x{TARGET_KERNEL_THREAD_DIAGNOSTIC_ACCESS:08x};;;{trustee})"
+            ));
+        }
+        Ok(Self {
+            process_policy_sha256: super::record::digest(process_sddl.as_bytes()),
+            thread_policy_sha256: super::record::digest(thread_sddl.as_bytes()),
+            process_sddl,
+            thread_sddl,
+            restricting_trustee_count: restricting_sids.len(),
+        })
+    }
+
+    pub(crate) fn process_sddl(&self) -> &str {
+        &self.process_sddl
+    }
+
+    pub(crate) fn thread_sddl(&self) -> &str {
+        &self.thread_sddl
+    }
+}
+
 pub fn launcher_process_sddl() -> Result<String, String> {
     let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME)?;
     let broker = service_sid(memcordon_core::WINDOWS_SESSION_BROKER_SERVICE_NAME)?;
@@ -1056,6 +1125,13 @@ fn require_live_access_check_descriptor_shape(
 pub(crate) fn write_restricted_behavior_attested(
     token: windows_sys::Win32::Foundation::HANDLE,
 ) -> Result<bool, String> {
+    write_restricted_behavior_for_sid_attested(token, "S-1-5-33")
+}
+
+pub(crate) fn write_restricted_behavior_for_sid_attested(
+    token: windows_sys::Win32::Foundation::HANDLE,
+    restricting_sid: &str,
+) -> Result<bool, String> {
     const READ: u32 = 0x1;
     const WRITE: u32 = 0x2;
     let user = super::token::token_user_sid(token)?;
@@ -1066,22 +1142,41 @@ pub(crate) fn write_restricted_behavior_attested(
         GenericAll: READ | WRITE,
     };
     let user_only = SecurityDescriptor::from_sddl(&format!("O:SYG:SYD:P(A;;0x3;;;{user})"))?;
-    let user_wr =
-        SecurityDescriptor::from_sddl(&format!("O:SYG:SYD:P(A;;0x3;;;{user})(A;;0x2;;;WR)"))?;
-    let user_rc =
-        SecurityDescriptor::from_sddl(&format!("O:SYG:SYD:P(A;;0x3;;;{user})(A;;0x2;;;RC)"))?;
+    let user_restricting = SecurityDescriptor::from_sddl(&format!(
+        "O:SYG:SYD:P(A;;0x3;;;{user})(A;;0x2;;;{restricting_sid})"
+    ))?;
+    let unrelated_sid = if restricting_sid == "S-1-5-33" {
+        "S-1-5-12"
+    } else {
+        "S-1-5-33"
+    };
+    let user_unrelated = SecurityDescriptor::from_sddl(&format!(
+        "O:SYG:SYD:P(A;;0x3;;;{user})(A;;0x2;;;{unrelated_sid})"
+    ))?;
     Ok(
         access_check_descriptor(user_only.raw(), token, READ, mapping)
-            .map_err(|error| format!("write-restricted oracle user-only/read: {error}"))?
+            .map_err(|error| {
+                format!("write-restricted {restricting_sid} oracle user-only/read: {error}")
+            })?
             .0
             && !access_check_descriptor(user_only.raw(), token, WRITE, mapping)
-                .map_err(|error| format!("write-restricted oracle user-only/write: {error}"))?
+                .map_err(|error| {
+                    format!("write-restricted {restricting_sid} oracle user-only/write: {error}")
+                })?
                 .0
-            && access_check_descriptor(user_wr.raw(), token, WRITE, mapping)
-                .map_err(|error| format!("write-restricted oracle user-WR/write: {error}"))?
+            && access_check_descriptor(user_restricting.raw(), token, WRITE, mapping)
+                .map_err(|error| {
+                    format!(
+                        "write-restricted {restricting_sid} oracle user-restricting/write: {error}"
+                    )
+                })?
                 .0
-            && !access_check_descriptor(user_rc.raw(), token, WRITE, mapping)
-                .map_err(|error| format!("write-restricted oracle user-RC/write: {error}"))?
+            && !access_check_descriptor(user_unrelated.raw(), token, WRITE, mapping)
+                .map_err(|error| {
+                    format!(
+                        "write-restricted {restricting_sid} oracle user-unrelated/write: {error}"
+                    )
+                })?
                 .0,
     )
 }
@@ -2244,6 +2339,34 @@ pub enum SecurityObjectKind {
     Desktop,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LiveKernelObjectSecurityEvidenceV1 {
+    pub(crate) equality_sha256: String,
+    pub(crate) dacl_protected: bool,
+    pub(crate) ace_count: u32,
+    pub(crate) target_allowed: bool,
+    pub(crate) target_granted: u32,
+    pub(crate) launcher_allowed: bool,
+    pub(crate) launcher_granted: u32,
+    pub(crate) requested_access: u32,
+}
+
+impl LiveKernelObjectSecurityEvidenceV1 {
+    pub(crate) fn diagnostic(&self, role: &str) -> String {
+        format!(
+            "{role}_live_sha256={} {role}_dacl_protected={} {role}_ace_count={} {role}_requested=0x{:08x} {role}_target_allowed={} {role}_target_granted=0x{:08x} {role}_launcher_allowed={} {role}_launcher_granted=0x{:08x}",
+            self.equality_sha256,
+            self.dacl_protected,
+            self.ace_count,
+            self.requested_access,
+            self.target_allowed,
+            self.target_granted,
+            self.launcher_allowed,
+            self.launcher_granted,
+        )
+    }
+}
+
 impl SecurityObjectKind {
     const fn generic_mapping(self) -> GENERIC_MAPPING {
         match self {
@@ -3092,6 +3215,109 @@ impl SecurityDescriptor {
         }
         let descriptor = LocalSecurityDescriptor::new(descriptor)?;
         self.verify_descriptor(descriptor.0, SecurityObjectKind::File)
+    }
+
+    pub(crate) fn live_kernel_object_security_evidence(
+        handle: windows_sys::Win32::Foundation::HANDLE,
+        kind: SecurityObjectKind,
+        target_token: windows_sys::Win32::Foundation::HANDLE,
+        requested_access: u32,
+    ) -> Result<LiveKernelObjectSecurityEvidenceV1, String> {
+        let information =
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        let mut needed = 0_u32;
+        // SAFETY: the sizing call writes only the required descriptor length.
+        unsafe {
+            GetKernelObjectSecurity(handle, information, ptr::null_mut(), 0, &raw mut needed)
+        };
+        if needed == 0 {
+            return Err(format!(
+                "read live {:?} security descriptor size: {}",
+                kind,
+                io::Error::last_os_error()
+            ));
+        }
+        let allocated = needed;
+        let mut descriptor = descriptor_buffer(allocated)?;
+        // SAFETY: descriptor has the exact reported capacity and handle remains live.
+        if unsafe {
+            GetKernelObjectSecurity(
+                handle,
+                information,
+                descriptor.as_mut_ptr().cast(),
+                allocated,
+                &raw mut needed,
+            )
+        } == 0
+            || needed == 0
+            || needed > allocated
+        {
+            return Err(format!(
+                "read live {:?} security descriptor: {}",
+                kind,
+                io::Error::last_os_error()
+            ));
+        }
+        let actual = descriptor.as_mut_ptr().cast();
+        let equality_sha256 = super::record::digest(
+            normalized_descriptor_sddl(actual, information, kind)?.as_bytes(),
+        );
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        // SAFETY: descriptor and output storage remain live.
+        if unsafe { GetSecurityDescriptorControl(actual, &raw mut control, &raw mut revision) } == 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let mut present = 0_i32;
+        let mut defaulted = 0_i32;
+        let mut dacl = ptr::null_mut();
+        // SAFETY: descriptor and output storage remain live.
+        if unsafe {
+            GetSecurityDescriptorDacl(actual, &raw mut present, &raw mut dacl, &raw mut defaulted)
+        } == 0
+            || present == 0
+            || dacl.is_null()
+        {
+            return Err("live kernel object has no decision-bearing DACL".to_owned());
+        }
+        // SAFETY: zero is valid for this output-only POD.
+        let mut acl = unsafe { std::mem::zeroed::<ACL_SIZE_INFORMATION>() };
+        // SAFETY: DACL and output buffer remain live.
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&raw mut acl).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let (target_allowed, target_granted) = access_check_descriptor(
+            actual,
+            target_token,
+            requested_access,
+            kind.generic_mapping(),
+        )?;
+        let launcher = super::token::current_process_token_for_access_check()?;
+        let (launcher_allowed, launcher_granted) = access_check_descriptor(
+            actual,
+            launcher.raw(),
+            requested_access,
+            kind.generic_mapping(),
+        )?;
+        Ok(LiveKernelObjectSecurityEvidenceV1 {
+            equality_sha256,
+            dacl_protected: control & SE_DACL_PROTECTED != 0,
+            ace_count: acl.AceCount,
+            target_allowed,
+            target_granted,
+            launcher_allowed,
+            launcher_granted,
+            requested_access,
+        })
     }
 
     pub fn verify_kernel_object(

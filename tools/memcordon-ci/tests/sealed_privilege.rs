@@ -203,7 +203,6 @@ fn validate_windows_live_kernel_access_check_contract(security: &str) -> Result<
             ));
         }
     }
-
     let shape = semantic_function_region(
         security,
         "fn require_live_access_check_descriptor_shape(",
@@ -261,6 +260,7 @@ struct WindowsProductionSources {
     session_broker: String,
     service_manager: String,
     record: String,
+    core_windows: String,
     launcher: String,
     qualification: String,
     control: String,
@@ -322,6 +322,9 @@ impl WindowsProductionSources {
             record: normalize_windows_source(include_str!(
                 "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/record.rs"
             )),
+            core_windows: normalize_windows_source(include_str!(
+                "../../../crates/memcordon-core/src/windows_sealed.rs"
+            )),
             launcher: normalize_windows_source(include_str!(
                 "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/launcher_service.rs"
             )),
@@ -353,6 +356,7 @@ impl WindowsProductionSources {
         self.session_broker = normalize_windows_source(&self.session_broker);
         self.service_manager = normalize_windows_source(&self.service_manager);
         self.record = normalize_windows_source(&self.record);
+        self.core_windows = normalize_windows_source(&self.core_windows);
         self.launcher = normalize_windows_source(&self.launcher);
         self.qualification = normalize_windows_source(&self.qualification);
         self.control = normalize_windows_source(&self.control);
@@ -373,6 +377,7 @@ impl WindowsProductionSources {
         self.session_broker = self.session_broker.replace('\n', "\r\n");
         self.service_manager = self.service_manager.replace('\n', "\r\n");
         self.record = self.record.replace('\n', "\r\n");
+        self.core_windows = self.core_windows.replace('\n', "\r\n");
         self.launcher = self.launcher.replace('\n', "\r\n");
         self.qualification = self.qualification.replace('\n', "\r\n");
         self.control = self.control.replace('\n', "\r\n");
@@ -1250,8 +1255,14 @@ fn validate_windows_session_broker_contract(
         "O:SYG:SYD:P(D;;WDWO;;;OW)(A;;GA;;;SY)(A;;0x00101000;;;{launcher})(A;;0x00101000;;;BA)",
         "exact query/synchronize-only broker process policy",
     )?;
-    require_source(
+    let launcher_process_policy = semantic_function_region(
         &sources.security,
+        "pub fn launcher_process_sddl() -> Result<String, String> {",
+        "pub fn session_broker_process_sddl() -> Result<String, String> {",
+    )
+    .ok_or_else(|| "launcher process policy has no semantic boundary".to_owned())?;
+    require_source(
+        &launcher_process_policy,
         "O:SYD:P(A;;GA;;;SY)(A;;GA;;;{launcher})(A;;0x00101040;;;{broker})",
         "exact synchronize/query/duplicate broker access to launcher process",
     )?;
@@ -2349,7 +2360,7 @@ fn validate_windows_session_broker_contract(
     }
     require_source(
         &sources.session_broker,
-        "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 5;",
+        "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;",
         "versioned exact-call creation authority protocol",
     )?;
     require_source(
@@ -3665,11 +3676,6 @@ fn validate_windows_preauthorization_abort_terminal_contract(
             "preauthorization-abort outbox disposition",
         ),
         (
-            &sources.record,
-            "rejection.terminal_ack_required",
-            "abort Reject ACK requirement",
-        ),
-        (
             &sources.qualification,
             "if rejection.terminal_ack_required {",
             "qualification abort Reject acknowledgment",
@@ -3794,10 +3800,82 @@ fn validate_windows_preauthorization_abort_terminal_contract(
         "    pub fn acknowledge_terminal_response(&mut self) -> Result<(), String> {",
     )
     .ok_or_else(|| "durable terminal-staging boundary is absent".to_owned())?;
-    require_source(
+    require_source_order(
         &terminal_stage,
-        "&& rejection.terminal_ack_required",
-        "preauthorization-abort durable ACK requirement",
+        &[
+            (
+                "self.prepare_terminal_response(response)",
+                "terminal validation before durable staging",
+            ),
+            (
+                "WindowsTerminalizationCheckpointV1::OutboxStaging,",
+                "durable outbox-staging checkpoint",
+            ),
+        ],
+    )?;
+
+    let terminal_prepare = semantic_function_region(
+        &sources.record,
+        "    fn prepare_terminal_response(",
+        "    pub fn stage_terminal_response_for_test(",
+    )
+    .ok_or_else(|| "durable terminal-preparation boundary is absent".to_owned())?;
+    require_source_order(
+        &terminal_prepare,
+        &[
+            (
+                "memcordon_core::windows_terminal_outbox_is_bound(",
+                "delegated shared terminal-outbox binding validation",
+            ),
+            (
+                "self.terminal_disposition,",
+                "typed terminal-disposition binding",
+            ),
+        ],
+    )?;
+
+    let rejection_builder = semantic_function_region(
+        &sources.record,
+        "pub fn rejection_evidence(",
+        "fn posttarget_rejection(",
+    )
+    .ok_or_else(|| "authenticated rejection-evidence builder boundary is absent".to_owned())?;
+    require_source(
+        &rejection_builder,
+        "terminal_ack_required: record.terminal_disposition.is_some(),",
+        "abort Reject ACK origination",
+    )?;
+
+    let shared_terminal_validator = semantic_function_region(
+        &sources.core_windows,
+        "pub fn windows_terminal_outbox_is_bound(",
+        "pub enum WindowsCertificationPhaseV1 {",
+    )
+    .ok_or_else(|| "shared terminal-outbox binding boundary is absent".to_owned())?;
+    require_source_order(
+        &shared_terminal_validator,
+        &[
+            (
+                "Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort)",
+                "preauthorization-abort shared validator arm",
+            ),
+            (
+                "rejection.terminal_ack_required && rejection.terminal_receipt.is_none()",
+                "preauthorization-abort ACK and receipt prohibition",
+            ),
+            (
+                "response_attempt_id == attempt_id",
+                "exact terminal response attempt binding",
+            ),
+            (
+                "response_request_sha256 == request_sha256",
+                "exact terminal response request binding",
+            ),
+            (
+                "rejection.is_consistent()",
+                "bounded rejection evidence validation",
+            ),
+        ],
     )?;
 
     let launch_attempt = semantic_function_region(
@@ -5472,10 +5550,6 @@ fn validate_windows_production_contract(sources: &WindowsProductionSources) -> R
             "logon-exact target ordinary trustee",
         ),
         (
-            "trustees.extend(restricting_sids.iter().cloned());",
-            "exact target restricting trustees",
-        ),
-        (
             "TargetRestrictionSemantics::Unrestricted => {}",
             "typed unrestricted target policy",
         ),
@@ -5502,6 +5576,17 @@ fn validate_windows_production_contract(sources: &WindowsProductionSources) -> R
     ] {
         require_source(&sources.security, needle, label)?;
     }
+    let target_user_object_policy = semantic_function_region(
+        &sources.security,
+        "    fn sddl(&self, access: u32) -> String {",
+        "    pub(crate) fn window_station_sddl(&self) -> String {",
+    )
+    .ok_or_else(|| "target user-object policy has no semantic boundary".to_owned())?;
+    require_source(
+        &target_user_object_policy,
+        "trustees.extend(restricting_sids.iter().cloned());",
+        "exact target restricting trustees",
+    )?;
     let bootstrap_create = semantic_function_region(
         &sources.process,
         "    fn create(",
@@ -6124,10 +6209,6 @@ fn validate_windows_production_contract(sources: &WindowsProductionSources) -> R
         ("SeTcbPrivilege", "TCB privilege lookup"),
         ("AdjustTokenPrivileges(", "scoped TCB enablement"),
         (
-            "adjust_error != ERROR_SUCCESS",
-            "exact privilege enablement result",
-        ),
-        (
             "NtSetInformationToken(",
             "raw-status duplicate-only session mutation",
         ),
@@ -6158,6 +6239,17 @@ fn validate_windows_production_contract(sources: &WindowsProductionSources) -> R
     ] {
         require_source(&sources.token, needle, label)?;
     }
+    let holder_carrier_privilege = semantic_function_region(
+        &sources.token,
+        "fn enable_holder_carrier_privilege(",
+        "fn nt_status_native_code(status: i32) -> Option<i32> {",
+    )
+    .ok_or_else(|| "holder privilege carrier has no semantic boundary".to_owned())?;
+    require_source(
+        &holder_carrier_privilege,
+        "adjusted == 0 || adjust_error != ERROR_SUCCESS",
+        "strict holder privilege adjustment and exact Win32 result",
+    )?;
     let holder_derivation = semantic_function_region(
         &sources.token,
         "pub(crate) fn derive_launcher_holder_primary(",
@@ -6278,11 +6370,6 @@ fn validate_windows_production_contract(sources: &WindowsProductionSources) -> R
         "typed narrowed granted-access diagnostics",
     )?;
     require_source(
-        &sources.token,
-        "adjusted == 0 || adjust_error != ERROR_SUCCESS",
-        "strict privilege adjustment and ERROR_NOT_ALL_ASSIGNED rejection",
-    )?;
-    require_source(
         &sources.process,
         "impl From<super::token::LauncherHolderTokenDerivationError> for TargetDesktopLeaseCreateError",
         "typed holder derivation error mapping",
@@ -6302,8 +6389,8 @@ fn validate_windows_production_contract(sources: &WindowsProductionSources) -> R
     )?;
     require_source(
         &sources.package,
-        "pub(crate) const LAUNCHER_PRIVILEGES: &[&str] = &[\n    \"SeAssignPrimaryTokenPrivilege\",\n    \"SeIncreaseQuotaPrivilege\",\n    \"SeTcbPrivilege\",\n];",
-        "launcher required TCB privilege",
+        "pub(crate) const LAUNCHER_PRIVILEGES: &[&str] = &[\n    \"SeAssignPrimaryTokenPrivilege\",\n    \"SeBackupPrivilege\",\n    \"SeIncreaseQuotaPrivilege\",\n    \"SeRestorePrivilege\",\n    \"SeTcbPrivilege\",\n];",
+        "launcher exact assignment, profile, quota, and TCB privilege inventory",
     )?;
     require_source_order(
         &sources.launcher,
@@ -8647,11 +8734,6 @@ fn windows_live_kernel_access_check_mutations_are_rejected() {
             "live-access-check-fill-bound-removed",
         ),
         (
-            "access_check_descriptor(\n            actual,",
-            "access_check_descriptor(\n            self.0,",
-            "expected-descriptor-access-check-surrogate-restored",
-        ),
-        (
             "require_live_access_check_descriptor_shape(\n            actual,\n            policy_information,\n            access_check_information,\n        )",
             "Ok(())",
             "live-descriptor-shape-proof-removed",
@@ -8694,6 +8776,20 @@ fn windows_live_kernel_access_check_mutations_are_rejected() {
             "live kernel-object AccessCheck mutant {mutant} survived"
         );
     }
+
+    let mut mutated = production.security.clone();
+    replace_windows_source_once_in_region(
+        &mut mutated,
+        "    pub(crate) fn kernel_object_access_check_for_test(",
+        "    pub fn apply_to_kernel_object(",
+        "access_check_descriptor(\n            actual,",
+        "access_check_descriptor(\n            self.0,",
+        "expected-descriptor-access-check-surrogate-restored",
+    );
+    assert!(
+        validate_windows_live_kernel_access_check_contract(&mutated).is_err(),
+        "live kernel-object expected-descriptor surrogate mutant survived its semantic region"
+    );
 }
 
 #[test]
@@ -8984,6 +9080,16 @@ fn windows_preauthorization_abort_terminal_mutations_are_rejected() {
             "abort-terminal-disposition-erased",
         ),
         (
+            "record",
+            "terminal_ack_required: record.terminal_disposition.is_some(),",
+            "abort-terminal-ack-origination-erased",
+        ),
+        (
+            "record",
+            "memcordon_core::windows_terminal_outbox_is_bound(",
+            "shared-terminal-binding-delegation-erased",
+        ),
+        (
             "qualification",
             "if rejection.terminal_ack_required {",
             "abort-terminal-ack-erased",
@@ -9057,16 +9163,16 @@ fn windows_preauthorization_abort_terminal_mutations_are_rejected() {
 
     let mut missing_abort_ack = production.clone();
     replace_windows_source_once_in_region(
-        &mut missing_abort_ack.record,
-        "    pub fn stage_terminal_response(",
-        "    pub fn acknowledge_terminal_response(&mut self) -> Result<(), String> {",
-        "                    && rejection.terminal_ack_required",
-        "                    /* preauthorization abort ACK mutant removed */",
-        "abort-terminal-ack-staging-erased",
+        &mut missing_abort_ack.core_windows,
+        "pub fn windows_terminal_outbox_is_bound(",
+        "pub enum WindowsCertificationPhaseV1 {",
+        "rejection.terminal_ack_required && rejection.terminal_receipt.is_none()",
+        "/* preauthorization abort ACK mutant removed */",
+        "abort-terminal-ack-validator-erased",
     );
     assert!(
         validate_windows_preauthorization_abort_terminal_contract(&missing_abort_ack).is_err(),
-        "preauthorization abort ACK staging mutant survived"
+        "preauthorization abort ACK validator mutant survived"
     );
 
     let mut premature_retirement = production.clone();
@@ -9541,8 +9647,8 @@ fn windows_session_broker_authority_mutations_are_rejected() {
         ),
         (
             WindowsProductionSource::SessionBroker,
+            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;",
             "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 5;",
-            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 4;",
             "broker-thread-protocol-version-not-bumped",
         ),
         (
@@ -9610,12 +9716,6 @@ fn windows_session_broker_authority_mutations_are_rejected() {
             "transfer_rollback.disarm_after_launched_delivery();",
             "let _ = &transfer_rollback;",
             "broker-delivery-close-owner-transition-deleted",
-        ),
-        (
-            WindowsProductionSource::Process,
-            ".terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS)",
-            ".contains(self.bootstrap_process.raw())",
-            "holder-job-termination-replaced-with-observation",
         ),
         (
             WindowsProductionSource::Process,
@@ -9705,6 +9805,10 @@ fn windows_session_broker_authority_mutations_are_rejected() {
             "broker-request-version-rejection-deleted" => {
                 Some(("fn validate_request(", "fn authenticate_launcher_client("))
             }
+            "launcher-process-broker-synchronize-ace-deleted" => Some((
+                "pub fn launcher_process_sddl() -> Result<String, String> {",
+                "pub fn session_broker_process_sddl() -> Result<String, String> {",
+            )),
             _ => None,
         };
         if let Some((start, end)) = region {
@@ -9722,6 +9826,26 @@ fn windows_session_broker_authority_mutations_are_rejected() {
         assert!(
             validate_windows_session_broker_contract(&mutated).is_err(),
             "session-broker authority mutant {mutant} survived the source contract"
+        );
+    }
+
+    for normalize_crlf in [false, true] {
+        let mut holder_job_termination = production.clone();
+        if normalize_crlf {
+            holder_job_termination.convert_line_endings_to_crlf();
+            holder_job_termination.normalize_line_endings();
+        }
+        replace_windows_source_once_in_region(
+            &mut holder_job_termination.process,
+            "impl Drop for TargetDesktopLease {",
+            "fn validate_target_association_preflight_grants(",
+            ".terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS)",
+            ".contains(self.bootstrap_process.raw())",
+            "holder-job-termination-replaced-with-observation",
+        );
+        assert!(
+            validate_windows_session_broker_contract(&holder_job_termination).is_err(),
+            "holder Job termination mutant survived its Drop region (crlf={normalize_crlf})"
         );
     }
 }
@@ -11289,7 +11413,18 @@ fn target_desktop_bootstrap_authority_mutations_are_rejected() {
         ),
     ] {
         let mut mutated = production.clone();
-        replace_windows_source_once(mutated.source_mut(source), exact, replacement, mutant);
+        if mutant == "target-restricting-trustees-omitted" {
+            replace_windows_source_once_in_region(
+                mutated.source_mut(source),
+                "    fn sddl(&self, access: u32) -> String {",
+                "    pub(crate) fn window_station_sddl(&self) -> String {",
+                exact,
+                replacement,
+                mutant,
+            );
+        } else {
+            replace_windows_source_once(mutated.source_mut(source), exact, replacement, mutant);
+        }
         assert!(
             validate_windows_production_contract(&mutated).is_err(),
             "{mutant} survived the target desktop bootstrap contract"
@@ -11316,11 +11451,6 @@ fn target_desktop_bootstrap_authority_mutations_are_rejected() {
     );
 
     for (exact, replacement, mutant) in [
-        (
-            "adjust_error != ERROR_SUCCESS",
-            "adjust_error == ERROR_NOT_ALL_ASSIGNED",
-            "tcb-adjust-result-not-exact",
-        ),
         (
             "if let Err(error) = scoped.revert() {\n        let error = LauncherHolderTokenDerivationError::new(",
             "if false {\n        let error = LauncherHolderTokenDerivationError::new(",
@@ -11390,6 +11520,26 @@ fn target_desktop_bootstrap_authority_mutations_are_rejected() {
         );
     }
 
+    for normalize_crlf in [false, true] {
+        let mut tcb_adjust_result = production.clone();
+        if normalize_crlf {
+            tcb_adjust_result.convert_line_endings_to_crlf();
+            tcb_adjust_result.normalize_line_endings();
+        }
+        replace_windows_source_once_in_region(
+            &mut tcb_adjust_result.token,
+            "fn enable_holder_carrier_privilege(",
+            "fn nt_status_native_code(status: i32) -> Option<i32> {",
+            "adjust_error != ERROR_SUCCESS",
+            "adjust_error == ERROR_NOT_ALL_ASSIGNED",
+            "tcb-adjust-result-not-exact",
+        );
+        assert!(
+            validate_windows_production_contract(&tcb_adjust_result).is_err(),
+            "non-exact TCB adjustment result survived its carrier region (crlf={normalize_crlf})"
+        );
+    }
+
     let mut early_mutable_duplicate = production.clone();
     let carrier_install = "ScopedPrivilegeThreadToken::install(privilege_carrier.raw())";
     let carrier_install_sentinel = "__MOVED_PRIVILEGE_CARRIER_INSTALL__";
@@ -11423,14 +11573,32 @@ fn target_desktop_bootstrap_authority_mutations_are_rejected() {
     let mut missing_tcb = production.clone();
     replace_windows_source_once(
         &mut missing_tcb.package,
-        "pub(crate) const LAUNCHER_PRIVILEGES: &[&str] = &[\n    \"SeAssignPrimaryTokenPrivilege\",\n    \"SeIncreaseQuotaPrivilege\",\n    \"SeTcbPrivilege\",\n];",
-        "pub(crate) const LAUNCHER_PRIVILEGES: &[&str] = &[\n    \"SeAssignPrimaryTokenPrivilege\",\n    \"SeIncreaseQuotaPrivilege\",\n];",
+        "pub(crate) const LAUNCHER_PRIVILEGES: &[&str] = &[\n    \"SeAssignPrimaryTokenPrivilege\",\n    \"SeBackupPrivilege\",\n    \"SeIncreaseQuotaPrivilege\",\n    \"SeRestorePrivilege\",\n    \"SeTcbPrivilege\",\n];",
+        "pub(crate) const LAUNCHER_PRIVILEGES: &[&str] = &[\n    \"SeAssignPrimaryTokenPrivilege\",\n    \"SeBackupPrivilege\",\n    \"SeIncreaseQuotaPrivilege\",\n    \"SeRestorePrivilege\",\n];",
         "launcher-tcb-required-privilege-omitted",
     );
     assert!(
         validate_windows_production_contract(&missing_tcb).is_err(),
         "missing launcher TCB privilege survived the target desktop bootstrap contract"
     );
+
+    for (privilege, mutant) in [
+        (
+            "    \"SeBackupPrivilege\",\n",
+            "launcher-profile-backup-required-privilege-omitted",
+        ),
+        (
+            "    \"SeRestorePrivilege\",\n",
+            "launcher-profile-restore-required-privilege-omitted",
+        ),
+    ] {
+        let mut mutated = production.clone();
+        replace_windows_source_once(&mut mutated.package, privilege, "", mutant);
+        assert!(
+            validate_windows_production_contract(&mutated).is_err(),
+            "{mutant} survived the target desktop bootstrap contract"
+        );
+    }
 
     let mut stale_schema = production.clone();
     replace_windows_source_once(
@@ -11530,10 +11698,16 @@ fn target_desktop_bootstrap_authority_mutations_are_rejected() {
 
 #[derive(Clone)]
 struct WindowsLoaderControlContractSources {
+    control_service: String,
+    launcher_service: String,
     process: String,
+    security: String,
+    token: String,
+    core: String,
     pipe: String,
     loader_access: String,
     loader_debug: String,
+    access_trace: String,
     session_broker: String,
     cargo: String,
     bootstrap: String,
@@ -11546,11 +11720,18 @@ struct WindowsLoaderControlContractSources {
 
 #[derive(Clone, Copy)]
 enum WindowsLoaderControlContractSource {
+    ControlService,
+    LauncherService,
     Process,
+    Security,
+    Token,
+    Core,
     Pipe,
     LoaderAccess,
     LoaderDebug,
+    AccessTrace,
     SessionBroker,
+    Cargo,
     Bootstrap,
     PackageSchema,
     Pe,
@@ -11560,8 +11741,23 @@ enum WindowsLoaderControlContractSource {
 impl WindowsLoaderControlContractSources {
     fn load() -> Self {
         Self {
+            control_service: normalize_windows_source(include_str!(
+                "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/control_service.rs"
+            )),
+            launcher_service: normalize_windows_source(include_str!(
+                "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/launcher_service.rs"
+            )),
             process: normalize_windows_source(include_str!(
                 "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/process.rs"
+            )),
+            security: normalize_windows_source(include_str!(
+                "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/security.rs"
+            )),
+            token: normalize_windows_source(include_str!(
+                "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/token.rs"
+            )),
+            core: normalize_windows_source(include_str!(
+                "../../../crates/memcordon-core/src/windows_sealed.rs"
             )),
             pipe: normalize_windows_source(include_str!(
                 "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/pipe.rs"
@@ -11571,6 +11767,9 @@ impl WindowsLoaderControlContractSources {
             )),
             loader_debug: normalize_windows_source(include_str!(
                 "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/loader_debug.rs"
+            )),
+            access_trace: normalize_windows_source(include_str!(
+                "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/access_trace.rs"
             )),
             session_broker: normalize_windows_source(include_str!(
                 "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/session_broker.rs"
@@ -11595,11 +11794,18 @@ impl WindowsLoaderControlContractSources {
 
     fn source_mut(&mut self, source: WindowsLoaderControlContractSource) -> &mut String {
         match source {
+            WindowsLoaderControlContractSource::ControlService => &mut self.control_service,
+            WindowsLoaderControlContractSource::LauncherService => &mut self.launcher_service,
             WindowsLoaderControlContractSource::Process => &mut self.process,
+            WindowsLoaderControlContractSource::Security => &mut self.security,
+            WindowsLoaderControlContractSource::Token => &mut self.token,
+            WindowsLoaderControlContractSource::Core => &mut self.core,
             WindowsLoaderControlContractSource::Pipe => &mut self.pipe,
             WindowsLoaderControlContractSource::LoaderAccess => &mut self.loader_access,
             WindowsLoaderControlContractSource::LoaderDebug => &mut self.loader_debug,
+            WindowsLoaderControlContractSource::AccessTrace => &mut self.access_trace,
             WindowsLoaderControlContractSource::SessionBroker => &mut self.session_broker,
+            WindowsLoaderControlContractSource::Cargo => &mut self.cargo,
             WindowsLoaderControlContractSource::Bootstrap => &mut self.bootstrap,
             WindowsLoaderControlContractSource::PackageSchema => &mut self.package_schema,
             WindowsLoaderControlContractSource::Pe => &mut self.pe,
@@ -11608,9 +11814,4621 @@ impl WindowsLoaderControlContractSources {
     }
 }
 
+fn validate_windows_shared_userenv_restriction_presence_contract(
+    process: &str,
+    token: &str,
+) -> Result<(), String> {
+    let same_access_constructor = semantic_function_region(
+        token,
+        "fn restricted_same_access_primary(source: HANDLE) -> Result<OwnedHandle, String> {",
+        "pub(crate) fn canonical_same_access_restricting_sids(token: HANDLE) -> Result<Vec<String>, String> {",
+    )
+    .ok_or_else(|| {
+        "private same-access restriction constructor has no semantic boundary".to_owned()
+    })?;
+    require_source_order(
+        &same_access_constructor,
+        &[
+            ("let user = query(source, TokenUser)?;", "B user SID source"),
+            (
+                "let groups = query(source, TokenGroups)?;",
+                "B group SID source",
+            ),
+            (
+                "entry.Attributes & SE_GROUP_INTEGRITY as u32 == 0",
+                "integrity SID exclusion",
+            ),
+            (
+                "CreateRestrictedToken(\n            source,\n            0,",
+                "zero-flag C derivation from exact B",
+            ),
+            (
+                "restricting_sid_count,\n            restricting_sids.as_ptr(),",
+                "complete canonical inventory passed to native construction",
+            ),
+        ],
+    )?;
+    if same_access_constructor.contains("pub(crate) fn restricted_same_access_primary") {
+        return Err("raw same-access restriction constructor escaped its token module".to_owned());
+    }
+
+    let canonical_inventory = semantic_function_region(
+        token,
+        "pub(crate) fn canonical_same_access_restricting_sids(token: HANDLE) -> Result<Vec<String>, String> {",
+        "pub(crate) fn nested_initial_thread_token_for_test() -> Result<OwnedHandle, String> {",
+    )
+    .ok_or_else(|| "canonical same-access inventory has no semantic boundary".to_owned())?;
+    require_source_order(
+        &canonical_inventory,
+        &[
+            (
+                "let mut sids = vec![token_user_sid(token)?];",
+                "token user first",
+            ),
+            (
+                "let groups = query(token, TokenGroups)?;",
+                "token groups read raw",
+            ),
+            (
+                "entry.Attributes & SE_GROUP_INTEGRITY as u32 == 0",
+                "integrity groups excluded",
+            ),
+            (
+                "sort_and_validate_canonical_same_access_restricting_sids(sids)",
+                "central sorted duplicate validation",
+            ),
+            ("sids.sort();", "canonical ordering"),
+            (
+                "sids.windows(2).any(|pair| pair[0] == pair[1])",
+                "adjacent duplicate rejection after sort",
+            ),
+            (
+                "canonical same-access restricting SID inventory contains duplicates",
+                "fail-closed duplicate diagnostic",
+            ),
+        ],
+    )?;
+    if canonical_inventory.contains(".dedup()") {
+        return Err("canonical same-access SID duplicates are silently removed".to_owned());
+    }
+
+    let identity_sibling = semantic_function_region(
+        token,
+        "pub(crate) fn loader_restriction_identity_sibling_from_presence_comparison(",
+        "struct TokenLogonSidGroupEvidenceV1 {",
+    )
+    .ok_or_else(|| "same-access restriction sibling has no semantic boundary".to_owned())?;
+    require_source_order(
+        &identity_sibling,
+        &[
+            (
+                "validate_loader_restriction_presence_pair(baseline, no_restricting_sid)?;",
+                "fresh A/B semantic reattestation before C derivation",
+            ),
+            (
+                "loader_restriction_presence_binding_sha256(\n        source_binding_sha256,",
+                "fresh A/B binding reattestation",
+            ),
+            (
+                "observed_presence_binding_sha256 != expected_restriction_presence_binding_sha256",
+                "transferred A/B binding equality",
+            ),
+            (
+                "canonical_same_access_restricting_sids(no_restricting_sid)?;",
+                "canonical B-derived same-access inventory",
+            ),
+            (
+                "if expected_restricting_sids.is_empty() {",
+                "nonempty canonical inventory admission",
+            ),
+            (
+                ".map(|sid| (sid.clone(), NORMALIZED_RESTRICTING_SID_ATTRIBUTES))",
+                "typed expected SID and normalized attribute inventory",
+            ),
+            (
+                "restricted_same_access_primary(no_restricting_sid)?;",
+                "C derived only from privilege-disabled B",
+            ),
+            (
+                "token_attestation_snapshot(same_access_restricted)?;",
+                "complete C attestation",
+            ),
+            (
+                "token_restricting_sid_inventory(same_access_restricted)?;",
+                "raw C restricting inventory",
+            ),
+            (
+                "LoaderRestrictionPairInvariantsV1::from_snapshot(&no_restricting_sid_snapshot)\n            .without_restricting_sid_inventory();",
+                "B invariant projection excluding only restricting inventory",
+            ),
+            (
+                "LoaderRestrictionPairInvariantsV1::from_snapshot(&same_access_snapshot)\n            .without_restricting_sid_inventory();",
+                "C invariant projection excluding only restricting inventory",
+            ),
+            (
+                "no_restricting_sid_invariants != same_access_invariants",
+                "exact B/C non-treatment equality",
+            ),
+            (
+                "!same_access_snapshot.behavior.token_is_restricted",
+                "C IsTokenRestricted admission",
+            ),
+            (
+                "same_access_inventory.trustees != expected_restricting_sids",
+                "exact canonical trustee equality",
+            ),
+            (
+                "same_access_inventory.entries != expected_restricting_entries",
+                "exact typed canonical trustee/count/attribute equality",
+            ),
+            (
+                ".enabled_sensitive_privilege_count\n            != 0",
+                "C sensitive privileges remain disabled",
+            ),
+            (
+                "\"memcordon-loader-restriction-identity-v1\"",
+                "domain-separated A/B/C binding",
+            ),
+            (
+                "\"baseline->no-restricting-SID->canonical-same-access\"",
+                "exact derivation-order binding",
+            ),
+            (
+                "DISABLE_MAX_PRIVILEGE,",
+                "B privilege-deletion recipe binding",
+            ),
+            ("0_u32,", "C zero-flag same-access recipe binding"),
+            ("baseline_snapshot,", "complete A snapshot binding"),
+            (
+                "no_restricting_sid_snapshot,",
+                "complete B snapshot binding",
+            ),
+            ("same_access_snapshot,", "complete C snapshot binding"),
+        ],
+    )?;
+    for forbidden in [
+        "restricted_same_access_primary(baseline)",
+        "restricted_same_access_primary(source",
+        "primary_without_restricting_sid_from_source(",
+        "same_access_inventory.trustees.contains(",
+        "same_access_inventory.evidence.contains(",
+        "token_id !=",
+        "token_id ==",
+    ] {
+        if identity_sibling.contains(forbidden) {
+            return Err(format!(
+                "same-access restriction sibling admitted a confound: {forbidden}"
+            ));
+        }
+    }
+    let logon_constructor = semantic_function_region(
+        token,
+        "fn restricted_logon_sid_primary(",
+        "fn authenticated_users_sid() -> Result<QueryBuffer, String> {",
+    )
+    .ok_or_else(|| {
+        "private target-logon restriction constructor has no semantic boundary".to_owned()
+    })?;
+    require_source_order(
+        &logon_constructor,
+        &[
+            (
+                "let groups = query(source, TokenGroups)?;",
+                "D source proof from raw B TokenGroups",
+            ),
+            (
+                "entry.Attributes & SE_GROUP_LOGON_ID as u32 == SE_GROUP_LOGON_ID as u32",
+                "raw TokenGroups logon marker",
+            ),
+            (
+                "let [source_entry] = candidates.as_slice() else {",
+                "exactly one raw logon group",
+            ),
+            (
+                "source_entry.Attributes & SE_GROUP_ENABLED as u32 == 0",
+                "enabled raw logon group",
+            ),
+            (
+                "source_entry.Attributes & SE_GROUP_USE_FOR_DENY_ONLY_ATTRIBUTES != 0",
+                "non-deny-only raw logon group",
+            ),
+            (
+                "let logon_groups = query(source, TokenLogonSid)?;",
+                "raw TokenLogonSid cross-check query",
+            ),
+            (
+                "let [logon_entry] = logon_entries else {",
+                "exact raw TokenLogonSid cardinality",
+            ),
+            (
+                "validate_token_logon_sid_attributes(logon_entry.Attributes)?;",
+                "raw TokenLogonSid marker validation",
+            ),
+            (
+                "if unsafe { EqualSid(source_entry.Sid, logon_entry.Sid) } == 0",
+                "raw PSID identity cross-check",
+            ),
+            (
+                "sid: sid_string(source_entry.Sid)?,",
+                "display rendering occurs only after raw authorization",
+            ),
+            (
+                "Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,",
+                "zero input SID attributes",
+            ),
+            (
+                "CreateRestrictedToken(\n            source,\n            0,",
+                "zero-flag D derivation from exact B",
+            ),
+            (
+                "1,\n            &raw const restricting_sid,",
+                "one source-attested restricting SID",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "pub(crate) fn restricted_logon_sid_primary",
+        "restricted_primary_for_source(",
+        "ConvertStringSidToSid",
+        ".is_ok_and(|sid|",
+        "Attributes: NORMALIZED_RESTRICTING_SID_ATTRIBUTES",
+    ] {
+        if logon_constructor.contains(forbidden) {
+            return Err(format!(
+                "target-logon restriction constructor admitted a confound: {forbidden}"
+            ));
+        }
+    }
+
+    let logon_sibling = semantic_function_region(
+        token,
+        "pub(crate) fn loader_logon_restriction_sibling_from_identity_comparison(",
+        "pub(crate) fn validate_transferred_loader_profile_capability(",
+    )
+    .ok_or_else(|| "authenticated target-logon sibling has no semantic boundary".to_owned())?;
+    require_source_order(
+        &logon_sibling,
+        &[
+            (
+                "validate_loader_restriction_identity_triplet(",
+                "fresh A/B/C semantic and binding reattestation",
+            ),
+            (
+                "Some(expected_restriction_identity_binding_sha256),",
+                "exact identity binding equality before D derivation",
+            ),
+            (
+                "restricted_logon_sid_primary(no_restricting_sid)?;",
+                "D derived only from authenticated privilege-disabled B",
+            ),
+            (
+                "let logon_snapshot = token_attestation_snapshot(logon_restricted)?;",
+                "complete D attestation",
+            ),
+            (
+                "let logon_inventory = token_restricting_sid_inventory(logon_restricted)?;",
+                "raw typed D restricting inventory",
+            ),
+            (
+                "NORMALIZED_RESTRICTING_SID_ATTRIBUTES,",
+                "normalized D output attributes",
+            ),
+            (
+                "no_restricting_sid_invariants != logon_invariants",
+                "exact B/D non-treatment equality",
+            ),
+            (
+                "baseline_invariants != logon_invariants",
+                "exact A/D non-treatment equality",
+            ),
+            (
+                "!logon_snapshot.behavior.token_is_restricted",
+                "D IsTokenRestricted admission",
+            ),
+            (
+                "logon_inventory.entries != expected_logon_entries",
+                "exact typed singleton SID/count/attribute equality",
+            ),
+            (
+                "logon_inventory.trustees != vec![source_logon_group.sid.clone()]",
+                "exact D trustee singleton equality",
+            ),
+            (
+                "logon_snapshot.behavior.enabled_sensitive_privilege_count != 0",
+                "D sensitive privileges remain disabled",
+            ),
+        ],
+    )?;
+    let logon_binding = semantic_function_region(
+        token,
+        "fn loader_logon_restriction_binding_sha256(",
+        "fn validate_loader_logon_restriction_quadruplet(",
+    )
+    .ok_or_else(|| "A/B/C/D binding has no semantic boundary".to_owned())?;
+    require_source_order(
+        &logon_binding,
+        &[
+            (
+                "\"memcordon-loader-logon-restriction-v1\"",
+                "domain-separated A/B/C/D binding",
+            ),
+            (
+                "\"baseline->no-restricting-SID->canonical-same-access->target-logon-SID\"",
+                "exact D derivation-order binding",
+            ),
+            (
+                "DISABLE_MAX_PRIVILEGE,",
+                "B privilege-deletion recipe binding",
+            ),
+            ("0_u32,", "D zero-flag recipe binding"),
+            (
+                "CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,",
+                "D zero input attribute binding",
+            ),
+            (
+                "NORMALIZED_RESTRICTING_SID_ATTRIBUTES,",
+                "D normalized output attribute binding",
+            ),
+            ("source_logon_group,", "raw source logon evidence binding"),
+            ("baseline_snapshot,", "complete A snapshot binding"),
+            (
+                "no_restricting_sid_snapshot,",
+                "complete B snapshot binding",
+            ),
+            ("same_access_snapshot,", "complete C snapshot binding"),
+            ("logon_snapshot,", "complete D snapshot binding"),
+        ],
+    )?;
+    for forbidden in [
+        "restricted_logon_sid_primary(baseline)",
+        "restricted_logon_sid_primary(same_access_restricted)",
+        "logon_inventory.evidence",
+        "logon_inventory.entries.contains(",
+        "token_id !=",
+        "token_id ==",
+    ] {
+        if logon_sibling.contains(forbidden) {
+            return Err(format!(
+                "authenticated target-logon sibling admitted a confound: {forbidden}"
+            ));
+        }
+    }
+    let authenticated_users_constructor = semantic_function_region(
+        token,
+        "fn authenticated_users_sid() -> Result<QueryBuffer, String> {",
+        "struct TargetUserGroupEvidenceV1 {",
+    )
+    .ok_or_else(|| {
+        "private Authenticated Users restriction constructor has no semantic boundary".to_owned()
+    })?;
+    require_source_order(
+        &authenticated_users_constructor,
+        &[
+            (
+                "CreateWellKnownSid(\n            WinAuthenticatedUserSid,",
+                "binary well-known Authenticated Users authority",
+            ),
+            (
+                "(unsafe { EqualSid(entry.Sid, expected_sid) }) != 0",
+                "raw EqualSid selection",
+            ),
+            (
+                "let [entry] = matches.as_slice() else {",
+                "exact raw match cardinality",
+            ),
+            (
+                "attributes != NORMALIZED_RESTRICTING_SID_ATTRIBUTES",
+                "exact enabled non-deny-only source attributes",
+            ),
+            (
+                "let groups = query(source, TokenGroups)?;",
+                "raw B TokenGroups authority",
+            ),
+            (
+                "let source_entry = exact_equal_sid_entry(",
+                "unique raw B Authenticated Users entry",
+            ),
+            (
+                "validate_authenticated_users_attributes(source_entry.Attributes, \"TokenGroups\")?;",
+                "exact B attributes",
+            ),
+            (
+                "let canonical = query(canonical_same_access, TokenRestrictedSids)?;",
+                "raw C canonical inventory authority",
+            ),
+            (
+                "let canonical_entry = exact_equal_sid_entry(",
+                "exact raw C membership",
+            ),
+            (
+                "validate_authenticated_users_attributes(\n        canonical_entry.Attributes,\n        \"canonical TokenRestrictedSids\",\n    )?;",
+                "exact canonical output attributes",
+            ),
+            (
+                "let sid = sid_string(expected_sid.as_ptr().cast_mut().cast())?;",
+                "display rendering only after raw B/C authority",
+            ),
+            (
+                "Sid: source_entry.Sid,\n        Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,",
+                "retained raw B PSID and zero input attributes",
+            ),
+            (
+                "CreateRestrictedToken(\n            source,\n            0,",
+                "zero-flag E derivation from exact B",
+            ),
+            (
+                "1,\n            &raw const restricting_sid,",
+                "one source-attested E restricting SID",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "pub(crate) fn restricted_authenticated_users_primary",
+        "ConvertStringSidToSid",
+        "sid_string(source_entry.Sid)",
+        ".is_ok_and(|sid|",
+        "Attributes: NORMALIZED_RESTRICTING_SID_ATTRIBUTES",
+        "CreateRestrictedToken(\n            canonical_same_access,",
+    ] {
+        if authenticated_users_constructor.contains(forbidden) {
+            return Err(format!(
+                "Authenticated Users restriction constructor admitted a confound: {forbidden}"
+            ));
+        }
+    }
+
+    let authenticated_users_sibling = semantic_function_region(
+        token,
+        "pub(crate) fn loader_authenticated_users_restriction_sibling_from_logon_comparison(",
+        "pub(crate) fn loader_target_user_restriction_sibling_from_authenticated_users_comparison(",
+    )
+    .ok_or_else(|| "authenticated E sibling has no semantic boundary".to_owned())?;
+    require_source_order(
+        &authenticated_users_sibling,
+        &[
+            (
+                "validate_loader_logon_restriction_quadruplet(",
+                "fresh authenticated A/B/C/D semantic reattestation",
+            ),
+            (
+                "Some(expected_logon_restriction_binding_sha256),",
+                "exact upstream D binding equality before E derivation",
+            ),
+            (
+                "restricted_authenticated_users_primary(no_restricting_sid, same_access_restricted)?;",
+                "E derived only from authenticated B and admitted C",
+            ),
+            (
+                "\"memcordon-loader-authenticated-users-restriction-v1\"",
+                "domain-separated A/B/C/D/E binding",
+            ),
+            (
+                "\"baseline->no-restricting-SID->canonical-same-access->target-logon-SID->authenticated-users-SID\"",
+                "exact E derivation-order binding",
+            ),
+            (
+                "DISABLE_MAX_PRIVILEGE,\n            0_u32,\n            CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,\n            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,",
+                "exact B privilege deletion and E flags/input/output recipe binding",
+            ),
+            (
+                "source_binding_sha256,\n            restriction_presence_binding_sha256,\n            restriction_identity_binding_sha256,\n            logon_restriction_binding_sha256,",
+                "complete upstream source/A/B/C/D bindings",
+            ),
+            (
+                "source_logon_group,\n            source_authenticated_users_group,\n            expected_same_access_entries,\n            expected_logon_entries,\n            expected_authenticated_users_entries,",
+                "raw source evidence and exact C/D/E inventories binding",
+            ),
+            (
+                "baseline_snapshot,\n            no_restricting_sid_snapshot,\n            same_access_snapshot,\n            logon_snapshot,\n            authenticated_users_snapshot,",
+                "complete A/B/C/D/E snapshot binding",
+            ),
+            (
+                "token_attestation_snapshot(authenticated_users_restricted)?;",
+                "complete E attestation",
+            ),
+            (
+                "token_restricting_sid_inventory(authenticated_users_restricted)?;",
+                "typed E restricting inventory",
+            ),
+            (
+                "token_has_exact_restricting_sid_equal_sid(",
+                "raw E singleton output authority",
+            ),
+            (
+                "no_restricting_sid_invariants != authenticated_users_invariants",
+                "exact B/E non-treatment equality",
+            ),
+            (
+                "baseline_invariants != authenticated_users_invariants",
+                "exact A/E non-treatment equality",
+            ),
+            (
+                "!authenticated_users_snapshot.behavior.token_is_restricted",
+                "E IsTokenRestricted admission",
+            ),
+            (
+                "authenticated_users_inventory.entries != expected_authenticated_users_entries",
+                "exact typed E singleton/count/attribute equality",
+            ),
+            (
+                "authenticated_users_inventory.trustees\n            != vec![source_authenticated_users_group.sid.clone()]",
+                "exact E trustee singleton equality",
+            ),
+            (
+                ".enabled_sensitive_privilege_count\n            != 0",
+                "E sensitive privileges remain disabled",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "restricted_authenticated_users_primary(baseline",
+        "restricted_authenticated_users_primary(logon_restricted",
+        "authenticated_users_inventory.entries.contains(",
+        "authenticated_users_inventory.evidence",
+        "token_id !=",
+        "token_id ==",
+    ] {
+        if authenticated_users_sibling.contains(forbidden) {
+            return Err(format!(
+                "authenticated E sibling admitted a confound: {forbidden}"
+            ));
+        }
+    }
+
+    let token_user_authority = semantic_function_region(
+        token,
+        "fn token_user_entry(user: &QueryBuffer) -> Result<SID_AND_ATTRIBUTES, String> {",
+        "fn validate_authenticated_users_attributes(attributes: u32, role: &str) -> Result<(), String> {",
+    )
+    .ok_or_else(|| "raw TokenUser authority validator has no semantic boundary".to_owned())?;
+    require_source_order(
+        &token_user_authority,
+        &[
+            (
+                "user.len() < std::mem::size_of::<windows_sys::Win32::Security::TOKEN_USER>()",
+                "fixed TOKEN_USER size admission",
+            ),
+            (
+                ".cast::<windows_sys::Win32::Security::TOKEN_USER>()",
+                "typed raw TOKEN_USER projection",
+            ),
+            (
+                "entry.Sid.is_null() || unsafe { IsValidSid(entry.Sid) } == 0",
+                "non-null valid raw TokenUser SID admission",
+            ),
+        ],
+    )?;
+
+    let target_user_constructor = semantic_function_region(
+        token,
+        "struct TargetUserGroupEvidenceV1 {",
+        "pub(crate) fn validate_authenticated_users_matches_for_test(",
+    )
+    .ok_or_else(|| {
+        "private target-user restriction constructor has no semantic boundary".to_owned()
+    })?;
+    require_source_order(
+        &target_user_constructor,
+        &[
+            (
+                "let user = query(source, TokenUser)?;",
+                "raw B TOKEN_USER authority",
+            ),
+            (
+                "let source_entry = token_user_entry(&user)?;",
+                "validated live B TokenUser entry",
+            ),
+            (
+                "let canonical = query(canonical_same_access, TokenRestrictedSids)?;",
+                "raw C restricting inventory authority",
+            ),
+            (
+                "let canonical_entry = exact_equal_sid_entry_for_trustee(",
+                "exactly one raw EqualSid membership match",
+            ),
+            (
+                "source_entry.Sid,\n        \"canonical TokenRestrictedSids\",\n        \"target user SID\",",
+                "raw B PSID compared directly against C",
+            ),
+            (
+                "canonical_entry.Attributes != NORMALIZED_RESTRICTING_SID_ATTRIBUTES",
+                "exact C output attributes",
+            ),
+            (
+                "sid: sid_string(source_entry.Sid)?,",
+                "SID rendered only after raw authority",
+            ),
+            (
+                "Sid: source_entry.Sid,\n        Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,",
+                "retained raw B PSID and zero input attributes",
+            ),
+            (
+                "CreateRestrictedToken(\n            source,\n            0,",
+                "zero-flag F derivation from exact B",
+            ),
+            (
+                "1,\n            &raw const restricting_sid,",
+                "one raw target-user restricting entry",
+            ),
+            (
+                "token_has_exact_restricting_sid_equal_sid(\n        restricted.raw(),\n        source_entry.Sid,\n        NORMALIZED_RESTRICTING_SID_ATTRIBUTES,",
+                "exact raw F singleton output attestation",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "pub(crate) fn restricted_target_user_primary",
+        "token_user_sid(source)",
+        "ConvertStringSidToSid",
+        "authenticated_users_sid()",
+        "sid_string(source_entry.Sid)? ==",
+        "Attributes: NORMALIZED_RESTRICTING_SID_ATTRIBUTES",
+        "CreateRestrictedToken(\n            canonical_same_access,",
+    ] {
+        if target_user_constructor.contains(forbidden) {
+            return Err(format!(
+                "target-user restriction constructor admitted a confound: {forbidden}"
+            ));
+        }
+    }
+    let target_user_evidence = semantic_function_region(
+        token,
+        "fn target_user_group_evidence(",
+        "fn restricted_target_user_primary(",
+    )
+    .ok_or_else(|| "raw target-user evidence helper has no semantic boundary".to_owned())?;
+    require_source_order(
+        &target_user_evidence,
+        &[
+            (
+                "let user = query(source, TokenUser)?;",
+                "raw B TOKEN_USER evidence",
+            ),
+            (
+                "let source_entry = token_user_entry(&user)?;",
+                "validated B TokenUser evidence",
+            ),
+            (
+                "let canonical = query(canonical_same_access, TokenRestrictedSids)?;",
+                "raw C inventory evidence",
+            ),
+            (
+                "let canonical_entry = exact_equal_sid_entry_for_trustee(",
+                "exact raw B-in-C membership evidence",
+            ),
+            (
+                "canonical_entry.Attributes != NORMALIZED_RESTRICTING_SID_ATTRIBUTES",
+                "exact C target-user attributes evidence",
+            ),
+            (
+                "sid: sid_string(source_entry.Sid)?,",
+                "display SID rendered only after raw evidence admission",
+            ),
+        ],
+    )?;
+    let target_user_restriction_constructor = semantic_function_region(
+        token,
+        "fn restricted_target_user_primary(",
+        "pub(crate) fn validate_authenticated_users_matches_for_test(",
+    )
+    .ok_or_else(|| "raw target-user constructor has no exact semantic boundary".to_owned())?;
+    require_source_order(
+        &target_user_restriction_constructor,
+        &[
+            (
+                "let user = query(source, TokenUser)?;",
+                "raw B TOKEN_USER construction authority",
+            ),
+            (
+                "let source_entry = token_user_entry(&user)?;",
+                "validated live B TokenUser construction entry",
+            ),
+            (
+                "let canonical = query(canonical_same_access, TokenRestrictedSids)?;",
+                "raw C inventory construction authority",
+            ),
+            (
+                "let canonical_entry = exact_equal_sid_entry_for_trustee(",
+                "exactly one raw EqualSid C membership for construction",
+            ),
+            (
+                "canonical_entry.Attributes != NORMALIZED_RESTRICTING_SID_ATTRIBUTES",
+                "exact C target-user attributes for construction",
+            ),
+            (
+                "sid: sid_string(source_entry.Sid)?,",
+                "display SID rendered after construction authority",
+            ),
+            (
+                "Sid: source_entry.Sid,\n        Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,",
+                "live raw B PSID and zero input attributes",
+            ),
+            (
+                "CreateRestrictedToken(\n            source,\n            0,\n            0,\n            ptr::null(),\n            0,\n            ptr::null(),\n            1,\n            &raw const restricting_sid,",
+                "zero flags, no disabled/deleted entries, and one restricting SID",
+            ),
+            (
+                "token_has_exact_restricting_sid_equal_sid(\n        restricted.raw(),\n        source_entry.Sid,\n        NORMALIZED_RESTRICTING_SID_ATTRIBUTES,",
+                "exact raw F singleton output",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "sid_string(source_entry.Sid).is_ok_and",
+        "sid_string(entry.Sid).is_ok_and",
+        "Sid: canonical_entry.Sid",
+        "CreateRestrictedToken(\n            canonical_same_access,",
+        "WRITE_RESTRICTED",
+    ] {
+        if target_user_evidence.contains(forbidden)
+            || target_user_restriction_constructor.contains(forbidden)
+        {
+            return Err(format!(
+                "raw target-user authority admitted a display or construction confound: {forbidden}"
+            ));
+        }
+    }
+
+    let target_user_sibling = semantic_function_region(
+        token,
+        "pub(crate) fn loader_target_user_restriction_sibling_from_authenticated_users_comparison(",
+        "pub(crate) fn validate_transferred_loader_profile_capability(",
+    )
+    .ok_or_else(|| "authenticated F sibling has no semantic boundary".to_owned())?;
+    require_source_order(
+        &target_user_sibling,
+        &[
+            (
+                "validate_loader_authenticated_users_restriction_quintuplet(",
+                "fresh authenticated A/B/C/D/E reattestation",
+            ),
+            (
+                "Some(expected_authenticated_users_restriction_binding_sha256),",
+                "exact upstream E binding equality before F derivation",
+            ),
+            (
+                "restricted_target_user_primary(no_restricting_sid, same_access_restricted)?;",
+                "F derived only from authenticated B and admitted C",
+            ),
+            (
+                "target_user_group_evidence(no_restricting_sid, same_access_restricted)?;",
+                "raw B/C target-user evidence reattestation",
+            ),
+            (
+                "token_attestation_snapshot(target_user_restricted.raw())?;",
+                "complete F attestation",
+            ),
+            (
+                "token_restricting_sid_inventory(target_user_restricted.raw())?;",
+                "typed F restricting inventory",
+            ),
+            (
+                "token_has_exact_restricting_sid_equal_sid(",
+                "raw F singleton output authority",
+            ),
+            (
+                "LoaderRestrictionPairInvariantsV1::from_snapshot(&validation.no_restricting_sid_snapshot)",
+                "exact B/F invariant projection",
+            ),
+            (
+                "LoaderRestrictionPairInvariantsV1::from_snapshot(&validation.baseline_snapshot)",
+                "exact A/F invariant projection",
+            ),
+            (
+                "!target_user_snapshot.behavior.token_is_restricted",
+                "F IsTokenRestricted admission",
+            ),
+            (
+                "target_user_inventory.entries != expected_target_user_entries",
+                "exact typed F singleton/count/attribute equality",
+            ),
+            (
+                "target_user_inventory.trustees != vec![source_target_user.sid.clone()]",
+                "exact F trustee singleton equality",
+            ),
+            (
+                ".enabled_sensitive_privilege_count\n            != 0",
+                "F sensitive privileges remain disabled",
+            ),
+            (
+                "let validation = validate_loader_authenticated_users_restriction_quintuplet(",
+                "post-F A/B/C/D/E reattestation",
+            ),
+            (
+                "target_user_group_evidence(no_restricting_sid, same_access_restricted)? != source_target_user",
+                "post-F raw TokenUser/C authority stability",
+            ),
+            (
+                "\"memcordon-loader-target-user-restriction-v1\"",
+                "domain-separated A/B/C/D/E/F binding",
+            ),
+            (
+                "\"baseline->no-restricting-SID->canonical-same-access->target-logon-SID->authenticated-users-SID->target-user-SID\"",
+                "exact F derivation-order binding",
+            ),
+            (
+                "DISABLE_MAX_PRIVILEGE,\n            0_u32,\n            CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,\n            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,",
+                "exact B privilege deletion and F non-WR flags/input/output recipe binding",
+            ),
+            (
+                "source_binding_sha256,\n            expected_restriction_presence_binding_sha256,\n            expected_restriction_identity_binding_sha256,\n            expected_logon_restriction_binding_sha256,\n            expected_authenticated_users_restriction_binding_sha256,",
+                "complete upstream source/A/B/C/D/E bindings",
+            ),
+            (
+                "&validation.source_logon_group,\n            &validation.source_authenticated_users_group,\n            &source_target_user,",
+                "raw D/E/F authority evidence binding",
+            ),
+            (
+                "&validation.expected_same_access_entries,\n            &validation.expected_logon_entries,\n            &validation.expected_authenticated_users_entries,\n            &expected_target_user_entries,",
+                "exact C/D/E/F inventories binding",
+            ),
+            (
+                "&validation.baseline_snapshot,\n            &validation.no_restricting_sid_snapshot,\n            &validation.same_access_snapshot,\n            &validation.logon_snapshot,\n            &validation.authenticated_users_snapshot,\n            &target_user_snapshot,",
+                "complete A/B/C/D/E/F snapshot binding",
+            ),
+        ],
+    )?;
+    if target_user_sibling
+        .matches("validate_loader_authenticated_users_restriction_quintuplet(")
+        .count()
+        != 2
+    {
+        return Err("F derivation lacks exact pre/post upstream reattestation".to_owned());
+    }
+    for forbidden in [
+        "restricted_target_user_primary(baseline",
+        "restricted_target_user_primary(same_access_restricted",
+        "restricted_target_user_primary(logon_restricted",
+        "restricted_target_user_primary(authenticated_users_restricted",
+        "target_user_inventory.entries.contains(",
+        "token_id !=",
+        "token_id ==",
+        "WRITE_RESTRICTED",
+    ] {
+        if target_user_sibling.contains(forbidden) {
+            return Err(format!(
+                "authenticated F sibling admitted a confound: {forbidden}"
+            ));
+        }
+    }
+    let authenticated_users_raw_output = semantic_function_region(
+        token,
+        "fn token_has_exact_restricting_sid_equal_sid(",
+        "pub(crate) fn loader_restriction_raw_sid_predicate_for_test()",
+    )
+    .ok_or_else(|| "raw E singleton output predicate has no semantic boundary".to_owned())?;
+    require_source_order(
+        &authenticated_users_raw_output,
+        &[
+            (
+                "let groups = query(token, TokenRestrictedSids)?;",
+                "raw E TokenRestrictedSids query",
+            ),
+            (
+                "entries.len() != 1 || entries[0].Attributes != expected_attributes",
+                "exact raw E cardinality and attribute admission",
+            ),
+            (
+                "EqualSid(entries[0].Sid, expected_sid)",
+                "raw E PSID equality",
+            ),
+        ],
+    )?;
+    let restricting_inventory = semantic_function_region(
+        token,
+        "pub(crate) struct TokenRestrictingSidInventory {",
+        "pub(crate) fn token_restricting_sids(token: HANDLE) -> Result<Vec<String>, String> {",
+    )
+    .ok_or_else(|| "typed restricting SID inventory has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restricting_inventory,
+        &[
+            (
+                "pub entries: Vec<(String, u32)>,",
+                "typed SID/attribute entries",
+            ),
+            (
+                ".map(|entry| Ok((sid_string(entry.Sid)?, entry.Attributes)))",
+                "raw TokenRestrictedSids SID and attribute projection",
+            ),
+            ("entries.sort();", "canonical typed entry ordering"),
+            (
+                "entries: entries.clone(),",
+                "complete typed entry retention",
+            ),
+            (
+                ".map(|(sid, attributes)| format!(\"{sid}@{attributes:x}\"))",
+                "separate display-only evidence projection",
+            ),
+        ],
+    )?;
+    let canary = semantic_function_region(
+        process,
+        "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+        "#[cfg(test)]",
+    )
+    .ok_or_else(|| "restriction-presence canary has no semantic boundary".to_owned())?;
+    require_source_order(
+        &canary,
+        &[
+            (
+                "validate_transferred_loader_restriction_presence_pair(",
+                "transferred token-pair reattestation",
+            ),
+            (
+                "token_attestation_snapshot(tokens.baseline.raw())",
+                "fresh full-restricted baseline attestation",
+            ),
+            (
+                "token_attestation_snapshot(\n        tokens.no_restricting_sid.raw(),",
+                "fresh no-restricting-SID sibling attestation",
+            ),
+            (
+                "loader_restriction_identity_sibling_from_presence_comparison(",
+                "locally derived and bound canonical same-access sibling",
+            ),
+            (
+                "tokens.baseline.raw(),",
+                "identity binding includes exact A",
+            ),
+            (
+                "tokens.no_restricting_sid.raw(),",
+                "identity sibling derives from exact B",
+            ),
+            (
+                "&tokens.source_binding_sha256,",
+                "identity binding retains authenticated source",
+            ),
+            (
+                "&tokens.restriction_presence_binding_sha256,",
+                "identity binding extends authenticated A/B treatment",
+            ),
+            (
+                "stage=same-access-restriction-derivation",
+                "fail-closed C derivation diagnostic",
+            ),
+            (
+                "loader_logon_restriction_sibling_from_identity_comparison(",
+                "locally derived authenticated target-logon sibling",
+            ),
+            (
+                "same_access_restricted.raw(),",
+                "D binding includes exact C",
+            ),
+            (
+                "&restriction_identity_binding_sha256,",
+                "D derivation extends authenticated A/B/C binding",
+            ),
+            (
+                "stage=logon-restriction-derivation",
+                "fail-closed D derivation diagnostic",
+            ),
+            (
+                "loader_authenticated_users_restriction_sibling_from_logon_comparison(",
+                "locally derived authenticated S-1-5-11 sibling",
+            ),
+            ("logon_restricted.raw(),", "E binding includes exact D"),
+            (
+                "&logon_restriction_binding_sha256,",
+                "E derivation extends authenticated A/B/C/D binding",
+            ),
+            (
+                "stage=authenticated-users-restriction-derivation",
+                "fail-closed E derivation diagnostic",
+            ),
+            (
+                "loader_target_user_restriction_sibling_from_authenticated_users_comparison(",
+                "locally derived authenticated raw target-user sibling",
+            ),
+            (
+                "authenticated_users_restricted.raw(),",
+                "F binding includes exact E",
+            ),
+            (
+                "&authenticated_users_restriction_binding_sha256,",
+                "F derivation extends authenticated A/B/C/D/E binding",
+            ),
+            (
+                "stage=target-user-restriction-derivation",
+                "fail-closed F derivation diagnostic",
+            ),
+            (
+                "let baseline_envelope = baseline_snapshot.behavior.envelope.clone();",
+                "baseline identity selects the shared Userenv allocation",
+            ),
+            (
+                "let same_access_envelope = same_access_snapshot.behavior.envelope.clone();",
+                "fresh C envelope drives only its diagnostic cell",
+            ),
+            (
+                "let logon_envelope = logon_snapshot.behavior.envelope.clone();",
+                "fresh D envelope drives only its diagnostic cell",
+            ),
+            (
+                "let authenticated_users_envelope = authenticated_users_snapshot.behavior.envelope.clone();",
+                "fresh E envelope drives only its diagnostic cell",
+            ),
+            (
+                "let target_user_envelope = target_user_snapshot.behavior.envelope.clone();",
+                "fresh F envelope drives only its diagnostic cell",
+            ),
+            (
+                "let before = observe_loader_profile(tokens.profile.raw(), &baseline_envelope.user_sid);",
+                "profile observation before shared environment construction",
+            ),
+            (
+                "before.state != LoaderProfileHiveStateV1::AlreadyLoadedBorrowed",
+                "already-loaded borrowed-profile admission",
+            ),
+            (
+                "OwnedUserEnvironmentBlock::create(tokens.baseline.raw())",
+                "single baseline-generated Userenv owner",
+            ),
+            (
+                "let admitted_environment = match shared_environment.inventory()",
+                "independent pre-launch byte inventory",
+            ),
+            (
+                "Ok(inventory) if inventory.missing_required.is_empty() => inventory,",
+                "required-key admission before either launch",
+            ),
+            (
+                "let baseline = launch_target_desktop_loader_control_cell_with_shared_environment(",
+                "fresh full-restricted baseline launch",
+            ),
+            ("tokens.baseline.raw(),", "exact baseline token"),
+            ("&baseline_envelope,", "exact baseline envelope"),
+            ("&baseline_snapshot,", "exact baseline snapshot"),
+            (
+                "LoaderControlMatrixCellV4::PRODUCTION,",
+                "fixed no-debugger/no-snaps production cell",
+            ),
+            (
+                "&mut shared_environment,",
+                "baseline borrows the prepared raw block",
+            ),
+            (
+                "&admitted_environment,",
+                "baseline borrows the admitted metadata",
+            ),
+            (
+                "LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,",
+                "fixed launcher-explicit diagnostic object authority",
+            ),
+            (
+                "let after_baseline_environment = shared_environment.inventory();",
+                "byte inventory between paired launches",
+            ),
+            (
+                "let after_baseline_observation = shared_environment_observation(\n        &admitted_environment,\n        &after_baseline_environment,\n        \"after-baseline\",",
+                "typed between-launch scan and exact metadata comparison",
+            ),
+            (
+                "if !after_baseline_observation.stable() {",
+                "between-launch mutation or scan failure rejection",
+            ),
+            (
+                "let comparison = launch_target_desktop_loader_control_cell_with_shared_environment(",
+                "fresh no-restricting-SID sibling launch",
+            ),
+            (
+                "tokens.no_restricting_sid.raw(),",
+                "exact no-restricting-SID token",
+            ),
+            ("&comparison_envelope,", "exact sibling envelope"),
+            ("&comparison_snapshot,", "exact sibling snapshot"),
+            (
+                "LoaderControlMatrixCellV4::PRODUCTION,",
+                "same fixed production cell",
+            ),
+            (
+                "&mut shared_environment,",
+                "sibling borrows the same raw block owner",
+            ),
+            (
+                "&admitted_environment,",
+                "sibling borrows the same admitted metadata",
+            ),
+            (
+                "LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,",
+                "same launcher-explicit diagnostic object authority",
+            ),
+            (
+                "let after_comparison_environment = shared_environment.inventory();",
+                "byte inventory after the paired launches",
+            ),
+            (
+                "let after_comparison_observation = shared_environment_observation(\n        &admitted_environment,\n        &after_comparison_environment,\n        \"after-comparison\",",
+                "typed post-B scan and exact metadata comparison",
+            ),
+            (
+                "if !after_comparison_observation.stable() {",
+                "B-to-C mutation or scan failure rejection",
+            ),
+            (
+                "let same_access = launch_target_desktop_loader_control_cell_with_shared_environment(",
+                "fresh canonical same-access restricted sibling launch",
+            ),
+            (
+                "same_access_restricted.raw(),",
+                "exact locally derived C token",
+            ),
+            ("&same_access_envelope,", "exact C envelope"),
+            ("&same_access_snapshot,", "exact C snapshot"),
+            (
+                "LoaderControlMatrixCellV4::PRODUCTION,",
+                "C uses the same fixed production cell",
+            ),
+            (
+                "&mut shared_environment,",
+                "C borrows the same raw block owner",
+            ),
+            (
+                "&admitted_environment,",
+                "C borrows the same admitted metadata",
+            ),
+            (
+                "LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,",
+                "C uses the same launcher-explicit diagnostic authority",
+            ),
+            (
+                "let after_same_access_environment = shared_environment.inventory();",
+                "byte inventory after C",
+            ),
+            (
+                "let after_same_access_observation = shared_environment_observation(\n        &admitted_environment,\n        &after_same_access_environment,\n        \"after-same-access\",",
+                "typed post-C scan and exact metadata comparison",
+            ),
+            (
+                "if !after_same_access_observation.stable() {",
+                "C-to-D mutation or scan failure rejection",
+            ),
+            (
+                "let logon = launch_target_desktop_loader_control_cell_with_shared_environment(",
+                "fresh target-logon restricted sibling launch",
+            ),
+            ("logon_restricted.raw(),", "exact locally derived D token"),
+            ("&logon_envelope,", "exact D envelope"),
+            ("&logon_snapshot,", "exact D snapshot"),
+            (
+                "let after_logon_environment = shared_environment.inventory();",
+                "byte inventory after D",
+            ),
+            (
+                "let after_logon_observation = shared_environment_observation(\n        &admitted_environment,\n        &after_logon_environment,\n        \"after-logon\",",
+                "typed post-D scan and exact metadata comparison",
+            ),
+            (
+                "if !after_logon_observation.stable() {",
+                "D-to-E mutation or scan failure rejection",
+            ),
+            (
+                "let authenticated_users = launch_target_desktop_loader_control_cell_with_shared_environment(",
+                "fresh Authenticated Users restricted sibling launch",
+            ),
+            (
+                "authenticated_users_restricted.raw(),",
+                "exact locally derived E token",
+            ),
+            ("&authenticated_users_envelope,", "exact E envelope"),
+            ("&authenticated_users_snapshot,", "exact E snapshot"),
+            (
+                "let after_authenticated_users_environment = shared_environment.inventory();",
+                "byte inventory after E",
+            ),
+            (
+                "let after_authenticated_users_observation = shared_environment_observation(\n        &admitted_environment,\n        &after_authenticated_users_environment,\n        \"after-authenticated-users\",",
+                "typed post-E scan and exact metadata comparison",
+            ),
+            (
+                "if !after_authenticated_users_observation.stable() {",
+                "E-to-F mutation or scan failure rejection",
+            ),
+            (
+                "let target_user = launch_target_desktop_loader_control_cell_with_shared_environment(",
+                "fresh target-user restricted sibling launch",
+            ),
+            (
+                "target_user_restricted.raw(),",
+                "exact locally derived F token",
+            ),
+            ("&target_user_envelope,", "exact F envelope"),
+            ("&target_user_snapshot,", "exact F snapshot"),
+            (
+                "let after_target_user_environment = shared_environment.inventory();",
+                "byte inventory after F",
+            ),
+            (
+                "let after_target_user_observation = shared_environment_observation(\n        &admitted_environment,\n        &after_target_user_environment,\n        \"after-target-user\",",
+                "typed post-F scan and exact metadata comparison",
+            ),
+            (
+                "let original_environment_stable = after_baseline_observation.stable()\n        && after_comparison_observation.stable()\n        && after_same_access_observation.stable()\n        && after_logon_observation.stable()\n        && after_authenticated_users_observation.stable()\n        && after_target_user_observation.stable();",
+                "all six original post-borrow observations feed pre-fallback stability",
+            ),
+            (
+                "loader_environment_canary_outcome(\n        \"privilege-disabled/authenticated-users-SID-restricted\",\n        &authenticated_users,",
+                "typed E outcome preserves its diagnostic-only semantics",
+            ),
+            (
+                "loader_environment_canary_outcome(\n        \"privilege-disabled/target-user-SID-restricted\",\n        &target_user,",
+                "typed F outcome preserves its diagnostic-only semantics",
+            ),
+            (
+                "let environment_destruction = shared_environment.destroy_after_create();",
+                "outer owner retirement after the final borrower",
+            ),
+            (
+                "let after = observe_loader_profile(tokens.profile.raw(), &baseline_envelope.user_sid);",
+                "profile observation after environment retirement",
+            ),
+        ],
+    )?;
+    require_source(
+        &canary,
+        "let common_field_names = [\n        \"matrix_cell\",\n        \"debug_mode\",\n        \"environment_classification\",\n        \"environment_sha256\",\n        \"environment_keys_sha256\",\n        \"environment_units\",\n        \"environment_entries\",\n        \"environment_profile_loaded\",\n        \"source_authentication_id\",\n        \"source_session_id\",\n        \"desktop_sha256\",\n        \"binary_sha256\",\n        \"current_directory_sha256\",\n        \"command_semantics_sha256\",\n        \"command_dynamic_fields\",\n        \"creation_flags\",\n        \"job_membership_attested\",\n        \"object_security_authority\",\n        \"process_policy_sha256\",\n        \"thread_policy_sha256\",\n        \"process_object_live_sha256\",\n        \"thread_object_live_sha256\",\n        \"descriptor_readback\",\n    ];",
+        "exact shared-environment and launch common-field inventory",
+    )?;
+    require_source_order(
+        &canary,
+        &[
+            (
+                "loader_common_result_field(&baseline, &comparison, field)",
+                "exact A/B equality for every common field",
+            ),
+            (
+                "loader_common_result_field(&baseline, &same_access, field)",
+                "exact A/C equality for every common field",
+            ),
+            (
+                "loader_common_result_field(&baseline, &logon, field)",
+                "exact A/D equality for every common field",
+            ),
+            (
+                "loader_common_result_field(&baseline, &authenticated_users, field)",
+                "exact A/E equality for every common field",
+            ),
+            (
+                "loader_common_result_field(&baseline, &target_user, field)",
+                "exact A/F equality for every common field",
+            ),
+            (
+                "let launcher_authority_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n        &target_user,\n    ]",
+                "launcher-explicit proof covers all six cells",
+            ),
+            (
+                "Some(LoaderObjectSecurityAuthorityV1::LauncherExplicit.diagnostic())",
+                "launcher-explicit label equality",
+            ),
+            (
+                "let job_empty_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n        &target_user,\n    ]\n    .into_iter()\n    .all(loader_control_cell_job_empty_attested);",
+                "terminal Job-empty proof for all six cells",
+            ),
+            (
+                "let containment_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n        &target_user,\n    ]",
+                "profile, Job, and descriptor containment covers all six cells",
+            ),
+            (
+                "loader_result_field(result, \"environment_profile_loaded\").as_deref() == Some(\"true\")",
+                "borrowed profile evidence held true",
+            ),
+            (
+                "loader_result_field(result, \"job_membership_attested\").as_deref() == Some(\"true\")",
+                "atomic Job membership held true",
+            ),
+            (
+                "loader_result_field(result, \"descriptor_readback\").as_deref() == Some(\"true\")",
+                "live descriptor readback held true",
+            ),
+            (
+                "let shared_environment_valid = environment_stable && environment_destruction.is_ok();",
+                "shared owner stability and destruction aggregate",
+            ),
+            (
+                "common_error.is_none()\n        && after == before\n        && launcher_authority_exact\n        && containment_exact\n        && shared_environment_valid",
+                "complete admission feeds fail-closed classification",
+            ),
+            (
+                "let presence_state = classify_loader_restriction_presence_outcomes(",
+                "A/B treatment result retained",
+            ),
+            (
+                "let identity_state = classify_loader_restriction_identity_outcomes(",
+                "typed A/B/C identity outcome retained",
+            ),
+            (
+                "let logon_state = classify_loader_restriction_logon_outcomes(",
+                "typed A/B/C/D outcome retained independently",
+            ),
+            (
+                "let authenticated_users_state = classify_loader_restriction_authenticated_users_outcomes(",
+                "typed A/B/C/D/E outcome retained independently",
+            ),
+            (
+                "let state = classify_loader_restriction_target_user_outcomes(",
+                "typed A/B/C/D/E/F outcome classifier after invariant admission",
+            ),
+            (
+                "logon_state={logon_state}",
+                "distinct D result retained beside E classification",
+            ),
+            (
+                "authenticated_users_semantics=privilege-disabled/authenticated-users-SID-restricted",
+                "bounded E semantic label",
+            ),
+            (
+                "target_user_semantics=privilege-disabled/target-user-SID-restricted",
+                "bounded F semantic label",
+            ),
+            (
+                "failed_common_fields=[{failed_common_fields}]",
+                "explicit failed-invariant inventory",
+            ),
+            (
+                "restriction_identity_binding_sha256={} logon_restriction_binding_sha256={} authenticated_users_restriction_binding_sha256={} target_user_restriction_binding_sha256={} shared_environment_sha256={} shared_environment_keys_sha256={} shared_environment_units={} shared_environment_entries={} shared_environment_profile_loaded=true after_baseline_scan={} after_baseline_metadata_match={} after_baseline_observation_sha256={} after_comparison_scan={} after_comparison_metadata_match={} after_comparison_observation_sha256={} after_same_access_scan={} after_same_access_metadata_match={} after_same_access_observation_sha256={} after_logon_scan={} after_logon_metadata_match={} after_logon_observation_sha256={} after_authenticated_users_scan={} after_authenticated_users_metadata_match={} after_authenticated_users_observation_sha256={} after_target_user_scan={} after_target_user_metadata_match={} after_target_user_observation_sha256={} shared_environment_scan={} shared_environment_metadata_match={} shared_environment_observation_sha256={} shared_environment_stable={} shared_environment_destroyed={} ",
+                "redacted prepared-environment identity and lifecycle evidence",
+            ),
+            ("same_access=[{}]", "redacted C outcome evidence"),
+            ("logon=[{}]", "redacted D outcome evidence"),
+            ("authenticated_users=[{}]", "redacted E outcome evidence"),
+            ("target_user=[{}]", "redacted F outcome evidence"),
+            (
+                "environment_values_redacted=true token_values_redacted=true job_empty={job_empty_exact} workload_executed=false qualification_promoted=false",
+                "redacted bootstrap-only nonpromotion boundary",
+            ),
+        ],
+    )?;
+    if canary.matches("OwnedUserEnvironmentBlock::create(").count() != 1
+        || canary
+            .matches("launch_target_desktop_loader_control_cell_with_shared_environment(")
+            .count()
+            != 8
+    {
+        return Err(
+            "restriction diagnostic does not use one baseline allocation for exactly eight original/debug borrowers"
+                .to_owned(),
+        );
+    }
+    for forbidden in [
+        "loader_restriction_presence_prerequisite_canary=v1",
+        "LoaderLaunchEnvironmentV5::create(",
+        "CreateEnvironmentBlock(",
+        "LoaderEnvironmentAuthorityV5::MatrixProjection",
+        "LoaderEnvironmentAuthorityV5::TargetTokenUserenv,",
+        "LoaderEnvironmentAuthorityV5::TargetTokenUserenvProfileLease",
+        "encode_windows_environment_block(",
+        "system_environment_entries(",
+        "\"child_token_id\",",
+        "ptr::null_mut()",
+        "TargetAwareProcess",
+        "TargetAwareThread",
+        "TargetAwareBoth",
+        "TargetKernelObjectPolicyV1::capture",
+        "OpenProcessToken(",
+        "LoadUserProfile",
+        "UnloadUserProfile",
+        "RegSetValue",
+        "SetSecurityInfo(",
+        "SetKernelObjectSecurity(",
+        "WindowsProviderRequestV1",
+        "LoaderControlReleaseWrite",
+        "restricted_same_access_primary(tokens.baseline.raw())",
+        "restricted_same_access_primary(tokens.no_restricting_sid.raw())",
+        "restricted_logon_sid_primary(",
+        "restricted_authenticated_users_primary(",
+        "restricted_target_user_primary(",
+    ] {
+        if canary.contains(forbidden) {
+            return Err(format!(
+                "restriction-presence shared-environment canary admitted a confound: {forbidden}"
+            ));
+        }
+    }
+
+    let identity_classifier = semantic_function_region(
+        process,
+        "fn classify_loader_restriction_identity_outcomes(",
+        "fn classify_loader_restriction_logon_outcomes(",
+    )
+    .ok_or_else(|| "restriction-identity classifier has no semantic boundary".to_owned())?;
+    require_source_order(
+        &identity_classifier,
+        &[
+            (
+                "classify_loader_restriction_presence_outcomes(",
+                "existing A/B causal treatment prerequisite",
+            ),
+            (
+                "presence_state != \"restricting-sid-presence-causal\"",
+                "noncausal or invalid A/B result preserved",
+            ),
+            (
+                "same_access_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+                "C passing branch",
+            ),
+            (
+                "\"restricted-code-sid-narrowing-causal\"",
+                "truthful narrow SID result",
+            ),
+            (
+                "same_access_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+                "C failure branch",
+            ),
+            (
+                "same_access_restricted.native_status == baseline.native_status",
+                "same native failure frontier",
+            ),
+            (
+                "same_access_restricted.failure_phase == baseline.failure_phase",
+                "same typed failure phase",
+            ),
+            (
+                "\"restricted-token-or-canonical-inventory-causal\"",
+                "truthful inseparable restricted-state/canonical-inventory result",
+            ),
+            (
+                "\"differing-inconclusive\"",
+                "other C result remains inconclusive",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "generic-restricted-token-semantics-causal",
+        "same_access_restricted.outcome != LoaderControlMatrixOutcomeKindV6::Failed",
+        "return \"restricted-code-sid-narrowing-causal\";\n    }\n    \"restricted-token-or-canonical-inventory-causal\"",
+    ] {
+        if identity_classifier.contains(forbidden) {
+            return Err(format!(
+                "restriction-identity classifier became vacuous or overclaimed: {forbidden}"
+            ));
+        }
+    }
+
+    let logon_classifier = semantic_function_region(
+        process,
+        "fn classify_loader_restriction_logon_outcomes(",
+        "fn classify_loader_restriction_authenticated_users_outcomes(",
+    )
+    .ok_or_else(|| "target-logon classifier has no semantic boundary".to_owned())?;
+    require_source_order(
+        &logon_classifier,
+        &[
+            (
+                "classify_loader_restriction_identity_outcomes(",
+                "existing A/B/C identity prerequisite",
+            ),
+            (
+                "identity_state != \"restricted-code-sid-narrowing-causal\"",
+                "nondecisive or invalid A/B/C result preserved",
+            ),
+            (
+                "logon_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+                "D passing branch",
+            ),
+            (
+                "\"restricted-code-sid-narrowing-logon-ceiling-compatible\"",
+                "truthful restricted-code identity/logon-ceiling result",
+            ),
+            (
+                "logon_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+                "D failure branch",
+            ),
+            (
+                "logon_restricted.native_status == baseline.native_status",
+                "same native D failure frontier",
+            ),
+            (
+                "logon_restricted.failure_phase == baseline.failure_phase",
+                "same typed D failure phase",
+            ),
+            (
+                "\"canonical-broader-group-or-union-required\"",
+                "truthful singleton-insufficient result",
+            ),
+            (
+                "\"differing-inconclusive\"",
+                "other D result remains inconclusive",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "exact-resource-causal",
+        "logon-sid-production-ready",
+        "return \"restricted-code-sid-narrowing-logon-ceiling-compatible\";\n    }\n    \"canonical-broader-group-or-union-required\"",
+    ] {
+        if logon_classifier.contains(forbidden) {
+            return Err(format!(
+                "target-logon classifier became vacuous or overclaimed: {forbidden}"
+            ));
+        }
+    }
+
+    let authenticated_users_classifier = semantic_function_region(
+        process,
+        "fn classify_loader_restriction_authenticated_users_outcomes(",
+        "fn loader_restriction_presence_required(",
+    )
+    .ok_or_else(|| "Authenticated Users classifier has no semantic boundary".to_owned())?;
+    require_source_order(
+        &authenticated_users_classifier,
+        &[
+            (
+                "classify_loader_restriction_identity_outcomes(",
+                "established A-failed/B-passed/C-passed prerequisite",
+            ),
+            (
+                "identity_state == \"invalid\"",
+                "invalid invariants remain invalid",
+            ),
+            (
+                "identity_state != \"restricted-code-sid-narrowing-causal\"",
+                "nondecisive A/B/C result rejected",
+            ),
+            (
+                "logon_restricted.outcome != LoaderControlMatrixOutcomeKindV6::Failed",
+                "passing D cannot be mislabeled logon-too-narrow",
+            ),
+            (
+                "authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+                "E passing branch",
+            ),
+            (
+                "\"authenticated-users-restriction-compatible-logon-too-narrow\"",
+                "bounded Authenticated Users compatibility result",
+            ),
+            (
+                "authenticated_users_restricted.native_status\n        == Some(STATUS_ACCESS_DENIED)",
+                "bounded E access-denied class",
+            ),
+            (
+                "authenticated_users_restricted.native_status == logon_restricted.native_status",
+                "E access-denied native match to D",
+            ),
+            (
+                "authenticated_users_restricted.failure_phase == logon_restricted.failure_phase",
+                "E access-denied phase match to D",
+            ),
+            (
+                "authenticated_users_restricted.native_status\n        == Some(STATUS_DLL_INIT_FAILED)",
+                "bounded E DLL-init class",
+            ),
+            (
+                "authenticated_users_restricted.native_status == baseline.native_status",
+                "E DLL-init native match to A",
+            ),
+            (
+                "authenticated_users_restricted.failure_phase == baseline.failure_phase",
+                "E DLL-init phase match to A",
+            ),
+            (
+                "authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+                "E failure branch",
+            ),
+            (
+                "&& (matches_logon_access_failure || matches_baseline_init_failure)",
+                "stable E failure frontier required",
+            ),
+            (
+                "\"canonical-group-union-or-other-trustee-required\"",
+                "bounded singleton insufficiency result",
+            ),
+            (
+                "\"authenticated-users-inconclusive\"",
+                "other D/E result remains inconclusive",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "exact-resource",
+        "production-ready",
+        "authenticated-users-production",
+        "return \"authenticated-users-restriction-compatible-logon-too-narrow\";\n    }\n    \"canonical-group-union-or-other-trustee-required\"",
+    ] {
+        if authenticated_users_classifier.contains(forbidden) {
+            return Err(format!(
+                "Authenticated Users classifier became vacuous or overclaimed: {forbidden}"
+            ));
+        }
+    }
+
+    let target_user_classifier = semantic_function_region(
+        process,
+        "fn classify_loader_restriction_target_user_outcomes(",
+        "fn loader_restriction_presence_required(",
+    )
+    .ok_or_else(|| "target-user classifier has no semantic boundary".to_owned())?;
+    require_source_order(
+        &target_user_classifier,
+        &[
+            (
+                "classify_loader_restriction_identity_outcomes(",
+                "exact A-failed/B-passed/C-passed prerequisite",
+            ),
+            (
+                "identity_state == \"invalid\"",
+                "invalid six-way evidence remains invalid",
+            ),
+            (
+                "logon_restricted.outcome\n        == LoaderControlMatrixOutcomeKindV6::Failed",
+                "exact D failure prerequisite",
+            ),
+            (
+                "logon_restricted.native_status == Some(STATUS_ACCESS_DENIED)",
+                "exact D access-denied class",
+            ),
+            (
+                "authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+                "exact E failure prerequisite",
+            ),
+            (
+                "authenticated_users_restricted.native_status == logon_restricted.native_status",
+                "D/E native frontier equality",
+            ),
+            (
+                "authenticated_users_restricted.failure_phase == logon_restricted.failure_phase",
+                "D/E phase frontier equality",
+            ),
+            (
+                "identity_state != \"restricted-code-sid-narrowing-causal\" || !prior_singletons_match",
+                "nonadmitted A-E matrix remains inconclusive",
+            ),
+            (
+                "target_user_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+                "F passing branch",
+            ),
+            (
+                "\"target-user-restriction-bootstrap-compatible-group-singletons-too-narrow\"",
+                "bounded target-user bootstrap compatibility label",
+            ),
+            (
+                "target_user_restricted.native_status\n        == Some(STATUS_ACCESS_DENIED)",
+                "exact F access-denied class",
+            ),
+            (
+                "target_user_restricted.native_status == logon_restricted.native_status",
+                "F native frontier equality to D",
+            ),
+            (
+                "target_user_restricted.failure_phase == logon_restricted.failure_phase",
+                "F phase frontier equality to D",
+            ),
+            (
+                "target_user_restricted.native_status == authenticated_users_restricted.native_status",
+                "F native frontier equality to E",
+            ),
+            (
+                "target_user_restricted.failure_phase == authenticated_users_restricted.failure_phase",
+                "F phase frontier equality to E",
+            ),
+            (
+                "target_user_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed\n        && matches_prior_singleton_access_failure",
+                "exact F access-denied failure branch",
+            ),
+            (
+                "\"no-tested-singleton-sufficient-trace-required\"",
+                "bounded negative-F next-step label",
+            ),
+            (
+                "target_user_restricted.native_status\n        == Some(STATUS_DLL_INIT_FAILED)",
+                "exact F DLL-init class",
+            ),
+            (
+                "target_user_restricted.native_status == baseline.native_status",
+                "F A-like native equality",
+            ),
+            (
+                "target_user_restricted.failure_phase == baseline.failure_phase",
+                "F A-like phase equality",
+            ),
+            (
+                "\"target-user-singleton-a-like-failure\"",
+                "bounded A-like label without resource identity claim",
+            ),
+            (
+                "\"target-user-singleton-inconclusive\"",
+                "all other F outcomes remain inconclusive",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "exact-resource",
+        "production-ready",
+        "target-user-production",
+        "user-profile-resource",
+        "return \"target-user-restriction-bootstrap-compatible-group-singletons-too-narrow\";\n    }\n    \"no-tested-singleton-sufficient-trace-required\"",
+    ] {
+        if target_user_classifier.contains(forbidden) {
+            return Err(format!(
+                "target-user classifier became vacuous or overclaimed: {forbidden}"
+            ));
+        }
+    }
+
+    let environment_source = semantic_function_region(
+        process,
+        "enum LoaderCellEnvironmentSourceV6<'a> {",
+        "enum LoaderObjectSecurityAuthorityV1 {",
+    )
+    .ok_or_else(|| "borrowable loader environment source has no semantic boundary".to_owned())?;
+    require_source_order(
+        &environment_source,
+        &[
+            (
+                "Create(LoaderEnvironmentAuthorityV5),",
+                "unrelated per-cell creation authority retained",
+            ),
+            ("BorrowedUserenv {", "typed borrowed Userenv authority"),
+            (
+                "block: &'a mut OwnedUserEnvironmentBlock,",
+                "exclusive borrow of the live raw owner",
+            ),
+            (
+                "inventory: UserEnvironmentInventoryV1,",
+                "owned immutable admitted metadata per launch",
+            ),
+            (
+                "Self::BorrowedUserenv { .. } => {\n                LoaderEnvironmentAuthorityV5::TargetTokenUserenvBorrowedProfile",
+                "fixed borrowed-profile classification authority",
+            ),
+            (
+                "Self::Create(authority) => {\n                LoaderLaunchEnvironmentV5::create(target_token, matrix_mode, authority)",
+                "standalone authorities retain owned construction",
+            ),
+            (
+                "Self::BorrowedUserenv { block, inventory } => Ok(\n                LoaderLaunchEnvironmentV5::borrowed_userenv(block, &inventory),",
+                "borrowed pointer and admitted inventory travel together",
+            ),
+        ],
+    )?;
+
+    let shared_wrapper = semantic_function_region(
+        process,
+        "fn launch_target_desktop_loader_control_cell_with_shared_environment(",
+        "fn launch_target_desktop_loader_control_cell_with_environment_source(",
+    )
+    .ok_or_else(|| "shared-environment launch wrapper has no semantic boundary".to_owned())?;
+    require_source_order(
+        &shared_wrapper,
+        &[
+            (
+                "environment: &mut OwnedUserEnvironmentBlock,",
+                "shared owner borrow parameter",
+            ),
+            (
+                "admitted_inventory: &UserEnvironmentInventoryV1,",
+                "admitted metadata borrow parameter",
+            ),
+            (
+                "LoaderCellEnvironmentSourceV6::BorrowedUserenv {",
+                "borrowed source selection",
+            ),
+            ("block: environment,", "exact owner forwarded"),
+            (
+                "inventory: admitted_inventory.clone(),",
+                "exact admitted metadata forwarded",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "OwnedUserEnvironmentBlock::create(",
+        "CreateEnvironmentBlock(",
+        "ptr::null_mut()",
+    ] {
+        if shared_wrapper.contains(forbidden) {
+            return Err(format!(
+                "shared-environment launch wrapper regenerated or replaced its input: {forbidden}"
+            ));
+        }
+    }
+
+    let launch_environment = semantic_function_region(
+        process,
+        "enum LoaderLaunchEnvironmentStorageV5<'a> {",
+        "fn loader_environment_keys_sha256(keys: &[String]) -> String {",
+    )
+    .ok_or_else(|| "borrowed launch environment has no semantic boundary".to_owned())?;
+    require_source_order(
+        &launch_environment,
+        &[
+            (
+                "BorrowedUserenv(&'a mut OwnedUserEnvironmentBlock),",
+                "nonowning launch storage",
+            ),
+            (
+                "fn borrowed_userenv(\n        block: &'a mut OwnedUserEnvironmentBlock,\n        inventory: &UserEnvironmentInventoryV1,",
+                "borrowed owner plus admitted inventory constructor",
+            ),
+            (
+                "classification: \"target-token-userenv-borrowed-profile-v1\",",
+                "exact borrowed-profile classification",
+            ),
+            ("sha256: inventory.sha256.clone(),", "exact content digest"),
+            (
+                "keys_sha256: inventory.keys_sha256.clone(),",
+                "exact key-set digest",
+            ),
+            (
+                "missing_required: inventory.missing_required.clone(),",
+                "exact required-key admission result",
+            ),
+            ("units: inventory.units,", "exact UTF-16 unit count"),
+            ("entries: inventory.entries,", "exact entry count"),
+            ("profile_loaded: true,", "borrowed profile evidence"),
+            (
+                "storage: LoaderLaunchEnvironmentStorageV5::BorrowedUserenv(block),",
+                "exact raw owner borrow",
+            ),
+            (
+                "LoaderLaunchEnvironmentStorageV5::BorrowedUserenv(block) => block.pointer(),",
+                "borrowed cell returns the owner's exact raw pointer",
+            ),
+            (
+                "LoaderLaunchEnvironmentStorageV5::BorrowedUserenv(_) => Ok(()),",
+                "borrowed cell destruction is a no-op",
+            ),
+        ],
+    )?;
+
+    let shared_observation = semantic_function_region(
+        process,
+        "fn shared_environment_observation(",
+        "enum LoaderLaunchEnvironmentStorageV5<'a> {",
+    )
+    .ok_or_else(|| "shared-environment observation has no semantic boundary".to_owned())?;
+    require_source_order(
+        &shared_observation,
+        &[
+            (
+                "Ok(observed) if observed == admitted",
+                "exact complete inventory equality",
+            ),
+            ("scan: \"ok\",", "successful byte scan classification"),
+            ("metadata_match: true,", "exact metadata-match evidence"),
+            (
+                "detail_sha256: \"none\".to_owned(),",
+                "no invented mismatch detail",
+            ),
+            ("Ok(observed) => {", "parseable metadata mismatch branch"),
+            (
+                "classification=metadata-mismatch admitted_sha256={} admitted_keys_sha256={} admitted_units={} admitted_entries={} admitted_missing_required_sha256={} observed_sha256={} observed_keys_sha256={} observed_units={} observed_entries={} observed_missing_required_sha256={}",
+                "complete value-redacted mismatch evidence",
+            ),
+            ("metadata_match: false,", "mismatch cannot be admitted"),
+            ("Err(error) => {", "scan failure branch"),
+            (
+                "classification=scan-error detail={}",
+                "scan failure detail enters only a digest",
+            ),
+            ("scan: \"error\",", "scan error classification"),
+            ("metadata_match: false,", "scan error cannot match"),
+            (
+                "detail_sha256: super::record::digest(detail.as_bytes()),",
+                "observation detail redaction",
+            ),
+        ],
+    )?;
+
+    let owned_environment = semantic_function_region(
+        process,
+        "struct OwnedUserEnvironmentBlock {",
+        "struct UserEnvironmentInventoryV1 {",
+    )
+    .ok_or_else(|| "shared Userenv owner has no semantic boundary".to_owned())?;
+    require_source_order(
+        &owned_environment,
+        &[
+            (
+                "CreateEnvironmentBlock(&raw mut raw, target_token, 0)",
+                "one exact-token noninheriting native allocation API",
+            ),
+            ("if raw.is_null() {", "null allocation rejection"),
+            (
+                "bounded_user_environment_inventory(block.raw)?;",
+                "construction-time bounded inventory",
+            ),
+            (
+                "fn inventory(&self) -> Result<UserEnvironmentInventoryV1, TargetDesktopLeaseCreateError> {\n        bounded_user_environment_inventory(self.raw)",
+                "repeatable exact raw-byte inventory",
+            ),
+            (
+                "let raw = std::mem::replace(&mut self.raw, ptr::null_mut());",
+                "one-shot owner retirement",
+            ),
+            (
+                "if raw.is_null() {\n            return Err(\"target-token environment block was already destroyed\"",
+                "double-destruction rejection",
+            ),
+            (
+                "impl Drop for OwnedUserEnvironmentBlock {",
+                "early-return and unwind fallback",
+            ),
+            (
+                "if !self.raw.is_null() {",
+                "fallback only while ownership remains",
+            ),
+        ],
+    )?;
+    if owned_environment
+        .matches("DestroyEnvironmentBlock(raw)")
+        .count()
+        != 2
+    {
+        return Err(
+            "Userenv owner does not have exact explicit/fallback destruction paths".to_owned(),
+        );
+    }
+
+    let object_authority = semantic_function_region(
+        process,
+        "enum LoaderObjectSecurityAuthorityV1 {",
+        "struct OwnedUserEnvironmentBlock {",
+    )
+    .ok_or_else(|| "restriction-presence object authority has no semantic boundary".to_owned())?;
+    require_source_order(
+        &object_authority,
+        &[
+            (
+                "Self::LauncherExplicitRestrictingSidCanary => \"launcher-explicit-v1\"",
+                "unchanged launcher-explicit evidence label",
+            ),
+            (
+                "const fn uses_target_policy(self) -> bool {",
+                "target-aware policy selector",
+            ),
+            (
+                "Self::TargetAwareProcess | Self::TargetAwareThread | Self::TargetAwareBoth",
+                "restriction-presence authority excluded from target-aware DACLs",
+            ),
+            (
+                "const fn diagnostic_only(self) -> bool {",
+                "diagnostic-only selector",
+            ),
+            (
+                "!matches!(self, Self::LauncherExplicit)",
+                "restriction-presence cells cannot reach production release",
+            ),
+        ],
+    )?;
+
+    let launch_inner = semantic_function_region(
+        process,
+        "fn launch_target_desktop_loader_control_cell_inner(",
+        "fn launch_target_desktop_probe(",
+    )
+    .ok_or_else(|| "loader-control cell has no semantic boundary".to_owned())?;
+    require_source_order(
+        &launch_inner,
+        &[
+            (
+                "let environment_authority = environment_source.authority();",
+                "typed source classification before the launch",
+            ),
+            (
+                "let mut environment =\n            environment_source.into_environment(target_token, matrix_cell.environment)?;",
+                "exact source materialization",
+            ),
+            ("CreateProcessAsUserW(", "exact-token native creation"),
+            ("target_token,", "exact target token at creation"),
+            (
+                "&raw const process_attributes,",
+                "non-null fixed process security attributes",
+            ),
+            (
+                "&raw const thread_attributes,",
+                "non-null fixed thread security attributes",
+            ),
+            ("creation_flags,", "fixed matrix creation flags"),
+            (
+                "environment.pointer(),",
+                "exact owned or borrowed environment pointer",
+            ),
+            (
+                "let creation_error = (created == 0).then(io::Error::last_os_error);",
+                "primary creation result preserved before cleanup",
+            ),
+            (
+                "let environment_destruction = environment.destroy_userenv_after_create();",
+                "typed owned-or-borrowed cleanup dispatch",
+            ),
+            (
+                "if let Some(error) = creation_error {",
+                "primary creation failure wins over cleanup",
+            ),
+            (
+                "if object_security_authority.diagnostic_only() {\n                control_job.terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS)?;\n                return Ok(());",
+                "diagnostic child terminates before release",
+            ),
+            (
+                "TargetDesktopBootstrapPipeOperation::LoaderControlReleaseWrite",
+                "release remains after diagnostic early return",
+            ),
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_windows_passive_access_localization_contract(
+    sources: &WindowsLoaderControlContractSources,
+) -> Result<(), String> {
+    require_source(
+        &sources.cargo,
+        "\"Win32_System_Diagnostics_Etw\"",
+        "typed ETW API feature",
+    )?;
+    require_source(
+        &sources.cargo,
+        "\"Win32_System_Time\"",
+        "windows-sys EVENT_TRACE_LOGFILEW and OpenTraceW feature gate",
+    )?;
+    let loader_error = semantic_function_region(
+        &sources.process,
+        "struct TargetDesktopLeaseCreateError {",
+        "impl TargetDesktopLeaseCreateError {",
+    )
+    .ok_or_else(|| "typed loader failure record has no semantic boundary".to_owned())?;
+    require_source(
+        &loader_error,
+        "loader_phase: LoaderLaunchFailurePhaseV1",
+        "typed loader failure phase field",
+    )?;
+    require_source(
+        &sources.process,
+        "loader_phase: LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady",
+        "owner-stamped post-resume pre-LoaderReady phase",
+    )?;
+    let peer_exit = semantic_function_region(
+        &sources.process,
+        "    fn accept_error(",
+        "impl From<String> for TargetDesktopLeaseCreateError {",
+    )
+    .ok_or_else(|| "peer-exit failure owner has no semantic boundary".to_owned())?;
+    require_source(
+        &peer_exit,
+        "loader_phase: LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady",
+        "peer-exit owner typed phase assignment",
+    )?;
+    let phase_selector = semantic_function_region(
+        &sources.process,
+        "fn loader_failure_phase(error: &TargetDesktopLeaseCreateError) -> &'static str {",
+        "impl LoaderFailureEvidenceRankV6 {",
+    )
+    .ok_or_else(|| "typed loader failure phase selector has no semantic boundary".to_owned())?;
+    require_source(
+        &phase_selector,
+        "error.loader_phase.diagnostic()",
+        "typed phase selection",
+    )?;
+    for forbidden in ["error.detail", ".contains(", "failure_phase="] {
+        if phase_selector.contains(forbidden) {
+            return Err(format!(
+                "untrusted prose can select the loader failure phase: {forbidden}"
+            ));
+        }
+    }
+
+    let setup_error = semantic_function_region(
+        &sources.access_trace,
+        "pub(crate) enum PassiveAccessLocalizationSetupStageV1 {",
+        "pub(crate) enum PassiveAccessLocalizationCellV1 {",
+    )
+    .ok_or_else(|| "typed trace setup error has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        ("SessionStart,", "session-start setup stage"),
+        ("ProviderEnable,", "provider-enable setup stage"),
+        ("ConsumerOpen,", "consumer-open setup stage"),
+        ("ConsumerReady,", "consumer-ready setup stage"),
+        (
+            "win32_status: Option<i64>",
+            "independent primary setup status",
+        ),
+        (
+            "cleanup_stop_status: PassiveAccessLocalizationCleanupStatusV1",
+            "independent STOP cleanup status",
+        ),
+        (
+            "cleanup_close_status: PassiveAccessLocalizationCleanupStatusV1",
+            "independent CLOSE cleanup status",
+        ),
+        (
+            "cleanup_process_trace_status: PassiveAccessLocalizationCleanupStatusV1",
+            "independent ProcessTrace cleanup status",
+        ),
+        ("session_created: bool", "session creation state"),
+        (
+            "provider_enable_attempted: bool",
+            "provider enable attempt state",
+        ),
+        ("consumer_opened: bool", "consumer open state"),
+        ("consumer_ready: bool", "consumer readiness state"),
+        (
+            "detail_sha256: super::record::digest(detail)",
+            "bounded non-native setup detail digest",
+        ),
+    ] {
+        require_source(&setup_error, needle, purpose)?;
+    }
+
+    require_source_order(
+        &sources.access_trace,
+        &[
+            (
+                "GUID::from_u128(0xedd08927_9cc4_4e65_b970_c2560fb5c289)",
+                "exact Microsoft-Windows-Kernel-File provider",
+            ),
+            ("const FILE_CREATE_EVENT_ID: u16 = 12;", "Create event id"),
+            (
+                "const FILE_OPERATION_END_EVENT_ID: u16 = 24;",
+                "OperationEnd event id",
+            ),
+            (
+                "const COVERAGE: &str = \"kernel-file-create-operation-end/no-requested-access\";",
+                "coverage-explicit schema",
+            ),
+        ],
+    )?;
+    for (needle, purpose) in [
+        (
+            "const MAX_TRACE_EVENTS: usize = 4_096;",
+            "event count bound",
+        ),
+        (
+            "const MAX_EVENT_PAYLOAD_BYTES: usize = 4_096;",
+            "per-event payload bound",
+        ),
+        (
+            "const MAX_PENDING_OPERATIONS: usize = 1_024;",
+            "operation join bound",
+        ),
+        (
+            "const MAX_FRONTIER_EVENTS: usize = 64;",
+            "frontier count bound",
+        ),
+        (
+            "const MAX_RENDERED_BYTES: usize = 32_768;",
+            "rendered evidence bound",
+        ),
+        (
+            "const MAX_SUBJECT_WINDOW: Duration = Duration::from_secs(45);",
+            "subject time bound",
+        ),
+        (
+            "const MAX_TRACE_SESSION: Duration = Duration::from_secs(180);",
+            "whole-session time bound",
+        ),
+        (
+            "const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);",
+            "consumer drain time bound",
+        ),
+        (
+            "const KERNEL_FILE_KEYWORD_OPERATION_END: u64 = 0x40;",
+            "exact OperationEnd provider keyword",
+        ),
+        (
+            "const KERNEL_FILE_KEYWORD_CREATE: u64 = 0x80;",
+            "exact Create provider keyword",
+        ),
+        (
+            "requested_access_available=false",
+            "requested-access absence",
+        ),
+        ("object_values_redacted=true", "object-name redaction"),
+        ("file-create-id-12-v", "typed Create event identity"),
+        ("debugger_attached=false", "passive observer proof"),
+        ("ifeo_changed=false", "IFEO nonmutation proof"),
+        ("sacl_changed=false", "SACL nonmutation proof"),
+        ("acl_changed=false", "ACL nonmutation proof"),
+        ("grant_created=false", "grant noncreation proof"),
+        ("workload_executed=false", "workload exclusion"),
+        ("qualification_promoted=false", "promotion exclusion"),
+    ] {
+        require_source(&sources.access_trace, needle, purpose)?;
+    }
+    for forbidden in [
+        "DesiredAccess",
+        "CreateOptions",
+        "DEBUG_ONLY_THIS_PROCESS",
+        "DebugActiveProcess",
+        "Image File Execution Options",
+        "SetNamedSecurityInfo",
+        "SetSecurityInfo",
+        "AdjustTokenPrivileges",
+        "\"IrpPtr\"",
+        "\"OpenPath\"",
+        "\"NtStatus\"",
+    ] {
+        if sources.access_trace.contains(forbidden) {
+            return Err(format!(
+                "passive access localization broadened authority or synthesized access: {forbidden}"
+            ));
+        }
+    }
+
+    let setup_evidence = semantic_function_region(
+        &sources.access_trace,
+        "    pub(crate) fn observer_unavailable(error: &PassiveAccessLocalizationSetupErrorV1) -> Self {",
+        "    pub(crate) fn diagnostic(&self) -> String {",
+    )
+    .ok_or_else(|| "observer-unavailable trace evidence has no semantic boundary".to_owned())?;
+    require_source_order(
+        &setup_evidence,
+        &[
+            (
+                "let cleanup_valid = error.cleanup_stop_status.successful_or_not_attempted()",
+                "typed setup cleanup admission",
+            ),
+            (
+                "&& error.cleanup_close_status.successful_or_not_attempted()",
+                "setup CloseTrace cleanup admission",
+            ),
+            (
+                "cleanup_process_trace_status\n                .successful_or_not_attempted()",
+                "setup ProcessTrace cleanup admission",
+            ),
+            (
+                "\"invalid-setup-cleanup\"",
+                "fail-closed setup cleanup state",
+            ),
+            ("setup_stage: Some(error.stage)", "typed setup stage"),
+            (
+                "setup_win32_status: error.win32_status",
+                "typed primary setup status",
+            ),
+            ("schema_observed: false", "no pre-ready schema observation"),
+            ("frontier: Vec::new(),", "unsupported frontier suppression"),
+            ("invalid: !cleanup_valid", "cleanup failure invalidation"),
+            ("incomplete: true,", "setup coverage remains incomplete"),
+        ],
+    )?;
+    require_source(
+        &sources.access_trace,
+        "win32_status={} operation_status={} session_created={}",
+        "independent primary setup status rendering",
+    )?;
+    for field in [
+        "cleanup_provider_disable_status={}",
+        "cleanup_stop_status={}",
+        "cleanup_close_status={}",
+        "cleanup_process_trace_status={}",
+    ] {
+        require_source(&sources.access_trace, field, field)?;
+    }
+
+    let start = semantic_function_region(
+        &sources.access_trace,
+        "    pub(crate) fn start_ready_before_child_creation()",
+        "    pub(crate) fn bind_suspended_child(",
+    )
+    .ok_or_else(|| "passive observer setup has no semantic boundary".to_owned())?;
+    require_source_order(
+        &start,
+        &[
+            ("StartTraceW(", "private trace session start"),
+            ("EnableTraceEx2(", "provider enable"),
+            (
+                "KERNEL_FILE_KEYWORD_CREATE | KERNEL_FILE_KEYWORD_OPERATION_END",
+                "minimal Create and OperationEnd keyword mask",
+            ),
+            (
+                "PassiveAccessLocalizationSetupStageV1::ProviderEnable",
+                "typed provider-enable setup failure",
+            ),
+            ("OpenTraceW(", "real-time consumer open"),
+            (
+                "PassiveAccessLocalizationSetupStageV1::ConsumerOpen",
+                "typed consumer-open setup failure",
+            ),
+            ("ProcessTrace(", "out-of-process consumer"),
+            (
+                "ready_receiver.recv_timeout(READY_TIMEOUT)",
+                "consumer ready gate",
+            ),
+        ],
+    )?;
+    for (needle, purpose) in [
+        (
+            "PassiveAccessLocalizationSetupStageV1::SessionStart",
+            "typed session-start failure",
+        ),
+        ("Some(i64::from(status))", "raw StartTrace status"),
+        ("b\"StartTraceW\"", "hashed StartTrace operation detail"),
+        (
+            "PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop)",
+            "separate STOP status",
+        ),
+        (
+            "PassiveAccessLocalizationCleanupStatusV1::Native(close)",
+            "separate CLOSE status",
+        ),
+        (
+            "process_trace_status",
+            "separate ProcessTrace completion status",
+        ),
+        (
+            ".raw_os_error()\n                .map(i64::from);",
+            "truthful optional OpenTrace native status",
+        ),
+    ] {
+        require_source(&start, needle, purpose)?;
+    }
+    if start.contains("Some(-1)") || start.contains("unwrap_or(-1)") {
+        return Err("OpenTrace failure invented an unavailable native status".to_owned());
+    }
+    for (needle, purpose) in [
+        (
+            "PassiveAccessLocalizationSetupStageV1::ProviderEnable,\n                Some(i64::from(enable_status)),\n                true,\n                true,\n                false,\n                false,\n                PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),",
+            "provider-enable primary and STOP status preservation",
+        ),
+        (
+            "PassiveAccessLocalizationSetupStageV1::ConsumerOpen,\n                operation_status,\n                true,\n                true,\n                false,\n                false,\n                PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),",
+            "consumer-open primary and STOP status preservation",
+        ),
+    ] {
+        require_source(&start, needle, purpose)?;
+    }
+    let bind = semantic_function_region(
+        &sources.access_trace,
+        "    pub(crate) fn bind_suspended_child(",
+        "    pub(crate) fn finish(",
+    )
+    .ok_or_else(|| "passive observer subject binding has no semantic boundary".to_owned())?;
+    require_source_order(
+        &bind,
+        &[
+            ("GetProcessId(process)", "live child PID query"),
+            ("GetProcessTimes(", "live child creation-time query"),
+            (
+                "process_id != expected_process_id",
+                "exact child PID binding",
+            ),
+            (
+                "creation_time_100ns != expected_creation_time_100ns",
+                "exact child creation identity binding",
+            ),
+            (
+                "if state.active.is_some() || !state.pending.is_empty()",
+                "overlap rejection",
+            ),
+            (
+                "state.active = Some(SubjectIdentityV1",
+                "active window binding",
+            ),
+        ],
+    )?;
+    let callback = semantic_function_region(
+        &sources.access_trace,
+        "unsafe extern \"system\" fn passive_file_event_callback(event: *mut EVENT_RECORD) {",
+        "fn guid_equal(left: &GUID, right: &GUID) -> bool {",
+    )
+    .ok_or_else(|| "passive observer event callback has no semantic boundary".to_owned())?;
+    require_source_order(
+        &callback,
+        &[
+            (
+                "!guid_equal(&event.EventHeader.ProviderId, &KERNEL_FILE_PROVIDER)",
+                "exact provider filter",
+            ),
+            (
+                "active.started.elapsed() > MAX_SUBJECT_WINDOW",
+                "active time-window bound",
+            ),
+            (
+                "FILE_CREATE_EVENT_VERSIONS.contains(&descriptor.Version)",
+                "Create version gate",
+            ),
+            ("descriptor.Opcode == INFO_OPCODE", "Create opcode gate"),
+            (
+                "event.EventHeader.ProcessId != active.process_id",
+                "Create-only active child PID filter",
+            ),
+            (
+                "let initiator_property = if descriptor.Version == 0",
+                "version-specific manifest initiator selection",
+            ),
+            (
+                "decode_create_initiator(descriptor.Version, &bytes)",
+                "version-specific manifest initiator decoding",
+            ),
+            (
+                "initiator_thread_id != event.EventHeader.ThreadId",
+                "payload and provider-header initiator consistency",
+            ),
+            (
+                "admit_subject_event_budget(&mut state, usize::from(event.UserDataLength))",
+                "admitted Create resource accounting",
+            ),
+            (
+                "tdh_pointer_property(event, \"Irp\")",
+                "manifest Create IRP",
+            ),
+            (
+                "tdh_property_bytes(event, \"FileName\")",
+                "manifest Create file name",
+            ),
+            (
+                "object_name_sha256: file_object_name_digest(&path)",
+                "domain-separated file name hash before storage",
+            ),
+            (
+                "descriptor.Version == FILE_OPERATION_END_EVENT_VERSION",
+                "OperationEnd version gate",
+            ),
+            (
+                "let Some(pending) = state.pending.get(&irp).cloned() else",
+                "unmatched global completion filter",
+            ),
+            (
+                "admit_subject_event_budget(&mut state, usize::from(event.UserDataLength))",
+                "matched OperationEnd resource accounting",
+            ),
+            (
+                "tdh_pointer_property(event, \"ExtraInformation\")",
+                "manifest OperationEnd extra-information schema",
+            ),
+            (
+                "tdh_i32_property(event, \"Status\")",
+                "raw manifest OperationEnd status",
+            ),
+            ("state.pending.remove(&irp)", "IRP operation join"),
+            (
+                "push_completed_frontier_or_invalidate(",
+                "fail-closed completed frontier admission",
+            ),
+        ],
+    )?;
+    require_source(
+        &callback,
+        "let initiator_property = if descriptor.Version == 0 {\n                \"ThreadId\"\n            } else {\n                \"IssuingThreadId\"\n            };",
+        "exact manifest Create initiator property names",
+    )?;
+    if callback
+        .matches("admit_subject_event_budget(&mut state, usize::from(event.UserDataLength))")
+        .count()
+        != 2
+        || callback.contains("state.total_events =")
+        || callback.contains("state.total_payload_bytes =")
+    {
+        return Err("provider-global traffic can consume the bounded subject budget".to_owned());
+    }
+    let operation_end = callback
+        .split_once("        FILE_OPERATION_END_EVENT_ID")
+        .and_then(|(_, suffix)| {
+            suffix
+                .split_once("        FILE_CREATE_EVENT_ID | FILE_OPERATION_END_EVENT_ID => {")
+                .map(|(region, _)| region)
+        })
+        .ok_or_else(|| "manifest OperationEnd arm has no semantic boundary".to_owned())?;
+    if operation_end.contains("EventHeader.ProcessId") {
+        return Err("OperationEnd was filtered by completion header PID".to_owned());
+    }
+    require_source(
+        operation_end,
+        "let Some(pending) = state.pending.get(&irp).cloned() else {\n                return;\n            };",
+        "unrelated global OperationEnd ignore gate",
+    )?;
+    let name_digest = semantic_function_region(
+        &sources.access_trace,
+        "fn file_object_name_digest(raw_name: &[u8]) -> String {",
+        "fn same_observed_file_operation(left: &FileOperationV1, right: &FileOperationV1) -> bool {",
+    )
+    .ok_or_else(|| "passive object-name digest has no semantic boundary".to_owned())?;
+    require_source_order(
+        &name_digest,
+        &[
+            (
+                "b\"memcordon-passive-file-object-name-v1\\0\".to_vec()",
+                "object-name digest domain",
+            ),
+            (
+                "material.extend_from_slice(raw_name);",
+                "exact raw name bytes",
+            ),
+            (
+                "super::record::digest(&material)",
+                "domain-separated digest",
+            ),
+        ],
+    )?;
+    let pair_classifier = semantic_function_region(
+        &sources.access_trace,
+        "fn classify_completed_file_pairs(",
+        "#[derive(Debug)]",
+    )
+    .ok_or_else(|| "passive file-pair classifier has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "same_observed_file_operation(baseline, target)",
+            "affirmative exact object and schema pairing",
+        ),
+        (
+            "target.native_status == STATUS_ACCESS_DENIED",
+            "exact F denial candidate",
+        ),
+        (
+            "baseline.native_status != target.native_status",
+            "strict raw status differential",
+        ),
+        ("if !comparable", "unpaired observation is insufficient"),
+        (
+            "\"candidate-file-denial-differential\"",
+            "candidate-only differential state",
+        ),
+        ("\"file-domain-common\"", "common file-domain state"),
+        ("\"coverage-insufficient\"", "coverage-insufficient state"),
+    ] {
+        require_source(&pair_classifier, needle, purpose)?;
+    }
+    if pair_classifier.contains("!canonical.iter().any") {
+        return Err("absence of a C operation was promoted to a differential".to_owned());
+    }
+    require_source(
+        &pair_classifier,
+        "same_observed_file_operation(baseline, target)\n                    && baseline.native_status != target.native_status",
+        "affirmative exact pair with differing raw status",
+    )?;
+    let pair_identity = semantic_function_region(
+        &sources.access_trace,
+        "fn same_observed_file_operation(left: &FileOperationV1, right: &FileOperationV1) -> bool {",
+        "fn classify_completed_file_pairs(",
+    )
+    .ok_or_else(|| "passive file-pair identity has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "left.object_name_sha256 == right.object_name_sha256",
+            "exact domain-separated object identity",
+        ),
+        (
+            "left.create_event_version == right.create_event_version",
+            "exact Create schema identity",
+        ),
+        (
+            "left.operation_end_event_version == right.operation_end_event_version",
+            "exact OperationEnd schema identity",
+        ),
+    ] {
+        require_source(&pair_identity, needle, purpose)?;
+    }
+    let frontier_admission = semantic_function_region(
+        &sources.access_trace,
+        "fn push_completed_frontier_or_invalidate(state: &mut TraceStateV1, event: FileOperationV1) {",
+        "fn admit_subject_event_budget(state: &mut TraceStateV1, payload_bytes: usize) -> bool {",
+    )
+    .ok_or_else(|| "completed frontier admission has no semantic boundary".to_owned())?;
+    require_source_order(
+        &frontier_admission,
+        &[
+            (
+                "state.frontier.len() >= MAX_FRONTIER_EVENTS",
+                "frontier cap",
+            ),
+            (
+                "state.overflow = Some(\"frontier-bound\");",
+                "typed frontier overflow",
+            ),
+            ("state.incomplete = true;", "truncation invalidation"),
+            ("return;", "no lossy eviction"),
+            ("state.frontier.push(event);", "bounded append"),
+        ],
+    )?;
+    if frontier_admission.contains("remove(0)") {
+        return Err("completed frontier silently evicts admitted evidence".to_owned());
+    }
+    let subject_budget = semantic_function_region(
+        &sources.access_trace,
+        "fn admit_subject_event_budget(state: &mut TraceStateV1, payload_bytes: usize) -> bool {",
+        "#[derive(Debug, Default)]",
+    )
+    .ok_or_else(|| "subject event budget has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "state.total_events.saturating_add(1)",
+            "admitted event count",
+        ),
+        ("state.total_events > MAX_TRACE_EVENTS", "event count cap"),
+        ("payload_bytes > MAX_EVENT_PAYLOAD_BYTES", "payload cap"),
+        ("state.incomplete = true;", "overflow invalidation"),
+    ] {
+        require_source(&subject_budget, needle, purpose)?;
+    }
+    let initiator_decoder = semantic_function_region(
+        &sources.access_trace,
+        "fn decode_create_initiator(version: u8, bytes: &[u8]) -> Result<u32, String> {",
+        "fn tdh_i32_property(event: &EVENT_RECORD, name: &str) -> Result<i32, String> {",
+    )
+    .ok_or_else(|| "manifest Create initiator decoder has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "0 => u32::try_from(decode_pointer_property_bytes(bytes, \"ThreadId\")?)",
+            "v0 pointer-width ThreadId decoder",
+        ),
+        (
+            "1 if bytes.len() == size_of::<u32>()",
+            "v1 exact-width IssuingThreadId decoder",
+        ),
+        (
+            "_ => Err(\"TDH Create initiator version changed\".to_owned())",
+            "unknown initiator version rejection",
+        ),
+    ] {
+        require_source(&initiator_decoder, needle, purpose)?;
+    }
+    let drain = semantic_function_region(
+        &sources.access_trace,
+        "impl DrainBarrierV1 {",
+        "struct TraceCallbackContext {",
+    )
+    .ok_or_else(|| "consumer drain barrier has no semantic boundary".to_owned())?;
+    require_source_order(
+        &drain,
+        &[
+            (
+                "state.requested_epoch = state.requested_epoch.checked_add(1)?;",
+                "checked per-cell drain epoch",
+            ),
+            (
+                "state.target_buffers = Some(target_buffers);",
+                "FlushTrace cumulative buffer watermark",
+            ),
+            (
+                "state.processed_buffers >= target_buffers",
+                "already-drained acknowledgement",
+            ),
+            ("fn buffer_completed(&self)", "BufferCallback transition"),
+            (
+                "state.processed_buffers = state.processed_buffers.saturating_add(1);",
+                "processed buffer watermark",
+            ),
+            ("self.changed.notify_all();", "consumer drain notification"),
+            (
+                "fn wait(&self, epoch: u64, timeout: Duration)",
+                "bounded drain wait",
+            ),
+            (
+                ".wait_timeout_while(state, timeout, |state|",
+                "condition-variable timeout",
+            ),
+        ],
+    )?;
+    let subject_drop = semantic_function_region(
+        &sources.access_trace,
+        "impl Drop for PassiveAccessLocalizationSubjectGuardV1 {",
+        "unsafe extern \"system\" fn passive_file_buffer_callback(logfile: *mut EVENT_TRACE_LOGFILEW) -> u32 {",
+    )
+    .ok_or_else(|| "passive subject drain has no semantic boundary".to_owned())?;
+    require_source_order(
+        &subject_drop,
+        &[
+            (
+                "let drain_epoch = self.drain.request();",
+                "pre-flush epoch request",
+            ),
+            ("FlushTraceW(", "cell buffer flush"),
+            (
+                "u64::from(properties.properties.BuffersWritten)",
+                "cumulative flush watermark",
+            ),
+            (
+                "self.drain.wait(epoch, DRAIN_TIMEOUT)",
+                "bounded consumer acknowledgement",
+            ),
+            ("state.flush_failed = true;", "drain failure invalidation"),
+            (
+                "active.started.elapsed() > MAX_SUBJECT_WINDOW",
+                "event-independent subject timeout",
+            ),
+            (
+                "if !state.pending.is_empty()",
+                "post-drain join completeness",
+            ),
+            ("state.active = None;", "active clear after drain"),
+        ],
+    )?;
+    let buffer_callback = semantic_function_region(
+        &sources.access_trace,
+        "unsafe extern \"system\" fn passive_file_buffer_callback(logfile: *mut EVENT_TRACE_LOGFILEW) -> u32 {",
+        "unsafe extern \"system\" fn passive_file_event_callback(event: *mut EVENT_RECORD) {",
+    )
+    .ok_or_else(|| "passive buffer acknowledgement has no semantic boundary".to_owned())?;
+    require_source_order(
+        &buffer_callback,
+        &[
+            ("state.events_lost =", "buffer loss observation"),
+            (
+                "context.drain.buffer_completed();",
+                "post-event buffer acknowledgement",
+            ),
+        ],
+    )?;
+    let finish = semantic_function_region(
+        &sources.access_trace,
+        "    pub(crate) fn finish(",
+        "    fn cleanup(&mut self) -> PassiveAccessLocalizationCleanupReceiptV1 {",
+    )
+    .ok_or_else(|| "passive observer admission has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "self.started.elapsed() > MAX_TRACE_SESSION",
+            "event-independent whole-session timeout",
+        ),
+        ("!reproduction_valid", "exact A-F reproduction gate"),
+        ("state.overflow.is_some()", "overflow rejection"),
+        ("state.incomplete", "partial join rejection"),
+        ("state.events_lost != 0", "event loss rejection"),
+        ("state.realtime_buffers_lost != 0", "buffer loss rejection"),
+        (
+            "\"unsupported-provider-schema\"",
+            "unsupported schema state",
+        ),
+        ("\"invalid\"", "invalid trace state"),
+        (
+            "let frontier = if invalid || unsupported_schema",
+            "invalid trace frontier suppression",
+        ),
+    ] {
+        require_source(&finish, needle, purpose)?;
+    }
+    require_source(
+        &finish,
+        "|| state.overflow.is_some()\n            || state.incomplete\n            || state.flush_failed\n            || state.events_lost != 0\n            || state.realtime_buffers_lost != 0;",
+        "complete loss overflow and partial-result rejection gate",
+    )?;
+    let cleanup = semantic_function_region(
+        &sources.access_trace,
+        "    fn cleanup(&mut self) -> PassiveAccessLocalizationCleanupReceiptV1 {",
+        "impl Drop for PassiveAccessLocalizationObserverV1 {",
+    )
+    .ok_or_else(|| "passive observer cleanup has no semantic boundary".to_owned())?;
+    require_source_order(
+        &cleanup,
+        &[
+            ("if self.cleanup_performed", "repeat cleanup rejection"),
+            ("self.cleanup_performed = true;", "one cleanup transition"),
+            (
+                "EVENT_CONTROL_CODE_DISABLE_PROVIDER",
+                "provider disable cleanup",
+            ),
+            ("EVENT_TRACE_CONTROL_STOP", "session stop cleanup"),
+            ("worker.join()", "consumer join cleanup"),
+            (
+                "CloseTrace(self.processing_handle)",
+                "consumer close cleanup",
+            ),
+            (
+                "PassiveAccessLocalizationCleanupReceiptV1 {",
+                "typed cleanup receipt",
+            ),
+        ],
+    )?;
+    let cleanup_receipt = semantic_function_region(
+        &sources.access_trace,
+        "impl PassiveAccessLocalizationCleanupReceiptV1 {",
+        "#[derive(Clone, Debug, Eq, PartialEq)]",
+    )
+    .ok_or_else(|| "passive cleanup receipt has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        ("!self.repeated", "one-shot cleanup receipt"),
+        (
+            "self.provider_disable\n                == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)",
+            "provider-disable cleanup result",
+        ),
+        (
+            "self.stop == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)",
+            "STOP cleanup result",
+        ),
+        (
+            "self.process_trace == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)",
+            "ProcessTrace cleanup result",
+        ),
+        (
+            "self.close == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)",
+            "CloseTrace cleanup result",
+        ),
+        (
+            "passive access-localization cleanup failed: repeated={}",
+            "typed cleanup failure detail",
+        ),
+    ] {
+        require_source(&cleanup_receipt, needle, purpose)?;
+    }
+
+    let diagnostic = semantic_function_region(
+        &sources.process,
+        "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+        "#[cfg(test)]",
+    )
+    .ok_or_else(|| "restriction diagnostic has no semantic boundary".to_owned())?;
+    require_source_order(
+        &diagnostic,
+        &[
+            (
+                "after_comparison_observation.stable()",
+                "B scan before tracing",
+            ),
+            (
+                "PassiveAccessLocalizationObserverV1::start_ready_before_child_creation(",
+                "observer readiness before C creation",
+            ),
+            (
+                "PassiveAccessLocalizationCellV1::CanonicalSameAccess",
+                "C observation",
+            ),
+            (
+                "after_authenticated_users_observation.stable()",
+                "E stability gate before F",
+            ),
+            (
+                "PassiveAccessLocalizationCellV1::TargetUser",
+                "F observation",
+            ),
+            (
+                "let original_reproduction_valid = loader_restriction_original_sext_reproduction_valid(",
+                "exact original A-F reproduction gate",
+            ),
+            (
+                "let full_observer_fallback_allowed = original_reproduction_valid",
+                "typed fallback admission gate",
+            ),
+            (
+                "LoaderControlMatrixCellV4::RESTRICTION_FULL_OBSERVER_SNAPS_OFF",
+                "debug-C exact FullObserver snaps-off launch",
+            ),
+            ("\"after-debug-c\"", "post-debug-C shared environment scan"),
+            (
+                "LoaderControlMatrixCellV4::RESTRICTION_FULL_OBSERVER_SNAPS_OFF",
+                "debug-F identical FullObserver snaps-off launch",
+            ),
+            ("\"after-debug-f\"", "post-debug-F shared environment scan"),
+            (
+                "let environment_destruction = shared_environment.destroy_after_create();",
+                "one final shared Userenv destroy after debug-F",
+            ),
+            (
+                "PassiveAccessLocalizationEvidenceV1::observer_unavailable(&error)",
+                "typed fail-closed setup error evidence",
+            ),
+            (
+                "passive_access_localization.diagnostic()",
+                "bounded trace evidence rendering",
+            ),
+            (
+                "debug_observer_diagnostic",
+                "bounded observer-perturbation evidence rendering",
+            ),
+        ],
+    )?;
+    let debug_launches = diagnostic
+        .split_once("    let debug_pair = if full_observer_fallback_allowed {")
+        .and_then(|(_, suffix)| {
+            suffix
+                .split_once("    let debug_environment_stable = match debug_pair.as_ref() {")
+                .map(|(region, _)| region)
+        })
+        .ok_or_else(|| "debug C/F launch sequence has no semantic boundary".to_owned())?;
+    require_source_order(
+        debug_launches,
+        &[
+            (
+                "same_access_restricted.raw(),",
+                "debug-C authenticated canonical token",
+            ),
+            ("&same_access_envelope,", "debug-C complete token envelope"),
+            ("&same_access_snapshot,", "debug-C complete token snapshot"),
+            (
+                "LoaderControlMatrixCellV4::RESTRICTION_FULL_OBSERVER_SNAPS_OFF,",
+                "debug-C exact observer matrix cell",
+            ),
+            ("&mut shared_environment,", "debug-C borrowed Userenv block"),
+            ("\"after-debug-c\"", "debug-C post-launch Userenv scan"),
+            (
+                "if loader_full_observer_debug_f_allowed(\n            full_observer_fallback_allowed,\n            &after_debug_c_observation,\n        ) {",
+                "post-debug-C stable observation gates debug-F creation",
+            ),
+            (
+                "target_user_restricted.raw(),",
+                "debug-F authenticated target-user token",
+            ),
+            ("&target_user_envelope,", "debug-F complete token envelope"),
+            ("&target_user_snapshot,", "debug-F complete token snapshot"),
+            (
+                "LoaderControlMatrixCellV4::RESTRICTION_FULL_OBSERVER_SNAPS_OFF,",
+                "debug-F identical observer matrix cell",
+            ),
+            ("&mut shared_environment,", "debug-F borrowed Userenv block"),
+            ("\"after-debug-f\"", "debug-F post-launch Userenv scan"),
+        ],
+    )?;
+    if diagnostic
+        .matches("launch_target_desktop_loader_control_cell_with_shared_environment(")
+        .count()
+        != 8
+        || debug_launches.matches("&mut shared_environment,").count() != 2
+        || debug_launches
+            .matches("shared_environment.inventory()")
+            .count()
+            != 2
+    {
+        return Err(
+            "A-F plus debug C/F do not each borrow and scan the one Userenv block".to_owned(),
+        );
+    }
+    if diagnostic
+        .matches(
+            "                original_reproduction_valid,\n                original_invariants_valid,",
+        )
+        .count()
+        != 2
+        || diagnostic.contains(
+            "                original_reproduction_valid,\n                invariants_valid,",
+        )
+    {
+        return Err(
+            "FullObserver receipt paths do not preserve pre-debug A-F invariant provenance"
+                .to_owned(),
+        );
+    }
+    let setup_gate = semantic_function_region(
+        &sources.access_trace,
+        "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+        "impl PassiveAccessLocalizationObserverV1 {",
+    )
+    .ok_or_else(|| "exact session-start fallback gate has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "self.classification == \"observer-unavailable\"",
+            "observer-unavailable state gate",
+        ),
+        (
+            "self.setup_stage == Some(PassiveAccessLocalizationSetupStageV1::SessionStart)",
+            "session-start stage gate",
+        ),
+        (
+            "self.setup_win32_status == Some(5)",
+            "exact access-denied setup status",
+        ),
+        ("!self.session_created", "no session creation"),
+        ("!self.provider_enable_attempted", "no provider attempt"),
+        ("!self.consumer_opened", "no consumer open"),
+        ("!self.consumer_ready", "no consumer readiness"),
+        ("!self.schema_observed", "no schema observation"),
+        (
+            "self.cleanup_provider_disable_status.not_attempted()",
+            "no fabricated provider-disable cleanup",
+        ),
+        (
+            "self.cleanup_stop_status.not_attempted()",
+            "no fabricated STOP cleanup",
+        ),
+        (
+            "self.cleanup_close_status.not_attempted()",
+            "no fabricated CLOSE cleanup",
+        ),
+        (
+            "self.cleanup_process_trace_status.not_attempted()",
+            "no fabricated ProcessTrace cleanup",
+        ),
+        (
+            "self.subject_binding_sha256 == \"none\"",
+            "no subject binding",
+        ),
+        ("self.frontier.is_empty()", "no setup frontier"),
+        ("self.cleanup_count == 0", "no fabricated cleanup"),
+        ("self.canonical_events == 0", "no canonical events"),
+        ("self.target_user_events == 0", "no target events"),
+        ("self.events_lost == 0", "no hidden loss"),
+        ("!self.overflow", "no hidden overflow"),
+        ("self.incomplete", "truthful unavailable coverage"),
+        ("!self.invalid", "clean setup state"),
+        ("!self.unsupported_schema", "no schema observation"),
+    ] {
+        require_source(&setup_gate, needle, purpose)?;
+    }
+    let original_reproduction = semantic_function_region(
+        &sources.process,
+        "fn loader_restriction_original_sext_reproduction_valid(",
+        "struct LoaderFullObserverTraceReceiptV1 {",
+    )
+    .ok_or_else(|| "original A-F reproduction gate has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "    invariants_valid\n        && baseline.outcome",
+            "original A-F invariants",
+        ),
+        (
+            "baseline.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "A failure outcome",
+        ),
+        (
+            "baseline.native_status == Some(STATUS_DLL_INIT_FAILED)",
+            "exact A native status",
+        ),
+        (
+            "baseline.failure_phase == \"post-resume-pre-loader-ready\"",
+            "exact A typed phase",
+        ),
+        (
+            "no_restricting_sid.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+            "B pass",
+        ),
+        (
+            "same_access_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+            "C pass",
+        ),
+        (
+            "logon_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "D failure outcome",
+        ),
+        (
+            "logon_restricted.native_status == Some(STATUS_ACCESS_DENIED)",
+            "exact D access denial",
+        ),
+        (
+            "logon_restricted.failure_phase == \"post-resume-pre-loader-ready\"",
+            "D typed phase",
+        ),
+        (
+            "authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "E failure outcome",
+        ),
+        (
+            "authenticated_users_restricted.native_status == logon_restricted.native_status",
+            "exact E status reproduction",
+        ),
+        (
+            "authenticated_users_restricted.failure_phase == logon_restricted.failure_phase",
+            "E typed phase reproduction",
+        ),
+        (
+            "target_user_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "F failure outcome",
+        ),
+        (
+            "target_user_restricted.native_status == logon_restricted.native_status",
+            "exact F status reproduction",
+        ),
+        (
+            "target_user_restricted.failure_phase == logon_restricted.failure_phase",
+            "exact F phase reproduction",
+        ),
+    ] {
+        require_source(&original_reproduction, needle, purpose)?;
+    }
+    let observer_classifier = semantic_function_region(
+        &sources.process,
+        "fn classify_loader_full_observer_pair(",
+        "enum LoaderFullObserverInvariantStateV1 {",
+    )
+    .ok_or_else(|| "FullObserver classifier has no semantic boundary".to_owned())?;
+    let module_frontier = semantic_function_region(
+        &sources.process,
+        "fn loader_full_observer_module_frontier(",
+        "fn classify_loader_full_observer_pair(",
+    )
+    .ok_or_else(|| "FullObserver frontier comparator has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "debug_c.stable_modules",
+            "typed debug-C stable module sequence",
+        ),
+        (
+            "debug_f.stable_modules",
+            "typed debug-F stable module sequence",
+        ),
+        (
+            ".zip(debug_f.stable_modules.iter())",
+            "ordered sequence comparison",
+        ),
+        (
+            "canonical.sha256 == target.sha256",
+            "stable identity equality",
+        ),
+        ("module.stable", "stable provenance admission"),
+        (
+            "seen.insert(module.sha256.as_str())",
+            "unique stable identities",
+        ),
+        (
+            "debug_f.stable_modules.len() < debug_c.stable_modules.len()",
+            "strict F-prefix/C-extension length",
+        ),
+        (
+            "common_prefix == debug_f.stable_modules.len()",
+            "complete F prefix admission",
+        ),
+        (
+            "memcordon-loader-stable-module-last-common-v1",
+            "domain-separated last-common identity",
+        ),
+        (
+            "memcordon-loader-stable-module-first-c-only-v1",
+            "domain-separated first-C-only identity",
+        ),
+        (
+            "first_c_only_identity_sha256: useful.then",
+            "candidate hash suppression",
+        ),
+    ] {
+        require_source(&module_frontier, needle, purpose)?;
+    }
+    for forbidden in [
+        "candidate_modules_sha256",
+        "unload_tail_sha256",
+        "exception_tail_sha256",
+        "loader_snap",
+    ] {
+        if module_frontier.contains(forbidden) {
+            return Err(format!(
+                "unstable or phase-only evidence entered the stable module frontier: {forbidden}"
+            ));
+        }
+    }
+    for (needle, purpose) in [
+        (
+            "debug_c.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+            "debug-C LoaderReady reproduction",
+        ),
+        (
+            "debug_f.native_status == Some(STATUS_ACCESS_DENIED)",
+            "debug-F exact native status",
+        ),
+        (
+            "debug_f.failure_phase == \"post-resume-pre-loader-ready\"",
+            "debug-F exact typed phase",
+        ),
+        (
+            "useful_frontier_differential.is_none()",
+            "missing bounded frontier rejection",
+        ),
+        (
+            "\"observer-perturbed-differential\"",
+            "candidate differential state",
+        ),
+        (
+            "\"observer-perturbed-nonlocalizing\"",
+            "nonlocalizing state",
+        ),
+        (
+            "\"observer-perturbed-inconclusive\"",
+            "perturbation-inconclusive state",
+        ),
+    ] {
+        require_source(&observer_classifier, needle, purpose)?;
+    }
+    let observer_invariants = semantic_function_region(
+        &sources.process,
+        "struct LoaderFullObserverInvariantReceiptV1 {",
+        "fn render_loader_full_observer_diagnostic(",
+    )
+    .ok_or_else(|| "FullObserver typed invariant receipt has no semantic boundary".to_owned())?;
+    for gate in [
+        "fallback_authority",
+        "original_reproduction",
+        "original_invariants",
+        "original_projection",
+        "debug_pair_common",
+        "debug_mode",
+        "debug_c_trace_admission",
+        "debug_f_trace_admission",
+        "debug_containment",
+        "post_debug_c_environment",
+        "post_debug_f_environment",
+        "profile_stability",
+        "environment_destruction_once",
+    ] {
+        require_source(&observer_invariants, &format!("{gate}:"), gate)?;
+    }
+    for (mapping, purpose) in [
+        (
+            "(\"fallback-authority\", self.fallback_authority)",
+            "fallback authority provenance",
+        ),
+        (
+            "(\"original-reproduction\", self.original_reproduction)",
+            "original reproduction provenance",
+        ),
+        (
+            "(\"original-invariants\", self.original_invariants)",
+            "original invariant provenance",
+        ),
+        (
+            "(\"original-projection\", self.original_projection)",
+            "original projection provenance",
+        ),
+        (
+            "(\"debug-pair-common\", self.debug_pair_common)",
+            "debug pair common provenance",
+        ),
+        ("(\"debug-mode\", self.debug_mode)", "debug mode provenance"),
+        (
+            "(\"debug-c-trace-admission\", self.debug_c_trace_admission)",
+            "debug-C trace provenance",
+        ),
+        (
+            "(\"debug-f-trace-admission\", self.debug_f_trace_admission)",
+            "debug-F trace provenance",
+        ),
+        (
+            "(\"debug-containment\", self.debug_containment)",
+            "debug containment provenance",
+        ),
+        (
+            "(\"post-debug-c-environment\", self.post_debug_c_environment)",
+            "post-debug-C provenance",
+        ),
+        (
+            "(\"post-debug-f-environment\", self.post_debug_f_environment)",
+            "post-debug-F provenance",
+        ),
+        (
+            "(\"profile-stability\", self.profile_stability)",
+            "profile stability provenance",
+        ),
+        (
+            "\"environment-destruction-once\",\n                self.environment_destruction_once,",
+            "environment destruction provenance",
+        ),
+    ] {
+        require_source(&observer_invariants, mapping, purpose)?;
+    }
+    for (needle, purpose) in [
+        (
+            "state == LoaderFullObserverInvariantStateV1::Passed",
+            "all invariant states must pass",
+        ),
+        (
+            "state == LoaderFullObserverInvariantStateV1::Failed",
+            "failed invariant provenance",
+        ),
+        ("failed_diagnostic", "bounded failed-invariant renderer"),
+        ("named_states", "closed invariant vocabulary"),
+    ] {
+        require_source(&observer_invariants, needle, purpose)?;
+    }
+    let debug_f_gate = semantic_function_region(
+        &sources.process,
+        "fn loader_full_observer_debug_f_allowed(",
+        "fn loader_restriction_presence_required(",
+    )
+    .ok_or_else(|| "debug-F prelaunch gate has no semantic boundary".to_owned())?;
+    require_source(
+        &debug_f_gate,
+        "fallback_allowed && after_debug_c.stable()",
+        "authorized fallback and stable debug-C environment gate",
+    )?;
+    for (needle, purpose) in [
+        (
+            "LoaderControlMatrixCellV4::RESTRICTION_FULL_OBSERVER_SNAPS_OFF",
+            "same exact debug cell for C and F",
+        ),
+        (
+            "Some(evidence) if evidence.exact_session_start_access_denied()",
+            "exact typed setup gate before fallback",
+        ),
+        (
+            "loader_common_result_field(&same_access, debug_c, field)",
+            "C to debug-C projection equality",
+        ),
+        (
+            "loader_common_result_field(&target_user, debug_f, field)",
+            "F to debug-F projection equality",
+        ),
+        (
+            "loader_common_result_field(debug_c, debug_f, field)",
+            "debug pair common-field equality",
+        ),
+        (
+            "let debug_pair_job_empty_exact = [&debug_c, &debug_f]",
+            "separate debug pair Job-empty proof",
+        ),
+        (
+            "let debug_containment_exact = debug_pair_job_empty_exact",
+            "Job-empty proof enters containment admission",
+        ),
+        (
+            "== Some(\"0x00080406\")",
+            "exact symmetric debug creation flags",
+        ),
+        (
+            "changed_fields=[debugger_relation,debug_creation_flag]",
+            "explicit observer perturbation fields",
+        ),
+        ("observer_perturbed=true", "explicit observer perturbation"),
+        (
+            "candidate_frontier_only=true",
+            "bounded candidate-only claim",
+        ),
+        (
+            "requested_access_available=false",
+            "requested access remains unavailable",
+        ),
+        (
+            "exact_resource_identified=false",
+            "no exact resource overclaim",
+        ),
+        ("acl_fix_identified=false", "no ACL fix overclaim"),
+        ("primary_failure=original-a", "original A primary retention"),
+        ("release_sent=false", "no diagnostic release"),
+        ("workload_executed=false", "no workload"),
+        ("qualification_promoted=false", "no promotion"),
+        (
+            "debug_pair_job_empty_exact,",
+            "renderer receives the exact Job-empty predicate",
+        ),
+    ] {
+        require_source(&sources.process, needle, purpose)?;
+    }
+    let debug_observer_evidence = diagnostic
+        .split_once(
+            "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair\n        .as_ref()\n    {",
+        )
+        .and_then(|(_, suffix)| {
+            suffix
+                .split_once("    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256")
+                .map(|(region, _)| region)
+        })
+        .ok_or_else(|| "debug observer evidence has no semantic boundary".to_owned())?;
+    let observer_renderer = semantic_function_region(
+        &sources.process,
+        "fn render_loader_full_observer_diagnostic(",
+        "#[allow(clippy::too_many_arguments)]",
+    )
+    .ok_or_else(|| "FullObserver renderer has no semantic boundary".to_owned())?;
+    for field in [
+        "candidate_frontier_only=true",
+        "requested_access_available=false",
+        "exact_resource_identified=false",
+        "acl_fix_identified=false",
+        "primary_failure=original-a",
+        "debugger_values_redacted=true",
+        "environment_values_redacted=true",
+        "token_values_redacted=true",
+        "release_sent=false",
+        "workload_executed=false",
+        "qualification_promoted=false",
+    ] {
+        require_source(&observer_renderer, field, field)?;
+        require_source(debug_observer_evidence, field, field)?;
+    }
+    require_source(
+        debug_observer_evidence,
+        "render_loader_full_observer_diagnostic(",
+        "shared production FullObserver renderer",
+    )?;
+    require_source(
+        debug_observer_evidence,
+        "&debug_invariants,\n                    debug_pair_job_empty_exact,",
+        "exact Job-empty predicate passed independently to the renderer",
+    )?;
+    for (needle, purpose) in [
+        ("debug_c_trace.is_ok()", "typed debug-C trace admission"),
+        ("debug_f_trace.is_ok()", "typed debug-F trace admission"),
+        (
+            "let debug_invariants_valid = debug_invariants.valid();",
+            "typed aggregate invariant admission",
+        ),
+        ("&debug_c_trace,", "debug-C trace provenance rendering"),
+        (
+            "Some(&debug_f_trace),",
+            "debug-F trace provenance rendering",
+        ),
+        (
+            "&debug_invariants,",
+            "aggregate invariant provenance rendering",
+        ),
+        (
+            ".map(|(canonical, target)| loader_full_observer_module_frontier(canonical, target))",
+            "typed stable module frontier derivation",
+        ),
+        (
+            "module_frontier.as_ref().map(|frontier| frontier.useful)",
+            "strict stable frontier classification input",
+        ),
+        (
+            "module_frontier.as_ref(),",
+            "bounded stable frontier rendering input",
+        ),
+    ] {
+        require_source(debug_observer_evidence, needle, purpose)?;
+    }
+    let debug_projection = diagnostic
+        .split_once("    let debug_preserved_field_names = [")
+        .and_then(|(_, suffix)| {
+            suffix
+                .split_once(
+                    "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair\n        .as_ref()\n    {",
+                )
+                .map(|(region, _)| region)
+        })
+        .ok_or_else(|| "debug projection field inventory has no semantic boundary".to_owned())?;
+    for field in [
+        "environment_classification",
+        "environment_sha256",
+        "environment_keys_sha256",
+        "environment_units",
+        "environment_entries",
+        "environment_profile_loaded",
+        "source_token_sha256",
+        "source_token_id",
+        "source_modified_id",
+        "source_authentication_id",
+        "source_session_id",
+        "desktop_sha256",
+        "binary_sha256",
+        "current_directory_sha256",
+        "command_semantics_sha256",
+        "command_dynamic_fields",
+        "job_membership_attested",
+        "object_security_authority",
+        "process_policy_sha256",
+        "thread_policy_sha256",
+        "process_object_live_sha256",
+        "thread_object_live_sha256",
+        "descriptor_readback",
+        "target_logon_trustee",
+        "restricting_trustee_count",
+    ] {
+        require_source(debug_projection, &format!("\"{field}\""), field)?;
+    }
+    let command_binding = semantic_function_region(
+        &sources.process,
+        "fn loader_control_command_semantics_sha256(",
+        "fn launch_target_desktop_loader_control(",
+    )
+    .ok_or_else(|| "loader-control semantic command binding has no boundary".to_owned())?;
+    require_source_order(
+        &command_binding,
+        &[
+            (
+                "b\"memcordon-loader-control-command-semantics-v1\\0\".to_vec()",
+                "semantic command digest domain",
+            ),
+            (
+                "executable.as_os_str().encode_wide()",
+                "stable executable identity",
+            ),
+            ("action.as_bytes()", "stable loader-control action"),
+            (
+                "b\"dynamic:authenticated-private-pipe\\0\"",
+                "explicit private-pipe dynamic field",
+            ),
+            (
+                "b\"dynamic:authenticated-nonce\\0\"",
+                "explicit nonce dynamic field",
+            ),
+            ("exact_desktop.encode_utf16()", "stable desktop binding"),
+            ("binary_sha256.as_bytes()", "validated image binding"),
+            (
+                "super::record::digest(&material)",
+                "redacted command receipt",
+            ),
+        ],
+    )?;
+    for forbidden in ["pipe_name.", "nonce."] {
+        if command_binding.contains(forbidden) {
+            return Err(format!(
+                "per-launch secret entered stable command binding: {forbidden}"
+            ));
+        }
+    }
+    for (needle, purpose) in [
+        (
+            "memcordon-loader-candidate-modules-tail-v1\\0",
+            "domain-separated candidate tail digest",
+        ),
+        (
+            "candidate_modules_tail_digest(&modules)",
+            "candidate tail digest binds the rendered tail",
+        ),
+        (
+            "command_semantics_sha256: String",
+            "typed loader launch command receipt",
+        ),
+        (
+            "command_semantics_sha256={} command_dynamic_fields=authenticated-private-pipe,authenticated-nonce",
+            "redacted command diagnostic",
+        ),
+    ] {
+        require_source(&sources.loader_debug, needle, purpose)?;
+    }
+    require_source_order(
+        &diagnostic,
+        &[
+            (
+                "let common_field_names = [",
+                "original A-F common-field inventory",
+            ),
+            (
+                "\"command_semantics_sha256\"",
+                "A-F semantic command equality",
+            ),
+            (
+                "\"command_dynamic_fields\"",
+                "A-F dynamic-field declaration equality",
+            ),
+            (
+                "let debug_preserved_field_names = [",
+                "original-to-debug projection inventory",
+            ),
+            (
+                "\"command_semantics_sha256\"",
+                "C/F-to-debug semantic command equality",
+            ),
+            (
+                "\"command_dynamic_fields\"",
+                "C/F-to-debug dynamic-field declaration equality",
+            ),
+        ],
+    )?;
+    if debug_observer_evidence
+        .matches("b\"memcordon-loader-observer-perturbation-detail-v1\\0\".to_vec()")
+        .count()
+        != 2
+    {
+        return Err("both FullObserver result paths must domain-separate detail hashes".to_owned());
+    }
+    let trace_rejection = semantic_function_region(
+        &sources.process,
+        "enum LoaderFullObserverTraceRejectionV1 {",
+        "fn loader_full_observer_trace_record(",
+    )
+    .ok_or_else(|| "FullObserver trace-rejection vocabulary has no boundary".to_owned())?;
+    for reason in [
+        "rejected-missing-trace-record",
+        "rejected-duplicate-trace-record",
+        "rejected-missing-scalar",
+        "rejected-duplicate-scalar",
+        "rejected-invalid-unsigned",
+        "rejected-version",
+        "rejected-gate",
+        "rejected-drain",
+        "rejected-debug-cleanup",
+        "rejected-create-event",
+        "rejected-exit-event",
+        "rejected-command-declaration",
+        "rejected-event-accounting",
+        "rejected-event-bound",
+        "rejected-debug-string-count",
+        "rejected-debug-string-bytes",
+        "rejected-debug-string-overflow",
+        "rejected-loader-snap-count",
+        "rejected-loader-snap-retained",
+        "rejected-loader-snap-overflow",
+        "rejected-candidate-module-tail-malformed",
+        "rejected-candidate-module-tail-digest",
+        "rejected-digest-shape",
+        "rejected-empty-snap-digest",
+    ] {
+        require_source(&trace_rejection, reason, reason)?;
+    }
+    for reason in [
+        "rejected-{}-tail-count-retained",
+        "rejected-{}-tail-overflow",
+        "rejected-{}-tail-capacity",
+    ] {
+        require_source(&trace_rejection, reason, reason)?;
+    }
+    let trace_record = semantic_function_region(
+        &sources.process,
+        "fn loader_full_observer_trace_record(",
+        "fn loader_trace_scalar<'a>(",
+    )
+    .ok_or_else(|| "FullObserver trace-record selector has no semantic boundary".to_owned())?;
+    require_source_order(
+        &trace_record,
+        &[
+            ("let marker = \"loader_trace=\";", "bounded trace marker"),
+            ("detail.match_indices(marker)", "trace marker selection"),
+            ("char::is_whitespace", "trace marker token boundary"),
+            ("MissingTraceRecord", "missing trace-record rejection"),
+            (
+                "if markers.next().is_some()",
+                "duplicate trace-record detection",
+            ),
+            ("DuplicateTraceRecord", "duplicate trace-record rejection"),
+            (
+                "trace.split_ascii_whitespace().next() != Some(\"loader_trace=v4\")",
+                "exact v4 trace-record schema",
+            ),
+            ("Ok(trace)", "selected trace suffix only"),
+        ],
+    )?;
+    let trace_scalar = semantic_function_region(
+        &sources.process,
+        "fn loader_trace_scalar<'a>(",
+        "fn loader_trace_list_scalar<'a>(",
+    )
+    .ok_or_else(|| "FullObserver scalar parser has no semantic boundary".to_owned())?;
+    require_source_order(
+        &trace_scalar,
+        &[
+            ("split_ascii_whitespace()", "bounded token parsing"),
+            (
+                "LoaderFullObserverTraceRejectionV1::MissingScalar",
+                "missing-field rejection",
+            ),
+            ("if matches.next().is_some()", "duplicate-field rejection"),
+            (
+                "LoaderFullObserverTraceRejectionV1::DuplicateScalar",
+                "typed duplicate-field provenance",
+            ),
+            ("Ok(value)", "unique scalar admission"),
+        ],
+    )?;
+    let candidate_tail = semantic_function_region(
+        &sources.process,
+        "fn loader_trace_list_scalar<'a>(",
+        "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+    )
+    .ok_or_else(|| "FullObserver candidate-module parser has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        ("strip_prefix('[')", "candidate list opening delimiter"),
+        ("strip_suffix(']')", "candidate list closing delimiter"),
+        (
+            "if matches.next().is_some()",
+            "duplicate candidate list rejection",
+        ),
+        (
+            "parsed.to_string() == suffix",
+            "canonical numeric provenance status",
+        ),
+        ("ordinal_base,", "typed candidate ordinal/base field"),
+        ("basename,", "typed candidate basename field"),
+        ("path_source,", "typed candidate path-source field"),
+        ("path_sha256,", "typed candidate path digest field"),
+        ("path_error,", "typed candidate path-error field"),
+        ("path_provenance,", "typed candidate provenance field"),
+        ("] = fields.as_slice()", "exact candidate field cardinality"),
+        (".split_once(\"@0x\")", "typed ordinal/base delimiter"),
+        (
+            "u64::from_str_radix(base, 16)",
+            "typed hexadecimal base parsing",
+        ),
+        ("ordinal <= previous", "strictly increasing raw ordinal"),
+        ("ordinal == 0", "nonzero module ordinal"),
+        ("if base == 0", "nonzero module base"),
+        (
+            "LoaderFullObserverModulePathSourceV1::parse",
+            "closed path-source vocabulary",
+        ),
+        (
+            "loader_trace_module_provenance(path_source, path_provenance)",
+            "closed source/provenance relation",
+        ),
+        (
+            "expected_path_error.is_some_and(|expected| parsed_path_error != expected)",
+            "source/provenance path-error consistency",
+        ),
+        (
+            "partial_error_unobservable",
+            "unobservable partial-read last-error handling",
+        ),
+        (
+            "!loader_trace_sha256_valid(path_sha256)",
+            "candidate path digest admission",
+        ),
+        (
+            "!stable_identity_set.insert(identity.sha256.clone())",
+            "duplicate stable identity rejection",
+        ),
+        (
+            "identities.len() as u64 != retained",
+            "exact parsed candidate count",
+        ),
+        (
+            "let canonical = canonical_entries.join(\",\")",
+            "canonical candidate re-render",
+        ),
+        (
+            "candidate_modules_tail_digest(&canonical) != declared_sha256",
+            "domain-separated declared-tail verification",
+        ),
+        (
+            "memcordon-loader-module-basename-v1",
+            "domain-separated basename digest",
+        ),
+        (
+            "memcordon-loader-stable-module-identity-v1",
+            "domain-separated stable identity",
+        ),
+        (
+            "memcordon-loader-stable-module-sequence-v1",
+            "domain-separated stable sequence",
+        ),
+        (
+            "path_error.unwrap_or_default().to_le_bytes()",
+            "numeric path-error binding",
+        ),
+        ("path_error.is_some()", "path-error presence binding"),
+    ] {
+        require_source(&candidate_tail, needle, purpose)?;
+    }
+    for forbidden in ["ordinal.to_le_bytes", "base.to_le_bytes"] {
+        if candidate_tail.contains(forbidden) {
+            return Err(format!(
+                "process-local candidate coordinate entered stable identity: {forbidden}"
+            ));
+        }
+    }
+    let bounded_tail = semantic_function_region(
+        &sources.process,
+        "fn loader_trace_bounded_tail_valid(",
+        "fn loader_trace_sha256_valid(value: &str) -> bool {",
+    )
+    .ok_or_else(|| "FullObserver tail admission has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        ("if overflow != 0", "tail overflow rejection"),
+        ("TailOverflow(tail)", "typed tail overflow provenance"),
+        ("if count != retained", "tail count/retained equality"),
+        (
+            "TailCountRetained(tail)",
+            "typed tail count/retained provenance",
+        ),
+        ("if retained > capacity as u64", "tail capacity bound"),
+        ("TailCapacity(tail)", "typed tail capacity provenance"),
+        ("Ok(())", "bounded tail admission"),
+    ] {
+        require_source(&bounded_tail, needle, purpose)?;
+    }
+    let trace_digest = semantic_function_region(
+        &sources.process,
+        "fn loader_trace_sha256_valid(value: &str) -> bool {",
+        "fn admit_loader_full_observer_trace(",
+    )
+    .ok_or_else(|| "FullObserver digest admission has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "value.len() == super::record::digest(b\"\").len()",
+            "exact SHA-256 digest length",
+        ),
+        (
+            ".all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))",
+            "lowercase hexadecimal SHA-256 alphabet",
+        ),
+    ] {
+        require_source(&trace_digest, needle, purpose)?;
+    }
+    let trace_admission = semantic_function_region(
+        &sources.process,
+        "fn admit_loader_full_observer_trace(",
+        "fn loader_full_observer_module_frontier(",
+    )
+    .ok_or_else(|| "FullObserver trace admission has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "-> Result<LoaderFullObserverTraceReceiptV1, LoaderFullObserverTraceRejectionV1>",
+            "typed trace admission result",
+        ),
+        (
+            "loader_full_observer_trace_record(loader_result_detail(result))?",
+            "trace-local record selection",
+        ),
+        (
+            "loader_trace_scalar(detail, \"loader_trace\")? != \"v4\"",
+            "trace version",
+        ),
+        (
+            "loader_trace_scalar(detail, \"gate\")? != \"ephemeral-ci\"",
+            "trace gate",
+        ),
+        (
+            "loader_trace_scalar(detail, \"drained\")? != \"true\"",
+            "trace drain",
+        ),
+        (
+            "loader_trace_scalar(detail, \"debug_cleanup\")? != \"exit-process-event-continued\"",
+            "debug event cleanup",
+        ),
+        (
+            "loader_trace_scalar(detail, \"create_event\")? != \"true\"",
+            "debug process creation observation",
+        ),
+        (
+            "loader_trace_scalar(detail, \"exit_event\")? != \"true\"",
+            "debug process exit observation",
+        ),
+        ("events != accounted_events", "exact event accounting"),
+        ("LOADER_TRACE_EVENT_ADMISSION_MAX", "event count bound"),
+        (
+            "loader_trace_u64(detail, \"debug_strings\")? != 0",
+            "debug string rejection",
+        ),
+        (
+            "loader_trace_u64(detail, \"debug_string_bytes\")? != 0",
+            "debug string byte rejection",
+        ),
+        (
+            "loader_trace_u64(detail, \"debug_string_overflow\")? != 0",
+            "debug string overflow rejection",
+        ),
+        (
+            "candidate_modules_overflow",
+            "module tail overflow rejection",
+        ),
+        ("unload_tail_overflow", "unload tail overflow rejection"),
+        (
+            "unknown_event_tail_overflow",
+            "unknown-event overflow rejection",
+        ),
+        (
+            "exception_tail_overflow",
+            "exception tail overflow rejection",
+        ),
+        (
+            "let unknown_event_tail_sha256 = loader_trace_scalar(detail, \"unknown_event_tail_sha256\")?;",
+            "trace-local unknown-event digest scalar",
+        ),
+        (
+            "unload_tail_sha256.as_str(),\n        unknown_event_tail_sha256,\n        exception_tail_sha256.as_str(),",
+            "unknown-event digest shape admission",
+        ),
+        ("loader_snap_tail_count", "unexpected snap rejection"),
+        ("loader_snap_tail_retained", "retained snap rejection"),
+        ("loader_snap_tail_overflow", "snap overflow rejection"),
+        (
+            "loader_snap_tail_sha256 != super::record::digest(b\"\")",
+            "exact empty snap digest",
+        ),
+        ("loader_trace_sha256_valid", "digest shape admission"),
+        (
+            "command_dynamic_fields",
+            "bounded command dynamic-field declaration",
+        ),
+        (
+            "loader_trace_candidate_modules(\n        detail,\n        &candidate_modules_sha256,\n        candidate_modules_retained,\n    )?",
+            "typed candidate tail admission",
+        ),
+        (
+            "loader_stable_module_sequence_digest(&stable_modules)",
+            "stable sequence receipt",
+        ),
+        ("candidate_modules_count,", "candidate total receipt"),
+        ("stable_modules,", "typed stable module receipt"),
+        (
+            "stable_module_sequence_sha256,",
+            "stable sequence digest receipt",
+        ),
+    ] {
+        require_source(&trace_admission, needle, purpose)?;
+    }
+    for field in [
+        "debug_c_trace_admission={}",
+        "debug_f_trace_admission={}",
+        "failed_invariants=[{failed_invariants}]",
+        "debug_c_trace_sha256={}",
+        "debug_f_trace_sha256={}",
+        "debug_c_modules_sha256={}",
+        "debug_f_modules_sha256={}",
+        "debug_c_unloads_sha256={}",
+        "debug_f_unloads_sha256={}",
+        "debug_c_exceptions_sha256={}",
+        "debug_f_exceptions_sha256={}",
+        "stable_module_frontier={module_frontier_state}",
+        "stable_module_c_total={}",
+        "stable_module_c_retained={}",
+        "stable_module_c_sequence_sha256={}",
+        "stable_module_f_total={}",
+        "stable_module_f_retained={}",
+        "stable_module_f_sequence_sha256={}",
+        "stable_module_common_prefix={}",
+        "stable_module_last_common_sha256={}",
+        "stable_module_first_c_only_sha256={}",
+        "loader_snap_evidence=expected-empty",
+        "job_empty={job_empty}",
+    ] {
+        require_source(&observer_renderer, field, field)?;
+    }
+    for (needle, purpose) in [
+        (
+            "Err(rejection) => rejection.diagnostic()",
+            "typed trace-rejection rendering",
+        ),
+        (
+            "trace_admission(Some(debug_c_trace))",
+            "debug-C trace-admission provenance",
+        ),
+        (
+            "trace_admission(debug_f_trace)",
+            "debug-F trace-admission provenance",
+        ),
+        (
+            "let failed_invariants = invariants.failed_diagnostic();",
+            "typed aggregate-invariant provenance",
+        ),
+        (
+            "state != \"observer-perturbed-inconclusive\"",
+            "inconclusive stable frontier suppression",
+        ),
+        (
+            "if frontier.useful",
+            "strict-prefix frontier classification",
+        ),
+        (
+            "\"strict-f-prefix-c-extension\"",
+            "bounded candidate frontier label",
+        ),
+        ("\"nonlocalizing\"", "ambiguous frontier label"),
+        (
+            "\"last-common\" if frontier.useful =>",
+            "last-common identity visibility requires a useful frontier",
+        ),
+        (
+            "frontier.last_common_identity_sha256.as_ref()",
+            "suppressed last-common identity rendering",
+        ),
+        (
+            "\"first-c-only\" if frontier.useful =>",
+            "first-C-only identity visibility requires a useful frontier",
+        ),
+        (
+            "frontier.first_c_only_identity_sha256.as_ref()",
+            "suppressed first-C-only identity rendering",
+        ),
+    ] {
+        require_source(&observer_renderer, needle, purpose)?;
+    }
+    require_source_order(
+        &observer_renderer,
+        &[
+            (
+                "if state == \"observer-perturbed-inconclusive\"",
+                "inconclusive frontier suppression",
+            ),
+            ("return \"none\".to_owned();", "suppressed typed hash"),
+        ],
+    )?;
+    for forbidden in ["loader_result_detail", "raw_debug", "pipe_name", "nonce"] {
+        if observer_renderer.contains(forbidden) {
+            return Err(format!(
+                "FullObserver provenance renderer exposes an unbounded source: {forbidden}"
+            ));
+        }
+    }
+    if sources
+        .process
+        .matches("RESTRICTION_FULL_OBSERVER_SNAPS_OFF,")
+        .count()
+        != 2
+    {
+        return Err(
+            "FullObserver restriction cell is not declared once and used exactly for C/F"
+                .to_owned(),
+        );
+    }
+    validate_windows_trace_session_capability_contract(sources)?;
+    let launch = semantic_function_region(
+        &sources.process,
+        "fn launch_target_desktop_loader_control_cell_inner(",
+        "fn launch_target_desktop_probe(",
+    )
+    .ok_or_else(|| "loader-control launch has no semantic boundary".to_owned())?;
+    require_source_order(
+        &launch,
+        &[
+            (
+                "let control_identity = process_identity(control_process.raw())?;",
+                "child identity attestation",
+            ),
+            ("observer.bind_suspended_child(", "trace identity binding"),
+            (
+                "ResumeThread(control_thread.raw())",
+                "child resume after binding",
+            ),
+        ],
+    )?;
+    require_source_order(
+        &launch,
+        &[
+            (
+                "if object_security_authority.diagnostic_only() {",
+                "diagnostic-only termination boundary",
+            ),
+            (
+                "session.drain_until_exit(",
+                "FullObserver event drain after diagnostic termination",
+            ),
+            (
+                "control_job.wait_empty(Instant::now() + Duration::from_secs(30))",
+                "debug child Job-empty proof",
+            ),
+            (
+                "loader_debug_observer.map_or(\"none\", |observer| observer.diagnostic())",
+                "exact debug observer rendering",
+            ),
+            (
+                "session.trace().diagnostic()",
+                "bounded FullObserver trace rendering",
+            ),
+        ],
+    )?;
+    require_source_order(
+        &launch,
+        &[
+            (
+                "let loader_control_action = \"loader-control\";",
+                "single stable command action",
+            ),
+            (
+                "let command_semantics_sha256 = loader_control_command_semantics_sha256(",
+                "semantic command receipt before argv creation",
+            ),
+            (
+                "loader_control_action.encode_utf16().collect(),",
+                "same action used by child argv",
+            ),
+            (
+                "pipe_name.encode_utf16().collect(),",
+                "authenticated private-pipe argv field",
+            ),
+            (
+                "nonce.encode_utf16().collect(),",
+                "authenticated nonce argv field",
+            ),
+            (
+                "exact_desktop.encode_utf16().collect(),",
+                "same desktop used by child argv",
+            ),
+            (
+                "command_semantics_sha256,",
+                "semantic receipt published in launch evidence",
+            ),
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_windows_trace_session_capability_contract(
+    sources: &WindowsLoaderControlContractSources,
+) -> Result<(), String> {
+    for (needle, purpose) in [
+        (
+            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;",
+            "outer broker protocol schema v6",
+        ),
+        (
+            "const TRACE_SESSION_CAPABILITY_SCHEMA_VERSION: u32 = 1;",
+            "nested capability schema v1",
+        ),
+        (
+            "TraceSessionCapabilityRequest(TraceSessionCapabilityRequestV1)",
+            "closed capability request frame",
+        ),
+        (
+            "TraceSessionCapabilityReceipt(TraceSessionCapabilityReceiptV1)",
+            "closed capability receipt frame",
+        ),
+        (
+            "TraceSessionCapabilityFailed(TraceSessionCapabilityFailureV1)",
+            "closed capability failure frame",
+        ),
+        (
+            "Self::TraceSessionCapability => \"trace-session-capability\"",
+            "distinct broker operation",
+        ),
+    ] {
+        require_source(&sources.session_broker, needle, purpose)?;
+    }
+    let trigger_gate = semantic_function_region(
+        &sources.process,
+        "fn loader_trace_session_capability_allowed(",
+        "#[allow(clippy::too_many_arguments)]",
+    )
+    .ok_or_else(|| "trace-session capability typed gate has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        ("ephemeral_ci", "ephemeral-only gate"),
+        (
+            "&& passive_setup_admitted",
+            "typed passive StartTrace denial gate",
+        ),
+        (
+            "original_reproduction_valid",
+            "original A-F reproduction gate",
+        ),
+        ("original_invariants_valid", "original invariant gate"),
+        ("invariants.valid()", "all 13 FullObserver invariants"),
+        (
+            "debug_c.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+            "exact debug-C pass",
+        ),
+        (
+            "debug_f.native_status == Some(STATUS_ACCESS_DENIED)",
+            "exact debug-F access denial",
+        ),
+        (
+            "debug_f.failure_phase == \"post-resume-pre-loader-ready\"",
+            "exact debug-F phase",
+        ),
+        (
+            "!debug_c_trace.stable_modules.is_empty()",
+            "present debug-C stable-module evidence",
+        ),
+        (
+            "!debug_f_trace.stable_modules.is_empty()",
+            "present debug-F stable-module evidence",
+        ),
+        ("after_debug_c_stable", "post-debug-C environment gate"),
+        ("after_debug_f_stable", "post-debug-F environment gate"),
+        ("!frontier.useful", "nonlocalizing-only gate"),
+        ("frontier.common_prefix == 0", "zero-prefix-only gate"),
+        (
+            "frontier.last_common_identity_sha256.is_none()",
+            "last-common identity suppression gate",
+        ),
+        (
+            "frontier.first_c_only_identity_sha256.is_none()",
+            "first-C-only identity suppression gate",
+        ),
+    ] {
+        require_source(&trigger_gate, needle, purpose)?;
+    }
+    let trigger = semantic_function_region(
+        &sources.process,
+        "fn loader_trace_session_capability_trigger_sha256(",
+        "fn classify_loader_full_observer_pair(",
+    )
+    .ok_or_else(|| "trace-session capability trigger has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "memcordon-loader-trace-session-capability-trigger-v1",
+            "domain-separated typed prerequisite receipt",
+        ),
+        (
+            "debug_c_trace.trace_sha256",
+            "admitted debug-C trace receipt",
+        ),
+        (
+            "debug_f_trace.trace_sha256",
+            "admitted debug-F trace receipt",
+        ),
+        (
+            "restriction_identity_binding_sha256",
+            "canonical same-access derivation receipt",
+        ),
+        (
+            "logon_restriction_binding_sha256",
+            "target-logon derivation receipt",
+        ),
+        (
+            "authenticated_users_restriction_binding_sha256",
+            "authenticated-users derivation receipt",
+        ),
+        (
+            "target_user_restriction_binding_sha256",
+            "target-user derivation receipt",
+        ),
+        (
+            "shared_evidence_sha256",
+            "shared Userenv/profile/containment/destruction receipt",
+        ),
+        (
+            "for field in [\n        passive_setup_sha256.unwrap_or_default(),\n        source_binding_sha256,\n        pair_invariants_sha256,\n        restriction_presence_binding_sha256,\n        restriction_identity_binding_sha256,\n        logon_restriction_binding_sha256,\n        authenticated_users_restriction_binding_sha256,\n        target_user_restriction_binding_sha256,\n        profile_binding_sha256,\n        shared_evidence_sha256,",
+            "ordered A-F lineage and shared-evidence digest material",
+        ),
+        (
+            "memcordon-loader-trace-session-capability-shared-evidence-v1",
+            "domain-separated shared evidence aggregation",
+        ),
+        (
+            "invariants.named_states()",
+            "all invariant components bound",
+        ),
+        (
+            "for outcome in [\n        baseline,\n        no_restricting_sid,\n        same_access_restricted,\n        logon_restricted,\n        authenticated_users_restricted,\n        target_user_restricted,\n        debug_c,\n        debug_f,\n    ]",
+            "typed original A-F and debug C/F outcomes bound",
+        ),
+        (
+            "outcome.native_status.unwrap_or(i32::MIN).to_le_bytes()",
+            "typed outcome native status bound",
+        ),
+        (
+            "outcome.detail_sha256.as_bytes()",
+            "every A-F/debug cell detail receipt bound",
+        ),
+        (
+            "outcome.failure_phase.len() as u64",
+            "typed outcome phase length bound",
+        ),
+        (
+            "outcome.failure_phase.as_bytes()",
+            "typed outcome phase bound",
+        ),
+        (
+            "Some(super::record::digest(&material))",
+            "sealed trigger receipt",
+        ),
+    ] {
+        require_source(&trigger, needle, purpose)?;
+    }
+    require_source_order(
+        &sources.process,
+        &[
+            (
+                "let environment_destruction = shared_environment.destroy_after_create();",
+                "one Userenv owner destruction",
+            ),
+            (
+                "loader_trace_session_capability_trigger_sha256(",
+                "typed trigger after cleanup",
+            ),
+            (
+                "request_trace_session_capability(trigger_sha256)",
+                "authenticated capability request",
+            ),
+        ],
+    )?;
+    let native = semantic_function_region(
+        &sources.access_trace,
+        "pub(super) fn run_trace_session_capability(",
+        "pub(crate) struct PassiveAccessLocalizationObserverV1 {",
+    )
+    .ok_or_else(|| "one-shot native trace capability has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "TracePropertiesBuffer::new(&session_name)?",
+            "shared bounded ETW properties",
+        ),
+        ("StartTraceW(", "exact session start"),
+        ("start_status != ERROR_SUCCESS", "start failure branch"),
+        (
+            "start_status != ERROR_ALREADY_EXISTS",
+            "collision absence suppression",
+        ),
+        ("guard.finish()", "guarded immediate STOP"),
+        ("cleanup_count", "exact cleanup count"),
+        ("stop_status == ERROR_SUCCESS", "exact STOP success"),
+    ] {
+        require_source(&native, needle, purpose)?;
+    }
+    if native.matches("StartTraceW(").count() != 1 {
+        return Err("trace-session capability must call StartTraceW exactly once".to_owned());
+    }
+    for forbidden in [
+        "EnableTraceEx2",
+        "OpenTraceW",
+        "ProcessTrace",
+        "FlushTraceW",
+        "CloseTrace",
+        "CreateProcess",
+        "Userenv",
+    ] {
+        if native.contains(forbidden) {
+            return Err(format!(
+                "trace-session capability widened beyond Start/STOP: {forbidden}"
+            ));
+        }
+    }
+    let request_admission = semantic_function_region(
+        &sources.session_broker,
+        "fn validate_trace_session_capability_request(",
+        "fn run_trace_session_capability_authority_transaction(",
+    )
+    .ok_or_else(|| "trace-session request admission has no boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "request.start_nonce != hello.start_nonce",
+            "authenticated start-nonce binding",
+        ),
+        (
+            "request.challenge != hello.challenge",
+            "authenticated challenge binding",
+        ),
+        (
+            "&request.launcher_identity != launcher_identity",
+            "live launcher identity binding",
+        ),
+        (
+            "request.broker_identity != hello.broker_identity",
+            "Hello broker identity binding",
+        ),
+        (
+            "request.calculated_sha256()? != request.request_binding_sha256",
+            "request seal validation",
+        ),
+        (
+            "windows_service_attestation_challenge_is_valid(&request.transaction_nonce)",
+            "transaction replay nonce validation",
+        ),
+        (
+            "TraceSessionCapabilityTriggerReasonV1::StableModuleZeroPrefixNonlocalizing",
+            "closed prerequisite reason",
+        ),
+    ] {
+        require_source(&request_admission, needle, purpose)?;
+    }
+    let receipt_admission = semantic_function_region(
+        &sources.session_broker,
+        "fn trace_session_capability_receipt_valid_for_binding(",
+        "pub(crate) fn request_trace_session_capability(",
+    )
+    .ok_or_else(|| "trace-session receipt admission has no boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "receipt.validate_seal()?",
+            "independent receipt seal validation",
+        ),
+        (
+            "receipt.transaction_sha256\n            == super::record::digest(request.transaction_nonce.as_bytes())",
+            "transaction replay binding",
+        ),
+        (
+            "receipt.request_binding_sha256 == request.request_binding_sha256",
+            "sealed request binding",
+        ),
+        (
+            "&receipt.broker_identity == broker_identity",
+            "authenticated broker identity binding",
+        ),
+        (
+            "receipt.broker_source_sha256 == request.broker_source_sha256",
+            "normalized broker source binding",
+        ),
+        (
+            "receipt.session_name_sha256 == expected_session_name_sha256",
+            "deterministic private-session binding",
+        ),
+        (
+            "receipt.authority_equal == authority_digest_equal",
+            "before/after authority truth binding",
+        ),
+        (
+            "receipt.authority_before_sha256 == receipt.authority_after_sha256",
+            "exact post-authority digest equality",
+        ),
+        (
+            "trace_session_capability_deadline_exceeded(receipt.elapsed_ms)",
+            "elapsed deadline truth binding",
+        ),
+        (
+            "classify_trace_session_capability_native(",
+            "independent native-state recomputation",
+        ),
+        (
+            "trace_session_capability_native_shape(receipt)",
+            "closed legitimate native tuple",
+        ),
+        (
+            "receipt.state == recomputed_state",
+            "exact broker/client classifier equality",
+        ),
+        (
+            "authority_digest_equal && receipt.authority_equal && !receipt.deadline_exceeded",
+            "accepted state authority/deadline gate",
+        ),
+    ] {
+        require_source(&receipt_admission, needle, purpose)?;
+    }
+    let guard = semantic_function_region(
+        &sources.access_trace,
+        "struct StartedTraceSessionCapability {",
+        "fn trace_session_capability_name(",
+    )
+    .ok_or_else(|| "trace-session STOP guard has no semantic boundary".to_owned())?;
+    for (needle, purpose) in [
+        ("ControlTraceW(", "one STOP primitive"),
+        ("EVENT_TRACE_CONTROL_STOP", "STOP-only control"),
+        ("self.stop_status.is_none()", "one-attempt guard"),
+        (
+            "if self.stop_status.is_none()",
+            "Drop cleanup only before an attempt",
+        ),
+    ] {
+        require_source(&guard, needle, purpose)?;
+    }
+    if guard.matches("ControlTraceW(").count() != 1 {
+        return Err("trace-session capability must have one guarded STOP call site".to_owned());
+    }
+    let authority = semantic_function_region(
+        &sources.session_broker,
+        "fn attest_trace_session_capability_authority(",
+        "fn trace_session_capability_failure(",
+    )
+    .ok_or_else(|| "trace-session live authority reattestation has no boundary".to_owned())?;
+    for (needle, purpose) in [
+        ("ephemeral_ci_enabled()", "broker ephemeral gate"),
+        ("require_thread_token_absent", "absent broker thread token"),
+        ("process_identity", "live broker identity"),
+        ("current_process_token_for_attestation", "live broker token"),
+        (
+            "validate_normalized_session_broker_source_snapshot",
+            "normalized authority",
+        ),
+        (
+            "require_same_process_token_query",
+            "live process-token binding",
+        ),
+    ] {
+        require_source(&authority, needle, purpose)?;
+    }
+    let transaction = semantic_function_region(
+        &sources.session_broker,
+        "fn run_trace_session_capability_authority_transaction(",
+        "fn run_creation_authority_transaction(",
+    )
+    .ok_or_else(|| "broker capability transaction has no semantic boundary".to_owned())?;
+    require_source_order(
+        &transaction,
+        &[
+            (
+                "validate_trace_session_capability_request(",
+                "sealed request validation",
+            ),
+            (
+                "attest_trace_session_capability_authority(hello)",
+                "before authority",
+            ),
+            (
+                "run_trace_session_capability(",
+                "one-shot native transaction",
+            ),
+            (
+                "attest_trace_session_capability_authority(hello)",
+                "after authority",
+            ),
+            (
+                "classify_trace_session_capability_native(",
+                "closed result state",
+            ),
+            (".seal()?", "sealed receipt"),
+            ("TraceSessionCapabilityReceipt(receipt)", "typed response"),
+        ],
+    )?;
+    for forbidden in [
+        "EnableTraceEx2",
+        "OpenTraceW",
+        "ProcessTrace",
+        "LoaderSnapsTransactionV2",
+    ] {
+        if transaction.contains(forbidden) {
+            return Err(format!(
+                "broker capability transaction widened authority: {forbidden}"
+            ));
+        }
+    }
+    let client = semantic_function_region(
+        &sources.session_broker,
+        "pub(crate) fn request_trace_session_capability(",
+        "#[cfg(test)]",
+    )
+    .ok_or_else(|| "authenticated trace capability client has no boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "start_authenticated_broker",
+            "existing authenticated one-shot broker",
+        ),
+        ("TraceSessionCapabilityRequest", "typed request"),
+        (
+            "trace_session_capability_receipt_valid",
+            "strict receipt admission",
+        ),
+        (
+            "Ok(receipt) => match authenticated.retire()",
+            "mandatory exact broker retirement",
+        ),
+        (
+            "retirement_failure_sha256: Some(super::record::digest(error.as_bytes()))",
+            "separate retirement failure provenance",
+        ),
+        (
+            "failure_sha256: Some(super::record::digest(error.as_bytes()))",
+            "primary transaction failure provenance",
+        ),
+        (
+            "retirement_failure_sha256: retirement_failure",
+            "dual failure preservation",
+        ),
+        (
+            "failure_sha256: Some(super::record::digest(error.as_bytes())),\n                retirement_failure_sha256: retirement_failure,",
+            "primary and retirement failures preserved separately",
+        ),
+    ] {
+        require_source(&client, needle, purpose)?;
+    }
+    let diagnostic = semantic_function_region(
+        &sources.session_broker,
+        "impl TraceSessionCapabilityEvidenceV1 {",
+        "pub(crate) struct LoaderSnapsArmedReceiptV2 {",
+    )
+    .ok_or_else(|| "trace-session capability renderer has no boundary".to_owned())?;
+    for field in [
+        "broker_receipt_state=",
+        "receipt_sha256=",
+        "transaction_sha256=",
+        "broker_source_sha256=",
+        "retirement_failure_sha256=",
+        "requested_access_available=false",
+        "exact_resource_identified=false",
+        "acl_fix_identified=false",
+        "primary_failure=original-a",
+        "release_sent=false",
+        "workload_executed=false",
+        "qualification_promoted=false",
+        "session_name_redacted=true",
+        "transaction_nonce_redacted=true",
+        "broker_source_values_redacted=true",
+        "token_values_redacted=true",
+        "object_values_redacted=true",
+    ] {
+        require_source(&diagnostic, field, field)?;
+    }
+    for (needle, purpose) in [
+        ("receipt.receipt_sha256", "sealed receipt digest rendering"),
+        (
+            "receipt.transaction_sha256",
+            "hashed transaction binding rendering",
+        ),
+        (
+            "receipt.broker_source_sha256",
+            "hashed broker-source binding rendering",
+        ),
+        (
+            "let effective_state = if self.retirement == \"retired\"",
+            "retirement-derived effective invalid state",
+        ),
+    ] {
+        require_source(&diagnostic, needle, purpose)?;
+    }
+    for forbidden in [
+        "receipt.start_nonce",
+        "receipt.transaction_nonce",
+        "pipe_name={}",
+        "user_sid={}",
+    ] {
+        if diagnostic.contains(forbidden) {
+            return Err(format!(
+                "capability renderer exposes secret material: {forbidden}"
+            ));
+        }
+    }
+    for (region, name) in [
+        (&native, "native capability"),
+        (&authority, "authority attestation"),
+        (&transaction, "broker transaction"),
+        (&client, "capability client"),
+    ] {
+        for forbidden in [
+            "AdjustTokenPrivileges",
+            "SetThreadToken",
+            "ImpersonateNamedPipeClient",
+            "RegSetKeySecurity",
+            "SetNamedSecurityInfo",
+            "SetSecurityInfo",
+            "ChangeServiceConfig",
+            "SERVICE_SID",
+            "SeSystemProfilePrivilege",
+        ] {
+            if region.contains(forbidden) {
+                return Err(format!(
+                    "trace-session {name} widened authority or policy: {forbidden}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_windows_loader_control_contract(
     sources: &WindowsLoaderControlContractSources,
 ) -> Result<(), String> {
+    validate_windows_shared_userenv_restriction_presence_contract(
+        &sources.process,
+        &sources.token,
+    )?;
+    validate_windows_passive_access_localization_contract(sources)?;
+    for (source, boundary) in [
+        (&sources.core, "core protocol"),
+        (&sources.control_service, "control transfer"),
+        (&sources.launcher_service, "launcher adoption"),
+    ] {
+        for forbidden in [
+            "remote_same_access_restricted_token_handle",
+            "remote_canonical_same_access_token_handle",
+            "remote_logon_restricted_token_handle",
+            "remote_target_logon_token_handle",
+        ] {
+            if source.contains(forbidden) {
+                return Err(format!(
+                    "launcher-local diagnostic sibling escaped into {boundary}: {forbidden}"
+                ));
+            }
+        }
+    }
     require_source(
         &sources.bootstrap,
         "#[cfg(all(target_os = \"windows\", not(target_feature = \"crt-static\")))]\ncompile_error!(\"the target desktop bootstrap requires a statically linked CRT\");",
@@ -11659,7 +16477,7 @@ fn validate_windows_loader_control_contract(
     let control = semantic_function_region(
         &sources.process,
         "fn launch_target_desktop_loader_control(",
-        "#[allow(clippy::too_many_arguments)]",
+        "fn launch_target_desktop_probe(",
     )
     .ok_or_else(|| "loader-control launch has no semantic boundary".to_owned())?;
     require_source_order(
@@ -11674,8 +16492,12 @@ fn validate_windows_loader_control_contract(
                 "atomic loader-control Job assignment",
             ),
             (
-                "\"loader-control\".encode_utf16().collect(),",
+                "let loader_control_action = \"loader-control\";",
                 "same-image loader-control role",
+            ),
+            (
+                "loader_control_action.encode_utf16().collect(),",
+                "bound loader-control role argument",
             ),
             (
                 "exact_desktop.encode_utf16().collect(),",
@@ -11698,7 +16520,7 @@ fn validate_windows_loader_control_contract(
                 "exact-token loader-control creation",
             ),
             (
-                "require_assigned_process_authority(\n            \"target-request-to-loader-control-process\"",
+                "require_assigned_process_authority(\n                \"target-request-to-loader-control-process\"",
                 "exact target assignment attestation",
             ),
             (
@@ -11721,7 +16543,10 @@ fn validate_windows_loader_control_contract(
                 "WaitForSingleObject(control_process.raw(), 30_000)",
                 "bounded loader-control exit",
             ),
-            ("control_job.wait_empty(", "empty loader-control Job proof"),
+            (
+                "if !control_job.wait_empty(Instant::now() + Duration::from_secs(30))? {",
+                "empty loader-control Job proof",
+            ),
         ],
     )?;
     if control.contains("let mut loader_control_desktop = [0_u16];")
@@ -11779,16 +16604,2969 @@ fn validate_windows_loader_control_contract(
     if control.contains("DEBUG_PROCESS") {
         return Err("loader-control trace includes descendants through DEBUG_PROCESS".to_owned());
     }
+
+    let loader_matrix = semantic_function_region(
+        &sources.process,
+        "impl LoaderControlMatrixCellV4 {",
+        "struct LoaderEnvironmentBlockV4 {",
+    )
+    .ok_or_else(|| "loader-control environment matrix has no semantic boundary".to_owned())?;
+    let production_cell = semantic_function_region(
+        &loader_matrix,
+        "    const PRODUCTION: Self = Self {",
+        "    const CERTIFICATION: [Self; 6] = [",
+    )
+    .ok_or_else(|| "loader-control production cell has no semantic boundary".to_owned())?;
+    require_source_order(
+        &production_cell,
+        &[
+            (
+                "environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,",
+                "canonical-minimal production environment",
+            ),
+            (
+                "debugger: LoaderDebuggerRelationV5::None,",
+                "production debugger absence",
+            ),
+            ("loader_snaps: false,", "production loader-snaps absence"),
+        ],
+    )?;
+    if production_cell.contains("LoaderEnvironmentModeV4::Empty") {
+        return Err("loader-control production admits the explicit-empty environment".to_owned());
+    }
+
+    let certification_cells = semantic_function_region(
+        &loader_matrix,
+        "    const CERTIFICATION: [Self; 6] = [",
+        "    const fn diagnostic(self) -> &'static str {",
+    )
+    .ok_or_else(|| "loader-control certification cells have no semantic boundary".to_owned())?;
+    let canonical_certification_cells = certification_cells
+        .match_indices("environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,")
+        .count();
+    if canonical_certification_cells != 6
+        || certification_cells.contains("LoaderEnvironmentModeV4::Empty")
+    {
+        return Err(format!(
+            "loader-control pass-required certification cells are not all canonical-minimal: canonical_cells={canonical_certification_cells}"
+        ));
+    }
+    require_source(
+        &loader_matrix,
+        "match (self.environment, self.debugger, self.loader_snaps) {",
+        "environment-derived loader matrix diagnostics",
+    )?;
+    require_source(
+        &loader_matrix,
+        "canonical-minimal-system-full-observer-snaps-on",
+        "canonical-minimal full-observer loader-snaps control cell",
+    )?;
+    let failure_ranks = semantic_function_region(
+        &loader_matrix,
+        "enum LoaderFailureEvidenceRankV6 {",
+        "impl LoaderFailureEvidenceRankV6 {",
+    )
+    .ok_or_else(|| "loader failure evidence ranks have no semantic boundary".to_owned())?;
+    require_source_order(
+        &failure_ranks,
+        &[
+            ("Unclassified,", "unclassified loader failure rank"),
+            ("NativeExit,", "native-exit loader failure rank"),
+            (
+                "MandatoryPumpSnapsOff,",
+                "mandatory-pump snaps-off loader failure rank",
+            ),
+            (
+                "MandatoryPumpSnapsOn,",
+                "mandatory-pump snaps-on loader failure rank",
+            ),
+            (
+                "FullObserverSnapsOff,",
+                "full-observer snaps-off loader failure rank",
+            ),
+            (
+                "FullObserverSnapsOn,",
+                "unique maximal full-observer snaps-on loader failure rank",
+            ),
+        ],
+    )?;
+    let failure_rank = semantic_function_region(
+        &loader_matrix,
+        "fn loader_failure_evidence_rank(",
+        "fn loader_failure_should_replace(",
+    )
+    .ok_or_else(|| "loader failure rank function has no semantic boundary".to_owned())?;
+    require_source_order(
+        &failure_rank,
+        &[
+            (
+                "let has_native_trace = error.os_code.is_some() && error.detail.contains(\"loader_trace=v4\");",
+                "native traced failure rank input",
+            ),
+            (
+                "match (cell.debugger, cell.loader_snaps) {",
+                "observer-and-snaps total rank",
+            ),
+            (
+                "(LoaderDebuggerRelationV5::FullObserver, true) => {",
+                "full-observer snaps-on rank arm",
+            ),
+            (
+                "LoaderFailureEvidenceRankV6::FullObserverSnapsOn",
+                "full-observer snaps-on maximal rank selection",
+            ),
+            (
+                "(LoaderDebuggerRelationV5::FullObserver, false) => {",
+                "full-observer snaps-off rank arm",
+            ),
+            (
+                "(LoaderDebuggerRelationV5::MandatoryPump, true) => {",
+                "mandatory-pump snaps-on rank arm",
+            ),
+            (
+                "(LoaderDebuggerRelationV5::MandatoryPump, false) => {",
+                "mandatory-pump snaps-off rank arm",
+            ),
+            (
+                "(LoaderDebuggerRelationV5::None, _) => LoaderFailureEvidenceRankV6::NativeExit,",
+                "no-debug native-exit rank arm",
+            ),
+        ],
+    )?;
+    let rank_replacement = semantic_function_region(
+        &loader_matrix,
+        "fn loader_failure_should_replace(",
+        "fn loader_control_matrix_failure_detail(",
+    )
+    .ok_or_else(|| "loader failure replacement function has no semantic boundary".to_owned())?;
+    require_source(
+        &rank_replacement,
+        "selected.map_or(true, |selected| candidate > selected)",
+        "strict rank upgrade without equal-rank downgrade",
+    )?;
+    let matrix_failure_detail = semantic_function_region(
+        &sources.process,
+        "fn loader_control_matrix_failure_detail(",
+        "struct LoaderEnvironmentBlockV4 {",
+    )
+    .ok_or_else(|| "loader matrix failure renderer has no semantic boundary".to_owned())?;
+    require_source_order(
+        &matrix_failure_detail,
+        &[
+            (
+                "loader_control_matrix=v6 dimensions=debugger-relation-x-loader-snaps environment={} selected_cell={} selected_rank={} selected_native={} completed={} results=[{}] selected_failure=[{}]",
+                "prefix-first typed loader matrix summary",
+            ),
+            ("results.len(),", "completed matrix outcome count"),
+            (
+                ".map(LoaderControlMatrixOutcomeV6::diagnostic)",
+                "typed per-cell matrix outcome rendering",
+            ),
+            ("selected_detail,", "bulk selected detail rendered last"),
+        ],
+    )?;
+
+    let restriction_lease = semantic_function_region(
+        &sources.token,
+        "struct QualificationLoaderRestrictionSourceLease {",
+        "static QUALIFICATION_LOADER_RESTRICTION_SOURCE: Mutex<",
+    )
+    .ok_or_else(|| "loader restriction lease has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_lease,
+        &[
+            ("scope: String,", "qualification scope binding"),
+            (
+                "generation_sha256: String,",
+                "qualification challenge-generation binding",
+            ),
+            (
+                "owner: WindowsProcessIdentityV1,",
+                "exact owner identity binding",
+            ),
+            ("frontend: OwnedHandle,", "pinned owner process handle"),
+            (
+                "baseline: Option<OwnedHandle>,",
+                "one-shot baseline capability",
+            ),
+            (
+                "comparison: Option<OwnedHandle>,",
+                "one-shot comparison capability",
+            ),
+            (
+                "no_restricting_sid: Option<OwnedHandle>,",
+                "one-shot privilege-disabled no-restricting-SID capability",
+            ),
+            (
+                "profile: Option<OwnedHandle>,",
+                "one-shot restricted profile capability",
+            ),
+            (
+                "source_binding_sha256: String,",
+                "source attestation binding",
+            ),
+            ("pair_invariants_sha256: String,", "pair invariant binding"),
+            (
+                "restriction_presence_binding_sha256: String,",
+                "restriction-presence sibling binding",
+            ),
+            (
+                "profile_binding_sha256: String,",
+                "profile capability binding",
+            ),
+        ],
+    )?;
+    for forbidden in ["source: OwnedHandle", "source_token"] {
+        if restriction_lease.contains(forbidden) {
+            return Err(format!(
+                "loader restriction lease retained broad source capability: {forbidden}"
+            ));
+        }
+    }
+
+    let restriction_guard_drop = semantic_function_region(
+        &sources.token,
+        "impl Drop for QualificationLoaderRestrictionSourceGuard {",
+        "pub(crate) fn install_qualification_loader_restriction_source(",
+    )
+    .ok_or_else(|| "loader restriction guard drop has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_guard_drop,
+        &[
+            ("lease.scope == self.scope", "exact scope teardown binding"),
+            (
+                "lease.generation_sha256 == self.generation_sha256",
+                "exact generation teardown binding",
+            ),
+            ("lease.owner == self.owner", "exact owner teardown binding"),
+            ("if !matches {", "mismatched guard fails closed"),
+            ("std::process::abort();", "mismatched teardown abort"),
+            ("slot.take();", "RAII lease removal"),
+        ],
+    )?;
+
+    let restriction_install = semantic_function_region(
+        &sources.token,
+        "pub(crate) fn install_qualification_loader_restriction_source(",
+        "struct LoaderRestrictionPairInvariantsV1 {",
+    )
+    .ok_or_else(|| "loader restriction lease install has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_install,
+        &[
+            (
+                "if !matches!(scope, \"direct\" | \"package\") {",
+                "bounded qualification scope",
+            ),
+            (
+                "if generation.is_empty() {",
+                "nonempty challenge generation",
+            ),
+            (
+                "let generation_sha256 = super::record::digest(generation.as_bytes());",
+                "challenge generation digest",
+            ),
+            (
+                "super::process::process_identity(frontend.raw())? != *owner",
+                "pinned exact owner process",
+            ),
+            (
+                "let snapshot = token_attestation_snapshot(source.raw())?;",
+                "authenticated source attestation",
+            ),
+            (
+                "if !snapshot.behavior.envelope.elevated",
+                "elevated source requirement",
+            ),
+            (
+                "|| snapshot.behavior.token_is_restricted",
+                "unrestricted source requirement",
+            ),
+            (
+                "|| !snapshot.behavior.restricting_sids.is_empty()",
+                "empty restricting-SID source requirement",
+            ),
+            (
+                "let pair = loader_restriction_diagnostic_pair_from_source(source.raw())?;",
+                "prederived pair before source drop",
+            ),
+            (
+                "if pair.source_binding_sha256 != source_binding_sha256 {",
+                "prederived source binding readback",
+            ),
+            ("if slot.is_some() {", "duplicate registration rejection"),
+            ("scope: scope.to_owned(),", "stored scope binding"),
+            (
+                "generation_sha256: generation_sha256.clone(),",
+                "stored generation binding",
+            ),
+            ("owner: owner.clone(),", "stored owner binding"),
+            ("frontend,", "stored pinned owner handle"),
+            ("baseline: Some(pair.baseline),", "stored baseline only"),
+            (
+                "comparison: Some(pair.comparison),",
+                "stored comparison only",
+            ),
+            (
+                "no_restricting_sid: Some(pair.no_restricting_sid),",
+                "stored no-restricting-SID sibling only",
+            ),
+            (
+                "profile: Some(pair.profile),",
+                "stored profile capability only",
+            ),
+            ("source_binding_sha256,", "stored source digest only"),
+            (
+                "pair_invariants_sha256: pair.pair_invariants_sha256,",
+                "stored pair digest only",
+            ),
+            (
+                "restriction_presence_binding_sha256: pair.restriction_presence_binding_sha256,",
+                "stored restriction-presence digest only",
+            ),
+            (
+                "profile_binding_sha256: pair.profile_binding_sha256,",
+                "stored profile binding only",
+            ),
+        ],
+    )?;
+
+    let restriction_pair_builder = semantic_function_region(
+        &sources.token,
+        "fn loader_restriction_diagnostic_pair_from_source(",
+        "pub(crate) fn loader_restriction_diagnostic_pair_for_qualification(",
+    )
+    .ok_or_else(|| "loader restriction pair builder has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_pair_builder,
+        &[
+            (
+                "const RESTRICTING_SID: &str = \"S-1-5-12\";",
+                "exact Restricted Code SID",
+            ),
+            (
+                "let source_snapshot = token_attestation_snapshot(source)?;",
+                "authenticated retained source token",
+            ),
+            (
+                "source_snapshot.behavior.token_is_restricted",
+                "unrestricted source check",
+            ),
+            (
+                "!source_snapshot.behavior.restricting_sids.is_empty()",
+                "empty source restricting inventory",
+            ),
+            ("let baseline =", "derived baseline token"),
+            (
+                "restricted_primary_for_source(source, DISABLE_MAX_PRIVILEGE, RESTRICTING_SID)?;",
+                "baseline source, flags, and restricting SID binding",
+            ),
+            (
+                "let comparison = restricted_primary_for_source(",
+                "derived comparison token",
+            ),
+            ("source,", "comparison source binding"),
+            (
+                "DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,",
+                "write-restricted comparison flags",
+            ),
+            ("RESTRICTING_SID,", "comparison restricting SID binding"),
+            (
+                "let no_restricting_sid =\n        primary_without_restricting_sid_from_source(source, DISABLE_MAX_PRIVILEGE)?;",
+                "same-source privilege-disabled no-restricting-SID sibling",
+            ),
+            (
+                "validate_loader_restriction_diagnostic_pair(",
+                "pair invariant validation before storage",
+            ),
+            (
+                "validate_loader_restriction_presence_pair(baseline.raw(), no_restricting_sid.raw())?;",
+                "restriction-presence sibling validation before storage",
+            ),
+            (
+                "const PROFILE_ACCESS: u32 = TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE;",
+                "exact profile API token access",
+            ),
+            (
+                "duplicate_handle_with_access(\n        baseline.raw(),\n        PROFILE_ACCESS,",
+                "profile capability narrowed from full-restricted baseline",
+            ),
+            (
+                "handle_granted_access(profile.raw()).map_err(|error| error.detail)? != PROFILE_ACCESS",
+                "exact profile capability access readback",
+            ),
+            (
+                "envelope(profile.raw())? != baseline_snapshot.behavior.envelope",
+                "profile capability identity and semantics binding",
+            ),
+            (
+                "source_snapshot.lineage.authentication_id",
+                "source authentication lineage",
+            ),
+            (
+                "source_snapshot.lineage.originating_logon_session",
+                "source logon lineage",
+            ),
+            ("source_snapshot.lineage.user_sid", "source user lineage"),
+            (
+                "source_snapshot.lineage.session_id",
+                "source session lineage",
+            ),
+            (
+                "loader_restriction_presence_binding_sha256(",
+                "restriction-presence evidence binding",
+            ),
+            ("no_restricting_sid,", "sibling capability result"),
+            (
+                "restriction_presence_binding_sha256,",
+                "sibling binding result",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "OpenProcessToken(",
+        "SetSecurityInfo(",
+        "SetKernelObjectSecurity(",
+        "MAXIMUM_ALLOWED",
+    ] {
+        if restriction_install.contains(forbidden) || restriction_pair_builder.contains(forbidden) {
+            return Err(format!(
+                "loader restriction source path admitted foreign authority mutation: {forbidden}"
+            ));
+        }
+    }
+
+    let no_restricting_sid_constructor = semantic_function_region(
+        &sources.token,
+        "fn primary_without_restricting_sid_from_source(",
+        "fn current_process_token() -> Result<OwnedHandle, String> {",
+    )
+    .ok_or_else(|| {
+        "privilege-disabled no-restricting-SID constructor has no semantic boundary".to_owned()
+    })?;
+    require_source_order(
+        &no_restricting_sid_constructor,
+        &[
+            (
+                "CreateRestrictedToken(",
+                "native restricted-token derivation",
+            ),
+            ("process_token,", "same authenticated source token"),
+            ("flags,", "caller-fixed DISABLE_MAX_PRIVILEGE flags"),
+            ("0,", "empty disabled-SID inventory"),
+            ("ptr::null(),", "null disabled-SID pointer"),
+            ("0,", "empty deleted-privilege inventory"),
+            ("ptr::null(),", "null deleted-privilege pointer"),
+            ("0,", "empty restricting-SID inventory"),
+            ("ptr::null(),", "null restricting-SID pointer"),
+            ("&raw mut restricted,", "owned derived-token output"),
+        ],
+    )?;
+
+    let restriction_presence_validation = semantic_function_region(
+        &sources.token,
+        "fn validate_loader_restriction_presence_pair(",
+        "fn validate_loader_restriction_pair_invariants(",
+    )
+    .ok_or_else(|| "loader restriction-presence validator has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_presence_validation,
+        &[
+            (
+                "let baseline_snapshot = token_attestation_snapshot(baseline)?;",
+                "sole-RC full snapshot",
+            ),
+            (
+                "let no_restricting_sid_snapshot = token_attestation_snapshot(no_restricting_sid)?;",
+                "no-restricting-SID full snapshot",
+            ),
+            (
+                ".without_restricting_sid_inventory();",
+                "baseline restriction inventory projection",
+            ),
+            (
+                ".without_restricting_sid_inventory();",
+                "sibling restriction inventory projection",
+            ),
+            (
+                "if baseline_invariants != no_restricting_sid_invariants",
+                "all projected invariants remain equal",
+            ),
+            (
+                "!token_has_exact_restricting_sid(",
+                "sole exact Restricted Code SID requirement",
+            ),
+            ("RESTRICTED_CODE_SID,", "exact restricting trustee"),
+            (
+                "NORMALIZED_RESTRICTING_SID_ATTRIBUTES,",
+                "exact normalized restricting attributes",
+            ),
+            (
+                "!no_restricting_sid_inventory.trustees.is_empty()",
+                "empty sibling restricting trustee inventory",
+            ),
+            (
+                "!no_restricting_sid_inventory.evidence.is_empty()",
+                "empty sibling restricting evidence inventory",
+            ),
+            (
+                "baseline_snapshot.behavior.enabled_sensitive_privilege_count != 0",
+                "sole-RC sensitive privileges disabled",
+            ),
+            (
+                "no_restricting_sid_snapshot\n            .behavior\n            .enabled_sensitive_privilege_count\n            != 0",
+                "sibling sensitive privileges disabled",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "OpenProcessToken(",
+        "SetSecurityInfo(",
+        "SetKernelObjectSecurity(",
+    ] {
+        if no_restricting_sid_constructor.contains(forbidden)
+            || restriction_presence_validation.contains(forbidden)
+        {
+            return Err(format!(
+                "restriction-presence derivation admitted foreign authority mutation: {forbidden}"
+            ));
+        }
+    }
+
+    let restriction_consume = semantic_function_region(
+        &sources.token,
+        "pub(crate) fn loader_restriction_diagnostic_pair_for_qualification(",
+        "pub(crate) fn validate_transferred_loader_restriction_diagnostic_pair(",
+    )
+    .ok_or_else(|| "loader restriction one-shot consume has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_consume,
+        &[
+            (
+                "qualification loader restriction source is unavailable",
+                "missing or expired lease rejection",
+            ),
+            ("if &lease.owner != owner {", "exact launch owner check"),
+            (
+                "qualification loader restriction source owner does not match launch",
+                "owner mismatch rejection",
+            ),
+            (
+                "super::process::process_identity(lease.frontend.raw())? != lease.owner",
+                "pinned owner process identity recheck",
+            ),
+            (
+                "qualification loader restriction source process identity changed",
+                "owner process mismatch rejection",
+            ),
+            (".baseline", "baseline presence check"),
+            (".as_ref()", "baseline non-consuming validation borrow"),
+            (
+                "qualification loader restriction pair was already consumed",
+                "baseline replay rejection",
+            ),
+            (".comparison", "comparison presence check"),
+            (".as_ref()", "comparison non-consuming validation borrow"),
+            (
+                ".no_restricting_sid",
+                "no-restricting-SID sibling presence check",
+            ),
+            (".as_ref()", "sibling non-consuming validation borrow"),
+            (
+                "qualification loader no-restricting-SID sibling was already consumed",
+                "sibling replay rejection",
+            ),
+            (".profile", "profile capability presence check"),
+            (".as_ref()", "profile non-consuming validation borrow"),
+            (
+                "qualification loader profile capability was already consumed",
+                "profile replay rejection",
+            ),
+            (
+                "validate_loader_restriction_diagnostic_pair(effective, baseline.raw(), comparison.raw())?;",
+                "effective token validation before consume",
+            ),
+            (
+                "if observed_pair_invariants_sha256 != lease.pair_invariants_sha256 {",
+                "pair digest validation before consume",
+            ),
+            (
+                "validate_loader_restriction_presence_pair(baseline.raw(), no_restricting_sid.raw())?;",
+                "restriction-presence invariant validation before consume",
+            ),
+            (
+                "if observed_restriction_presence_binding_sha256 != lease.restriction_presence_binding_sha256 {",
+                "restriction-presence digest validation before consume",
+            ),
+            (
+                "const PROFILE_ACCESS: u32 = TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE;",
+                "exact consumed profile capability access",
+            ),
+            (
+                "handle_granted_access(profile.raw()).map_err(|error| error.detail)? != PROFILE_ACCESS",
+                "consumed profile access readback",
+            ),
+            (
+                "envelope(profile.raw())? != baseline_snapshot.behavior.envelope",
+                "consumed profile semantic binding",
+            ),
+            (
+                "if observed_profile_binding_sha256 != lease.profile_binding_sha256 {",
+                "profile digest validation before consume",
+            ),
+            ("baseline: lease", "baseline transfer construction"),
+            (".baseline", "baseline slot selection"),
+            (".take()", "one-shot baseline consume"),
+            (
+                "comparison: lease.comparison.take()",
+                "one-shot comparison consume",
+            ),
+            (
+                "no_restricting_sid: lease.no_restricting_sid.take()",
+                "one-shot no-restricting-SID sibling consume",
+            ),
+            (
+                "profile: lease\n            .profile\n            .take()",
+                "one-shot profile capability consume",
+            ),
+            (
+                "restriction_presence_binding_sha256: lease.restriction_presence_binding_sha256.clone(),",
+                "restriction-presence binding transfer",
+            ),
+        ],
+    )?;
+
+    let qualification_session = semantic_function_region(
+        &sources.control_service,
+        "fn qualification_session(public: HANDLE, scope: &str, challenge: &str) -> Result<(), String> {",
+        "fn launch_client(",
+    )
+    .ok_or_else(|| "qualification loader lease session has no semantic boundary".to_owned())?;
+    require_source_order(
+        &qualification_session,
+        &[
+            (
+                "let (source_token, envelope, source_frontend, owner) =",
+                "retained authenticated source and owner process",
+            ),
+            ("if !envelope.elevated {", "elevated source requirement"),
+            (
+                "let admission = super::record::reserve_qualification_admission_for(scope, owner.clone())?;",
+                "durable qualification admission",
+            ),
+            (
+                "let loader_restriction_source = super::token::install_qualification_loader_restriction_source(",
+                "qualification-scoped pair prederivation",
+            ),
+            ("scope,", "lease scope binding"),
+            ("challenge,", "lease challenge-generation binding"),
+            ("&owner,", "lease exact owner binding"),
+            (
+                "source_token,",
+                "authenticated unrestricted source transfer",
+            ),
+            ("source_frontend,", "authenticated pinned frontend transfer"),
+            (
+                "WindowsProviderResponseV1::QualificationReady {",
+                "lease ready before qualification use",
+            ),
+            (
+                "WindowsProviderRequestV1::QualificationEnd { schema_version }",
+                "normal session end",
+            ),
+            (
+                "drop(loader_restriction_source);",
+                "source-pair guard retired first",
+            ),
+            ("drop(admission);", "admission retired after pair guard"),
+        ],
+    )?;
+
+    let launch_client = semantic_function_region(
+        &sources.control_service,
+        "fn launch_client_inner(",
+        "pub(crate) fn bound_public_replay_failure_response_for_test(",
+    )
+    .ok_or_else(|| "qualification loader lease launch has no semantic boundary".to_owned())?;
+    require_source_order(
+        &launch_client,
+        &[
+            (
+                "let qualification_in_progress = super::record::qualification_in_progress();",
+                "qualification state capture",
+            ),
+            (
+                "if !super::record::qualification_allows(&before)? {",
+                "admission authorization before pair consume",
+            ),
+            (
+                "let loader_restriction_canary = if qualification_in_progress",
+                "qualification-only pair gate",
+            ),
+            (
+                "TargetDesktopBootstrapRoleV1::LoaderControl",
+                "loader-control role gate",
+            ),
+            (
+                "is_exact_full_restricted_loader_canary_source(primary_token.raw())?",
+                "exact effective restricted-token gate",
+            ),
+            (
+                "loader_restriction_diagnostic_pair_for_qualification(",
+                "one-shot owner-bound pair consume",
+            ),
+            ("&before,", "exact current owner identity"),
+            (
+                "primary_token.raw(),",
+                "authenticated effective token validation",
+            ),
+            (
+                "role: \"loader-restriction-baseline-token\"",
+                "baseline pair handle transfer",
+            ),
+            (
+                "role: \"loader-restriction-comparison-token\"",
+                "comparison pair handle transfer",
+            ),
+            (
+                "role: \"loader-no-restricting-sid-token\"",
+                "privilege-disabled no-restricting-SID handle transfer",
+            ),
+            (
+                "role: \"loader-profile-token\"",
+                "restricted profile handle transfer",
+            ),
+            (
+                "source_binding_sha256: pair.source_binding_sha256.clone(),",
+                "source digest transfer",
+            ),
+            (
+                "pair_invariants_sha256: pair.pair_invariants_sha256.clone(),",
+                "pair digest transfer",
+            ),
+            (
+                "restriction_presence_binding_sha256: pair.restriction_presence_binding_sha256.clone(),",
+                "restriction-presence digest transfer",
+            ),
+            (
+                "profile_binding_sha256: pair.profile_binding_sha256.clone(),",
+                "profile digest transfer",
+            ),
+        ],
+    )?;
+    if launch_client.contains("OpenProcessToken(") {
+        return Err("launch path reopened a foreign frontend token".to_owned());
+    }
+
+    let transferred_profile = semantic_function_region(
+        &sources.token,
+        "pub(crate) fn validate_transferred_loader_profile_capability(",
+        "fn write_restricted_primary_from_source(source: HANDLE) -> Result<OwnedHandle, String> {",
+    )
+    .ok_or_else(|| "transferred loader profile capability has no semantic boundary".to_owned())?;
+    require_source_order(
+        &transferred_profile,
+        &[
+            (
+                "const PROFILE_ACCESS: u32 = TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE;",
+                "exact transferred profile token access",
+            ),
+            (
+                "handle_granted_access(profile).map_err(|error| error.detail)? != PROFILE_ACCESS",
+                "transferred profile access readback",
+            ),
+            (
+                "let effective_envelope = envelope(effective)?;",
+                "effective target identity readback",
+            ),
+            (
+                "let profile_envelope = envelope(profile)?;",
+                "profile capability identity readback",
+            ),
+            (
+                "if profile_envelope != effective_envelope",
+                "exact target/profile identity equality",
+            ),
+            ("|| !profile_envelope.elevated", "elevated target binding"),
+            (
+                "|| profile_envelope.token_type != TokenPrimary as u32",
+                "primary token-type binding",
+            ),
+            (
+                "token_has_exact_restricting_sid(",
+                "exact Restricted Code SID binding",
+            ),
+            (
+                "write_restricted_behavior_for_sid_attested(",
+                "full-restricted rather than WRITE_RESTRICTED binding",
+            ),
+            (
+                "memcordon-loader-profile-capability-v1",
+                "versioned source/pair/access profile binding",
+            ),
+            (
+                "if observed != expected_profile_binding_sha256 {",
+                "expected profile digest equality",
+            ),
+        ],
+    )?;
+    for forbidden in ["OpenProcessToken(", "source_token", "frontend"] {
+        if transferred_profile.contains(forbidden) {
+            return Err(format!(
+                "transferred loader profile capability reopened or retained foreign authority: {forbidden}"
+            ));
+        }
+    }
+
+    let profile_privilege_scope = semantic_function_region(
+        &sources.token,
+        "pub(crate) fn with_scoped_loader_profile_privileges<T>(",
+        "pub(crate) fn validate_holder_session_derivation(",
+    )
+    .ok_or_else(|| "loader profile privilege scope has no semantic boundary".to_owned())?;
+    require_source_order(
+        &profile_privilege_scope,
+        &[
+            (
+                "const PRIVILEGES: [&str; 2] = [\"SeBackupPrivilege\", \"SeRestorePrivilege\"];",
+                "exact Backup and Restore privilege set",
+            ),
+            (
+                "require_current_thread_token_absent()?;",
+                "no ambient thread authority",
+            ),
+            (
+                "TOKEN_QUERY | TOKEN_DUPLICATE,",
+                "read-only launcher process privilege source",
+            ),
+            (
+                "let source_before = privilege_entries_snapshot(source.raw())?;",
+                "launcher process privilege inventory before operation",
+            ),
+            (
+                "let carrier_access = TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE;",
+                "exact disposable carrier access",
+            ),
+            (
+                "SecurityImpersonation,\n            TokenImpersonation,",
+                "disposable impersonation carrier",
+            ),
+            (
+                "LookupPrivilegeValueW(ptr::null(), wide.as_ptr(), luid)",
+                "exact privilege LUID lookup",
+            ),
+            (
+                "adjust_error == ERROR_NOT_ALL_ASSIGNED",
+                "ERROR_NOT_ALL_ASSIGNED rejection",
+            ),
+            (
+                "loader profile privilege transition was not exactly backup/restore enablement",
+                "exact two-LUID transition readback",
+            ),
+            (
+                "ScopedPrivilegeThreadToken::install(carrier.raw())",
+                "thread-scoped carrier installation",
+            ),
+            (
+                "effective_thread_privilege_enabled(name)",
+                "effective privilege readback",
+            ),
+            (
+                "Ok(true) => operation(),",
+                "single scoped profile operation",
+            ),
+            (
+                "if let Err(error) = scoped.revert() {",
+                "mandatory carrier reversion",
+            ),
+            ("std::process::abort();", "fail-stop reversion failure"),
+            (
+                "if !privilege_snapshots_equal(&source_before, &source_after) {",
+                "launcher process-token invariance",
+            ),
+            (
+                "require_current_thread_token_absent()?;",
+                "post-operation thread-token absence",
+            ),
+        ],
+    )?;
+
+    let canary_handles = semantic_function_region(
+        &sources.core,
+        "pub struct WindowsLoaderRestrictionCanaryHandlesV1 {",
+        "pub struct WindowsLaunchBrokerRequestV1 {",
+    )
+    .ok_or_else(|| "loader restriction canary handle schema has no semantic boundary".to_owned())?;
+    require_source_order(
+        &canary_handles,
+        &[
+            (
+                "pub remote_baseline_token_handle: u64,",
+                "baseline handle only",
+            ),
+            (
+                "pub remote_comparison_token_handle: u64,",
+                "comparison handle only",
+            ),
+            (
+                "pub remote_no_restricting_sid_token_handle: u64,",
+                "no-restricting-SID sibling handle only",
+            ),
+            (
+                "pub remote_profile_token_handle: u64,",
+                "qualification-only restricted profile handle",
+            ),
+            ("pub source_binding_sha256: String,", "source digest only"),
+            ("pub pair_invariants_sha256: String,", "pair digest only"),
+            (
+                "pub restriction_presence_binding_sha256: String,",
+                "restriction-presence binding digest only",
+            ),
+            (
+                "pub profile_binding_sha256: String,",
+                "profile capability binding digest only",
+            ),
+        ],
+    )?;
+    if canary_handles.matches("token_handle: u64,").count() != 4
+        || canary_handles.contains("source_token")
+    {
+        return Err("loader restriction transfer schema admitted a source capability".to_owned());
+    }
+
+    let public_requests = semantic_function_region(
+        &sources.core,
+        "pub enum WindowsProviderRequestV1 {",
+        "pub enum WindowsProviderResponseV1 {",
+    )
+    .ok_or_else(|| "Windows provider request schema has no semantic boundary".to_owned())?;
+    for forbidden in [
+        "source_token_handle",
+        "loader_restriction_source",
+        "source_token_access",
+        "no_restricting_sid_token_handle",
+        "restriction_presence_binding_sha256",
+    ] {
+        if public_requests.contains(forbidden) {
+            return Err(format!(
+                "public provider request nominated loader source authority: {forbidden}"
+            ));
+        }
+    }
+
+    let launcher_adoption = semantic_function_region(
+        &sources.launcher_service,
+        "fn launch_attempt(",
+        "fn build_terminal_receipt(",
+    )
+    .ok_or_else(|| "launcher handle-adoption path has no semantic boundary".to_owned())?;
+    require_source_order(
+        &launcher_adoption,
+        &[
+            (
+                "OwnedHandle::new(pair.remote_baseline_token_handle as usize as HANDLE)?",
+                "baseline handle immediate RAII adoption",
+            ),
+            (
+                "OwnedHandle::new(pair.remote_comparison_token_handle as usize as HANDLE)?",
+                "write-restricted handle immediate RAII adoption",
+            ),
+            (
+                "OwnedHandle::new(pair.remote_no_restricting_sid_token_handle as usize as HANDLE)?",
+                "no-restricting-SID handle immediate RAII adoption",
+            ),
+            (
+                "OwnedHandle::new(pair.remote_profile_token_handle as usize as HANDLE)?",
+                "profile handle immediate RAII adoption",
+            ),
+            (
+                "pair.restriction_presence_binding_sha256.clone(),",
+                "restriction-presence binding adoption",
+            ),
+            (
+                "LoaderRestrictionCanaryTokens::from_transferred(",
+                "post-adoption typed validation",
+            ),
+            ("no_restricting_sid,", "sibling ownership transfer"),
+            (
+                "restriction_presence_binding_sha256,",
+                "sibling binding transfer",
+            ),
+        ],
+    )?;
+
+    let transferred_restriction_tokens = semantic_function_region(
+        &sources.process,
+        "pub(crate) struct LoaderRestrictionCanaryTokens {",
+        "struct LoaderRestrictionCanaryOutcomeV1 {",
+    )
+    .ok_or_else(|| "transferred restriction token bundle has no semantic boundary".to_owned())?;
+    require_source_order(
+        &transferred_restriction_tokens,
+        &[
+            ("baseline: OwnedHandle,", "owned sole-RC baseline"),
+            (
+                "comparison: OwnedHandle,",
+                "owned WRITE_RESTRICTED comparison",
+            ),
+            (
+                "no_restricting_sid: OwnedHandle,",
+                "owned no-restricting-SID sibling",
+            ),
+            ("profile: OwnedHandle,", "owned profile capability"),
+            (
+                "restriction_presence_binding_sha256: String,",
+                "owned sibling evidence binding",
+            ),
+            (
+                "validate_transferred_loader_restriction_diagnostic_pair(",
+                "existing pair validation retained",
+            ),
+            (
+                "validate_transferred_loader_restriction_presence_pair(",
+                "sibling validation after transfer",
+            ),
+            (
+                "no_restricting_sid.raw(),",
+                "exact sibling handle validation",
+            ),
+            (
+                "&restriction_presence_binding_sha256,",
+                "exact sibling binding validation",
+            ),
+            (
+                "validate_transferred_loader_profile_capability(",
+                "profile validation retained",
+            ),
+        ],
+    )?;
+
+    let restriction_pair_fields = semantic_function_region(
+        &sources.token,
+        "struct LoaderRestrictionPairInvariantsV1 {",
+        "impl LoaderRestrictionPairInvariantsV1 {",
+    )
+    .ok_or_else(|| "loader restriction pair fields have no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_pair_fields,
+        &[
+            ("user_sid: String,", "user SID invariant"),
+            (
+                "originating_logon_session: u64,",
+                "originating logon-session invariant",
+            ),
+            ("authentication_id: u64,", "authentication-id invariant"),
+            ("source_name: [u8; 8],", "token source-name invariant"),
+            ("source_identifier: u64,", "token source-id invariant"),
+            ("session_id: u32,", "session-id invariant"),
+            ("token_type: u32,", "token-type invariant"),
+            ("impersonation_level: u32,", "impersonation-level invariant"),
+            ("integrity_level: String,", "integrity invariant"),
+            ("mandatory_policy: u32,", "mandatory-policy invariant"),
+            ("groups_sha256: String,", "normal-group digest invariant"),
+            (
+                "privileges_sha256: String,",
+                "privilege-inventory digest invariant",
+            ),
+            (
+                "restricted_sids_sha256: String,",
+                "restricting-SID digest invariant",
+            ),
+            ("groups: Vec<String>,", "normal-group inventory invariant"),
+            ("privileges: Vec<String>,", "privilege inventory invariant"),
+            ("owner_sid: String,", "owner invariant"),
+            ("primary_group_sid: String,", "primary-group invariant"),
+            (
+                "default_dacl_sha256: Option<String>,",
+                "default-DACL invariant",
+            ),
+            ("elevation_type: u32,", "elevation-type invariant"),
+            ("elevated: bool,", "elevation-state invariant"),
+            ("appcontainer: bool,", "AppContainer invariant"),
+            ("ui_access: bool,", "UIAccess invariant"),
+            (
+                "virtualization_allowed: bool,",
+                "virtualization-allowed invariant",
+            ),
+            (
+                "virtualization_enabled: bool,",
+                "virtualization-enabled invariant",
+            ),
+            (
+                "restricting_sids: Vec<String>,",
+                "restricting-SID inventory invariant",
+            ),
+        ],
+    )?;
+    let restriction_pair_validation = semantic_function_region(
+        &sources.token,
+        "fn validate_loader_restriction_pair_invariants(",
+        "pub(crate) fn loader_restriction_pair_construction_for_test() -> (u32, u32, &'static str) {",
+    )
+    .ok_or_else(|| "loader restriction pair validation has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_pair_validation,
+        &[(
+            "if baseline != effective || comparison != baseline {",
+            "complete typed one-factor invariant equality",
+        )],
+    )?;
+    let restriction_sid_predicate = semantic_function_region(
+        &sources.token,
+        "fn token_has_exact_restricting_sid(",
+        "pub(crate) fn loader_restriction_raw_sid_predicate_for_test()",
+    )
+    .ok_or_else(|| "raw restricting SID predicate has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_sid_predicate,
+        &[
+            (
+                "let groups = query(token, TokenRestrictedSids)?;",
+                "raw restricted-SID query",
+            ),
+            ("if entries.len() != 1 {", "exact restricted-SID count"),
+            (
+                "entry.Attributes == expected_attributes",
+                "exact restricted-SID attributes",
+            ),
+            (
+                "restricting_sid_entry_matches(entry, expected_sid)?",
+                "exact restricted-SID identity",
+            ),
+        ],
+    )?;
+    require_source(
+        &sources.token,
+        "const CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES: u32 = 0;",
+        "zero CreateRestrictedToken input restricting-SID attributes",
+    )?;
+    require_source(
+        &sources.token,
+        "const NORMALIZED_RESTRICTING_SID_ATTRIBUTES: u32 =\n    SE_GROUP_MANDATORY as u32 | SE_GROUP_ENABLED_BY_DEFAULT as u32 | SE_GROUP_ENABLED as u32;",
+        "exact normalized restricting-SID output attributes",
+    )?;
+    require_source(
+        &sources.token,
+        "Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,",
+        "input/output restricting-SID attribute separation",
+    )?;
+    let restriction_source_eligibility = semantic_function_region(
+        &sources.token,
+        "pub(crate) fn is_exact_full_restricted_loader_canary_source(token: HANDLE) -> Result<bool, String> {",
+        "fn loader_restriction_pair_binding_sha256(",
+    )
+    .ok_or_else(|| "loader restriction source eligibility has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_source_eligibility,
+        &[
+            (
+                "snapshot.behavior.token_is_restricted",
+                "restricted-token eligibility",
+            ),
+            (
+                "token_has_exact_restricting_sid(\n            token,\n            RESTRICTED_CODE_SID,\n            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,\n        )?",
+                "exact normalized restricting-SID eligibility",
+            ),
+            (
+                "enabled_sensitive_privilege_count == 0",
+                "disabled sensitive privileges",
+            ),
+        ],
+    )?;
+    let restriction_pair_behavior = semantic_function_region(
+        &sources.token,
+        "fn validate_loader_restriction_diagnostic_pair(",
+        "fn loader_restriction_diagnostic_pair_from_source(",
+    )
+    .ok_or_else(|| "loader restriction pair behavior has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_pair_behavior,
+        &[
+            (
+                "validate_loader_restriction_pair_invariants(",
+                "typed pair invariant validation before semantic checks",
+            ),
+            (
+                "!token_has_exact_restricting_sid(\n            effective,\n            RESTRICTED_CODE_SID,\n            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,\n        )?",
+                "exact effective restricting SID",
+            ),
+            (
+                "!token_has_exact_restricting_sid(\n            baseline,\n            RESTRICTED_CODE_SID,\n            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,\n        )?",
+                "exact baseline restricting SID",
+            ),
+            (
+                "!token_has_exact_restricting_sid(\n            comparison,\n            RESTRICTED_CODE_SID,\n            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,\n        )?",
+                "exact comparison restricting SID",
+            ),
+            (
+                "write_restricted_behavior_for_sid_attested(\n            effective,\n            RESTRICTED_CODE_SID,\n        )?",
+                "unmodified effective-token behavior proof",
+            ),
+            (
+                "write_restricted_behavior_for_sid_attested(\n            baseline,\n            RESTRICTED_CODE_SID,\n        )?",
+                "baseline full-restricted behavior proof",
+            ),
+            (
+                "!super::security::write_restricted_behavior_for_sid_attested(\n            comparison,",
+                "comparison write-restricted behavior proof",
+            ),
+        ],
+    )?;
+
+    let restriction_canary_gate = semantic_function_region(
+        &sources.process,
+        "fn loader_restriction_canary_is_required(results: &[LoaderControlMatrixOutcomeV6]) -> bool {",
+        "pub(crate) fn loader_restriction_canary_required_for_test(failed_cells: usize) -> bool {",
+    )
+    .ok_or_else(|| "loader restriction canary gate has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_canary_gate,
+        &[
+            (
+                "results.len() == LoaderControlMatrixCellV4::CERTIFICATION.len()",
+                "complete pass-required matrix prerequisite",
+            ),
+            (
+                ".all(|result| result.outcome == LoaderControlMatrixOutcomeKindV6::Failed)",
+                "every pass-required cell failed prerequisite",
+            ),
+        ],
+    )?;
+
+    let restriction_canary = semantic_function_region(
+        &sources.process,
+        "fn loader_restriction_canary_diagnostic(",
+        "struct LoaderEnvironmentBlockV4 {",
+    )
+    .ok_or_else(|| "loader restriction canary diagnostic has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_canary,
+        &[
+            (
+                "let cell = LoaderControlMatrixCellV4::PRODUCTION;",
+                "identical no-debug no-snaps production cell",
+            ),
+            (
+                "let baseline = launch_target_desktop_loader_control_cell(",
+                "full-restricted baseline launch",
+            ),
+            ("cell,", "baseline production-cell binding"),
+            (
+                "let comparison = launch_target_desktop_loader_control_cell(",
+                "write-restricted comparison launch",
+            ),
+            ("cell,", "comparison production-cell binding"),
+            (
+                "let common_fields = [",
+                "one-factor launch evidence comparison",
+            ),
+            ("\"environment_sha256\",", "identical environment digest"),
+            ("\"desktop_sha256\",", "identical desktop digest"),
+            ("\"binary_sha256\",", "identical bootstrap image digest"),
+            (
+                "\"current_directory_sha256\",",
+                "identical current-directory digest",
+            ),
+            ("\"creation_flags\",", "identical creation flags"),
+            (
+                "launcher_process_sddl()",
+                "identical process security descriptor digest",
+            ),
+            (
+                "launcher_thread_sddl()",
+                "identical thread security descriptor digest",
+            ),
+            (
+                "loader_init_prerequisite_canary=v1 state={state} baseline_semantics=full-restricted comparison_semantics=write-restricted differing_fields=[write_restricted]",
+                "typed bounded restriction comparison",
+            ),
+            (
+                "baseline_modules_sha256={} comparison_modules_sha256={} baseline_unloads_sha256={} comparison_unloads_sha256={}",
+                "typed causal comparison digests",
+            ),
+            (
+                "job_policy_sha256={}",
+                "identical contained Job policy digest",
+            ),
+        ],
+    )?;
+
+    let restriction_environment_gate = semantic_function_region(
+        &sources.process,
+        "fn loader_target_environment_is_required(",
+        "pub(crate) fn loader_target_environment_required_for_test(",
+    )
+    .ok_or_else(|| "loader restriction environment gate has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_environment_gate,
+        &[
+            (
+                "invariants_valid\n        && baseline.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+                "valid restriction pair and failed full-restricted baseline prerequisite",
+            ),
+            (
+                "comparison.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+                "failed write-restricted comparison prerequisite",
+            ),
+            (
+                "baseline.native_status == Some(STATUS_DLL_INIT_FAILED)",
+                "exact baseline STATUS_DLL_INIT_FAILED prerequisite",
+            ),
+            (
+                "comparison.native_status == Some(STATUS_DLL_INIT_FAILED)",
+                "exact comparison STATUS_DLL_INIT_FAILED prerequisite",
+            ),
+            (
+                "baseline.failure_phase == comparison.failure_phase",
+                "same pre-entry failure phase prerequisite",
+            ),
+        ],
+    )?;
+    require_source_order(
+        &restriction_canary,
+        &[
+            (
+                "let target_environment_required = loader_target_environment_is_required(",
+                "typed target-environment gate invocation",
+            ),
+            ("common_error.is_none(),", "validated held-common fields"),
+            ("&baseline_outcome,", "typed baseline restriction outcome"),
+            (
+                "&comparison_outcome,",
+                "typed comparison restriction outcome",
+            ),
+            (
+                "target_environment_required,",
+                "typed target-environment gate result",
+            ),
+        ],
+    )?;
+
+    let environment_canary = semantic_function_region(
+        &sources.process,
+        "fn loader_environment_prerequisite_canary_diagnostic(",
+        "struct LoaderEnvironmentBlockV4 {",
+    )
+    .ok_or_else(|| "loader environment prerequisite canary has no semantic boundary".to_owned())?;
+    require_source_order(
+        &environment_canary,
+        &[
+            (
+                "let comparison = launch_target_desktop_loader_control_cell_with_environment_authority(",
+                "single target-environment comparison launch",
+            ),
+            ("target_token,", "same exact target token"),
+            (
+                "LoaderControlMatrixCellV4::PRODUCTION,",
+                "same no-debugger/no-snaps production cell",
+            ),
+            (
+                "LoaderEnvironmentAuthorityV5::TargetTokenUserenv,",
+                "target-token Userenv comparison authority",
+            ),
+            (
+                "let common_fields = [",
+                "held-constant launch evidence comparison",
+            ),
+            ("\"matrix_cell\",", "identical matrix cell"),
+            ("\"desktop_sha256\",", "identical desktop"),
+            ("\"binary_sha256\",", "identical bootstrap image"),
+            (
+                "\"current_directory_sha256\",",
+                "identical current directory",
+            ),
+            ("\"creation_flags\",", "identical creation flags"),
+            (
+                "loader_environment_prerequisite_canary=v1 state={state} baseline_environment=canonical-minimal-system comparison_environment=target-token-userenv-v1 differing_fields=[environment]",
+                "typed one-factor environment diagnostic",
+            ),
+            (
+                "target_token_instance_sha256={}",
+                "exact target-token evidence binding",
+            ),
+            (
+                "comparison_environment_sha256={}",
+                "value-redacted exact environment digest",
+            ),
+            (
+                "comparison_environment_keys_sha256={}",
+                "value-redacted key inventory digest",
+            ),
+            (
+                "comparison_environment_units={}",
+                "bounded environment unit count",
+            ),
+            (
+                "comparison_environment_entries={}",
+                "bounded environment entry count",
+            ),
+            ("profile_loaded=false", "no-profile comparison evidence"),
+            (
+                "process_sddl_sha256={}",
+                "identical process security descriptor evidence",
+            ),
+            (
+                "thread_sddl_sha256={}",
+                "identical thread security descriptor evidence",
+            ),
+            ("job_policy_sha256={}", "identical contained Job evidence"),
+            ("invariant_error={}", "typed comparison invariant result"),
+            (
+                "workload_executed=false qualification_promoted=false",
+                "diagnostic-only non-promotion boundary",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "environment_values=",
+        "LoadUserProfile",
+        "UnloadUserProfile",
+        "RegSetValue",
+        "SetSecurityInfo",
+        "SetNamedSecurityInfo",
+        "SetKernelObjectSecurity",
+    ] {
+        if environment_canary.contains(forbidden) {
+            return Err(format!(
+                "loader environment canary admitted value disclosure or state mutation: {forbidden}"
+            ));
+        }
+    }
+
+    let profile_canary = semantic_function_region(
+        &sources.process,
+        "fn loader_profile_prerequisite_canary_diagnostic(",
+        "fn render_loader_profile_prerequisite_canary(",
+    )
+    .ok_or_else(|| "loader profile prerequisite canary has no semantic boundary".to_owned())?;
+    require_source_order(
+        &profile_canary,
+        &[
+            (
+                "token_attestation_snapshot(tokens.baseline.raw())",
+                "full-restricted target identity source",
+            ),
+            (
+                "let before = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);",
+                "exact-SID hive observation before applicability",
+            ),
+            (
+                "LoaderProfileHiveStateV1::AlreadyLoadedBorrowed => {",
+                "typed borrowed-profile branch",
+            ),
+            (
+                "LoaderEnvironmentAuthorityV5::TargetTokenUserenvBorrowedProfile",
+                "borrowed profile comparison without ownership",
+            ),
+            ("borrowed-no-load=true", "borrowed profile never loaded"),
+            ("borrowed-no-unload=true", "borrowed profile never unloaded"),
+            (
+                "LoaderProfileHiveStateV1::Absent => {",
+                "typed absent-profile branch",
+            ),
+            (
+                "TargetUserProfileLease::acquire(\n                tokens.profile.raw(),\n                &target_envelope.user_sid,",
+                "owned profile acquired from the bound profile capability",
+            ),
+            (
+                "let loaded = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);",
+                "loaded hive observation before environment construction",
+            ),
+            (
+                "LoaderEnvironmentAuthorityV5::TargetTokenUserenvProfileLease",
+                "environment and contained comparison while the owned profile is live",
+            ),
+            (
+                "let unload = lease.unload();",
+                "owned profile explicit unload",
+            ),
+            (
+                "let after = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);",
+                "post-unload exact-SID hive observation",
+            ),
+            (
+                "LoaderProfileHiveStateV1::AccessDenied | LoaderProfileHiveStateV1::QueryFailed(_) => {",
+                "unknown profile state fails closed before a comparison",
+            ),
+        ],
+    )?;
+    if profile_canary.contains("profile_loaded=false") {
+        return Err("loader profile applicability was hard-coded instead of observed".to_owned());
+    }
+    require_source_order(
+        &profile_canary,
+        &[
+            (
+                "loader_object_security_required(state, environment_baseline, comparison_outcome.as_ref())",
+                "typed object-security gate after profile observation",
+            ),
+            (
+                "object_security_required,",
+                "typed object-security prerequisite result",
+            ),
+        ],
+    )?;
+
+    let object_security_gate = semantic_function_region(
+        &sources.process,
+        "fn loader_object_security_required(",
+        "fn render_loader_profile_prerequisite_canary(",
+    )
+    .ok_or_else(|| {
+        "loader object-security prerequisite gate has no semantic boundary".to_owned()
+    })?;
+    require_source_order(
+        &object_security_gate,
+        &[
+            (
+                "profile_state == \"classified-borrowed-stable\"",
+                "stable borrowed profile prerequisite",
+            ),
+            (
+                "baseline.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+                "failed full-restricted target-environment baseline",
+            ),
+            (
+                "comparison.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+                "failed profile comparison prerequisite",
+            ),
+            (
+                "comparison.native_status == Some(STATUS_DLL_INIT_FAILED)",
+                "exact profile comparison STATUS_DLL_INIT_FAILED",
+            ),
+            (
+                "comparison.native_status == baseline.native_status",
+                "equal profile/baseline native failure",
+            ),
+            (
+                "comparison.failure_phase == baseline.failure_phase",
+                "equal ranked failure phase",
+            ),
+        ],
+    )?;
+
+    let object_security_evidence_schema = semantic_function_region(
+        &sources.process,
+        "const LOADER_OBJECT_SECURITY_COMMON_FIELDS_V1: [&str; 16] = [",
+        "struct LoaderObjectSecurityEvidenceValidityV1 {",
+    )
+    .ok_or_else(|| "loader object-security evidence schema has no semantic boundary".to_owned())?;
+    require_source_order(
+        &object_security_evidence_schema,
+        &[
+            (
+                "\"environment_profile_loaded\",",
+                "exact loader launch profile-authority field",
+            ),
+            (
+                "const LOADER_OBJECT_SECURITY_LIVE_FIELDS_V1: [&str; 8] = [",
+                "typed live descriptor field inventory",
+            ),
+            ("\"live_sha256\",", "resultant descriptor digest evidence"),
+            ("\"dacl_protected\",", "DACL protection evidence"),
+            ("\"ace_count\",", "bounded ACE-count evidence"),
+            ("\"requested\",", "requested-mask evidence"),
+            ("\"target_allowed\",", "target decision evidence"),
+            ("\"target_granted\",", "target granted-mask evidence"),
+            ("\"launcher_allowed\",", "launcher decision evidence"),
+            ("\"launcher_granted\",", "launcher granted-mask evidence"),
+        ],
+    )?;
+
+    let object_security_evidence_validity = semantic_function_region(
+        &sources.process,
+        "fn loader_object_security_evidence_validity(",
+        "fn loader_restriction_canary_diagnostic(",
+    )
+    .ok_or_else(|| {
+        "loader object-security evidence validator has no semantic boundary".to_owned()
+    })?;
+    require_source_order(
+        &object_security_evidence_validity,
+        &[
+            (
+                "loader_common_result_field(baseline, comparison, field)",
+                "all common fields are equal across cells",
+            ),
+            (
+                "loader_result_field(result, \"environment_profile_loaded\").as_deref() == Some(\"true\")",
+                "profile authority is present and exactly true for every cell",
+            ),
+            (
+                "let common_evidence_valid = results.len() >= 2",
+                "comparison evidence is nonempty",
+            ),
+            ("&& profile_stable", "profile observation remains stable"),
+            (
+                "&& common_error.is_none()",
+                "common evidence parsed and matched",
+            ),
+            (
+                "&& authority_binding_valid",
+                "object-security authority labels remain exact",
+            ),
+            (
+                "&& profile_authority_exact",
+                "profile authority contributes to common validity",
+            ),
+            (
+                "let descriptor_evidence_present = !results.is_empty()",
+                "descriptor evidence presence is an independent fact",
+            ),
+            (
+                "[\"process_object\", \"thread_object\"]",
+                "both live kernel objects are covered",
+            ),
+            (
+                "LOADER_OBJECT_SECURITY_LIVE_FIELDS_V1",
+                "every decision-bearing live field is required",
+            ),
+            (
+                "invariants_valid: common_evidence_valid && descriptor_evidence_present",
+                "aggregate validity is the conjunction of independent facts",
+            ),
+        ],
+    )?;
+
+    let object_security_classifier = semantic_function_region(
+        &sources.process,
+        "fn classify_loader_object_security_outcomes(",
+        "fn loader_object_security_prerequisite_canary_diagnostic(",
+    )
+    .ok_or_else(|| "loader object-security classifier has no semantic boundary".to_owned())?;
+    require_source_order(
+        &object_security_classifier,
+        &[
+            ("if !evidence_valid", "live-evidence fail-closed gate"),
+            (
+                "baseline.outcome != LoaderControlMatrixOutcomeKindV6::Failed",
+                "production failure prerequisite",
+            ),
+            (
+                "baseline.native_status != Some(STATUS_DLL_INIT_FAILED)",
+                "exact baseline STATUS_DLL_INIT_FAILED prerequisite",
+            ),
+            (
+                "process.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+                "process-only causal classification",
+            ),
+            (
+                "thread.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+                "thread-only causal classification",
+            ),
+            (
+                "outcome.native_status == baseline.native_status",
+                "split failures preserve exact native status",
+            ),
+            (
+                "outcome.failure_phase == baseline.failure_phase",
+                "split failures preserve ranked phase",
+            ),
+            (
+                "Some(outcome) if outcome.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+                "combined-only causal classification",
+            ),
+            (
+                "\"classified-common-failure\"",
+                "all-equal failure advances the hypothesis",
+            ),
+            (
+                "Some(_) => \"differing-inconclusive\"",
+                "typed differing result",
+            ),
+            ("None => \"invalid\"", "missing combined evidence rejection"),
+        ],
+    )?;
+
+    let object_security_canary = semantic_function_region(
+        &sources.process,
+        "fn loader_object_security_prerequisite_canary_diagnostic(",
+        "fn preserve_loader_profile_primary_detail(primary: &str, cleanup: &[String]) -> String {",
+    )
+    .ok_or_else(|| "loader object-security canary has no semantic boundary".to_owned())?;
+    require_source_order(
+        &object_security_canary,
+        &[
+            (
+                "token_attestation_snapshot(tokens.baseline.raw())",
+                "full-restricted exact target token",
+            ),
+            (
+                "let before = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);",
+                "stable exact-SID profile observation",
+            ),
+            (
+                "before.state != LoaderProfileHiveStateV1::AlreadyLoadedBorrowed",
+                "borrowed-profile-only experiment",
+            ),
+            (
+                "TargetKernelObjectPolicyV1::capture(tokens.baseline.raw())",
+                "target-aware policy from the same exact token",
+            ),
+            (
+                "LoaderControlMatrixCellV4::PRODUCTION,",
+                "same no-debugger/no-snaps production cell",
+            ),
+            (
+                "LoaderEnvironmentAuthorityV5::TargetTokenUserenvBorrowedProfile,",
+                "same target environment and borrowed profile authority",
+            ),
+            (
+                "let process_result = run(LoaderObjectSecurityAuthorityV1::TargetAwareProcess);",
+                "process-only split cell",
+            ),
+            (
+                "let thread_result = run(LoaderObjectSecurityAuthorityV1::TargetAwareThread);",
+                "thread-only split cell",
+            ),
+            (
+                "singles_common.then(|| run(LoaderObjectSecurityAuthorityV1::TargetAwareBoth))",
+                "paired cell runs only after equal split failures",
+            ),
+            (
+                "let after = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);",
+                "profile stability after all cells",
+            ),
+            (
+                "let executed_results = results.into_iter().flatten().collect::<Vec<_>>();",
+                "executed-cell evidence inventory",
+            ),
+            (
+                "let evidence = loader_object_security_evidence_validity(",
+                "factored evidence validator call",
+            ),
+            (
+                "&executed_results,",
+                "all executed cell evidence is validated",
+            ),
+            (
+                "after == before,",
+                "profile observation equality feeds validation",
+            ),
+            (
+                "authority_exact,",
+                "exact authority binding feeds validation",
+            ),
+            (
+                "classify_loader_object_security_outcomes(",
+                "typed exhaustive object-security classification",
+            ),
+            (
+                "evidence.invariants_valid,",
+                "classification uses aggregate invariant validity",
+            ),
+            (
+                "loader_object_security_prerequisite_canary=v1 state={state}",
+                "typed object-security diagnostic prefix",
+            ),
+            (
+                "workload_executed=false qualification_promoted=false object_security_values_redacted=true",
+                "diagnostic cannot execute or promote and redacts authority",
+            ),
+            (
+                "profile_state=already-loaded-borrowed",
+                "stable borrowed-profile evidence",
+            ),
+            (
+                "common_evidence_valid={} descriptor_evidence_present={} invariants_valid={}",
+                "independent common, descriptor, and aggregate flags",
+            ),
+            (
+                "process_policy_sha256={} thread_policy_sha256={} target_logon_trustee=true restricting_trustee_count={} descriptor_readback={} job_empty=true",
+                "bounded policy/resultant evidence and nonpromotion claims",
+            ),
+            (
+                "evidence.descriptor_evidence_present,\n        evidence.invariant_error.as_ref().map_or_else(",
+                "descriptor_readback renders descriptor evidence rather than aggregate validity",
+            ),
+        ],
+    )?;
+    if object_security_canary.contains(" evidence_valid=")
+        || object_security_canary.contains("descriptor_readback={invariants_valid}")
+    {
+        return Err(
+            "loader object-security canary conflated descriptor evidence with aggregate validity"
+                .to_owned(),
+        );
+    }
+    for forbidden in [
+        "raw_sddl",
+        "user_sid=",
+        "account_name=",
+        "profile_path=",
+        "environment_values=",
+        "handle=",
+    ] {
+        if object_security_canary.contains(forbidden) {
+            return Err(format!(
+                "loader object-security canary disclosed raw authority: {forbidden}"
+            ));
+        }
+    }
+
+    let restriction_presence_classifier = semantic_function_region(
+        &sources.process,
+        "fn classify_loader_restriction_presence_outcomes(",
+        "fn loader_restriction_presence_required(",
+    )
+    .ok_or_else(|| "restriction-presence classifier has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_presence_classifier,
+        &[
+            ("if !invariants_valid", "invariant mismatch fails closed"),
+            (
+                "baseline.outcome != LoaderControlMatrixOutcomeKindV6::Failed",
+                "sole-RC baseline must fail",
+            ),
+            (
+                "baseline.native_status != Some(STATUS_DLL_INIT_FAILED)",
+                "sole-RC baseline must retain exact STATUS_DLL_INIT_FAILED",
+            ),
+            (
+                "comparison.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+                "passing sibling is causal evidence only",
+            ),
+            (
+                "\"restricting-sid-presence-causal\"",
+                "typed causal classification",
+            ),
+            (
+                "comparison.native_status == baseline.native_status",
+                "common failure preserves exact native status",
+            ),
+            (
+                "comparison.failure_phase == baseline.failure_phase",
+                "common failure preserves ranked frontier",
+            ),
+            (
+                "\"classified-common-failure\"",
+                "typed negative discriminator",
+            ),
+            (
+                "\"differing-inconclusive\"",
+                "typed differing non-success outcome",
+            ),
+        ],
+    )?;
+
+    let restriction_presence_gate = semantic_function_region(
+        &sources.process,
+        "fn loader_restriction_presence_required(",
+        "#[allow(clippy::too_many_arguments)]",
+    )
+    .ok_or_else(|| "restriction-presence gate has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_presence_gate,
+        &[
+            (
+                "object_security_state == \"classified-common-failure\"",
+                "valid object-security common-failure prerequisite",
+            ),
+            (
+                "&& object_security_common_evidence_valid",
+                "valid object-security common-field evidence prerequisite",
+            ),
+            (
+                "&& object_security_descriptor_evidence_present",
+                "complete live descriptor evidence prerequisite",
+            ),
+            (
+                "&& object_security_invariants_valid",
+                "valid live object evidence prerequisite",
+            ),
+        ],
+    )?;
+
+    let terminal_job_empty = semantic_function_region(
+        &sources.process,
+        "fn loader_control_cell_job_empty_attested(",
+        "const LOADER_OBJECT_SECURITY_COMMON_FIELDS_V1: [&str; 16] = [",
+    )
+    .ok_or_else(|| "loader-control terminal Job proof has no semantic boundary".to_owned())?;
+    require_source_order(
+        &terminal_job_empty,
+        &[
+            (
+                ".rsplit_once(\" profile_child_cleanup=[\")",
+                "last appended cleanup evidence selected",
+            ),
+            (
+                "cleanup.strip_suffix(']')",
+                "complete cleanup record required",
+            ),
+            (".split(',')", "structured cleanup fields parsed"),
+            (".rev()", "last terminal cleanup field selected"),
+            (
+                "field.strip_prefix(\"job_empty_after_cleanup=\")",
+                "verified failure cleanup field selected",
+            ),
+            ("== Some(\"true\")", "exact true cleanup proof required"),
+            (
+                "loader_result_field(result, \"job_empty\").as_deref() == Some(\"true\")",
+                "contained success Job proof accepted",
+            ),
+        ],
+    )?;
+
+    let loader_control_integration = semantic_function_region(
+        &sources.process,
+        "fn launch_target_desktop_loader_control(",
+        "fn launch_target_desktop_loader_control_cell(",
+    )
+    .ok_or_else(|| "loader-control prerequisite integration has no semantic boundary".to_owned())?;
+    require_source_order(
+        &loader_control_integration,
+        &[
+            (
+                ".filter(|evaluation| evaluation.restriction_presence_required)",
+                "restriction-presence canary follows valid object evidence",
+            ),
+            (
+                "loader_restriction_presence_prerequisite_canary_diagnostic(",
+                "restriction-presence canary invocation",
+            ),
+            (
+                "if let Some((rank, cell, mut failure)) = selected_failure {",
+                "authoritative production failure retained",
+            ),
+            (
+                "prerequisites.push(restriction_presence.diagnostic);",
+                "diagnostic evidence attached without promotion",
+            ),
+            ("Err(failure)", "original launch remains failed"),
+        ],
+    )?;
+
+    let profile_renderer = semantic_function_region(
+        &sources.process,
+        "fn render_loader_profile_prerequisite_canary(",
+        "fn preserve_loader_profile_primary_detail(primary: &str, cleanup: &[String]) -> String {",
+    )
+    .ok_or_else(|| "loader profile prerequisite renderer has no semantic boundary".to_owned())?;
+    require_source_order(
+        &profile_renderer,
+        &[
+            ("before.state.diagnostic()", "typed before-hive state"),
+            ("after.state.diagnostic()", "typed after-hive state"),
+            (
+                "before.profile_directory_sha256",
+                "value-redacted before-profile evidence",
+            ),
+            (
+                "after.profile_directory_sha256",
+                "value-redacted after-profile evidence",
+            ),
+            ("profile_binding_sha256", "bound profile capability digest"),
+            (
+                "outcome(baseline)",
+                "retained primary full-restricted evidence",
+            ),
+            ("lifecycle.join(\",\")", "bounded lifecycle evidence"),
+        ],
+    )?;
+    for (fragment, invariant) in [
+        ("profile_values_redacted=true", "profile value redaction"),
+        (
+            "workload_executed=false",
+            "diagnostic-only workload boundary",
+        ),
+        (
+            "qualification_promoted=false",
+            "diagnostic cannot promote qualification",
+        ),
+    ] {
+        require_source(&profile_renderer, fragment, invariant)?;
+    }
+    for forbidden in [
+        "profile_loaded=false",
+        "authenticated_user_sid",
+        "user_name",
+        "profile_path",
+        "hProfile",
+        "profile_values=",
+    ] {
+        if profile_renderer.contains(forbidden) {
+            return Err(format!(
+                "loader profile diagnostic disclosed or hard-coded private evidence: {forbidden}"
+            ));
+        }
+    }
+
+    let profile_observation = semantic_function_region(
+        &sources.process,
+        "fn observe_loader_profile(",
+        "struct LocalProfileSid(*mut c_void);",
+    )
+    .ok_or_else(|| "loader profile observation has no semantic boundary".to_owned())?;
+    require_source_order(
+        &profile_observation,
+        &[
+            (
+                "let key_name = super::pipe::wide_null(authenticated_user_sid);",
+                "exact authenticated SID hive path",
+            ),
+            ("RegOpenKeyExW(HKEY_USERS", "HKEY_USERS observation only"),
+            ("KEY_READ", "read-only hive observation"),
+            ("RegCloseKey(key)", "observed hive key ownership release"),
+            (
+                "LoaderProfileHiveStateV1::AlreadyLoadedBorrowed",
+                "typed observed-present state",
+            ),
+            (
+                "LoaderProfileHiveStateV1::Absent",
+                "typed observed-absent state",
+            ),
+            (
+                "LoaderProfileHiveStateV1::AccessDenied",
+                "typed access-denied state",
+            ),
+            (
+                "LoaderProfileHiveStateV1::QueryFailed(status)",
+                "typed native observation failure",
+            ),
+        ],
+    )?;
+    for forbidden in ["RegSetValue", "RegDelete", "SetSecurityInfo"] {
+        if profile_observation.contains(forbidden) {
+            return Err(format!(
+                "loader profile observation mutated state: {forbidden}"
+            ));
+        }
+    }
+
+    let profile_lease = semantic_function_region(
+        &sources.process,
+        "struct TargetUserProfileLease {",
+        "enum LoaderEnvironmentAuthorityV5 {",
+    )
+    .ok_or_else(|| "owned target profile lease has no semantic boundary".to_owned())?;
+    require_source_order(
+        &profile_lease,
+        &[
+            ("token: OwnedHandle,", "owned narrow profile token"),
+            ("profile: HANDLE,", "borrowed Userenv profile authority"),
+            (
+                "const PROFILE_ACCESS: u32 = TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE;",
+                "exact profile token access",
+            ),
+            (
+                "resolve_loader_profile_account_name(authenticated_user_sid)?;",
+                "local account name resolved from the exact SID",
+            ),
+            ("flags: 1,", "PI_NOUI profile load"),
+            ("profile_path: ptr::null_mut(),", "no caller profile path"),
+            ("policy_path: ptr::null_mut(),", "no caller policy path"),
+            (
+                "with_scoped_loader_profile_privileges(|| {",
+                "Backup and Restore scoped around load",
+            ),
+            (
+                "LoadUserProfileW(token.raw()",
+                "owned exact-token profile load",
+            ),
+            (
+                "if profile.profile.is_null()",
+                "non-null profile authority proof",
+            ),
+            (
+                "UnloadUserProfile(self.token.raw(), self.profile)",
+                "same-token exact profile unload",
+            ),
+            ("self.active = false;", "one-shot owned profile retirement"),
+        ],
+    )?;
+    for forbidden in [
+        "CloseHandle(self.profile)",
+        "OwnedHandle::new(self.profile)",
+    ] {
+        if profile_lease.contains(forbidden) {
+            return Err(format!(
+                "Userenv profile authority was closed as a kernel handle: {forbidden}"
+            ));
+        }
+    }
+
+    let object_security_authority = semantic_function_region(
+        &sources.process,
+        "enum LoaderObjectSecurityAuthorityV1 {",
+        "struct OwnedUserEnvironmentBlock {",
+    )
+    .ok_or_else(|| "loader object-security authority has no semantic boundary".to_owned())?;
+    require_source_order(
+        &object_security_authority,
+        &[
+            (
+                "LauncherExplicit,",
+                "production explicit descriptor authority",
+            ),
+            (
+                "LauncherExplicitRestrictingSidCanary,",
+                "contained launcher-explicit restriction-presence authority",
+            ),
+            (
+                "TargetAwareProcess,",
+                "process-only diagnostic split authority",
+            ),
+            (
+                "TargetAwareThread,",
+                "thread-only diagnostic split authority",
+            ),
+            (
+                "TargetAwareBoth,",
+                "paired target-aware diagnostic authority",
+            ),
+            (
+                "Self::LauncherExplicit => \"launcher-explicit-v1\"",
+                "stable production authority label",
+            ),
+            (
+                "Self::LauncherExplicitRestrictingSidCanary => \"launcher-explicit-v1\"",
+                "diagnostic sibling preserves launcher-explicit authority label",
+            ),
+            (
+                "Self::TargetAwareProcess => \"target-aware-process-v1\"",
+                "stable process split label",
+            ),
+            (
+                "Self::TargetAwareThread => \"target-aware-thread-v1\"",
+                "stable thread split label",
+            ),
+            (
+                "Self::TargetAwareBoth => \"target-aware-both-v1\"",
+                "stable paired comparison label",
+            ),
+            (
+                "const fn uses_target_policy(self) -> bool {",
+                "typed target-policy selection helper",
+            ),
+            (
+                "Self::TargetAwareProcess | Self::TargetAwareThread | Self::TargetAwareBoth",
+                "only target-aware diagnostic variants capture target policy",
+            ),
+            (
+                "const fn diagnostic_only(self) -> bool {",
+                "typed diagnostic containment helper",
+            ),
+            (
+                "!matches!(self, Self::LauncherExplicit)",
+                "every nonproduction authority remains diagnostic-only",
+            ),
+        ],
+    )?;
+
+    for (fragment, invariant) in [
+        (
+            "pub(crate) const TARGET_KERNEL_PROCESS_DIAGNOSTIC_ACCESS: u32 = 0x0010_1040;",
+            "bounded target-aware process access",
+        ),
+        (
+            "pub(crate) const TARGET_KERNEL_THREAD_DIAGNOSTIC_ACCESS: u32 = 0x0012_1800;",
+            "bounded target-aware thread access",
+        ),
+    ] {
+        require_source(&sources.security, fragment, invariant)?;
+    }
+    let target_kernel_policy = semantic_function_region(
+        &sources.security,
+        "pub(crate) struct TargetKernelObjectPolicyV1 {",
+        "pub fn launcher_process_sddl() -> Result<String, String> {",
+    )
+    .ok_or_else(|| "target-aware kernel-object policy has no semantic boundary".to_owned())?;
+    require_source_order(
+        &target_kernel_policy,
+        &[
+            (
+                "TargetUserObjectPolicy::capture(token, TargetUserObjectPolicyRoleV1::DirectTarget)",
+                "exact target-token policy capture",
+            ),
+            (
+                "TargetRestrictionSemantics::Restricted { restricting_sids }",
+                "full-restricted target semantics",
+            ),
+            (
+                "TargetRestrictionSemantics::Unrestricted => {",
+                "unrestricted target rejection",
+            ),
+            (
+                "TargetRestrictionSemantics::WriteRestricted { .. } => {",
+                "WRITE_RESTRICTED target rejection",
+            ),
+            (
+                "if restricting_sids.is_empty() {",
+                "nonempty restricting-trustee proof",
+            ),
+            (
+                "service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME)?",
+                "launcher role binding",
+            ),
+            (
+                "service_sid(memcordon_core::WINDOWS_SESSION_BROKER_SERVICE_NAME)?",
+                "broker role binding",
+            ),
+            (
+                "BTreeSet::from([target.target_logon_sid.clone()])",
+                "target logon trustee binding",
+            ),
+            (
+                "target_trustees.extend(restricting_sids.iter().cloned());",
+                "restricting trustee binding",
+            ),
+            (
+                "TARGET_KERNEL_PROCESS_DIAGNOSTIC_ACCESS",
+                "bounded process trustee rights",
+            ),
+            (
+                "TARGET_KERNEL_THREAD_DIAGNOSTIC_ACCESS",
+                "bounded thread trustee rights",
+            ),
+            (
+                "process_policy_sha256: super::record::digest(process_sddl.as_bytes())",
+                "redacted process policy binding",
+            ),
+            (
+                "thread_policy_sha256: super::record::digest(thread_sddl.as_bytes())",
+                "redacted thread policy binding",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "SetKernelObjectSecurity",
+        "SetSecurityInfo",
+        "OpenProcessToken",
+    ] {
+        if target_kernel_policy.contains(forbidden) {
+            return Err(format!(
+                "target-aware object-security policy mutated or reopened authority: {forbidden}"
+            ));
+        }
+    }
+
+    let live_object_evidence = semantic_function_region(
+        &sources.security,
+        "    pub(crate) fn live_kernel_object_security_evidence(",
+        "    pub fn verify_kernel_object(",
+    )
+    .ok_or_else(|| "live kernel-object security evidence has no semantic boundary".to_owned())?;
+    require_source_order(
+        &live_object_evidence,
+        &[
+            (
+                "OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION",
+                "decision-bearing resultant descriptor fields",
+            ),
+            (
+                "GetKernelObjectSecurity(handle, information, ptr::null_mut(), 0, &raw mut needed)",
+                "bounded live descriptor sizing",
+            ),
+            (
+                "let allocated = needed;",
+                "exact live descriptor allocation bound",
+            ),
+            (
+                "GetKernelObjectSecurity(\n                handle,\n                information,\n                descriptor.as_mut_ptr().cast(),",
+                "live descriptor fill",
+            ),
+            (
+                "needed == 0\n            || needed > allocated",
+                "descriptor growth and empty-result rejection",
+            ),
+            (
+                "let equality_sha256 = super::record::digest(",
+                "resultant descriptor digest construction",
+            ),
+            (
+                "normalized_descriptor_sddl(actual, information, kind)?.as_bytes(),",
+                "resultant descriptor equality hash",
+            ),
+            (
+                "GetSecurityDescriptorControl(actual",
+                "protected-DACL control readback",
+            ),
+            (
+                "GetSecurityDescriptorDacl(",
+                "decision-bearing DACL readback",
+            ),
+            (
+                "present == 0\n            || dacl.is_null()",
+                "missing or null decision-bearing DACL rejection",
+            ),
+            ("GetAclInformation(", "bounded ACE-count readback"),
+            (
+                "let (target_allowed, target_granted) = access_check_descriptor(",
+                "target role AccessCheck result",
+            ),
+            ("target_token,", "exact target token AccessCheck authority"),
+            ("requested_access,", "bounded requested-access mask"),
+            ("kind.generic_mapping(),", "object-specific generic mapping"),
+            (
+                "current_process_token_for_access_check()?",
+                "launcher role AccessCheck authority",
+            ),
+            (
+                "access_check_descriptor(\n            actual,\n            launcher.raw(),",
+                "launcher role AccessCheck evidence",
+            ),
+        ],
+    )?;
+    for forbidden in ["SetKernelObjectSecurity", "raw_sddl", "account_name"] {
+        if live_object_evidence.contains(forbidden) {
+            return Err(format!(
+                "live object-security evidence mutated or disclosed authority: {forbidden}"
+            ));
+        }
+    }
+
+    let live_object_renderer = semantic_function_region(
+        &sources.security,
+        "impl LiveKernelObjectSecurityEvidenceV1 {",
+        "impl SecurityObjectKind {",
+    )
+    .ok_or_else(|| "live kernel-object evidence renderer has no semantic boundary".to_owned())?;
+    for (fragment, invariant) in [
+        (
+            "{role}_live_sha256={}",
+            "resultant descriptor equality digest",
+        ),
+        ("{role}_dacl_protected={}", "protected-DACL evidence"),
+        ("{role}_ace_count={}", "bounded ACE-count evidence"),
+        ("{role}_requested=0x{:08x}", "fixed-width requested access"),
+        ("{role}_target_allowed={}", "target role access decision"),
+        ("{role}_target_granted=0x{:08x}", "target granted mask"),
+        (
+            "{role}_launcher_allowed={}",
+            "launcher role access decision",
+        ),
+        ("{role}_launcher_granted=0x{:08x}", "launcher granted mask"),
+    ] {
+        require_source(&live_object_renderer, fragment, invariant)?;
+    }
+    for forbidden in ["sddl", "sid", "account", "handle"] {
+        if live_object_renderer
+            .to_ascii_lowercase()
+            .contains(forbidden)
+        {
+            return Err(format!(
+                "live object-security renderer disclosed a raw principal or authority: {forbidden}"
+            ));
+        }
+    }
+
+    let owned_user_environment = semantic_function_region(
+        &sources.process,
+        "struct OwnedUserEnvironmentBlock {",
+        "struct UserEnvironmentInventoryV1 {",
+    )
+    .ok_or_else(|| "owned target-token environment has no semantic boundary".to_owned())?;
+    require_source_order(
+        &owned_user_environment,
+        &[
+            (
+                "fn create(target_token: HANDLE)",
+                "exact-token environment constructor",
+            ),
+            (
+                "CreateEnvironmentBlock(&raw mut raw, target_token, 0)",
+                "target-token Userenv source with inheritance disabled",
+            ),
+            ("if raw.is_null() {", "null Userenv block rejection"),
+            (
+                "let inventory = bounded_user_environment_inventory(block.raw)?;",
+                "bounded inventory validation before launch",
+            ),
+            (
+                "fn pointer(&mut self) -> *mut c_void {",
+                "owned raw pointer accessor",
+            ),
+            ("self.raw", "exact Userenv pointer return"),
+            (
+                "let raw = std::mem::replace(&mut self.raw, ptr::null_mut());",
+                "explicit one-shot post-create ownership consume",
+            ),
+            (
+                "DestroyEnvironmentBlock(raw)",
+                "post-create Userenv release",
+            ),
+            (
+                "impl Drop for OwnedUserEnvironmentBlock {",
+                "unwind-safe RAII fallback",
+            ),
+            (
+                "let raw = std::mem::replace(&mut self.raw, ptr::null_mut());",
+                "fallback one-shot ownership consume",
+            ),
+            ("DestroyEnvironmentBlock(raw)", "fallback Userenv release"),
+        ],
+    )?;
+    if owned_user_environment
+        .matches("DestroyEnvironmentBlock(raw)")
+        .count()
+        != 2
+        || owned_user_environment.contains("encode_windows_environment_block")
+        || owned_user_environment.contains("LoadUserProfile")
+    {
+        return Err(
+            "target-token Userenv ownership is not exact, raw, no-profile, and one-shot".to_owned(),
+        );
+    }
+
+    let launch_environment = semantic_function_region(
+        &sources.process,
+        "enum LoaderLaunchEnvironmentStorageV5<'a> {",
+        "fn loader_environment_keys_sha256(keys: &[String]) -> String {",
+    )
+    .ok_or_else(|| "loader launch environment authority has no semantic boundary".to_owned())?;
+    require_source_order(
+        &launch_environment,
+        &[
+            (
+                "LoaderEnvironmentAuthorityV5::TargetTokenUserenv => {",
+                "target-token authority branch",
+            ),
+            (
+                "let block = OwnedUserEnvironmentBlock::create(target_token)?;",
+                "exact target-token environment construction",
+            ),
+            (
+                "classification: \"target-token-userenv-v1\",",
+                "typed target-token environment classification",
+            ),
+            (
+                "visible_keys: Vec::new(),",
+                "environment key/value redaction",
+            ),
+            (
+                "storage: LoaderLaunchEnvironmentStorageV5::Userenv(block),",
+                "native Userenv allocation ownership",
+            ),
+            (
+                "LoaderLaunchEnvironmentStorageV5::Userenv(block) => block.pointer(),",
+                "exact native pointer selection",
+            ),
+            (
+                "LoaderLaunchEnvironmentStorageV5::Userenv(block) => block.destroy_after_create(),",
+                "exact post-create release dispatch",
+            ),
+        ],
+    )?;
+    if launch_environment.contains("SECRET=value") {
+        return Err("loader launch environment exposed a target profile value".to_owned());
+    }
+
+    let target_environment_inventory = semantic_function_region(
+        &sources.process,
+        "fn bounded_user_environment_inventory(",
+        "fn loader_environment_block(",
+    )
+    .ok_or_else(|| "target-token environment inventory has no semantic boundary".to_owned())?;
+    require_source_order(
+        &target_environment_inventory,
+        &[
+            ("if raw.is_null() {", "null block rejection"),
+            (
+                "0..LOADER_ENVIRONMENT_MAX_UNITS.saturating_sub(1)",
+                "bounded Unicode scan",
+            ),
+            (
+                "if current == 0 && next == 0 {",
+                "terminal double-NUL proof",
+            ),
+            (
+                "target-token environment is not double-NUL terminated within its native bound",
+                "over-bound and unterminated rejection",
+            ),
+            (
+                "let mut block_digest = b\"memcordon-target-token-userenv-v1\\0\".to_vec();",
+                "versioned exact UTF-16 digest",
+            ),
+            (
+                "block_digest.extend_from_slice(&unit.to_le_bytes());",
+                "exact UTF-16 unit hashing",
+            ),
+            (
+                "target-token environment entry is not valid UTF-16",
+                "malformed UTF-16 rejection",
+            ),
+            (
+                "target-token environment entry has no key separator",
+                "malformed entry rejection",
+            ),
+            (
+                "target-token environment contains a duplicate case-insensitive key",
+                "ambiguous duplicate-key rejection",
+            ),
+            ("keys_sha256:", "value-redacted key digest"),
+        ],
+    )?;
+
+    let loader_cell_inner = semantic_function_region(
+        &sources.process,
+        "fn launch_target_desktop_loader_control_cell_inner(",
+        "fn launch_target_desktop_probe(",
+    )
+    .ok_or_else(|| "loader-control inner launch has no semantic boundary".to_owned())?;
+    require_source_order(
+        &loader_cell_inner,
+        &[
+            (
+                "let environment_authority = environment_source.authority();",
+                "typed launch-environment authority",
+            ),
+            (
+                "let mut environment =\n            environment_source.into_environment(target_token, matrix_cell.environment)?;",
+                "typed owned-or-borrowed environment materialization",
+            ),
+            (
+                "CREATE_UNICODE_ENVIRONMENT",
+                "Unicode environment creation flag",
+            ),
+            ("CreateProcessAsUserW(", "exact-token child creation"),
+            (
+                "target_token,",
+                "same exact target token at process creation",
+            ),
+            (
+                "environment.pointer(),",
+                "exact owned environment pointer at process creation",
+            ),
+            (
+                "let creation_error = (created == 0).then(io::Error::last_os_error);",
+                "creation result captured before release",
+            ),
+            (
+                "let environment_destruction = environment.destroy_userenv_after_create();",
+                "Userenv block released immediately after process creation returns",
+            ),
+            (
+                "if let Some(error) = creation_error {",
+                "creation failure retained across release",
+            ),
+            (
+                "if let Err(error) = environment_destruction {",
+                "destruction failure remains typed",
+            ),
+            (
+                "let _control_process = OwnedHandle::new(process.hProcess)?;",
+                "created process retained through destruction failure unwind",
+            ),
+            (
+                "let _control_thread = OwnedHandle::new(process.hThread)?;",
+                "created thread retained through destruction failure unwind",
+            ),
+            (
+                "return Err(error);",
+                "destruction failure returned after native handle ownership",
+            ),
+        ],
+    )?;
+    require_source_order(
+        &loader_cell_inner,
+        &[
+            (
+                "let target_policy = object_security_authority",
+                "typed object-security authority selection",
+            ),
+            (
+                ".uses_target_policy()",
+                "only target-aware diagnostic variants capture target policy",
+            ),
+            (
+                "TargetKernelObjectPolicyV1::capture(target_token)",
+                "diagnostic policy derives only from the exact target token",
+            ),
+            (
+                "LoaderObjectSecurityAuthorityV1::TargetAwareProcess",
+                "process-only policy split",
+            ),
+            (
+                "LoaderObjectSecurityAuthorityV1::TargetAwareBoth",
+                "paired process policy comparison",
+            ),
+            (
+                "super::security::launcher_process_sddl()?",
+                "explicit production process policy",
+            ),
+            (
+                "LoaderObjectSecurityAuthorityV1::TargetAwareThread",
+                "thread-only policy split",
+            ),
+            (
+                "super::security::launcher_thread_sddl()?",
+                "explicit production thread policy",
+            ),
+            (
+                "let process_security = SecurityDescriptor::from_sddl(&process_sddl)?;",
+                "owned process descriptor",
+            ),
+            (
+                "let process_attributes = process_security.attributes(false);",
+                "noninheritable process SECURITY_ATTRIBUTES",
+            ),
+            (
+                "let thread_security = SecurityDescriptor::from_sddl(&thread_sddl)?;",
+                "owned thread descriptor",
+            ),
+            (
+                "let thread_attributes = thread_security.attributes(false);",
+                "noninheritable thread SECURITY_ATTRIBUTES",
+            ),
+            (
+                "CreateProcessAsUserW(",
+                "exact-token suspended child creation",
+            ),
+            (
+                "&raw const process_attributes,",
+                "non-null process attributes for every authority",
+            ),
+            (
+                "&raw const thread_attributes,",
+                "non-null thread attributes for every authority",
+            ),
+        ],
+    )?;
+    require_source_order(
+        &loader_cell_inner,
+        &[
+            (
+                "if !control_job.contains(control_process.raw())? {",
+                "at-create Job membership proof",
+            ),
+            (
+                "SecurityDescriptor::live_kernel_object_security_evidence(\n                control_process.raw(),",
+                "live resultant process descriptor evidence",
+            ),
+            (
+                "SecurityDescriptor::live_kernel_object_security_evidence(\n                control_thread.raw(),",
+                "live resultant thread descriptor evidence",
+            ),
+            (
+                "if unsafe { ResumeThread(control_thread.raw()) } != 1 {",
+                "single suspended-child resume for bounded observation",
+            ),
+            (
+                "if object_security_authority.diagnostic_only() {\n                control_job.terminate(TARGET_DESKTOP_BOOTSTRAP_FAILURE_STATUS)?;\n                return Ok(());",
+                "diagnostic child terminated before release",
+            ),
+            (
+                "TargetDesktopBootstrapPipeOperation::LoaderControlReleaseWrite",
+                "release remains production-only after diagnostic termination",
+            ),
+            (
+                "if object_security_authority.diagnostic_only() {",
+                "post-protocol diagnostic containment branch",
+            ),
+            (
+                "if let Some(session) = debug_session.as_mut() {",
+                "debug child event drain branch",
+            ),
+            (
+                "session.drain_until_exit(",
+                "bounded FullObserver child retirement",
+            ),
+            (
+                "} else if unsafe { WaitForSingleObject(control_process.raw(), 30_000) } != WAIT_OBJECT_0",
+                "bounded no-observer diagnostic child retirement",
+            ),
+            (
+                "if !control_job.wait_empty(Instant::now() + Duration::from_secs(30))? {",
+                "diagnostic Job-empty proof",
+            ),
+            (
+                "descriptor_readback=true job_empty=true workload_executed=false qualification_promoted=false",
+                "resultant evidence and nonpromotion boundary",
+            ),
+        ],
+    )?;
+
+    let production_loader_completion = semantic_function_region(
+        &sources.process,
+        "        let mut exit_code = 0_u32;",
+        "fn launch_target_desktop_probe(",
+    )
+    .ok_or_else(|| "production loader-control completion has no semantic boundary".to_owned())?;
+    require_source_order(
+        &production_loader_completion,
+        &[
+            (
+                "if !control_job.wait_empty(Instant::now() + Duration::from_secs(30))? {",
+                "production loader-control Job-empty proof",
+            ),
+            (
+                "return Err(\"loader-control Job did not become empty\".to_owned().into());",
+                "production Job drain failure",
+            ),
+            (
+                "phase=loader-ready-and-clean-exit exit=0x00000000 exit_status_symbol=STATUS_SUCCESS",
+                "success classification after production Job drain",
+            ),
+        ],
+    )?;
+
+    require_source_order(
+        &control,
+        &[
+            (
+                "let mut canonical_baseline = None;",
+                "retained production-cell baseline result",
+            ),
+            (
+                "for cell in LoaderControlMatrixCellV4::CERTIFICATION {",
+                "unchanged six-cell certification matrix",
+            ),
+            (
+                "if cell == LoaderControlMatrixCellV4::PRODUCTION {",
+                "exact production-cell baseline capture",
+            ),
+            (
+                "canonical_baseline = Some(clone_loader_control_result(&result));",
+                "baseline outcome retained for one-factor comparison",
+            ),
+            (
+                "let restriction_canary = loader_restriction_canary_is_required(&results).then(|| {",
+                "restriction canary remains matrix-gated",
+            ),
+            (
+                ".filter(|evaluation| evaluation.target_environment_required)",
+                "environment canary requires classified common restriction failure",
+            ),
+            (
+                "(Some(tokens), Some(baseline)) => {",
+                "bound tokens and production baseline prerequisite",
+            ),
+            (
+                "Some(loader_environment_prerequisite_canary_diagnostic(",
+                "typed environment prerequisite evaluation",
+            ),
+            (
+                ".filter(|evaluation| evaluation.profile_required)",
+                "profile canary requires the exact classified common environment failure",
+            ),
+            (
+                "loader_profile_prerequisite_canary_diagnostic(",
+                "observed profile prerequisite evaluation",
+            ),
+            (
+                "let object_security_canary = profile_canary",
+                "object-security experiment follows the profile experiment",
+            ),
+            (
+                ".filter(|evaluation| evaluation.object_security_required)",
+                "object-security experiment requires stable equal profile failure",
+            ),
+            (
+                "loader_object_security_prerequisite_canary_diagnostic(",
+                "typed object-security prerequisite evaluation",
+            ),
+            (
+                "if let Some((rank, cell, mut failure)) = selected_failure {",
+                "authoritative matrix failure retained",
+            ),
+            (
+                "format!(\"{} {matrix_detail}\", prerequisites.join(\" \"))",
+                "diagnostics prefixed ahead of primary matrix evidence",
+            ),
+            (
+                "Err(failure)",
+                "diagnostic cannot convert failure to success",
+            ),
+        ],
+    )?;
+
+    let loader_environment = semantic_function_region(
+        &sources.process,
+        "fn loader_environment_block(",
+        "fn system_environment_entries() -> Result<BTreeMap<String, Vec<u16>>, TargetDesktopLeaseCreateError>",
+    )
+    .ok_or_else(|| "loader-control environment builder has no semantic boundary".to_owned())?;
+    require_source_order(
+        &loader_environment,
+        &[
+            (
+                "LoaderEnvironmentModeV4::CanonicalMinimalSystem => {",
+                "canonical-minimal environment branch",
+            ),
+            (
+                "let source = system_environment_entries()?;",
+                "trusted system environment source",
+            ),
+            (
+                "for key in LOADER_REQUIRED_ENVIRONMENT_KEYS {",
+                "required environment allowlist projection",
+            ),
+            (
+                "memcordon_core::encode_windows_environment_block(&entries)",
+                "explicit bounded Unicode environment encoding",
+            ),
+        ],
+    )?;
+    require_source_order(
+        &control,
+        &[
+            (
+                "let mut environment =\n            environment_source.into_environment(target_token, matrix_cell.environment)?;",
+                "typed loader environment selection",
+            ),
+            (
+                "let creation_flags = if loader_debug_trace {",
+                "explicit Unicode environment creation flags",
+            ),
+            ("CreateProcessAsUserW(", "loader-control process creation"),
+            (
+                "environment.pointer(),",
+                "explicit authenticated environment block",
+            ),
+        ],
+    )?;
+    require_source_order(
+        &control,
+        &[
+            (
+                "let mut results = Vec::with_capacity(LoaderControlMatrixCellV4::CERTIFICATION.len());",
+                "six-cell typed outcome collection",
+            ),
+            (
+                "for cell in LoaderControlMatrixCellV4::CERTIFICATION {",
+                "complete loader matrix execution",
+            ),
+            (
+                "results.push(LoaderControlMatrixOutcomeV6 {",
+                "per-cell typed matrix outcome",
+            ),
+            (
+                "let rank = loader_failure_evidence_rank(cell, &error);",
+                "named diagnostic-value rank selection",
+            ),
+            (
+                "loader_failure_should_replace(",
+                "strict selected-failure upgrade",
+            ),
+            (
+                "let matrix_detail = loader_control_matrix_failure_detail(",
+                "prefix-first matrix failure publication",
+            ),
+            (
+                "let mut prerequisites = Vec::new();",
+                "diagnostic canary prefixed without replacing primary matrix evidence",
+            ),
+            (
+                "prerequisites.push(object_security.diagnostic);",
+                "object-security diagnostic evidence retained",
+            ),
+            (
+                "prerequisites.push(profile.diagnostic);",
+                "profile prerequisite evidence retained",
+            ),
+            (
+                "format!(\"{} {matrix_detail}\", prerequisites.join(\" \"))",
+                "prerequisite evidence precedes the primary matrix failure",
+            ),
+            ("Err(failure)", "matrix failure remains a terminal failure"),
+        ],
+    )?;
+    require_source_order(
+        &control,
+        &[
+            (
+                "let restriction_canary = loader_restriction_canary_is_required(&results).then(|| {",
+                "restriction canary gated after the complete failed matrix",
+            ),
+            (
+                "loader_restriction_canary_diagnostic(",
+                "one-factor restriction diagnostic execution",
+            ),
+            (
+                "if let Some((rank, cell, mut failure)) = selected_failure {",
+                "authoritative full-restricted failure selection",
+            ),
+            (
+                "let matrix_detail = loader_control_matrix_failure_detail(",
+                "retained full-restricted primary evidence",
+            ),
+            (
+                "format!(\"{} {matrix_detail}\", prerequisites.join(\" \"))",
+                "bounded diagnostic prefix before primary evidence",
+            ),
+            (
+                "Err(failure)",
+                "diagnostic success cannot convert failure to success",
+            ),
+        ],
+    )?;
+
+    let loader_diagnostic = semantic_function_region(
+        &sources.loader_debug,
+        "    pub(crate) fn diagnostic(&self) -> String {",
+        "pub(crate) struct LoaderDebugSession {",
+    )
+    .ok_or_else(|| "loader causal diagnostic has no semantic boundary".to_owned())?;
+    require_source_order(
+        &loader_diagnostic,
+        &[
+            (
+                "exit={} exit_status_symbol={}",
+                "native exit status and symbolic status prefix",
+            ),
+            (
+                "pre_initial_breakpoint={} static_closure_complete={} application_entry_possible={} failure_phase={}",
+                "pre-entry failure classification prefix",
+            ),
+            ("let causal_frontier = format!(", "compact causal frontier"),
+            ("candidate_modules_count={}", "candidate-module total count"),
+            (
+                "candidate_modules_retained={}",
+                "candidate-module retained count",
+            ),
+            (
+                "candidate_modules_overflow={}",
+                "candidate-module overflow count",
+            ),
+            (
+                "candidate_modules_sha256={}",
+                "candidate-module deterministic digest",
+            ),
+            ("unload_tail_count={}", "unload total count"),
+            ("unload_tail_retained={}", "unload retained count"),
+            ("unload_tail_overflow={}", "unload overflow count"),
+            ("unload_tail_sha256={}", "unload deterministic digest"),
+            ("loader_snap_tail_count={}", "loader-snap total count"),
+            ("loader_snap_tail_retained={}", "loader-snap retained count"),
+            ("loader_snap_tail_overflow={}", "loader-snap overflow count"),
+            (
+                "loader_snap_tail_sha256={}",
+                "loader-snap deterministic digest",
+            ),
+            (
+                "let bounded_root_frontier = bounded(&root_frontier, ROOT_FRONTIER_DIAGNOSTIC_MAX_BYTES);",
+                "independently bounded verbose root frontier",
+            ),
+            ("missing_direct_roots_count={}", "root frontier total count"),
+            (
+                "missing_direct_roots_overflow_bytes={}",
+                "root frontier overflow accounting",
+            ),
+            (
+                "missing_direct_roots_sha256={}",
+                "root frontier deterministic digest",
+            ),
+            (
+                "{header} {causal_frontier} exact_token_import_tier_canary=core-ntdll-kernel32:read-execute-map-attested,advapi32:read-execute-map-attested canary_attested={} canary_execution_scope=holder-effective-thread-under-exact-target-impersonation canary_child_startup=unproven {launch_evidence} {root_detail}",
+                "causal frontier published before verbose roots",
+            ),
+            (
+                "LOADER_TRACE_DIAGNOSTIC_MAX_BYTES,",
+                "bounded complete loader trace publication",
+            ),
+        ],
+    )?;
+    require_source(
+        &sources.loader_debug,
+        "0xC000_0142 => \"STATUS_DLL_INIT_FAILED\"",
+        "STATUS_DLL_INIT_FAILED remains explicit native failure evidence",
+    )?;
     for (source, fragment, invariant) in [
         (
             &sources.process,
             "const CERTIFICATION: [Self; 6] = [",
             "frozen six-cell debugger-relation/loader-snaps certification matrix",
-        ),
-        (
-            &sources.process,
-            "explicit-empty-full-observer-snaps-on",
-            "explicit-empty full-observer loader-snaps control cell",
         ),
         (
             &sources.process,
@@ -12886,6 +20664,3378 @@ fn validate_windows_loader_control_contract(
 }
 
 #[test]
+fn windows_loader_environment_contract_is_identical_after_crlf_checkout_normalization() {
+    let sources = WindowsLoaderControlContractSources::load();
+    validate_windows_loader_control_contract(&sources)
+        .expect("unmutated LF loader-control environment contract must be complete");
+
+    let mut crlf = sources;
+    crlf.control_service = crlf.control_service.replace('\n', "\r\n");
+    crlf.control_service = normalize_windows_source(&crlf.control_service);
+    crlf.launcher_service = crlf.launcher_service.replace('\n', "\r\n");
+    crlf.launcher_service = normalize_windows_source(&crlf.launcher_service);
+    crlf.process = crlf.process.replace('\n', "\r\n");
+    crlf.process = normalize_windows_source(&crlf.process);
+    crlf.security = crlf.security.replace('\n', "\r\n");
+    crlf.security = normalize_windows_source(&crlf.security);
+    crlf.token = crlf.token.replace('\n', "\r\n");
+    crlf.token = normalize_windows_source(&crlf.token);
+    crlf.core = crlf.core.replace('\n', "\r\n");
+    crlf.core = normalize_windows_source(&crlf.core);
+    crlf.loader_debug = crlf.loader_debug.replace('\n', "\r\n");
+    crlf.loader_debug = normalize_windows_source(&crlf.loader_debug);
+    crlf.access_trace = crlf.access_trace.replace('\n', "\r\n");
+    crlf.access_trace = normalize_windows_source(&crlf.access_trace);
+    crlf.pipe = crlf.pipe.replace('\n', "\r\n");
+    crlf.pipe = normalize_windows_source(&crlf.pipe);
+    crlf.session_broker = crlf.session_broker.replace('\n', "\r\n");
+    crlf.session_broker = normalize_windows_source(&crlf.session_broker);
+    validate_windows_loader_control_contract(&crlf)
+        .expect("normalized CRLF loader-control environment contract must match LF");
+}
+
+#[test]
+fn windows_trace_session_capability_region_mutations_are_rejected() {
+    let sources = WindowsLoaderControlContractSources::load();
+    validate_windows_trace_session_capability_contract(&sources)
+        .expect("unmutated broker trace-session capability contract must be complete");
+    for (source, start, end, exact, replacement, mutant) in [
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "use std::io::{self, Write};",
+            "const LOADER_SNAPS_SCHEMA_VERSION: u32 = 2;",
+            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;",
+            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 5;",
+            "trace-capability-outer-schema-not-bumped",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "const LOADER_SNAPS_SCHEMA_VERSION: u32 = 2;",
+            "const LOADER_SNAPS_REGISTRY_PARENT: &str =",
+            "const TRACE_SESSION_CAPABILITY_SCHEMA_VERSION: u32 = 1;",
+            "const TRACE_SESSION_CAPABILITY_SCHEMA_VERSION: u32 = 2;",
+            "trace-capability-nested-schema-changed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_allowed(",
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "frontier.common_prefix == 0",
+            "frontier.common_prefix <= debug_f.detail.len()",
+            "trace-capability-zero-prefix-gate-weakened",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_allowed(",
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "!frontier.useful",
+            "true",
+            "trace-capability-nonlocalizing-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_allowed(",
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "invariants.valid()",
+            "true",
+            "trace-capability-thirteen-invariant-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_allowed(",
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "&& passive_setup_admitted",
+            "&& true",
+            "trace-capability-passive-denial-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_allowed(",
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "&& !debug_c_trace.stable_modules.is_empty()",
+            "&& true",
+            "trace-capability-debug-c-module-presence-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_allowed(",
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "&& !debug_f_trace.stable_modules.is_empty()",
+            "&& true",
+            "trace-capability-debug-f-module-presence-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "fn classify_loader_full_observer_pair(",
+            "        target_user_restricted,\n        debug_c,",
+            "        debug_c,\n        debug_c,",
+            "trace-capability-original-a-f-outcome-binding-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "fn classify_loader_full_observer_pair(",
+            "outcome.native_status.unwrap_or(i32::MIN).to_le_bytes()",
+            "i32::MIN.to_le_bytes()",
+            "trace-capability-outcome-status-binding-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "fn classify_loader_full_observer_pair(",
+            "outcome.failure_phase.as_bytes()",
+            "b\"\"",
+            "trace-capability-outcome-phase-binding-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "fn classify_loader_full_observer_pair(",
+            "for field in [\n        passive_setup_sha256.unwrap_or_default(),\n        source_binding_sha256,\n        pair_invariants_sha256,\n        restriction_presence_binding_sha256,\n        restriction_identity_binding_sha256,",
+            "for field in [\n        passive_setup_sha256.unwrap_or_default(),\n        source_binding_sha256,\n        pair_invariants_sha256,\n        restriction_presence_binding_sha256,\n        source_binding_sha256,",
+            "trace-capability-restriction-identity-binding-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "fn classify_loader_full_observer_pair(",
+            "for field in [\n        passive_setup_sha256.unwrap_or_default(),\n        source_binding_sha256,\n        pair_invariants_sha256,\n        restriction_presence_binding_sha256,\n        restriction_identity_binding_sha256,\n        logon_restriction_binding_sha256,",
+            "for field in [\n        passive_setup_sha256.unwrap_or_default(),\n        source_binding_sha256,\n        pair_invariants_sha256,\n        restriction_presence_binding_sha256,\n        restriction_identity_binding_sha256,\n        source_binding_sha256,",
+            "trace-capability-logon-binding-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "fn classify_loader_full_observer_pair(",
+            "for field in [\n        passive_setup_sha256.unwrap_or_default(),\n        source_binding_sha256,\n        pair_invariants_sha256,\n        restriction_presence_binding_sha256,\n        restriction_identity_binding_sha256,\n        logon_restriction_binding_sha256,\n        authenticated_users_restriction_binding_sha256,",
+            "for field in [\n        passive_setup_sha256.unwrap_or_default(),\n        source_binding_sha256,\n        pair_invariants_sha256,\n        restriction_presence_binding_sha256,\n        restriction_identity_binding_sha256,\n        logon_restriction_binding_sha256,\n        source_binding_sha256,",
+            "trace-capability-authenticated-users-binding-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "fn classify_loader_full_observer_pair(",
+            "for field in [\n        passive_setup_sha256.unwrap_or_default(),\n        source_binding_sha256,\n        pair_invariants_sha256,\n        restriction_presence_binding_sha256,\n        restriction_identity_binding_sha256,\n        logon_restriction_binding_sha256,\n        authenticated_users_restriction_binding_sha256,\n        target_user_restriction_binding_sha256,",
+            "for field in [\n        passive_setup_sha256.unwrap_or_default(),\n        source_binding_sha256,\n        pair_invariants_sha256,\n        restriction_presence_binding_sha256,\n        restriction_identity_binding_sha256,\n        logon_restriction_binding_sha256,\n        authenticated_users_restriction_binding_sha256,\n        source_binding_sha256,",
+            "trace-capability-target-user-binding-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "fn classify_loader_full_observer_pair(",
+            "        shared_evidence_sha256,\n        &debug_c_trace.trace_sha256,",
+            "        source_binding_sha256,\n        &debug_c_trace.trace_sha256,",
+            "trace-capability-shared-evidence-binding-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_trace_session_capability_trigger_sha256(",
+            "fn classify_loader_full_observer_pair(",
+            "material.extend_from_slice(outcome.detail_sha256.as_bytes());",
+            "material.extend_from_slice(b\"\");",
+            "trace-capability-cell-detail-binding-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "pub(super) fn run_trace_session_capability(",
+            "pub(crate) struct PassiveAccessLocalizationObserverV1 {",
+            "start_status != ERROR_ALREADY_EXISTS",
+            "true",
+            "trace-capability-collision-claimed-absent",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "struct StartedTraceSessionCapability {",
+            "fn trace_session_capability_name(",
+            "if self.stop_status.is_none() {",
+            "if true {",
+            "trace-capability-stop-retry-enabled",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn attest_trace_session_capability_authority(",
+            "fn trace_session_capability_failure(",
+            "super::token::require_thread_token_absent(unsafe { GetCurrentThread() })?;",
+            "let _ = unsafe { GetCurrentThread() };",
+            "trace-capability-thread-token-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn validate_trace_session_capability_request(",
+            "fn run_trace_session_capability_authority_transaction(",
+            "request.start_nonce != hello.start_nonce",
+            "false",
+            "trace-capability-request-start-nonce-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn validate_trace_session_capability_request(",
+            "fn run_trace_session_capability_authority_transaction(",
+            "request.challenge != hello.challenge",
+            "false",
+            "trace-capability-request-challenge-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn validate_trace_session_capability_request(",
+            "fn run_trace_session_capability_authority_transaction(",
+            "&request.launcher_identity != launcher_identity",
+            "false",
+            "trace-capability-request-launcher-identity-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn validate_trace_session_capability_request(",
+            "fn run_trace_session_capability_authority_transaction(",
+            "request.broker_identity != hello.broker_identity",
+            "false",
+            "trace-capability-request-broker-identity-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn validate_trace_session_capability_request(",
+            "fn run_trace_session_capability_authority_transaction(",
+            "request.calculated_sha256()? != request.request_binding_sha256",
+            "false",
+            "trace-capability-request-seal-validation-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn validate_trace_session_capability_request(",
+            "fn run_trace_session_capability_authority_transaction(",
+            "!memcordon_core::windows_service_attestation_challenge_is_valid(&request.transaction_nonce)",
+            "false",
+            "trace-capability-request-replay-nonce-validation-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn run_trace_session_capability_authority_transaction(",
+            "fn run_creation_authority_transaction(",
+            "attest_trace_session_capability_authority(hello).unwrap_or_else(|error| {",
+            "Ok::<String, String>(authority_before_sha256.clone()).unwrap_or_else(|error| {",
+            "trace-capability-post-authority-reattest-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn trace_session_capability_receipt_valid_for_binding(",
+            "pub(crate) fn request_trace_session_capability(",
+            "receipt.validate_seal()?;",
+            "let _ = &receipt.receipt_sha256;",
+            "trace-capability-receipt-seal-validation-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn trace_session_capability_receipt_valid_for_binding(",
+            "pub(crate) fn request_trace_session_capability(",
+            "receipt.request_binding_sha256 == request.request_binding_sha256",
+            "true",
+            "trace-capability-receipt-request-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn trace_session_capability_receipt_valid_for_binding(",
+            "pub(crate) fn request_trace_session_capability(",
+            "receipt.broker_source_sha256 == request.broker_source_sha256",
+            "true",
+            "trace-capability-receipt-source-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn trace_session_capability_receipt_valid_for_binding(",
+            "pub(crate) fn request_trace_session_capability(",
+            "receipt.session_name_sha256 == expected_session_name_sha256",
+            "true",
+            "trace-capability-receipt-session-name-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn trace_session_capability_receipt_valid_for_binding(",
+            "pub(crate) fn request_trace_session_capability(",
+            "receipt.authority_before_sha256 == receipt.authority_after_sha256",
+            "receipt.authority_before_sha256 == receipt.authority_before_sha256",
+            "trace-capability-receipt-post-authority-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn trace_session_capability_receipt_valid_for_binding(",
+            "pub(crate) fn request_trace_session_capability(",
+            "let authority_relation = receipt.authority_equal == authority_digest_equal;",
+            "let authority_relation = true;",
+            "trace-capability-receipt-authority-flag-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn trace_session_capability_receipt_valid_for_binding(",
+            "pub(crate) fn request_trace_session_capability(",
+            "let deadline_relation =\n        receipt.deadline_exceeded == trace_session_capability_deadline_exceeded(receipt.elapsed_ms);",
+            "let deadline_relation = true;",
+            "trace-capability-receipt-deadline-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn trace_session_capability_receipt_valid_for_binding(",
+            "pub(crate) fn request_trace_session_capability(",
+            "let recomputed_state = classify_trace_session_capability_native(",
+            "let recomputed_state = receipt.state; ignore_trace_session_capability_native(",
+            "trace-capability-receipt-classifier-recomputation-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn trace_session_capability_receipt_valid_for_binding(",
+            "pub(crate) fn request_trace_session_capability(",
+            "&& trace_session_capability_native_shape(receipt)",
+            "&& true",
+            "trace-capability-receipt-closed-native-shape-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn trace_session_capability_receipt_valid_for_binding(",
+            "pub(crate) fn request_trace_session_capability(",
+            "&& receipt.state == recomputed_state",
+            "&& true",
+            "trace-capability-receipt-state-equality-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn trace_session_capability_receipt_valid_for_binding(",
+            "pub(crate) fn request_trace_session_capability(",
+            "authority_digest_equal && receipt.authority_equal && !receipt.deadline_exceeded",
+            "authority_digest_equal",
+            "trace-capability-accepted-authority-deadline-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn request_trace_session_capability(",
+            "pub(crate) fn trace_session_capability_state_for_test(",
+            "if !trace_session_capability_receipt_valid(&receipt, &request, hello)? {",
+            "if false {",
+            "trace-capability-receipt-admission-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn request_trace_session_capability(",
+            "pub(crate) fn trace_session_capability_state_for_test(",
+            "Ok(receipt) => match authenticated.retire() {",
+            "Ok(receipt) => match Ok(()) {",
+            "trace-capability-retirement-proof-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn request_trace_session_capability(",
+            "pub(crate) fn trace_session_capability_state_for_test(",
+            "Ok(receipt) => match authenticated.retire() {",
+            "Ok(mut receipt) => { receipt.state = TraceSessionCapabilityStateV1::BrokerSessionInvalid; match authenticated.retire() {",
+            "trace-capability-sealed-receipt-mutated-by-retirement",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn request_trace_session_capability(",
+            "pub(crate) fn trace_session_capability_state_for_test(",
+            "failure_sha256: Some(super::record::digest(error.as_bytes())),\n                retirement_failure_sha256: retirement_failure,",
+            "failure_sha256: retirement_failure.clone(),\n                retirement_failure_sha256: retirement_failure,",
+            "trace-capability-retirement-overwrites-primary-failure",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) struct LoaderSnapsArmedReceiptV2 {",
+            "            receipt.receipt_sha256,",
+            "            super::record::digest(b\"omitted-receipt\"),",
+            "trace-capability-rendered-receipt-digest-omitted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) struct LoaderSnapsArmedReceiptV2 {",
+            "            receipt.transaction_sha256,",
+            "            receipt.receipt_sha256,",
+            "trace-capability-rendered-transaction-binding-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) struct LoaderSnapsArmedReceiptV2 {",
+            "            receipt.broker_source_sha256,",
+            "            receipt.receipt_sha256,",
+            "trace-capability-rendered-source-binding-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) struct LoaderSnapsArmedReceiptV2 {",
+            "transaction_nonce_redacted=true",
+            "transaction_nonce_redacted=false",
+            "trace-capability-transaction-redaction-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn run_trace_session_capability_authority_transaction(",
+            "fn run_creation_authority_transaction(",
+            "    let started = Instant::now();",
+            "    AdjustTokenPrivileges();\n    let started = Instant::now();",
+            "trace-capability-privilege-enable-inserted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn run_trace_session_capability_authority_transaction(",
+            "fn run_creation_authority_transaction(",
+            "    let authority_before_sha256 = match attest_trace_session_capability_authority(hello) {",
+            "    SetNamedSecurityInfo();\n    let authority_before_sha256 = match attest_trace_session_capability_authority(hello) {",
+            "trace-capability-etw-acl-widening-inserted",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            mutated.source_mut(source),
+            start,
+            end,
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_trace_session_capability_contract(&mutated).is_err(),
+            "trace-session capability mutant {mutant} survived"
+        );
+    }
+}
+
+#[test]
+fn windows_passive_access_localization_mutations_are_rejected() {
+    let sources = WindowsLoaderControlContractSources::load();
+    validate_windows_passive_access_localization_contract(&sources)
+        .expect("unmutated passive C/F access-localization contract must be complete");
+
+    for (source, exact, replacement, mutant) in [
+        (
+            WindowsLoaderControlContractSource::Cargo,
+            "\"Win32_System_Diagnostics_Etw\"",
+            "\"Win32_System_Diagnostics_Debug\"",
+            "etw-feature-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Cargo,
+            "\"Win32_System_Time\"",
+            "\"Win32_System_SystemServices\"",
+            "etw-logfile-feature-gate-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "loader_phase: LoaderLaunchFailurePhaseV1,",
+            "loader_phase: String,",
+            "typed-loader-phase-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "error.loader_phase.diagnostic()",
+            "loader_failure_phase_from_detail(&error.detail)",
+            "loader-phase-restored-to-prose-parsing",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "GUID::from_u128(0xedd08927_9cc4_4e65_b970_c2560fb5c289)",
+            "GUID::from_u128(0)",
+            "kernel-file-provider-changed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const FILE_CREATE_EVENT_ID: u16 = 12;",
+            "const FILE_CREATE_EVENT_ID: u16 = 11;",
+            "file-create-event-id-changed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const FILE_OPERATION_END_EVENT_ID: u16 = 24;",
+            "const FILE_OPERATION_END_EVENT_ID: u16 = 23;",
+            "file-operation-end-event-id-changed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const COVERAGE: &str = \"kernel-file-create-operation-end/no-requested-access\";",
+            "const COVERAGE: &str = \"all-access/requested-access\";",
+            "coverage-overclaimed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const MAX_TRACE_EVENTS: usize = 4_096;",
+            "const MAX_TRACE_EVENTS: usize = usize::MAX;",
+            "event-bound-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const MAX_EVENT_PAYLOAD_BYTES: usize = 4_096;",
+            "const MAX_EVENT_PAYLOAD_BYTES: usize = usize::MAX;",
+            "payload-bound-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const MAX_FRONTIER_EVENTS: usize = 64;",
+            "const MAX_FRONTIER_EVENTS: usize = usize::MAX;",
+            "frontier-bound-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const MAX_SUBJECT_WINDOW: Duration = Duration::from_secs(45);",
+            "const MAX_SUBJECT_WINDOW: Duration = Duration::MAX;",
+            "time-bound-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const MAX_TRACE_SESSION: Duration = Duration::from_secs(180);",
+            "const MAX_TRACE_SESSION: Duration = Duration::MAX;",
+            "session-time-bound-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);",
+            "const DRAIN_TIMEOUT: Duration = Duration::MAX;",
+            "drain-time-bound-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const KERNEL_FILE_KEYWORD_CREATE: u64 = 0x80;",
+            "const KERNEL_FILE_KEYWORD_CREATE: u64 = 0;",
+            "create-keyword-mask-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const KERNEL_FILE_KEYWORD_OPERATION_END: u64 = 0x40;",
+            "const KERNEL_FILE_KEYWORD_OPERATION_END: u64 = 0;",
+            "operation-end-keyword-mask-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "ready_receiver.recv_timeout(READY_TIMEOUT)",
+            "Ok(())",
+            "consumer-readiness-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "KERNEL_FILE_KEYWORD_CREATE | KERNEL_FILE_KEYWORD_OPERATION_END,",
+            "0,",
+            "all-provider-keywords-enabled",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "process_id != expected_process_id",
+            "false",
+            "child-pid-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "creation_time_100ns != expected_creation_time_100ns",
+            "false",
+            "child-creation-identity-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "event.EventHeader.ProcessId != active.process_id",
+            "false",
+            "event-child-pid-filter-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "initiator_thread_id != event.EventHeader.ThreadId",
+            "false",
+            "manifest-initiator-consistency-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "tdh_property_bytes(event, \"FileName\")",
+            "tdh_property_bytes(event, \"CreateOptions\")",
+            "object-name-replaced-by-create-options",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "object_name_sha256: file_object_name_digest(&path)",
+            "object_name_sha256: String::from_utf8_lossy(&path).into_owned()",
+            "raw-object-name-retained",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "detail_sha256: super::record::digest(detail),",
+            "detail_sha256: String::from_utf8_lossy(detail).into_owned(),",
+            "unsupported-setup-detail-not-hashed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "win32_status={} operation_status={}",
+            "win32_status={} operation_status=discarded",
+            "setup-primary-status-rendering-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            ".raw_os_error()\n                .map(i64::from);",
+            ".raw_os_error()\n                .map(i64::from)\n                .or(Some(-1));",
+            "consumer-open-absent-status-invented",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "invalid: !cleanup_valid,",
+            "invalid: false,",
+            "setup-cleanup-failure-admitted",
+        ),
+        (
+            WindowsLoaderControlContractSource::LoaderDebug,
+            "command_semantics_sha256: String,",
+            "command_semantics_omitted: String,",
+            "semantic-command-receipt-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::LoaderDebug,
+            "command_semantics_sha256={} command_dynamic_fields=authenticated-private-pipe,authenticated-nonce",
+            "command_semantics_sha256={} command_dynamic_fields=raw-command",
+            "command-dynamic-redaction-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "tdh_i32_property(event, \"Status\")",
+            "tdh_i32_property(event, \"ExtraInfo\")",
+            "raw-operation-status-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "self.cleanup_performed = true;",
+            "self.cleanup_performed = false;",
+            "one-cleanup-transition-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "CloseTrace(self.processing_handle)",
+            "ERROR_SUCCESS",
+            "consumer-close-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "self.process_trace == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)",
+            "true",
+            "consumer-status-gate-weakened",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "ifeo_changed=false",
+            "ifeo_changed=true",
+            "ifeo-nonmutation-broadened",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once(mutated.source_mut(source), exact, replacement, mutant);
+        assert!(
+            validate_windows_passive_access_localization_contract(&mutated).is_err(),
+            "{mutant} survived the passive C/F access-localization contract",
+        );
+    }
+
+    for (start, end, exact, replacement, mutant) in [
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "self.classification == \"observer-unavailable\"",
+            "true",
+            "observer-unavailable-state-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "self.setup_stage == Some(PassiveAccessLocalizationSetupStageV1::SessionStart)",
+            "true",
+            "session-start-stage-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "self.setup_win32_status == Some(5)",
+            "self.setup_win32_status.is_some()",
+            "session-start-status-five-gate-weakened",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& !self.session_created",
+            "&& true",
+            "session-not-created-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& !self.provider_enable_attempted",
+            "&& true",
+            "provider-not-attempted-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& !self.consumer_opened",
+            "&& true",
+            "consumer-not-opened-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& !self.consumer_ready",
+            "&& true",
+            "consumer-not-ready-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& !self.schema_observed",
+            "&& true",
+            "schema-not-observed-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& self.cleanup_provider_disable_status.not_attempted()",
+            "&& true",
+            "provider-cleanup-absence-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& self.cleanup_stop_status.not_attempted()",
+            "&& true",
+            "stop-cleanup-absence-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& self.cleanup_close_status.not_attempted()",
+            "&& true",
+            "close-cleanup-absence-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& self.cleanup_process_trace_status.not_attempted()",
+            "&& true",
+            "process-cleanup-absence-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& self.subject_binding_sha256 == \"none\"",
+            "&& true",
+            "setup-subject-absence-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& self.frontier.is_empty()",
+            "&& true",
+            "setup-frontier-absence-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& self.cleanup_count == 0",
+            "&& true",
+            "setup-cleanup-count-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& self.canonical_events == 0",
+            "&& true",
+            "setup-canonical-event-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& self.target_user_events == 0",
+            "&& true",
+            "setup-target-event-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& self.events_lost == 0",
+            "&& true",
+            "setup-event-loss-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& !self.overflow",
+            "&& true",
+            "setup-overflow-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& self.incomplete",
+            "&& true",
+            "setup-incomplete-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& !self.invalid",
+            "&& true",
+            "setup-invalid-gate-removed",
+        ),
+        (
+            "    pub(crate) fn exact_session_start_access_denied(&self) -> bool {",
+            "impl PassiveAccessLocalizationObserverV1 {",
+            "&& !self.unsupported_schema",
+            "&& true",
+            "setup-schema-state-gate-removed",
+        ),
+        (
+            "    pub(crate) fn observer_unavailable(error: &PassiveAccessLocalizationSetupErrorV1) -> Self {",
+            "    pub(crate) fn diagnostic(&self) -> String {",
+            "&& error.cleanup_close_status.successful_or_not_attempted()",
+            "&& true",
+            "setup-close-cleanup-validation-removed",
+        ),
+        (
+            "    pub(crate) fn observer_unavailable(error: &PassiveAccessLocalizationSetupErrorV1) -> Self {",
+            "    pub(crate) fn diagnostic(&self) -> String {",
+            "&& error\n                .cleanup_process_trace_status\n                .successful_or_not_attempted();",
+            "&& true;",
+            "setup-process-cleanup-validation-removed",
+        ),
+        (
+            "impl PassiveAccessLocalizationCleanupReceiptV1 {",
+            "pub(crate) struct PassiveAccessLocalizationEvidenceV1 {",
+            "self.provider_disable\n                == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)",
+            "true",
+            "runtime-provider-disable-status-admitted",
+        ),
+        (
+            "impl PassiveAccessLocalizationCleanupReceiptV1 {",
+            "pub(crate) struct PassiveAccessLocalizationEvidenceV1 {",
+            "self.stop == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)",
+            "true",
+            "runtime-stop-status-admitted",
+        ),
+        (
+            "impl PassiveAccessLocalizationCleanupReceiptV1 {",
+            "pub(crate) struct PassiveAccessLocalizationEvidenceV1 {",
+            "self.process_trace == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)",
+            "true",
+            "runtime-process-status-admitted",
+        ),
+        (
+            "impl PassiveAccessLocalizationCleanupReceiptV1 {",
+            "pub(crate) struct PassiveAccessLocalizationEvidenceV1 {",
+            "self.close == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)",
+            "true",
+            "runtime-close-status-admitted",
+        ),
+        (
+            "    pub(crate) fn start_ready_before_child_creation()",
+            "    pub(crate) fn bind_suspended_child(",
+            "PassiveAccessLocalizationSetupStageV1::ProviderEnable,\n                Some(i64::from(enable_status)),\n                true,\n                true,\n                false,\n                false,\n                PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),",
+            "PassiveAccessLocalizationSetupStageV1::ProviderEnable,\n                Some(i64::from(enable_status)),\n                true,\n                true,\n                false,\n                false,\n                PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS),",
+            "provider-enable-stop-status-discarded",
+        ),
+        (
+            "    pub(crate) fn start_ready_before_child_creation()",
+            "    pub(crate) fn bind_suspended_child(",
+            "Some(i64::from(enable_status)),",
+            "Some(-1),",
+            "provider-enable-primary-status-discarded",
+        ),
+        (
+            "    pub(crate) fn start_ready_before_child_creation()",
+            "    pub(crate) fn bind_suspended_child(",
+            "PassiveAccessLocalizationSetupStageV1::ConsumerOpen,\n                operation_status,\n                true,\n                true,\n                false,\n                false,\n                PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),",
+            "PassiveAccessLocalizationSetupStageV1::ConsumerOpen,\n                operation_status,\n                true,\n                true,\n                false,\n                false,\n                PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS),",
+            "consumer-open-stop-status-discarded",
+        ),
+        (
+            "    pub(crate) fn start_ready_before_child_creation()",
+            "    pub(crate) fn bind_suspended_child(",
+            "PassiveAccessLocalizationSetupStageV1::ConsumerOpen,\n                operation_status,",
+            "PassiveAccessLocalizationSetupStageV1::ConsumerOpen,\n                Some(-1),",
+            "consumer-open-primary-status-discarded",
+        ),
+        (
+            "    pub(crate) fn finish(",
+            "    fn cleanup(&mut self) -> PassiveAccessLocalizationCleanupReceiptV1 {",
+            "|| state.events_lost != 0",
+            "|| false",
+            "event-loss-rejection-removed",
+        ),
+        (
+            "    pub(crate) fn finish(",
+            "    fn cleanup(&mut self) -> PassiveAccessLocalizationCleanupReceiptV1 {",
+            "|| state.overflow.is_some()",
+            "|| false",
+            "overflow-rejection-removed",
+        ),
+        (
+            "    pub(crate) fn finish(",
+            "    fn cleanup(&mut self) -> PassiveAccessLocalizationCleanupReceiptV1 {",
+            "|| state.incomplete",
+            "|| false",
+            "partial-join-rejection-removed",
+        ),
+        (
+            "    pub(crate) fn finish(",
+            "    fn cleanup(&mut self) -> PassiveAccessLocalizationCleanupReceiptV1 {",
+            "let frontier = if invalid || unsupported_schema",
+            "let frontier = if false",
+            "invalid-frontier-suppression-removed",
+        ),
+        (
+            "        FILE_CREATE_EVENT_ID",
+            "        FILE_OPERATION_END_EVENT_ID",
+            "tdh_pointer_property(event, \"Irp\")",
+            "tdh_pointer_property(event, \"FileObject\")",
+            "irp-correlation-replaced",
+        ),
+        (
+            "        FILE_OPERATION_END_EVENT_ID",
+            "        FILE_CREATE_EVENT_ID | FILE_OPERATION_END_EVENT_ID => {",
+            "state.pending.remove(&irp)",
+            "state.pending.values().next().cloned()",
+            "irp-operation-join-weakened",
+        ),
+        (
+            "fn file_object_name_digest(raw_name: &[u8]) -> String {",
+            "fn same_observed_file_operation(left: &FileOperationV1, right: &FileOperationV1) -> bool {",
+            "b\"memcordon-passive-file-object-name-v1\\0\".to_vec()",
+            "Vec::new()",
+            "object-name-hash-domain-removed",
+        ),
+        (
+            "fn same_observed_file_operation(left: &FileOperationV1, right: &FileOperationV1) -> bool {",
+            "fn classify_completed_file_pairs(",
+            "left.object_name_sha256 == right.object_name_sha256",
+            "true",
+            "object-pair-identity-removed",
+        ),
+        (
+            "fn same_observed_file_operation(left: &FileOperationV1, right: &FileOperationV1) -> bool {",
+            "fn classify_completed_file_pairs(",
+            "&& left.create_event_version == right.create_event_version",
+            "&& true",
+            "create-version-pairing-removed",
+        ),
+        (
+            "fn same_observed_file_operation(left: &FileOperationV1, right: &FileOperationV1) -> bool {",
+            "fn classify_completed_file_pairs(",
+            "&& left.operation_end_event_version == right.operation_end_event_version",
+            "&& true",
+            "operation-end-version-pairing-removed",
+        ),
+        (
+            "fn classify_completed_file_pairs(",
+            "#[derive(Debug)]",
+            "same_observed_file_operation(baseline, target)\n                    && baseline.native_status != target.native_status",
+            "baseline.native_status != target.native_status",
+            "affirmative-object-pairing-removed",
+        ),
+        (
+            "fn classify_completed_file_pairs(",
+            "#[derive(Debug)]",
+            "baseline.native_status != target.native_status",
+            "baseline.native_status == target.native_status",
+            "strict-status-differential-removed",
+        ),
+        (
+            "fn push_completed_frontier_or_invalidate(state: &mut TraceStateV1, event: FileOperationV1) {",
+            "fn admit_subject_event_budget(state: &mut TraceStateV1, payload_bytes: usize) -> bool {",
+            "state.frontier.len() >= MAX_FRONTIER_EVENTS",
+            "false",
+            "frontier-cap-removed",
+        ),
+        (
+            "fn push_completed_frontier_or_invalidate(state: &mut TraceStateV1, event: FileOperationV1) {",
+            "fn admit_subject_event_budget(state: &mut TraceStateV1, payload_bytes: usize) -> bool {",
+            "state.overflow = Some(\"frontier-bound\");",
+            "state.overflow = None;",
+            "frontier-overflow-state-removed",
+        ),
+        (
+            "fn decode_create_initiator(version: u8, bytes: &[u8]) -> Result<u32, String> {",
+            "fn tdh_i32_property(event: &EVENT_RECORD, name: &str) -> Result<i32, String> {",
+            "decode_pointer_property_bytes(bytes, \"ThreadId\")?",
+            "u64::from(u32::from_ne_bytes(bytes.try_into().unwrap()))",
+            "v0-pointer-width-decoder-removed",
+        ),
+        (
+            "impl DrainBarrierV1 {",
+            "struct TraceCallbackContext {",
+            "state.requested_epoch = state.requested_epoch.checked_add(1)?;",
+            "state.requested_epoch = state.requested_epoch;",
+            "drain-epoch-transition-removed",
+        ),
+        (
+            "impl DrainBarrierV1 {",
+            "struct TraceCallbackContext {",
+            "state.processed_buffers >= target_buffers",
+            "true",
+            "drain-watermark-comparison-removed",
+        ),
+        (
+            "unsafe extern \"system\" fn passive_file_buffer_callback(logfile: *mut EVENT_TRACE_LOGFILEW) -> u32 {",
+            "unsafe extern \"system\" fn passive_file_event_callback(event: *mut EVENT_RECORD) {",
+            "context.drain.buffer_completed();",
+            "",
+            "buffer-callback-drain-ack-removed",
+        ),
+        (
+            "impl Drop for PassiveAccessLocalizationSubjectGuardV1 {",
+            "unsafe extern \"system\" fn passive_file_buffer_callback(logfile: *mut EVENT_TRACE_LOGFILEW) -> u32 {",
+            "self.drain.wait(epoch, DRAIN_TIMEOUT)",
+            "true",
+            "bounded-drain-wait-removed",
+        ),
+        (
+            "impl Drop for PassiveAccessLocalizationSubjectGuardV1 {",
+            "unsafe extern \"system\" fn passive_file_buffer_callback(logfile: *mut EVENT_TRACE_LOGFILEW) -> u32 {",
+            "active.started.elapsed() > MAX_SUBJECT_WINDOW",
+            "false",
+            "event-independent-subject-timeout-removed",
+        ),
+        (
+            "    pub(crate) fn finish(",
+            "    fn cleanup(&mut self) -> PassiveAccessLocalizationCleanupReceiptV1 {",
+            "self.started.elapsed() > MAX_TRACE_SESSION",
+            "false",
+            "event-independent-session-timeout-removed",
+        ),
+        (
+            "        FILE_OPERATION_END_EVENT_ID",
+            "        FILE_CREATE_EVENT_ID | FILE_OPERATION_END_EVENT_ID => {",
+            "let Some(pending) = state.pending.get(&irp).cloned() else {\n                return;\n            };",
+            "let Some(pending) = state.pending.get(&irp).cloned() else {\n                state.incomplete = true;\n                return;\n            };",
+            "global-unmatched-completion-invalidates-subject",
+        ),
+        (
+            "        FILE_OPERATION_END_EVENT_ID",
+            "        FILE_CREATE_EVENT_ID | FILE_OPERATION_END_EVENT_ID => {",
+            "let Some(pending) = state.pending.get(&irp).cloned() else {",
+            "if event.EventHeader.ProcessId != active.process_id { return; }\n            let Some(pending) = state.pending.get(&irp).cloned() else {",
+            "completion-header-pid-filter-restored",
+        ),
+        (
+            "        FILE_CREATE_EVENT_ID",
+            "        FILE_OPERATION_END_EVENT_ID",
+            "let initiator_property = if descriptor.Version == 0 {\n                \"ThreadId\"\n            } else {\n                \"IssuingThreadId\"\n            };",
+            "let initiator_property = \"ThreadId\";",
+            "v1-initiator-property-replaced-by-v0",
+        ),
+        (
+            "        FILE_OPERATION_END_EVENT_ID",
+            "        FILE_CREATE_EVENT_ID | FILE_OPERATION_END_EVENT_ID => {",
+            "tdh_pointer_property(event, \"ExtraInformation\")",
+            "Ok(0)",
+            "operation-end-schema-width-proof-removed",
+        ),
+        (
+            "fn push_completed_frontier_or_invalidate(state: &mut TraceStateV1, event: FileOperationV1) {",
+            "fn admit_subject_event_budget(state: &mut TraceStateV1, payload_bytes: usize) -> bool {",
+            "state.incomplete = true;",
+            "state.incomplete = false;",
+            "frontier-truncation-invalidation-removed",
+        ),
+        (
+            "fn push_completed_frontier_or_invalidate(state: &mut TraceStateV1, event: FileOperationV1) {",
+            "fn admit_subject_event_budget(state: &mut TraceStateV1, payload_bytes: usize) -> bool {",
+            "return;",
+            "state.frontier.remove(0);",
+            "frontier-loss-restored",
+        ),
+        (
+            "unsafe extern \"system\" fn passive_file_event_callback(event: *mut EVENT_RECORD) {",
+            "fn guid_equal(left: &GUID, right: &GUID) -> bool {",
+            "let descriptor = event.EventHeader.EventDescriptor;",
+            "state.total_events = state.total_events.saturating_add(1);\n    let descriptor = event.EventHeader.EventDescriptor;",
+            "provider-global-events-consume-subject-budget",
+        ),
+        (
+            "        FILE_OPERATION_END_EVENT_ID",
+            "        FILE_CREATE_EVENT_ID | FILE_OPERATION_END_EVENT_ID => {",
+            "let Some(pending) = state.pending.get(&irp).cloned() else {\n                return;\n            };",
+            "let pending = state.pending.get(&irp).cloned().unwrap_or(PendingCreateV1 { cell: active.cell, object_name_sha256: String::new(), ordinal: 0, event_version: descriptor.Version });",
+            "global-unmatched-completion-admitted",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.access_trace,
+            start,
+            end,
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_passive_access_localization_contract(&mutated).is_err(),
+            "{mutant} survived the passive trace admission contract",
+        );
+    }
+
+    for (start, end, exact, replacement, mutant) in [
+        (
+            "    fn accept_error(",
+            "impl From<String> for TargetDesktopLeaseCreateError {",
+            "loader_phase: LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady,",
+            "loader_phase: LoaderLaunchFailurePhaseV1::Unknown,",
+            "peer-exit-owner-phase-dropped",
+        ),
+        (
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "pub(crate) fn classify_loader_restriction_presence_for_test(",
+            "super::access_trace::PassiveAccessLocalizationCellV1::CanonicalSameAccess,",
+            "super::access_trace::PassiveAccessLocalizationCellV1::TargetUser,",
+            "canonical-cell-replaced-by-target-user",
+        ),
+        (
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "pub(crate) fn classify_loader_restriction_presence_for_test(",
+            "super::access_trace::PassiveAccessLocalizationCellV1::TargetUser,",
+            "super::access_trace::PassiveAccessLocalizationCellV1::CanonicalSameAccess,",
+            "target-user-cell-replaced-by-canonical",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "    invariants_valid\n        && baseline.outcome",
+            "    true\n        && baseline.outcome",
+            "original-af-invariants-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "baseline.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "true",
+            "exact-a-outcome-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "baseline.native_status == Some(STATUS_DLL_INIT_FAILED)",
+            "true",
+            "exact-af-reproduction-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "baseline.failure_phase == \"post-resume-pre-loader-ready\"",
+            "true",
+            "exact-a-phase-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "no_restricting_sid.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+            "true",
+            "exact-b-pass-reproduction-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "same_access_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+            "true",
+            "exact-c-pass-reproduction-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "logon_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "true",
+            "exact-d-outcome-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "logon_restricted.native_status == Some(STATUS_ACCESS_DENIED)",
+            "true",
+            "exact-d-native-status-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "logon_restricted.failure_phase == \"post-resume-pre-loader-ready\"",
+            "true",
+            "exact-d-phase-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "true",
+            "exact-e-outcome-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "authenticated_users_restricted.native_status == logon_restricted.native_status",
+            "true",
+            "exact-e-native-status-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "authenticated_users_restricted.failure_phase == logon_restricted.failure_phase",
+            "true",
+            "exact-e-phase-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "target_user_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "true",
+            "exact-f-outcome-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "target_user_restricted.native_status == logon_restricted.native_status",
+            "true",
+            "exact-f-native-status-gate-removed",
+        ),
+        (
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            "struct LoaderFullObserverTraceReceiptV1 {",
+            "target_user_restricted.failure_phase == logon_restricted.failure_phase",
+            "true",
+            "exact-f-typed-phase-gate-removed",
+        ),
+        (
+            "fn loader_full_observer_trace_record(",
+            "fn loader_trace_scalar<'a>(",
+            "let marker = \"loader_trace=\";",
+            "let marker = \"loader_trace=v4\";",
+            "full-observer-trace-record-schema-selector-weakened",
+        ),
+        (
+            "fn loader_full_observer_trace_record(",
+            "fn loader_trace_scalar<'a>(",
+            "if markers.next().is_some() {",
+            "if false {",
+            "full-observer-duplicate-trace-record-admitted",
+        ),
+        (
+            "fn loader_full_observer_trace_record(",
+            "fn loader_trace_scalar<'a>(",
+            "Ok(trace)",
+            "Ok(detail)",
+            "full-observer-trace-suffix-boundary-removed",
+        ),
+        (
+            "fn loader_trace_scalar<'a>(",
+            "fn loader_trace_list_scalar<'a>(",
+            "if matches.next().is_some() {",
+            "if false {",
+            "full-observer-duplicate-field-rejection-removed",
+        ),
+        (
+            "fn loader_trace_list_scalar<'a>(",
+            "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+            "if matches.next().is_some() {",
+            "if false {",
+            "full-observer-duplicate-candidate-list-admitted",
+        ),
+        (
+            "fn loader_trace_list_scalar<'a>(",
+            "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+            "parsed.to_string() == suffix",
+            "true",
+            "full-observer-noncanonical-provenance-number-admitted",
+        ),
+        (
+            "fn loader_trace_list_scalar<'a>(",
+            "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+            "if identities.len() as u64 != retained {",
+            "if false {",
+            "full-observer-candidate-entry-count-gate-removed",
+        ),
+        (
+            "fn loader_trace_list_scalar<'a>(",
+            "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+            "if ordinal == 0 || previous_ordinal.is_some_and(|previous| ordinal <= previous) {",
+            "if previous_ordinal.is_some_and(|previous| ordinal <= previous) {",
+            "full-observer-zero-candidate-ordinal-admitted",
+        ),
+        (
+            "fn loader_trace_list_scalar<'a>(",
+            "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+            "if base == 0 {",
+            "if false {",
+            "full-observer-zero-candidate-base-admitted",
+        ),
+        (
+            "fn loader_trace_list_scalar<'a>(",
+            "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+            "if !stable_identity_set.insert(identity.sha256.clone()) {",
+            "if false {",
+            "full-observer-duplicate-stable-identity-admitted",
+        ),
+        (
+            "fn loader_trace_list_scalar<'a>(",
+            "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+            "LoaderFullObserverModulePathSourceV1::parse(path_source)",
+            "Some(LoaderFullObserverModulePathSourceV1::FileHandle)",
+            "full-observer-unknown-path-source-admitted",
+        ),
+        (
+            "fn loader_trace_list_scalar<'a>(",
+            "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+            "loader_trace_module_provenance(path_source, path_provenance)",
+            "Some(LoaderFullObserverModulePathProvenanceV1::FileHandle)",
+            "full-observer-unknown-path-provenance-admitted",
+        ),
+        (
+            "fn loader_trace_list_scalar<'a>(",
+            "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+            "if expected_path_error.is_some_and(|expected| parsed_path_error != expected) {",
+            "if false {",
+            "full-observer-path-error-provenance-mismatch-admitted",
+        ),
+        (
+            "fn loader_trace_list_scalar<'a>(",
+            "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+            "if super::loader_debug::candidate_modules_tail_digest(&canonical) != declared_sha256 {",
+            "if false {",
+            "full-observer-candidate-tail-digest-gate-removed",
+        ),
+        (
+            "fn loader_trace_list_scalar<'a>(",
+            "fn loader_trace_u64(detail: &str, field: &str) -> Result<u64, LoaderFullObserverTraceRejectionV1> {",
+            "let mut identity_material = b\"memcordon-loader-stable-module-identity-v1\\0\".to_vec();",
+            "let mut identity_material = b\"memcordon-loader-stable-module-identity-v1\\0\".to_vec();\n    identity_material.extend_from_slice(&ordinal.to_le_bytes());",
+            "full-observer-ordinal-entered-stable-identity",
+        ),
+        (
+            "fn loader_trace_bounded_tail_valid(",
+            "fn loader_trace_sha256_valid(value: &str) -> bool {",
+            "if overflow != 0 {",
+            "if false {",
+            "full-observer-tail-overflow-gate-removed",
+        ),
+        (
+            "fn loader_trace_bounded_tail_valid(",
+            "fn loader_trace_sha256_valid(value: &str) -> bool {",
+            "if count != retained {",
+            "if false {",
+            "full-observer-tail-count-retained-gate-removed",
+        ),
+        (
+            "fn loader_trace_bounded_tail_valid(",
+            "fn loader_trace_sha256_valid(value: &str) -> bool {",
+            "if retained > capacity as u64 {",
+            "if false {",
+            "full-observer-tail-capacity-gate-removed",
+        ),
+        (
+            "fn loader_trace_sha256_valid(value: &str) -> bool {",
+            "fn admit_loader_full_observer_trace(",
+            "value.len() == super::record::digest(b\"\").len()",
+            "true",
+            "full-observer-digest-length-gate-removed",
+        ),
+        (
+            "fn loader_trace_sha256_valid(value: &str) -> bool {",
+            "fn admit_loader_full_observer_trace(",
+            ".all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))",
+            ".all(|_| true)",
+            "full-observer-digest-alphabet-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            ") -> Result<LoaderFullObserverTraceReceiptV1, LoaderFullObserverTraceRejectionV1> {",
+            ") -> Option<LoaderFullObserverTraceReceiptV1> {",
+            "full-observer-typed-trace-rejection-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_full_observer_trace_record(loader_result_detail(result))?",
+            "loader_result_detail(result)",
+            "full-observer-trace-local-boundary-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "    let unknown_event_tail_sha256 = loader_trace_scalar(detail, \"unknown_event_tail_sha256\")?;",
+            "    let unknown_event_tail_sha256 = super::record::digest(b\"\");",
+            "full-observer-unknown-event-digest-scalar-admission-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "        unload_tail_sha256.as_str(),\n        unknown_event_tail_sha256,\n        exception_tail_sha256.as_str(),",
+            "        unload_tail_sha256.as_str(),\n        exception_tail_sha256.as_str(),",
+            "full-observer-unknown-event-digest-shape-admission-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_scalar(detail, \"loader_trace\")? != \"v4\"",
+            "false",
+            "full-observer-trace-version-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_scalar(detail, \"gate\")? != \"ephemeral-ci\"",
+            "false",
+            "full-observer-ephemeral-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_scalar(detail, \"drained\")? != \"true\"",
+            "false",
+            "full-observer-drain-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_scalar(detail, \"debug_cleanup\")? != \"exit-process-event-continued\"",
+            "false",
+            "full-observer-debug-cleanup-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_scalar(detail, \"create_event\")? != \"true\"",
+            "false",
+            "full-observer-create-event-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_scalar(detail, \"exit_event\")? != \"true\"",
+            "false",
+            "full-observer-exit-event-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_scalar(detail, \"command_dynamic_fields\")?\n        != \"authenticated-private-pipe,authenticated-nonce\"",
+            "false",
+            "full-observer-command-field-declaration-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "events != accounted_events",
+            "false",
+            "full-observer-event-accounting-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "events > super::loader_debug::LOADER_TRACE_EVENT_ADMISSION_MAX",
+            "false",
+            "full-observer-event-bound-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_u64(detail, \"debug_strings\")? != 0",
+            "false",
+            "full-observer-debug-string-count-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_u64(detail, \"debug_string_bytes\")? != 0",
+            "false",
+            "full-observer-debug-string-byte-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_u64(detail, \"debug_string_overflow\")? != 0",
+            "false",
+            "full-observer-debug-string-overflow-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_u64(detail, \"loader_snap_tail_count\")? != 0",
+            "false",
+            "full-observer-snap-count-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_u64(detail, \"loader_snap_tail_retained\")? != 0",
+            "false",
+            "full-observer-snap-retained-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_trace_u64(detail, \"loader_snap_tail_overflow\")? != 0",
+            "false",
+            "full-observer-snap-overflow-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            ".any(|value| !loader_trace_sha256_valid(value))",
+            ".any(|_| false)",
+            "full-observer-digest-admission-gate-removed",
+        ),
+        (
+            "fn admit_loader_full_observer_trace(",
+            "fn loader_full_observer_module_frontier(",
+            "loader_snap_tail_sha256 != super::record::digest(b\"\")",
+            "false",
+            "full-observer-empty-snap-digest-gate-removed",
+        ),
+        (
+            "fn loader_full_observer_module_frontier(",
+            "fn classify_loader_full_observer_pair(",
+            "module.stable && seen.insert(module.sha256.as_str())",
+            "seen.insert(module.sha256.as_str())",
+            "full-observer-unstable-module-frontier-admitted",
+        ),
+        (
+            "fn loader_full_observer_module_frontier(",
+            "fn classify_loader_full_observer_pair(",
+            "debug_f.stable_modules.len() < debug_c.stable_modules.len()",
+            "debug_f.stable_modules.len() <= debug_c.stable_modules.len()",
+            "full-observer-equal-module-frontier-admitted",
+        ),
+        (
+            "fn loader_full_observer_module_frontier(",
+            "fn classify_loader_full_observer_pair(",
+            "common_prefix == debug_f.stable_modules.len()",
+            "true",
+            "full-observer-nonprefix-module-frontier-admitted",
+        ),
+        (
+            "fn loader_full_observer_module_frontier(",
+            "fn classify_loader_full_observer_pair(",
+            "let useful = identities_unique_and_stable(&debug_c.stable_modules)",
+            "let useful = debug_c.exception_tail_sha256 != debug_f.exception_tail_sha256 || identities_unique_and_stable(&debug_c.stable_modules)",
+            "full-observer-exception-tail-restored-as-localizer",
+        ),
+        (
+            "fn loader_full_observer_module_frontier(",
+            "fn classify_loader_full_observer_pair(",
+            "first_c_only_identity_sha256: useful.then(|| {",
+            "first_c_only_identity_sha256: true.then(|| {",
+            "full-observer-candidate-hash-suppression-removed",
+        ),
+        (
+            "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
+            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            ".map(|(canonical, target)| loader_full_observer_module_frontier(canonical, target));",
+            ".map(|_| panic!(\"stable module frontier omitted\"));",
+            "full-observer-stable-module-frontier-derivation-removed",
+        ),
+        (
+            "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
+            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "module_frontier.as_ref().map(|frontier| frontier.useful),",
+            "Some(true),",
+            "full-observer-stable-module-frontier-classification-bypassed",
+        ),
+        (
+            "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
+            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "module_frontier.as_ref(),",
+            "None,",
+            "full-observer-stable-module-frontier-rendering-removed",
+        ),
+        (
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "pub(crate) fn classify_loader_restriction_presence_for_test(",
+            "super::access_trace::PassiveAccessLocalizationEvidenceV1::observer_unavailable(&error)",
+            "super::access_trace::PassiveAccessLocalizationEvidenceV1::observer_unavailable(&PassiveAccessLocalizationSetupErrorV1::new())",
+            "setup-cleanup-failure-detail-dropped",
+        ),
+        (
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "pub(crate) fn classify_loader_restriction_presence_for_test(",
+            "Some(evidence) if evidence.exact_session_start_access_denied()",
+            "Some(_)",
+            "typed-session-start-fallback-gate-removed",
+        ),
+        (
+            "    let debug_pair = if full_observer_fallback_allowed {",
+            "        let after_debug_c_environment = shared_environment.inventory();",
+            "let debug_c = launch_target_desktop_loader_control_cell_with_shared_environment(",
+            "let debug_c = launch_target_desktop_loader_control_cell_without_shared_environment(",
+            "full-observer-octet-debug-c-shared-borrow-removed",
+        ),
+        (
+            "    let debug_pair = if full_observer_fallback_allowed {",
+            "        let after_debug_c_environment = shared_environment.inventory();",
+            "LoaderControlMatrixCellV4::RESTRICTION_FULL_OBSERVER_SNAPS_OFF,",
+            "LoaderControlMatrixCellV4::PRODUCTION,",
+            "debug-c-observer-cell-replaced-by-production",
+        ),
+        (
+            "        let debug_f = if loader_full_observer_debug_f_allowed(",
+            "            let after_environment = shared_environment.inventory();",
+            "LoaderControlMatrixCellV4::RESTRICTION_FULL_OBSERVER_SNAPS_OFF,",
+            "LoaderControlMatrixCellV4::PRODUCTION,",
+            "debug-f-observer-cell-replaced-by-production",
+        ),
+        (
+            "    let debug_pair = if full_observer_fallback_allowed {",
+            "    let debug_environment_stable = match debug_pair.as_ref() {",
+            "same_access_restricted.raw(),",
+            "tokens.no_restricting_sid.raw(),",
+            "debug-c-token-replaced-by-b",
+        ),
+        (
+            "    let debug_pair = if full_observer_fallback_allowed {",
+            "    let debug_environment_stable = match debug_pair.as_ref() {",
+            "&same_access_snapshot,",
+            "&target_user_snapshot,",
+            "debug-c-snapshot-replaced-by-f",
+        ),
+        (
+            "    let debug_pair = if full_observer_fallback_allowed {",
+            "    let debug_environment_stable = match debug_pair.as_ref() {",
+            "target_user_restricted.raw(),",
+            "same_access_restricted.raw(),",
+            "debug-f-token-replaced-by-c",
+        ),
+        (
+            "    let debug_pair = if full_observer_fallback_allowed {",
+            "    let debug_environment_stable = match debug_pair.as_ref() {",
+            "&target_user_envelope,",
+            "&same_access_envelope,",
+            "debug-f-envelope-replaced-by-c",
+        ),
+        (
+            "    let debug_pair = if full_observer_fallback_allowed {",
+            "    let debug_environment_stable = match debug_pair.as_ref() {",
+            "\"after-debug-c\"",
+            "\"after-debug-f\"",
+            "debug-c-scan-checkpoint-replaced",
+        ),
+        (
+            "    let debug_pair = if full_observer_fallback_allowed {",
+            "    let debug_environment_stable = match debug_pair.as_ref() {",
+            "if loader_full_observer_debug_f_allowed(\n            full_observer_fallback_allowed,\n            &after_debug_c_observation,\n        ) {",
+            "if full_observer_fallback_allowed {",
+            "debug-f-prelaunch-environment-gate-removed",
+        ),
+        (
+            "        Some((debug_c, after_debug_c, Some((debug_f, after_debug_f)))) => {",
+            "        Some((debug_c, after_debug_c, None)) => {",
+            "                original_reproduction_valid,\n                original_invariants_valid,",
+            "                original_reproduction_valid,\n                invariants_valid,",
+            "full-observer-complete-original-invariants-rewired-to-aggregate",
+        ),
+        (
+            "        Some((debug_c, after_debug_c, None)) => {",
+            "        None => format!(",
+            "                original_reproduction_valid,\n                original_invariants_valid,",
+            "                original_reproduction_valid,\n                invariants_valid,",
+            "full-observer-c-only-original-invariants-rewired-to-aggregate",
+        ),
+        (
+            "fn classify_loader_full_observer_pair(",
+            "enum LoaderFullObserverInvariantStateV1 {",
+            "debug_c.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+            "true",
+            "debug-c-loader-ready-reproduction-removed",
+        ),
+        (
+            "fn classify_loader_full_observer_pair(",
+            "enum LoaderFullObserverInvariantStateV1 {",
+            "debug_f.native_status == Some(STATUS_ACCESS_DENIED)",
+            "debug_f.native_status.is_some()",
+            "debug-f-exact-status-reproduction-weakened",
+        ),
+        (
+            "fn classify_loader_full_observer_pair(",
+            "enum LoaderFullObserverInvariantStateV1 {",
+            "debug_f.failure_phase == \"post-resume-pre-loader-ready\"",
+            "true",
+            "debug-f-typed-phase-reproduction-removed",
+        ),
+        (
+            "fn classify_loader_full_observer_pair(",
+            "enum LoaderFullObserverInvariantStateV1 {",
+            "useful_frontier_differential.is_none()",
+            "false",
+            "missing-frontier-admitted",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"fallback-authority\", self.fallback_authority)",
+            "(\"fallback-authority\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-fallback-provenance-gate-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"original-reproduction\", self.original_reproduction)",
+            "(\"original-reproduction\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-original-reproduction-provenance-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"original-invariants\", self.original_invariants)",
+            "(\"original-invariants\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-original-invariants-provenance-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"original-projection\", self.original_projection)",
+            "(\"original-projection\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-original-projection-provenance-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"debug-pair-common\", self.debug_pair_common)",
+            "(\"debug-pair-common\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-debug-pair-common-provenance-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"debug-mode\", self.debug_mode)",
+            "(\"debug-mode\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-debug-mode-provenance-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"debug-c-trace-admission\", self.debug_c_trace_admission)",
+            "(\"debug-c-trace-admission\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-debug-c-trace-provenance-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"debug-f-trace-admission\", self.debug_f_trace_admission)",
+            "(\"debug-f-trace-admission\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-debug-f-trace-provenance-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"debug-containment\", self.debug_containment)",
+            "(\"debug-containment\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-debug-containment-provenance-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"post-debug-c-environment\", self.post_debug_c_environment)",
+            "(\"post-debug-c-environment\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-post-debug-c-provenance-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"post-debug-f-environment\", self.post_debug_f_environment)",
+            "(\"post-debug-f-environment\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-post-debug-f-provenance-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "(\"profile-stability\", self.profile_stability)",
+            "(\"profile-stability\", LoaderFullObserverInvariantStateV1::Passed)",
+            "full-observer-profile-provenance-removed",
+        ),
+        (
+            "impl LoaderFullObserverInvariantReceiptV1 {",
+            "fn render_loader_full_observer_diagnostic(",
+            "\"environment-destruction-once\",\n                self.environment_destruction_once,",
+            "\"environment-destruction-once\",\n                LoaderFullObserverInvariantStateV1::Passed,",
+            "full-observer-destruction-provenance-removed",
+        ),
+        (
+            "    let debug_preserved_field_names = [",
+            "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
+            "\"object_security_authority\",",
+            "\"unused_field\",",
+            "debug-object-security-projection-dropped",
+        ),
+        (
+            "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
+            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "loader_common_result_field(&same_access, debug_c, field).is_ok()",
+            "true",
+            "debug-c-original-projection-check-removed",
+        ),
+        (
+            "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
+            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "== Some(\"0x00080406\")",
+            "== Some(\"0x00080402\")",
+            "debug-creation-flags-changed",
+        ),
+        (
+            "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
+            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "let detail_hash =\n                |label: &[u8], result: &Result<String, TargetDesktopLeaseCreateError>| {\n                    let mut material =\n                        b\"memcordon-loader-observer-perturbation-detail-v1\\0\".to_vec();",
+            "let detail_hash =\n                |label: &[u8], result: &Result<String, TargetDesktopLeaseCreateError>| {\n                    let mut material = Vec::new();",
+            "debug-detail-hash-domain-dropped",
+        ),
+        (
+            "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
+            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "&debug_invariants,\n                    debug_pair_job_empty_exact,",
+            "&debug_invariants,\n                    debug_containment_exact,",
+            "debug-job-empty-reconnected-to-containment-aggregate",
+        ),
+        (
+            "fn render_loader_full_observer_diagnostic(",
+            "fn loader_full_observer_invariants_valid(",
+            "Err(rejection) => rejection.diagnostic()",
+            "Err(_) => \"admitted\".to_owned()",
+            "full-observer-trace-rejection-mapped-to-admitted",
+        ),
+        (
+            "fn render_loader_full_observer_diagnostic(",
+            "fn loader_full_observer_invariants_valid(",
+            "trace_admission(Some(debug_c_trace))",
+            "\"omitted\".to_owned()",
+            "full-observer-debug-c-rejection-provenance-omitted",
+        ),
+        (
+            "fn render_loader_full_observer_diagnostic(",
+            "fn loader_full_observer_invariants_valid(",
+            "trace_admission(debug_f_trace)",
+            "\"omitted\".to_owned()",
+            "full-observer-debug-f-rejection-provenance-omitted",
+        ),
+        (
+            "fn render_loader_full_observer_diagnostic(",
+            "fn loader_full_observer_invariants_valid(",
+            "let failed_invariants = invariants.failed_diagnostic();",
+            "let failed_invariants = String::new();",
+            "full-observer-failed-invariant-provenance-omitted",
+        ),
+        (
+            "fn render_loader_full_observer_diagnostic(",
+            "fn loader_full_observer_invariants_valid(",
+            "debug_c_trace_admission={} debug_f_trace_admission={}",
+            "raw_trace={} debug_f_trace_admission={}",
+            "full-observer-raw-trace-label-introduced",
+        ),
+        (
+            "fn render_loader_full_observer_diagnostic(",
+            "fn loader_full_observer_invariants_valid(",
+            "if state == \"observer-perturbed-inconclusive\" {",
+            "if false {",
+            "full-observer-inconclusive-frontier-suppression-removed",
+        ),
+        (
+            "fn render_loader_full_observer_diagnostic(",
+            "fn loader_full_observer_invariants_valid(",
+            "\"last-common\" if frontier.useful => frontier.last_common_identity_sha256.as_ref(),",
+            "\"last-common\" => frontier.last_common_identity_sha256.as_ref(),",
+            "full-observer-nonlocalizing-last-common-identity-suppression-removed",
+        ),
+        (
+            "fn render_loader_full_observer_diagnostic(",
+            "fn loader_full_observer_invariants_valid(",
+            "requested_access_available=false",
+            "requested_access_available=true",
+            "debug-requested-access-overclaimed",
+        ),
+        (
+            "fn render_loader_full_observer_diagnostic(",
+            "fn loader_full_observer_invariants_valid(",
+            "primary_failure=original-a",
+            "primary_failure=debug-f",
+            "debug-primary-failure-replaced",
+        ),
+        (
+            "fn render_loader_full_observer_diagnostic(",
+            "fn loader_full_observer_invariants_valid(",
+            "qualification_promoted=false",
+            "qualification_promoted=true",
+            "debug-diagnostic-promoted",
+        ),
+        (
+            "    let debug_environment_stable = match debug_pair.as_ref() {",
+            "    let presence_state = classify_loader_restriction_presence_outcomes(",
+            "let environment_destruction = shared_environment.destroy_after_create();",
+            "let environment_destruction = Ok(());",
+            "shared-userenv-destroy-removed-after-debug-f",
+        ),
+        (
+            "fn launch_target_desktop_loader_control_cell_inner(",
+            "fn launch_target_desktop_probe(",
+            "observer.bind_suspended_child(",
+            "observer.bind_unverified_child(",
+            "pre-resume-child-binding-removed",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.process,
+            start,
+            end,
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_passive_access_localization_contract(&mutated).is_err(),
+            "{mutant} survived the passive C/F process integration contract",
+        );
+    }
+
+    let mut raw_candidate_tail_digest = sources.clone();
+    replace_windows_source_once(
+        &mut raw_candidate_tail_digest.loader_debug,
+        "candidate_modules_tail_digest(&modules)",
+        "super::record::digest(modules.as_bytes())",
+        "full-observer-candidate-tail-domain-binding-removed",
+    );
+    assert!(
+        validate_windows_passive_access_localization_contract(&raw_candidate_tail_digest).is_err(),
+        "raw candidate-tail digest survived the passive C/F contract",
+    );
+}
+
+#[test]
+fn windows_shared_userenv_restriction_presence_mutations_are_rejected() {
+    let sources = WindowsLoaderControlContractSources::load();
+    validate_windows_shared_userenv_restriction_presence_contract(&sources.process, &sources.token)
+        .expect("unmutated shared Userenv restriction-presence contract must be complete");
+
+    for (start, end, exact, replacement, mutant) in [
+        (
+            "pub(crate) fn canonical_same_access_restricting_sids(token: HANDLE) -> Result<Vec<String>, String> {",
+            "pub(crate) fn nested_initial_thread_token_for_test() -> Result<OwnedHandle, String> {",
+            "if sids.windows(2).any(|pair| pair[0] == pair[1]) {",
+            "if false {",
+            "canonical-same-access-duplicate-rejection-removed",
+        ),
+        (
+            "pub(crate) fn canonical_same_access_restricting_sids(token: HANDLE) -> Result<Vec<String>, String> {",
+            "pub(crate) fn nested_initial_thread_token_for_test() -> Result<OwnedHandle, String> {",
+            "    sids.sort();",
+            "    sids.sort();\n    sids.dedup();",
+            "canonical-same-access-duplicates-silently-deduplicated",
+        ),
+        (
+            "pub(crate) fn loader_restriction_identity_sibling_from_presence_comparison(",
+            "fn validate_loader_restriction_identity_triplet(",
+            "canonical_same_access_restricting_sids(no_restricting_sid)?;",
+            "canonical_same_access_restricting_sids(baseline)?;",
+            "same-access-inventory-derived-from-baseline",
+        ),
+        (
+            "pub(crate) fn loader_restriction_identity_sibling_from_presence_comparison(",
+            "fn validate_loader_restriction_identity_triplet(",
+            "restricted_same_access_primary(no_restricting_sid)?;",
+            "restricted_same_access_primary(baseline)?;",
+            "same-access-token-derived-from-baseline",
+        ),
+        (
+            "pub(crate) fn loader_restriction_identity_sibling_from_presence_comparison(",
+            "fn validate_loader_restriction_identity_triplet(",
+            ".map(|sid| (sid.clone(), NORMALIZED_RESTRICTING_SID_ATTRIBUTES))",
+            ".map(|sid| (sid.clone(), 0))",
+            "same-access-normalized-attributes-dropped",
+        ),
+        (
+            "fn validate_loader_restriction_identity_triplet(",
+            "fn loader_restriction_identity_binding_sha256(",
+            "no_restricting_sid_invariants != same_access_invariants",
+            "false",
+            "same-access-nontreatment-invariants-dropped",
+        ),
+        (
+            "fn validate_loader_restriction_identity_triplet(",
+            "fn loader_restriction_identity_binding_sha256(",
+            "same_access_inventory.trustees != expected_restricting_sids",
+            "!same_access_inventory.trustees.iter().all(|sid| expected_restricting_sids.contains(sid))",
+            "same-access-trustee-subset-admitted",
+        ),
+        (
+            "fn validate_loader_restriction_identity_triplet(",
+            "fn loader_restriction_identity_binding_sha256(",
+            "same_access_inventory.entries != expected_restricting_entries",
+            "false",
+            "same-access-typed-entry-equality-dropped",
+        ),
+        (
+            "fn validate_loader_restriction_identity_triplet(",
+            "fn loader_restriction_identity_binding_sha256(",
+            "!same_access_snapshot.behavior.token_is_restricted",
+            "false",
+            "same-access-restricted-state-dropped",
+        ),
+        (
+            "fn loader_restriction_identity_binding_sha256(",
+            "struct TokenLogonSidGroupEvidenceV1 {",
+            "same_access_snapshot,",
+            "baseline_snapshot,",
+            "same-access-complete-snapshot-removed-from-binding",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.token,
+            start,
+            end,
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the same-access restriction identity contract",
+        );
+    }
+
+    let mut public_raw_constructor = sources.clone();
+    replace_windows_source_once(
+        &mut public_raw_constructor.token,
+        "fn restricted_same_access_primary(source: HANDLE) -> Result<OwnedHandle, String> {",
+        "pub(crate) fn restricted_same_access_primary(source: HANDLE) -> Result<OwnedHandle, String> {",
+        "raw-same-access-constructor-made-crate-visible",
+    );
+    assert!(
+        validate_windows_shared_userenv_restriction_presence_contract(
+            &public_raw_constructor.process,
+            &public_raw_constructor.token,
+        )
+        .is_err(),
+        "crate-visible raw same-access constructor survived the identity contract",
+    );
+
+    for (exact, replacement, mutant) in [
+        (
+            "let [source_entry] = candidates.as_slice() else {",
+            "let source_entry = candidates.first().unwrap();",
+            "target-logon-raw-cardinality-dropped",
+        ),
+        (
+            "source_entry.Attributes & SE_GROUP_ENABLED as u32 == 0",
+            "false",
+            "target-logon-enabled-check-dropped",
+        ),
+        (
+            "source_entry.Attributes & SE_GROUP_USE_FOR_DENY_ONLY_ATTRIBUTES != 0",
+            "false",
+            "target-logon-deny-only-check-dropped",
+        ),
+        (
+            "validate_token_logon_sid_attributes(logon_entry.Attributes)?;",
+            "let _ = logon_entry.Attributes;",
+            "TokenLogonSid-marker-check-dropped",
+        ),
+        (
+            "if unsafe { EqualSid(source_entry.Sid, logon_entry.Sid) } == 0 {",
+            "if false {",
+            "target-logon-raw-PSID-equality-dropped",
+        ),
+        (
+            "if unsafe { EqualSid(source_entry.Sid, logon_entry.Sid) } == 0 {",
+            "if sid_string(source_entry.Sid).is_ok_and(|sid| sid == sid_string(logon_entry.Sid).unwrap()) {",
+            "target-logon-string-reselection-restored",
+        ),
+        (
+            "Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,",
+            "Attributes: NORMALIZED_RESTRICTING_SID_ATTRIBUTES,",
+            "target-logon-native-input-attributes-normalized-early",
+        ),
+        (
+            "CreateRestrictedToken(\n            source,\n            0,",
+            "CreateRestrictedToken(\n            source,\n            WRITE_RESTRICTED,",
+            "target-logon-create-flags-changed",
+        ),
+        (
+            "1,\n            &raw const restricting_sid,",
+            "0,\n            &raw const restricting_sid,",
+            "target-logon-native-singleton-count-dropped",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.token,
+            "fn restricted_logon_sid_primary(",
+            "fn authenticated_users_sid() -> Result<QueryBuffer, String> {",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the raw target-logon constructor contract",
+        );
+    }
+
+    let mut public_logon_constructor = sources.clone();
+    replace_windows_source_once(
+        &mut public_logon_constructor.token,
+        "fn restricted_logon_sid_primary(\n    source: HANDLE,",
+        "pub(crate) fn restricted_logon_sid_primary(\n    source: HANDLE,",
+        "raw-target-logon-constructor-made-crate-visible",
+    );
+    assert!(
+        validate_windows_shared_userenv_restriction_presence_contract(
+            &public_logon_constructor.process,
+            &public_logon_constructor.token,
+        )
+        .is_err(),
+        "crate-visible raw target-logon constructor survived the contract",
+    );
+
+    for (exact, replacement, mutant) in [
+        (
+            "Some(expected_restriction_identity_binding_sha256),\n    )?;\n    let (logon_restricted, source_logon_group)",
+            "None,\n    )?;\n    let (logon_restricted, source_logon_group)",
+            "target-logon-identity-binding-check-dropped",
+        ),
+        (
+            "restricted_logon_sid_primary(no_restricting_sid)?;",
+            "restricted_logon_sid_primary(baseline)?;",
+            "target-logon-derived-from-baseline",
+        ),
+        (
+            "no_restricting_sid_invariants != logon_invariants",
+            "false",
+            "target-logon-BD-invariants-dropped",
+        ),
+        (
+            "baseline_invariants != logon_invariants",
+            "false",
+            "target-logon-AD-invariants-dropped",
+        ),
+        (
+            "!logon_snapshot.behavior.token_is_restricted",
+            "false",
+            "target-logon-restricted-state-dropped",
+        ),
+        (
+            "logon_inventory.entries != expected_logon_entries",
+            "false",
+            "target-logon-typed-entry-equality-dropped",
+        ),
+        (
+            "logon_inventory.trustees != vec![source_logon_group.sid.clone()]",
+            "!logon_inventory.trustees.contains(&source_logon_group.sid)",
+            "target-logon-singleton-trustee-equality-dropped",
+        ),
+        (
+            "logon_snapshot.behavior.enabled_sensitive_privilege_count != 0",
+            "false",
+            "target-logon-sensitive-privilege-check-dropped",
+        ),
+        (
+            "source_logon_group,\n        expected_same_access_entries,",
+            "expected_logon_entries,\n        expected_same_access_entries,",
+            "target-logon-raw-source-proof-unbound",
+        ),
+        (
+            "same_access_snapshot,\n        logon_snapshot,\n    ))",
+            "same_access_snapshot,\n        same_access_snapshot,\n    ))",
+            "target-logon-complete-snapshot-unbound",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.token,
+            "pub(crate) fn loader_logon_restriction_sibling_from_identity_comparison(",
+            "pub(crate) fn validate_transferred_loader_profile_capability(",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the authenticated target-logon sibling contract",
+        );
+    }
+
+    for (exact, replacement, mutant) in [
+        (
+            "if presence_state != \"restricting-sid-presence-causal\" {",
+            "if false {",
+            "same-access-classifier-ignores-ab-treatment",
+        ),
+        (
+            "same_access_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+            "same_access_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "same-access-classifier-pass-branch-inverted",
+        ),
+        (
+            "same_access_restricted.native_status == baseline.native_status",
+            "true",
+            "same-access-classifier-native-frontier-dropped",
+        ),
+        (
+            "same_access_restricted.failure_phase == baseline.failure_phase",
+            "true",
+            "same-access-classifier-phase-frontier-dropped",
+        ),
+        (
+            "\"restricted-token-or-canonical-inventory-causal\"",
+            "\"generic-restricted-token-semantics-causal\"",
+            "same-access-classifier-overclaims-generic-token-cause",
+        ),
+        (
+            "\"differing-inconclusive\"",
+            "\"restricted-token-or-canonical-inventory-causal\"",
+            "same-access-classifier-promotes-other-failures",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.process,
+            "fn classify_loader_restriction_identity_outcomes(",
+            "fn classify_loader_restriction_logon_outcomes(",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the restriction identity classifier contract",
+        );
+    }
+
+    for (exact, replacement, mutant) in [
+        (
+            "WinAuthenticatedUserSid,",
+            "WinLocalSid,",
+            "authenticated-users-well-known-SID-changed",
+        ),
+        (
+            "(unsafe { EqualSid(entry.Sid, expected_sid) }) != 0",
+            "sid_string(entry.Sid).is_ok_and(|sid| sid == AUTHENTICATED_USERS_SID)",
+            "authenticated-users-string-reselection-restored",
+        ),
+        (
+            "let [entry] = matches.as_slice() else {",
+            "let entry = matches.first().unwrap();",
+            "authenticated-users-raw-cardinality-dropped",
+        ),
+        (
+            "if attributes != NORMALIZED_RESTRICTING_SID_ATTRIBUTES {",
+            "if false {",
+            "authenticated-users-exact-source-attributes-dropped",
+        ),
+        (
+            "let canonical = query(canonical_same_access, TokenRestrictedSids)?;",
+            "let canonical = query(canonical_same_access, TokenGroups)?;",
+            "authenticated-users-canonical-membership-query-dropped",
+        ),
+        (
+            "let canonical_entry = exact_equal_sid_entry(",
+            "let canonical_entry = source_entry; let _removed = exact_equal_sid_entry_removed(",
+            "authenticated-users-canonical-raw-membership-dropped",
+        ),
+        (
+            "Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,",
+            "Attributes: NORMALIZED_RESTRICTING_SID_ATTRIBUTES,",
+            "authenticated-users-native-input-attributes-normalized-early",
+        ),
+        (
+            "CreateRestrictedToken(\n            source,\n            0,",
+            "CreateRestrictedToken(\n            canonical_same_access,\n            0,",
+            "authenticated-users-derived-from-canonical-token",
+        ),
+        (
+            "CreateRestrictedToken(\n            source,\n            0,",
+            "CreateRestrictedToken(\n            source,\n            WRITE_RESTRICTED,",
+            "authenticated-users-create-flags-changed",
+        ),
+        (
+            "1,\n            &raw const restricting_sid,",
+            "0,\n            &raw const restricting_sid,",
+            "authenticated-users-native-singleton-count-dropped",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.token,
+            "fn authenticated_users_sid() -> Result<QueryBuffer, String> {",
+            "struct TargetUserGroupEvidenceV1 {",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the raw Authenticated Users constructor contract",
+        );
+    }
+
+    let mut public_authenticated_users_constructor = sources.clone();
+    replace_windows_source_once(
+        &mut public_authenticated_users_constructor.token,
+        "fn restricted_authenticated_users_primary(\n    source: HANDLE,",
+        "pub(crate) fn restricted_authenticated_users_primary(\n    source: HANDLE,",
+        "raw-authenticated-users-constructor-made-crate-visible",
+    );
+    assert!(
+        validate_windows_shared_userenv_restriction_presence_contract(
+            &public_authenticated_users_constructor.process,
+            &public_authenticated_users_constructor.token,
+        )
+        .is_err(),
+        "crate-visible raw Authenticated Users constructor survived the contract",
+    );
+
+    for (exact, replacement, mutant) in [
+        (
+            "if user.len() < std::mem::size_of::<windows_sys::Win32::Security::TOKEN_USER>() {",
+            "if false {",
+            "target-user-raw-buffer-size-check-dropped",
+        ),
+        (
+            ".cast::<windows_sys::Win32::Security::TOKEN_USER>()",
+            ".cast::<windows_sys::Win32::Security::TOKEN_GROUPS>()",
+            "target-user-raw-buffer-type-changed",
+        ),
+        (
+            "if entry.Sid.is_null() || unsafe { IsValidSid(entry.Sid) } == 0 {",
+            "if false {",
+            "target-user-null-valid-SID-check-dropped",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.token,
+            "fn token_user_entry(user: &QueryBuffer) -> Result<SID_AND_ATTRIBUTES, String> {",
+            "fn validate_authenticated_users_attributes(attributes: u32, role: &str) -> Result<(), String> {",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived raw TokenUser admission",
+        );
+    }
+
+    for (exact, replacement, mutant) in [
+        (
+            "let user = query(source, TokenUser)?;",
+            "let user = query(source, TokenGroups)?;",
+            "target-user-constructor-TokenUser-authority-dropped",
+        ),
+        (
+            "let source_entry = token_user_entry(&user)?;",
+            "let source_entry = unsafe { ptr::read_unaligned(user.as_ptr().cast()) };",
+            "target-user-constructor-raw-user-validation-dropped",
+        ),
+        (
+            "let canonical = query(canonical_same_access, TokenRestrictedSids)?;",
+            "let canonical = query(canonical_same_access, TokenGroups)?;",
+            "target-user-constructor-C-inventory-authority-dropped",
+        ),
+        (
+            "let canonical_entry = exact_equal_sid_entry_for_trustee(",
+            "let canonical_entry = exact_equal_sid_entry_by_display_string(",
+            "target-user-constructor-display-string-authority-restored",
+        ),
+        (
+            "if canonical_entry.Attributes != NORMALIZED_RESTRICTING_SID_ATTRIBUTES {",
+            "if canonical_entry.Attributes & NORMALIZED_RESTRICTING_SID_ATTRIBUTES == 0 {",
+            "target-user-constructor-C-exact-attributes-weakened",
+        ),
+        (
+            "Sid: source_entry.Sid,",
+            "Sid: canonical_entry.Sid,",
+            "target-user-constructor-live-B-pointer-replaced",
+        ),
+        (
+            "Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,",
+            "Attributes: NORMALIZED_RESTRICTING_SID_ATTRIBUTES,",
+            "target-user-constructor-input-attributes-normalized-early",
+        ),
+        (
+            "CreateRestrictedToken(\n            source,\n            0,",
+            "CreateRestrictedToken(\n            canonical_same_access,\n            0,",
+            "target-user-constructor-derived-from-C",
+        ),
+        (
+            "CreateRestrictedToken(\n            source,\n            0,",
+            "CreateRestrictedToken(\n            source,\n            WRITE_RESTRICTED,",
+            "target-user-constructor-flags-changed",
+        ),
+        (
+            "            0,\n            ptr::null(),\n            0,\n            ptr::null(),\n            1,\n            &raw const restricting_sid,",
+            "            1,\n            ptr::null(),\n            0,\n            ptr::null(),\n            1,\n            &raw const restricting_sid,",
+            "target-user-constructor-disabled-SID-count-added",
+        ),
+        (
+            "            0,\n            ptr::null(),\n            0,\n            ptr::null(),\n            1,\n            &raw const restricting_sid,",
+            "            0,\n            ptr::null(),\n            1,\n            ptr::null(),\n            1,\n            &raw const restricting_sid,",
+            "target-user-constructor-deleted-privilege-count-added",
+        ),
+        (
+            "            1,\n            &raw const restricting_sid,",
+            "            2,\n            &raw const restricting_sid,",
+            "target-user-constructor-singleton-width-changed",
+        ),
+        (
+            "if !token_has_exact_restricting_sid_equal_sid(",
+            "if !token_has_exact_restricting_sid_equal_sid_removed(",
+            "target-user-constructor-raw-output-attestation-dropped",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.token,
+            "fn restricted_target_user_primary(",
+            "pub(crate) fn validate_authenticated_users_matches_for_test(",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the raw target-user constructor contract",
+        );
+    }
+
+    let mut public_target_user_constructor = sources.clone();
+    replace_windows_source_once(
+        &mut public_target_user_constructor.token,
+        "fn restricted_target_user_primary(\n    source: HANDLE,",
+        "pub(crate) fn restricted_target_user_primary(\n    source: HANDLE,",
+        "raw-target-user-constructor-made-crate-visible",
+    );
+    assert!(
+        validate_windows_shared_userenv_restriction_presence_contract(
+            &public_target_user_constructor.process,
+            &public_target_user_constructor.token,
+        )
+        .is_err(),
+        "crate-visible raw target-user constructor survived the contract",
+    );
+
+    for (exact, replacement, mutant) in [
+        (
+            "Some(expected_logon_restriction_binding_sha256),\n    )?;\n    let (authenticated_users_restricted",
+            "None,\n    )?;\n    let (authenticated_users_restricted",
+            "authenticated-users-upstream-logon-binding-check-dropped",
+        ),
+        (
+            "restricted_authenticated_users_primary(no_restricting_sid, same_access_restricted)?;",
+            "restricted_authenticated_users_primary(baseline, same_access_restricted)?;",
+            "authenticated-users-derived-from-baseline",
+        ),
+        (
+            "restricted_authenticated_users_primary(no_restricting_sid, same_access_restricted)?;",
+            "restricted_authenticated_users_primary(no_restricting_sid, no_restricting_sid)?;",
+            "authenticated-users-canonical-membership-token-replaced",
+        ),
+        (
+            "if !token_has_exact_restricting_sid_equal_sid(",
+            "if !token_has_exact_restricting_sid_equal_sid_removed(",
+            "authenticated-users-raw-output-equality-dropped",
+        ),
+        (
+            "no_restricting_sid_invariants != authenticated_users_invariants",
+            "false",
+            "authenticated-users-BE-invariants-dropped",
+        ),
+        (
+            "baseline_invariants != authenticated_users_invariants",
+            "false",
+            "authenticated-users-AE-invariants-dropped",
+        ),
+        (
+            "!authenticated_users_snapshot.behavior.token_is_restricted",
+            "false",
+            "authenticated-users-restricted-state-dropped",
+        ),
+        (
+            "authenticated_users_inventory.entries != expected_authenticated_users_entries",
+            "false",
+            "authenticated-users-typed-entry-equality-dropped",
+        ),
+        (
+            "authenticated_users_inventory.trustees\n            != vec![source_authenticated_users_group.sid.clone()]",
+            "!authenticated_users_inventory\n            .trustees\n            .contains(&source_authenticated_users_group.sid)",
+            "authenticated-users-singleton-trustee-equality-dropped",
+        ),
+        (
+            "authenticated_users_snapshot\n            .behavior\n            .enabled_sensitive_privilege_count\n            != 0",
+            "false",
+            "authenticated-users-sensitive-privilege-check-dropped",
+        ),
+        (
+            "source_binding_sha256,\n            restriction_presence_binding_sha256,\n            restriction_identity_binding_sha256,\n            logon_restriction_binding_sha256,",
+            "source_binding_sha256,\n            restriction_presence_binding_sha256,\n            restriction_identity_binding_sha256,",
+            "authenticated-users-upstream-binding-unbound",
+        ),
+        (
+            "source_logon_group,\n            source_authenticated_users_group,",
+            "source_logon_group,\n            source_logon_group,",
+            "authenticated-users-raw-source-proof-unbound",
+        ),
+        (
+            "expected_logon_entries,\n            expected_authenticated_users_entries,",
+            "expected_logon_entries,\n            expected_logon_entries,",
+            "authenticated-users-typed-inventory-unbound",
+        ),
+        (
+            "logon_snapshot,\n            authenticated_users_snapshot,",
+            "logon_snapshot,\n            logon_snapshot,",
+            "authenticated-users-complete-snapshot-unbound",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.token,
+            "pub(crate) fn loader_authenticated_users_restriction_sibling_from_logon_comparison(",
+            "pub(crate) fn loader_target_user_restriction_sibling_from_authenticated_users_comparison(",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the authenticated E sibling contract",
+        );
+    }
+
+    for (exact, replacement, mutant) in [
+        (
+            "Some(expected_authenticated_users_restriction_binding_sha256),\n    )?;\n    let (target_user_restricted",
+            "None,\n    )?;\n    let (target_user_restricted",
+            "target-user-upstream-E-binding-check-dropped",
+        ),
+        (
+            "restricted_target_user_primary(no_restricting_sid, same_access_restricted)?;",
+            "restricted_target_user_primary(baseline, same_access_restricted)?;",
+            "target-user-derived-from-baseline",
+        ),
+        (
+            "restricted_target_user_primary(no_restricting_sid, same_access_restricted)?;",
+            "restricted_target_user_primary(no_restricting_sid, no_restricting_sid)?;",
+            "target-user-C-membership-token-replaced",
+        ),
+        (
+            "let observed_target_user =\n        target_user_group_evidence(no_restricting_sid, same_access_restricted)?;",
+            "let observed_target_user = source_target_user.clone();",
+            "target-user-immediate-raw-authority-reattestation-dropped",
+        ),
+        (
+            "if !token_has_exact_restricting_sid_equal_sid(",
+            "if !token_has_exact_restricting_sid_equal_sid_removed(",
+            "target-user-wrapper-raw-output-equality-dropped",
+        ),
+        (
+            "LoaderRestrictionPairInvariantsV1::from_snapshot(&validation.no_restricting_sid_snapshot)\n        .without_restricting_sid_inventory()\n        != target_user_invariants",
+            "false",
+            "target-user-BF-invariants-dropped",
+        ),
+        (
+            "LoaderRestrictionPairInvariantsV1::from_snapshot(&validation.baseline_snapshot)\n            .without_restricting_sid_inventory()\n            != target_user_invariants",
+            "false",
+            "target-user-AF-invariants-dropped",
+        ),
+        (
+            "!target_user_snapshot.behavior.token_is_restricted",
+            "false",
+            "target-user-restricted-state-dropped",
+        ),
+        (
+            "target_user_inventory.entries != expected_target_user_entries",
+            "!target_user_inventory.entries.contains(&expected_target_user_entries[0])",
+            "target-user-typed-singleton-equality-weakened",
+        ),
+        (
+            "target_user_inventory.trustees != vec![source_target_user.sid.clone()]",
+            "!target_user_inventory.trustees.contains(&source_target_user.sid)",
+            "target-user-trustee-singleton-equality-weakened",
+        ),
+        (
+            "target_user_snapshot\n            .behavior\n            .enabled_sensitive_privilege_count\n            != 0",
+            "false",
+            "target-user-sensitive-privilege-check-dropped",
+        ),
+        (
+            "    }\n    let validation = validate_loader_authenticated_users_restriction_quintuplet(",
+            "    }\n    let validation = validate_loader_authenticated_users_restriction_quintuplet_removed(",
+            "target-user-post-derivation-upstream-reattestation-dropped",
+        ),
+        (
+            "target_user_group_evidence(no_restricting_sid, same_access_restricted)? != source_target_user",
+            "false",
+            "target-user-post-derivation-raw-authority-stability-dropped",
+        ),
+        (
+            "\"memcordon-loader-target-user-restriction-v1\"",
+            "\"memcordon-loader-target-user-restriction-unbound\"",
+            "target-user-binding-domain-changed",
+        ),
+        (
+            "expected_logon_restriction_binding_sha256,\n            expected_authenticated_users_restriction_binding_sha256,",
+            "expected_logon_restriction_binding_sha256,",
+            "target-user-upstream-E-binding-unbound",
+        ),
+        (
+            "&validation.source_authenticated_users_group,\n            &source_target_user,",
+            "&validation.source_authenticated_users_group,\n            &validation.source_authenticated_users_group,",
+            "target-user-raw-source-evidence-unbound",
+        ),
+        (
+            "&validation.expected_authenticated_users_entries,\n            &expected_target_user_entries,",
+            "&validation.expected_authenticated_users_entries,\n            &validation.expected_authenticated_users_entries,",
+            "target-user-typed-inventory-unbound",
+        ),
+        (
+            "&validation.authenticated_users_snapshot,\n            &target_user_snapshot,",
+            "&validation.authenticated_users_snapshot,\n            &validation.authenticated_users_snapshot,",
+            "target-user-complete-snapshot-unbound",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.token,
+            "pub(crate) fn loader_target_user_restriction_sibling_from_authenticated_users_comparison(",
+            "pub(crate) fn validate_transferred_loader_profile_capability(",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the authenticated F sibling contract",
+        );
+    }
+
+    for (exact, replacement, mutant) in [
+        (
+            "if identity_state != \"restricted-code-sid-narrowing-causal\" {",
+            "if false {",
+            "target-logon-classifier-ignores-ABC-control",
+        ),
+        (
+            "logon_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+            "logon_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "target-logon-classifier-pass-branch-inverted",
+        ),
+        (
+            "logon_restricted.native_status == baseline.native_status",
+            "true",
+            "target-logon-classifier-native-frontier-dropped",
+        ),
+        (
+            "logon_restricted.failure_phase == baseline.failure_phase",
+            "true",
+            "target-logon-classifier-phase-frontier-dropped",
+        ),
+        (
+            "\"differing-inconclusive\"",
+            "\"canonical-broader-group-or-union-required\"",
+            "target-logon-classifier-promotes-other-failures",
+        ),
+        (
+            "\"restricted-code-sid-narrowing-logon-ceiling-compatible\"",
+            "\"exact-resource-causal\"",
+            "target-logon-classifier-overclaims-exact-resource",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.process,
+            "fn classify_loader_restriction_logon_outcomes(",
+            "fn classify_loader_restriction_authenticated_users_outcomes(",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the target-logon classifier contract",
+        );
+    }
+
+    for (exact, replacement, mutant) in [
+        (
+            "if identity_state == \"invalid\" {",
+            "if false {",
+            "authenticated-users-classifier-ignores-invalid-invariants",
+        ),
+        (
+            "identity_state != \"restricted-code-sid-narrowing-causal\"",
+            "false",
+            "authenticated-users-classifier-ignores-ABC-control",
+        ),
+        (
+            "logon_restricted.outcome != LoaderControlMatrixOutcomeKindV6::Failed",
+            "false",
+            "authenticated-users-classifier-ignores-D-shape",
+        ),
+        (
+            "authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+            "authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "authenticated-users-classifier-pass-branch-inverted",
+        ),
+        (
+            "&& (matches_logon_access_failure || matches_baseline_init_failure)",
+            "&& true",
+            "authenticated-users-classifier-failure-class-dropped",
+        ),
+        (
+            "authenticated_users_restricted.native_status == logon_restricted.native_status",
+            "true",
+            "authenticated-users-classifier-D-native-frontier-dropped",
+        ),
+        (
+            "authenticated_users_restricted.failure_phase == logon_restricted.failure_phase",
+            "true",
+            "authenticated-users-classifier-D-phase-frontier-dropped",
+        ),
+        (
+            "authenticated_users_restricted.native_status == baseline.native_status",
+            "true",
+            "authenticated-users-classifier-A-native-frontier-dropped",
+        ),
+        (
+            "authenticated_users_restricted.failure_phase == baseline.failure_phase",
+            "true",
+            "authenticated-users-classifier-A-phase-frontier-dropped",
+        ),
+        (
+            "\"authenticated-users-restriction-compatible-logon-too-narrow\"",
+            "\"authenticated-users-exact-resource-production-ready\"",
+            "authenticated-users-classifier-overclaims-production",
+        ),
+        (
+            "\"canonical-group-union-or-other-trustee-required\"",
+            "\"authenticated-users-exact-denied-resource\"",
+            "authenticated-users-failure-overclaims-resource",
+        ),
+        (
+            "    \"authenticated-users-inconclusive\"\n}",
+            "    \"canonical-group-union-or-other-trustee-required\"\n}",
+            "authenticated-users-classifier-promotes-other-failures",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.process,
+            "fn classify_loader_restriction_authenticated_users_outcomes(",
+            "fn classify_loader_restriction_target_user_outcomes(",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the Authenticated Users classifier contract",
+        );
+    }
+
+    for (exact, replacement, mutant) in [
+        (
+            "if identity_state == \"invalid\" {",
+            "if false {",
+            "target-user-classifier-ignores-invalid-invariants",
+        ),
+        (
+            "identity_state != \"restricted-code-sid-narrowing-causal\"",
+            "false",
+            "target-user-classifier-ignores-ABC-control",
+        ),
+        (
+            "logon_restricted.outcome\n        == LoaderControlMatrixOutcomeKindV6::Failed",
+            "true",
+            "target-user-classifier-ignores-D-outcome",
+        ),
+        (
+            "logon_restricted.native_status == Some(STATUS_ACCESS_DENIED)",
+            "true",
+            "target-user-classifier-ignores-D-status",
+        ),
+        (
+            "authenticated_users_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "true",
+            "target-user-classifier-ignores-E-outcome",
+        ),
+        (
+            "authenticated_users_restricted.native_status == logon_restricted.native_status",
+            "true",
+            "target-user-classifier-ignores-E-native-frontier",
+        ),
+        (
+            "authenticated_users_restricted.failure_phase == logon_restricted.failure_phase",
+            "true",
+            "target-user-classifier-ignores-E-phase-frontier",
+        ),
+        (
+            "target_user_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Passed",
+            "target_user_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "target-user-classifier-pass-branch-inverted",
+        ),
+        (
+            "target_user_restricted.native_status\n        == Some(STATUS_ACCESS_DENIED)",
+            "true",
+            "target-user-classifier-access-denied-class-dropped",
+        ),
+        (
+            "target_user_restricted.native_status == logon_restricted.native_status",
+            "true",
+            "target-user-classifier-D-native-frontier-dropped",
+        ),
+        (
+            "target_user_restricted.failure_phase == logon_restricted.failure_phase",
+            "true",
+            "target-user-classifier-D-phase-frontier-dropped",
+        ),
+        (
+            "target_user_restricted.native_status == authenticated_users_restricted.native_status",
+            "true",
+            "target-user-classifier-E-native-frontier-dropped",
+        ),
+        (
+            "target_user_restricted.failure_phase == authenticated_users_restricted.failure_phase",
+            "true",
+            "target-user-classifier-E-phase-frontier-dropped",
+        ),
+        (
+            "target_user_restricted.outcome == LoaderControlMatrixOutcomeKindV6::Failed\n        && matches_prior_singleton_access_failure",
+            "matches_prior_singleton_access_failure",
+            "target-user-classifier-failure-outcome-dropped",
+        ),
+        (
+            "\"target-user-restriction-bootstrap-compatible-group-singletons-too-narrow\"",
+            "\"target-user-exact-resource-production-ready\"",
+            "target-user-classifier-pass-overclaims-resource",
+        ),
+        (
+            "\"no-tested-singleton-sufficient-trace-required\"",
+            "\"target-user-exact-denied-resource\"",
+            "target-user-classifier-negative-overclaims-resource",
+        ),
+        (
+            "    \"target-user-singleton-inconclusive\"\n}",
+            "    \"no-tested-singleton-sufficient-trace-required\"\n}",
+            "target-user-classifier-promotes-other-outcomes",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.process,
+            "fn classify_loader_restriction_target_user_outcomes(",
+            "fn loader_restriction_original_sext_reproduction_valid(",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the target-user classifier contract",
+        );
+    }
+
+    for (exact, replacement, mutant) in [
+        (
+            "loader_authenticated_users_restriction_sibling_from_logon_comparison(",
+            "loader_authenticated_users_restriction_sibling_removed(",
+            "authenticated-users-derivation-bypassed",
+        ),
+        (
+            "loader_target_user_restriction_sibling_from_authenticated_users_comparison(",
+            "loader_target_user_restriction_sibling_removed(",
+            "target-user-derivation-bypassed",
+        ),
+        (
+            "OwnedUserEnvironmentBlock::create(tokens.baseline.raw())",
+            "OwnedUserEnvironmentBlock::create(tokens.no_restricting_sid.raw())",
+            "shared-userenv-created-from-sibling-token",
+        ),
+        (
+            "let mut shared_environment = match OwnedUserEnvironmentBlock::create(tokens.baseline.raw()) {",
+            "let _separate_environment = OwnedUserEnvironmentBlock::create(tokens.no_restricting_sid.raw());\n    let mut shared_environment = match OwnedUserEnvironmentBlock::create(tokens.baseline.raw()) {",
+            "separate-comparison-userenv-allocation-added",
+        ),
+        (
+            "Ok(inventory) if inventory.missing_required.is_empty() => inventory,",
+            "Ok(inventory) => inventory,",
+            "shared-userenv-required-key-admission-removed",
+        ),
+        (
+            "if !after_baseline_observation.stable() {",
+            "if false {",
+            "shared-userenv-between-launch-scan-bypassed",
+        ),
+        (
+            "if !after_comparison_observation.stable() {",
+            "if false {",
+            "shared-userenv-after-comparison-scan-bypassed",
+        ),
+        (
+            "if !after_logon_observation.stable() {",
+            "if false {",
+            "shared-userenv-D-to-E-scan-bypassed",
+        ),
+        (
+            "        && after_same_access_observation.stable()",
+            "        && true",
+            "shared-userenv-after-same-access-scan-bypassed",
+        ),
+        (
+            "        && after_logon_observation.stable()",
+            "        && true",
+            "shared-userenv-after-logon-scan-bypassed",
+        ),
+        (
+            "        && after_authenticated_users_observation.stable()",
+            "        && true",
+            "shared-userenv-after-authenticated-users-scan-bypassed",
+        ),
+        (
+            "        && after_target_user_observation.stable();",
+            "        && true;",
+            "shared-userenv-after-target-user-scan-bypassed",
+        ),
+        (
+            "let shared_environment_valid = environment_stable && environment_destruction.is_ok();",
+            "let shared_environment_valid = environment_stable;",
+            "shared-userenv-owner-destruction-dropped-from-admission",
+        ),
+        (
+            "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state={presence_state}",
+            "loader_restriction_presence_prerequisite_canary=v1 state={state} presence_state={presence_state}",
+            "shared-userenv-diagnostic-schema-rolled-back",
+        ),
+        (
+            "invariant_error_sha256={} {} {} environment_values_redacted=true token_values_redacted=true job_empty={job_empty_exact} workload_executed=false qualification_promoted=false",
+            "invariant_error_sha256={} {} {} environment_values_redacted=false token_values_redacted=false job_empty={job_empty_exact} workload_executed=true qualification_promoted=true",
+            "shared-userenv-diagnostic-disclosed-and-promoted",
+        ),
+        (
+            "        \"environment_entries\",\n        \"environment_profile_loaded\",\n        \"source_authentication_id\",",
+            "        \"environment_profile_loaded\",\n        \"source_authentication_id\",",
+            "shared-userenv-entry-count-invariant-dropped",
+        ),
+        (
+            "        \"environment_entries\",\n        \"environment_profile_loaded\",\n        \"source_authentication_id\",",
+            "        \"environment_entries\",\n        \"source_token_id\",\n        \"environment_profile_loaded\",\n        \"source_authentication_id\",",
+            "shared-userenv-token-instance-equality-required",
+        ),
+        (
+            "let baseline = launch_target_desktop_loader_control_cell_with_shared_environment(",
+            "let _public_environment_request = WindowsProviderRequestV1::Mutant;\n    let baseline = launch_target_desktop_loader_control_cell_with_shared_environment(",
+            "shared-userenv-public-authority-added",
+        ),
+        (
+            "let same_access = launch_target_desktop_loader_control_cell_with_shared_environment(\n        same_access_restricted.raw(),",
+            "let same_access = launch_target_desktop_loader_control_cell_with_shared_environment(\n        tokens.no_restricting_sid.raw(),",
+            "same-access-cell-replaced-with-no-sid-token",
+        ),
+        (
+            "        &same_access_snapshot,\n        exact_desktop,",
+            "        &comparison_snapshot,\n        exact_desktop,",
+            "same-access-cell-snapshot-replaced",
+        ),
+        (
+            "        loader_common_result_field(&baseline, &same_access, field)?;",
+            "        let _ = &same_access;",
+            "same-access-common-field-equality-dropped",
+        ),
+        (
+            "let logon = launch_target_desktop_loader_control_cell_with_shared_environment(\n        logon_restricted.raw(),",
+            "let logon = launch_target_desktop_loader_control_cell_with_shared_environment(\n        tokens.no_restricting_sid.raw(),",
+            "target-logon-cell-replaced-with-no-sid-token",
+        ),
+        (
+            "        &logon_snapshot,\n        exact_desktop,",
+            "        &comparison_snapshot,\n        exact_desktop,",
+            "target-logon-cell-snapshot-replaced",
+        ),
+        (
+            "        loader_common_result_field(&baseline, &logon, field)?;",
+            "        let _ = &logon;",
+            "target-logon-common-field-equality-dropped",
+        ),
+        (
+            "let authenticated_users = launch_target_desktop_loader_control_cell_with_shared_environment(\n        authenticated_users_restricted.raw(),",
+            "let authenticated_users = launch_target_desktop_loader_control_cell_with_shared_environment(\n        tokens.no_restricting_sid.raw(),",
+            "authenticated-users-cell-replaced-with-no-sid-token",
+        ),
+        (
+            "        &authenticated_users_snapshot,\n        exact_desktop,",
+            "        &comparison_snapshot,\n        exact_desktop,",
+            "authenticated-users-cell-snapshot-replaced",
+        ),
+        (
+            "        loader_common_result_field(&baseline, &authenticated_users, field)?;",
+            "        let _ = &authenticated_users;",
+            "authenticated-users-common-field-equality-dropped",
+        ),
+        (
+            "let target_user = launch_target_desktop_loader_control_cell_with_shared_environment(\n        target_user_restricted.raw(),",
+            "let target_user = launch_target_desktop_loader_control_cell_with_shared_environment(\n        tokens.no_restricting_sid.raw(),",
+            "target-user-cell-replaced-with-no-sid-token",
+        ),
+        (
+            "        &target_user_snapshot,\n        exact_desktop,",
+            "        &comparison_snapshot,\n        exact_desktop,",
+            "target-user-cell-snapshot-replaced",
+        ),
+        (
+            "        loader_common_result_field(&baseline, &target_user, field)?;",
+            "        let _ = &target_user;",
+            "target-user-common-field-equality-dropped",
+        ),
+        (
+            "let authenticated_users_state = classify_loader_restriction_authenticated_users_outcomes(",
+            "let authenticated_users_state = classify_loader_restriction_logon_outcomes(",
+            "authenticated-users-classifier-bypassed",
+        ),
+        (
+            "let state = classify_loader_restriction_target_user_outcomes(",
+            "let state = classify_loader_restriction_authenticated_users_outcomes(",
+            "target-user-classifier-bypassed",
+        ),
+        (
+            "logon_semantics=privilege-disabled/target-logon-SID-restricted authenticated_users_semantics=privilege-disabled/authenticated-users-SID-restricted",
+            "logon_semantics=privilege-disabled/target-logon-SID-restricted authenticated_users_semantics=production-restricted",
+            "authenticated-users-semantics-promoted",
+        ),
+        (
+            "authenticated_users_restriction_binding_sha256={} target_user_restriction_binding_sha256={}",
+            "authenticated_users_restriction_binding_sha256={} target_user_restriction_binding=omitted",
+            "target-user-binding-evidence-dropped",
+        ),
+        (
+            "target_user_semantics=privilege-disabled/target-user-SID-restricted",
+            "target_user_semantics=production-restricted",
+            "target-user-semantics-promoted",
+        ),
+        (
+            "target_user=[{}]",
+            "target_user=redacted-away",
+            "target-user-outcome-dropped",
+        ),
+        (
+            "authenticated_users_restriction_binding_sha256={} target_user_restriction_binding_sha256={}",
+            "authenticated_users_restriction_binding=omitted target_user_restriction_binding_sha256={}",
+            "authenticated-users-binding-evidence-dropped",
+        ),
+        (
+            "authenticated_users=[{}]",
+            "authenticated_users=redacted-away",
+            "authenticated-users-outcome-dropped",
+        ),
+        (
+            "let job_empty_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n        &target_user,\n    ]",
+            "let job_empty_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &authenticated_users,\n        &target_user,\n    ]",
+            "target-logon-job-empty-proof-dropped",
+        ),
+        (
+            "let containment_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n        &target_user,\n    ]",
+            "let containment_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &authenticated_users,\n        &target_user,\n    ]",
+            "target-logon-containment-proof-dropped",
+        ),
+        (
+            "let job_empty_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n        &target_user,\n    ]",
+            "let job_empty_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &target_user,\n    ]",
+            "authenticated-users-job-empty-proof-dropped",
+        ),
+        (
+            "let containment_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n        &target_user,\n    ]",
+            "let containment_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &target_user,\n    ]",
+            "authenticated-users-containment-proof-dropped",
+        ),
+        (
+            "let job_empty_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n        &target_user,\n    ]",
+            "let job_empty_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n    ]",
+            "target-user-job-empty-proof-dropped",
+        ),
+        (
+            "let containment_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n        &target_user,\n    ]",
+            "let containment_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n    ]",
+            "target-user-containment-proof-dropped",
+        ),
+        (
+            "let launcher_authority_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n        &target_user,\n    ]",
+            "let launcher_authority_exact = [\n        &baseline,\n        &comparison,\n        &same_access,\n        &logon,\n        &authenticated_users,\n    ]",
+            "target-user-launcher-authority-proof-dropped",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.process,
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "pub(crate) enum LoaderObjectSecurityOutcomeForTest {",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the shared Userenv restriction-presence contract",
+        );
+    }
+
+    for (start, end, exact, replacement, mutant) in [
+        (
+            "    fn borrowed_userenv(",
+            "    fn pointer(&mut self) -> *mut c_void {",
+            "classification: \"target-token-userenv-borrowed-profile-v1\",",
+            "classification: \"opaque-sanitized-environment\",",
+            "shared-userenv-classification-replaced",
+        ),
+        (
+            "    fn borrowed_userenv(",
+            "    fn pointer(&mut self) -> *mut c_void {",
+            "sha256: inventory.sha256.clone(),",
+            "sha256: String::new(),",
+            "shared-userenv-content-hash-dropped",
+        ),
+        (
+            "    fn borrowed_userenv(",
+            "    fn pointer(&mut self) -> *mut c_void {",
+            "keys_sha256: inventory.keys_sha256.clone(),",
+            "keys_sha256: String::new(),",
+            "shared-userenv-key-hash-dropped",
+        ),
+        (
+            "    fn borrowed_userenv(",
+            "    fn pointer(&mut self) -> *mut c_void {",
+            "missing_required: inventory.missing_required.clone(),",
+            "missing_required: Vec::new(),",
+            "shared-userenv-required-key-result-sanitized",
+        ),
+        (
+            "    fn borrowed_userenv(",
+            "    fn pointer(&mut self) -> *mut c_void {",
+            "units: inventory.units,",
+            "units: 0,",
+            "shared-userenv-unit-count-dropped",
+        ),
+        (
+            "    fn borrowed_userenv(",
+            "    fn pointer(&mut self) -> *mut c_void {",
+            "entries: inventory.entries,",
+            "entries: 0,",
+            "shared-userenv-entry-count-dropped",
+        ),
+        (
+            "fn shared_environment_observation(",
+            "enum LoaderLaunchEnvironmentStorageV5<'a> {",
+            "Ok(observed) if observed == admitted => SharedEnvironmentObservationV1 {",
+            "Ok(_) => SharedEnvironmentObservationV1 {",
+            "shared-userenv-metadata-equality-removed",
+        ),
+        (
+            "fn shared_environment_observation(",
+            "enum LoaderLaunchEnvironmentStorageV5<'a> {",
+            "scan: \"error\",",
+            "scan: \"ok\",",
+            "shared-userenv-scan-error-misclassified",
+        ),
+        (
+            "enum LoaderObjectSecurityAuthorityV1 {",
+            "struct OwnedUserEnvironmentBlock {",
+            "!matches!(self, Self::LauncherExplicit)",
+            "false",
+            "shared-userenv-diagnostic-release-enabled",
+        ),
+        (
+            "fn launch_target_desktop_loader_control_cell_inner(",
+            "fn launch_target_desktop_probe(",
+            "&raw const process_attributes,",
+            "ptr::null(),",
+            "shared-userenv-process-dacl-replaced-with-null",
+        ),
+        (
+            "fn launch_target_desktop_loader_control_cell_inner(",
+            "fn launch_target_desktop_probe(",
+            "&raw const thread_attributes,",
+            "ptr::null(),",
+            "shared-userenv-thread-dacl-replaced-with-null",
+        ),
+        (
+            "fn launch_target_desktop_loader_control_cell_inner(",
+            "fn launch_target_desktop_probe(",
+            "environment.pointer(),",
+            "ptr::null_mut(),",
+            "shared-userenv-child-environment-replaced-with-null",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.process,
+            start,
+            end,
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the shared Userenv restriction-presence contract",
+        );
+    }
+
+    for (exact, replacement, mutant) in [
+        (
+            "LoaderLaunchEnvironmentStorageV5::BorrowedUserenv(block) => block.pointer(),",
+            "LoaderLaunchEnvironmentStorageV5::BorrowedUserenv(_) => ptr::null_mut(),",
+            "shared-userenv-borrowed-pointer-replaced-with-null",
+        ),
+        (
+            "LoaderLaunchEnvironmentStorageV5::BorrowedUserenv(_) => Ok(()),",
+            "LoaderLaunchEnvironmentStorageV5::BorrowedUserenv(block) => block.destroy_after_create(),",
+            "shared-userenv-borrower-destroys-owner",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once(&mut mutated.process, exact, replacement, mutant);
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the shared Userenv restriction-presence contract",
+        );
+    }
+
+    for (exact, replacement, mutant) in [
+        (
+            "CreateEnvironmentBlock(&raw mut raw, target_token, 0)",
+            "CreateEnvironmentBlock(&raw mut raw, ptr::null_mut(), 0)",
+            "shared-userenv-public-system-allocation-restored",
+        ),
+        (
+            "CreateEnvironmentBlock(&raw mut raw, target_token, 0)",
+            "CreateEnvironmentBlock(&raw mut raw, target_token, 1)",
+            "shared-userenv-parent-environment-inheritance-enabled",
+        ),
+        (
+            "bounded_user_environment_inventory(block.raw)?;",
+            "bounded_user_environment_inventory(sanitize_environment(block.raw))?;",
+            "shared-userenv-opaque-sanitation-added",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.process,
+            "struct OwnedUserEnvironmentBlock {",
+            "struct UserEnvironmentInventoryV1 {",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_shared_userenv_restriction_presence_contract(
+                &mutated.process,
+                &mutated.token,
+            )
+            .is_err(),
+            "{mutant} survived the shared Userenv restriction-presence contract",
+        );
+    }
+
+    let mut protocol_expansion = sources.clone();
+    replace_windows_source_once_in_region(
+        &mut protocol_expansion.core,
+        "pub struct WindowsLoaderRestrictionCanaryHandlesV1 {",
+        "pub struct WindowsLaunchBrokerRequestV1 {",
+        "    pub remote_profile_token_handle: u64,",
+        "    pub remote_profile_token_handle: u64,\n    pub remote_same_access_restricted_token_handle: u64,",
+        "same-access-sibling-added-to-private-transfer-protocol",
+    );
+    assert!(
+        validate_windows_loader_control_contract(&protocol_expansion).is_err(),
+        "a launcher-local same-access sibling escaped into the transfer protocol",
+    );
+
+    let mut logon_protocol_expansion = sources.clone();
+    replace_windows_source_once_in_region(
+        &mut logon_protocol_expansion.core,
+        "pub struct WindowsLoaderRestrictionCanaryHandlesV1 {",
+        "pub struct WindowsLaunchBrokerRequestV1 {",
+        "    pub remote_profile_token_handle: u64,",
+        "    pub remote_profile_token_handle: u64,\n    pub remote_logon_restricted_token_handle: u64,",
+        "target-logon-sibling-added-to-private-transfer-protocol",
+    );
+    assert!(
+        validate_windows_loader_control_contract(&logon_protocol_expansion).is_err(),
+        "a launcher-local target-logon sibling escaped into the transfer protocol",
+    );
+
+    let mut authenticated_users_protocol_expansion = sources.clone();
+    replace_windows_source_once_in_region(
+        &mut authenticated_users_protocol_expansion.core,
+        "pub struct WindowsLoaderRestrictionCanaryHandlesV1 {",
+        "pub struct WindowsLaunchBrokerRequestV1 {",
+        "    pub remote_profile_token_handle: u64,",
+        "    pub remote_profile_token_handle: u64,\n    pub remote_authenticated_users_restricted_token_handle: u64,",
+        "authenticated-users-sibling-added-to-private-transfer-protocol",
+    );
+    assert!(
+        validate_windows_loader_control_contract(&authenticated_users_protocol_expansion).is_err(),
+        "a launcher-local Authenticated Users sibling escaped into the transfer protocol",
+    );
+}
+
+#[test]
 fn windows_loader_control_and_static_crt_mutations_are_rejected() {
     let sources = WindowsLoaderControlContractSources::load();
     validate_windows_loader_control_contract(&sources)
@@ -12930,8 +24080,8 @@ fn windows_loader_control_and_static_crt_mutations_are_rejected() {
         ),
         (
             WindowsLoaderControlContractSource::Process,
-            "        \"loader-control\".encode_utf16().collect(),\n        pipe_name.encode_utf16().collect(),\n        nonce.encode_utf16().collect(),\n        exact_desktop.encode_utf16().collect(),",
-            "        \"loader-control\".encode_utf16().collect(),\n        pipe_name.encode_utf16().collect(),\n        nonce.encode_utf16().collect(),",
+            "            loader_control_action.encode_utf16().collect(),\n            pipe_name.encode_utf16().collect(),\n            nonce.encode_utf16().collect(),\n            exact_desktop.encode_utf16().collect(),",
+            "            loader_control_action.encode_utf16().collect(),\n            pipe_name.encode_utf16().collect(),\n            nonce.encode_utf16().collect(),",
             "loader-control-canonical-cli-argument-removed",
         ),
         (
@@ -12942,8 +24092,8 @@ fn windows_loader_control_and_static_crt_mutations_are_rejected() {
         ),
         (
             WindowsLoaderControlContractSource::Process,
-            "                && observed_desktop.as_deref() == Some(exact_desktop)\n                && bootstrap_identity == control_identity",
-            "                && bootstrap_identity == control_identity",
+            "                    && observed_desktop.as_deref() == Some(exact_desktop)\n                    && bootstrap_identity == control_identity",
+            "                    && bootstrap_identity == control_identity",
             "loader-ready-canonical-desktop-binding-removed",
         ),
         (
@@ -12972,8 +24122,8 @@ fn windows_loader_control_and_static_crt_mutations_are_rejected() {
         ),
         (
             WindowsLoaderControlContractSource::Process,
-            "    launch_target_desktop_loader_control(\n        target_token,\n        target_envelope,\n        target_snapshot,\n        exact_desktop,\n        launch_context,\n        &association_preflight,\n        &holder_lease.bootstrap_identity,\n    )?;\n    holder_lease\n        .attest_live()\n        .map_err(TargetDesktopLeaseCreateError::from)?;",
-            "    holder_lease\n        .attest_live()\n        .map_err(TargetDesktopLeaseCreateError::from)?;\n    launch_target_desktop_loader_control(\n        target_token,\n        target_envelope,\n        target_snapshot,\n        exact_desktop,\n        launch_context,\n        &association_preflight,\n        &holder_lease.bootstrap_identity,\n    )?;",
+            "    launch_target_desktop_loader_control(\n        target_token,\n        target_envelope,\n        target_snapshot,\n        exact_desktop,\n        launch_context,\n        &association_preflight,\n        &holder_lease.bootstrap_identity,\n        loader_restriction_canary,\n    )?;\n    holder_lease\n        .attest_live()\n        .map_err(TargetDesktopLeaseCreateError::from)?;",
+            "    holder_lease\n        .attest_live()\n        .map_err(TargetDesktopLeaseCreateError::from)?;\n    launch_target_desktop_loader_control(\n        target_token,\n        target_envelope,\n        target_snapshot,\n        exact_desktop,\n        launch_context,\n        &association_preflight,\n        &holder_lease.bootstrap_identity,\n        loader_restriction_canary,\n    )?;",
             "holder-liveness-reordered-before-loader-control",
         ),
         (
@@ -12981,12 +24131,6 @@ fn windows_loader_control_and_static_crt_mutations_are_rejected() {
             "TargetDesktopBootstrapPipeOperation::LoaderControlReleaseWrite",
             "TargetDesktopBootstrapPipeOperation::AdmissionWrite",
             "loader-control-release-confused",
-        ),
-        (
-            WindowsLoaderControlContractSource::Process,
-            "control_job.wait_empty(",
-            "control_job_mutant.wait_empty(",
-            "loader-control-job-empty-proof-removed",
         ),
         (
             WindowsLoaderControlContractSource::Process,
@@ -13005,6 +24149,90 @@ fn windows_loader_control_and_static_crt_mutations_are_rejected() {
             "const CERTIFICATION: [Self; 6] = [",
             "const CERTIFICATION: [Self; 5] = [",
             "loader-control-six-cell-matrix-truncated",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "match (self.environment, self.debugger, self.loader_snaps) {",
+            "match (self.debugger, self.loader_snaps) {",
+            "loader-matrix-diagnostic-environment-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "canonical-minimal-system-full-observer-snaps-on",
+            "explicit-empty-full-observer-snaps-on",
+            "loader-matrix-canonical-diagnostic-reverted-to-empty",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "environment.pointer(),",
+            "ptr::null_mut(),",
+            "loader-environment-explicit-block-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "CreateEnvironmentBlock(&raw mut raw, target_token, 0)",
+            "CreateEnvironmentBlock(&raw mut raw, ptr::null_mut(), 0)",
+            "loader-target-environment-authority-reverted-to-system",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "LoaderEnvironmentAuthorityV5::TargetTokenUserenv,",
+            "LoaderEnvironmentAuthorityV5::MatrixProjection,",
+            "loader-target-environment-comparison-reuses-canonical-projection",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "classification: \"target-token-userenv-v1\",\n                    sha256: block.sha256.clone(),\n                    visible_keys: Vec::new(),",
+            "classification: \"target-token-userenv-v1\",\n                    sha256: block.sha256.clone(),\n                    visible_keys: vec![String::from(\"SECRET=value\")],",
+            "loader-target-environment-values-exposed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "invariants_valid\n        && baseline.outcome == LoaderControlMatrixOutcomeKindV6::Failed\n        && comparison.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "true\n        && baseline.outcome == LoaderControlMatrixOutcomeKindV6::Failed\n        && comparison.outcome == LoaderControlMatrixOutcomeKindV6::Failed",
+            "loader-target-environment-common-failure-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            ".filter(|evaluation| evaluation.target_environment_required)",
+            ".filter(|_| true)",
+            "loader-target-environment-classification-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "invariant_error={} workload_executed=false qualification_promoted=false",
+            "invariant_error={} workload_executed=true qualification_promoted=true",
+            "loader-target-environment-diagnostic-promoted-to-workload",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "let environment_destruction = environment.destroy_userenv_after_create();",
+            "let environment_destruction = Ok(());",
+            "loader-target-environment-post-create-release-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "format!(\"{} {matrix_detail}\", prerequisites.join(\" \"))",
+            "prerequisites.join(\" \")",
+            "loader-target-environment-primary-matrix-failure-discarded",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "const LOADER_REQUIRED_ENVIRONMENT_KEYS: [&str; 3] = [\"SystemDrive\", \"SystemRoot\", \"windir\"];",
+            "const LOADER_REQUIRED_ENVIRONMENT_KEYS: [&str; 3] = [\"SystemRoot\", \"SystemRoot\", \"windir\"];",
+            "loader-environment-system-drive-omitted",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "const LOADER_REQUIRED_ENVIRONMENT_KEYS: [&str; 3] = [\"SystemDrive\", \"SystemRoot\", \"windir\"];",
+            "const LOADER_REQUIRED_ENVIRONMENT_KEYS: [&str; 3] = [\"SystemDrive\", \"windir\", \"windir\"];",
+            "loader-environment-system-root-omitted",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "const LOADER_REQUIRED_ENVIRONMENT_KEYS: [&str; 3] = [\"SystemDrive\", \"SystemRoot\", \"windir\"];",
+            "const LOADER_REQUIRED_ENVIRONMENT_KEYS: [&str; 3] = [\"SystemDrive\", \"SystemRoot\", \"SystemRoot\"];",
+            "loader-environment-windir-omitted",
         ),
         (
             WindowsLoaderControlContractSource::Process,
@@ -13056,9 +24284,207 @@ fn windows_loader_control_and_static_crt_mutations_are_rejected() {
         ),
         (
             WindowsLoaderControlContractSource::Process,
-            "error.detail.contains(\"loader_trace=v4\")",
-            "false",
+            "let has_native_trace = error.os_code.is_some() && error.detail.contains(\"loader_trace=v4\");",
+            "let has_native_trace = false;",
             "loader-matrix-child-trace-selection-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "        (LoaderDebuggerRelationV5::FullObserver, true) => {\n            LoaderFailureEvidenceRankV6::FullObserverSnapsOn\n        }",
+            "        (LoaderDebuggerRelationV5::FullObserver, true) => {\n            LoaderFailureEvidenceRankV6::FullObserverSnapsOff\n        }",
+            "loader-matrix-maximal-full-observer-snaps-on-rank-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "selected.map_or(true, |selected| candidate > selected)",
+            "selected.map_or(true, |selected| candidate >= selected)",
+            "loader-matrix-equal-rank-downgrade-admitted",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "loader_control_matrix=v6 dimensions=debugger-relation-x-loader-snaps environment={} selected_cell={} selected_rank={} selected_native={} completed={} results=[{}] selected_failure=[{}]",
+            "selected_failure=[{}] loader_control_matrix=v6 dimensions=debugger-relation-x-loader-snaps environment={} selected_cell={} selected_rank={} selected_native={} completed={} results=[{}]",
+            "loader-matrix-summary-moved-behind-bulk-detail",
+        ),
+        (
+            WindowsLoaderControlContractSource::LoaderDebug,
+            "{header} {causal_frontier} exact_token_import_tier_canary=core-ntdll-kernel32:read-execute-map-attested,advapi32:read-execute-map-attested canary_attested={} canary_execution_scope=holder-effective-thread-under-exact-target-impersonation canary_child_startup=unproven {launch_evidence} {root_detail}",
+            "{header} {root_detail} exact_token_import_tier_canary=core-ntdll-kernel32:read-execute-map-attested,advapi32:read-execute-map-attested canary_attested={} canary_execution_scope=holder-effective-thread-under-exact-target-impersonation canary_child_startup=unproven {launch_evidence} {causal_frontier}",
+            "loader-causal-frontier-moved-behind-verbose-roots",
+        ),
+        (
+            WindowsLoaderControlContractSource::LoaderDebug,
+            "0xC000_0142 => \"STATUS_DLL_INIT_FAILED\"",
+            "0xC000_0142 => \"STATUS_SUCCESS\"",
+            "status-dll-init-failed-accepted-as-success",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "lease.scope == self.scope",
+            "true",
+            "loader-restriction-guard-scope-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "lease.generation_sha256 == self.generation_sha256",
+            "true",
+            "loader-restriction-guard-generation-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "lease.owner == self.owner",
+            "true",
+            "loader-restriction-guard-owner-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "if &lease.owner != owner {",
+            "if false {",
+            "loader-restriction-launch-owner-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "if super::process::process_identity(lease.frontend.raw())? != lease.owner {",
+            "if false {",
+            "loader-restriction-owner-process-recheck-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "comparison: lease.comparison.take().ok_or_else(|| {",
+            "comparison: lease.comparison.as_ref().ok_or_else(|| {",
+            "loader-restriction-comparison-one-shot-consume-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "no_restricting_sid: lease.no_restricting_sid.take().ok_or_else(|| {",
+            "no_restricting_sid: lease.no_restricting_sid.as_ref().ok_or_else(|| {",
+            "loader-no-restricting-sid-one-shot-consume-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::LauncherService,
+            "OwnedHandle::new(pair.remote_no_restricting_sid_token_handle as usize as HANDLE)?",
+            "OwnedHandle::new(pair.remote_comparison_token_handle as usize as HANDLE)?",
+            "loader-no-restricting-sid-launcher-adoption-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "baseline: Option<OwnedHandle>,",
+            "source: Option<OwnedHandle>,",
+            "loader-restriction-broad-source-retained-instead-of-baseline",
+        ),
+        (
+            WindowsLoaderControlContractSource::ControlService,
+            "let loader_restriction_source = super::token::install_qualification_loader_restriction_source(",
+            "let loader_restriction_source = super::token::foreign_loader_restriction_source(",
+            "loader-restriction-qualification-source-install-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::ControlService,
+            "                drop(loader_restriction_source);\n                drop(admission);",
+            "                drop(admission);\n                drop(loader_restriction_source);",
+            "loader-restriction-guard-retired-after-admission",
+        ),
+        (
+            WindowsLoaderControlContractSource::Core,
+            "    pub remote_comparison_token_handle: u64,",
+            "    pub remote_comparison_token_handle: u64,\n    pub remote_source_token_handle: u64,",
+            "loader-restriction-source-handle-added-to-private-schema",
+        ),
+        (
+            WindowsLoaderControlContractSource::Core,
+            "    QualificationBegin {\n        schema_version: u32,\n        scope: String,\n        challenge: String,\n    },",
+            "    QualificationBegin {\n        schema_version: u32,\n        scope: String,\n        challenge: String,\n        source_token_handle: u64,\n    },",
+            "loader-restriction-source-handle-added-to-public-schema",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "    let source_snapshot = token_attestation_snapshot(source)?;",
+            "    OpenProcessToken(source, 0, std::ptr::null_mut());\n    let source_snapshot = token_attestation_snapshot(source)?;",
+            "loader-restriction-foreign-token-reopen-restored",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "    let source_snapshot = token_attestation_snapshot(source)?;",
+            "    SetSecurityInfo(source, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());\n    let source_snapshot = token_attestation_snapshot(source)?;",
+            "loader-restriction-foreign-token-dacl-mutation-added",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "restricted_primary_for_source(source, DISABLE_MAX_PRIVILEGE, RESTRICTING_SID)?;",
+            "restricted_primary_for_source(\n            source,\n            DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,\n            RESTRICTING_SID,\n        )?;",
+            "loader-restriction-baseline-weakened-to-write-restricted",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "    let comparison = restricted_primary_for_source(\n        source,\n        DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,\n        RESTRICTING_SID,\n    )?;",
+            "    let comparison = restricted_primary_for_source(\n        source,\n        DISABLE_MAX_PRIVILEGE,\n        RESTRICTING_SID,\n    )?;",
+            "loader-restriction-comparison-write-restriction-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "primary_without_restricting_sid_from_source(source, DISABLE_MAX_PRIVILEGE)?;",
+            "primary_without_restricting_sid_from_source(\n            source,\n            DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,\n        )?;",
+            "loader-no-restricting-sid-derivation-flags-changed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Token,
+            "comparison != baseline",
+            "false",
+            "loader-restriction-comparison-pair-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "results.len() == LoaderControlMatrixCellV4::CERTIFICATION.len()\n        && results\n            .iter()\n            .all(|result| result.outcome == LoaderControlMatrixOutcomeKindV6::Failed)",
+            "results\n        .iter()\n        .any(|result| result.outcome == LoaderControlMatrixOutcomeKindV6::Failed)",
+            "loader-restriction-canary-admitted-before-complete-required-failure",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "        \"environment_sha256\",\n        \"desktop_sha256\",\n        \"binary_sha256\",\n        \"current_directory_sha256\",\n        \"command_semantics_sha256\",\n        \"command_dynamic_fields\",\n        \"creation_flags\",",
+            "        \"environment_sha256\",\n        \"desktop_sha256\",\n        \"binary_sha256\",\n        \"current_directory_sha256\",\n        \"command_semantics_sha256\",\n        \"command_dynamic_fields\",",
+            "loader-restriction-one-factor-creation-flags-binding-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "format!(\"{} {matrix_detail}\", prerequisites.join(\" \"))",
+            "format!(\"{matrix_detail} {}\", prerequisites.join(\" \"))",
+            "loader-restriction-diagnostic-moved-behind-primary-bulk-evidence",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            ".rsplit_once(\" profile_child_cleanup=[\")",
+            ".split_once(\" profile_child_cleanup=[\")",
+            "loader-restriction-presence-stale-job-cleanup-admitted",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            ".all(loader_control_cell_job_empty_attested);",
+            ".all(|_| true);",
+            "loader-restriction-presence-job-empty-proof-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "&& object_security_common_evidence_valid",
+            "&& true",
+            "loader-restriction-presence-common-evidence-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "&& object_security_descriptor_evidence_present",
+            "&& true",
+            "loader-restriction-presence-descriptor-evidence-gate-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "Self::TargetAwareProcess | Self::TargetAwareThread | Self::TargetAwareBoth",
+            "Self::LauncherExplicitRestrictingSidCanary",
+            "loader-restriction-presence-target-policy-capture-admitted",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "!matches!(self, Self::LauncherExplicit)",
+            "true",
+            "loader-restriction-presence-diagnostic-containment-removed",
         ),
         (
             WindowsLoaderControlContractSource::Process,
@@ -13656,6 +25082,313 @@ fn windows_loader_control_and_static_crt_mutations_are_rejected() {
             "{mutant} survived the loader-control/static-CRT contract",
         );
     }
+
+    let mut mutated = sources.clone();
+    replace_windows_source_once_in_region(
+        &mut mutated.process,
+        "        let mut exit_code = 0_u32;",
+        "fn launch_target_desktop_probe(",
+        "if !control_job.wait_empty(Instant::now() + Duration::from_secs(30))? {",
+        "if false {",
+        "loader-control-job-empty-proof-removed",
+    );
+    assert!(
+        validate_windows_loader_control_contract(&mutated).is_err(),
+        "loader-control-job-empty-proof-removed survived the loader-control/static-CRT contract",
+    );
+
+    let mut mutated = sources.clone();
+    replace_windows_source_once_in_region(
+        &mut mutated.process,
+        "fn loader_target_environment_is_required(",
+        "pub(crate) fn loader_target_environment_required_for_test(",
+        "comparison.native_status == Some(STATUS_DLL_INIT_FAILED)",
+        "comparison.native_status.is_some()",
+        "loader-target-environment-exact-status-gate-weakened",
+    );
+    assert!(
+        validate_windows_loader_control_contract(&mutated).is_err(),
+        "loader-target-environment-exact-status-gate-weakened survived the loader-control/static-CRT contract",
+    );
+
+    for (start, end, exact, replacement, mutant) in [
+        (
+            "pub fn package_mutex_sddl() -> Result<String, String> {",
+            "pub(crate) struct TargetKernelObjectPolicyV1 {",
+            "pub(crate) const TARGET_KERNEL_PROCESS_DIAGNOSTIC_ACCESS: u32 = 0x0010_1040;",
+            "pub(crate) const TARGET_KERNEL_PROCESS_DIAGNOSTIC_ACCESS: u32 = u32::MAX;",
+            "loader-object-security-process-access-widened",
+        ),
+        (
+            "pub fn package_mutex_sddl() -> Result<String, String> {",
+            "pub(crate) struct TargetKernelObjectPolicyV1 {",
+            "pub(crate) const TARGET_KERNEL_THREAD_DIAGNOSTIC_ACCESS: u32 = 0x0012_1800;",
+            "pub(crate) const TARGET_KERNEL_THREAD_DIAGNOSTIC_ACCESS: u32 = u32::MAX;",
+            "loader-object-security-thread-access-widened",
+        ),
+        (
+            "pub(crate) struct TargetKernelObjectPolicyV1 {",
+            "pub fn launcher_process_sddl() -> Result<String, String> {",
+            "TargetUserObjectPolicy::capture(token, TargetUserObjectPolicyRoleV1::DirectTarget)",
+            "TargetUserObjectPolicy::capture(token, TargetUserObjectPolicyRoleV1::NestedWriteRestrictedDelegation)",
+            "loader-object-security-direct-target-role-replaced",
+        ),
+        (
+            "pub(crate) struct TargetKernelObjectPolicyV1 {",
+            "pub fn launcher_process_sddl() -> Result<String, String> {",
+            "target_trustees.extend(restricting_sids.iter().cloned());",
+            "let _ = restricting_sids;",
+            "loader-object-security-restricting-trustees-omitted",
+        ),
+        (
+            "    pub(crate) fn live_kernel_object_security_evidence(",
+            "    pub fn verify_kernel_object(",
+            "GetKernelObjectSecurity(handle, information, ptr::null_mut(), 0, &raw mut needed)",
+            "GetKernelObjectSecurity(handle, information, ptr::null_mut(), 0, ptr::null_mut())",
+            "loader-object-security-live-sizing-proof-removed",
+        ),
+        (
+            "    pub(crate) fn live_kernel_object_security_evidence(",
+            "    pub fn verify_kernel_object(",
+            "GetSecurityDescriptorControl(actual",
+            "GetSecurityDescriptorControl(ptr::null_mut()",
+            "loader-object-security-control-readback-removed",
+        ),
+        (
+            "    pub(crate) fn live_kernel_object_security_evidence(",
+            "    pub fn verify_kernel_object(",
+            "GetSecurityDescriptorDacl(",
+            "GetSecurityDescriptorSacl(",
+            "loader-object-security-dacl-readback-removed",
+        ),
+        (
+            "    pub(crate) fn live_kernel_object_security_evidence(",
+            "    pub fn verify_kernel_object(",
+            "let (target_allowed, target_granted) = access_check_descriptor(",
+            "let (target_allowed, target_granted) = surrogate_access_check_descriptor(",
+            "loader-object-security-target-access-check-removed",
+        ),
+        (
+            "    pub(crate) fn live_kernel_object_security_evidence(",
+            "    pub fn verify_kernel_object(",
+            "current_process_token_for_access_check()?",
+            "current_process_token_for_access_check_surrogate()?",
+            "loader-object-security-launcher-access-check-removed",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            mutated.source_mut(WindowsLoaderControlContractSource::Security),
+            start,
+            end,
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_loader_control_contract(&mutated).is_err(),
+            "{mutant} survived the loader object-security source contract",
+        );
+    }
+
+    for (start, end, exact, replacement, mutant) in [
+        (
+            "const LOADER_OBJECT_SECURITY_COMMON_FIELDS_V1: [&str; 16] = [",
+            "struct LoaderObjectSecurityEvidenceValidityV1 {",
+            "\"environment_profile_loaded\",",
+            "\"profile_loaded\",",
+            "loader-object-security-stale-profile-field-restored",
+        ),
+        (
+            "fn loader_object_security_evidence_validity(",
+            "fn loader_restriction_canary_diagnostic(",
+            "loader_common_result_field(baseline, comparison, field)",
+            "Ok(String::new())",
+            "loader-object-security-common-field-equality-bypassed",
+        ),
+        (
+            "fn loader_object_security_evidence_validity(",
+            "fn loader_restriction_canary_diagnostic(",
+            "loader_result_field(result, \"environment_profile_loaded\").as_deref() == Some(\"true\")",
+            "loader_result_field(result, \"environment_profile_loaded\").is_some()",
+            "loader-object-security-profile-true-requirement-weakened",
+        ),
+        (
+            "fn loader_object_security_evidence_validity(",
+            "fn loader_restriction_canary_diagnostic(",
+            "invariants_valid: common_evidence_valid && descriptor_evidence_present",
+            "invariants_valid: descriptor_evidence_present",
+            "loader-object-security-common-validity-omitted-from-aggregate",
+        ),
+        (
+            "fn loader_object_security_prerequisite_canary_diagnostic(",
+            "fn preserve_loader_profile_primary_detail(primary: &str, cleanup: &[String]) -> String {",
+            "let evidence = loader_object_security_evidence_validity(",
+            "let evidence = loader_object_security_evidence_validity_disconnected(",
+            "loader-object-security-evidence-validator-disconnected",
+        ),
+        (
+            "fn loader_object_security_prerequisite_canary_diagnostic(",
+            "fn preserve_loader_profile_primary_detail(primary: &str, cleanup: &[String]) -> String {",
+            "common_evidence_valid={} descriptor_evidence_present={} invariants_valid={}",
+            "descriptor_readback={} descriptor_evidence_present={} invariants_valid={}",
+            "loader-object-security-common-label-misreported-as-descriptor-readback",
+        ),
+        (
+            "fn loader_object_security_prerequisite_canary_diagnostic(",
+            "fn preserve_loader_profile_primary_detail(primary: &str, cleanup: &[String]) -> String {",
+            "evidence.descriptor_evidence_present,\n        evidence.invariant_error.as_ref().map_or_else(",
+            "evidence.invariants_valid,\n        evidence.invariant_error.as_ref().map_or_else(",
+            "loader-object-security-descriptor-readback-conflated-with-aggregate",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            mutated.source_mut(WindowsLoaderControlContractSource::Process),
+            start,
+            end,
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_loader_control_contract(&mutated).is_err(),
+            "{mutant} survived the loader object-security evidence contract",
+        );
+    }
+
+    for (forbidden, mutant) in [
+        (
+            "LoadUserProfileW(target_token)",
+            "loader-target-environment-profile-load-added",
+        ),
+        (
+            "RegSetValueExW(profile_key)",
+            "loader-target-environment-registry-mutation-added",
+        ),
+        (
+            "SetSecurityInfo(process)",
+            "loader-target-environment-dacl-mutation-added",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        let marker = "    let comparison = launch_target_desktop_loader_control_cell_with_environment_authority(";
+        let replacement = format!("    {forbidden};\n{marker}");
+        replace_windows_source_once_in_region(
+            &mut mutated.process,
+            "fn loader_environment_prerequisite_canary_diagnostic(",
+            "fn loader_profile_prerequisite_canary_diagnostic(",
+            marker,
+            &replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_loader_control_contract(&mutated).is_err(),
+            "{mutant} survived the loader-control environment contract",
+        );
+    }
+
+    for (exact, replacement, mutant) in [
+        (
+            "    let before = observe_loader_profile(tokens.profile.raw(), &target_envelope.user_sid);",
+            "    let before = observe_loader_profile_mutant(tokens.profile.raw(), &target_envelope.user_sid);",
+            "loader-profile-hive-observation-hard-coded",
+        ),
+        (
+            "            let comparison = run(LoaderEnvironmentAuthorityV5::TargetTokenUserenvBorrowedProfile);",
+            "            let comparison = run(LoaderEnvironmentAuthorityV5::TargetTokenUserenvProfileLease);",
+            "loader-profile-borrowed-state-treated-as-owned",
+        ),
+        (
+            "            let comparison = run(LoaderEnvironmentAuthorityV5::TargetTokenUserenvProfileLease);\n            let unload = lease.unload();",
+            "            let unload = lease.unload();\n            let comparison = run(LoaderEnvironmentAuthorityV5::TargetTokenUserenvProfileLease);",
+            "loader-profile-unloaded-before-contained-cell-completed",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            &mut mutated.process,
+            "fn loader_profile_prerequisite_canary_diagnostic(",
+            "fn render_loader_profile_prerequisite_canary(",
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_loader_control_contract(&mutated).is_err(),
+            "{mutant} survived the loader profile applicability contract",
+        );
+    }
+
+    let mut profile_promotes = sources.clone();
+    replace_windows_source_once_in_region(
+        &mut profile_promotes.process,
+        "fn render_loader_profile_prerequisite_canary(",
+        "fn preserve_loader_profile_primary_detail(primary: &str, cleanup: &[String]) -> String {",
+        "profile_values_redacted=true workload_executed=false qualification_promoted=false",
+        "profile_values_redacted=false workload_executed=true qualification_promoted=true",
+        "loader-profile-diagnostic-promoted-to-workload",
+    );
+    assert!(
+        validate_windows_loader_control_contract(&profile_promotes).is_err(),
+        "profile diagnostic promotion survived the loader profile contract",
+    );
+
+    let mut profile_handle_closed = sources.clone();
+    replace_windows_source_once_in_region(
+        &mut profile_handle_closed.process,
+        "struct TargetUserProfileLease {",
+        "enum LoaderEnvironmentAuthorityV5 {",
+        "    fn unload(mut self) -> Result<String, String> {",
+        "    fn unload(mut self) -> Result<String, String> {\n        CloseHandle(self.profile);",
+        "loader-profile-authority-closed-as-kernel-handle",
+    );
+    assert!(
+        validate_windows_loader_control_contract(&profile_handle_closed).is_err(),
+        "CloseHandle(hProfile) survived the owned profile contract",
+    );
+
+    let mut profile_privilege_scope_widened = sources.clone();
+    replace_windows_source_once_in_region(
+        &mut profile_privilege_scope_widened.token,
+        "pub(crate) fn with_scoped_loader_profile_privileges<T>(",
+        "pub(crate) fn validate_holder_session_derivation(",
+        "    const PRIVILEGES: [&str; 2] = [\"SeBackupPrivilege\", \"SeRestorePrivilege\"];",
+        "    const PRIVILEGES: [&str; 1] = [\"SeBackupPrivilege\"];",
+        "loader-profile-restore-privilege-scope-removed",
+    );
+    assert!(
+        validate_windows_loader_control_contract(&profile_privilege_scope_widened).is_err(),
+        "incomplete profile privilege scope survived the loader profile contract",
+    );
+
+    let mut empty_production_environment = sources.clone();
+    replace_windows_source_once_in_region(
+        &mut empty_production_environment.process,
+        "    const PRODUCTION: Self = Self {",
+        "    const CERTIFICATION: [Self; 6] = [",
+        "environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,\n        debugger: LoaderDebuggerRelationV5::None,\n        loader_snaps: false,\n    };",
+        "environment: LoaderEnvironmentModeV4::Empty,\n        debugger: LoaderDebuggerRelationV5::None,\n        loader_snaps: false,\n    };",
+        "loader-production-environment-reverted-to-empty",
+    );
+    assert!(
+        validate_windows_loader_control_contract(&empty_production_environment).is_err(),
+        "explicit-empty production environment survived the loader-control contract",
+    );
+
+    let mut empty_certification_environment = sources.clone();
+    replace_windows_source_once_in_region(
+        &mut empty_certification_environment.process,
+        "    const CERTIFICATION: [Self; 6] = [",
+        "enum LoaderFailureEvidenceRankV6 {",
+        "Self {\n            environment: LoaderEnvironmentModeV4::CanonicalMinimalSystem,\n            debugger: LoaderDebuggerRelationV5::None,\n            loader_snaps: false,\n        },",
+        "Self {\n            environment: LoaderEnvironmentModeV4::Empty,\n            debugger: LoaderDebuggerRelationV5::None,\n            loader_snaps: false,\n        },",
+        "loader-certification-environment-reverted-to-empty",
+    );
+    assert!(
+        validate_windows_loader_control_contract(&empty_certification_environment).is_err(),
+        "explicit-empty pass-required certification environment survived the loader-control contract",
+    );
 
     for (forbidden, mutant) in [
         ("SetNamedSecurityInfo", "loader-file-dacl-repair-added"),
@@ -14627,7 +26360,9 @@ fn windows_package_starts_the_exact_configured_service_handles() {
         "#[derive(Default)]",
     )
     .expect("service-owned cleanup barrier must end at the transition ownership model");
-    assert!(cleanup_barrier.contains("super::qualification::prepare_package_cleanup()"));
+    assert!(
+        cleanup_barrier.contains("super::qualification::prepare_package_cleanup(deadline_millis)")
+    );
     assert!(cleanup_barrier.contains("super::qualification::recovery_status()?"));
     assert!(cleanup_barrier.contains("MCSEALED-WINDOWS-PACKAGE-ACTIVE:"));
     assert!(cleanup_barrier.contains("MCSEALED-WINDOWS-PACKAGE-CLEANUP-TIMEOUT:"));
@@ -15092,14 +26827,16 @@ fn windows_qualification_and_package_teardown_are_phase_bound() {
         );
     }
     assert!(canary.contains("if !target_authorized || target_retired"));
-    assert!(canary.contains("&& target_authorized\n                    && target_retired"));
+    assert!(canary.contains(
+        "&& ((target_authorized && target_retired)\n                        || terminal_recovery.replay_consumed())"
+    ));
 
     let package = include_str!(
         "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/package.rs"
     );
     assert_eq!(
         package
-            .matches("super::qualification::prepare_package_cleanup()")
+            .matches("super::qualification::prepare_package_cleanup(deadline_millis)")
             .count(),
         1,
         "all destructive package paths must use the shared bounded barrier"

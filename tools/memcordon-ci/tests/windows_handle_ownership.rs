@@ -272,7 +272,7 @@ fn broker_raw_duplicate_inventory_holds(session_broker: &str) -> bool {
         return false;
     }
 
-    session_broker.contains("pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 5;")
+    session_broker.contains("pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;")
         && session_broker.contains(
         "const LAUNCHER_PROCESS_BROKER_ACCESS: u32 =\n    SYNCHRONIZE_ACCESS | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE;",
     )
@@ -610,6 +610,174 @@ fn assert_user_object_duplicate_contract(process: &str) {
     assert!(!process.contains("OpenDesktopW(desktop_name_wide.as_ptr()"));
 }
 
+fn loader_control_call_chain_holds(process: &str) -> bool {
+    let outer = match bounded_region(
+        process,
+        "\nfn launch_target_desktop_loader_control(",
+        "\nfn launch_target_desktop_loader_control_cell(",
+    ) {
+        Some(region) => region,
+        None => return false,
+    };
+    let cell = match bounded_region(
+        process,
+        "\nfn launch_target_desktop_loader_control_cell(",
+        "\nfn launch_target_desktop_loader_control_cell_with_environment_authority(",
+    ) {
+        Some(region) => region,
+        None => return false,
+    };
+    let authority_wrapper = match bounded_region(
+        process,
+        "\nfn launch_target_desktop_loader_control_cell_with_environment_authority(",
+        "\nfn launch_target_desktop_loader_control_cell_with_shared_environment(",
+    ) {
+        Some(region) => region,
+        None => return false,
+    };
+    let shared_wrapper = match bounded_region(
+        process,
+        "\nfn launch_target_desktop_loader_control_cell_with_shared_environment(",
+        "\nfn launch_target_desktop_loader_control_cell_with_environment_source(",
+    ) {
+        Some(region) => region,
+        None => return false,
+    };
+    let source_wrapper = match bounded_region(
+        process,
+        "\nfn launch_target_desktop_loader_control_cell_with_environment_source(",
+        "\nfn preserve_loader_snaps_primary<T>(",
+    ) {
+        Some(region) => region,
+        None => return false,
+    };
+    let inner = match bounded_region(
+        process,
+        "\nfn launch_target_desktop_loader_control_cell_inner(",
+        "\n#[allow(clippy::too_many_arguments)]\nfn launch_target_desktop_probe(",
+    ) {
+        Some(region) => region,
+        None => return false,
+    };
+    let environment_source_model = match bounded_region(
+        process,
+        "\nenum LoaderCellEnvironmentSourceV6<'a> {",
+        "\nenum LoaderObjectSecurityAuthorityV1 {",
+    ) {
+        Some(region) => region,
+        None => return false,
+    };
+
+    outer
+        .matches("launch_target_desktop_loader_control_cell(")
+        .count()
+        == 2
+        && cell
+            .matches("launch_target_desktop_loader_control_cell_with_environment_authority(")
+            .count()
+            == 1
+        && fragments_are_ordered(
+            cell,
+            &[
+                "launch_target_desktop_loader_control_cell_with_environment_authority(",
+                "LoaderEnvironmentAuthorityV5::MatrixProjection,",
+            ],
+        )
+        && authority_wrapper
+            .matches("launch_target_desktop_loader_control_cell_with_environment_source(")
+            .count()
+            == 1
+        && !authority_wrapper.contains("launch_target_desktop_loader_control_cell_inner(")
+        && fragments_are_ordered(
+            authority_wrapper,
+            &[
+                "launch_target_desktop_loader_control_cell_with_environment_source(",
+                "LoaderCellEnvironmentSourceV6::Create(environment_authority),",
+            ],
+        )
+        && shared_wrapper
+            .matches("launch_target_desktop_loader_control_cell_with_environment_source(")
+            .count()
+            == 1
+        && !shared_wrapper.contains("launch_target_desktop_loader_control_cell_inner(")
+        && fragments_are_ordered(
+            shared_wrapper,
+            &[
+                "launch_target_desktop_loader_control_cell_with_environment_source(",
+                "LoaderCellEnvironmentSourceV6::BorrowedUserenv {",
+                "block: environment,",
+                "inventory: admitted_inventory.clone(),",
+            ],
+        )
+        && source_wrapper
+            .matches("launch_target_desktop_loader_control_cell_inner(")
+            .count()
+            == 1
+        && fragments_are_ordered(
+            source_wrapper,
+            &[
+                "let result = launch_target_desktop_loader_control_cell_inner(",
+                "environment_source,",
+            ],
+        )
+        && fragments_are_ordered(
+            environment_source_model,
+            &[
+                "Create(LoaderEnvironmentAuthorityV5),",
+                "BorrowedUserenv {",
+                "Self::Create(authority) => *authority,",
+                "Self::BorrowedUserenv { .. } => {",
+                "LoaderEnvironmentAuthorityV5::TargetTokenUserenvBorrowedProfile",
+                "Self::Create(authority) => {",
+                "LoaderLaunchEnvironmentV5::create(target_token, matrix_mode, authority)",
+                "Self::BorrowedUserenv { block, inventory } => Ok(",
+                "LoaderLaunchEnvironmentV5::borrowed_userenv(block, &inventory),",
+            ],
+        )
+        && inner
+            .matches("environment_source.into_environment(target_token, matrix_cell.environment)?;")
+            .count()
+            == 1
+        && !inner.contains("LoaderLaunchEnvironmentV5::create(")
+        && !inner.contains("LoaderLaunchEnvironmentV5::borrowed_userenv(")
+        && fragments_are_ordered(
+            inner,
+            &[
+                "let environment_authority = environment_source.authority();",
+                "environment_source.into_environment(target_token, matrix_cell.environment)?;",
+            ],
+        )
+}
+
+fn guardian_loader_lifecycle_contract_holds(process: &str) -> bool {
+    bounded_region(
+        process,
+        "\nfn launch_target_desktop_loader_control_cell_inner(",
+        "\n#[allow(clippy::too_many_arguments)]\nfn launch_target_desktop_probe(",
+    )
+    .is_some_and(|loader_control| {
+        fragments_are_ordered(
+            loader_control,
+            &[
+                "let loader_control_action = \"loader-control\";",
+                "let command_semantics_sha256 = loader_control_command_semantics_sha256(",
+                "loader_control_action,",
+                "loader_control_action.encode_utf16().collect(),",
+                "exact_desktop.encode_utf16().collect(),",
+                "let mut loader_control_desktop = exact_desktop.encode_utf16().collect::<Vec<_>>();",
+                "loader_control_desktop.push(0);",
+                "startup.StartupInfo.lpDesktop = loader_control_desktop.as_mut_ptr();",
+                "CreateProcessAsUserW(",
+                "ResumeThread(control_thread.raw())",
+                "TargetDesktopBootstrapPipeOperation::LoaderReadyRead",
+                "observed_desktop.as_deref() == Some(exact_desktop)",
+                "TargetDesktopBootstrapPipeOperation::LoaderControlReleaseWrite",
+                "control_job.wait_empty(",
+            ],
+        )
+    })
+}
+
 fn assert_guardian_loader_contract(process: &str, guardian: &str, backend: &str) {
     assert!(process.contains("GetProcessWindowStation()"));
     assert!(process.contains("GetThreadDesktop(GetCurrentThreadId())"));
@@ -665,28 +833,17 @@ fn assert_guardian_loader_contract(process: &str, guardian: &str, backend: &str)
             "verify_private_desktop_containment(",
         ],
     ));
+    assert!(
+        loader_control_call_chain_holds(process),
+        "loader-control outer/cell/environment-authority/shared-environment/environment-source/inner created/borrowed call chain must remain live"
+    );
     let loader_control = bounded_region(
         process,
-        "fn launch_target_desktop_loader_control(",
-        "#[allow(clippy::too_many_arguments)]",
+        "\nfn launch_target_desktop_loader_control_cell_inner(",
+        "\n#[allow(clippy::too_many_arguments)]\nfn launch_target_desktop_probe(",
     )
-    .expect("loader-control launch region must be present");
-    assert!(fragments_are_ordered(
-        loader_control,
-        &[
-            "\"loader-control\".encode_utf16().collect(),",
-            "exact_desktop.encode_utf16().collect(),",
-            "let mut loader_control_desktop = exact_desktop.encode_utf16().collect::<Vec<_>>();",
-            "loader_control_desktop.push(0);",
-            "startup.StartupInfo.lpDesktop = loader_control_desktop.as_mut_ptr();",
-            "CreateProcessAsUserW(",
-            "ResumeThread(control_thread.raw())",
-            "TargetDesktopBootstrapPipeOperation::LoaderReadyRead",
-            "observed_desktop.as_deref() == Some(exact_desktop)",
-            "TargetDesktopBootstrapPipeOperation::LoaderControlReleaseWrite",
-            "control_job.wait_empty(",
-        ],
-    ));
+    .expect("loader-control inner launch region must be present");
+    assert!(guardian_loader_lifecycle_contract_holds(process));
     assert!(!loader_control.contains("let mut loader_control_desktop = [0_u16];"));
     assert!(!loader_control.contains("startup.StartupInfo.lpDesktop = ptr::null_mut();"));
     let bootstrap_entry = bounded_region(
@@ -811,6 +968,38 @@ fn replace_once(source: &mut String, from: &str, to: &str) {
         "mutation selector must be unique: {from}"
     );
     *source = source.replacen(from, to, 1);
+}
+
+fn assert_loader_control_call_chain_mutant_rejected(from: &str, to: &str) {
+    for normalize_crlf in [false, true] {
+        let mut sources = WindowsHandleOwnershipSources::load();
+        if normalize_crlf {
+            sources.convert_line_endings_to_crlf();
+            sources.normalize_line_endings();
+        }
+        assert!(
+            loader_control_call_chain_holds(&sources.process),
+            "loader-control call-chain baseline must hold before mutation"
+        );
+        replace_once(&mut sources.process, from, to);
+        assert!(!loader_control_call_chain_holds(&sources.process));
+    }
+}
+
+fn assert_guardian_loader_lifecycle_mutant_rejected(from: &str, to: &str) {
+    for normalize_crlf in [false, true] {
+        let mut sources = WindowsHandleOwnershipSources::load();
+        if normalize_crlf {
+            sources.convert_line_endings_to_crlf();
+            sources.normalize_line_endings();
+        }
+        assert!(
+            guardian_loader_lifecycle_contract_holds(&sources.process),
+            "guardian loader lifecycle baseline must hold before mutation"
+        );
+        replace_once(&mut sources.process, from, to);
+        assert!(!guardian_loader_lifecycle_contract_holds(&sources.process));
+    }
 }
 
 fn assert_remote_snapshot_mutant_rejected(
@@ -1008,8 +1197,8 @@ fn broker_handle_transfer_contract_rejects_namespace_and_ownership_mutants() {
     assert_broker_raw_duplicate_mutant_rejected(|sources| {
         replace_once(
             &mut sources.session_broker,
+            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;",
             "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 5;",
-            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 4;",
         );
     });
     assert_broker_raw_duplicate_mutant_rejected(|sources| {
@@ -1317,6 +1506,82 @@ fn assigned_user_objects_are_pinned_by_exact_reduced_owned_duplicates() {
 fn guardian_loader_context_is_exact_and_runs_in_both_native_windows_lanes() {
     let sources = WindowsHandleOwnershipSources::load();
     assert_guardian_loader_contract(&sources.process, &sources.guardian, &sources.backend);
+}
+
+#[test]
+fn guardian_loader_lifecycle_rejects_disconnected_and_mismatched_action_bindings() {
+    for (from, to) in [
+        (
+            "let loader_control_action = \"loader-control\";",
+            "let loader_control_action = \"loader-control-disconnected\";",
+        ),
+        (
+            "            loader_control_action,\n            exact_desktop,",
+            "            \"loader-control\",\n            exact_desktop,",
+        ),
+        (
+            "            loader_control_action.encode_utf16().collect(),\n            pipe_name.encode_utf16().collect(),",
+            "            \"loader-control\".encode_utf16().collect(),\n            pipe_name.encode_utf16().collect(),",
+        ),
+    ] {
+        assert_guardian_loader_lifecycle_mutant_rejected(from, to);
+    }
+}
+
+#[test]
+fn guardian_loader_call_chain_rejects_disconnected_and_wrong_authority_mutants() {
+    for (from, to) in [
+        (
+            "return launch_target_desktop_loader_control_cell(",
+            "return disconnected_loader_control_cell(",
+        ),
+        (
+            "LoaderEnvironmentAuthorityV5::MatrixProjection,",
+            "LoaderEnvironmentAuthorityV5::TargetTokenUserenv,",
+        ),
+        (
+            "LoaderCellEnvironmentSourceV6::Create(environment_authority),",
+            "LoaderCellEnvironmentSourceV6::Create(LoaderEnvironmentAuthorityV5::TargetTokenUserenv),",
+        ),
+        (
+            "LoaderCellEnvironmentSourceV6::BorrowedUserenv {",
+            "LoaderCellEnvironmentSourceV6::DisconnectedBorrowedUserenv {",
+        ),
+        (
+            "let result = launch_target_desktop_loader_control_cell_inner(",
+            "let result = disconnected_loader_control_cell_inner(",
+        ),
+        (
+            "matrix_cell,\n        environment_source,\n        object_security_authority,",
+            "matrix_cell,\n        LoaderCellEnvironmentSourceV6::Create(LoaderEnvironmentAuthorityV5::MatrixProjection),\n        object_security_authority,",
+        ),
+        (
+            "enum LoaderCellEnvironmentSourceV6<'a> {",
+            "enum DisconnectedLoaderCellEnvironmentSourceV6<'a> {",
+        ),
+        (
+            "Self::Create(authority) => *authority,",
+            "Self::Create(_) => LoaderEnvironmentAuthorityV5::MatrixProjection,",
+        ),
+        (
+            "LoaderLaunchEnvironmentV5::create(target_token, matrix_mode, authority)",
+            "LoaderLaunchEnvironmentV5::create(target_token, matrix_mode, LoaderEnvironmentAuthorityV5::MatrixProjection)",
+        ),
+        (
+            "LoaderLaunchEnvironmentV5::borrowed_userenv(block, &inventory),",
+            "LoaderLaunchEnvironmentV5::create(target_token, matrix_mode, LoaderEnvironmentAuthorityV5::MatrixProjection)?,",
+        ),
+        (
+            "let environment_authority = environment_source.authority();",
+            "let environment_authority = LoaderEnvironmentAuthorityV5::MatrixProjection;",
+        ),
+        (
+            "environment_source.into_environment(target_token, matrix_cell.environment)?;",
+            "LoaderLaunchEnvironmentV5::create(target_token, matrix_cell.environment, LoaderEnvironmentAuthorityV5::MatrixProjection)?;",
+        ),
+    ] {
+        assert_loader_control_call_chain_mutant_rejected(from, to);
+    }
 }
 
 #[test]

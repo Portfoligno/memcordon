@@ -1,3 +1,4 @@
+pub(crate) mod access_trace;
 pub mod control_service;
 pub mod guardian;
 pub mod guardian_service;

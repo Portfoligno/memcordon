@@ -5,9 +5,9 @@ use memcordon_core::{
     WINDOWS_CONTROL_PIPE, WINDOWS_CONTROL_SERVICE_NAME, WINDOWS_LAUNCHER_PIPE,
     WINDOWS_LAUNCHER_SERVICE_NAME, WINDOWS_PRIVATE_PROTOCOL_VERSION,
     WINDOWS_PUBLIC_PROTOCOL_VERSION, WindowsLaunchBrokerRequestV1, WindowsLauncherRequestV1,
-    WindowsLauncherResponseV1, WindowsProcessIdentityV1, WindowsProviderRequestV1,
-    WindowsProviderResponseV1, WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsSealedFault,
-    WindowsSealedMutant, WindowsServiceSelfAttestationV1,
+    WindowsLauncherResponseV1, WindowsLoaderRestrictionCanaryHandlesV1, WindowsProcessIdentityV1,
+    WindowsProviderRequestV1, WindowsProviderResponseV1, WindowsRelayEventV1, WindowsRelayPhaseV1,
+    WindowsSealedFault, WindowsSealedMutant, WindowsServiceSelfAttestationV1,
 };
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
@@ -361,15 +361,20 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
         WindowsProviderRequestV1::PackageCleanup {
             schema_version,
             challenge,
-        } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION && !challenge.is_empty() => {
+            deadline_millis,
+        } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+            && !challenge.is_empty()
+            && deadline_millis != 0 =>
+        {
             if !super::token::pipe_client_is_elevated(public)? {
                 return Err(
                     "MCSEALED-WINDOWS-ELEVATION: package cleanup requires an elevated caller"
                         .to_owned(),
                 );
             }
-            let result = super::record::remove_empty_attempt_state();
-            let (status, attempts_empty, detail) = match result {
+            let result = converge_launcher_package_cleanup(deadline_millis)
+                .and_then(|()| super::record::remove_empty_attempt_state());
+            let (mut status, attempts_empty, mut detail) = match result {
                 Ok(()) => (
                     memcordon_core::WindowsControlRequestStatusV1::Ready,
                     Some(true),
@@ -392,6 +397,16 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                     error,
                 ),
             };
+            let terminal_outboxes = match super::record::terminal_outbox_count() {
+                Ok(count) => Some(count),
+                Err(error) => {
+                    status = memcordon_core::WindowsControlRequestStatusV1::Failed;
+                    detail = format!(
+                        "{detail}; authenticated terminal outbox inventory failed: {error}"
+                    );
+                    None
+                }
+            };
             pipe::write_frame(
                 public,
                 &WindowsProviderResponseV1::PackageCleanupResult {
@@ -399,7 +414,7 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                     challenge,
                     status,
                     attempts_empty,
-                    terminal_outboxes: super::record::terminal_outbox_count().ok(),
+                    terminal_outboxes,
                     detail,
                 },
             )
@@ -419,14 +434,26 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
             relay_phase,
         } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION => {
             let caller = authenticate_replay_binding(public, &attempt_id, &nonce, &request_sha256)?;
-            replay_terminal_session(
+            match replay_terminal_session(
                 public,
-                attempt_id,
-                nonce,
-                request_sha256,
+                attempt_id.clone(),
+                nonce.clone(),
+                request_sha256.clone(),
                 relay_phase,
                 caller,
-            )
+            ) {
+                Ok(()) => Ok(()),
+                Err(error) => pipe::write_frame(
+                    public,
+                    &bound_public_replay_failure_response(
+                        &attempt_id,
+                        &nonce,
+                        &request_sha256,
+                        relay_phase,
+                        error,
+                    ),
+                ),
+            }
         }
         WindowsProviderRequestV1::Launch(launch)
             if launch.schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
@@ -489,11 +516,18 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                                         public,
                                         &binding.attempt_id,
                                         &binding.nonce,
-                                        &binding.request_sha256,
-                                        failure.progress.relay_phase,
-                                        &caller,
-                                    ) {
-                                        Ok(_) => return Ok(()),
+                                    &binding.request_sha256,
+                                    failure.progress.relay_phase,
+                                    &caller,
+                                    Some(super::record::bounded_terminalization_error(
+                                        memcordon_core::WindowsTerminalizationErrorStageV1::LaunchRelay,
+                                        &code,
+                                        &primary,
+                                        None,
+                                    )),
+                                ) {
+                                        Ok(ReplayTerminalProgress::Complete) => return Ok(()),
+                                        Ok(ReplayTerminalProgress::Pending) => return Ok(()),
                                         Err(error) => error,
                                     },
                                     Err(error) => error,
@@ -509,7 +543,7 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                                 failure.progress.relay_phase,
                                 primary,
                                 vec![replay_error],
-                            )?;
+                            );
                             pipe::write_frame(
                                 public,
                                 &WindowsProviderResponseV1::AttemptRetained(retained),
@@ -650,7 +684,7 @@ fn qualification_session(public: HANDLE, scope: &str, challenge: &str) -> Result
     if unsafe { GetNamedPipeClientProcessId(public, &raw mut client_pid) } == 0 {
         return Err(io::Error::last_os_error().to_string());
     }
-    let (_token, envelope, _frontend, owner) =
+    let (source_token, envelope, source_frontend, owner) =
         super::token::authenticate_pipe_client(public, client_pid, None)?;
     if !envelope.elevated {
         return Err("MCSEALED-WINDOWS-ELEVATION: qualification requires elevation".to_owned());
@@ -673,6 +707,13 @@ fn qualification_session(public: HANDLE, scope: &str, challenge: &str) -> Result
         );
     }
     let admission = super::record::reserve_qualification_admission_for(scope, owner.clone())?;
+    let loader_restriction_source = super::token::install_qualification_loader_restriction_source(
+        scope,
+        challenge,
+        &owner,
+        source_token,
+        source_frontend,
+    )?;
     pipe::write_frame(
         public,
         &WindowsProviderResponseV1::QualificationAuthenticated {
@@ -713,6 +754,7 @@ fn qualification_session(public: HANDLE, scope: &str, challenge: &str) -> Result
             WindowsProviderRequestV1::QualificationEnd { schema_version }
                 if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
             {
+                drop(loader_restriction_source);
                 drop(admission);
                 return pipe::write_frame(
                     public,
@@ -771,6 +813,19 @@ fn launch_client_inner(
                 .to_owned(),
         );
     }
+    let loader_restriction_canary = if qualification_in_progress
+        && super::loader_debug::enabled(super::process::TargetDesktopBootstrapRoleV1::LoaderControl)
+        && super::token::is_exact_full_restricted_loader_canary_source(primary_token.raw())?
+    {
+        Some(
+            super::token::loader_restriction_diagnostic_pair_for_qualification(
+                &before,
+                primary_token.raw(),
+            )?,
+        )
+    } else {
+        None
+    };
     let request_bytes = serde_json::to_vec(&launch).map_err(|error| error.to_string())?;
     let request_sha256 = hex(Sha256::digest(request_bytes));
     let mut attempt_digest = Sha256::new();
@@ -956,6 +1011,84 @@ fn launch_client_inner(
         }
         Err(error) => return Err(remote_transfers.abort(error)),
     };
+    let remote_loader_restriction_canary = if let Some(pair) = &loader_restriction_canary {
+        let baseline = match duplicate_for_launcher(
+            ProcessRelativeHandle {
+                owner: control_namespace,
+                raw: pair.baseline.raw(),
+                role: "loader-restriction-baseline-token",
+                inventory_index: None,
+            },
+            launcher_namespace,
+            None,
+        ) {
+            Ok(handle) => {
+                remote_transfers.push(handle);
+                handle
+            }
+            Err(error) => return Err(remote_transfers.abort(error)),
+        };
+        let comparison = match duplicate_for_launcher(
+            ProcessRelativeHandle {
+                owner: control_namespace,
+                raw: pair.comparison.raw(),
+                role: "loader-restriction-comparison-token",
+                inventory_index: None,
+            },
+            launcher_namespace,
+            None,
+        ) {
+            Ok(handle) => {
+                remote_transfers.push(handle);
+                handle
+            }
+            Err(error) => return Err(remote_transfers.abort(error)),
+        };
+        let no_restricting_sid = match duplicate_for_launcher(
+            ProcessRelativeHandle {
+                owner: control_namespace,
+                raw: pair.no_restricting_sid.raw(),
+                role: "loader-no-restricting-sid-token",
+                inventory_index: None,
+            },
+            launcher_namespace,
+            None,
+        ) {
+            Ok(handle) => {
+                remote_transfers.push(handle);
+                handle
+            }
+            Err(error) => return Err(remote_transfers.abort(error)),
+        };
+        let profile = match duplicate_for_launcher(
+            ProcessRelativeHandle {
+                owner: control_namespace,
+                raw: pair.profile.raw(),
+                role: "loader-profile-token",
+                inventory_index: None,
+            },
+            launcher_namespace,
+            None,
+        ) {
+            Ok(handle) => {
+                remote_transfers.push(handle);
+                handle
+            }
+            Err(error) => return Err(remote_transfers.abort(error)),
+        };
+        Some(WindowsLoaderRestrictionCanaryHandlesV1 {
+            remote_baseline_token_handle: baseline,
+            remote_comparison_token_handle: comparison,
+            remote_no_restricting_sid_token_handle: no_restricting_sid,
+            remote_profile_token_handle: profile,
+            source_binding_sha256: pair.source_binding_sha256.clone(),
+            pair_invariants_sha256: pair.pair_invariants_sha256.clone(),
+            restriction_presence_binding_sha256: pair.restriction_presence_binding_sha256.clone(),
+            profile_binding_sha256: pair.profile_binding_sha256.clone(),
+        })
+    } else {
+        None
+    };
 
     let broker = WindowsLaunchBrokerRequestV1 {
         schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
@@ -966,6 +1099,7 @@ fn launch_client_inner(
         remote_primary_token_handle: remote_token,
         remote_frontend_process_handle: remote_frontend,
         remote_frontend_canary_handles: remote_frontend_canaries.clone(),
+        loader_restriction_canary: remote_loader_restriction_canary,
         certification_fault,
         certification_mutant,
         launch,
@@ -993,6 +1127,34 @@ fn launch_client_inner(
 struct ReplayCallerBinding {
     process_identity: WindowsProcessIdentityV1,
     token_sha256: String,
+}
+
+fn bound_public_replay_failure_response(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    relay_phase: WindowsRelayPhaseV1,
+    error: String,
+) -> WindowsProviderResponseV1 {
+    WindowsProviderResponseV1::AttemptRetained(super::record::in_memory_retained_attempt_evidence(
+        attempt_id,
+        nonce,
+        request_sha256,
+        relay_phase,
+        "authenticated terminal replay did not complete".to_owned(),
+        vec![format!("control replay failure: {error}")],
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn bound_public_replay_failure_response_for_test(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    relay_phase: WindowsRelayPhaseV1,
+    error: String,
+) -> WindowsProviderResponseV1 {
+    bound_public_replay_failure_response(attempt_id, nonce, request_sha256, relay_phase, error)
 }
 
 fn authenticate_replay_binding(
@@ -1034,6 +1196,7 @@ fn replay_terminal(
     request_sha256: &str,
     relay_phase: WindowsRelayPhaseV1,
     caller: &ReplayCallerBinding,
+    terminalization_error: Option<memcordon_core::WindowsTerminalizationErrorV1>,
 ) -> Result<ReplayTerminalProgress, String> {
     let (launcher, _process, _identity) = authenticated_launcher()?;
     pipe::write_frame(
@@ -1046,6 +1209,7 @@ fn replay_terminal(
             relay_phase,
             caller_process_identity: caller.process_identity.clone(),
             caller_token_sha256: caller.token_sha256.clone(),
+            terminalization_error,
         },
     )?;
     let response = pipe::read_frame::<WindowsLauncherResponseV1>(launcher.raw())?;
@@ -1160,6 +1324,7 @@ fn replay_terminal_session(
             &request_sha256,
             relay_phase,
             &caller,
+            None,
         )? == ReplayTerminalProgress::Complete
         {
             return Ok(());
@@ -1330,6 +1495,44 @@ fn authenticated_launcher() -> Result<
     String,
 > {
     authenticated_launcher_detailed().map_err(|error| error.to_string())
+}
+
+fn converge_launcher_package_cleanup(deadline_millis: u64) -> Result<(), String> {
+    let (launcher, _process, _identity) = authenticated_launcher()?;
+    pipe::write_frame(
+        launcher.raw(),
+        &WindowsLauncherRequestV1::PackageCleanup {
+            schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+            deadline_millis,
+        },
+    )?;
+    match pipe::read_frame::<WindowsLauncherResponseV1>(launcher.raw())? {
+        WindowsLauncherResponseV1::PackageCleanup {
+            schema_version,
+            status: memcordon_core::WindowsControlRequestStatusV1::Ready,
+            attempts_empty: Some(true),
+            ..
+        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => Ok(()),
+        WindowsLauncherResponseV1::PackageCleanup {
+            schema_version,
+            status: memcordon_core::WindowsControlRequestStatusV1::Active,
+            attempts_empty: Some(false),
+            detail,
+        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
+            && detail
+                .strip_prefix("MCSEALED-WINDOWS-PACKAGE-ACTIVE:")
+                .is_some() =>
+        {
+            Err(detail)
+        }
+        WindowsLauncherResponseV1::PackageCleanup {
+            schema_version,
+            status: memcordon_core::WindowsControlRequestStatusV1::Failed,
+            detail,
+            ..
+        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => Err(detail),
+        _ => Err("launcher returned contradictory package cleanup state".to_owned()),
+    }
 }
 
 fn probe_authenticated_launcher_detailed() -> Result<(), LauncherAuthenticationError> {

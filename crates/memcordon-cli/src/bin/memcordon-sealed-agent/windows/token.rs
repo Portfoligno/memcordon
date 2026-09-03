@@ -1,10 +1,11 @@
 use std::ffi::c_void;
 use std::io;
 use std::ptr;
+use std::sync::Mutex;
 
 use memcordon_core::{
-    WindowsCallerTokenEnvelopeV1, WindowsSealedFault, WindowsServiceSelfAttestationV1,
-    windows_service_attestation_challenge_is_valid,
+    WindowsCallerTokenEnvelopeV1, WindowsProcessIdentityV1, WindowsSealedFault,
+    WindowsServiceSelfAttestationV1, windows_service_attestation_challenge_is_valid,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,23 +22,27 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 use windows_sys::Win32::Security::LookupPrivilegeValueW;
 use windows_sys::Win32::Security::{
-    ACL, AdjustTokenPrivileges, CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, DuplicateTokenEx,
-    GetLengthSid, GetTokenInformation, IsTokenRestricted, LUA_TOKEN, LUID_AND_ATTRIBUTES,
-    PRIVILEGE_SET, PrivilegeCheck, RevertToSelf, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
-    SecurityAnonymous, SecurityDelegation, SecurityImpersonation, SetTokenInformation,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY,
-    TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_IMPERSONATE,
-    TOKEN_MANDATORY_LABEL, TOKEN_MANDATORY_POLICY, TOKEN_ORIGIN, TOKEN_OWNER, TOKEN_PRIMARY_GROUP,
-    TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_QUERY_SOURCE, TOKEN_SOURCE, TOKEN_STATISTICS,
-    TokenDefaultDacl, TokenElevation, TokenElevationType, TokenGroups, TokenImpersonation,
-    TokenImpersonationLevel, TokenIntegrityLevel, TokenIsAppContainer, TokenLogonSid,
-    TokenMandatoryPolicy, TokenOrigin, TokenOwner, TokenPrimary, TokenPrimaryGroup,
-    TokenPrivileges, TokenRestrictedSids, TokenSessionId, TokenSource, TokenStatistics,
-    TokenUIAccess, TokenUser, TokenVirtualizationAllowed, TokenVirtualizationEnabled,
-    WRITE_RESTRICTED,
+    ACL, AdjustTokenPrivileges, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
+    DuplicateTokenEx, EqualSid, GetLengthSid, GetTokenInformation, IsTokenRestricted, IsValidSid,
+    LUA_TOKEN, LUID_AND_ATTRIBUTES, PRIVILEGE_SET, PrivilegeCheck, RevertToSelf,
+    SE_PRIVILEGE_ENABLED, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SecurityAnonymous,
+    SecurityDelegation, SecurityImpersonation, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL,
+    TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_MANDATORY_LABEL,
+    TOKEN_MANDATORY_POLICY, TOKEN_ORIGIN, TOKEN_OWNER, TOKEN_PRIMARY_GROUP, TOKEN_PRIVILEGES,
+    TOKEN_QUERY, TOKEN_QUERY_SOURCE, TOKEN_SOURCE, TOKEN_STATISTICS, TokenDefaultDacl,
+    TokenElevation, TokenElevationType, TokenGroups, TokenImpersonation, TokenImpersonationLevel,
+    TokenIntegrityLevel, TokenIsAppContainer, TokenLogonSid, TokenMandatoryPolicy, TokenOrigin,
+    TokenOwner, TokenPrimary, TokenPrimaryGroup, TokenPrivileges, TokenRestrictedSids,
+    TokenSessionId, TokenSource, TokenStatistics, TokenUIAccess, TokenUser,
+    TokenVirtualizationAllowed, TokenVirtualizationEnabled, WRITE_RESTRICTED,
+    WinAuthenticatedUserSid,
 };
 use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
-use windows_sys::Win32::System::SystemServices::{SE_GROUP_INTEGRITY, SE_GROUP_LOGON_ID};
+use windows_sys::Win32::System::SystemServices::{
+    SE_GROUP_ENABLED, SE_GROUP_ENABLED_BY_DEFAULT, SE_GROUP_INTEGRITY, SE_GROUP_LOGON_ID,
+    SE_GROUP_MANDATORY,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
     PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION, SetThreadToken,
@@ -67,6 +72,12 @@ const TOKEN_ATTESTATION_ACCESS: u32 = TOKEN_QUERY | TOKEN_QUERY_SOURCE;
 const READ_CONTROL_ACCESS: u32 = 0x0002_0000;
 const WRITE_DAC_ACCESS: u32 = 0x0004_0000;
 const SE_PRIVILEGE_REMOVED: u32 = 0x0000_0004;
+const RESTRICTED_CODE_SID: &str = "S-1-5-12";
+const AUTHENTICATED_USERS_SID: &str = "S-1-5-11";
+const CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES: u32 = 0;
+const NORMALIZED_RESTRICTING_SID_ATTRIBUTES: u32 =
+    SE_GROUP_MANDATORY as u32 | SE_GROUP_ENABLED_BY_DEFAULT as u32 | SE_GROUP_ENABLED as u32;
+const SE_GROUP_USE_FOR_DENY_ONLY_ATTRIBUTES: u32 = 0x0000_0010;
 // MS-LSAD 3.1.1.2.1 defines SeChangeNotifyPrivilege as the stable LUID
 // { HighPart: 0, LowPart: 23 }. Snapshot normalization must remain a pure
 // function of the supplied token handle, including while the caller is
@@ -819,6 +830,1391 @@ pub fn restricted_current_primary() -> Result<OwnedHandle, String> {
 pub fn write_restricted_current_primary() -> Result<OwnedHandle, String> {
     let source = current_process_token_with_access(CALLER_PRIMARY_LAUNCH_ACCESS)?;
     write_restricted_primary_from_source(source.raw())
+}
+
+pub(crate) struct LoaderRestrictionDiagnosticTokenPair {
+    pub baseline: OwnedHandle,
+    pub comparison: OwnedHandle,
+    pub no_restricting_sid: OwnedHandle,
+    pub profile: OwnedHandle,
+    pub source_binding_sha256: String,
+    pub pair_invariants_sha256: String,
+    pub restriction_presence_binding_sha256: String,
+    pub profile_binding_sha256: String,
+}
+
+struct QualificationLoaderRestrictionSourceLease {
+    scope: String,
+    generation_sha256: String,
+    owner: WindowsProcessIdentityV1,
+    frontend: OwnedHandle,
+    baseline: Option<OwnedHandle>,
+    comparison: Option<OwnedHandle>,
+    no_restricting_sid: Option<OwnedHandle>,
+    profile: Option<OwnedHandle>,
+    source_binding_sha256: String,
+    pair_invariants_sha256: String,
+    restriction_presence_binding_sha256: String,
+    profile_binding_sha256: String,
+}
+
+static QUALIFICATION_LOADER_RESTRICTION_SOURCE: Mutex<
+    Option<QualificationLoaderRestrictionSourceLease>,
+> = Mutex::new(None);
+
+pub(crate) struct QualificationLoaderRestrictionSourceGuard {
+    scope: String,
+    generation_sha256: String,
+    owner: WindowsProcessIdentityV1,
+    active: bool,
+}
+
+impl Drop for QualificationLoaderRestrictionSourceGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let Ok(mut slot) = QUALIFICATION_LOADER_RESTRICTION_SOURCE.lock() else {
+            std::process::abort();
+        };
+        let matches = slot.as_ref().is_some_and(|lease| {
+            lease.scope == self.scope
+                && lease.generation_sha256 == self.generation_sha256
+                && lease.owner == self.owner
+        });
+        if !matches {
+            std::process::abort();
+        }
+        slot.take();
+        self.active = false;
+    }
+}
+
+pub(crate) fn install_qualification_loader_restriction_source(
+    scope: &str,
+    generation: &str,
+    owner: &WindowsProcessIdentityV1,
+    source: OwnedHandle,
+    frontend: OwnedHandle,
+) -> Result<QualificationLoaderRestrictionSourceGuard, String> {
+    if !matches!(scope, "direct" | "package") {
+        return Err("invalid loader restriction source qualification scope".to_owned());
+    }
+    if generation.is_empty() {
+        return Err("loader restriction source generation is empty".to_owned());
+    }
+    let generation_sha256 = super::record::digest(generation.as_bytes());
+    if super::process::process_identity(frontend.raw())? != *owner {
+        return Err("qualification loader restriction source process is not the owner".to_owned());
+    }
+    let snapshot = token_attestation_snapshot(source.raw())?;
+    if !snapshot.behavior.envelope.elevated
+        || snapshot.behavior.envelope.token_type != TokenPrimary as u32
+        || snapshot.behavior.token_is_restricted
+        || !snapshot.behavior.restricting_sids.is_empty()
+    {
+        return Err(
+            "qualification loader restriction source is not an elevated unrestricted primary"
+                .to_owned(),
+        );
+    }
+    let source_binding_sha256 = serde_json::to_vec(&snapshot)
+        .map(|bytes| super::record::digest(&bytes))
+        .map_err(|error| error.to_string())?;
+    let pair = loader_restriction_diagnostic_pair_from_source(source.raw())?;
+    if pair.source_binding_sha256 != source_binding_sha256 {
+        return Err("prederived loader restriction pair source binding changed".to_owned());
+    }
+    let mut slot = QUALIFICATION_LOADER_RESTRICTION_SOURCE
+        .lock()
+        .map_err(|_| "qualification loader restriction source lock is poisoned".to_owned())?;
+    if slot.is_some() {
+        return Err("qualification loader restriction source is already active".to_owned());
+    }
+    *slot = Some(QualificationLoaderRestrictionSourceLease {
+        scope: scope.to_owned(),
+        generation_sha256: generation_sha256.clone(),
+        owner: owner.clone(),
+        frontend,
+        baseline: Some(pair.baseline),
+        comparison: Some(pair.comparison),
+        no_restricting_sid: Some(pair.no_restricting_sid),
+        profile: Some(pair.profile),
+        source_binding_sha256,
+        pair_invariants_sha256: pair.pair_invariants_sha256,
+        restriction_presence_binding_sha256: pair.restriction_presence_binding_sha256,
+        profile_binding_sha256: pair.profile_binding_sha256,
+    });
+    Ok(QualificationLoaderRestrictionSourceGuard {
+        scope: scope.to_owned(),
+        generation_sha256,
+        owner: owner.clone(),
+        active: true,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct LoaderRestrictionPairInvariantsV1 {
+    user_sid: String,
+    originating_logon_session: u64,
+    authentication_id: u64,
+    source_name: [u8; 8],
+    source_identifier: u64,
+    session_id: u32,
+    token_type: u32,
+    impersonation_level: u32,
+    integrity_level: String,
+    mandatory_policy: u32,
+    groups_sha256: String,
+    privileges_sha256: String,
+    restricted_sids_sha256: String,
+    groups: Vec<String>,
+    privileges: Vec<String>,
+    owner_sid: String,
+    primary_group_sid: String,
+    default_dacl_sha256: Option<String>,
+    elevation_type: u32,
+    elevated: bool,
+    appcontainer: bool,
+    ui_access: bool,
+    virtualization_allowed: bool,
+    virtualization_enabled: bool,
+    restricting_sids: Vec<String>,
+}
+
+impl LoaderRestrictionPairInvariantsV1 {
+    fn from_snapshot(snapshot: &TokenAttestationSnapshot) -> Self {
+        Self {
+            user_sid: snapshot.lineage.user_sid.clone(),
+            originating_logon_session: snapshot.lineage.originating_logon_session,
+            authentication_id: snapshot.lineage.authentication_id,
+            source_name: snapshot.lineage.source_name,
+            source_identifier: snapshot.lineage.source_identifier,
+            session_id: snapshot.lineage.session_id,
+            token_type: snapshot.behavior.envelope.token_type,
+            impersonation_level: snapshot.behavior.envelope.impersonation_level,
+            integrity_level: snapshot.behavior.envelope.integrity_level.clone(),
+            mandatory_policy: snapshot.behavior.envelope.mandatory_policy,
+            groups_sha256: snapshot.behavior.envelope.groups_sha256.clone(),
+            privileges_sha256: snapshot.behavior.envelope.privileges_sha256.clone(),
+            restricted_sids_sha256: snapshot.behavior.envelope.restricted_sids_sha256.clone(),
+            groups: snapshot.behavior.groups.clone(),
+            privileges: snapshot.behavior.privileges.clone(),
+            owner_sid: snapshot.behavior.envelope.owner_sid.clone(),
+            primary_group_sid: snapshot.behavior.envelope.primary_group_sid.clone(),
+            default_dacl_sha256: snapshot.behavior.default_dacl_sha256.clone(),
+            elevation_type: snapshot.behavior.envelope.elevation_type,
+            elevated: snapshot.behavior.envelope.elevated,
+            appcontainer: snapshot.behavior.envelope.appcontainer,
+            ui_access: snapshot.behavior.envelope.ui_access,
+            virtualization_allowed: snapshot.behavior.envelope.virtualization_allowed,
+            virtualization_enabled: snapshot.behavior.envelope.virtualization_enabled,
+            restricting_sids: snapshot.behavior.restricting_sids.clone(),
+        }
+    }
+
+    fn without_restricting_sid_inventory(mut self) -> Self {
+        self.restricted_sids_sha256.clear();
+        self.restricting_sids.clear();
+        self
+    }
+}
+
+fn loader_restriction_presence_binding_sha256(
+    source_binding_sha256: &str,
+    baseline: &TokenAttestationSnapshot,
+    no_restricting_sid: &TokenAttestationSnapshot,
+) -> Result<String, String> {
+    serde_json::to_vec(&(
+        "memcordon-loader-restriction-presence-v1",
+        DISABLE_MAX_PRIVILEGE,
+        source_binding_sha256,
+        baseline,
+        no_restricting_sid,
+    ))
+    .map(|bytes| super::record::digest(&bytes))
+    .map_err(|error| error.to_string())
+}
+
+fn validate_loader_restriction_presence_pair(
+    baseline: HANDLE,
+    no_restricting_sid: HANDLE,
+) -> Result<(TokenAttestationSnapshot, TokenAttestationSnapshot), String> {
+    let baseline_snapshot = token_attestation_snapshot(baseline)?;
+    let no_restricting_sid_snapshot = token_attestation_snapshot(no_restricting_sid)?;
+    let baseline_invariants = LoaderRestrictionPairInvariantsV1::from_snapshot(&baseline_snapshot)
+        .without_restricting_sid_inventory();
+    let no_restricting_sid_invariants =
+        LoaderRestrictionPairInvariantsV1::from_snapshot(&no_restricting_sid_snapshot)
+            .without_restricting_sid_inventory();
+    let no_restricting_sid_inventory = token_restricting_sid_inventory(no_restricting_sid)?;
+    if baseline_invariants != no_restricting_sid_invariants
+        || !baseline_snapshot.behavior.token_is_restricted
+        || no_restricting_sid_snapshot.behavior.token_is_restricted
+        || !token_has_exact_restricting_sid(
+            baseline,
+            RESTRICTED_CODE_SID,
+            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+        )?
+        || !no_restricting_sid_inventory.entries.is_empty()
+        || !no_restricting_sid_inventory.trustees.is_empty()
+        || !no_restricting_sid_inventory.evidence.is_empty()
+        || baseline_snapshot.behavior.enabled_sensitive_privilege_count != 0
+        || no_restricting_sid_snapshot
+            .behavior
+            .enabled_sensitive_privilege_count
+            != 0
+        || super::security::write_restricted_behavior_for_sid_attested(
+            baseline,
+            RESTRICTED_CODE_SID,
+        )?
+        || super::security::write_restricted_behavior_for_sid_attested(
+            no_restricting_sid,
+            RESTRICTED_CODE_SID,
+        )?
+    {
+        return Err(
+            "loader restriction-presence pair differs outside restricting SID inventory".to_owned(),
+        );
+    }
+    Ok((baseline_snapshot, no_restricting_sid_snapshot))
+}
+
+fn validate_loader_restriction_pair_invariants(
+    effective: &LoaderRestrictionPairInvariantsV1,
+    baseline: &LoaderRestrictionPairInvariantsV1,
+    comparison: &LoaderRestrictionPairInvariantsV1,
+) -> Result<(), String> {
+    if baseline != effective || comparison != baseline {
+        return Err(
+            "loader restriction diagnostic pair differs outside WRITE_RESTRICTED semantics"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn loader_restriction_pair_construction_for_test() -> (u32, u32, &'static str) {
+    (
+        DISABLE_MAX_PRIVILEGE,
+        DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
+        "S-1-5-12",
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn validate_loader_restriction_pair_invariants_for_test(
+    mutated_field: Option<&str>,
+) -> Result<String, String> {
+    let effective = LoaderRestrictionPairInvariantsV1 {
+        user_sid: "S-1-5-21-test".to_owned(),
+        originating_logon_session: 7,
+        authentication_id: 11,
+        source_name: *b"TestSrc\0",
+        source_identifier: 13,
+        session_id: 2,
+        token_type: TokenPrimary as u32,
+        impersonation_level: SecurityAnonymous as u32,
+        integrity_level: "S-1-16-12288".to_owned(),
+        mandatory_policy: 1,
+        groups_sha256: "33".repeat(32),
+        privileges_sha256: "44".repeat(32),
+        restricted_sids_sha256: "55".repeat(32),
+        groups: vec!["S-1-5-5-test:enabled".to_owned()],
+        privileges: vec!["SeChangeNotifyPrivilege:enabled".to_owned()],
+        owner_sid: "S-1-5-21-test".to_owned(),
+        primary_group_sid: "S-1-5-21-group".to_owned(),
+        default_dacl_sha256: Some("11".repeat(32)),
+        elevation_type: 2,
+        elevated: true,
+        appcontainer: false,
+        ui_access: false,
+        virtualization_allowed: false,
+        virtualization_enabled: false,
+        restricting_sids: vec!["S-1-5-12@7".to_owned()],
+    };
+    let baseline = effective.clone();
+    let mut comparison = effective.clone();
+    match mutated_field {
+        None => {}
+        Some("user") => comparison.user_sid.push_str("-changed"),
+        Some("logon") => comparison.originating_logon_session += 1,
+        Some("authentication") => comparison.authentication_id += 1,
+        Some("source") => comparison.source_identifier += 1,
+        Some("session") => comparison.session_id += 1,
+        Some("type") => comparison.token_type += 1,
+        Some("impersonation") => comparison.impersonation_level += 1,
+        Some("integrity") => comparison.integrity_level = "S-1-16-8192".to_owned(),
+        Some("mandatory") => comparison.mandatory_policy += 1,
+        Some("groups") => comparison.groups.push("S-1-1-0:enabled".to_owned()),
+        Some("privileges") => comparison.privileges.clear(),
+        Some("owner") => comparison.owner_sid.push_str("-changed"),
+        Some("primary_group") => comparison.primary_group_sid.push_str("-changed"),
+        Some("default_dacl") => comparison.default_dacl_sha256 = Some("22".repeat(32)),
+        Some("elevation") => comparison.elevated = false,
+        Some("appcontainer") => comparison.appcontainer = true,
+        Some("ui_access") => comparison.ui_access = true,
+        Some("virtualization_allowed") => comparison.virtualization_allowed = true,
+        Some("virtualization_enabled") => comparison.virtualization_enabled = true,
+        Some("restricting_sids") => comparison.restricting_sids = vec!["S-1-5-33".to_owned()],
+        Some(field) => return Err(format!("unknown loader restriction fixture field {field}")),
+    }
+    validate_loader_restriction_pair_invariants(&effective, &baseline, &comparison)?;
+    serde_json::to_vec(&(baseline, comparison))
+        .map(|bytes| super::record::digest(&bytes))
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn is_exact_full_restricted_loader_canary_source(token: HANDLE) -> Result<bool, String> {
+    let snapshot = token_attestation_snapshot(token)?;
+    Ok(snapshot.behavior.token_is_restricted
+        && token_has_exact_restricting_sid(
+            token,
+            RESTRICTED_CODE_SID,
+            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+        )?
+        && snapshot.behavior.enabled_sensitive_privilege_count == 0
+        && !super::security::write_restricted_behavior_for_sid_attested(
+            token,
+            RESTRICTED_CODE_SID,
+        )?)
+}
+
+fn loader_restriction_pair_binding_sha256(
+    baseline: &TokenAttestationSnapshot,
+    comparison: &TokenAttestationSnapshot,
+) -> Result<String, String> {
+    let baseline = LoaderRestrictionPairInvariantsV1::from_snapshot(baseline);
+    let comparison = LoaderRestrictionPairInvariantsV1::from_snapshot(comparison);
+    serde_json::to_vec(&(baseline, comparison))
+        .map(|bytes| super::record::digest(&bytes))
+        .map_err(|error| error.to_string())
+}
+
+fn validate_loader_restriction_diagnostic_pair(
+    effective: HANDLE,
+    baseline: HANDLE,
+    comparison: HANDLE,
+) -> Result<(TokenAttestationSnapshot, TokenAttestationSnapshot), String> {
+    let effective_snapshot = token_attestation_snapshot(effective)?;
+    let baseline_snapshot = token_attestation_snapshot(baseline)?;
+    let comparison_snapshot = token_attestation_snapshot(comparison)?;
+    validate_loader_restriction_pair_invariants(
+        &LoaderRestrictionPairInvariantsV1::from_snapshot(&effective_snapshot),
+        &LoaderRestrictionPairInvariantsV1::from_snapshot(&baseline_snapshot),
+        &LoaderRestrictionPairInvariantsV1::from_snapshot(&comparison_snapshot),
+    )?;
+    if !effective_snapshot.behavior.token_is_restricted
+        || !baseline_snapshot.behavior.token_is_restricted
+        || !comparison_snapshot.behavior.token_is_restricted
+        || !token_has_exact_restricting_sid(
+            effective,
+            RESTRICTED_CODE_SID,
+            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+        )?
+        || !token_has_exact_restricting_sid(
+            baseline,
+            RESTRICTED_CODE_SID,
+            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+        )?
+        || !token_has_exact_restricting_sid(
+            comparison,
+            RESTRICTED_CODE_SID,
+            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+        )?
+        || baseline_snapshot.behavior.enabled_sensitive_privilege_count != 0
+        || super::security::write_restricted_behavior_for_sid_attested(
+            effective,
+            RESTRICTED_CODE_SID,
+        )?
+        || super::security::write_restricted_behavior_for_sid_attested(
+            baseline,
+            RESTRICTED_CODE_SID,
+        )?
+        || !super::security::write_restricted_behavior_for_sid_attested(
+            comparison,
+            RESTRICTED_CODE_SID,
+        )?
+    {
+        return Err(
+            "loader restriction diagnostic pair differs outside WRITE_RESTRICTED semantics"
+                .to_owned(),
+        );
+    }
+    Ok((baseline_snapshot, comparison_snapshot))
+}
+
+fn loader_restriction_diagnostic_pair_from_source(
+    source: HANDLE,
+) -> Result<LoaderRestrictionDiagnosticTokenPair, String> {
+    const RESTRICTING_SID: &str = "S-1-5-12";
+    let source_snapshot = token_attestation_snapshot(source)?;
+    if source_snapshot.behavior.token_is_restricted
+        || !source_snapshot.behavior.restricting_sids.is_empty()
+    {
+        return Err(
+            "authenticated qualification token is not an unrestricted source authority".to_owned(),
+        );
+    }
+    let baseline = restricted_primary_for_source(source, DISABLE_MAX_PRIVILEGE, RESTRICTING_SID)?;
+    let comparison = restricted_primary_for_source(
+        source,
+        DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
+        RESTRICTING_SID,
+    )?;
+    let no_restricting_sid =
+        primary_without_restricting_sid_from_source(source, DISABLE_MAX_PRIVILEGE)?;
+    let (baseline_snapshot, comparison_snapshot) = validate_loader_restriction_diagnostic_pair(
+        baseline.raw(),
+        baseline.raw(),
+        comparison.raw(),
+    )?;
+    let (_, no_restricting_sid_snapshot) =
+        validate_loader_restriction_presence_pair(baseline.raw(), no_restricting_sid.raw())?;
+    const PROFILE_ACCESS: u32 = TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE;
+    let profile = duplicate_handle_with_access(
+        baseline.raw(),
+        PROFILE_ACCESS,
+        "MCSEALED-WINDOWS-LOADER-PROFILE-TOKEN-NARROW",
+    )?;
+    if handle_granted_access(profile.raw()).map_err(|error| error.detail)? != PROFILE_ACCESS {
+        return Err(
+            "loader profile capability did not receive exact query/duplicate/impersonate access"
+                .to_owned(),
+        );
+    }
+    if envelope(profile.raw())? != baseline_snapshot.behavior.envelope {
+        return Err(
+            "loader profile capability differs from the full-restricted baseline".to_owned(),
+        );
+    }
+    if source_snapshot.lineage.authentication_id != baseline_snapshot.lineage.authentication_id
+        || source_snapshot.lineage.originating_logon_session
+            != baseline_snapshot.lineage.originating_logon_session
+        || source_snapshot.lineage.user_sid != baseline_snapshot.lineage.user_sid
+        || source_snapshot.lineage.session_id != baseline_snapshot.lineage.session_id
+    {
+        return Err(
+            "prederived loader restriction baseline does not preserve source lineage".to_owned(),
+        );
+    }
+    let source_binding_sha256 = serde_json::to_vec(&source_snapshot)
+        .map(|bytes| super::record::digest(&bytes))
+        .map_err(|error| error.to_string())?;
+    let pair_invariants_sha256 =
+        loader_restriction_pair_binding_sha256(&baseline_snapshot, &comparison_snapshot)?;
+    let restriction_presence_binding_sha256 = loader_restriction_presence_binding_sha256(
+        &source_binding_sha256,
+        &baseline_snapshot,
+        &no_restricting_sid_snapshot,
+    )?;
+    let profile_binding_sha256 = super::record::digest(
+        format!(
+            "memcordon-loader-profile-capability-v1\0{}\0{}\0{PROFILE_ACCESS:08x}",
+            source_binding_sha256, pair_invariants_sha256
+        )
+        .as_bytes(),
+    );
+    Ok(LoaderRestrictionDiagnosticTokenPair {
+        baseline,
+        comparison,
+        no_restricting_sid,
+        profile,
+        source_binding_sha256,
+        pair_invariants_sha256,
+        restriction_presence_binding_sha256,
+        profile_binding_sha256,
+    })
+}
+
+pub(crate) fn loader_restriction_diagnostic_pair_for_qualification(
+    owner: &WindowsProcessIdentityV1,
+    effective: HANDLE,
+) -> Result<LoaderRestrictionDiagnosticTokenPair, String> {
+    let mut slot = QUALIFICATION_LOADER_RESTRICTION_SOURCE
+        .lock()
+        .map_err(|_| "qualification loader restriction source lock is poisoned".to_owned())?;
+    let lease = slot
+        .as_mut()
+        .ok_or_else(|| "qualification loader restriction source is unavailable".to_owned())?;
+    if &lease.owner != owner {
+        return Err(
+            "qualification loader restriction source owner does not match launch".to_owned(),
+        );
+    }
+    if super::process::process_identity(lease.frontend.raw())? != lease.owner {
+        return Err("qualification loader restriction source process identity changed".to_owned());
+    }
+    let baseline = lease
+        .baseline
+        .as_ref()
+        .ok_or_else(|| "qualification loader restriction pair was already consumed".to_owned())?;
+    let comparison = lease
+        .comparison
+        .as_ref()
+        .ok_or_else(|| "qualification loader restriction pair was already consumed".to_owned())?;
+    let no_restricting_sid = lease.no_restricting_sid.as_ref().ok_or_else(|| {
+        "qualification loader no-restricting-SID sibling was already consumed".to_owned()
+    })?;
+    let profile = lease
+        .profile
+        .as_ref()
+        .ok_or_else(|| "qualification loader profile capability was already consumed".to_owned())?;
+    let (baseline_snapshot, comparison_snapshot) =
+        validate_loader_restriction_diagnostic_pair(effective, baseline.raw(), comparison.raw())?;
+    let observed_pair_invariants_sha256 =
+        loader_restriction_pair_binding_sha256(&baseline_snapshot, &comparison_snapshot)?;
+    if observed_pair_invariants_sha256 != lease.pair_invariants_sha256 {
+        return Err("qualification loader restriction pair binding changed".to_owned());
+    }
+    let (presence_baseline_snapshot, no_restricting_sid_snapshot) =
+        validate_loader_restriction_presence_pair(baseline.raw(), no_restricting_sid.raw())?;
+    if presence_baseline_snapshot != baseline_snapshot {
+        return Err("qualification loader restriction baseline evidence changed".to_owned());
+    }
+    let observed_restriction_presence_binding_sha256 = loader_restriction_presence_binding_sha256(
+        &lease.source_binding_sha256,
+        &presence_baseline_snapshot,
+        &no_restricting_sid_snapshot,
+    )?;
+    if observed_restriction_presence_binding_sha256 != lease.restriction_presence_binding_sha256 {
+        return Err("qualification loader restriction-presence binding changed".to_owned());
+    }
+    const PROFILE_ACCESS: u32 = TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE;
+    if handle_granted_access(profile.raw()).map_err(|error| error.detail)? != PROFILE_ACCESS
+        || envelope(profile.raw())? != baseline_snapshot.behavior.envelope
+    {
+        return Err("qualification loader profile capability binding changed".to_owned());
+    }
+    let observed_profile_binding_sha256 = super::record::digest(
+        format!(
+            "memcordon-loader-profile-capability-v1\0{}\0{}\0{PROFILE_ACCESS:08x}",
+            lease.source_binding_sha256, lease.pair_invariants_sha256
+        )
+        .as_bytes(),
+    );
+    if observed_profile_binding_sha256 != lease.profile_binding_sha256 {
+        return Err("qualification loader profile capability digest changed".to_owned());
+    }
+    Ok(LoaderRestrictionDiagnosticTokenPair {
+        baseline: lease
+            .baseline
+            .take()
+            .ok_or_else(|| "qualification loader restriction baseline is unavailable".to_owned())?,
+        comparison: lease.comparison.take().ok_or_else(|| {
+            "qualification loader restriction comparison is unavailable".to_owned()
+        })?,
+        no_restricting_sid: lease.no_restricting_sid.take().ok_or_else(|| {
+            "qualification loader no-restricting-SID sibling is unavailable".to_owned()
+        })?,
+        profile: lease
+            .profile
+            .take()
+            .ok_or_else(|| "qualification loader profile capability is unavailable".to_owned())?,
+        source_binding_sha256: lease.source_binding_sha256.clone(),
+        pair_invariants_sha256: lease.pair_invariants_sha256.clone(),
+        restriction_presence_binding_sha256: lease.restriction_presence_binding_sha256.clone(),
+        profile_binding_sha256: lease.profile_binding_sha256.clone(),
+    })
+}
+
+pub(crate) fn validate_transferred_loader_restriction_diagnostic_pair(
+    effective: HANDLE,
+    baseline: HANDLE,
+    comparison: HANDLE,
+    expected_pair_invariants_sha256: &str,
+) -> Result<(), String> {
+    let (baseline_snapshot, comparison_snapshot) =
+        validate_loader_restriction_diagnostic_pair(effective, baseline, comparison)?;
+    let observed =
+        loader_restriction_pair_binding_sha256(&baseline_snapshot, &comparison_snapshot)?;
+    if observed != expected_pair_invariants_sha256 {
+        return Err(
+            "loader restriction diagnostic pair binding changed during transfer".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_transferred_loader_restriction_presence_pair(
+    baseline: HANDLE,
+    no_restricting_sid: HANDLE,
+    source_binding_sha256: &str,
+    expected_restriction_presence_binding_sha256: &str,
+) -> Result<(), String> {
+    let (baseline_snapshot, no_restricting_sid_snapshot) =
+        validate_loader_restriction_presence_pair(baseline, no_restricting_sid)?;
+    let observed = loader_restriction_presence_binding_sha256(
+        source_binding_sha256,
+        &baseline_snapshot,
+        &no_restricting_sid_snapshot,
+    )?;
+    if observed != expected_restriction_presence_binding_sha256 {
+        return Err("loader restriction-presence binding changed during transfer".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) fn loader_restriction_identity_sibling_from_presence_comparison(
+    baseline: HANDLE,
+    no_restricting_sid: HANDLE,
+    source_binding_sha256: &str,
+    expected_restriction_presence_binding_sha256: &str,
+) -> Result<(OwnedHandle, TokenAttestationSnapshot, String), String> {
+    let (baseline_snapshot, no_restricting_sid_snapshot) =
+        validate_loader_restriction_presence_pair(baseline, no_restricting_sid)?;
+    let observed_presence_binding_sha256 = loader_restriction_presence_binding_sha256(
+        source_binding_sha256,
+        &baseline_snapshot,
+        &no_restricting_sid_snapshot,
+    )?;
+    if observed_presence_binding_sha256 != expected_restriction_presence_binding_sha256 {
+        return Err(
+            "loader restriction-presence binding changed before identity derivation".to_owned(),
+        );
+    }
+    let expected_restricting_sids = canonical_same_access_restricting_sids(no_restricting_sid)?;
+    if expected_restricting_sids.is_empty() {
+        return Err("canonical same-access restricting SID inventory is empty".to_owned());
+    }
+    let expected_restricting_entries = expected_restricting_sids
+        .iter()
+        .map(|sid| (sid.clone(), NORMALIZED_RESTRICTING_SID_ATTRIBUTES))
+        .collect::<Vec<_>>();
+    let same_access_restricted = restricted_same_access_primary(no_restricting_sid)?;
+    let (_, _, same_access_snapshot, observed_restricting_entries, identity_binding_sha256) =
+        validate_loader_restriction_identity_triplet(
+            baseline,
+            no_restricting_sid,
+            same_access_restricted.raw(),
+            source_binding_sha256,
+            expected_restriction_presence_binding_sha256,
+            None,
+        )?;
+    if observed_restricting_entries != expected_restricting_entries {
+        return Err(
+            "canonical same-access inventory changed during identity derivation".to_owned(),
+        );
+    }
+    Ok((
+        same_access_restricted,
+        same_access_snapshot,
+        identity_binding_sha256,
+    ))
+}
+
+#[allow(clippy::type_complexity)]
+fn validate_loader_restriction_identity_triplet(
+    baseline: HANDLE,
+    no_restricting_sid: HANDLE,
+    same_access_restricted: HANDLE,
+    source_binding_sha256: &str,
+    expected_restriction_presence_binding_sha256: &str,
+    expected_restriction_identity_binding_sha256: Option<&str>,
+) -> Result<
+    (
+        TokenAttestationSnapshot,
+        TokenAttestationSnapshot,
+        TokenAttestationSnapshot,
+        Vec<(String, u32)>,
+        String,
+    ),
+    String,
+> {
+    let (baseline_snapshot, no_restricting_sid_snapshot) =
+        validate_loader_restriction_presence_pair(baseline, no_restricting_sid)?;
+    let observed_presence_binding_sha256 = loader_restriction_presence_binding_sha256(
+        source_binding_sha256,
+        &baseline_snapshot,
+        &no_restricting_sid_snapshot,
+    )?;
+    if observed_presence_binding_sha256 != expected_restriction_presence_binding_sha256 {
+        return Err(
+            "loader restriction-presence binding changed before identity derivation".to_owned(),
+        );
+    }
+    let expected_restricting_sids = canonical_same_access_restricting_sids(no_restricting_sid)?;
+    if expected_restricting_sids.is_empty() {
+        return Err("canonical same-access restricting SID inventory is empty".to_owned());
+    }
+    let expected_restricting_entries = expected_restricting_sids
+        .iter()
+        .map(|sid| (sid.clone(), NORMALIZED_RESTRICTING_SID_ATTRIBUTES))
+        .collect::<Vec<_>>();
+    let same_access_snapshot = token_attestation_snapshot(same_access_restricted)?;
+    let same_access_inventory = token_restricting_sid_inventory(same_access_restricted)?;
+    let no_restricting_sid_invariants =
+        LoaderRestrictionPairInvariantsV1::from_snapshot(&no_restricting_sid_snapshot)
+            .without_restricting_sid_inventory();
+    let same_access_invariants =
+        LoaderRestrictionPairInvariantsV1::from_snapshot(&same_access_snapshot)
+            .without_restricting_sid_inventory();
+    if no_restricting_sid_invariants != same_access_invariants
+        || !same_access_snapshot.behavior.token_is_restricted
+        || same_access_inventory.trustees != expected_restricting_sids
+        || same_access_inventory.entries != expected_restricting_entries
+        || same_access_snapshot
+            .behavior
+            .enabled_sensitive_privilege_count
+            != 0
+    {
+        return Err(
+            "loader same-access restricted sibling differs outside canonical restricting SID inventory"
+                .to_owned(),
+        );
+    }
+    let identity_binding_sha256 = loader_restriction_identity_binding_sha256(
+        source_binding_sha256,
+        expected_restriction_presence_binding_sha256,
+        &expected_restricting_entries,
+        &baseline_snapshot,
+        &no_restricting_sid_snapshot,
+        &same_access_snapshot,
+    )?;
+    if expected_restriction_identity_binding_sha256
+        .is_some_and(|expected| expected != identity_binding_sha256)
+    {
+        return Err(
+            "loader restriction-identity binding changed before logon derivation".to_owned(),
+        );
+    }
+    Ok((
+        baseline_snapshot,
+        no_restricting_sid_snapshot,
+        same_access_snapshot,
+        expected_restricting_entries,
+        identity_binding_sha256,
+    ))
+}
+
+fn loader_restriction_identity_binding_sha256(
+    source_binding_sha256: &str,
+    restriction_presence_binding_sha256: &str,
+    expected_restricting_entries: &[(String, u32)],
+    baseline_snapshot: &TokenAttestationSnapshot,
+    no_restricting_sid_snapshot: &TokenAttestationSnapshot,
+    same_access_snapshot: &TokenAttestationSnapshot,
+) -> Result<String, String> {
+    serde_json::to_vec(&(
+        "memcordon-loader-restriction-identity-v1",
+        "baseline->no-restricting-SID->canonical-same-access",
+        DISABLE_MAX_PRIVILEGE,
+        0_u32,
+        source_binding_sha256,
+        restriction_presence_binding_sha256,
+        expected_restricting_entries,
+        baseline_snapshot,
+        no_restricting_sid_snapshot,
+        same_access_snapshot,
+    ))
+    .map(|bytes| super::record::digest(&bytes))
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct TokenLogonSidGroupEvidenceV1 {
+    sid: String,
+    attributes: u32,
+}
+
+pub(crate) fn loader_logon_restriction_sibling_from_identity_comparison(
+    baseline: HANDLE,
+    no_restricting_sid: HANDLE,
+    same_access_restricted: HANDLE,
+    source_binding_sha256: &str,
+    expected_restriction_presence_binding_sha256: &str,
+    expected_restriction_identity_binding_sha256: &str,
+) -> Result<(OwnedHandle, TokenAttestationSnapshot, String), String> {
+    validate_loader_restriction_identity_triplet(
+        baseline,
+        no_restricting_sid,
+        same_access_restricted,
+        source_binding_sha256,
+        expected_restriction_presence_binding_sha256,
+        Some(expected_restriction_identity_binding_sha256),
+    )?;
+    let (logon_restricted, source_logon_group) = restricted_logon_sid_primary(no_restricting_sid)?;
+    let (_, _, _, logon_snapshot, _, observed_source_logon_group, logon_binding_sha256) =
+        validate_loader_logon_restriction_quadruplet(
+            baseline,
+            no_restricting_sid,
+            same_access_restricted,
+            logon_restricted.raw(),
+            source_binding_sha256,
+            expected_restriction_presence_binding_sha256,
+            expected_restriction_identity_binding_sha256,
+            None,
+        )?;
+    if observed_source_logon_group != source_logon_group {
+        return Err("source logon SID changed during logon restriction derivation".to_owned());
+    }
+    Ok((logon_restricted, logon_snapshot, logon_binding_sha256))
+}
+
+fn loader_logon_restriction_binding_sha256(
+    source_binding_sha256: &str,
+    restriction_presence_binding_sha256: &str,
+    restriction_identity_binding_sha256: &str,
+    source_logon_group: &TokenLogonSidGroupEvidenceV1,
+    expected_same_access_entries: &[(String, u32)],
+    expected_logon_entries: &[(String, u32)],
+    baseline_snapshot: &TokenAttestationSnapshot,
+    no_restricting_sid_snapshot: &TokenAttestationSnapshot,
+    same_access_snapshot: &TokenAttestationSnapshot,
+    logon_snapshot: &TokenAttestationSnapshot,
+) -> Result<String, String> {
+    serde_json::to_vec(&(
+        "memcordon-loader-logon-restriction-v1",
+        "baseline->no-restricting-SID->canonical-same-access->target-logon-SID",
+        DISABLE_MAX_PRIVILEGE,
+        0_u32,
+        CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,
+        NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+        source_binding_sha256,
+        restriction_presence_binding_sha256,
+        restriction_identity_binding_sha256,
+        source_logon_group,
+        expected_same_access_entries,
+        expected_logon_entries,
+        baseline_snapshot,
+        no_restricting_sid_snapshot,
+        same_access_snapshot,
+        logon_snapshot,
+    ))
+    .map(|bytes| super::record::digest(&bytes))
+    .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::type_complexity)]
+fn validate_loader_logon_restriction_quadruplet(
+    baseline: HANDLE,
+    no_restricting_sid: HANDLE,
+    same_access_restricted: HANDLE,
+    logon_restricted: HANDLE,
+    source_binding_sha256: &str,
+    expected_restriction_presence_binding_sha256: &str,
+    expected_restriction_identity_binding_sha256: &str,
+    expected_logon_restriction_binding_sha256: Option<&str>,
+) -> Result<
+    (
+        TokenAttestationSnapshot,
+        TokenAttestationSnapshot,
+        TokenAttestationSnapshot,
+        TokenAttestationSnapshot,
+        Vec<(String, u32)>,
+        TokenLogonSidGroupEvidenceV1,
+        String,
+    ),
+    String,
+> {
+    let (
+        baseline_snapshot,
+        no_restricting_sid_snapshot,
+        same_access_snapshot,
+        expected_same_access_entries,
+        _,
+    ) = validate_loader_restriction_identity_triplet(
+        baseline,
+        no_restricting_sid,
+        same_access_restricted,
+        source_binding_sha256,
+        expected_restriction_presence_binding_sha256,
+        Some(expected_restriction_identity_binding_sha256),
+    )?;
+    let source_logon_group = source_logon_sid_group_evidence(no_restricting_sid)?;
+    let logon_snapshot = token_attestation_snapshot(logon_restricted)?;
+    let logon_inventory = token_restricting_sid_inventory(logon_restricted)?;
+    let expected_logon_entries = vec![(
+        source_logon_group.sid.clone(),
+        NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+    )];
+    let no_restricting_sid_invariants =
+        LoaderRestrictionPairInvariantsV1::from_snapshot(&no_restricting_sid_snapshot)
+            .without_restricting_sid_inventory();
+    let baseline_invariants = LoaderRestrictionPairInvariantsV1::from_snapshot(&baseline_snapshot)
+        .without_restricting_sid_inventory();
+    let logon_invariants = LoaderRestrictionPairInvariantsV1::from_snapshot(&logon_snapshot)
+        .without_restricting_sid_inventory();
+    if no_restricting_sid_invariants != logon_invariants
+        || baseline_invariants != logon_invariants
+        || !logon_snapshot.behavior.token_is_restricted
+        || logon_inventory.entries != expected_logon_entries
+        || logon_inventory.trustees != vec![source_logon_group.sid.clone()]
+        || logon_snapshot.behavior.enabled_sensitive_privilege_count != 0
+    {
+        return Err(
+            "loader logon-restricted sibling differs outside its singleton restricting SID inventory"
+                .to_owned(),
+        );
+    }
+    let logon_binding_sha256 = loader_logon_restriction_binding_sha256(
+        source_binding_sha256,
+        expected_restriction_presence_binding_sha256,
+        expected_restriction_identity_binding_sha256,
+        &source_logon_group,
+        &expected_same_access_entries,
+        &expected_logon_entries,
+        &baseline_snapshot,
+        &no_restricting_sid_snapshot,
+        &same_access_snapshot,
+        &logon_snapshot,
+    )?;
+    if expected_logon_restriction_binding_sha256
+        .is_some_and(|expected| expected != logon_binding_sha256)
+    {
+        return Err(
+            "loader logon-restriction binding changed before authenticated-users derivation"
+                .to_owned(),
+        );
+    }
+    Ok((
+        baseline_snapshot,
+        no_restricting_sid_snapshot,
+        same_access_snapshot,
+        logon_snapshot,
+        expected_same_access_entries,
+        source_logon_group,
+        logon_binding_sha256,
+    ))
+}
+
+pub(crate) fn loader_authenticated_users_restriction_sibling_from_logon_comparison(
+    baseline: HANDLE,
+    no_restricting_sid: HANDLE,
+    same_access_restricted: HANDLE,
+    logon_restricted: HANDLE,
+    source_binding_sha256: &str,
+    expected_restriction_presence_binding_sha256: &str,
+    expected_restriction_identity_binding_sha256: &str,
+    expected_logon_restriction_binding_sha256: &str,
+) -> Result<(OwnedHandle, TokenAttestationSnapshot, String), String> {
+    validate_loader_logon_restriction_quadruplet(
+        baseline,
+        no_restricting_sid,
+        same_access_restricted,
+        logon_restricted,
+        source_binding_sha256,
+        expected_restriction_presence_binding_sha256,
+        expected_restriction_identity_binding_sha256,
+        Some(expected_logon_restriction_binding_sha256),
+    )?;
+    let (authenticated_users_restricted, source_authenticated_users_group) =
+        restricted_authenticated_users_primary(no_restricting_sid, same_access_restricted)?;
+    let validation = validate_loader_authenticated_users_restriction_quintuplet(
+        baseline,
+        no_restricting_sid,
+        same_access_restricted,
+        logon_restricted,
+        authenticated_users_restricted.raw(),
+        source_binding_sha256,
+        expected_restriction_presence_binding_sha256,
+        expected_restriction_identity_binding_sha256,
+        expected_logon_restriction_binding_sha256,
+        None,
+    )?;
+    if validation.source_authenticated_users_group != source_authenticated_users_group {
+        return Err(
+            "source Authenticated Users SID changed during restriction derivation".to_owned(),
+        );
+    }
+    Ok((
+        authenticated_users_restricted,
+        validation.authenticated_users_snapshot,
+        validation.authenticated_users_binding_sha256,
+    ))
+}
+
+#[derive(Debug)]
+struct LoaderAuthenticatedUsersRestrictionValidationV1 {
+    baseline_snapshot: TokenAttestationSnapshot,
+    no_restricting_sid_snapshot: TokenAttestationSnapshot,
+    same_access_snapshot: TokenAttestationSnapshot,
+    logon_snapshot: TokenAttestationSnapshot,
+    authenticated_users_snapshot: TokenAttestationSnapshot,
+    expected_same_access_entries: Vec<(String, u32)>,
+    source_logon_group: TokenLogonSidGroupEvidenceV1,
+    source_authenticated_users_group: AuthenticatedUsersGroupEvidenceV1,
+    expected_logon_entries: Vec<(String, u32)>,
+    expected_authenticated_users_entries: Vec<(String, u32)>,
+    authenticated_users_binding_sha256: String,
+}
+
+fn authenticated_users_group_evidence(
+    source: HANDLE,
+    canonical_same_access: HANDLE,
+) -> Result<AuthenticatedUsersGroupEvidenceV1, String> {
+    let expected_sid = authenticated_users_sid()?;
+    let groups = query(source, TokenGroups)?;
+    let source_entry = exact_equal_sid_entry(
+        token_group_entries(groups.as_bytes())?,
+        expected_sid.as_ptr().cast_mut().cast(),
+        "TokenGroups",
+    )?;
+    validate_authenticated_users_attributes(source_entry.Attributes, "TokenGroups")?;
+    let canonical = query(canonical_same_access, TokenRestrictedSids)?;
+    let canonical_entry = exact_equal_sid_entry(
+        token_group_entries(canonical.as_bytes())?,
+        expected_sid.as_ptr().cast_mut().cast(),
+        "canonical TokenRestrictedSids",
+    )?;
+    validate_authenticated_users_attributes(
+        canonical_entry.Attributes,
+        "canonical TokenRestrictedSids",
+    )?;
+    let sid = sid_string(expected_sid.as_ptr().cast_mut().cast())?;
+    if sid != AUTHENTICATED_USERS_SID {
+        return Err("well-known Authenticated Users SID rendered unexpectedly".to_owned());
+    }
+    Ok(AuthenticatedUsersGroupEvidenceV1 {
+        sid,
+        source_attributes: source_entry.Attributes,
+        canonical_attributes: canonical_entry.Attributes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loader_authenticated_users_restriction_binding_sha256(
+    source_binding_sha256: &str,
+    restriction_presence_binding_sha256: &str,
+    restriction_identity_binding_sha256: &str,
+    logon_restriction_binding_sha256: &str,
+    source_logon_group: &TokenLogonSidGroupEvidenceV1,
+    source_authenticated_users_group: &AuthenticatedUsersGroupEvidenceV1,
+    expected_same_access_entries: &[(String, u32)],
+    expected_logon_entries: &[(String, u32)],
+    expected_authenticated_users_entries: &[(String, u32)],
+    baseline_snapshot: &TokenAttestationSnapshot,
+    no_restricting_sid_snapshot: &TokenAttestationSnapshot,
+    same_access_snapshot: &TokenAttestationSnapshot,
+    logon_snapshot: &TokenAttestationSnapshot,
+    authenticated_users_snapshot: &TokenAttestationSnapshot,
+) -> Result<String, String> {
+    serde_json::to_vec(&(
+        (
+            "memcordon-loader-authenticated-users-restriction-v1",
+            "baseline->no-restricting-SID->canonical-same-access->target-logon-SID->authenticated-users-SID",
+            DISABLE_MAX_PRIVILEGE,
+            0_u32,
+            CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,
+            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+        ),
+        (
+            source_binding_sha256,
+            restriction_presence_binding_sha256,
+            restriction_identity_binding_sha256,
+            logon_restriction_binding_sha256,
+        ),
+        (
+            source_logon_group,
+            source_authenticated_users_group,
+            expected_same_access_entries,
+            expected_logon_entries,
+            expected_authenticated_users_entries,
+        ),
+        (
+            baseline_snapshot,
+            no_restricting_sid_snapshot,
+            same_access_snapshot,
+            logon_snapshot,
+            authenticated_users_snapshot,
+        ),
+    ))
+    .map(|bytes| super::record::digest(&bytes))
+    .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_loader_authenticated_users_restriction_quintuplet(
+    baseline: HANDLE,
+    no_restricting_sid: HANDLE,
+    same_access_restricted: HANDLE,
+    logon_restricted: HANDLE,
+    authenticated_users_restricted: HANDLE,
+    source_binding_sha256: &str,
+    expected_restriction_presence_binding_sha256: &str,
+    expected_restriction_identity_binding_sha256: &str,
+    expected_logon_restriction_binding_sha256: &str,
+    expected_authenticated_users_restriction_binding_sha256: Option<&str>,
+) -> Result<LoaderAuthenticatedUsersRestrictionValidationV1, String> {
+    let (
+        baseline_snapshot,
+        no_restricting_sid_snapshot,
+        same_access_snapshot,
+        logon_snapshot,
+        expected_same_access_entries,
+        source_logon_group,
+        _,
+    ) = validate_loader_logon_restriction_quadruplet(
+        baseline,
+        no_restricting_sid,
+        same_access_restricted,
+        logon_restricted,
+        source_binding_sha256,
+        expected_restriction_presence_binding_sha256,
+        expected_restriction_identity_binding_sha256,
+        Some(expected_logon_restriction_binding_sha256),
+    )?;
+    let source_authenticated_users_group =
+        authenticated_users_group_evidence(no_restricting_sid, same_access_restricted)?;
+    let authenticated_users_snapshot = token_attestation_snapshot(authenticated_users_restricted)?;
+    let authenticated_users_inventory =
+        token_restricting_sid_inventory(authenticated_users_restricted)?;
+    let expected_authenticated_users_entries = vec![(
+        source_authenticated_users_group.sid.clone(),
+        NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+    )];
+    let expected_sid = authenticated_users_sid()?;
+    if !token_has_exact_restricting_sid_equal_sid(
+        authenticated_users_restricted,
+        expected_sid.as_ptr().cast_mut().cast(),
+        NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+    )? {
+        return Err(
+            "loader Authenticated Users sibling lacks its exact raw singleton restriction"
+                .to_owned(),
+        );
+    }
+    let no_restricting_sid_invariants =
+        LoaderRestrictionPairInvariantsV1::from_snapshot(&no_restricting_sid_snapshot)
+            .without_restricting_sid_inventory();
+    let baseline_invariants = LoaderRestrictionPairInvariantsV1::from_snapshot(&baseline_snapshot)
+        .without_restricting_sid_inventory();
+    let authenticated_users_invariants =
+        LoaderRestrictionPairInvariantsV1::from_snapshot(&authenticated_users_snapshot)
+            .without_restricting_sid_inventory();
+    if no_restricting_sid_invariants != authenticated_users_invariants
+        || baseline_invariants != authenticated_users_invariants
+        || !authenticated_users_snapshot.behavior.token_is_restricted
+        || authenticated_users_inventory.entries != expected_authenticated_users_entries
+        || authenticated_users_inventory.trustees
+            != vec![source_authenticated_users_group.sid.clone()]
+        || authenticated_users_snapshot
+            .behavior
+            .enabled_sensitive_privilege_count
+            != 0
+    {
+        return Err(
+            "loader Authenticated Users sibling differs outside its singleton restricting SID inventory"
+                .to_owned(),
+        );
+    }
+    let expected_logon_entries = vec![(
+        source_logon_group.sid.clone(),
+        NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+    )];
+    let authenticated_users_binding_sha256 = loader_authenticated_users_restriction_binding_sha256(
+        source_binding_sha256,
+        expected_restriction_presence_binding_sha256,
+        expected_restriction_identity_binding_sha256,
+        expected_logon_restriction_binding_sha256,
+        &source_logon_group,
+        &source_authenticated_users_group,
+        &expected_same_access_entries,
+        &expected_logon_entries,
+        &expected_authenticated_users_entries,
+        &baseline_snapshot,
+        &no_restricting_sid_snapshot,
+        &same_access_snapshot,
+        &logon_snapshot,
+        &authenticated_users_snapshot,
+    )?;
+    if expected_authenticated_users_restriction_binding_sha256
+        .is_some_and(|expected| expected != authenticated_users_binding_sha256)
+    {
+        return Err(
+            "loader Authenticated Users restriction binding changed before target-user derivation"
+                .to_owned(),
+        );
+    }
+    Ok(LoaderAuthenticatedUsersRestrictionValidationV1 {
+        baseline_snapshot,
+        no_restricting_sid_snapshot,
+        same_access_snapshot,
+        logon_snapshot,
+        authenticated_users_snapshot,
+        expected_same_access_entries,
+        source_logon_group,
+        source_authenticated_users_group,
+        expected_logon_entries,
+        expected_authenticated_users_entries,
+        authenticated_users_binding_sha256,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loader_target_user_restriction_sibling_from_authenticated_users_comparison(
+    baseline: HANDLE,
+    no_restricting_sid: HANDLE,
+    same_access_restricted: HANDLE,
+    logon_restricted: HANDLE,
+    authenticated_users_restricted: HANDLE,
+    source_binding_sha256: &str,
+    expected_restriction_presence_binding_sha256: &str,
+    expected_restriction_identity_binding_sha256: &str,
+    expected_logon_restriction_binding_sha256: &str,
+    expected_authenticated_users_restriction_binding_sha256: &str,
+) -> Result<(OwnedHandle, TokenAttestationSnapshot, String), String> {
+    let validation = validate_loader_authenticated_users_restriction_quintuplet(
+        baseline,
+        no_restricting_sid,
+        same_access_restricted,
+        logon_restricted,
+        authenticated_users_restricted,
+        source_binding_sha256,
+        expected_restriction_presence_binding_sha256,
+        expected_restriction_identity_binding_sha256,
+        expected_logon_restriction_binding_sha256,
+        Some(expected_authenticated_users_restriction_binding_sha256),
+    )?;
+    let (target_user_restricted, source_target_user) =
+        restricted_target_user_primary(no_restricting_sid, same_access_restricted)?;
+    let observed_target_user =
+        target_user_group_evidence(no_restricting_sid, same_access_restricted)?;
+    if observed_target_user != source_target_user {
+        return Err("target TokenUser changed during restriction derivation".to_owned());
+    }
+    let target_user_snapshot = token_attestation_snapshot(target_user_restricted.raw())?;
+    let target_user_inventory = token_restricting_sid_inventory(target_user_restricted.raw())?;
+    let expected_target_user_entries = vec![(
+        source_target_user.sid.clone(),
+        NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+    )];
+    let source_user = query(no_restricting_sid, TokenUser)?;
+    let source_user_entry = token_user_entry(&source_user)?;
+    if !token_has_exact_restricting_sid_equal_sid(
+        target_user_restricted.raw(),
+        source_user_entry.Sid,
+        NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+    )? {
+        return Err(
+            "loader target-user sibling lacks its exact raw singleton restriction".to_owned(),
+        );
+    }
+    let target_user_invariants =
+        LoaderRestrictionPairInvariantsV1::from_snapshot(&target_user_snapshot)
+            .without_restricting_sid_inventory();
+    if LoaderRestrictionPairInvariantsV1::from_snapshot(&validation.no_restricting_sid_snapshot)
+        .without_restricting_sid_inventory()
+        != target_user_invariants
+        || LoaderRestrictionPairInvariantsV1::from_snapshot(&validation.baseline_snapshot)
+            .without_restricting_sid_inventory()
+            != target_user_invariants
+        || !target_user_snapshot.behavior.token_is_restricted
+        || target_user_inventory.entries != expected_target_user_entries
+        || target_user_inventory.trustees != vec![source_target_user.sid.clone()]
+        || target_user_snapshot
+            .behavior
+            .enabled_sensitive_privilege_count
+            != 0
+    {
+        return Err(
+            "loader target-user sibling differs outside its singleton restricting SID inventory"
+                .to_owned(),
+        );
+    }
+    let validation = validate_loader_authenticated_users_restriction_quintuplet(
+        baseline,
+        no_restricting_sid,
+        same_access_restricted,
+        logon_restricted,
+        authenticated_users_restricted,
+        source_binding_sha256,
+        expected_restriction_presence_binding_sha256,
+        expected_restriction_identity_binding_sha256,
+        expected_logon_restriction_binding_sha256,
+        Some(expected_authenticated_users_restriction_binding_sha256),
+    )?;
+    if target_user_group_evidence(no_restricting_sid, same_access_restricted)? != source_target_user
+    {
+        return Err("target TokenUser changed after restriction derivation".to_owned());
+    }
+    let target_user_binding_sha256 = serde_json::to_vec(&(
+        (
+            "memcordon-loader-target-user-restriction-v1",
+            "baseline->no-restricting-SID->canonical-same-access->target-logon-SID->authenticated-users-SID->target-user-SID",
+            DISABLE_MAX_PRIVILEGE,
+            0_u32,
+            CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,
+            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+        ),
+        (
+            source_binding_sha256,
+            expected_restriction_presence_binding_sha256,
+            expected_restriction_identity_binding_sha256,
+            expected_logon_restriction_binding_sha256,
+            expected_authenticated_users_restriction_binding_sha256,
+        ),
+        (
+            &validation.source_logon_group,
+            &validation.source_authenticated_users_group,
+            &source_target_user,
+            &validation.expected_same_access_entries,
+            &validation.expected_logon_entries,
+            &validation.expected_authenticated_users_entries,
+            &expected_target_user_entries,
+        ),
+        (
+            &validation.baseline_snapshot,
+            &validation.no_restricting_sid_snapshot,
+            &validation.same_access_snapshot,
+            &validation.logon_snapshot,
+            &validation.authenticated_users_snapshot,
+            &target_user_snapshot,
+        ),
+        &validation.authenticated_users_binding_sha256,
+    ))
+    .map(|bytes| super::record::digest(&bytes))
+    .map_err(|error| error.to_string())?;
+    Ok((
+        target_user_restricted,
+        target_user_snapshot,
+        target_user_binding_sha256,
+    ))
+}
+
+pub(crate) fn validate_transferred_loader_profile_capability(
+    effective: HANDLE,
+    profile: HANDLE,
+    source_binding_sha256: &str,
+    pair_invariants_sha256: &str,
+    expected_profile_binding_sha256: &str,
+) -> Result<(), String> {
+    const PROFILE_ACCESS: u32 = TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE;
+    if handle_granted_access(profile).map_err(|error| error.detail)? != PROFILE_ACCESS {
+        return Err("transferred loader profile capability has unexpected access".to_owned());
+    }
+    let effective_envelope = envelope(effective)?;
+    let profile_envelope = envelope(profile)?;
+    if profile_envelope != effective_envelope
+        || !profile_envelope.elevated
+        || profile_envelope.token_type != TokenPrimary as u32
+        || !token_has_exact_restricting_sid(
+            profile,
+            RESTRICTED_CODE_SID,
+            NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+        )?
+        || super::security::write_restricted_behavior_for_sid_attested(
+            profile,
+            RESTRICTED_CODE_SID,
+        )?
+    {
+        return Err(
+            "transferred loader profile capability is not the bound full-restricted target"
+                .to_owned(),
+        );
+    }
+    let observed = super::record::digest(
+        format!(
+            "memcordon-loader-profile-capability-v1\0{}\0{}\0{PROFILE_ACCESS:08x}",
+            source_binding_sha256, pair_invariants_sha256
+        )
+        .as_bytes(),
+    );
+    if observed != expected_profile_binding_sha256 {
+        return Err("loader profile capability binding changed during transfer".to_owned());
+    }
+    Ok(())
 }
 
 fn write_restricted_primary_from_source(source: HANDLE) -> Result<OwnedHandle, String> {
@@ -1613,7 +3009,7 @@ fn restricted_primary_for_source(
     let sid = allocated_sid(restricting_sid)?;
     let restricted_sid = SID_AND_ATTRIBUTES {
         Sid: sid,
-        Attributes: 0,
+        Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,
     };
     let mut restricted = ptr::null_mut();
     // SAFETY: the input token and single restricting SID remain live for the call;
@@ -1699,6 +3095,455 @@ fn restricted_same_access_primary(source: HANDLE) -> Result<OwnedHandle, String>
     OwnedHandle::new(restricted)
 }
 
+fn validate_logon_sid_group_inventory(
+    groups: &[(String, u32)],
+) -> Result<TokenLogonSidGroupEvidenceV1, String> {
+    let candidates = groups
+        .iter()
+        .filter(|(_, attributes)| attributes & SE_GROUP_LOGON_ID as u32 == SE_GROUP_LOGON_ID as u32)
+        .collect::<Vec<_>>();
+    let [candidate] = candidates.as_slice() else {
+        return Err(format!(
+            "TokenGroups contains {} logon SID entries instead of exactly one",
+            candidates.len()
+        ));
+    };
+    if candidate.1 & SE_GROUP_ENABLED as u32 == 0
+        || candidate.1 & SE_GROUP_USE_FOR_DENY_ONLY_ATTRIBUTES != 0
+    {
+        return Err("TokenGroups logon SID is disabled or deny-only".to_owned());
+    }
+    Ok(TokenLogonSidGroupEvidenceV1 {
+        sid: candidate.0.clone(),
+        attributes: candidate.1,
+    })
+}
+
+fn validate_token_logon_sid_attributes(attributes: u32) -> Result<(), String> {
+    if attributes & SE_GROUP_LOGON_ID as u32 != SE_GROUP_LOGON_ID as u32 {
+        return Err("TokenLogonSid entry lacks SE_GROUP_LOGON_ID attributes".to_owned());
+    }
+    Ok(())
+}
+
+fn source_logon_sid_group_evidence(source: HANDLE) -> Result<TokenLogonSidGroupEvidenceV1, String> {
+    let groups = query(source, TokenGroups)?;
+    let group_entries = token_group_entries(groups.as_bytes())?;
+    let candidates = group_entries
+        .iter()
+        .filter(|entry| entry.Attributes & SE_GROUP_LOGON_ID as u32 == SE_GROUP_LOGON_ID as u32)
+        .collect::<Vec<_>>();
+    let [source_entry] = candidates.as_slice() else {
+        return Err(format!(
+            "TokenGroups contains {} logon SID entries instead of exactly one",
+            candidates.len()
+        ));
+    };
+    if source_entry.Attributes & SE_GROUP_ENABLED as u32 == 0
+        || source_entry.Attributes & SE_GROUP_USE_FOR_DENY_ONLY_ATTRIBUTES != 0
+    {
+        return Err("TokenGroups logon SID is disabled or deny-only".to_owned());
+    }
+    let logon_groups = query(source, TokenLogonSid)?;
+    let logon_entries = token_group_entries(logon_groups.as_bytes())?;
+    let [logon_entry] = logon_entries else {
+        return Err(format!(
+            "TokenLogonSid returned {} entries instead of exactly one",
+            logon_entries.len()
+        ));
+    };
+    validate_token_logon_sid_attributes(logon_entry.Attributes)?;
+    // SAFETY: both PSIDs point into live token-information buffers and are
+    // used only for this equality check.
+    if unsafe { EqualSid(source_entry.Sid, logon_entry.Sid) } == 0 {
+        return Err("TokenGroups logon SID differs from TokenLogonSid".to_owned());
+    }
+    Ok(TokenLogonSidGroupEvidenceV1 {
+        sid: sid_string(source_entry.Sid)?,
+        attributes: source_entry.Attributes,
+    })
+}
+
+fn restricted_logon_sid_primary(
+    source: HANDLE,
+) -> Result<(OwnedHandle, TokenLogonSidGroupEvidenceV1), String> {
+    let groups = query(source, TokenGroups)?;
+    let group_entries = token_group_entries(groups.as_bytes())?;
+    let candidates = group_entries
+        .iter()
+        .filter(|entry| entry.Attributes & SE_GROUP_LOGON_ID as u32 == SE_GROUP_LOGON_ID as u32)
+        .collect::<Vec<_>>();
+    let [source_entry] = candidates.as_slice() else {
+        return Err(format!(
+            "TokenGroups contains {} logon SID entries instead of exactly one",
+            candidates.len()
+        ));
+    };
+    if source_entry.Attributes & SE_GROUP_ENABLED as u32 == 0
+        || source_entry.Attributes & SE_GROUP_USE_FOR_DENY_ONLY_ATTRIBUTES != 0
+    {
+        return Err("TokenGroups logon SID is disabled or deny-only".to_owned());
+    }
+    let logon_groups = query(source, TokenLogonSid)?;
+    let logon_entries = token_group_entries(logon_groups.as_bytes())?;
+    let [logon_entry] = logon_entries else {
+        return Err(format!(
+            "TokenLogonSid returned {} entries instead of exactly one",
+            logon_entries.len()
+        ));
+    };
+    validate_token_logon_sid_attributes(logon_entry.Attributes)?;
+    // SAFETY: both PSIDs point into live token-information buffers and are
+    // used only for the duration of this equality check.
+    if unsafe { EqualSid(source_entry.Sid, logon_entry.Sid) } == 0 {
+        return Err("TokenGroups logon SID differs from TokenLogonSid".to_owned());
+    }
+    let evidence = TokenLogonSidGroupEvidenceV1 {
+        sid: sid_string(source_entry.Sid)?,
+        attributes: source_entry.Attributes,
+    };
+    let restricting_sid = SID_AND_ATTRIBUTES {
+        Sid: source_entry.Sid,
+        Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,
+    };
+    let mut restricted = ptr::null_mut();
+    // SAFETY: source and the TokenGroups query buffer are live; the one SID
+    // pointer comes from the uniquely attested enabled non-deny-only logon
+    // group; CreateRestrictedToken requires zero input attributes; output
+    // ownership transfers to OwnedHandle.
+    if unsafe {
+        CreateRestrictedToken(
+            source,
+            0,
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            1,
+            &raw const restricting_sid,
+            &raw mut restricted,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    Ok((OwnedHandle::new(restricted)?, evidence))
+}
+
+fn authenticated_users_sid() -> Result<QueryBuffer, String> {
+    let requested = SECURITY_MAX_SID_SIZE as usize;
+    let word_count = requested.div_ceil(std::mem::size_of::<usize>());
+    let mut words = vec![0_usize; word_count];
+    let mut byte_length = SECURITY_MAX_SID_SIZE;
+    // SAFETY: the word vector is suitably aligned and has SECURITY_MAX_SID_SIZE
+    // writable bytes; no domain SID is required for WinAuthenticatedUserSid.
+    if unsafe {
+        CreateWellKnownSid(
+            WinAuthenticatedUserSid,
+            ptr::null_mut(),
+            words.as_mut_ptr().cast(),
+            &raw mut byte_length,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    if byte_length == 0 || byte_length as usize > requested {
+        return Err("Authenticated Users well-known SID length is invalid".to_owned());
+    }
+    Ok(QueryBuffer {
+        words,
+        byte_length: byte_length as usize,
+    })
+}
+
+fn exact_equal_sid_entry<'a>(
+    entries: &'a [SID_AND_ATTRIBUTES],
+    expected_sid: *mut c_void,
+    role: &str,
+) -> Result<&'a SID_AND_ATTRIBUTES, String> {
+    exact_equal_sid_entry_for_trustee(entries, expected_sid, role, "Authenticated Users")
+}
+
+fn exact_equal_sid_entry_for_trustee<'a>(
+    entries: &'a [SID_AND_ATTRIBUTES],
+    expected_sid: *mut c_void,
+    role: &str,
+    trustee: &str,
+) -> Result<&'a SID_AND_ATTRIBUTES, String> {
+    let matches = entries
+        .iter()
+        .filter(|entry| {
+            // SAFETY: the entry PSID is backed by its live token-information
+            // buffer and expected_sid is backed by a live well-known-SID buffer.
+            (unsafe { EqualSid(entry.Sid, expected_sid) }) != 0
+        })
+        .collect::<Vec<_>>();
+    let [entry] = matches.as_slice() else {
+        return Err(format!(
+            "{role} contains {} {trustee} entries instead of exactly one",
+            matches.len()
+        ));
+    };
+    Ok(entry)
+}
+
+fn token_user_entry(user: &QueryBuffer) -> Result<SID_AND_ATTRIBUTES, String> {
+    if user.len() < std::mem::size_of::<windows_sys::Win32::Security::TOKEN_USER>() {
+        return Err("token user response is truncated".to_owned());
+    }
+    // SAFETY: the fixed TOKEN_USER structure is present and the copied SID
+    // pointer remains backed by `user` for the caller's use.
+    let entry = unsafe {
+        ptr::read_unaligned(
+            user.as_ptr()
+                .cast::<windows_sys::Win32::Security::TOKEN_USER>(),
+        )
+        .User
+    };
+    if entry.Sid.is_null() || unsafe { IsValidSid(entry.Sid) } == 0 {
+        return Err("token user response contains an invalid SID".to_owned());
+    }
+    Ok(entry)
+}
+
+fn validate_authenticated_users_attributes(attributes: u32, role: &str) -> Result<(), String> {
+    if attributes != NORMALIZED_RESTRICTING_SID_ATTRIBUTES {
+        return Err(format!(
+            "{role} Authenticated Users attributes are not exact enabled non-deny-only 0x7"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct AuthenticatedUsersGroupEvidenceV1 {
+    sid: String,
+    source_attributes: u32,
+    canonical_attributes: u32,
+}
+
+fn restricted_authenticated_users_primary(
+    source: HANDLE,
+    canonical_same_access: HANDLE,
+) -> Result<(OwnedHandle, AuthenticatedUsersGroupEvidenceV1), String> {
+    let expected_sid = authenticated_users_sid()?;
+    let groups = query(source, TokenGroups)?;
+    let group_entries = token_group_entries(groups.as_bytes())?;
+    let source_entry = exact_equal_sid_entry(
+        group_entries,
+        expected_sid.as_ptr().cast_mut().cast(),
+        "TokenGroups",
+    )?;
+    validate_authenticated_users_attributes(source_entry.Attributes, "TokenGroups")?;
+    let canonical = query(canonical_same_access, TokenRestrictedSids)?;
+    let canonical_entries = token_group_entries(canonical.as_bytes())?;
+    let canonical_entry = exact_equal_sid_entry(
+        canonical_entries,
+        expected_sid.as_ptr().cast_mut().cast(),
+        "canonical TokenRestrictedSids",
+    )?;
+    validate_authenticated_users_attributes(
+        canonical_entry.Attributes,
+        "canonical TokenRestrictedSids",
+    )?;
+    let sid = sid_string(expected_sid.as_ptr().cast_mut().cast())?;
+    if sid != AUTHENTICATED_USERS_SID {
+        return Err("well-known Authenticated Users SID rendered unexpectedly".to_owned());
+    }
+    let evidence = AuthenticatedUsersGroupEvidenceV1 {
+        sid,
+        source_attributes: source_entry.Attributes,
+        canonical_attributes: canonical_entry.Attributes,
+    };
+    let restricting_sid = SID_AND_ATTRIBUTES {
+        Sid: source_entry.Sid,
+        Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,
+    };
+    let mut restricted = ptr::null_mut();
+    // SAFETY: source, the raw TokenGroups entry, and both well-known/canonical
+    // admission buffers remain live; exactly one zero-attribute restricting
+    // SID is supplied and output ownership transfers to OwnedHandle.
+    if unsafe {
+        CreateRestrictedToken(
+            source,
+            0,
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            1,
+            &raw const restricting_sid,
+            &raw mut restricted,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    Ok((OwnedHandle::new(restricted)?, evidence))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct TargetUserGroupEvidenceV1 {
+    sid: String,
+    source_attributes: u32,
+    canonical_attributes: u32,
+}
+
+fn target_user_group_evidence(
+    source: HANDLE,
+    canonical_same_access: HANDLE,
+) -> Result<TargetUserGroupEvidenceV1, String> {
+    let user = query(source, TokenUser)?;
+    let source_entry = token_user_entry(&user)?;
+    let canonical = query(canonical_same_access, TokenRestrictedSids)?;
+    let canonical_entry = exact_equal_sid_entry_for_trustee(
+        token_group_entries(canonical.as_bytes())?,
+        source_entry.Sid,
+        "canonical TokenRestrictedSids",
+        "target user SID",
+    )?;
+    if canonical_entry.Attributes != NORMALIZED_RESTRICTING_SID_ATTRIBUTES {
+        return Err(
+            "canonical TokenRestrictedSids target user attributes are not exact 0x7".to_owned(),
+        );
+    }
+    Ok(TargetUserGroupEvidenceV1 {
+        sid: sid_string(source_entry.Sid)?,
+        source_attributes: source_entry.Attributes,
+        canonical_attributes: canonical_entry.Attributes,
+    })
+}
+
+fn restricted_target_user_primary(
+    source: HANDLE,
+    canonical_same_access: HANDLE,
+) -> Result<(OwnedHandle, TargetUserGroupEvidenceV1), String> {
+    let user = query(source, TokenUser)?;
+    let source_entry = token_user_entry(&user)?;
+    let canonical = query(canonical_same_access, TokenRestrictedSids)?;
+    let canonical_entries = token_group_entries(canonical.as_bytes())?;
+    let canonical_entry = exact_equal_sid_entry_for_trustee(
+        canonical_entries,
+        source_entry.Sid,
+        "canonical TokenRestrictedSids",
+        "target user SID",
+    )?;
+    if canonical_entry.Attributes != NORMALIZED_RESTRICTING_SID_ATTRIBUTES {
+        return Err(
+            "canonical TokenRestrictedSids target user attributes are not exact 0x7".to_owned(),
+        );
+    }
+    let evidence = TargetUserGroupEvidenceV1 {
+        sid: sid_string(source_entry.Sid)?,
+        source_attributes: source_entry.Attributes,
+        canonical_attributes: canonical_entry.Attributes,
+    };
+    let restricting_sid = SID_AND_ATTRIBUTES {
+        Sid: source_entry.Sid,
+        Attributes: CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,
+    };
+    let mut restricted = ptr::null_mut();
+    // SAFETY: source and the live TokenUser and canonical admission buffers
+    // remain valid; exactly one zero-attribute raw target-user SID is supplied;
+    // output ownership transfers to OwnedHandle.
+    if unsafe {
+        CreateRestrictedToken(
+            source,
+            0,
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            1,
+            &raw const restricting_sid,
+            &raw mut restricted,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    let restricted = OwnedHandle::new(restricted)?;
+    if !token_has_exact_restricting_sid_equal_sid(
+        restricted.raw(),
+        source_entry.Sid,
+        NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+    )? {
+        return Err(
+            "loader target-user sibling lacks its exact raw singleton restriction".to_owned(),
+        );
+    }
+    Ok((restricted, evidence))
+}
+
+#[cfg(test)]
+pub(crate) fn validate_authenticated_users_matches_for_test(
+    matching_attributes: &[u32],
+) -> Result<u32, String> {
+    let [attributes] = matching_attributes else {
+        return Err(format!(
+            "TokenGroups contains {} Authenticated Users entries instead of exactly one",
+            matching_attributes.len()
+        ));
+    };
+    validate_authenticated_users_attributes(*attributes, "TokenGroups")?;
+    Ok(*attributes)
+}
+
+#[cfg(test)]
+pub(crate) fn validate_target_user_matches_for_test(
+    source_user_valid: bool,
+    canonical_entries: &[(bool, u32)],
+    output_entries: &[(bool, u32)],
+) -> Result<(u32, u32), String> {
+    if !source_user_valid {
+        return Err("token user response contains an invalid SID".to_owned());
+    }
+    let canonical_matches = canonical_entries
+        .iter()
+        .filter(|(equal_sid, _)| *equal_sid)
+        .collect::<Vec<_>>();
+    let [(_, canonical_attributes)] = canonical_matches.as_slice() else {
+        return Err(format!(
+            "canonical TokenRestrictedSids contains {} target user SID entries instead of exactly one",
+            canonical_matches.len()
+        ));
+    };
+    if *canonical_attributes != NORMALIZED_RESTRICTING_SID_ATTRIBUTES {
+        return Err(
+            "canonical TokenRestrictedSids target user attributes are not exact 0x7".to_owned(),
+        );
+    }
+    let [(output_equal_sid, output_attributes)] = output_entries else {
+        return Err(format!(
+            "target-user output contains {} restricting entries instead of exactly one",
+            output_entries.len()
+        ));
+    };
+    if !output_equal_sid || *output_attributes != NORMALIZED_RESTRICTING_SID_ATTRIBUTES {
+        return Err("target-user output is not the exact raw singleton at 0x7".to_owned());
+    }
+    Ok((*canonical_attributes, *output_attributes))
+}
+
+#[cfg(test)]
+pub(crate) fn validate_logon_sid_group_inventory_for_test(
+    groups: &[(&str, u32)],
+) -> Result<(String, u32), String> {
+    validate_logon_sid_group_inventory(
+        &groups
+            .iter()
+            .map(|(sid, attributes)| ((*sid).to_owned(), *attributes))
+            .collect::<Vec<_>>(),
+    )
+    .map(|evidence| (evidence.sid, evidence.attributes))
+}
+
+#[cfg(test)]
+pub(crate) fn validate_token_logon_sid_attributes_for_test(attributes: u32) -> Result<(), String> {
+    validate_token_logon_sid_attributes(attributes)
+}
+
 pub(crate) fn canonical_same_access_restricting_sids(token: HANDLE) -> Result<Vec<String>, String> {
     let mut sids = vec![token_user_sid(token)?];
     let groups = query(token, TokenGroups)?;
@@ -1709,8 +3554,33 @@ pub(crate) fn canonical_same_access_restricting_sids(token: HANDLE) -> Result<Ve
             .map(|entry| sid_string(entry.Sid))
             .collect::<Result<Vec<_>, _>>()?,
     );
+    sort_and_validate_canonical_same_access_restricting_sids(sids)
+}
+
+fn sort_and_validate_canonical_same_access_restricting_sids(
+    mut sids: Vec<String>,
+) -> Result<Vec<String>, String> {
     sids.sort();
+    if sids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(
+            "canonical same-access restricting SID inventory contains duplicates".to_owned(),
+        );
+    }
     Ok(sids)
+}
+
+#[cfg(test)]
+pub(crate) fn canonical_same_access_restricting_sids_for_test(
+    sids: &[&str],
+) -> Result<Vec<(String, u32)>, String> {
+    sort_and_validate_canonical_same_access_restricting_sids(
+        sids.iter().map(|sid| (*sid).to_owned()).collect(),
+    )
+    .map(|sids| {
+        sids.into_iter()
+            .map(|sid| (sid, NORMALIZED_RESTRICTING_SID_ATTRIBUTES))
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -2379,6 +4249,145 @@ pub(crate) fn with_scoped_service_owner_restore_privilege<T>(
         )
         .to_string()
     })?;
+    result
+}
+
+pub(crate) fn with_scoped_loader_profile_privileges<T>(
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    const PRIVILEGES: [&str; 2] = ["SeBackupPrivilege", "SeRestorePrivilege"];
+    require_current_thread_token_absent()?;
+    let source = current_process_token_with_attested_access(
+        TOKEN_QUERY | TOKEN_DUPLICATE,
+        "loader-profile-privilege-source",
+    )?;
+    let source_before = privilege_entries_snapshot(source.raw())?;
+    let carrier_access = TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE;
+    let mut raw_carrier = ptr::null_mut();
+    if unsafe {
+        DuplicateTokenEx(
+            source.raw(),
+            carrier_access,
+            ptr::null(),
+            SecurityImpersonation,
+            TokenImpersonation,
+            &raw mut raw_carrier,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "loader profile privilege carrier duplication failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let carrier = OwnedHandle::new(raw_carrier)?;
+    if handle_granted_access(carrier.raw()).map_err(|error| error.detail)? != carrier_access {
+        return Err("loader profile privilege carrier has unexpected access".to_owned());
+    }
+    let carrier_before = privilege_entries_snapshot(carrier.raw())?;
+    let mut luids = [windows_sys::Win32::Foundation::LUID::default(); 2];
+    for (name, luid) in PRIVILEGES.iter().zip(luids.iter_mut()) {
+        let wide = super::pipe::wide_null(name);
+        if unsafe { LookupPrivilegeValueW(ptr::null(), wide.as_ptr(), luid) } == 0 {
+            return Err(format!(
+                "loader profile privilege lookup failed for {name}: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    #[repr(C)]
+    struct TwoTokenPrivileges {
+        privilege_count: u32,
+        privileges: [LUID_AND_ATTRIBUTES; 2],
+    }
+    let requested = TwoTokenPrivileges {
+        privilege_count: 2,
+        privileges: luids.map(|luid| LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }),
+    };
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    let adjusted = unsafe {
+        AdjustTokenPrivileges(
+            carrier.raw(),
+            0,
+            (&raw const requested).cast(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    let adjust_error = unsafe { GetLastError() };
+    if adjusted == 0 || adjust_error != ERROR_SUCCESS {
+        return Err(format!(
+            "loader profile privilege enable failed: native_code={} not_all_assigned={}",
+            adjust_error,
+            adjust_error == ERROR_NOT_ALL_ASSIGNED
+        ));
+    }
+    let carrier_after = privilege_entries_snapshot(carrier.raw())?;
+    let luid_matches = |left: &windows_sys::Win32::Foundation::LUID,
+                        right: &windows_sys::Win32::Foundation::LUID| {
+        left.LowPart == right.LowPart && left.HighPart == right.HighPart
+    };
+    if carrier_before.len() != carrier_after.len()
+        || carrier_before.iter().any(|before| {
+            let Some(after) = carrier_after
+                .iter()
+                .find(|after| luid_matches(&before.Luid, &after.Luid))
+            else {
+                return true;
+            };
+            let selected = luids.iter().any(|luid| luid_matches(&before.Luid, luid));
+            let expected = if selected {
+                before.Attributes | SE_PRIVILEGE_ENABLED
+            } else {
+                before.Attributes
+            };
+            after.Attributes != expected
+        })
+        || luids.iter().any(|luid| {
+            !carrier_after.iter().any(|entry| {
+                luid_matches(&entry.Luid, luid) && entry.Attributes & SE_PRIVILEGE_ENABLED != 0
+            })
+        })
+    {
+        return Err(
+            "loader profile privilege transition was not exactly backup/restore enablement"
+                .to_owned(),
+        );
+    }
+    let scoped =
+        ScopedPrivilegeThreadToken::install(carrier.raw()).map_err(|error| error.to_string())?;
+    let effective = PRIVILEGES.iter().try_fold(true, |all, name| {
+        effective_thread_privilege_enabled(name).map(|enabled| all && enabled)
+    });
+    let result = match effective {
+        Ok(true) => operation(),
+        Ok(false) => Err(
+            "loader profile backup/restore privileges are not effective on the disposable carrier"
+                .to_owned(),
+        ),
+        Err(error) => Err(error.to_string()),
+    };
+    if let Err(error) = scoped.revert() {
+        eprintln!("loader profile privilege carrier revert failed: {error}");
+        unsafe {
+            windows_sys::Win32::System::Threading::TerminateProcess(
+                GetCurrentProcess(),
+                0xED15_0003,
+            )
+        };
+        std::process::abort();
+    }
+    drop(carrier);
+    let source_after = privilege_entries_snapshot(source.raw())?;
+    if !privilege_snapshots_equal(&source_before, &source_after) {
+        return Err("launcher process privilege state changed during profile operation".to_owned());
+    }
+    drop(source);
+    require_current_thread_token_absent()?;
     result
 }
 
@@ -4686,6 +6695,77 @@ pub(crate) fn token_restricting_sid_attributes(
     Ok(None)
 }
 
+fn token_has_exact_restricting_sid(
+    token: HANDLE,
+    expected_sid: &str,
+    expected_attributes: u32,
+) -> Result<bool, String> {
+    let groups = query(token, TokenRestrictedSids)?;
+    let entries = token_group_entries(groups.as_bytes())?;
+    if entries.len() != 1 {
+        return Ok(false);
+    }
+    let entry = &entries[0];
+    Ok(entry.Attributes == expected_attributes
+        && restricting_sid_entry_matches(entry, expected_sid)?)
+}
+
+fn token_has_exact_restricting_sid_equal_sid(
+    token: HANDLE,
+    expected_sid: *mut c_void,
+    expected_attributes: u32,
+) -> Result<bool, String> {
+    let groups = query(token, TokenRestrictedSids)?;
+    let entries = token_group_entries(groups.as_bytes())?;
+    if entries.len() != 1 || entries[0].Attributes != expected_attributes {
+        return Ok(false);
+    }
+    // SAFETY: the token entry is backed by `groups` and expected_sid is backed
+    // by the caller's live well-known-SID buffer for this immediate query.
+    Ok(unsafe { EqualSid(entries[0].Sid, expected_sid) } != 0)
+}
+
+#[cfg(test)]
+pub(crate) fn loader_restriction_raw_sid_predicate_for_test()
+-> Result<(Vec<String>, [bool; 4]), String> {
+    let exact = restricted_current_primary().map_err(|error| format!("exact fixture: {error}"))?;
+    let ordinary = current_process_token_with_access(PROCESS_TOKEN_QUERY_ACCESS)
+        .map_err(|error| format!("ordinary fixture: {error}"))?;
+    let display = token_attestation_snapshot(exact.raw())
+        .map_err(|error| format!("exact display: {error}"))?
+        .behavior
+        .restricting_sids;
+    Ok((
+        display,
+        [
+            token_has_exact_restricting_sid(
+                exact.raw(),
+                RESTRICTED_CODE_SID,
+                NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+            )
+            .map_err(|error| format!("exact predicate: {error}"))?,
+            token_has_exact_restricting_sid(
+                exact.raw(),
+                "S-1-5-33",
+                NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+            )
+            .map_err(|error| format!("wrong SID predicate: {error}"))?,
+            token_has_exact_restricting_sid(
+                exact.raw(),
+                RESTRICTED_CODE_SID,
+                CREATE_RESTRICTED_TOKEN_INPUT_ATTRIBUTES,
+            )
+            .map_err(|error| format!("input attributes predicate: {error}"))?,
+            token_has_exact_restricting_sid(
+                ordinary.raw(),
+                RESTRICTED_CODE_SID,
+                NORMALIZED_RESTRICTING_SID_ATTRIBUTES,
+            )
+            .map_err(|error| format!("wrong count predicate: {error}"))?,
+        ],
+    ))
+}
+
 pub(crate) fn enabled_group_entry_matches(
     entry: &SID_AND_ATTRIBUTES,
     expected_sid: &str,
@@ -4745,6 +6825,7 @@ fn token_group_has_attributes(
 }
 
 pub(crate) struct TokenRestrictingSidInventory {
+    pub entries: Vec<(String, u32)>,
     pub trustees: Vec<String>,
     pub evidence: Vec<String>,
 }
@@ -4759,6 +6840,7 @@ pub(crate) fn token_restricting_sid_inventory(
         .collect::<Result<Vec<_>, String>>()?;
     entries.sort();
     Ok(TokenRestrictingSidInventory {
+        entries: entries.clone(),
         trustees: entries.iter().map(|(sid, _)| sid.clone()).collect(),
         evidence: entries
             .iter()

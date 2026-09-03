@@ -31,7 +31,9 @@ use super::service_manager::{
 pub(crate) const CONTROL_PRIVILEGES: &[&str] = &["SeImpersonatePrivilege"];
 pub(crate) const LAUNCHER_PRIVILEGES: &[&str] = &[
     "SeAssignPrimaryTokenPrivilege",
+    "SeBackupPrivilege",
     "SeIncreaseQuotaPrivilege",
+    "SeRestorePrivilege",
     "SeTcbPrivilege",
 ];
 pub(crate) const SESSION_BROKER_PRIVILEGES: &[&str] = &[
@@ -744,7 +746,17 @@ fn rollback_fresh_install(rollback: FreshRollback) -> Result<(), String> {
 fn service_owned_cleanup_barrier() -> Result<(), String> {
     let deadline = Instant::now() + PACKAGE_CLEANUP_DEADLINE;
     loop {
-        match super::qualification::prepare_package_cleanup() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(
+                "MCSEALED-WINDOWS-PACKAGE-CLEANUP-TIMEOUT: recovery_empty=false; last=cleanup deadline expired before convergence"
+                    .to_owned(),
+            );
+        }
+        let deadline_millis = u64::try_from((deadline - now).as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        match super::qualification::prepare_package_cleanup(deadline_millis) {
             Ok(()) => return Ok(()),
             Err(error)
                 if error

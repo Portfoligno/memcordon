@@ -2,7 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::{BoundaryRequirement, CleanupSummary, RestartSafetyProof, WindowsTerminalReceiptV1};
+use crate::{
+    BoundaryMechanismEvidence, BoundaryRequirement, CleanupSummary, RestartSafetyProof,
+    WindowsTerminalReceiptV1,
+};
+
+pub const PROVIDER_REJECTION_MAX_DETAIL_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -59,7 +64,6 @@ pub struct ProviderRejectionEvidence {
 impl ProviderRejectionEvidence {
     pub fn is_consistent(&self) -> bool {
         const MAX_CODE_BYTES: usize = 128;
-        const MAX_DETAIL_BYTES: usize = 8 * 1024;
         const MAX_CLEANUP_ERRORS: usize = 16;
         const MAX_CLEANUP_ERROR_BYTES: usize = 1024;
         self.schema_version == 1
@@ -70,7 +74,7 @@ impl ProviderRejectionEvidence {
                 .bytes()
                 .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
             && !self.detail.is_empty()
-            && self.detail.len() <= MAX_DETAIL_BYTES
+            && self.detail.len() <= PROVIDER_REJECTION_MAX_DETAIL_BYTES
             && !self.detail.contains('\0')
             && (!self.target_released || self.target_created)
             && self.restart_safety.errors.len() <= MAX_CLEANUP_ERRORS
@@ -86,9 +90,14 @@ impl ProviderRejectionEvidence {
                 || (self.cleanup_attempted
                     && self.restart_safety.is_safe_for(BoundaryRequirement::Sealed)))
             && self.terminal_receipt.as_ref().is_none_or(|terminal| {
+                let target_release_matches = matches!(
+                    &terminal.boundary_detail,
+                    BoundaryMechanismEvidence::WindowsJobObjectV2(native)
+                        if native.target_released == self.target_released
+                );
                 self.terminal_ack_required
                     && self.target_created
-                    && self.target_released
+                    && target_release_matches
                     && self.cleanup_attempted
                     && terminal.schema_version == 1
                     && terminal.restart_safety == self.restart_safety

@@ -6,7 +6,12 @@ use std::ptr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use memcordon_core::{WindowsAttemptStateV1, WindowsAttemptTerminalDispositionV1};
-use memcordon_core::{WindowsProcessIdentityV1, windows_attempt_transition_allowed};
+use memcordon_core::{
+    WindowsProcessIdentityV1, WindowsTerminalizationCheckpointV1,
+    WindowsTerminalizationErrorStageV1, WindowsTerminalizationErrorV1,
+    WindowsTerminalizationOwnerV1, WindowsTerminalizationStatusV1,
+    windows_attempt_transition_allowed,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_OBJECT_0};
@@ -27,6 +32,8 @@ use super::pipe::OwnedHandle;
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const DELETE_ACCESS: u32 = 0x0001_0000;
 const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
+const MAX_TERMINALIZATION_CODE_BYTES: usize = 128;
+const MAX_TERMINALIZATION_DETAIL_BYTES: usize = 2 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +66,7 @@ pub struct WindowsAttemptRecordV1 {
     pub terminal_response_json: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_disposition: Option<WindowsAttemptTerminalDispositionV1>,
+    pub terminalization: WindowsTerminalizationStatusV1,
     pub integrity_sha256: String,
 }
 
@@ -81,7 +89,7 @@ impl WindowsAttemptRecordV1 {
         job_identity_sha256: String,
     ) -> Result<Self, String> {
         Ok(Self {
-            schema_version: 1,
+            schema_version: 2,
             attempt_id,
             provider_generation: provider_generation(),
             boot_identity: boot_identity()?,
@@ -98,20 +106,41 @@ impl WindowsAttemptRecordV1 {
             cleanup_state: WindowsCleanupStateV1::default(),
             terminal_response_json: None,
             terminal_disposition: None,
+            terminalization: WindowsTerminalizationStatusV1 {
+                schema_version: 1,
+                owner: WindowsTerminalizationOwnerV1::LauncherWorker,
+                sequence: 1,
+                checkpoint: WindowsTerminalizationCheckpointV1::Executing,
+                last_error: None,
+                secondary_errors: Vec::new(),
+            },
             integrity_sha256: String::new(),
         })
     }
 
     pub fn store(&mut self) -> Result<(), String> {
-        self.integrity_sha256.clear();
-        self.integrity_sha256 =
-            digest(&serde_json::to_vec(self).map_err(|error| error.to_string())?);
-        let mut bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
-        bytes.push(b'\n');
+        let bytes = self.authenticated_store_bytes()?;
         let path = record_path(&self.attempt_id)?;
         let staged = path.with_extension("json.new");
         fs::write(&staged, bytes).map_err(|error| error.to_string())?;
         replace_atomically(&staged, &path)
+    }
+
+    fn authenticated_store_bytes(&mut self) -> Result<Vec<u8>, String> {
+        self.integrity_sha256.clear();
+        self.integrity_sha256 =
+            digest(&serde_json::to_vec(self).map_err(|error| error.to_string())?);
+        authenticate(self, &self.attempt_id).map_err(|detail| {
+            format!("MCSEALED-WINDOWS-ATTEMPT-RECORD-STORE: phase=validate-before-publish {detail}")
+        })?;
+        let mut bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    #[cfg(test)]
+    pub fn validate_for_store_for_test(&mut self) -> Result<(), String> {
+        self.authenticated_store_bytes().map(|_| ())
     }
 
     pub fn authorize(&mut self) -> Result<(), String> {
@@ -139,68 +168,353 @@ impl WindowsAttemptRecordV1 {
     }
 
     pub fn complete_retirement(&mut self) -> Result<(), String> {
-        self.transition(WindowsAttemptStateV1::Empty)?;
-        self.cleanup_state.termination_requested = true;
-        self.cleanup_state.active_processes_zero = true;
-        self.cleanup_state.guardian_reaped = true;
-        self.cleanup_state.final_handles_closed = true;
-        self.terminal_disposition = Some(WindowsAttemptTerminalDispositionV1::Posttarget);
+        self.prepare_cleanup_completion(WindowsAttemptTerminalDispositionV1::Posttarget)?;
         self.store()
     }
 
-    pub fn complete_preauthorization_abort(&mut self) -> Result<(), String> {
+    fn prepare_cleanup_completion(
+        &mut self,
+        disposition: WindowsAttemptTerminalDispositionV1,
+    ) -> Result<(), String> {
         self.transition(WindowsAttemptStateV1::Empty)?;
         self.cleanup_state.termination_requested = true;
         self.cleanup_state.active_processes_zero = true;
         self.cleanup_state.guardian_reaped = true;
         self.cleanup_state.final_handles_closed = true;
+        self.terminal_disposition = Some(disposition);
+        self.advance_terminalization(
+            WindowsTerminalizationOwnerV1::LauncherWorker,
+            WindowsTerminalizationCheckpointV1::CleanupProofReady,
+        )?;
+        Ok(())
+    }
+
+    pub fn begin_preauthorization_abort(&mut self) -> Result<(), String> {
+        if self.authorization_unix_millis.is_some() || self.resume_attempted {
+            return Err(
+                "preauthorization abort cannot replace durable authorization intent".to_owned(),
+            );
+        }
+        match self.terminal_disposition {
+            None | Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort) => {}
+            Some(WindowsAttemptTerminalDispositionV1::Posttarget) => {
+                return Err(
+                    "preauthorization abort conflicts with posttarget terminal disposition"
+                        .to_owned(),
+                );
+            }
+        }
+        if self.state != WindowsAttemptStateV1::Terminating {
+            self.transition(WindowsAttemptStateV1::Terminating)?;
+        }
+        self.cleanup_state.termination_requested = true;
         self.terminal_disposition =
             Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort);
         self.store()
+    }
+
+    pub fn begin_postauthorization_retirement(&mut self) -> Result<(), String> {
+        self.prepare_postauthorization_retirement()?;
+        self.store()
+    }
+
+    fn prepare_postauthorization_retirement(&mut self) -> Result<(), String> {
+        if self.authorization_unix_millis.is_none() {
+            return Err(
+                "postauthorization retirement requires durable authorization intent".to_owned(),
+            );
+        }
+        if self.resume_attempted || self.target_released {
+            return Err(
+                "pre-resume postauthorization retirement conflicts with target release intent"
+                    .to_owned(),
+            );
+        }
+        match self.terminal_disposition {
+            None | Some(WindowsAttemptTerminalDispositionV1::Posttarget) => {}
+            Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort) => {
+                return Err(
+                    "postauthorization retirement conflicts with preauthorization abort".to_owned(),
+                );
+            }
+        }
+        if !matches!(
+            self.state,
+            WindowsAttemptStateV1::Authorized | WindowsAttemptStateV1::Terminating
+        ) {
+            return Err(format!(
+                "postauthorization retirement requires authorized state, observed {:?}",
+                self.state
+            ));
+        }
+        if self.state != WindowsAttemptStateV1::Terminating {
+            self.transition(WindowsAttemptStateV1::Terminating)?;
+        }
+        self.cleanup_state.termination_requested = true;
+        self.terminal_disposition = Some(WindowsAttemptTerminalDispositionV1::Posttarget);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn begin_postauthorization_retirement_for_test(&mut self) -> Result<(), String> {
+        self.prepare_postauthorization_retirement()?;
+        self.validate_for_store_for_test()
+    }
+
+    pub fn complete_preauthorization_abort(&mut self) -> Result<(), String> {
+        self.prepare_cleanup_completion(
+            WindowsAttemptTerminalDispositionV1::PreauthorizationAbort,
+        )?;
+        self.store()
+    }
+
+    fn prepare_rejection_cleanup_completion(&mut self) -> Result<(), String> {
+        if self.state != WindowsAttemptStateV1::Terminating {
+            return Err(format!(
+                "MCSEALED-WINDOWS-REJECTION-CLEANUP: expected terminating record before final-handle proof, observed {:?}",
+                self.state
+            ));
+        }
+        match self.terminal_disposition {
+            Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort)
+                if self.authorization_unix_millis.is_none() && !self.resume_attempted =>
+            {
+                self.prepare_cleanup_completion(
+                    WindowsAttemptTerminalDispositionV1::PreauthorizationAbort,
+                )
+            }
+            Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort) => Err(
+                "MCSEALED-WINDOWS-REJECTION-CLEANUP: preauthorization disposition conflicts with durable authorization intent"
+                    .to_owned(),
+            ),
+            Some(WindowsAttemptTerminalDispositionV1::Posttarget) => {
+                self.prepare_cleanup_completion(WindowsAttemptTerminalDispositionV1::Posttarget)
+            }
+            None if self.authorization_unix_millis.is_some() || self.resume_attempted => {
+                self.prepare_cleanup_completion(WindowsAttemptTerminalDispositionV1::Posttarget)
+            }
+            None => Err(
+                "MCSEALED-WINDOWS-REJECTION-CLEANUP: terminating record has no typed terminal disposition"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    pub fn complete_rejection_cleanup(&mut self) -> Result<(), String> {
+        self.prepare_rejection_cleanup_completion()?;
+        self.store()
+    }
+
+    #[cfg(test)]
+    pub fn complete_rejection_cleanup_for_test(&mut self) -> Result<(), String> {
+        self.prepare_rejection_cleanup_completion()?;
+        self.validate_for_store_for_test()
     }
 
     pub fn stage_terminal_response(
         &mut self,
         response: &memcordon_core::WindowsLauncherResponseV1,
     ) -> Result<(), String> {
+        self.stage_terminal_response_with_store(response, &mut |record| record.store())
+    }
+
+    fn stage_terminal_response_with_store<F>(
+        &mut self,
+        response: &memcordon_core::WindowsLauncherResponseV1,
+        store: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut Self) -> Result<(), String>,
+    {
+        let response_json = match self.prepare_terminal_response(response) {
+            Ok(response_json) => response_json,
+            Err(primary) => {
+                return Err(self.persist_terminalization_failure(
+                    WindowsTerminalizationOwnerV1::LauncherWorker,
+                    WindowsTerminalizationErrorStageV1::ResponseValidate,
+                    "MCSEALED-WINDOWS-TERMINAL-RESPONSE",
+                    primary.clone(),
+                    None,
+                    primary,
+                    store,
+                ));
+            }
+        };
+        self.advance_terminalization(
+            WindowsTerminalizationOwnerV1::LauncherWorker,
+            WindowsTerminalizationCheckpointV1::OutboxStaging,
+        )?;
+        if let Err(primary) = store(self) {
+            return Err(self.persist_terminalization_failure(
+                WindowsTerminalizationOwnerV1::LauncherWorker,
+                WindowsTerminalizationErrorStageV1::AtomicStore,
+                "MCSEALED-WINDOWS-TERMINAL-CHECKPOINT",
+                format!("failed to persist the outbox-staging checkpoint: {primary}"),
+                None,
+                primary,
+                store,
+            ));
+        }
+        self.terminal_response_json = Some(response_json);
+        self.advance_terminalization(
+            WindowsTerminalizationOwnerV1::LauncherWorker,
+            WindowsTerminalizationCheckpointV1::OutboxStaged,
+        )?;
+        if let Err(primary) = store(self) {
+            self.terminal_response_json = None;
+            return Err(self.persist_terminalization_failure(
+                WindowsTerminalizationOwnerV1::LauncherWorker,
+                WindowsTerminalizationErrorStageV1::AtomicStore,
+                "MCSEALED-WINDOWS-TERMINAL-OUTBOX-STORE",
+                format!("failed to publish the create-once terminal outbox: {primary}"),
+                None,
+                primary,
+                store,
+            ));
+        }
+        Ok(())
+    }
+
+    fn advance_terminalization(
+        &mut self,
+        owner: WindowsTerminalizationOwnerV1,
+        checkpoint: WindowsTerminalizationCheckpointV1,
+    ) -> Result<(), String> {
+        self.terminalization.sequence = self
+            .terminalization
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| "terminalization sequence exhausted".to_owned())?;
+        self.terminalization.owner = owner;
+        self.terminalization.checkpoint = checkpoint;
+        Ok(())
+    }
+
+    fn persist_terminalization_failure<F>(
+        &mut self,
+        owner: WindowsTerminalizationOwnerV1,
+        stage: WindowsTerminalizationErrorStageV1,
+        error_code: &str,
+        detail: String,
+        native_code: Option<i32>,
+        primary: String,
+        store: &mut F,
+    ) -> String
+    where
+        F: FnMut(&mut Self) -> Result<(), String>,
+    {
+        let checkpoint = if self.terminal_response_json.is_some() {
+            WindowsTerminalizationCheckpointV1::OutboxStaged
+        } else {
+            WindowsTerminalizationCheckpointV1::RetainedFailure
+        };
+        let diagnostic_result = self
+            .advance_terminalization(owner, checkpoint)
+            .and_then(|()| {
+                self.retain_terminalization_error(terminalization_error(
+                    stage,
+                    error_code,
+                    detail,
+                    native_code,
+                ));
+                store(self)
+            });
+        match diagnostic_result {
+            Ok(()) => primary,
+            Err(secondary) => format!(
+                "{primary}; secondary authenticated terminalization diagnostic failure: {secondary}"
+            ),
+        }
+    }
+
+    fn retain_terminalization_error(&mut self, error: WindowsTerminalizationErrorV1) -> bool {
+        if self.terminalization.last_error.is_none() {
+            self.terminalization.last_error = Some(error);
+            true
+        } else if self.terminalization.secondary_errors.len()
+            < memcordon_core::WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS
+        {
+            self.terminalization.secondary_errors.push(error);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn apply_terminalization_diagnostic(
+        &mut self,
+        error: WindowsTerminalizationErrorV1,
+    ) -> Result<bool, String> {
+        if self.terminalization.last_error.is_some()
+            && self.terminalization.secondary_errors.len()
+                >= memcordon_core::WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS
+        {
+            return Ok(false);
+        }
+        self.terminalization.sequence = self
+            .terminalization
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| "terminalization sequence exhausted".to_owned())?;
+        Ok(self.retain_terminalization_error(error))
+    }
+
+    #[cfg(test)]
+    pub fn record_terminalization_diagnostic_for_test(
+        &mut self,
+        error: WindowsTerminalizationErrorV1,
+    ) -> Result<(), String> {
+        self.apply_terminalization_diagnostic(error)?;
+        self.validate_for_store_for_test()
+    }
+
+    fn prepare_terminal_response(
+        &self,
+        response: &memcordon_core::WindowsLauncherResponseV1,
+    ) -> Result<String, String> {
         if self.state != WindowsAttemptStateV1::Empty || self.terminal_response_json.is_some() {
             return Err("attempt is not ready for a create-once terminal outbox".to_owned());
         }
-        let binding_matches = match response {
-            memcordon_core::WindowsLauncherResponseV1::Terminal(receipt) => {
-                receipt.attempt_id == self.attempt_id
-                    && receipt.request_sha256 == self.request_sha256
-            }
-            memcordon_core::WindowsLauncherResponseV1::Reject {
-                attempt_id,
-                request_sha256,
-                rejection,
-                ..
-            } => {
-                let terminal_binding_matches =
-                    rejection.terminal_receipt.as_ref().is_some_and(|receipt| {
-                        receipt.attempt_id == self.attempt_id
-                            && receipt.request_sha256 == self.request_sha256
-                    });
-                let abort_binding_matches = rejection.terminal_receipt.is_none()
-                    && rejection.terminal_ack_required
-                    && self.terminal_disposition
-                        == Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort);
-                attempt_id == &self.attempt_id
-                    && request_sha256 == &self.request_sha256
-                    && (terminal_binding_matches || abort_binding_matches)
-            }
-            _ => false,
-        };
-        if !binding_matches {
-            return Err("terminal outbox response is not bound to the attempt".to_owned());
+        if !memcordon_core::windows_terminal_outbox_is_bound(
+            &self.attempt_id,
+            &self.request_sha256,
+            self.terminal_disposition,
+            response,
+        ) {
+            return Err(
+                "terminal outbox response is not bound and consistent for the attempt".to_owned(),
+            );
         }
         let response_json = serde_json::to_string(response).map_err(|error| error.to_string())?;
         if response_json.len() > memcordon_core::WINDOWS_MAX_FRAME_BYTES / 2 {
             return Err("terminal outbox response exceeds the bounded frame size".to_owned());
         }
-        self.terminal_response_json = Some(response_json);
-        self.store()
+        Ok(response_json)
+    }
+
+    #[cfg(test)]
+    pub fn stage_terminal_response_for_test(
+        &mut self,
+        response: &memcordon_core::WindowsLauncherResponseV1,
+    ) -> Result<(), String> {
+        self.terminal_response_json = Some(self.prepare_terminal_response(response)?);
+        self.advance_terminalization(
+            WindowsTerminalizationOwnerV1::LauncherWorker,
+            WindowsTerminalizationCheckpointV1::OutboxStaged,
+        )?;
+        self.validate_for_store_for_test()
+    }
+
+    #[cfg(test)]
+    pub fn stage_terminal_response_with_store_for_test<F>(
+        &mut self,
+        response: &memcordon_core::WindowsLauncherResponseV1,
+        mut store: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&mut Self) -> Result<(), String>,
+    {
+        self.stage_terminal_response_with_store(response, &mut store)
     }
 
     pub fn acknowledge_terminal_response(&mut self) -> Result<(), String> {
@@ -250,11 +564,133 @@ impl WindowsAttemptRecordV1 {
             ));
         }
         self.state = state;
+        if state == WindowsAttemptStateV1::Terminating
+            && self.terminalization.checkpoint == WindowsTerminalizationCheckpointV1::Executing
+        {
+            self.advance_terminalization(
+                WindowsTerminalizationOwnerV1::LauncherWorker,
+                WindowsTerminalizationCheckpointV1::CleanupRequested,
+            )?;
+        }
         Ok(())
     }
 }
 
+pub fn bounded_terminalization_error(
+    stage: WindowsTerminalizationErrorStageV1,
+    error_code: &str,
+    detail: impl AsRef<str>,
+    native_code: Option<i32>,
+) -> WindowsTerminalizationErrorV1 {
+    let error_code = if !error_code.is_empty()
+        && error_code.len() <= MAX_TERMINALIZATION_CODE_BYTES
+        && error_code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        error_code.to_owned()
+    } else {
+        "MCSEALED-WINDOWS-TERMINALIZATION".to_owned()
+    };
+    let detail = bounded_nonempty_detail(
+        detail.as_ref(),
+        MAX_TERMINALIZATION_DETAIL_BYTES,
+        "unspecified terminalization failure",
+    );
+    WindowsTerminalizationErrorV1 {
+        stage,
+        error_code,
+        detail,
+        native_code,
+        observed_unix_millis: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok()),
+    }
+}
+
+fn bounded_nonempty_detail(detail: &str, max_bytes: usize, default_detail: &str) -> String {
+    let sanitized = detail.replace('\0', "�");
+    let sanitized = if sanitized.is_empty() {
+        default_detail.to_owned()
+    } else {
+        sanitized
+    };
+    if sanitized.len() <= max_bytes {
+        return sanitized;
+    }
+    let mut end = max_bytes.min(sanitized.len());
+    while !sanitized.is_char_boundary(end) {
+        end -= 1;
+    }
+    sanitized[..end].to_owned()
+}
+
+fn bounded_rejection_detail(detail: String) -> String {
+    bounded_nonempty_detail(
+        &detail,
+        memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES,
+        "unspecified provider rejection",
+    )
+}
+
+fn terminalization_error(
+    stage: WindowsTerminalizationErrorStageV1,
+    error_code: &str,
+    detail: String,
+    native_code: Option<i32>,
+) -> WindowsTerminalizationErrorV1 {
+    bounded_terminalization_error(stage, error_code, detail, native_code)
+}
+
+pub fn record_terminalization_failure(
+    attempt_id: &str,
+    owner: WindowsTerminalizationOwnerV1,
+    error: WindowsTerminalizationErrorV1,
+) -> Result<(), String> {
+    let path = record_path(attempt_id)?;
+    let bytes = fs::read(&path).map_err(|read_error| read_error.to_string())?;
+    let mut record: WindowsAttemptRecordV1 =
+        serde_json::from_slice(&bytes).map_err(|parse_error| parse_error.to_string())?;
+    authenticate(&record, attempt_id)?;
+    let checkpoint = if record.terminal_response_json.is_some() {
+        WindowsTerminalizationCheckpointV1::OutboxStaged
+    } else {
+        WindowsTerminalizationCheckpointV1::RetainedFailure
+    };
+    record.advance_terminalization(owner, checkpoint)?;
+    record.retain_terminalization_error(error);
+    record.store()
+}
+
+pub fn record_terminalization_diagnostic(
+    attempt_id: &str,
+    error: WindowsTerminalizationErrorV1,
+) -> Result<(), String> {
+    let path = record_path(attempt_id)?;
+    let bytes = fs::read(&path).map_err(|read_error| read_error.to_string())?;
+    let mut record: WindowsAttemptRecordV1 =
+        serde_json::from_slice(&bytes).map_err(|parse_error| parse_error.to_string())?;
+    authenticate(&record, attempt_id)?;
+    if !record.apply_terminalization_diagnostic(error)? {
+        return Ok(());
+    }
+    record.store()
+}
+
 pub fn recover() -> Result<(), String> {
+    recover_until(Instant::now() + Duration::from_secs(35))
+}
+
+/// Converges active attempt state within the package transaction's single
+/// deadline. The launcher first terminates every Job for which it still owns
+/// authority; this durable phase then waits for guardian/process-zero proof
+/// and retires only records without an unacknowledged terminal outbox.
+pub fn converge_package_cleanup(deadline: Instant) -> Result<(), String> {
+    recover_until(deadline)
+}
+
+fn recover_until(deadline: Instant) -> Result<(), String> {
     let attempts = attempts_root();
     fs::create_dir_all(&attempts).map_err(|error| error.to_string())?;
     fs::create_dir_all(quarantine_root()).map_err(|error| error.to_string())?;
@@ -341,12 +777,15 @@ pub fn recover() -> Result<(), String> {
             continue;
         }
         let reconciled = (|| {
-            if record.state != WindowsAttemptStateV1::Terminating {
-                record.transition(WindowsAttemptStateV1::Terminating)?;
+            if record.authorization_unix_millis.is_none() && !record.resume_attempted {
+                record.begin_preauthorization_abort()?;
+            } else {
+                if record.state != WindowsAttemptStateV1::Terminating {
+                    record.transition(WindowsAttemptStateV1::Terminating)?;
+                }
+                record.cleanup_state.termination_requested = true;
+                record.store()?;
             }
-            record.cleanup_state.termination_requested = true;
-            record.store()?;
-            let deadline = Instant::now() + Duration::from_secs(35);
             while Instant::now() < deadline && record_has_live_process(&record)? {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -862,6 +1301,7 @@ pub fn rejection_evidence(
     os_code: Option<i32>,
     terminal_receipt: Option<Box<memcordon_core::WindowsTerminalReceiptV1>>,
 ) -> Result<memcordon_core::ProviderRejectionEvidence, String> {
+    let detail = bounded_rejection_detail(detail);
     let path = match record_path(attempt_id) {
         Ok(path) => path,
         Err(_) => {
@@ -894,10 +1334,10 @@ pub fn rejection_evidence(
     if cleanup_attempted
         && record.cleanup_state.active_processes_zero
         && record.cleanup_state.guardian_reaped
+        && !record.cleanup_state.final_handles_closed
         && !live
     {
-        record.cleanup_state.final_handles_closed = true;
-        record.store()?;
+        record.complete_rejection_cleanup()?;
     }
     let safe = cleanup_attempted
         && record.cleanup_state.active_processes_zero
@@ -958,7 +1398,7 @@ fn posttarget_rejection(
         schema_version: 1,
         code: code.to_owned(),
         phase: phase.unwrap_or(memcordon_core::BoundarySetupPhase::Retirement),
-        detail,
+        detail: bounded_rejection_detail(detail),
         os_code,
         target_created: true,
         target_released: true,
@@ -1093,14 +1533,130 @@ pub fn replay_unavailable_evidence(
     })
 }
 
-pub fn replay_pending_evidence(
+pub enum ReplayUnstagedEvidence {
+    Pending(memcordon_core::WindowsReplayPendingV1),
+    Retained(memcordon_core::WindowsAttemptRetainedV1),
+}
+
+fn render_terminalization_error(error: &WindowsTerminalizationErrorV1) -> String {
+    format!(
+        "stage={:?} code={} detail={} native_code={:?} observed_unix_millis={:?}",
+        error.stage,
+        error.error_code,
+        error.detail.lines().collect::<Vec<_>>().join(" "),
+        error.native_code,
+        error.observed_unix_millis,
+    )
+}
+
+fn classify_replay_unstaged_evidence(
+    record: &WindowsAttemptRecordV1,
+    nonce: &str,
+    relay_phase: memcordon_core::WindowsRelayPhaseV1,
+) -> ReplayUnstagedEvidence {
+    let cleanup_complete = record.state == WindowsAttemptStateV1::Empty
+        && record.cleanup_state.termination_requested
+        && record.cleanup_state.active_processes_zero
+        && record.cleanup_state.guardian_reaped
+        && record.cleanup_state.final_handles_closed;
+    if cleanup_complete
+        && record.terminalization.checkpoint == WindowsTerminalizationCheckpointV1::RetainedFailure
+    {
+        let primary_detail = record.terminalization.last_error.as_ref().map_or_else(
+            || {
+                "authenticated terminalization retained failure without a primary diagnostic"
+                    .to_owned()
+            },
+            |error| {
+                format!(
+                    "authenticated terminalization retained failure {}",
+                    render_terminalization_error(error)
+                )
+            },
+        );
+        return ReplayUnstagedEvidence::Retained(memcordon_core::WindowsAttemptRetainedV1 {
+            schema_version: 1,
+            attempt_id: record.attempt_id.clone(),
+            nonce: nonce.to_owned(),
+            request_sha256: record.request_sha256.clone(),
+            relay_phase,
+            durable_state: Some(record.state),
+            terminal_disposition: record.terminal_disposition,
+            cleanup_complete,
+            terminal_replay_available: false,
+            authority_retained: true,
+            primary_detail,
+            secondary_failures: record
+                .terminalization
+                .secondary_errors
+                .iter()
+                .map(render_terminalization_error)
+                .collect(),
+        });
+    }
+    let outbox_stage = match record.terminalization.checkpoint {
+        WindowsTerminalizationCheckpointV1::OutboxStaging => {
+            memcordon_core::WindowsReplayOutboxStageV1::Attempting
+        }
+        WindowsTerminalizationCheckpointV1::OutboxStaged
+        | WindowsTerminalizationCheckpointV1::AckRetiring => {
+            memcordon_core::WindowsReplayOutboxStageV1::Staged
+        }
+        WindowsTerminalizationCheckpointV1::RetainedFailure => {
+            memcordon_core::WindowsReplayOutboxStageV1::Failed
+        }
+        _ => memcordon_core::WindowsReplayOutboxStageV1::NotAttempted,
+    };
+    let detail = record.terminalization.last_error.as_ref().map_or_else(
+        || "authenticated attempt is pending before durable terminal staging".to_owned(),
+        |error| {
+            format!(
+                "authenticated terminalization failure {}",
+                render_terminalization_error(error)
+            )
+        },
+    );
+    ReplayUnstagedEvidence::Pending(memcordon_core::WindowsReplayPendingV1 {
+        schema_version: 2,
+        attempt_id: record.attempt_id.clone(),
+        nonce: nonce.to_owned(),
+        request_sha256: record.request_sha256.clone(),
+        relay_phase,
+        durable_state: record.state,
+        terminal_disposition: record.terminal_disposition,
+        authorization_present: record.authorization_unix_millis.is_some(),
+        resume_attempted: record.resume_attempted,
+        target_released: record.target_released,
+        cleanup_state: memcordon_core::WindowsDurableCleanupStateV1 {
+            termination_requested: record.cleanup_state.termination_requested,
+            active_processes_zero: record.cleanup_state.active_processes_zero,
+            guardian_reaped: record.cleanup_state.guardian_reaped,
+            final_handles_closed: record.cleanup_state.final_handles_closed,
+        },
+        cleanup_complete,
+        outbox_stage,
+        terminalization: record.terminalization.clone(),
+        detail,
+    })
+}
+
+#[cfg(test)]
+pub fn replay_unstaged_evidence_for_test(
+    record: &WindowsAttemptRecordV1,
+    nonce: &str,
+    relay_phase: memcordon_core::WindowsRelayPhaseV1,
+) -> ReplayUnstagedEvidence {
+    classify_replay_unstaged_evidence(record, nonce, relay_phase)
+}
+
+pub fn replay_unstaged_evidence(
     attempt_id: &str,
     nonce: &str,
     request_sha256: &str,
     relay_phase: memcordon_core::WindowsRelayPhaseV1,
     caller_process_identity: &memcordon_core::WindowsProcessIdentityV1,
     caller_token_sha256: &str,
-) -> Result<Option<memcordon_core::WindowsReplayPendingV1>, String> {
+) -> Result<Option<ReplayUnstagedEvidence>, String> {
     let path = record_path(attempt_id)?;
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -1119,22 +1675,11 @@ pub fn replay_pending_evidence(
     if record.terminal_response_json.is_some() {
         return Err("terminal replay outbox changed while availability was inspected".to_owned());
     }
-    let cleanup_complete = record.state == WindowsAttemptStateV1::Empty
-        && record.cleanup_state.termination_requested
-        && record.cleanup_state.active_processes_zero
-        && record.cleanup_state.guardian_reaped
-        && record.cleanup_state.final_handles_closed;
-    Ok(Some(memcordon_core::WindowsReplayPendingV1 {
-        schema_version: 1,
-        attempt_id: attempt_id.to_owned(),
-        nonce: nonce.to_owned(),
-        request_sha256: request_sha256.to_owned(),
+    Ok(Some(classify_replay_unstaged_evidence(
+        &record,
+        nonce,
         relay_phase,
-        durable_state: record.state,
-        cleanup_complete,
-        outbox_stage: memcordon_core::WindowsReplayOutboxStageV1::NotStaged,
-        detail: "authenticated attempt remains active before durable terminal staging".to_owned(),
-    }))
+    )))
 }
 
 pub fn retained_attempt_evidence(
@@ -1144,21 +1689,73 @@ pub fn retained_attempt_evidence(
     relay_phase: memcordon_core::WindowsRelayPhaseV1,
     primary_detail: String,
     secondary_failures: Vec<String>,
-) -> Result<memcordon_core::WindowsAttemptRetainedV1, String> {
-    let path = record_path(attempt_id)?;
-    let record = match fs::read(&path) {
-        Ok(bytes) => {
-            let record: WindowsAttemptRecordV1 =
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            authenticate(&record, attempt_id)?;
-            if record.request_sha256 != request_sha256 {
-                return Err("retained attempt request digest is not exact".to_owned());
+) -> memcordon_core::WindowsAttemptRetainedV1 {
+    let record = (|| -> Result<Option<WindowsAttemptRecordV1>, String> {
+        let path = record_path(attempt_id)?;
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let record: WindowsAttemptRecordV1 =
+                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                authenticate(&record, attempt_id)?;
+                if record.request_sha256 != request_sha256 {
+                    return Err("retained attempt request digest is not exact".to_owned());
+                }
+                Ok(Some(record))
             }
-            Some(record)
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.to_string()),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.to_string()),
-    };
+    })();
+    match record {
+        Ok(record) => retained_attempt_evidence_from_snapshot(
+            attempt_id,
+            nonce,
+            request_sha256,
+            relay_phase,
+            primary_detail,
+            secondary_failures,
+            record.as_ref(),
+        ),
+        Err(error) => retained_attempt_evidence_after_inspection_failure(
+            attempt_id,
+            nonce,
+            request_sha256,
+            relay_phase,
+            primary_detail,
+            secondary_failures,
+            error,
+        ),
+    }
+}
+
+pub fn in_memory_retained_attempt_evidence(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    relay_phase: memcordon_core::WindowsRelayPhaseV1,
+    primary_detail: String,
+    secondary_failures: Vec<String>,
+) -> memcordon_core::WindowsAttemptRetainedV1 {
+    retained_attempt_evidence_from_snapshot(
+        attempt_id,
+        nonce,
+        request_sha256,
+        relay_phase,
+        primary_detail,
+        secondary_failures,
+        None,
+    )
+}
+
+fn retained_attempt_evidence_from_snapshot(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    relay_phase: memcordon_core::WindowsRelayPhaseV1,
+    primary_detail: String,
+    secondary_failures: Vec<String>,
+    record: Option<&WindowsAttemptRecordV1>,
+) -> memcordon_core::WindowsAttemptRetainedV1 {
     let cleanup_complete = record.as_ref().is_some_and(|record| {
         record.state == WindowsAttemptStateV1::Empty
             && record.cleanup_state.termination_requested
@@ -1166,7 +1763,7 @@ pub fn retained_attempt_evidence(
             && record.cleanup_state.guardian_reaped
             && record.cleanup_state.final_handles_closed
     });
-    Ok(memcordon_core::WindowsAttemptRetainedV1 {
+    memcordon_core::WindowsAttemptRetainedV1 {
         schema_version: 1,
         attempt_id: attempt_id.to_owned(),
         nonce: nonce.to_owned(),
@@ -1183,7 +1780,50 @@ pub fn retained_attempt_evidence(
         authority_retained: true,
         primary_detail,
         secondary_failures,
-    })
+    }
+}
+
+fn retained_attempt_evidence_after_inspection_failure(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    relay_phase: memcordon_core::WindowsRelayPhaseV1,
+    primary_detail: String,
+    mut secondary_failures: Vec<String>,
+    error: String,
+) -> memcordon_core::WindowsAttemptRetainedV1 {
+    secondary_failures.push(format!(
+        "retained attempt record inspection failed: {error}"
+    ));
+    in_memory_retained_attempt_evidence(
+        attempt_id,
+        nonce,
+        request_sha256,
+        relay_phase,
+        primary_detail,
+        secondary_failures,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn retained_attempt_evidence_after_inspection_failure_for_test(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    relay_phase: memcordon_core::WindowsRelayPhaseV1,
+    primary_detail: String,
+    secondary_failures: Vec<String>,
+    error: String,
+) -> memcordon_core::WindowsAttemptRetainedV1 {
+    retained_attempt_evidence_after_inspection_failure(
+        attempt_id,
+        nonce,
+        request_sha256,
+        relay_phase,
+        primary_detail,
+        secondary_failures,
+        error,
+    )
 }
 
 pub fn terminal_outbox_count() -> Result<u32, String> {
@@ -1195,10 +1835,32 @@ pub fn terminal_outbox_count() -> Result<u32, String> {
     };
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
-        let bytes = fs::read(entry.path()).map_err(|error| error.to_string())?;
-        let record: WindowsAttemptRecordV1 =
-            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-        authenticate(&record, &record.attempt_id)?;
+        let path = entry.path();
+        let attempt_id = terminal_inventory_attempt_id(&path)?;
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            return Err(format!(
+                "MCSEALED-WINDOWS-TERMINAL-INVENTORY-ENTRY: attempt_id={attempt_id} is not a regular file"
+            ));
+        }
+        let bytes = fs::read(&path).map_err(|error| {
+            format!(
+                "MCSEALED-WINDOWS-TERMINAL-INVENTORY-READ: attempt_id={attempt_id} error={error}"
+            )
+        })?;
+        let record: WindowsAttemptRecordV1 = serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "MCSEALED-WINDOWS-TERMINAL-INVENTORY-PARSE: attempt_id={attempt_id} error={error}"
+            )
+        })?;
+        authenticate(&record, &attempt_id).map_err(|error| {
+            format!(
+                "MCSEALED-WINDOWS-TERMINAL-INVENTORY-AUTHENTICATION: attempt_id={attempt_id} error={error}"
+            )
+        })?;
         if record.terminal_response_json.is_some() {
             count = count
                 .checked_add(1)
@@ -1206,6 +1868,31 @@ pub fn terminal_outbox_count() -> Result<u32, String> {
         }
     }
     Ok(count)
+}
+
+fn terminal_inventory_attempt_id(path: &Path) -> Result<String, String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "MCSEALED-WINDOWS-TERMINAL-INVENTORY-ENTRY: name is not UTF-8".to_owned())?;
+    if let Some(attempt_id) = name.strip_suffix(".json.new") {
+        validate_attempt_id(attempt_id).map_err(|error| {
+            format!(
+                "MCSEALED-WINDOWS-TERMINAL-INVENTORY-ENTRY: staged attempt name is invalid: {error}"
+            )
+        })?;
+        return Err(format!(
+            "MCSEALED-WINDOWS-TERMINAL-INVENTORY-STAGED: attempt_id={attempt_id} requires durable recovery before inventory"
+        ));
+    }
+    record_attempt_id(path).map_err(|error| {
+        format!("MCSEALED-WINDOWS-TERMINAL-INVENTORY-ENTRY: name={name} error={error}")
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn terminal_inventory_attempt_id_for_test(name: &str) -> Result<String, String> {
+    terminal_inventory_attempt_id(Path::new(name))
 }
 
 pub fn acknowledge_terminal_response(
@@ -1252,7 +1939,7 @@ pub fn pretarget_rejection_at(
         schema_version: 1,
         code: code.to_owned(),
         phase,
-        detail,
+        detail: bounded_rejection_detail(detail),
         os_code: None,
         target_created: false,
         target_released: false,

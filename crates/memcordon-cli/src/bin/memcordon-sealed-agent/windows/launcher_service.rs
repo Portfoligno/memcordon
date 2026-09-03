@@ -266,10 +266,25 @@ impl LaunchAttemptError {
         observation: memcordon_core::WindowsMutantNativeObservationV1,
         candidate: WindowsTerminalReceiptV1,
     ) -> Self {
-        let mut failure =
-            Self::mutant_observed(observation, memcordon_core::BoundarySetupPhase::Retirement);
-        failure.terminal_candidate = Some(Box::new(candidate));
-        failure
+        Self::mutant_observed(observation, memcordon_core::BoundarySetupPhase::Retirement)
+            .with_terminal_candidate(candidate)
+    }
+
+    fn with_terminal_candidate(mut self, candidate: WindowsTerminalReceiptV1) -> Self {
+        self.terminal_candidate = Some(Box::new(candidate));
+        self
+    }
+
+    fn terminal_transport(subphase: &'static str, detail: String) -> Self {
+        Self {
+            code: "MCSEALED-WINDOWS-TERMINAL-TRANSPORT",
+            detail: format!("subphase={subphase} detail={detail}"),
+            os_code: None,
+            phase: Some(memcordon_core::BoundarySetupPhase::Retirement),
+            connection_must_close: true,
+            mutant_observation: None,
+            terminal_candidate: None,
+        }
     }
 
     fn authority_loss(detail: String) -> Self {
@@ -354,6 +369,19 @@ impl JobView {
             Err(io::Error::last_os_error().to_string())
         } else {
             Ok(inside != 0)
+        }
+    }
+
+    fn terminate(&self) -> Result<(), String> {
+        // SAFETY: the active registry owns this duplicated Job handle until
+        // the per-attempt worker unregisters it after cleanup.
+        if unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0.raw(), CANCEL_STATUS)
+        } == 0
+        {
+            Err(io::Error::last_os_error().to_string())
+        } else {
+            Ok(())
         }
     }
 }
@@ -517,6 +545,55 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                 },
             )
         }
+        WindowsLauncherRequestV1::PackageCleanup {
+            schema_version,
+            deadline_millis,
+        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION && deadline_millis != 0 => {
+            let result = converge_package_cleanup(deadline_millis);
+            let (status, attempts_empty, detail) = match result {
+                Ok(()) => (
+                    memcordon_core::WindowsControlRequestStatusV1::Ready,
+                    Some(true),
+                    "launcher package cleanup converged".to_owned(),
+                ),
+                Err(error)
+                    if error
+                        .strip_prefix("MCSEALED-WINDOWS-PACKAGE-ACTIVE:")
+                        .is_some()
+                        || error
+                            .strip_prefix("MCSEALED-WINDOWS-RECOVERY-AMBIGUOUS:")
+                            .is_some() =>
+                {
+                    let detail = if error
+                        .strip_prefix("MCSEALED-WINDOWS-PACKAGE-ACTIVE:")
+                        .is_some()
+                    {
+                        error
+                    } else {
+                        format!("MCSEALED-WINDOWS-PACKAGE-ACTIVE: {error}")
+                    };
+                    (
+                        memcordon_core::WindowsControlRequestStatusV1::Active,
+                        Some(false),
+                        detail,
+                    )
+                }
+                Err(error) => (
+                    memcordon_core::WindowsControlRequestStatusV1::Failed,
+                    None,
+                    error,
+                ),
+            };
+            pipe::write_frame(
+                connection,
+                &WindowsLauncherResponseV1::PackageCleanup {
+                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                    status,
+                    attempts_empty,
+                    detail,
+                },
+            )
+        }
         WindowsLauncherRequestV1::ReplayTerminal {
             schema_version,
             attempt_id,
@@ -525,6 +602,7 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
             relay_phase,
             caller_process_identity,
             caller_token_sha256,
+            terminalization_error,
         } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
             && !attempt_id.is_empty()
             && !nonce.is_empty()
@@ -533,35 +611,86 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
             && caller_process_identity.creation_time_100ns != 0
             && !caller_token_sha256.is_empty() =>
         {
-            let Some(response) = super::record::pending_terminal_response(
+            if let Some(error) = terminalization_error {
+                super::record::record_terminalization_diagnostic(&attempt_id, error)?;
+            }
+            let pending_terminal = super::record::pending_terminal_response(
                 &attempt_id,
                 &nonce,
                 &request_sha256,
                 &caller_process_identity,
                 &caller_token_sha256,
-            )?
-            else {
-                if let Some(pending) = super::record::replay_pending_evidence(
-                    &attempt_id,
-                    &nonce,
-                    &request_sha256,
-                    relay_phase,
-                    &caller_process_identity,
-                    &caller_token_sha256,
-                )? {
+            );
+            let Some(response) = (match pending_terminal {
+                Ok(response) => response,
+                Err(error) => {
                     return pipe::write_frame(
                         connection,
-                        &WindowsLauncherResponseV1::ReplayPending(pending),
+                        &bound_launcher_replay_failure_response(
+                            &attempt_id,
+                            &nonce,
+                            &request_sha256,
+                            relay_phase,
+                            error,
+                        ),
                     );
                 }
-                let retained = super::record::replay_unavailable_evidence(
+            }) else {
+                let pending = match super::record::replay_unstaged_evidence(
                     &attempt_id,
                     &nonce,
                     &request_sha256,
                     relay_phase,
                     &caller_process_identity,
                     &caller_token_sha256,
-                )?;
+                ) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        return pipe::write_frame(
+                            connection,
+                            &bound_launcher_replay_failure_response(
+                                &attempt_id,
+                                &nonce,
+                                &request_sha256,
+                                relay_phase,
+                                error,
+                            ),
+                        );
+                    }
+                };
+                if let Some(evidence) = pending {
+                    let response = match evidence {
+                        super::record::ReplayUnstagedEvidence::Pending(pending) => {
+                            WindowsLauncherResponseV1::ReplayPending(pending)
+                        }
+                        super::record::ReplayUnstagedEvidence::Retained(retained) => {
+                            WindowsLauncherResponseV1::AttemptRetained(retained)
+                        }
+                    };
+                    return pipe::write_frame(connection, &response);
+                }
+                let retained = match super::record::replay_unavailable_evidence(
+                    &attempt_id,
+                    &nonce,
+                    &request_sha256,
+                    relay_phase,
+                    &caller_process_identity,
+                    &caller_token_sha256,
+                ) {
+                    Ok(retained) => retained,
+                    Err(error) => {
+                        return pipe::write_frame(
+                            connection,
+                            &bound_launcher_replay_failure_response(
+                                &attempt_id,
+                                &nonce,
+                                &request_sha256,
+                                relay_phase,
+                                error,
+                            ),
+                        );
+                    }
+                };
                 return pipe::write_frame(
                     connection,
                     &WindowsLauncherResponseV1::AttemptRetained(retained),
@@ -742,6 +871,75 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
             }
         }
         _ => Err("unsupported Windows private launcher request".to_owned()),
+    }
+}
+
+fn bound_launcher_replay_failure_response(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    relay_phase: memcordon_core::WindowsRelayPhaseV1,
+    error: String,
+) -> WindowsLauncherResponseV1 {
+    WindowsLauncherResponseV1::AttemptRetained(super::record::in_memory_retained_attempt_evidence(
+        attempt_id,
+        nonce,
+        request_sha256,
+        relay_phase,
+        "authenticated launcher terminal replay did not complete".to_owned(),
+        vec![format!("launcher replay record inspection failed: {error}")],
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn bound_launcher_replay_failure_response_for_test(
+    attempt_id: &str,
+    nonce: &str,
+    request_sha256: &str,
+    relay_phase: memcordon_core::WindowsRelayPhaseV1,
+    error: String,
+) -> WindowsLauncherResponseV1 {
+    bound_launcher_replay_failure_response(attempt_id, nonce, request_sha256, relay_phase, error)
+}
+
+fn converge_package_cleanup(deadline_millis: u64) -> Result<(), String> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(deadline_millis))
+        .ok_or_else(|| "package cleanup deadline overflowed".to_owned())?;
+    loop {
+        let active_count = {
+            let jobs = ACTIVE_JOBS
+                .lock()
+                .map_err(|_| "active Job registry is poisoned".to_owned())?;
+            for active in jobs.iter() {
+                active.job.terminate().map_err(|error| {
+                    format!(
+                        "phase=terminate-job attempt_id={} error={error}",
+                        active.attempt_id
+                    )
+                })?;
+            }
+            jobs.len()
+        };
+        if active_count == 0 {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "MCSEALED-WINDOWS-PACKAGE-ACTIVE: phase=wait-launcher-jobs active_jobs={active_count} deadline_millis={deadline_millis}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50).min(deadline - now));
+    }
+    super::record::converge_package_cleanup(deadline)?;
+    if super::record::attempts_empty()? {
+        Ok(())
+    } else {
+        Err(
+            "MCSEALED-WINDOWS-PACKAGE-ACTIVE: phase=durable-recovery attempts_empty=false"
+                .to_owned(),
+        )
     }
 }
 
@@ -1116,6 +1314,22 @@ fn launch_attempt(
         .copied()
         .map(|raw| OwnedHandle::new(raw as usize as HANDLE))
         .collect::<Result<Vec<_>, _>>()?;
+    let loader_restriction_canary_handles = request
+        .loader_restriction_canary
+        .as_ref()
+        .map(|pair| {
+            Ok::<_, String>((
+                OwnedHandle::new(pair.remote_baseline_token_handle as usize as HANDLE)?,
+                OwnedHandle::new(pair.remote_comparison_token_handle as usize as HANDLE)?,
+                OwnedHandle::new(pair.remote_no_restricting_sid_token_handle as usize as HANDLE)?,
+                OwnedHandle::new(pair.remote_profile_token_handle as usize as HANDLE)?,
+                pair.source_binding_sha256.clone(),
+                pair.pair_invariants_sha256.clone(),
+                pair.restriction_presence_binding_sha256.clone(),
+                pair.profile_binding_sha256.clone(),
+            ))
+        })
+        .transpose()?;
     if request.attempt_id != expected_attempt_id
         || request.launch.nonce != expected_nonce
         || request.request_sha256 != expected_request_sha256
@@ -1194,6 +1408,32 @@ fn launch_attempt(
         )
         .into());
     }
+    let loader_restriction_canary = loader_restriction_canary_handles
+        .map(
+            |(
+                baseline,
+                comparison,
+                no_restricting_sid,
+                profile,
+                source_binding_sha256,
+                pair_invariants_sha256,
+                restriction_presence_binding_sha256,
+                profile_binding_sha256,
+            )| {
+                super::process::LoaderRestrictionCanaryTokens::from_transferred(
+                    primary_token.raw(),
+                    baseline,
+                    comparison,
+                    no_restricting_sid,
+                    profile,
+                    source_binding_sha256,
+                    pair_invariants_sha256,
+                    restriction_presence_binding_sha256,
+                    profile_binding_sha256,
+                )
+            },
+        )
+        .transpose()?;
     super::record::reserve_attempt(&request.attempt_id, &request.request_sha256)?;
     // Keep the durable admission until the first authenticated attempt record
     // has been stored. Package mutation therefore sees either the admission or
@@ -1368,11 +1608,7 @@ fn launch_attempt(
                 frontend.raw(),
                 Instant::now() + Duration::from_secs(30),
             )?;
-            cleanup_guard
-                .record
-                .transition(super::record::WindowsAttemptStateV1::Terminating)?;
-            cleanup_guard.record.cleanup_state.termination_requested = true;
-            cleanup_guard.record.store()?;
+            cleanup_guard.record.begin_preauthorization_abort()?;
             job.terminate(CANCEL_STATUS)?;
             if !job.wait_empty(Instant::now() + Duration::from_secs(30))? {
                 return Err("Job did not empty after preauthorization failure"
@@ -1461,6 +1697,7 @@ fn launch_attempt(
     };
     let target_result = SuspendedTarget::create(
         primary_token.raw(),
+        loader_restriction_canary.as_ref(),
         &job,
         &target_command,
         &request.launch.environment,
@@ -1509,11 +1746,7 @@ fn launch_attempt(
                 frontend.raw(),
                 Instant::now() + Duration::from_secs(30),
             )?;
-            cleanup_guard
-                .record
-                .transition(super::record::WindowsAttemptStateV1::Terminating)?;
-            cleanup_guard.record.cleanup_state.termination_requested = true;
-            cleanup_guard.record.store()?;
+            cleanup_guard.record.begin_preauthorization_abort()?;
             job.terminate(CANCEL_STATUS)?;
             if !job.wait_empty(Instant::now() + Duration::from_secs(30))? {
                 return Err("Job did not empty after preauthorization failure"
@@ -1728,12 +1961,132 @@ fn launch_attempt(
         Ok(target_token) => target_token,
         Err(failure) => retire_preauthorization_with_target!(failure),
     };
+    macro_rules! retire_postauthorization_before_resume {
+        ($failure:expr) => {{
+            let mut failure = $failure;
+            let authorization_offset = started.elapsed();
+            let mut job_process_identities = Vec::new();
+            for process_id in job.process_ids()? {
+                if let Some(identity) =
+                    super::process::process_identity_for_pid_as_authenticated_caller(
+                        process_id,
+                        primary_token.raw(),
+                        &job,
+                    )
+                    .map_err(LaunchAttemptError::process_inventory)?
+                {
+                    record_job_process_identity(&mut job_process_identities, identity)
+                        .map_err(LaunchAttemptError::from)?;
+                }
+            }
+            let job_total_processes = job.total_processes()?;
+            pipe::write_frame(
+                connection,
+                &WindowsLauncherResponseV1::RelaysAbort {
+                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                    attempt_id: request.attempt_id.clone(),
+                    nonce: request.launch.nonce.clone(),
+                    request_sha256: request.request_sha256.clone(),
+                },
+            )?;
+            let _ = wait_for_relays_retired(
+                connection,
+                &request.attempt_id,
+                &request.launch.nonce,
+                &request.request_sha256,
+                frontend.raw(),
+            )?;
+            wait_for_relay_retirement_proof(
+                relay_retired_event.raw(),
+                frontend.raw(),
+                Instant::now() + Duration::from_secs(30),
+            )?;
+            let relays_retired = RelaysRetired;
+            cleanup_guard.record.begin_postauthorization_retirement()?;
+            job.terminate(CANCEL_STATUS)?;
+            let job_terminated = JobTerminated;
+            if !target.wait(Duration::from_secs(30))? {
+                return Err(
+                    "suspended target did not reap after postauthorization failure"
+                        .to_owned()
+                        .into(),
+                );
+            }
+            let direct_target_reaped = DirectTargetReaped;
+            if !job.wait_empty(Instant::now() + Duration::from_secs(30))? {
+                return Err("Job did not empty after postauthorization failure"
+                    .to_owned()
+                    .into());
+            }
+            let active_processes_zero = ActiveProcessesZero;
+            target_cleanup_barrier.finish();
+            cleanup_guard.record.cleanup_state.active_processes_zero = true;
+            cleanup_guard.record.store()?;
+            // SAFETY: disarm is a live private event and signals the guardian's normal path.
+            if unsafe { SetEvent(disarm.raw()) } == 0
+                || unsafe { WaitForSingleObject(guardian.raw(), 10_000) } != WAIT_OBJECT_0
+            {
+                return Err("guardian did not reap after postauthorization failure"
+                    .to_owned()
+                    .into());
+            }
+            let guardian_reaped = GuardianReaped;
+            cleanup_guard.record.cleanup_state.guardian_reaped = true;
+            cleanup_guard.record.store()?;
+            let child_pid = target.process_id;
+            let outcome = RunOutcome::MonitorFailed {
+                error: failure.detail.clone(),
+                child_after_termination: Some(child_termination(target.exit_status()?)),
+                cleanup: CleanupSummary {
+                    force_attempted: true,
+                    direct_child_reaped: true,
+                    workload_empty: Some(true),
+                    ..CleanupSummary::default()
+                },
+            };
+            let mut record = cleanup_guard.finish();
+            drop(streams);
+            drop(relay_retired_event);
+            drop(target_token);
+            drop(target);
+            drop(guardian);
+            drop(ready);
+            drop(disarm);
+            drop(registration);
+            drop(job);
+            let final_handles_closed = FinalHandlesClosed;
+            record.complete_retirement()?;
+            let record_retired = RecordRetired;
+            let completed = CompletedRetirement {
+                child_pid,
+                job_total_processes,
+                job_process_identities,
+                cleanup_process_creation: None,
+                outcome,
+                target_release: TargetReleaseDisposition::CancelledWhileSuspended,
+                job_terminated,
+                direct_target_reaped,
+                active_processes_zero,
+                relays_retired,
+                guardian_reaped,
+                final_handles_closed,
+                record_retired,
+            };
+            failure.terminal_candidate = Some(Box::new(build_terminal_receipt(
+                &request,
+                started,
+                authorization_offset,
+                completed,
+            )));
+            return Err(failure);
+        }};
+    }
     if let Some(
         mutant @ (memcordon_core::WindowsSealedMutant::ResumeBeforeGuardian
         | memcordon_core::WindowsSealedMutant::ResumeBeforeRelays),
     ) = request.certification_mutant
     {
-        if let Err(detail) = cleanup_guard.record.mark_resume_attempted() {
+        if let Err(detail) = cleanup_guard.record.begin_preauthorization_abort() {
             retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
         }
         if let Err(detail) = target.resume(None) {
@@ -1795,7 +2148,7 @@ fn launch_attempt(
         retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
     }
     if request.certification_fault == Some(WindowsSealedFault::Resume) {
-        retire_preauthorization_with_target!(LaunchAttemptError::certification_fault(
+        retire_postauthorization_before_resume!(LaunchAttemptError::certification_fault(
             WindowsSealedFault::Resume,
             memcordon_core::BoundarySetupPhase::Authorization,
         ));
@@ -2116,20 +2469,8 @@ fn launch_attempt(
     drop(registration);
     drop(job);
     let final_handles_closed = FinalHandlesClosed;
-    if request.certification_fault == Some(WindowsSealedFault::RecordRetire) {
-        return Err(LaunchAttemptError::certification_fault(
-            WindowsSealedFault::RecordRetire,
-            memcordon_core::BoundarySetupPhase::Retirement,
-        ));
-    }
     record.complete_retirement()?;
     let record_retired = RecordRetired;
-    if request.certification_fault == Some(WindowsSealedFault::GuardianKilledAfterAuthorization) {
-        return Err(LaunchAttemptError::certification_fault(
-            WindowsSealedFault::GuardianKilledAfterAuthorization,
-            memcordon_core::BoundarySetupPhase::Retirement,
-        ));
-    }
 
     let completed = CompletedRetirement {
         child_pid,
@@ -2137,6 +2478,7 @@ fn launch_attempt(
         job_process_identities,
         cleanup_process_creation,
         outcome,
+        target_release: TargetReleaseDisposition::Released,
         job_terminated,
         direct_target_reaped,
         active_processes_zero,
@@ -2146,6 +2488,17 @@ fn launch_attempt(
         record_retired,
     };
     let receipt = build_terminal_receipt(&request, started, authorization_offset, completed);
+    if let Some(
+        fault @ (WindowsSealedFault::RecordRetire
+        | WindowsSealedFault::GuardianKilledAfterAuthorization),
+    ) = request.certification_fault
+    {
+        return Err(LaunchAttemptError::certification_fault(
+            fault,
+            memcordon_core::BoundarySetupPhase::Retirement,
+        )
+        .with_terminal_candidate(receipt));
+    }
     if let Some(mut cleanup_failure) = cleanup_probe_failure {
         cleanup_failure.detail = primary_target_failure.map_or_else(
             || format!("cleanup certification failed: {}", cleanup_failure.detail),
@@ -2176,28 +2529,62 @@ fn launch_attempt(
             mutant_candidate.unwrap_or_else(|| receipt.clone()),
         ));
     }
-    if control_connected {
-        let response = WindowsLauncherResponseV1::Terminal(receipt);
-        record.stage_terminal_response(&response)?;
+    fn stage_completed_terminal_response(
+        record: &mut super::record::WindowsAttemptRecordV1,
+        receipt: WindowsTerminalReceiptV1,
+    ) -> Result<(WindowsLauncherResponseV1, String), LaunchAttemptError> {
+        let response = WindowsLauncherResponseV1::Terminal(receipt.clone());
+        (|| -> Result<(), String> {
+            record.stage_terminal_response(&response)?;
+            Ok(())
+        })()
+        .map_err(|error| {
+            LaunchAttemptError::from(format!(
+                "durable terminal outbox staging failed after completed retirement: {error}"
+            ))
+            .with_terminal_candidate(receipt.clone())
+        })?;
         let terminal_response_sha256 = super::record::digest(
             serde_json::to_string(&response)
-                .map_err(|error| error.to_string())?
+                .map_err(|error| {
+                    LaunchAttemptError::from(format!(
+                        "durable terminal outbox digest serialization failed: {error}"
+                    ))
+                    .with_terminal_candidate(receipt)
+                })?
                 .as_bytes(),
         );
-        pipe::write_frame(connection, &response)?;
+        Ok((response, terminal_response_sha256))
+    }
+    let (response, terminal_response_sha256) =
+        stage_completed_terminal_response(&mut record, receipt)?;
+    if control_connected {
+        (|| -> Result<(), String> {
+            pipe::write_frame(connection, &response)?;
+            Ok(())
+        })()
+        .map_err(|error| LaunchAttemptError::terminal_transport("live-delivery", error))?;
         wait_for_terminal_acknowledgment(
             connection,
             &request.attempt_id,
             &request.launch.nonce,
             &request.request_sha256,
             &terminal_response_sha256,
-        )?;
-        let retired = record.terminal_retired_receipt(&request.launch.nonce)?;
-        record.acknowledge_terminal_response()?;
+        )
+        .map_err(|error| LaunchAttemptError::terminal_transport("terminal-ack", error))?;
+        let retired = record
+            .terminal_retired_receipt(&request.launch.nonce)
+            .map_err(|error| LaunchAttemptError::terminal_transport("retirement-receipt", error))?;
+        (|| -> Result<(), String> {
+            record.acknowledge_terminal_response()?;
+            Ok(())
+        })()
+        .map_err(|error| LaunchAttemptError::terminal_transport("outbox-retirement", error))?;
         pipe::write_frame(
             connection,
             &WindowsLauncherResponseV1::TerminalRetired(retired),
-        )?;
+        )
+        .map_err(|error| LaunchAttemptError::terminal_transport("retirement-delivery", error))?;
     }
     Ok(())
 }
@@ -2209,6 +2596,18 @@ struct RelaysRetired;
 struct GuardianReaped;
 struct FinalHandlesClosed;
 struct RecordRetired;
+
+#[derive(Clone, Copy)]
+enum TargetReleaseDisposition {
+    Released,
+    CancelledWhileSuspended,
+}
+
+impl TargetReleaseDisposition {
+    const fn target_released(self) -> bool {
+        matches!(self, Self::Released)
+    }
+}
 
 trait VerifiedRetirementFact {
     fn verified(&self) -> bool {
@@ -2230,6 +2629,7 @@ struct CompletedRetirement {
     job_process_identities: Vec<memcordon_core::WindowsProcessIdentityV1>,
     cleanup_process_creation: Option<WindowsCleanupProcessCreationEvidenceV1>,
     outcome: RunOutcome,
+    target_release: TargetReleaseDisposition,
     job_terminated: JobTerminated,
     direct_target_reaped: DirectTargetReaped,
     active_processes_zero: ActiveProcessesZero,
@@ -2338,7 +2738,7 @@ fn complete_windows_boundary_evidence(
         target_job_membership_verified: true,
         target_still_suspended_during_verification: true,
         inherited_handles_verified: true,
-        target_released: true,
+        target_released: completed.target_release.target_released(),
         terminate_job_invoked: completed.job_terminated.verified(),
         active_processes_zero: completed.active_processes_zero.verified(),
         direct_target_reaped: completed.direct_target_reaped.verified(),
@@ -3474,6 +3874,11 @@ impl Drop for AttemptCleanup<'_> {
             return;
         }
         let mut failures = Vec::new();
+        if self.record.authorization_unix_millis.is_none() && !self.record.resume_attempted {
+            if let Err(error) = self.record.begin_preauthorization_abort() {
+                failures.push(format!("record-preauthorization-abort: {error}"));
+            }
+        }
         if let Err(error) = self.job.terminate(CANCEL_STATUS) {
             failures.push(format!("terminate-job: {error}"));
         }

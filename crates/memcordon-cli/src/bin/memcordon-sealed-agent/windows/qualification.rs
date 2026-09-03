@@ -3310,6 +3310,62 @@ fn qualification_control_peer_identity(
         .ok_or_else(|| "qualification control-service process identity is unavailable".to_owned())
 }
 
+pub(crate) fn render_replay_pending(pending: &memcordon_core::WindowsReplayPendingV1) -> String {
+    let last_error_stage = pending
+        .terminalization
+        .last_error
+        .as_ref()
+        .map(|error| format!("{:?}", error.stage))
+        .unwrap_or_else(|| "None".to_owned());
+    let last_error_code = pending
+        .terminalization
+        .last_error
+        .as_ref()
+        .map(|error| error.error_code.as_str())
+        .unwrap_or("None");
+    let last_error_detail = pending
+        .terminalization
+        .last_error
+        .as_ref()
+        .map(|error| error.detail.lines().collect::<Vec<_>>().join(" "))
+        .unwrap_or_else(|| "None".to_owned());
+    let last_error_native_code = pending
+        .terminalization
+        .last_error
+        .as_ref()
+        .map(|error| format!("{:?}", error.native_code))
+        .unwrap_or_else(|| "None".to_owned());
+    let last_error_observed_unix_millis = pending
+        .terminalization
+        .last_error
+        .as_ref()
+        .map(|error| format!("{:?}", error.observed_unix_millis))
+        .unwrap_or_else(|| "None".to_owned());
+    format!(
+        "attempt_id={} relay_phase={:?} durable_state={:?} terminal_disposition={:?} authorization_present={} resume_attempted={} target_released={} termination_requested={} active_processes_zero={} guardian_reaped={} final_handles_closed={} outbox_stage={:?} terminalization_owner={:?} terminalization_sequence={} terminalization_checkpoint={:?} last_error_stage={} last_error_code={} last_error_detail={} last_error_native_code={} last_error_observed_unix_millis={}",
+        pending.attempt_id,
+        pending.relay_phase,
+        pending.durable_state,
+        pending.terminal_disposition,
+        pending.authorization_present,
+        pending.resume_attempted,
+        pending.target_released,
+        pending.cleanup_state.termination_requested,
+        pending.cleanup_state.active_processes_zero,
+        pending.cleanup_state.guardian_reaped,
+        pending.cleanup_state.final_handles_closed,
+        pending.outbox_stage,
+        pending.terminalization.owner,
+        pending.terminalization.sequence,
+        pending.terminalization.checkpoint,
+        last_error_stage,
+        last_error_code,
+        last_error_detail,
+        last_error_native_code,
+        last_error_observed_unix_millis,
+    )
+}
+
 fn native_public_canary(
     target_mode: &str,
     token_scenario: &str,
@@ -3812,10 +3868,17 @@ fn native_public_canary(
                     }
                     replay_deadline =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
-                    original_transport_failure = Some(format!(
+                    let first_pending = format!(
                         "typed qualification replay pending before durable outbox: {}",
-                        pending.detail
-                    ));
+                        render_replay_pending(&pending)
+                    );
+                    original_transport_failure = Some(
+                        original_transport_failure
+                            .take()
+                            .map_or(first_pending.clone(), |prior| {
+                                format!("{prior}; first_pending={first_pending}")
+                            }),
+                    );
                     pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE)?;
                     if qualification_control_peer_identity(pipe.raw())? != control_peer_identity {
                         return Err(
@@ -3826,13 +3889,11 @@ fn native_public_canary(
                     .is_none_or(|deadline| std::time::Instant::now() >= deadline)
                 {
                     return Err(format!(
-                        "{}; secondary qualification terminal replay deadline expired state={:?} cleanup_complete={} outbox={:?}",
+                        "{}; secondary qualification terminal replay deadline expired last_pending={}",
                         original_transport_failure
                             .as_deref()
                             .unwrap_or("qualification replay pending"),
-                        pending.durable_state,
-                        pending.cleanup_complete,
-                        pending.outbox_stage,
+                        render_replay_pending(&pending),
                     ));
                 } else {
                     std::thread::sleep(std::time::Duration::from_millis(25));
@@ -6459,7 +6520,10 @@ pub fn recovery_status() -> Result<bool, String> {
     }
 }
 
-pub fn prepare_package_cleanup() -> Result<(), String> {
+pub fn prepare_package_cleanup(deadline_millis: u64) -> Result<(), String> {
+    if deadline_millis == 0 {
+        return Err("package cleanup deadline must be nonzero".to_owned());
+    }
     let pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE)?;
     let challenge = control_request_challenge("package-cleanup");
     super::pipe::write_frame(
@@ -6467,6 +6531,7 @@ pub fn prepare_package_cleanup() -> Result<(), String> {
         &WindowsProviderRequestV1::PackageCleanup {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
             challenge: challenge.clone(),
+            deadline_millis,
         },
     )?;
     match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw())? {

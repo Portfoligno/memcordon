@@ -10,7 +10,8 @@ use memcordon_core::{
     WindowsQualificationReceiptV1, WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsRemoteStreamV1,
     WindowsReplayOutboxStageV1, WindowsReplayPendingV1, WindowsSealedEvidenceV2,
     WindowsServiceSelfAttestationV1, WindowsStreamRoleV1, WindowsTerminalReceiptV1,
-    WindowsTerminalReplayDecisionV1, WindowsTerminalRetiredV1, decode_windows_command_line,
+    WindowsTerminalReplayDecisionV1, WindowsTerminalRetiredV1, WindowsTerminalizationCheckpointV1,
+    WindowsTerminalizationOwnerV1, WindowsTerminalizationStatusV1, decode_windows_command_line,
     encode_windows_command_line, encode_windows_environment_block,
     parse_and_authenticate_windows_attempt_record,
     parse_windows_certification_frontend_handle_values, validate_windows_security_descriptor_text,
@@ -30,6 +31,18 @@ fn sha256(bytes: &[u8]) -> String {
             ]
         })
         .collect()
+}
+
+fn authenticate_signed_attempt_record(
+    record: &mut WindowsDurableAttemptRecordV1,
+) -> Result<WindowsDurableAttemptRecordV1, &'static str> {
+    record.integrity_sha256.clear();
+    record.integrity_sha256 = sha256(&serde_json::to_vec(record).unwrap());
+    parse_and_authenticate_windows_attempt_record(
+        &serde_json::to_vec(record).unwrap(),
+        &record.attempt_id,
+        &record.provider_generation,
+    )
 }
 
 fn qualification() -> WindowsQualificationReceiptV1 {
@@ -318,6 +331,13 @@ fn windows_command_line_round_trips_adversarial_vectors() {
 }
 
 #[test]
+fn windows_command_line_preserves_separator_after_unquoted_backslash() {
+    let arguments = vec![vec![], vec![b'\\' as u16], vec![1282]];
+    let encoded = encode_windows_command_line(&arguments);
+    assert_eq!(decode_windows_command_line(&encoded), Ok(arguments));
+}
+
+#[test]
 fn windows_environment_uses_one_case_key_and_native_size_limit() {
     let canonical = [
         WindowsEnvironmentEntryV1 {
@@ -518,7 +538,7 @@ fn windows_attempt_state_machine_rejects_authorization_shortcuts() {
 fn windows_durable_attempt_parser_authenticates_and_bounds_real_records() {
     let digest = sha256(&[]);
     let mut record = WindowsDurableAttemptRecordV1 {
-        schema_version: 1,
+        schema_version: 2,
         attempt_id: digest.clone(),
         provider_generation: "windows-provider-generation".to_owned(),
         boot_identity: "boot-identity".to_owned(),
@@ -538,6 +558,14 @@ fn windows_durable_attempt_parser_authenticates_and_bounds_real_records() {
         cleanup_state: WindowsDurableCleanupStateV1::default(),
         terminal_response_json: None,
         terminal_disposition: None,
+        terminalization: WindowsTerminalizationStatusV1 {
+            schema_version: 1,
+            owner: WindowsTerminalizationOwnerV1::LauncherWorker,
+            sequence: 1,
+            checkpoint: WindowsTerminalizationCheckpointV1::Executing,
+            last_error: None,
+            secondary_errors: Vec::new(),
+        },
         integrity_sha256: String::new(),
     };
     record.integrity_sha256 = sha256(&serde_json::to_vec(&record).unwrap());
@@ -584,6 +612,8 @@ fn windows_durable_attempt_parser_authenticates_and_bounds_real_records() {
         Some(serde_json::to_string(&WindowsLauncherResponseV1::Terminal(terminal)).unwrap());
     pending.terminal_disposition =
         Some(memcordon_core::WindowsAttemptTerminalDispositionV1::Posttarget);
+    pending.terminalization.sequence += 1;
+    pending.terminalization.checkpoint = WindowsTerminalizationCheckpointV1::OutboxStaged;
     pending.integrity_sha256.clear();
     pending.integrity_sha256 = sha256(&serde_json::to_vec(&pending).unwrap());
     assert!(
@@ -621,6 +651,80 @@ fn windows_durable_attempt_parser_authenticates_and_bounds_real_records() {
             "windows-provider-generation",
         )
         .is_err()
+    );
+}
+
+#[test]
+fn windows_attempt_record_authenticates_only_typed_preauthorization_abort_release() {
+    let digest = sha256(&[]);
+    let process_identity = WindowsProcessIdentityV1 {
+        process_id: 17,
+        creation_time_100ns: 23,
+    };
+    let mut record = WindowsDurableAttemptRecordV1 {
+        schema_version: 2,
+        attempt_id: digest.clone(),
+        provider_generation: "windows-provider-generation".to_owned(),
+        boot_identity: "boot-identity".to_owned(),
+        request_sha256: digest.clone(),
+        caller_process_identity: process_identity.clone(),
+        caller_token_sha256: digest.clone(),
+        job_identity_sha256: digest,
+        guardian_identity: Some(process_identity.clone()),
+        target_identity: Some(process_identity),
+        state: WindowsAttemptStateV1::TargetCreatedSuspended,
+        authorization_unix_millis: None,
+        resume_attempted: true,
+        target_released: false,
+        cleanup_state: WindowsDurableCleanupStateV1::default(),
+        terminal_response_json: None,
+        terminal_disposition: None,
+        terminalization: WindowsTerminalizationStatusV1 {
+            schema_version: 1,
+            owner: WindowsTerminalizationOwnerV1::LauncherWorker,
+            sequence: 1,
+            checkpoint: WindowsTerminalizationCheckpointV1::Executing,
+            last_error: None,
+            secondary_errors: Vec::new(),
+        },
+        integrity_sha256: String::new(),
+    };
+
+    assert_eq!(
+        authenticate_signed_attempt_record(&mut record),
+        Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-resume-without-authorization")
+    );
+
+    record.resume_attempted = false;
+    record.state = WindowsAttemptStateV1::Terminating;
+    record.cleanup_state.termination_requested = true;
+    record.terminal_disposition = Some(WindowsAttemptTerminalDispositionV1::PreauthorizationAbort);
+    assert!(authenticate_signed_attempt_record(&mut record).is_ok());
+
+    record.target_released = true;
+    assert!(authenticate_signed_attempt_record(&mut record).is_ok());
+
+    let mut untyped_release = record.clone();
+    untyped_release.terminal_disposition = None;
+    assert_eq!(
+        authenticate_signed_attempt_record(&mut untyped_release),
+        Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=lifecycle-release-without-intent")
+    );
+
+    let mut before_target_creation = record.clone();
+    before_target_creation.target_identity = None;
+    before_target_creation.target_released = false;
+    assert!(authenticate_signed_attempt_record(&mut before_target_creation).is_ok());
+
+    authenticate_signed_attempt_record(&mut record).unwrap();
+    record.boot_identity = "tampered-boot-identity".to_owned();
+    assert_eq!(
+        parse_and_authenticate_windows_attempt_record(
+            &serde_json::to_vec(&record).unwrap(),
+            &record.attempt_id,
+            &record.provider_generation,
+        ),
+        Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=integrity-digest")
     );
 }
 
@@ -1039,14 +1143,27 @@ fn windows_public_terminal_pending_is_exactly_bound() {
     let digest = sha256(b"request");
     let attempt = sha256(b"attempt");
     let pending = WindowsReplayPendingV1 {
-        schema_version: 1,
+        schema_version: 2,
         attempt_id: attempt.clone(),
         nonce: "nonce".to_owned(),
         request_sha256: digest.clone(),
         relay_phase: WindowsRelayPhaseV1::AwaitAbortRejection,
         durable_state: WindowsAttemptStateV1::Terminating,
+        terminal_disposition: None,
+        authorization_present: false,
+        resume_attempted: false,
+        target_released: false,
+        cleanup_state: WindowsDurableCleanupStateV1::default(),
         cleanup_complete: false,
-        outbox_stage: WindowsReplayOutboxStageV1::NotStaged,
+        outbox_stage: WindowsReplayOutboxStageV1::NotAttempted,
+        terminalization: WindowsTerminalizationStatusV1 {
+            schema_version: 1,
+            owner: WindowsTerminalizationOwnerV1::LauncherWorker,
+            sequence: 1,
+            checkpoint: WindowsTerminalizationCheckpointV1::Executing,
+            last_error: None,
+            secondary_errors: Vec::new(),
+        },
         detail: "durable terminal is not staged".to_owned(),
     };
     assert!(pending.is_consistent_for(
