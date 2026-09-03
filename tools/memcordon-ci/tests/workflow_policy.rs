@@ -207,8 +207,8 @@ fn public_windows_release_smoke_is_structurally_required() {
     for (name, source, replacement, expected) in [
         (
             "ARM runner",
-            "          - id: linux-x64\n            runner: blacksmith-4vcpu-ubuntu-2404\n          - id: windows-x64\n            runner: windows-2025\n          - id: windows-arm64\n            runner: windows-11-arm\n",
-            "          - id: linux-x64\n            runner: blacksmith-4vcpu-ubuntu-2404\n          - id: windows-x64\n            runner: windows-2025\n",
+            "          - id: linux-x64\n            runner: ubuntu-24.04\n          - id: windows-x64\n            runner: windows-2025\n          - id: windows-arm64\n            runner: windows-11-arm\n",
+            "          - id: linux-x64\n            runner: ubuntu-24.04\n          - id: windows-x64\n            runner: windows-2025\n",
             "verify-public job matrix entries differ",
         ),
         (

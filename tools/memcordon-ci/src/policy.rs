@@ -298,14 +298,14 @@ fn check_push_and_dispatch_events(workflow: &Mapping, context: &str) -> Result<(
 
 const NATIVE_MATRIX: [(&str, &str); 6] = [
     ("linux-x64", "ubuntu-24.04"),
-    ("linux-arm64", "blacksmith-4vcpu-ubuntu-2404-arm"),
+    ("linux-arm64", "ubuntu-24.04-arm"),
     ("macos-arm64", "macos-15"),
     ("macos-x64", "macos-15-intel"),
     ("windows-x64", "windows-2025"),
     ("windows-arm64", "windows-11-arm"),
 ];
 const VERIFY_PUBLIC_MATRIX: [(&str, &str); 3] = [
-    ("linux-x64", "blacksmith-4vcpu-ubuntu-2404"),
+    ("linux-x64", "ubuntu-24.04"),
     ("windows-x64", "windows-2025"),
     ("windows-arm64", "windows-11-arm"),
 ];
