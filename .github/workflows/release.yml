@@ -21,7 +21,7 @@ concurrency:
 jobs:
   preflight:
     name: Release / preflight
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Check out pushed tag
@@ -78,7 +78,7 @@ jobs:
           - id: linux-x64
             runner: ubuntu-24.04
           - id: linux-arm64
-            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
           - id: macos-arm64
             runner: macos-15
           - id: macos-x64
@@ -143,7 +143,7 @@ jobs:
   miri:
     name: Release / Miri
     needs: preflight
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Check out pushed tag
@@ -176,7 +176,7 @@ jobs:
   fuzz:
     name: Release / fuzz
     needs: preflight
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Check out pushed tag
@@ -402,7 +402,7 @@ jobs:
       - linux-certification
       - windows-certification
       - macos-acceptance
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Check out pushed tag
@@ -437,7 +437,7 @@ jobs:
   publish:
     name: Release / publish
     needs: assemble
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 75
     permissions:
       actions: read
@@ -512,7 +512,7 @@ jobs:
       matrix:
         include:
           - id: linux-x64
-            runner: blacksmith-4vcpu-ubuntu-2404
+            runner: ubuntu-24.04
           - id: windows-x64
             runner: windows-2025
           - id: windows-arm64
