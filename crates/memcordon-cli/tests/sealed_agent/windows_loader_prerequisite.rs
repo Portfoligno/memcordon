@@ -3,7 +3,8 @@ use windows_sys::Win32::System::SystemServices::{SE_GROUP_ENABLED, SE_GROUP_LOGO
 
 use crate::windows::{
     access_trace::{
-        MAX_FRONTIER_EVENTS_FOR_TEST, MAX_TRACE_EVENTS_FOR_TEST, PassiveAccessLocalizationCellV1,
+        BrokerPassiveAccessMutationForTest, MAX_FRONTIER_EVENTS_FOR_TEST,
+        MAX_TRACE_EVENTS_FOR_TEST, PassiveAccessLocalizationCellV1,
         PassiveAccessLocalizationEventForTest, passive_access_consumer_open_failure_for_test,
         passive_access_localization_drain_barrier_for_test, passive_access_localization_for_test,
         passive_access_runtime_cleanup_for_test, passive_access_session_start_unavailable_for_test,
@@ -33,6 +34,7 @@ use crate::windows::{
         loader_shared_environment_triplet_valid_for_test,
         loader_trace_session_capability_gate_for_test,
         loader_trace_session_capability_trigger_binding_for_test,
+        render_bounded_loader_broker_passive_trace_for_test,
         render_bounded_loader_trace_session_capability_for_test,
         render_loader_full_observer_canary_for_test,
         render_loader_restriction_authenticated_users_canary_for_test,
@@ -42,7 +44,16 @@ use crate::windows::{
         render_loader_shared_environment_observation_for_test,
     },
     session_broker::{
-        TraceSessionCapabilityReceiptMutationForTest,
+        BrokerPassiveTracePairMutationForTest, TraceSessionCapabilityReceiptMutationForTest,
+        broker_passive_trace_diagnostic_for_test,
+        broker_passive_trace_max_frontier_diagnostic_for_test,
+        broker_passive_trace_mutated_diagnostic_for_test,
+        broker_passive_trace_no_receipt_diagnostics_for_test,
+        broker_passive_trace_pair_mutated_diagnostic_for_test,
+        broker_passive_trace_reordered_max_frontier_diagnostic_for_test,
+        broker_passive_trace_subject_receipt_schema_valid_for_test,
+        broker_passive_trace_typed_setup_failure_diagnostic_for_test,
+        broker_passive_trace_typed_subject_failure_diagnostic_for_test,
         trace_session_capability_no_receipt_diagnostics_for_test,
         trace_session_capability_not_run_diagnostic, trace_session_capability_receipt_for_test,
         trace_session_capability_schema_versions_for_test, trace_session_capability_state_for_test,
@@ -82,6 +93,303 @@ fn admitted_full_observer_trace(module_path_hashes: &[&str]) -> String {
     format!(
         "loader_trace=v4 gate=ephemeral-ci trace_sha256={TRACE_HASH_A} drained=true debug_cleanup=exit-process-event-continued events={event_count} accounted_events={event_count} debug_strings=0 debug_string_bytes=0 debug_string_overflow=0 create_event=true exit_event=true candidate_modules_count={module_count} candidate_modules_retained={module_count} candidate_modules_overflow=0 candidate_modules_sha256={candidate_modules_sha256} candidate_modules=[{candidate_modules}] unload_tail_count=0 unload_tail_retained=0 unload_tail_overflow=0 unload_tail_sha256={EMPTY_SHA256} unload_tail=[] loader_snap_tail_count=0 loader_snap_tail_retained=0 loader_snap_tail_overflow=0 loader_snap_tail_sha256={EMPTY_SHA256} loader_snap_tail=[] unknown_event_tail_count=0 unknown_event_tail_retained=0 unknown_event_tail_overflow=0 unknown_event_tail_sha256={EMPTY_SHA256} unknown_event_tail=[] exception_tail_count=0 exception_tail_retained=0 exception_tail_overflow=0 exception_tail_sha256={EMPTY_SHA256} exception_tail=[] command_semantics_sha256={TRACE_HASH_A} command_dynamic_fields=authenticated-private-pipe,authenticated-nonce"
     )
+}
+
+#[test]
+fn broker_passive_trace_record_is_fail_closed_redacted_and_precedes_the_real_bound() {
+    assert_eq!(
+        memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES,
+        8 * 1024
+    );
+    for finished in [false, true] {
+        assert!(broker_passive_trace_subject_receipt_schema_valid_for_test(
+            1, finished
+        ));
+        assert!(!broker_passive_trace_subject_receipt_schema_valid_for_test(
+            2, finished
+        ));
+    }
+    let capability = trace_session_capability_not_run_diagnostic();
+    let cases = [
+        (
+            "candidate-file-denial-differential",
+            true,
+            true,
+            true,
+            false,
+            true,
+        ),
+        ("file-domain-common", true, true, true, false, true),
+        ("coverage-insufficient", true, true, true, false, true),
+        (
+            "candidate-file-denial-differential",
+            false,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            "candidate-file-denial-differential",
+            true,
+            false,
+            true,
+            false,
+            false,
+        ),
+        (
+            "candidate-file-denial-differential",
+            true,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            "candidate-file-denial-differential",
+            true,
+            true,
+            true,
+            true,
+            false,
+        ),
+    ];
+    let trailing = format!(
+        "loader_observer_perturbation=v1 {} lower_priority_observer_end=true",
+        "bounded-observer-field=value ".repeat(memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES)
+    );
+    for (classification, authority, destroyed, retired, invalid, admitted) in cases {
+        let broker = broker_passive_trace_diagnostic_for_test(
+            classification,
+            authority,
+            destroyed,
+            retired,
+            invalid,
+        );
+        let bounded =
+            render_bounded_loader_broker_passive_trace_for_test(capability, &broker, &trailing);
+        assert_eq!(
+            bounded.len(),
+            memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES
+        );
+        assert_eq!(
+            bounded
+                .matches("broker_passive_access_localization=v1")
+                .count(),
+            1
+        );
+        assert!(bounded.contains("request_binding_sha256="));
+        assert!(bounded.contains("receipt_sha256="));
+        assert!(bounded.contains("transaction_sha256="));
+        assert!(bounded.contains("broker_source_sha256="));
+        assert!(bounded.contains("capability_binding_sha256="));
+        assert!(bounded.contains("environment_binding_sha256="));
+        assert!(bounded.contains("provider_sha256="));
+        assert!(bounded.contains("limits_sha256="));
+        assert!(bounded.contains("keyword_mask=0xc0"));
+        assert!(bounded.contains("create_event_id=12"));
+        assert!(bounded.contains("operation_end_event_id=24"));
+        assert!(bounded.contains("session_start_status=0"));
+        assert!(bounded.contains("provider_enable_status=0"));
+        assert!(bounded.contains("consumer_open_status=0"));
+        assert!(bounded.contains("consumer_ready_status=0"));
+        assert!(bounded.contains("lifecycle_sha256="));
+        assert!(bounded.contains("canonical_drain_receipt_sha256="));
+        assert!(bounded.contains("target_user_drain_receipt_sha256="));
+        assert!(bounded.contains("canonical_outcome=passed"));
+        assert!(bounded.contains("canonical_status=none"));
+        assert!(bounded.contains("target_user_outcome=failed"));
+        assert!(bounded.contains("target_user_status=0xc0000022"));
+        assert!(bounded.contains("target_user_phase=post-resume-pre-loader-ready"));
+        assert!(bounded.contains("profile_before_borrowed=true"));
+        assert!(bounded.contains("profile_after_equal=true"));
+        assert!(bounded.contains("after_target_environment_sha256="));
+        assert!(bounded.contains("reproduction_valid=true"));
+        assert!(bounded.contains("invariants_valid=true"));
+        assert!(bounded.contains("cleanup_provider_disable_status=0"));
+        assert!(bounded.contains("cleanup_stop_status=0"));
+        assert!(bounded.contains("cleanup_close_status=0"));
+        assert!(bounded.contains("cleanup_process_trace_status=0"));
+        assert!(bounded.contains("cleanup_absence_query_status=4201"));
+        assert!(bounded.contains("session_absence_proven=true"));
+        assert!(bounded.contains("elapsed_ms=1"));
+        assert!(bounded.contains("deadline_exceeded=false"));
+        assert!(bounded.contains("requested_access_available=false"));
+        assert!(bounded.contains("exact_resource_identified=false"));
+        assert!(bounded.contains("acl_fix_identified=false"));
+        assert!(bounded.contains("primary_failure=original-a"));
+        assert!(bounded.contains("release_sent=false"));
+        assert!(bounded.contains("workload_executed=false"));
+        assert!(bounded.contains("qualification_promoted=false"));
+        assert!(!bounded.contains("redacted-test-path"));
+        if admitted {
+            assert!(bounded.contains(&format!(" state={classification} ")));
+        } else {
+            assert!(bounded.contains(" state=invalid "));
+            assert!(!bounded.contains("frontier=[1:"));
+            assert!(!bounded.contains("classification=candidate-file-denial-differential"));
+            assert!(!bounded.contains("classification=file-domain-common"));
+        }
+        assert!(!bounded.contains("lower_priority_observer_end=true"));
+    }
+    for broker in broker_passive_trace_no_receipt_diagnostics_for_test() {
+        let bounded =
+            render_bounded_loader_broker_passive_trace_for_test(capability, &broker, &trailing);
+        assert_eq!(
+            bounded.len(),
+            memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES
+        );
+        assert_eq!(
+            bounded
+                .matches("broker_passive_access_localization=v1")
+                .count(),
+            1
+        );
+        assert!(bounded.contains("request_binding_sha256=unavailable"));
+        assert!(bounded.contains("receipt_sha256=unavailable"));
+        assert!(bounded.contains("transaction_sha256=unavailable"));
+        assert!(bounded.contains("broker_source_sha256=unavailable"));
+        assert!(bounded.contains("lifecycle_sha256=unavailable"));
+        assert!(bounded.contains("after_target_environment_sha256=unavailable"));
+        assert!(bounded.contains("authority_equal=unavailable"));
+        assert!(bounded.contains("reproduction_valid=unavailable"));
+        assert!(bounded.contains("invariants_valid=unavailable"));
+        assert!(bounded.contains("primary_failure=original-a"));
+        assert!(bounded.contains("release_sent=false"));
+        assert!(bounded.contains("workload_executed=false"));
+        assert!(bounded.contains("qualification_promoted=false"));
+        assert!(!bounded.contains("test-passive-trace-protocol-detail"));
+        assert!(!bounded.contains("lower_priority_observer_end=true"));
+    }
+    let max_frontier = broker_passive_trace_max_frontier_diagnostic_for_test();
+    let bounded =
+        render_bounded_loader_broker_passive_trace_for_test(capability, &max_frontier, &trailing);
+    assert_eq!(
+        bounded.len(),
+        memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES
+    );
+    assert_eq!(
+        bounded
+            .matches("broker_passive_access_localization=v1")
+            .count(),
+        1
+    );
+    assert!(bounded.contains("frontier_total=64"));
+    assert!(bounded.contains("frontier_retained=2"));
+    assert!(bounded.contains("frontier_render_overflow=true"));
+    assert!(bounded.contains("frontier_sha256="));
+    assert!(bounded.contains("frontier=[63:canonical-same-access:"));
+    assert!(bounded.contains(",64:target-user-singleton:"));
+    assert!(!bounded.contains("frontier=[1:canonical-same-access:"));
+    assert!(bounded.contains("qualification_promoted=false"));
+    assert!(!bounded.contains("lower_priority_observer_end=true"));
+    let reordered = broker_passive_trace_reordered_max_frontier_diagnostic_for_test();
+    let bounded =
+        render_bounded_loader_broker_passive_trace_for_test(capability, &reordered, &trailing);
+    assert_eq!(
+        bounded.len(),
+        memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES
+    );
+    assert!(bounded.contains("frontier=[63:canonical-same-access:"));
+    assert!(bounded.contains(",64:target-user-singleton:"));
+    assert!(!bounded.contains("frontier=[1:canonical-same-access:"));
+
+    for mutation in [
+        BrokerPassiveAccessMutationForTest::MalformedObjectDigest,
+        BrokerPassiveAccessMutationForTest::UnknownCell,
+        BrokerPassiveAccessMutationForTest::UnsupportedVersion,
+        BrokerPassiveAccessMutationForTest::CountMismatch,
+        BrokerPassiveAccessMutationForTest::FalseDifferential,
+        BrokerPassiveAccessMutationForTest::MissingSessionAbsence,
+    ] {
+        let broker = broker_passive_trace_mutated_diagnostic_for_test(mutation);
+        assert!(broker.contains(" state=invalid "), "mutation {mutation:?}");
+        assert!(broker.contains("frontier=[]"), "mutation {mutation:?}");
+        assert!(!broker.contains("classification=candidate-file-denial-differential"));
+        assert!(!broker.contains("classification=file-domain-common"));
+        assert!(!broker.contains("plaintext-path"), "mutation {mutation:?}");
+    }
+    for mutation in [
+        BrokerPassiveTracePairMutationForTest::CanonicalOutcome,
+        BrokerPassiveTracePairMutationForTest::TargetStatus,
+        BrokerPassiveTracePairMutationForTest::TargetPhase,
+        BrokerPassiveTracePairMutationForTest::EnvironmentStability,
+        BrokerPassiveTracePairMutationForTest::ProfilePrerequisite,
+        BrokerPassiveTracePairMutationForTest::ProfilePostcondition,
+        BrokerPassiveTracePairMutationForTest::JobContainment,
+        BrokerPassiveTracePairMutationForTest::MalformedDetailDigest,
+        BrokerPassiveTracePairMutationForTest::MalformedProfileDigest,
+    ] {
+        let broker = broker_passive_trace_pair_mutated_diagnostic_for_test(mutation);
+        assert!(broker.contains(" state=invalid "), "mutation {mutation:?}");
+        assert!(broker.contains("frontier=[]"), "mutation {mutation:?}");
+        assert!(!broker.contains("classification=candidate-file-denial-differential"));
+        assert!(!broker.contains("classification=file-domain-common"));
+        if matches!(
+            mutation,
+            BrokerPassiveTracePairMutationForTest::MalformedDetailDigest
+                | BrokerPassiveTracePairMutationForTest::MalformedProfileDigest
+        ) {
+            assert!(broker.contains("canonical_outcome=invalid"));
+            assert!(broker.contains("cleanup_stop_status=0"));
+            assert!(broker.contains("cleanup_absence_query_status=4201"));
+            assert!(broker.contains("session_absence_proven=true"));
+            assert!(broker.contains("retirement=retired"));
+        }
+    }
+
+    let typed_setup_failure = broker_passive_trace_typed_setup_failure_diagnostic_for_test();
+    let bounded = render_bounded_loader_broker_passive_trace_for_test(
+        capability,
+        &typed_setup_failure,
+        &trailing,
+    );
+    assert_eq!(
+        bounded.len(),
+        memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES
+    );
+    assert!(bounded.contains("state=invalid"));
+    assert!(bounded.contains("request_binding_sha256="));
+    assert!(bounded.contains("receipt_sha256="));
+    assert!(bounded.contains("transaction_sha256="));
+    assert!(bounded.contains("broker_pid=43"));
+    assert!(bounded.contains("broker_creation_time_100ns=44"));
+    assert!(bounded.contains("failure_stage=observer-start"));
+    assert!(bounded.contains("setup_stage=session-start"));
+    assert!(bounded.contains("setup_win32_status=5"));
+    assert!(bounded.contains("session_created=false"));
+    assert!(bounded.contains("cleanup_count=0"));
+    assert!(bounded.contains("cleanup_absence_query_status=not-attempted"));
+    assert!(bounded.contains("session_absence_proven=false"));
+    assert!(bounded.contains("qualification_promoted=false"));
+    assert!(!bounded.contains("broker-passive-test-observer-start"));
+    assert!(!bounded.contains("lower_priority_observer_end=true"));
+
+    let typed_subject_failure = broker_passive_trace_typed_subject_failure_diagnostic_for_test();
+    let bounded = render_bounded_loader_broker_passive_trace_for_test(
+        capability,
+        &typed_subject_failure,
+        &trailing,
+    );
+    assert_eq!(
+        bounded.len(),
+        memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES
+    );
+    assert!(bounded.contains("state=invalid"));
+    assert!(bounded.contains("failure_stage=transaction"));
+    assert!(bounded.contains("setup_stage=none"));
+    assert!(bounded.contains("session_created=true"));
+    assert!(bounded.contains("cleanup_provider_disable_status=0"));
+    assert!(bounded.contains("cleanup_stop_status=0"));
+    assert!(bounded.contains("cleanup_process_trace_status=0"));
+    assert!(bounded.contains("cleanup_close_status=0"));
+    assert!(bounded.contains("cleanup_absence_query_status=4201"));
+    assert!(bounded.contains("session_absence_proven=true"));
+    assert!(bounded.contains("classification=invalid"));
+    assert!(!bounded.contains("classification=candidate-file-denial-differential"));
+    assert!(!bounded.contains("classification=file-domain-common"));
+    assert!(!bounded.contains("broker-passive-test-subject-drain"));
+    assert!(!bounded.contains("lower_priority_observer_end=true"));
 }
 
 fn candidate_modules_from_trace(trace: &str) -> &str {
@@ -1312,7 +1620,7 @@ fn trace_session_capability_gate_accepts_only_clean_zero_prefix_nonlocalizing_ev
 
 #[test]
 fn trace_session_capability_state_table_is_fail_closed() {
-    assert_eq!(trace_session_capability_schema_versions_for_test(), (6, 1));
+    assert_eq!(trace_session_capability_schema_versions_for_test(), (7, 1));
     assert_eq!(
         trace_session_capability_state_for_test(true, false, 0, true, true, Some(0), 1, true),
         "broker-session-available"

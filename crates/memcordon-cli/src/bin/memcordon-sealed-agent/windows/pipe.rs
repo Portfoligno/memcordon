@@ -93,6 +93,22 @@ pub enum TargetDesktopBootstrapPipeOperation {
     BrokerTraceSessionCapabilityRequestWrite,
     BrokerTraceSessionCapabilityReceiptRead,
     BrokerTraceSessionCapabilityReceiptWrite,
+    BrokerPassiveTraceArmRead,
+    BrokerPassiveTraceArmWrite,
+    BrokerPassiveTraceReadyRead,
+    BrokerPassiveTraceReadyWrite,
+    BrokerPassiveTraceSubjectArmRead,
+    BrokerPassiveTraceSubjectArmWrite,
+    BrokerPassiveTraceSubjectReadyRead,
+    BrokerPassiveTraceSubjectReadyWrite,
+    BrokerPassiveTraceSubjectFinishRead,
+    BrokerPassiveTraceSubjectFinishWrite,
+    BrokerPassiveTraceSubjectFinishedRead,
+    BrokerPassiveTraceSubjectFinishedWrite,
+    BrokerPassiveTraceFinishRead,
+    BrokerPassiveTraceFinishWrite,
+    BrokerPassiveTraceFinalRead,
+    BrokerPassiveTraceFinalWrite,
 }
 
 impl TargetDesktopBootstrapPipeOperation {
@@ -164,6 +180,28 @@ impl TargetDesktopBootstrapPipeOperation {
             Self::BrokerTraceSessionCapabilityReceiptWrite => {
                 "broker-trace-session-capability-receipt-write"
             }
+            Self::BrokerPassiveTraceArmRead => "broker-passive-trace-arm-read",
+            Self::BrokerPassiveTraceArmWrite => "broker-passive-trace-arm-write",
+            Self::BrokerPassiveTraceReadyRead => "broker-passive-trace-ready-read",
+            Self::BrokerPassiveTraceReadyWrite => "broker-passive-trace-ready-write",
+            Self::BrokerPassiveTraceSubjectArmRead => "broker-passive-trace-subject-arm-read",
+            Self::BrokerPassiveTraceSubjectArmWrite => "broker-passive-trace-subject-arm-write",
+            Self::BrokerPassiveTraceSubjectReadyRead => "broker-passive-trace-subject-ready-read",
+            Self::BrokerPassiveTraceSubjectReadyWrite => "broker-passive-trace-subject-ready-write",
+            Self::BrokerPassiveTraceSubjectFinishRead => "broker-passive-trace-subject-finish-read",
+            Self::BrokerPassiveTraceSubjectFinishWrite => {
+                "broker-passive-trace-subject-finish-write"
+            }
+            Self::BrokerPassiveTraceSubjectFinishedRead => {
+                "broker-passive-trace-subject-finished-read"
+            }
+            Self::BrokerPassiveTraceSubjectFinishedWrite => {
+                "broker-passive-trace-subject-finished-write"
+            }
+            Self::BrokerPassiveTraceFinishRead => "broker-passive-trace-finish-read",
+            Self::BrokerPassiveTraceFinishWrite => "broker-passive-trace-finish-write",
+            Self::BrokerPassiveTraceFinalRead => "broker-passive-trace-final-read",
+            Self::BrokerPassiveTraceFinalWrite => "broker-passive-trace-final-write",
         }
     }
 }

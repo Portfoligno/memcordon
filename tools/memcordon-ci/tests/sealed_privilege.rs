@@ -2360,7 +2360,7 @@ fn validate_windows_session_broker_contract(
     }
     require_source(
         &sources.session_broker,
-        "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;",
+        "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 7;",
         "versioned exact-call creation authority protocol",
     )?;
     require_source(
@@ -9647,8 +9647,8 @@ fn windows_session_broker_authority_mutations_are_rejected() {
         ),
         (
             WindowsProductionSource::SessionBroker,
+            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 7;",
             "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;",
-            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 5;",
             "broker-thread-protocol-version-not-bumped",
         ),
         (
@@ -12742,6 +12742,17 @@ fn validate_windows_shared_userenv_restriction_presence_contract(
             ),
         ],
     )?;
+    let capability_prefix = semantic_function_region(
+        process,
+        "fn loader_restriction_presence_capability_prefix(",
+        "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+    )
+    .ok_or_else(|| "restriction-presence capability prefix has no semantic boundary".to_owned())?;
+    require_source(
+        &capability_prefix,
+        "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state={presence_state}",
+        "shared Userenv diagnostic schema",
+    )?;
     let canary = semantic_function_region(
         process,
         "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
@@ -14049,8 +14060,12 @@ fn validate_windows_passive_access_localization_contract(
         &setup_evidence,
         &[
             (
-                "let cleanup_valid = error.cleanup_stop_status.successful_or_not_attempted()",
+                "let cleanup_valid = error\n            .cleanup_provider_disable_status\n            .successful_or_not_attempted()",
                 "typed setup cleanup admission",
+            ),
+            (
+                "&& error.cleanup_stop_status.successful_or_not_attempted()",
+                "setup ControlTrace cleanup admission",
             ),
             (
                 "&& error.cleanup_close_status.successful_or_not_attempted()",
@@ -14151,11 +14166,11 @@ fn validate_windows_passive_access_localization_contract(
     }
     for (needle, purpose) in [
         (
-            "PassiveAccessLocalizationSetupStageV1::ProviderEnable,\n                Some(i64::from(enable_status)),\n                true,\n                true,\n                false,\n                false,\n                PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),",
+            "PassiveAccessLocalizationSetupStageV1::ProviderEnable,\n                Some(i64::from(enable_status)),\n                true,\n                true,\n                false,\n                false,\n                session_name_sha256.clone(),\n                PassiveAccessLocalizationCleanupStatusV1::NotAttempted,\n                PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),",
             "provider-enable primary and STOP status preservation",
         ),
         (
-            "PassiveAccessLocalizationSetupStageV1::ConsumerOpen,\n                operation_status,\n                true,\n                true,\n                false,\n                false,\n                PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),",
+            "PassiveAccessLocalizationSetupStageV1::ConsumerOpen,\n                operation_status,\n                true,\n                true,\n                false,\n                false,\n                session_name_sha256.clone(),\n                PassiveAccessLocalizationCleanupStatusV1::Native(disable),\n                PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),",
             "consumer-open primary and STOP status preservation",
         ),
     ] {
@@ -14484,14 +14499,14 @@ fn validate_windows_passive_access_localization_contract(
             ),
         ],
     )?;
-    let subject_drop = semantic_function_region(
+    let subject_finish = semantic_function_region(
         &sources.access_trace,
-        "impl Drop for PassiveAccessLocalizationSubjectGuardV1 {",
+        "impl PassiveAccessLocalizationSubjectGuardV1 {",
         "unsafe extern \"system\" fn passive_file_buffer_callback(logfile: *mut EVENT_TRACE_LOGFILEW) -> u32 {",
     )
     .ok_or_else(|| "passive subject drain has no semantic boundary".to_owned())?;
     require_source_order(
-        &subject_drop,
+        &subject_finish,
         &[
             (
                 "let drain_epoch = self.drain.request();",
@@ -14503,7 +14518,7 @@ fn validate_windows_passive_access_localization_contract(
                 "cumulative flush watermark",
             ),
             (
-                "self.drain.wait(epoch, DRAIN_TIMEOUT)",
+                ".wait(epoch, DRAIN_TIMEOUT)",
                 "bounded consumer acknowledgement",
             ),
             ("state.flush_failed = true;", "drain failure invalidation"),
@@ -14512,7 +14527,7 @@ fn validate_windows_passive_access_localization_contract(
                 "event-independent subject timeout",
             ),
             (
-                "if !state.pending.is_empty()",
+                "pending_empty = state.pending.is_empty();",
                 "post-drain join completeness",
             ),
             ("state.active = None;", "active clear after drain"),
@@ -15875,8 +15890,8 @@ fn validate_windows_trace_session_capability_contract(
 ) -> Result<(), String> {
     for (needle, purpose) in [
         (
-            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;",
-            "outer broker protocol schema v6",
+            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 7;",
+            "outer broker protocol schema v7",
         ),
         (
             "const TRACE_SESSION_CAPABILITY_SCHEMA_VERSION: u32 = 1;",
@@ -16060,6 +16075,11 @@ fn validate_windows_trace_session_capability_contract(
         "#[allow(clippy::too_many_arguments)]",
     )
     .ok_or_else(|| "trace-session capability priority prefix has no boundary".to_owned())?;
+    require_source(
+        &capability_prefix,
+        "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state={presence_state}",
+        "shared Userenv diagnostic schema",
+    )?;
     require_source_order(
         &capability_prefix,
         &[
@@ -16432,10 +16452,16 @@ fn validate_windows_trace_session_capability_contract(
     ] {
         require_source(&client, needle, purpose)?;
     }
-    let diagnostic = semantic_function_region(
+    let diagnostic_contract = semantic_function_region(
         &sources.session_broker,
         "impl TraceSessionCapabilityEvidenceV1 {",
-        "pub(crate) struct LoaderSnapsArmedReceiptV2 {",
+        "pub(crate) enum BrokerPassiveTraceCellV1 {",
+    )
+    .ok_or_else(|| "trace-session capability renderer contract has no boundary".to_owned())?;
+    let diagnostic = semantic_function_region(
+        &sources.session_broker,
+        "    pub(crate) fn diagnostic(&self) -> String {",
+        "    pub(crate) fn broker_passive_trace_binding_sha256(&self) -> Option<String> {",
     )
     .ok_or_else(|| "trace-session capability renderer has no boundary".to_owned())?;
     for field in [
@@ -16470,9 +16496,9 @@ fn validate_windows_trace_session_capability_contract(
         "token_values_redacted=true",
         "object_values_redacted=true",
     ] {
-        require_source(&diagnostic, field, field)?;
+        require_source(&diagnostic_contract, field, field)?;
     }
-    if diagnostic
+    if diagnostic_contract
         .matches("transaction_nonce_redacted=true")
         .count()
         != 2
@@ -16611,6 +16637,7 @@ fn validate_windows_loader_control_contract(
         &sources.token,
     )?;
     validate_windows_passive_access_localization_contract(sources)?;
+    validate_windows_broker_passive_trace_contract(sources)?;
     for (source, boundary) in [
         (&sources.core, "core protocol"),
         (&sources.control_service, "control transfer"),
@@ -20904,8 +20931,8 @@ fn windows_trace_session_capability_region_mutations_are_rejected() {
             WindowsLoaderControlContractSource::SessionBroker,
             "use std::io::{self, Write};",
             "const LOADER_SNAPS_SCHEMA_VERSION: u32 = 2;",
+            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 7;",
             "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;",
-            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 5;",
             "trace-capability-outer-schema-not-bumped",
         ),
         (
@@ -21497,6 +21524,912 @@ fn windows_trace_session_capability_region_mutations_are_rejected() {
         assert!(
             validate_windows_trace_session_capability_contract(&mutated).is_err(),
             "trace-session capability mutant {mutant} survived"
+        );
+    }
+}
+
+fn validate_windows_broker_passive_trace_contract(
+    sources: &WindowsLoaderControlContractSources,
+) -> Result<(), String> {
+    for (source, needle, purpose) in [
+        (
+            &sources.session_broker,
+            "const BROKER_PASSIVE_TRACE_SCHEMA_VERSION: u32 = 1;",
+            "nested broker passive-trace schema",
+        ),
+        (
+            &sources.session_broker,
+            "|| request.keyword_mask != 0xc0",
+            "exact Create and OperationEnd keyword admission",
+        ),
+        (
+            &sources.session_broker,
+            "0 => BrokerPassiveTraceCellV1::CanonicalSameAccess,",
+            "C-first broker subject order",
+        ),
+        (
+            &sources.session_broker,
+            "BrokerPassiveTraceArm(BrokerPassiveTraceArmRequestV1)",
+            "sealed arm frame",
+        ),
+        (
+            &sources.session_broker,
+            "BrokerPassiveTraceReady(BrokerPassiveTraceReadyReceiptV1)",
+            "sealed ready frame",
+        ),
+        (
+            &sources.session_broker,
+            "BrokerPassiveTraceSubjectArm(BrokerPassiveTraceSubjectArmV1)",
+            "sealed subject arm frame",
+        ),
+        (
+            &sources.session_broker,
+            "BrokerPassiveTraceSubjectFinish(BrokerPassiveTraceSubjectFinishV1)",
+            "sealed subject finish frame",
+        ),
+        (
+            &sources.session_broker,
+            "BrokerPassiveTraceFinal(BrokerPassiveTraceFinalReceiptV1)",
+            "sealed final frame",
+        ),
+        (
+            &sources.session_broker,
+            "PROCESS_QUERY_LIMITED_INFORMATION,\n                0,\n                0,",
+            "least-rights broker subject handle",
+        ),
+        (
+            &sources.session_broker,
+            "subject.cell_binding_sha256\n                            != broker_passive_trace_cell_binding_sha256(",
+            "broker-recomputed subject binding",
+        ),
+        (
+            &sources.session_broker,
+            "provider_sha256: broker_passive_trace_provider_sha256(),",
+            "typed provider request binding",
+        ),
+        (
+            &sources.session_broker,
+            "limits_sha256: super::access_trace::broker_passive_trace_limits_sha256(),",
+            "typed observer-limits request binding",
+        ),
+        (
+            &sources.session_broker,
+            "BrokerPassiveTraceFailed(BrokerPassiveTraceFailureV1)",
+            "sealed typed failure frame",
+        ),
+        (
+            &sources.session_broker,
+            "fn validate_broker_passive_trace_failure(",
+            "client validation of typed broker failure receipts",
+        ),
+        (
+            &sources.session_broker,
+            "failure.deadline_exceeded\n            != (failure.elapsed_ms > BROKER_PASSIVE_TRACE_DEADLINE.as_millis() as u64)",
+            "typed failure deadline relation",
+        ),
+        (
+            &sources.session_broker,
+            "authority_before_sha256 == authority_after_sha256",
+            "post-transaction authority equality",
+        ),
+        (
+            &sources.session_broker,
+            "receipt.authority_after_sha256 != receipt.authority_before_sha256",
+            "client authority reattestation",
+        ),
+        (
+            &sources.session_broker,
+            "self.completed_subjects != 2",
+            "exact two-subject client lifecycle",
+        ),
+        (
+            &sources.session_broker,
+            "completed != 2",
+            "exact two-subject broker lifecycle",
+        ),
+        (
+            &sources.session_broker,
+            "if receipt_sha256.len() != 5",
+            "ready plus four subject-receipt lifecycle cardinality",
+        ),
+        (
+            &sources.session_broker,
+            "let mut lifecycle_receipt_sha256 = vec![ready.ready_receipt_sha256];",
+            "broker lifecycle starts from sealed ready receipt",
+        ),
+        (
+            &sources.session_broker,
+            "let lifecycle_receipt_sha256 = vec![ready.ready_receipt_sha256.clone()];",
+            "client lifecycle starts from the same sealed ready receipt",
+        ),
+        (
+            &sources.session_broker,
+            "receipt.lifecycle_sha256 != expected_lifecycle_sha256",
+            "client final lifecycle admission",
+        ),
+        (
+            &sources.session_broker,
+            "receipt.after_target_environment_sha256\n                    != expected_after_target_environment_sha256",
+            "client post-F environment admission",
+        ),
+        (
+            &sources.session_broker,
+            "receipt.reproduction_valid != reproduction_valid",
+            "client exact traced-pair reproduction admission",
+        ),
+        (
+            &sources.session_broker,
+            "receipt.invariants_valid != invariants_valid",
+            "client exact traced-pair invariant admission",
+        ),
+        (
+            &sources.session_broker,
+            "receipt.pair_evidence != pair_evidence",
+            "client exact traced-pair evidence admission",
+        ),
+        (
+            &sources.session_broker,
+            "self.target_user_status == Some(STATUS_ACCESS_DENIED)",
+            "typed target-user denial admission",
+        ),
+        (
+            &sources.session_broker,
+            "subject-finished-drained",
+            "per-subject drain receipt",
+        ),
+        (
+            &sources.session_broker,
+            "let drain = guard.finish();",
+            "explicit one-shot subject drain",
+        ),
+        (
+            &sources.session_broker,
+            "self.lease.failure_receipt = Some(failure);",
+            "typed subject failure receipt retention",
+        ),
+        (
+            &sources.session_broker,
+            "self.failure_receipt = Some(failure);",
+            "typed subject-arm failure receipt retention",
+        ),
+        (
+            &sources.session_broker,
+            "let mut failure_receipt = self.failure_receipt.take();",
+            "typed subject failure receipt propagation",
+        ),
+        (
+            &sources.session_broker,
+            "if !drain.successful()",
+            "failed drain blocks success receipt",
+        ),
+        (
+            &sources.session_broker,
+            "authenticated.retire()",
+            "separate authenticated broker retirement",
+        ),
+        (
+            &sources.access_trace,
+            "const KERNEL_FILE_PROVIDER: GUID =",
+            "typed Kernel-File provider",
+        ),
+        (
+            &sources.access_trace,
+            "const FILE_CREATE_EVENT_ID: u16 = 12;",
+            "typed Create event",
+        ),
+        (
+            &sources.access_trace,
+            "const FILE_OPERATION_END_EVENT_ID: u16 = 24;",
+            "typed OperationEnd event",
+        ),
+        (
+            &sources.access_trace,
+            "KERNEL_FILE_KEYWORD_CREATE | KERNEL_FILE_KEYWORD_OPERATION_END",
+            "exact file keywords",
+        ),
+        (
+            &sources.access_trace,
+            "state.pending.remove(&irp)",
+            "IRP-only completion join",
+        ),
+        (
+            &sources.access_trace,
+            "requested_access_available=false",
+            "no requested-access overclaim",
+        ),
+        (
+            &sources.access_trace,
+            "self.diagnostic_with_frontier(false)",
+            "invalid outer evidence suppresses candidate frontier",
+        ),
+        (
+            &sources.access_trace,
+            "const MAX_BROKER_DIAGNOSTIC_FRONTIER: usize = 2;",
+            "bounded prioritized frontier publication",
+        ),
+        (
+            &sources.access_trace,
+            "frontier_render_overflow",
+            "explicit frontier publication overflow",
+        ),
+        (
+            &sources.access_trace,
+            ".flat_map(|(canonical, target)| [canonical, target])",
+            "classification-witness frontier publication",
+        ),
+        (
+            &sources.access_trace,
+            "let classification = if disclose_frontier {",
+            "invalid outer evidence classification suppression",
+        ),
+        (
+            &sources.access_trace,
+            "cleanup_absence_query_status",
+            "typed passive-session absence query",
+        ),
+        (
+            &sources.access_trace,
+            "session_absence_proven",
+            "passive-session absence proof",
+        ),
+        (
+            &sources.process,
+            "fn run_broker_passive_trace_pair(",
+            "separate traced-pair owner",
+        ),
+        (
+            &sources.process,
+            "OwnedUserEnvironmentBlock::create(baseline_token)",
+            "distinct traced Userenv owner",
+        ),
+        (
+            &sources.process,
+            "broker-trace-after-c",
+            "post-C environment gate",
+        ),
+        (
+            &sources.process,
+            "before_profile.state != LoaderProfileHiveStateV1::AlreadyLoadedBorrowed",
+            "borrowed-profile prerequisite before traced setup",
+        ),
+        (
+            &sources.process,
+            "&& lease.ready_for_target_user()",
+            "successful C drain before F launch",
+        ),
+        (
+            &sources.process,
+            "broker-trace-after-f",
+            "post-F environment gate",
+        ),
+        (
+            &sources.process,
+            "BrokerPassiveTraceCellV1::CanonicalSameAccess",
+            "traced C cell",
+        ),
+        (
+            &sources.process,
+            "BrokerPassiveTraceCellV1::TargetUser",
+            "traced F cell",
+        ),
+        (
+            &sources.process,
+            "environment.destroy_after_create().is_ok()",
+            "sole explicit traced owner destruction",
+        ),
+        (
+            &sources.process,
+            "BrokerPassiveTracePairEvidenceV1::invalid(error.as_bytes())",
+            "typed invalid-pair finalization",
+        ),
+        (
+            &sources.process,
+            "{trace_session_capability_diagnostic} {broker_passive_trace_diagnostic}",
+            "trace receipt before variable evidence",
+        ),
+        (
+            &sources.process,
+            "render_bounded_loader_broker_passive_trace_for_test",
+            "actual rejection-bound adapter",
+        ),
+    ] {
+        require_source(source, needle, purpose)?;
+    }
+    let server = semantic_function_region(
+        &sources.session_broker,
+        "fn run_broker_passive_trace_authority_transaction(",
+        "fn run_creation_authority_transaction(",
+    )
+    .ok_or_else(|| "broker passive-trace server transaction has no boundary".to_owned())?;
+    require_source(
+        &server,
+        "0 => BrokerPassiveTraceCellV1::CanonicalSameAccess,",
+        "broker-enforced C-first subject order",
+    )?;
+    require_source_order(
+        &server,
+        &[
+            (
+                "start_ready_before_child_creation",
+                "consumer ready before subjects",
+            ),
+            (
+                "BrokerPassiveTraceReady(ready.clone())",
+                "sealed ready publication",
+            ),
+            ("BrokerPassiveTraceSubjectArm(subject)", "subject arm"),
+            (".bind_suspended_child(", "PID and creation-time binding"),
+            (
+                "BrokerPassiveTraceSubjectReady(receipt.clone())",
+                "subject-ready publication",
+            ),
+            ("BrokerPassiveTraceSubjectFinish(finish)", "subject finish"),
+            ("let drain = guard.finish();", "subject drain"),
+            ("if !drain.successful()", "drain success admission"),
+            (
+                "BrokerPassiveTraceSubjectFinished(receipt.clone())",
+                "drained receipt publication",
+            ),
+            (
+                "finish(reproduction_valid)",
+                "final disable-stop-close cleanup",
+            ),
+            (
+                "let authority_after_sha256 = attest_trace_session_capability_authority(hello)",
+                "post-cleanup authority reattestation",
+            ),
+            (
+                "BrokerPassiveTraceFinal(final_receipt)",
+                "sealed final publication",
+            ),
+        ],
+    )?;
+    for forbidden in [
+        "AdjustTokenPrivileges",
+        "SetThreadToken",
+        "SetNamedSecurityInfo",
+        "SetServiceObjectSecurity",
+        "LoaderSnapsRequest",
+        "false &&",
+    ] {
+        if server.contains(forbidden) {
+            return Err(format!(
+                "broker passive trace widened authority or scope: {forbidden}"
+            ));
+        }
+    }
+    let client = semantic_function_region(
+        &sources.session_broker,
+        "impl BrokerPassiveTraceLease {",
+        "impl Drop for BrokerPassiveTraceLease {",
+    )
+    .ok_or_else(|| "broker passive-trace client lifecycle has no boundary".to_owned())?;
+    if client.contains("false &&") {
+        return Err("broker passive-trace client admission was weakened".to_owned());
+    }
+    let broker_evidence_admission = semantic_function_region(
+        &sources.access_trace,
+        "impl BrokerPassiveAccessEvidenceV1 {",
+        "    pub(crate) fn diagnostic(&self) -> String {",
+    )
+    .ok_or_else(|| "broker passive-trace evidence admission has no boundary".to_owned())?;
+    require_source(
+        &broker_evidence_admission,
+        "&& self.session_absence_proven",
+        "passive-session absence admission",
+    )?;
+    if broker_evidence_admission.contains("&& true") {
+        return Err("broker passive-trace evidence admission was weakened".to_owned());
+    }
+    let pair_evidence_admission = semantic_function_region(
+        &sources.session_broker,
+        "impl BrokerPassiveTracePairEvidenceV1 {",
+        "struct BrokerPassiveTraceFinishRequestV1 {",
+    )
+    .ok_or_else(|| "broker passive traced-pair evidence has no boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "&& self.profile_before_borrowed",
+            "borrowed-profile pair invariant",
+        ),
+        (
+            "&& self.target_user_status == Some(STATUS_ACCESS_DENIED)",
+            "exact target-user denial pair invariant",
+        ),
+    ] {
+        require_source(&pair_evidence_admission, needle, purpose)?;
+    }
+    if pair_evidence_admission.contains("&& true") {
+        return Err("broker passive traced-pair evidence was weakened".to_owned());
+    }
+    let subject_receipt_admission = semantic_function_region(
+        &sources.session_broker,
+        "impl BrokerPassiveTraceSubjectReceiptV1 {",
+        "struct BrokerPassiveTraceSubjectFinishV1 {",
+    )
+    .ok_or_else(|| "broker passive subject receipt admission has no boundary".to_owned())?;
+    for (needle, purpose) in [
+        ("fn valid_ready_for(", "subject-ready receipt admission"),
+        (
+            "fn valid_finished_for(",
+            "subject-finished receipt admission",
+        ),
+    ] {
+        require_source(&subject_receipt_admission, needle, purpose)?;
+    }
+    if subject_receipt_admission
+        .matches("&& self.trace_schema_version == BROKER_PASSIVE_TRACE_SCHEMA_VERSION")
+        .count()
+        != 2
+        || subject_receipt_admission.contains("&& true")
+    {
+        return Err("broker passive subject receipt schemas are not exact".to_owned());
+    }
+    let failure_admission = semantic_function_region(
+        &sources.session_broker,
+        "fn validate_broker_passive_trace_failure(",
+        "fn run_broker_passive_trace_authority_transaction(",
+    )
+    .ok_or_else(|| "broker passive typed-failure admission has no boundary".to_owned())?;
+    for (needle, purpose) in [
+        (
+            "failure.authority_equal\n            != (failure.authority_before_sha256 == failure.authority_after_sha256)",
+            "typed failure authority relation",
+        ),
+        (
+            "failure.deadline_exceeded\n            != (failure.elapsed_ms > BROKER_PASSIVE_TRACE_DEADLINE.as_millis() as u64)",
+            "typed failure deadline relation",
+        ),
+    ] {
+        require_source(&failure_admission, needle, purpose)?;
+    }
+    if failure_admission.contains("false &&") {
+        return Err("broker passive typed-failure admission was weakened".to_owned());
+    }
+    let client_start = semantic_function_region(
+        &sources.session_broker,
+        "pub(crate) fn start_broker_passive_trace(",
+        "impl BrokerPassiveTraceLease {",
+    )
+    .ok_or_else(|| "broker passive-trace client start has no boundary".to_owned())?;
+    require_source(
+        &client_start,
+        "provider_sha256: broker_passive_trace_provider_sha256(),",
+        "client typed provider binding",
+    )?;
+    require_source(
+        &client_start,
+        "limits_sha256: super::access_trace::broker_passive_trace_limits_sha256(),",
+        "client typed limits binding",
+    )?;
+    let traced_pair = semantic_function_region(
+        &sources.process,
+        "fn run_broker_passive_trace_pair(",
+        "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+    )
+    .ok_or_else(|| "broker passive traced-pair launcher has no boundary".to_owned())?;
+    if traced_pair.contains("false &&") {
+        return Err("broker passive traced-pair admission was weakened".to_owned());
+    }
+    require_source(
+        &traced_pair,
+        "let traced_f = if after_c_observation.stable()",
+        "post-C stability gate before F",
+    )?;
+    require_source(
+        &traced_pair,
+        "&& lease.ready_for_target_user()",
+        "successful C drain gate before F",
+    )?;
+    require_source_order(
+        &traced_pair,
+        &[
+            (
+                "let before_profile = observe_loader_profile",
+                "profile observation",
+            ),
+            (
+                "before_profile.state != LoaderProfileHiveStateV1::AlreadyLoadedBorrowed",
+                "borrowed-profile admission",
+            ),
+            (
+                "OwnedUserEnvironmentBlock::create(baseline_token)",
+                "traced owner creation",
+            ),
+            ("start_broker_passive_trace(", "broker trace start"),
+        ],
+    )?;
+    if traced_pair
+        .matches("LoaderControlMatrixCellV4::PRODUCTION,")
+        .count()
+        != 2
+        || traced_pair
+            .matches("LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,")
+            .count()
+            != 2
+        || traced_pair.matches("None,").count() != 2
+    {
+        return Err("broker passive traced C/F launch arguments are not exact".to_owned());
+    }
+    require_source(
+        &traced_pair,
+        "let destroyed = environment.destroy_after_create().is_ok();\n    evidence",
+        "final traced-owner destruction result",
+    )?;
+    require_source_order(
+        &traced_pair,
+        &[
+            (
+                "OwnedUserEnvironmentBlock::create(baseline_token)",
+                "one traced owner allocation",
+            ),
+            (
+                "BrokerPassiveTraceCellV1::CanonicalSameAccess",
+                "C arm before resume",
+            ),
+            ("broker-trace-after-c", "post-C drain and scan"),
+            (
+                "BrokerPassiveTraceCellV1::TargetUser",
+                "F only after C scan",
+            ),
+            ("broker-trace-after-f", "post-F drain and scan"),
+            ("lease.finish(", "broker final cleanup"),
+            (
+                "environment.destroy_after_create().is_ok()",
+                "owner destruction after trace cleanup",
+            ),
+        ],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn windows_broker_passive_trace_mutations_are_rejected() {
+    let sources = WindowsLoaderControlContractSources::load();
+    validate_windows_broker_passive_trace_contract(&sources)
+        .expect("unmutated authenticated broker passive C/F trace contract must be complete");
+    for (source, start, end, exact, replacement, mutant) in [
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "const TRACE_SESSION_CAPABILITY_SCHEMA_VERSION: u32 = 1;",
+            "const LOADER_SNAPS_REGISTRY_PARENT: &str =",
+            "const BROKER_PASSIVE_TRACE_SCHEMA_VERSION: u32 = 1;",
+            "const BROKER_PASSIVE_TRACE_SCHEMA_VERSION: u32 = 2;",
+            "broker-passive-nested-schema-changed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn validate_broker_passive_trace_arm_request(",
+            "fn run_creation_authority_transaction(",
+            "        || request.keyword_mask != 0xc0",
+            "        || request.keyword_mask != 0x80",
+            "broker-passive-create-keyword-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn run_broker_passive_trace_authority_transaction(",
+            "fn run_creation_authority_transaction(",
+            "                    0 => BrokerPassiveTraceCellV1::CanonicalSameAccess,",
+            "                    0 => BrokerPassiveTraceCellV1::TargetUser,",
+            "broker-passive-subject-order-reversed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn run_broker_passive_trace_authority_transaction(",
+            "fn run_creation_authority_transaction(",
+            "                    || subject.cell_binding_sha256",
+            "                    || false && subject.cell_binding_sha256",
+            "broker-passive-cell-binding-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn run_broker_passive_trace_authority_transaction(",
+            "fn run_creation_authority_transaction(",
+            "                let drain = guard.finish();",
+            "                let drain = guard.finish_once();",
+            "broker-passive-subject-drain-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn run_broker_passive_trace_authority_transaction(",
+            "fn run_creation_authority_transaction(",
+            "                if !drain.successful() {",
+            "                if false && !drain.successful() {",
+            "broker-passive-subject-drain-admission-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn run_broker_passive_trace_authority_transaction(",
+            "fn run_creation_authority_transaction(",
+            "                    .finish(reproduction_valid)",
+            "                    .finish(true)",
+            "broker-passive-invariants-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn start_broker_passive_trace(",
+            "impl BrokerPassiveTraceLease {",
+            "            provider_sha256: broker_passive_trace_provider_sha256(),",
+            "            provider_sha256: environment_binding_sha256.clone(),",
+            "broker-passive-provider-binding-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn start_broker_passive_trace(",
+            "impl BrokerPassiveTraceLease {",
+            "            limits_sha256: super::access_trace::broker_passive_trace_limits_sha256(),",
+            "            limits_sha256: environment_binding_sha256.clone(),",
+            "broker-passive-limits-binding-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl BrokerPassiveTraceLease {",
+            "impl Drop for BrokerPassiveTraceLease {",
+            "            if self.active_subject || self.completed_subjects != 2 || self.failure_sha256.is_some()",
+            "            if self.active_subject || self.failure_sha256.is_some()",
+            "broker-passive-two-subject-gate-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn broker_passive_trace_lifecycle_sha256(",
+            "fn validate_broker_passive_trace_arm_request(",
+            "    if receipt_sha256.len() != 5 {",
+            "    if receipt_sha256.len() != 4 {",
+            "broker-passive-lifecycle-cardinality-weakened",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl BrokerPassiveTraceLease {",
+            "impl Drop for BrokerPassiveTraceLease {",
+            "                || receipt.lifecycle_sha256 != expected_lifecycle_sha256",
+            "                || false && receipt.lifecycle_sha256 != expected_lifecycle_sha256",
+            "broker-passive-lifecycle-admission-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl BrokerPassiveTraceLease {",
+            "impl Drop for BrokerPassiveTraceLease {",
+            "                || receipt.after_target_environment_sha256\n                    != expected_after_target_environment_sha256",
+            "                || false && receipt.after_target_environment_sha256\n                    != expected_after_target_environment_sha256",
+            "broker-passive-after-environment-admission-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl BrokerPassiveTraceLease {",
+            "impl Drop for BrokerPassiveTraceLease {",
+            "                || receipt.reproduction_valid != reproduction_valid",
+            "                || false && receipt.reproduction_valid != reproduction_valid",
+            "broker-passive-reproduction-admission-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl BrokerPassiveTraceLease {",
+            "impl Drop for BrokerPassiveTraceLease {",
+            "                || receipt.invariants_valid != invariants_valid",
+            "                || false && receipt.invariants_valid != invariants_valid",
+            "broker-passive-invariants-admission-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl BrokerPassiveTraceLease {",
+            "impl Drop for BrokerPassiveTraceLease {",
+            "                || receipt.pair_evidence != pair_evidence",
+            "                || false && receipt.pair_evidence != pair_evidence",
+            "broker-passive-pair-evidence-admission-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl BrokerPassiveTracePairEvidenceV1 {",
+            "struct BrokerPassiveTraceFinishRequestV1 {",
+            "            && self.target_user_status == Some(STATUS_ACCESS_DENIED)",
+            "            && self.target_user_status.is_some()",
+            "broker-passive-target-status-weakened",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl BrokerPassiveTracePairEvidenceV1 {",
+            "struct BrokerPassiveTraceFinishRequestV1 {",
+            "            && self.profile_before_borrowed",
+            "            && true",
+            "broker-passive-pair-profile-prerequisite-weakened",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "fn validate_broker_passive_trace_failure(",
+            "fn run_broker_passive_trace_authority_transaction(",
+            "        || failure.deadline_exceeded\n            != (failure.elapsed_ms > BROKER_PASSIVE_TRACE_DEADLINE.as_millis() as u64)",
+            "        || false && failure.deadline_exceeded\n            != (failure.elapsed_ms > BROKER_PASSIVE_TRACE_DEADLINE.as_millis() as u64)",
+            "broker-passive-failure-deadline-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl BrokerPassiveTraceSubjectGuardV1<'_> {",
+            "impl Drop for BrokerPassiveTraceSubjectGuardV1<'_> {",
+            "                    self.lease.failure_receipt = Some(failure);",
+            "                    drop(failure);",
+            "broker-passive-subject-failure-receipt-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "    pub(crate) fn arm_suspended_child(",
+            "    pub(crate) fn finish(",
+            "                self.failure_receipt = Some(failure);",
+            "                drop(failure);",
+            "broker-passive-subject-arm-failure-receipt-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl BrokerPassiveTraceLease {",
+            "impl Drop for BrokerPassiveTraceLease {",
+            "        let mut failure_receipt = self.failure_receipt.take();",
+            "        let mut failure_receipt = None;",
+            "broker-passive-subject-failure-propagation-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "    fn valid_ready_for(&self, subject: &BrokerPassiveTraceSubjectArmV1) -> bool {",
+            "    fn valid_finished_for(&self, subject: &BrokerPassiveTraceSubjectArmV1) -> bool {",
+            "            && self.trace_schema_version == BROKER_PASSIVE_TRACE_SCHEMA_VERSION",
+            "            && true",
+            "broker-passive-subject-ready-schema-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "    fn valid_finished_for(&self, subject: &BrokerPassiveTraceSubjectArmV1) -> bool {",
+            "struct BrokerPassiveTraceSubjectFinishV1 {",
+            "            && self.trace_schema_version == BROKER_PASSIVE_TRACE_SCHEMA_VERSION",
+            "            && true",
+            "broker-passive-subject-finished-schema-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn run_broker_passive_trace_pair(",
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "    let traced_f = if after_c_observation.stable()",
+            "    let traced_f = if true",
+            "broker-passive-after-c-gate-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn run_broker_passive_trace_pair(",
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "        && lease.ready_for_target_user()",
+            "        && true",
+            "broker-passive-c-drain-gate-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn run_broker_passive_trace_pair(",
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "    if before_profile.state != LoaderProfileHiveStateV1::AlreadyLoadedBorrowed {",
+            "    if false && before_profile.state != LoaderProfileHiveStateV1::AlreadyLoadedBorrowed {",
+            "broker-passive-profile-prerequisite-bypassed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "    let traced_c = launch_target_desktop_loader_control_cell_with_shared_environment(",
+            "    let after_c_inventory = environment.inventory();",
+            "        LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,",
+            "        LoaderObjectSecurityAuthorityV1::LauncherExplicit,",
+            "broker-passive-c-diagnostic-authority-widened",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "    let traced_c = launch_target_desktop_loader_control_cell_with_shared_environment(",
+            "    let after_c_inventory = environment.inventory();",
+            "        LoaderControlMatrixCellV4::PRODUCTION,",
+            "        LoaderControlMatrixCellV4::DEBUG_C,",
+            "broker-passive-c-production-mode-changed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "    let traced_c = launch_target_desktop_loader_control_cell_with_shared_environment(",
+            "    let after_c_inventory = environment.inventory();",
+            "        None,",
+            "        Some(LoaderDebugObserverV1::FullObserver),",
+            "broker-passive-c-debug-observer-enabled",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "    let traced_f = if after_c_observation.stable()",
+            "    let after_f_inventory = environment.inventory();",
+            "                LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,",
+            "                LoaderObjectSecurityAuthorityV1::LauncherExplicit,",
+            "broker-passive-f-diagnostic-authority-widened",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "    let traced_f = if after_c_observation.stable()",
+            "    let after_f_inventory = environment.inventory();",
+            "                LoaderControlMatrixCellV4::PRODUCTION,",
+            "                LoaderControlMatrixCellV4::DEBUG_F,",
+            "broker-passive-f-production-mode-changed",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "    let traced_f = if after_c_observation.stable()",
+            "    let after_f_inventory = environment.inventory();",
+            "                None,",
+            "                Some(LoaderDebugObserverV1::FullObserver),",
+            "broker-passive-f-debug-observer-enabled",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn run_broker_passive_trace_pair(",
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "    let destroyed = environment.destroy_after_create().is_ok();\n    evidence",
+            "    let destroyed = true;\n    evidence",
+            "broker-passive-owner-destruction-fabricated",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn run_broker_passive_trace_pair(",
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "        super::session_broker::BrokerPassiveTracePairEvidenceV1::invalid(error.as_bytes())",
+            "        super::session_broker::BrokerPassiveTracePairEvidenceV1::invalid(b\"unbound pair failure\")",
+            "broker-passive-invalid-pair-provenance-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_restriction_presence_capability_prefix(",
+            "fn broker_passive_trace_environment_observation_sha256(",
+            "{trace_session_capability_diagnostic} {broker_passive_trace_diagnostic}",
+            "{trace_session_capability_diagnostic}",
+            "broker-passive-priority-record-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const MAX_FRONTIER_EVENTS: usize = 64;",
+            "impl PassiveAccessLocalizationEvidenceV1 {",
+            "self.diagnostic_with_frontier(false)",
+            "self.diagnostic_with_frontier(true)",
+            "broker-passive-invalid-frontier-disclosed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "const MAX_FRONTIER_EVENTS: usize = 64;",
+            "impl PassiveAccessLocalizationEvidenceV1 {",
+            "const MAX_BROKER_DIAGNOSTIC_FRONTIER: usize = 2;",
+            "const MAX_BROKER_DIAGNOSTIC_FRONTIER: usize = MAX_FRONTIER_EVENTS;",
+            "broker-passive-frontier-publication-unbounded",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "impl BrokerPassiveAccessEvidenceV1 {",
+            "impl PassiveAccessLocalizationEvidenceV1 {",
+            "                .flat_map(|(canonical, target)| [canonical, target])",
+            "                .take(MAX_BROKER_DIAGNOSTIC_FRONTIER)",
+            "broker-passive-frontier-witness-replaced-by-prefix",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "impl BrokerPassiveAccessEvidenceV1 {",
+            "impl PassiveAccessLocalizationEvidenceV1 {",
+            "        let classification = if disclose_frontier {",
+            "        let classification = if validated_frontier.is_some() {",
+            "broker-passive-invalid-classification-disclosed",
+        ),
+        (
+            WindowsLoaderControlContractSource::AccessTrace,
+            "impl BrokerPassiveAccessEvidenceV1 {",
+            "impl PassiveAccessLocalizationEvidenceV1 {",
+            "            && self.session_absence_proven",
+            "            && true",
+            "broker-passive-session-absence-bypassed",
+        ),
+    ] {
+        let mut mutated = sources.clone();
+        replace_windows_source_once_in_region(
+            mutated.source_mut(source),
+            start,
+            end,
+            exact,
+            replacement,
+            mutant,
+        );
+        assert!(
+            validate_windows_broker_passive_trace_contract(&mutated).is_err(),
+            "broker passive trace mutant {mutant} survived"
         );
     }
 }
@@ -23005,6 +23938,24 @@ fn windows_shared_userenv_restriction_presence_mutations_are_rejected() {
     validate_windows_shared_userenv_restriction_presence_contract(&sources.process, &sources.token)
         .expect("unmutated shared Userenv restriction-presence contract must be complete");
 
+    let mut schema_rollback = sources.clone();
+    replace_windows_source_once_in_region(
+        &mut schema_rollback.process,
+        "fn loader_restriction_presence_capability_prefix(",
+        "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+        "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state={presence_state}",
+        "loader_restriction_presence_prerequisite_canary=v1 state={state} presence_state={presence_state}",
+        "shared-userenv-diagnostic-schema-rolled-back",
+    );
+    assert!(
+        validate_windows_shared_userenv_restriction_presence_contract(
+            &schema_rollback.process,
+            &schema_rollback.token,
+        )
+        .is_err(),
+        "shared-userenv-diagnostic-schema-rolled-back survived the shared Userenv restriction-presence contract",
+    );
+
     for (start, end, exact, replacement, mutant) in [
         (
             "pub(crate) fn canonical_same_access_restricting_sids(token: HANDLE) -> Result<Vec<String>, String> {",
@@ -24046,11 +24997,6 @@ fn windows_shared_userenv_restriction_presence_mutations_are_rejected() {
             "let shared_environment_valid = environment_stable && environment_destruction.is_ok();",
             "let shared_environment_valid = environment_stable;",
             "shared-userenv-owner-destruction-dropped-from-admission",
-        ),
-        (
-            "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state={presence_state}",
-            "loader_restriction_presence_prerequisite_canary=v1 state={state} presence_state={presence_state}",
-            "shared-userenv-diagnostic-schema-rolled-back",
         ),
         (
             "invariant_error_sha256={} {} {} environment_values_redacted=true token_values_redacted=true job_empty={job_empty_exact} workload_executed=false qualification_promoted=false",

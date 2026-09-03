@@ -7,14 +7,18 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, FILETIME, HANDLE};
+use serde::{Deserialize, Serialize};
+use windows_sys::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND, FILETIME, HANDLE,
+};
 use windows_sys::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_DISABLE_PROVIDER,
-    EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
-    EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2,
-    FlushTraceW, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
-    PROCESSTRACE_HANDLE, PROPERTY_DATA_DESCRIPTOR, ProcessTrace, StartTraceW, TRACE_LEVEL_VERBOSE,
-    TdhGetProperty, TdhGetPropertySize, WNODE_FLAG_TRACED_GUID,
+    EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY,
+    EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
+    EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, FlushTraceW, OpenTraceW,
+    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
+    PROPERTY_DATA_DESCRIPTOR, ProcessTrace, StartTraceW, TRACE_LEVEL_VERBOSE, TdhGetProperty,
+    TdhGetPropertySize, WNODE_FLAG_TRACED_GUID,
 };
 use windows_sys::Win32::System::Threading::{GetProcessId, GetProcessTimes};
 use windows_sys::core::GUID;
@@ -33,6 +37,7 @@ pub(crate) const MAX_TRACE_EVENTS_FOR_TEST: usize = MAX_TRACE_EVENTS;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 4_096;
 const MAX_PENDING_OPERATIONS: usize = 1_024;
 const MAX_FRONTIER_EVENTS: usize = 64;
+const MAX_BROKER_DIAGNOSTIC_FRONTIER: usize = 2;
 #[cfg(test)]
 pub(crate) const MAX_FRONTIER_EVENTS_FOR_TEST: usize = MAX_FRONTIER_EVENTS;
 const MAX_RENDERED_BYTES: usize = 32_768;
@@ -83,7 +88,7 @@ impl PassiveAccessLocalizationCleanupStatusV1 {
 
     fn diagnostic(self) -> String {
         match self {
-            Self::NotAttempted => "none".to_owned(),
+            Self::NotAttempted => "not-attempted".to_owned(),
             Self::Native(status) => status.to_string(),
             Self::WorkerPanicked => "worker-panicked".to_owned(),
         }
@@ -98,9 +103,13 @@ pub(crate) struct PassiveAccessLocalizationSetupErrorV1 {
     provider_enable_attempted: bool,
     consumer_opened: bool,
     consumer_ready: bool,
+    session_name_sha256: String,
+    cleanup_provider_disable_status: PassiveAccessLocalizationCleanupStatusV1,
     cleanup_stop_status: PassiveAccessLocalizationCleanupStatusV1,
     cleanup_close_status: PassiveAccessLocalizationCleanupStatusV1,
     cleanup_process_trace_status: PassiveAccessLocalizationCleanupStatusV1,
+    cleanup_absence_query_status: PassiveAccessLocalizationCleanupStatusV1,
+    session_absence_proven: bool,
     detail_sha256: String,
 }
 
@@ -113,9 +122,13 @@ impl PassiveAccessLocalizationSetupErrorV1 {
         provider_enable_attempted: bool,
         consumer_opened: bool,
         consumer_ready: bool,
+        session_name_sha256: String,
+        cleanup_provider_disable_status: PassiveAccessLocalizationCleanupStatusV1,
         cleanup_stop_status: PassiveAccessLocalizationCleanupStatusV1,
         cleanup_close_status: PassiveAccessLocalizationCleanupStatusV1,
         cleanup_process_trace_status: PassiveAccessLocalizationCleanupStatusV1,
+        cleanup_absence_query_status: PassiveAccessLocalizationCleanupStatusV1,
+        session_absence_proven: bool,
         detail: &[u8],
     ) -> Self {
         Self {
@@ -125,9 +138,13 @@ impl PassiveAccessLocalizationSetupErrorV1 {
             provider_enable_attempted,
             consumer_opened,
             consumer_ready,
+            session_name_sha256,
+            cleanup_provider_disable_status,
             cleanup_stop_status,
             cleanup_close_status,
             cleanup_process_trace_status,
+            cleanup_absence_query_status,
+            session_absence_proven,
             detail_sha256: super::record::digest(detail),
         }
     }
@@ -559,12 +576,35 @@ pub(crate) struct PassiveAccessLocalizationSubjectGuardV1 {
     active: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PassiveAccessLocalizationDrainReceiptV1 {
+    pub(crate) flush_status: u32,
+    pub(crate) barrier_requested: bool,
+    pub(crate) barrier_armed: bool,
+    pub(crate) barrier_acknowledged: bool,
+    pub(crate) pending_empty: bool,
+    pub(crate) detail_sha256: String,
+}
+
+impl PassiveAccessLocalizationDrainReceiptV1 {
+    pub(crate) fn successful(&self) -> bool {
+        self.flush_status == ERROR_SUCCESS
+            && self.barrier_requested
+            && self.barrier_armed
+            && self.barrier_acknowledged
+            && self.pending_empty
+            && self.detail_sha256 == "none"
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PassiveAccessLocalizationCleanupReceiptV1 {
     provider_disable: PassiveAccessLocalizationCleanupStatusV1,
     stop: PassiveAccessLocalizationCleanupStatusV1,
     process_trace: PassiveAccessLocalizationCleanupStatusV1,
     close: PassiveAccessLocalizationCleanupStatusV1,
+    absence_query: PassiveAccessLocalizationCleanupStatusV1,
+    session_absence_proven: bool,
     repeated: bool,
 }
 
@@ -576,17 +616,22 @@ impl PassiveAccessLocalizationCleanupReceiptV1 {
             && self.stop == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)
             && self.process_trace == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)
             && self.close == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS)
+            && self.absence_query
+                == PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_WMI_INSTANCE_NOT_FOUND)
+            && self.session_absence_proven
     }
 
     fn failure_detail(&self) -> Option<String> {
         (!self.successful()).then(|| {
             format!(
-                "passive access-localization cleanup failed: repeated={} disable={} stop={} process_trace={} close={}",
+                "passive access-localization cleanup failed: repeated={} disable={} stop={} process_trace={} close={} absence_query={} absence_proven={}",
                 self.repeated,
                 self.provider_disable.diagnostic(),
                 self.stop.diagnostic(),
                 self.process_trace.diagnostic(),
                 self.close.diagnostic(),
+                self.absence_query.diagnostic(),
+                self.session_absence_proven,
             )
         })
     }
@@ -604,10 +649,13 @@ pub(crate) struct PassiveAccessLocalizationEvidenceV1 {
     consumer_opened: bool,
     consumer_ready: bool,
     schema_observed: bool,
+    session_name_sha256: String,
     cleanup_provider_disable_status: PassiveAccessLocalizationCleanupStatusV1,
     cleanup_stop_status: PassiveAccessLocalizationCleanupStatusV1,
     cleanup_close_status: PassiveAccessLocalizationCleanupStatusV1,
     cleanup_process_trace_status: PassiveAccessLocalizationCleanupStatusV1,
+    cleanup_absence_query_status: PassiveAccessLocalizationCleanupStatusV1,
+    session_absence_proven: bool,
     subject_binding_sha256: String,
     canonical_events: usize,
     target_user_events: usize,
@@ -619,13 +667,523 @@ pub(crate) struct PassiveAccessLocalizationEvidenceV1 {
     incomplete: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BrokerPassiveFileOperationV1 {
+    cell: String,
+    ordinal: usize,
+    native_status: i32,
+    object_name_sha256: String,
+    create_event_version: u8,
+    operation_end_event_version: u8,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BrokerPassiveAccessEvidenceV1 {
+    classification: String,
+    cleanup_count: u32,
+    detail_sha256: String,
+    setup_stage: Option<String>,
+    setup_win32_status: Option<i64>,
+    session_created: bool,
+    provider_enable_attempted: bool,
+    consumer_opened: bool,
+    consumer_ready: bool,
+    schema_observed: bool,
+    session_name_sha256: String,
+    cleanup_provider_disable_status: String,
+    cleanup_stop_status: String,
+    cleanup_close_status: String,
+    cleanup_process_trace_status: String,
+    cleanup_absence_query_status: String,
+    session_absence_proven: bool,
+    subject_binding_sha256: String,
+    canonical_events: usize,
+    target_user_events: usize,
+    frontier: Vec<BrokerPassiveFileOperationV1>,
+    invalid: bool,
+    unsupported_schema: bool,
+    events_lost: u32,
+    overflow: bool,
+    incomplete: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BrokerPassiveAccessMutationForTest {
+    MalformedObjectDigest,
+    UnknownCell,
+    UnsupportedVersion,
+    CountMismatch,
+    FalseDifferential,
+    MissingSessionAbsence,
+}
+
+impl BrokerPassiveAccessEvidenceV1 {
+    #[cfg(test)]
+    pub(crate) fn for_test(classification: &str, invalid: bool) -> Self {
+        let object_name_sha256 = file_object_name_digest(b"redacted-test-path");
+        let mut frontier = Vec::new();
+        if classification != "coverage-insufficient" {
+            frontier.push(BrokerPassiveFileOperationV1 {
+                cell: "canonical-same-access".to_owned(),
+                ordinal: 1,
+                native_status: 0,
+                object_name_sha256: object_name_sha256.clone(),
+                create_event_version: 1,
+                operation_end_event_version: 0,
+            });
+        }
+        frontier.push(BrokerPassiveFileOperationV1 {
+            cell: "target-user-singleton".to_owned(),
+            ordinal: 2,
+            native_status: if classification == "candidate-file-denial-differential" {
+                STATUS_ACCESS_DENIED
+            } else {
+                0
+            },
+            object_name_sha256,
+            create_event_version: 1,
+            operation_end_event_version: 0,
+        });
+        Self {
+            classification: classification.to_owned(),
+            cleanup_count: 1,
+            detail_sha256: super::record::digest(b"broker-passive-trace-test-detail"),
+            setup_stage: None,
+            setup_win32_status: None,
+            session_created: true,
+            provider_enable_attempted: true,
+            consumer_opened: true,
+            consumer_ready: true,
+            schema_observed: true,
+            session_name_sha256: super::record::digest(b"broker-passive-trace-test-session"),
+            cleanup_provider_disable_status: "0".to_owned(),
+            cleanup_stop_status: "0".to_owned(),
+            cleanup_close_status: "0".to_owned(),
+            cleanup_process_trace_status: "0".to_owned(),
+            cleanup_absence_query_status: ERROR_WMI_INSTANCE_NOT_FOUND.to_string(),
+            session_absence_proven: true,
+            subject_binding_sha256: super::record::digest(b"broker-passive-trace-test-subjects"),
+            canonical_events: usize::from(classification != "coverage-insufficient"),
+            target_user_events: 1,
+            frontier,
+            invalid,
+            unsupported_schema: false,
+            events_lost: 0,
+            overflow: false,
+            incomplete: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_frontier_for_test() -> Self {
+        let mut evidence = Self::for_test("candidate-file-denial-differential", false);
+        let pair_count = MAX_FRONTIER_EVENTS / 2;
+        evidence.frontier.clear();
+        for pair in 0..pair_count {
+            let object_name_sha256 = file_object_name_digest(&pair.to_le_bytes());
+            evidence.frontier.push(BrokerPassiveFileOperationV1 {
+                cell: "canonical-same-access".to_owned(),
+                ordinal: pair * 2 + 1,
+                native_status: 0,
+                object_name_sha256: object_name_sha256.clone(),
+                create_event_version: 1,
+                operation_end_event_version: 0,
+            });
+            evidence.frontier.push(BrokerPassiveFileOperationV1 {
+                cell: "target-user-singleton".to_owned(),
+                ordinal: pair * 2 + 2,
+                native_status: if pair + 1 == pair_count {
+                    STATUS_ACCESS_DENIED
+                } else {
+                    0
+                },
+                object_name_sha256,
+                create_event_version: 1,
+                operation_end_event_version: 0,
+            });
+        }
+        evidence.canonical_events = pair_count;
+        evidence.target_user_events = pair_count;
+        evidence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reordered_max_frontier_for_test() -> Self {
+        let mut evidence = Self::max_frontier_for_test();
+        evidence.frontier.reverse();
+        evidence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mutated_for_test(mutation: BrokerPassiveAccessMutationForTest) -> Self {
+        let mut evidence = Self::for_test("candidate-file-denial-differential", false);
+        match mutation {
+            BrokerPassiveAccessMutationForTest::MalformedObjectDigest => {
+                evidence.frontier[0].object_name_sha256 = "plaintext-path".to_owned();
+            }
+            BrokerPassiveAccessMutationForTest::UnknownCell => {
+                evidence.frontier[0].cell = "unknown-cell".to_owned();
+            }
+            BrokerPassiveAccessMutationForTest::UnsupportedVersion => {
+                evidence.frontier[0].create_event_version = 2;
+            }
+            BrokerPassiveAccessMutationForTest::CountMismatch => {
+                evidence.canonical_events += 1;
+            }
+            BrokerPassiveAccessMutationForTest::FalseDifferential => {
+                evidence.classification = "file-domain-common".to_owned();
+            }
+            BrokerPassiveAccessMutationForTest::MissingSessionAbsence => {
+                evidence.session_absence_proven = false;
+            }
+        }
+        evidence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drained_subject_failure_for_test() -> Self {
+        let mut evidence = Self::for_test("candidate-file-denial-differential", false);
+        evidence.classification = "invalid-runtime".to_owned();
+        evidence.detail_sha256 = super::record::digest(b"broker passive subject drain failed");
+        evidence.frontier.clear();
+        evidence.canonical_events = 0;
+        evidence.target_user_events = 0;
+        evidence.invalid = true;
+        evidence.incomplete = true;
+        evidence
+    }
+
+    pub(crate) fn classification(&self) -> &str {
+        &self.classification
+    }
+
+    pub(crate) fn admissible(&self) -> bool {
+        let Some((classification, _, _)) = self.validated_frontier_relation() else {
+            return false;
+        };
+        !self.invalid
+            && !self.unsupported_schema
+            && self.cleanup_count == 1
+            && self.cleanup_provider_disable_status == "0"
+            && self.cleanup_stop_status == "0"
+            && self.cleanup_close_status == "0"
+            && self.cleanup_process_trace_status == "0"
+            && self.cleanup_absence_query_status == ERROR_WMI_INSTANCE_NOT_FOUND.to_string()
+            && self.session_absence_proven
+            && self.session_created
+            && self.provider_enable_attempted
+            && self.consumer_opened
+            && self.consumer_ready
+            && self.schema_observed
+            && self.setup_stage.is_none()
+            && self.setup_win32_status.is_none()
+            && self.events_lost == 0
+            && !self.overflow
+            && !self.incomplete
+            && self.classification == classification
+            && digest_or_none_valid(&self.detail_sha256)
+            && super::record::validate_attempt_id(&self.subject_binding_sha256).is_ok()
+            && super::record::validate_attempt_id(&self.session_name_sha256).is_ok()
+    }
+
+    pub(crate) fn diagnostic(&self) -> String {
+        self.diagnostic_with_frontier(self.admissible())
+    }
+
+    pub(crate) fn diagnostic_without_frontier(&self) -> String {
+        self.diagnostic_with_frontier(false)
+    }
+
+    fn diagnostic_with_frontier(&self, disclose_frontier: bool) -> String {
+        let validated_frontier = self.validated_frontier_relation();
+        let disclose_frontier =
+            disclose_frontier && self.admissible() && validated_frontier.is_some();
+        let witness = validated_frontier
+            .as_ref()
+            .and_then(|(_, _, witness)| *witness);
+        let frontier = if disclose_frontier {
+            witness
+                .into_iter()
+                .flat_map(|(canonical, target)| [canonical, target])
+                .filter_map(|index| self.frontier.get(index))
+                .map(|event| {
+                    format!(
+                        "{}:{}:file-create-id-12-v{}/operation-end-id-24-v{}:{:#010x}:{}:candidate-only",
+                        event.ordinal,
+                        event.cell,
+                        event.create_event_version,
+                        event.operation_end_event_version,
+                        event.native_status as u32,
+                        event.object_name_sha256,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            String::new()
+        };
+        let frontier_total = if disclose_frontier {
+            self.frontier.len()
+        } else {
+            0
+        };
+        let frontier_retained = if disclose_frontier {
+            usize::from(witness.is_some()) * MAX_BROKER_DIAGNOSTIC_FRONTIER
+        } else {
+            0
+        };
+        let frontier_render_overflow = frontier_total > frontier_retained;
+        let frontier_sha256 = validated_frontier
+            .as_ref()
+            .map_or("unavailable", |(_, digest, _)| digest.as_str());
+        let classification = if disclose_frontier {
+            validated_frontier
+                .as_ref()
+                .map_or("invalid", |(value, _, _)| *value)
+        } else {
+            "invalid"
+        };
+        let detail_sha256 = if digest_or_none_valid(&self.detail_sha256) {
+            self.detail_sha256.as_str()
+        } else {
+            "unavailable"
+        };
+        let subject_binding_sha256 = validated_digest_or_unavailable(&self.subject_binding_sha256);
+        let session_name_sha256 = validated_digest_or_unavailable(&self.session_name_sha256);
+        let cleanup_provider_disable_status =
+            validated_cleanup_status_or_unavailable(&self.cleanup_provider_disable_status);
+        let cleanup_stop_status =
+            validated_cleanup_status_or_unavailable(&self.cleanup_stop_status);
+        let cleanup_close_status =
+            validated_cleanup_status_or_unavailable(&self.cleanup_close_status);
+        let cleanup_process_trace_status =
+            validated_cleanup_status_or_unavailable(&self.cleanup_process_trace_status);
+        let cleanup_absence_query_status =
+            validated_cleanup_status_or_unavailable(&self.cleanup_absence_query_status);
+        let setup_stage = self
+            .setup_stage
+            .as_deref()
+            .filter(|stage| {
+                matches!(
+                    *stage,
+                    "session-start"
+                        | "provider-enable"
+                        | "consumer-open"
+                        | "consumer-thread"
+                        | "consumer-ready"
+                )
+            })
+            .unwrap_or("none");
+        let setup_win32_status = self
+            .setup_win32_status
+            .map_or_else(|| "none".to_owned(), |status| status.to_string());
+        format!(
+            "classification={} coverage={COVERAGE} requested_access_available=false unobserved_domains=registry,object-namespace-known-dll-section,alpc-csrss,other-providers setup_stage={} setup_win32_status={} session_created={} provider_enable_attempted={} consumer_opened={} consumer_ready={} schema_observed={} session_name_sha256={} cleanup_provider_disable_status={} cleanup_stop_status={} cleanup_close_status={} cleanup_process_trace_status={} cleanup_absence_query_status={} session_absence_proven={} cleanup_count={} subject_binding_sha256={} canonical_events={} target_user_events={} events_lost={} overflow={} incomplete={} frontier_total={} frontier_retained={} frontier_render_overflow={} frontier_sha256={} frontier=[{}] detail_sha256={} candidate_frontier_only=true exact_resource_identified=false acl_fix_identified=false object_values_redacted=true",
+            classification,
+            setup_stage,
+            setup_win32_status,
+            self.session_created,
+            self.provider_enable_attempted,
+            self.consumer_opened,
+            self.consumer_ready,
+            self.schema_observed,
+            session_name_sha256,
+            cleanup_provider_disable_status,
+            cleanup_stop_status,
+            cleanup_close_status,
+            cleanup_process_trace_status,
+            cleanup_absence_query_status,
+            self.session_absence_proven,
+            self.cleanup_count,
+            subject_binding_sha256,
+            self.canonical_events,
+            self.target_user_events,
+            self.events_lost,
+            self.overflow,
+            self.incomplete,
+            frontier_total,
+            frontier_retained,
+            frontier_render_overflow,
+            frontier_sha256,
+            frontier,
+            detail_sha256,
+        )
+    }
+
+    fn validated_frontier_relation(
+        &self,
+    ) -> Option<(&'static str, String, Option<(usize, usize)>)> {
+        if self.frontier.len() > MAX_FRONTIER_EVENTS
+            || self.canonical_events
+                != self
+                    .frontier
+                    .iter()
+                    .filter(|event| event.cell == "canonical-same-access")
+                    .count()
+            || self.target_user_events
+                != self
+                    .frontier
+                    .iter()
+                    .filter(|event| event.cell == "target-user-singleton")
+                    .count()
+        {
+            return None;
+        }
+        let mut ordinals = Vec::with_capacity(self.frontier.len());
+        for event in &self.frontier {
+            if !matches!(
+                event.cell.as_str(),
+                "canonical-same-access" | "target-user-singleton"
+            ) || event.ordinal == 0
+                || event.ordinal > MAX_TRACE_EVENTS
+                || ordinals.contains(&event.ordinal)
+                || !FILE_CREATE_EVENT_VERSIONS.contains(&event.create_event_version)
+                || event.operation_end_event_version != FILE_OPERATION_END_EVENT_VERSION
+                || super::record::validate_attempt_id(&event.object_name_sha256).is_err()
+            {
+                return None;
+            }
+            ordinals.push(event.ordinal);
+        }
+        let mut comparable_witness = None;
+        let mut differential_witness = None;
+        for (target_index, target) in self.frontier.iter().enumerate() {
+            if target.cell != "target-user-singleton" {
+                continue;
+            }
+            for (canonical_index, canonical) in self.frontier.iter().enumerate() {
+                if canonical.cell != "canonical-same-access"
+                    || !broker_file_operations_comparable(canonical, target)
+                {
+                    continue;
+                }
+                comparable_witness.get_or_insert((canonical_index, target_index));
+                if target.native_status == STATUS_ACCESS_DENIED
+                    && canonical.native_status != target.native_status
+                {
+                    differential_witness.get_or_insert((canonical_index, target_index));
+                }
+            }
+        }
+        let (classification, witness) = if comparable_witness.is_none() {
+            ("coverage-insufficient", None)
+        } else if let Some(witness) = differential_witness {
+            ("candidate-file-denial-differential", Some(witness))
+        } else {
+            ("file-domain-common", comparable_witness)
+        };
+        let mut material = b"memcordon-broker-passive-frontier-v1\0".to_vec();
+        material.extend_from_slice(&(self.frontier.len() as u64).to_le_bytes());
+        for event in &self.frontier {
+            material.extend_from_slice(event.cell.as_bytes());
+            material.push(0);
+            material.extend_from_slice(&(event.ordinal as u64).to_le_bytes());
+            material.extend_from_slice(&event.native_status.to_le_bytes());
+            material.extend_from_slice(event.object_name_sha256.as_bytes());
+            material.push(event.create_event_version);
+            material.push(event.operation_end_event_version);
+        }
+        Some((classification, super::record::digest(&material), witness))
+    }
+}
+
+fn broker_file_operations_comparable(
+    left: &BrokerPassiveFileOperationV1,
+    right: &BrokerPassiveFileOperationV1,
+) -> bool {
+    left.object_name_sha256 == right.object_name_sha256
+        && left.create_event_version == right.create_event_version
+        && left.operation_end_event_version == right.operation_end_event_version
+}
+
+fn validated_digest_or_unavailable(value: &str) -> &str {
+    if super::record::validate_attempt_id(value).is_ok() {
+        value
+    } else {
+        "unavailable"
+    }
+}
+
+fn validated_cleanup_status_or_unavailable(value: &str) -> &str {
+    if value == "not-attempted"
+        || value
+            .parse::<u32>()
+            .is_ok_and(|status| status.to_string() == value)
+    {
+        value
+    } else {
+        "unavailable"
+    }
+}
+
+fn digest_or_none_valid(value: &str) -> bool {
+    value == "none" || super::record::validate_attempt_id(value).is_ok()
+}
+
 impl PassiveAccessLocalizationEvidenceV1 {
+    pub(crate) fn into_broker_evidence(self) -> BrokerPassiveAccessEvidenceV1 {
+        BrokerPassiveAccessEvidenceV1 {
+            classification: self.classification.to_owned(),
+            cleanup_count: self.cleanup_count,
+            detail_sha256: self.detail_sha256,
+            setup_stage: self.setup_stage.map(|stage| stage.diagnostic().to_owned()),
+            setup_win32_status: self.setup_win32_status,
+            session_created: self.session_created,
+            provider_enable_attempted: self.provider_enable_attempted,
+            consumer_opened: self.consumer_opened,
+            consumer_ready: self.consumer_ready,
+            schema_observed: self.schema_observed,
+            session_name_sha256: self.session_name_sha256,
+            cleanup_provider_disable_status: self.cleanup_provider_disable_status.diagnostic(),
+            cleanup_stop_status: self.cleanup_stop_status.diagnostic(),
+            cleanup_close_status: self.cleanup_close_status.diagnostic(),
+            cleanup_process_trace_status: self.cleanup_process_trace_status.diagnostic(),
+            cleanup_absence_query_status: self.cleanup_absence_query_status.diagnostic(),
+            session_absence_proven: self.session_absence_proven,
+            subject_binding_sha256: self.subject_binding_sha256,
+            canonical_events: self.canonical_events,
+            target_user_events: self.target_user_events,
+            frontier: self
+                .frontier
+                .into_iter()
+                .map(|event| BrokerPassiveFileOperationV1 {
+                    cell: event.cell.diagnostic().to_owned(),
+                    ordinal: event.ordinal,
+                    native_status: event.native_status,
+                    object_name_sha256: event.object_name_sha256,
+                    create_event_version: event.create_event_version,
+                    operation_end_event_version: event.operation_end_event_version,
+                })
+                .collect(),
+            invalid: self.invalid,
+            unsupported_schema: self.unsupported_schema,
+            events_lost: self.events_lost,
+            overflow: self.overflow,
+            incomplete: self.incomplete,
+        }
+    }
+
     pub(crate) fn observer_unavailable(error: &PassiveAccessLocalizationSetupErrorV1) -> Self {
-        let cleanup_valid = error.cleanup_stop_status.successful_or_not_attempted()
+        let cleanup_valid = error
+            .cleanup_provider_disable_status
+            .successful_or_not_attempted()
+            && error.cleanup_stop_status.successful_or_not_attempted()
             && error.cleanup_close_status.successful_or_not_attempted()
             && error
                 .cleanup_process_trace_status
-                .successful_or_not_attempted();
+                .successful_or_not_attempted()
+            && if error.session_created {
+                error.session_absence_proven
+                    && error.cleanup_absence_query_status
+                        == PassiveAccessLocalizationCleanupStatusV1::Native(
+                            ERROR_WMI_INSTANCE_NOT_FOUND,
+                        )
+            } else {
+                error.cleanup_absence_query_status.not_attempted()
+            };
         Self {
             classification: if cleanup_valid {
                 "observer-unavailable"
@@ -641,10 +1199,13 @@ impl PassiveAccessLocalizationEvidenceV1 {
             consumer_opened: error.consumer_opened,
             consumer_ready: error.consumer_ready,
             schema_observed: false,
-            cleanup_provider_disable_status: PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+            session_name_sha256: error.session_name_sha256.clone(),
+            cleanup_provider_disable_status: error.cleanup_provider_disable_status,
             cleanup_stop_status: error.cleanup_stop_status,
             cleanup_close_status: error.cleanup_close_status,
             cleanup_process_trace_status: error.cleanup_process_trace_status,
+            cleanup_absence_query_status: error.cleanup_absence_query_status,
+            session_absence_proven: error.session_absence_proven,
             subject_binding_sha256: "none".to_owned(),
             canonical_events: 0,
             target_user_events: 0,
@@ -682,7 +1243,7 @@ impl PassiveAccessLocalizationEvidenceV1 {
             .setup_stage
             .map_or_else(|| self.overflow.to_string(), |_| "unavailable".to_owned());
         let rendered = format!(
-            "passive_access_localization=v2 coverage={COVERAGE} state={} setup_stage={} win32_status={} operation_status={} session_created={} provider_enable_attempted={} consumer_opened={} consumer_ready={} schema_observed={} cleanup_provider_disable_status={} cleanup_stop_status={} cleanup_close_status={} cleanup_process_trace_status={} requested_access_available=false scope=child-pid-plus-creation-identity provider_sha256={} subject_binding_sha256={} canonical_events={} target_user_events={} frontier=[{frontier}] events_lost={} overflow={} incomplete={} cleanup_count={} detail_sha256={} object_values_redacted=true debugger_attached=false ifeo_changed=false sacl_changed=false acl_changed=false grant_created=false workload_executed=false qualification_promoted=false",
+            "passive_access_localization=v2 coverage={COVERAGE} state={} setup_stage={} win32_status={} operation_status={} session_created={} provider_enable_attempted={} consumer_opened={} consumer_ready={} schema_observed={} session_name_sha256={} cleanup_provider_disable_status={} cleanup_stop_status={} cleanup_close_status={} cleanup_process_trace_status={} cleanup_absence_query_status={} session_absence_proven={} requested_access_available=false scope=child-pid-plus-creation-identity provider_sha256={} subject_binding_sha256={} canonical_events={} target_user_events={} frontier=[{frontier}] events_lost={} overflow={} incomplete={} cleanup_count={} detail_sha256={} object_values_redacted=true debugger_attached=false ifeo_changed=false sacl_changed=false acl_changed=false grant_created=false workload_executed=false qualification_promoted=false",
             self.classification,
             self.setup_stage.map_or("none", |stage| stage.diagnostic()),
             self.setup_win32_status
@@ -694,10 +1255,13 @@ impl PassiveAccessLocalizationEvidenceV1 {
             self.consumer_opened,
             self.consumer_ready,
             self.schema_observed,
+            self.session_name_sha256,
             self.cleanup_provider_disable_status.diagnostic(),
             self.cleanup_stop_status.diagnostic(),
             self.cleanup_close_status.diagnostic(),
             self.cleanup_process_trace_status.diagnostic(),
+            self.cleanup_absence_query_status.diagnostic(),
+            self.session_absence_proven,
             super::record::digest(
                 b"Microsoft-Windows-Kernel-File/edd08927-9cc4-4e65-b970-c2560fb5c289"
             ),
@@ -747,10 +1311,13 @@ impl PassiveAccessLocalizationEvidenceV1 {
             && !self.consumer_opened
             && !self.consumer_ready
             && !self.schema_observed
+            && super::record::validate_attempt_id(&self.session_name_sha256).is_ok()
             && self.cleanup_provider_disable_status.not_attempted()
             && self.cleanup_stop_status.not_attempted()
             && self.cleanup_close_status.not_attempted()
             && self.cleanup_process_trace_status.not_attempted()
+            && self.cleanup_absence_query_status.not_attempted()
+            && !self.session_absence_proven
             && self.subject_binding_sha256 == "none"
             && self.frontier.is_empty()
             && self.cleanup_count == 0
@@ -776,7 +1343,62 @@ impl PassiveAccessLocalizationEvidenceV1 {
     }
 }
 
+fn passive_session_name_sha256(session_name: &[u16]) -> String {
+    let mut material = b"memcordon-passive-access-session-name-v1\0".to_vec();
+    for unit in session_name.iter().copied().take_while(|unit| *unit != 0) {
+        material.extend_from_slice(&unit.to_le_bytes());
+    }
+    super::record::digest(&material)
+}
+
+pub(crate) fn broker_passive_trace_limits_sha256() -> String {
+    let mut material = b"memcordon-broker-passive-trace-limits-v1\0".to_vec();
+    for value in [
+        MAX_TRACE_EVENTS as u64,
+        MAX_EVENT_PAYLOAD_BYTES as u64,
+        MAX_PENDING_OPERATIONS as u64,
+        MAX_FRONTIER_EVENTS as u64,
+        MAX_BROKER_DIAGNOSTIC_FRONTIER as u64,
+        MAX_RENDERED_BYTES as u64,
+        memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES as u64,
+        MAX_SUBJECT_WINDOW.as_millis() as u64,
+        MAX_TRACE_SESSION.as_millis() as u64,
+        READY_TIMEOUT.as_millis() as u64,
+        DRAIN_TIMEOUT.as_millis() as u64,
+    ] {
+        material.extend_from_slice(&value.to_le_bytes());
+    }
+    super::record::digest(&material)
+}
+
+fn passive_session_absence(
+    session_name: &[u16],
+) -> (PassiveAccessLocalizationCleanupStatusV1, bool) {
+    let Ok(mut properties) = TracePropertiesBuffer::new(session_name) else {
+        return (
+            PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+            false,
+        );
+    };
+    let status = unsafe {
+        ControlTraceW(
+            CONTROLTRACE_HANDLE::default(),
+            session_name.as_ptr(),
+            &raw mut properties.properties,
+            EVENT_TRACE_CONTROL_QUERY,
+        )
+    };
+    (
+        PassiveAccessLocalizationCleanupStatusV1::Native(status),
+        status == ERROR_WMI_INSTANCE_NOT_FOUND,
+    )
+}
+
 impl PassiveAccessLocalizationObserverV1 {
+    pub(crate) fn session_name_sha256(&self) -> String {
+        passive_session_name_sha256(&self.session_name)
+    }
+
     pub(crate) fn start_ready_before_child_creation()
     -> Result<Self, PassiveAccessLocalizationSetupErrorV1> {
         let sequence = SESSION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -786,6 +1408,7 @@ impl PassiveAccessLocalizationObserverV1 {
         );
         let mut session_name = name.encode_utf16().collect::<Vec<_>>();
         session_name.push(0);
+        let session_name_sha256 = passive_session_name_sha256(&session_name);
         let mut properties = TracePropertiesBuffer::new(&session_name).map_err(|error| {
             PassiveAccessLocalizationSetupErrorV1::new(
                 PassiveAccessLocalizationSetupStageV1::SessionStart,
@@ -794,9 +1417,13 @@ impl PassiveAccessLocalizationObserverV1 {
                 false,
                 false,
                 false,
+                session_name_sha256.clone(),
                 PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
                 PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
                 PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+                PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+                PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+                false,
                 error.as_bytes(),
             )
         })?;
@@ -816,9 +1443,13 @@ impl PassiveAccessLocalizationObserverV1 {
                 false,
                 false,
                 false,
+                session_name_sha256.clone(),
                 PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
                 PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
                 PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+                PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+                PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+                false,
                 b"StartTraceW",
             ));
         }
@@ -851,6 +1482,8 @@ impl PassiveAccessLocalizationObserverV1 {
                     EVENT_TRACE_CONTROL_STOP,
                 )
             };
+            let (cleanup_absence_query, session_absence_proven) =
+                passive_session_absence(&session_name);
             return Err(PassiveAccessLocalizationSetupErrorV1::new(
                 PassiveAccessLocalizationSetupStageV1::ProviderEnable,
                 Some(i64::from(enable_status)),
@@ -858,9 +1491,13 @@ impl PassiveAccessLocalizationObserverV1 {
                 true,
                 false,
                 false,
+                session_name_sha256.clone(),
+                PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
                 PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),
                 PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
                 PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+                cleanup_absence_query,
+                session_absence_proven,
                 b"EnableTraceEx2",
             ));
         }
@@ -879,6 +1516,18 @@ impl PassiveAccessLocalizationObserverV1 {
             let operation_status = std::io::Error::last_os_error()
                 .raw_os_error()
                 .map(i64::from);
+            let disable = unsafe {
+                EnableTraceEx2(
+                    control_handle,
+                    &raw const provider,
+                    EVENT_CONTROL_CODE_DISABLE_PROVIDER,
+                    0,
+                    0,
+                    0,
+                    0,
+                    null(),
+                )
+            };
             let cleanup_stop = unsafe {
                 ControlTraceW(
                     control_handle,
@@ -887,6 +1536,8 @@ impl PassiveAccessLocalizationObserverV1 {
                     EVENT_TRACE_CONTROL_STOP,
                 )
             };
+            let (cleanup_absence_query, session_absence_proven) =
+                passive_session_absence(&session_name);
             return Err(PassiveAccessLocalizationSetupErrorV1::new(
                 PassiveAccessLocalizationSetupStageV1::ConsumerOpen,
                 operation_status,
@@ -894,9 +1545,13 @@ impl PassiveAccessLocalizationObserverV1 {
                 true,
                 false,
                 false,
+                session_name_sha256.clone(),
+                PassiveAccessLocalizationCleanupStatusV1::Native(disable),
                 PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),
                 PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
                 PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+                cleanup_absence_query,
+                session_absence_proven,
                 b"OpenTraceW",
             ));
         }
@@ -910,6 +1565,18 @@ impl PassiveAccessLocalizationObserverV1 {
             }) {
             Ok(worker) => worker,
             Err(error) => {
+                let disable = unsafe {
+                    EnableTraceEx2(
+                        control_handle,
+                        &raw const provider,
+                        EVENT_CONTROL_CODE_DISABLE_PROVIDER,
+                        0,
+                        0,
+                        0,
+                        0,
+                        null(),
+                    )
+                };
                 let stop = unsafe {
                     ControlTraceW(
                         control_handle,
@@ -919,6 +1586,8 @@ impl PassiveAccessLocalizationObserverV1 {
                     )
                 };
                 let close = unsafe { CloseTrace(processing_handle) };
+                let (cleanup_absence_query, session_absence_proven) =
+                    passive_session_absence(&session_name);
                 return Err(PassiveAccessLocalizationSetupErrorV1::new(
                     PassiveAccessLocalizationSetupStageV1::ConsumerReady,
                     error.raw_os_error().map(i64::from),
@@ -926,14 +1595,30 @@ impl PassiveAccessLocalizationObserverV1 {
                     true,
                     true,
                     false,
+                    session_name_sha256.clone(),
+                    PassiveAccessLocalizationCleanupStatusV1::Native(disable),
                     PassiveAccessLocalizationCleanupStatusV1::Native(stop),
                     PassiveAccessLocalizationCleanupStatusV1::Native(close),
                     PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+                    cleanup_absence_query,
+                    session_absence_proven,
                     b"ProcessTrace worker spawn",
                 ));
             }
         };
         if let Err(error) = ready_receiver.recv_timeout(READY_TIMEOUT) {
+            let disable = unsafe {
+                EnableTraceEx2(
+                    control_handle,
+                    &raw const provider,
+                    EVENT_CONTROL_CODE_DISABLE_PROVIDER,
+                    0,
+                    0,
+                    0,
+                    0,
+                    null(),
+                )
+            };
             let stop = unsafe {
                 ControlTraceW(
                     control_handle,
@@ -948,6 +1633,8 @@ impl PassiveAccessLocalizationObserverV1 {
                 Ok(status) => PassiveAccessLocalizationCleanupStatusV1::Native(status),
                 Err(_) => PassiveAccessLocalizationCleanupStatusV1::WorkerPanicked,
             };
+            let (cleanup_absence_query, session_absence_proven) =
+                passive_session_absence(&session_name);
             let detail = format!("consumer readiness: {error}");
             return Err(PassiveAccessLocalizationSetupErrorV1::new(
                 PassiveAccessLocalizationSetupStageV1::ConsumerReady,
@@ -956,9 +1643,13 @@ impl PassiveAccessLocalizationObserverV1 {
                 true,
                 true,
                 false,
+                session_name_sha256.clone(),
+                PassiveAccessLocalizationCleanupStatusV1::Native(disable),
                 PassiveAccessLocalizationCleanupStatusV1::Native(stop),
                 PassiveAccessLocalizationCleanupStatusV1::Native(close),
                 process_trace_status,
+                cleanup_absence_query,
+                session_absence_proven,
                 detail.as_bytes(),
             ));
         }
@@ -1070,10 +1761,13 @@ impl PassiveAccessLocalizationObserverV1 {
                 consumer_opened: true,
                 consumer_ready: true,
                 schema_observed: false,
+                session_name_sha256: self.session_name_sha256(),
                 cleanup_provider_disable_status: cleanup_receipt.provider_disable,
                 cleanup_stop_status: cleanup_receipt.stop,
                 cleanup_close_status: cleanup_receipt.close,
                 cleanup_process_trace_status: cleanup_receipt.process_trace,
+                cleanup_absence_query_status: cleanup_receipt.absence_query,
+                session_absence_proven: cleanup_receipt.session_absence_proven,
                 subject_binding_sha256: "none".to_owned(),
                 canonical_events: 0,
                 target_user_events: 0,
@@ -1152,10 +1846,13 @@ impl PassiveAccessLocalizationObserverV1 {
             consumer_opened: true,
             consumer_ready: true,
             schema_observed: state.total_events != 0 || unsupported_schema,
+            session_name_sha256: self.session_name_sha256(),
             cleanup_provider_disable_status: cleanup_receipt.provider_disable,
             cleanup_stop_status: cleanup_receipt.stop,
             cleanup_close_status: cleanup_receipt.close,
             cleanup_process_trace_status: cleanup_receipt.process_trace,
+            cleanup_absence_query_status: cleanup_receipt.absence_query,
+            session_absence_proven: cleanup_receipt.session_absence_proven,
             subject_binding_sha256,
             canonical_events: if invalid || unsupported_schema {
                 0
@@ -1185,6 +1882,8 @@ impl PassiveAccessLocalizationObserverV1 {
                 stop: PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
                 process_trace: PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
                 close: PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+                absence_query: PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+                session_absence_proven: false,
                 repeated: true,
             };
         }
@@ -1226,12 +1925,15 @@ impl PassiveAccessLocalizationObserverV1 {
             None => PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
         };
         let close = unsafe { CloseTrace(self.processing_handle) };
+        let (absence_query, session_absence_proven) = passive_session_absence(&self.session_name);
         let _keep_callback_context_live = &self.callback_context;
         PassiveAccessLocalizationCleanupReceiptV1 {
             provider_disable: PassiveAccessLocalizationCleanupStatusV1::Native(disable),
             stop: PassiveAccessLocalizationCleanupStatusV1::Native(stop),
             process_trace,
             close: PassiveAccessLocalizationCleanupStatusV1::Native(close),
+            absence_query,
+            session_absence_proven,
             repeated: false,
         }
     }
@@ -1245,39 +1947,53 @@ impl Drop for PassiveAccessLocalizationObserverV1 {
     }
 }
 
-impl Drop for PassiveAccessLocalizationSubjectGuardV1 {
-    fn drop(&mut self) {
+impl PassiveAccessLocalizationSubjectGuardV1 {
+    pub(crate) fn finish(mut self) -> PassiveAccessLocalizationDrainReceiptV1 {
+        self.finish_once()
+    }
+
+    fn finish_once(&mut self) -> PassiveAccessLocalizationDrainReceiptV1 {
         if !self.active {
-            return;
+            return PassiveAccessLocalizationDrainReceiptV1 {
+                flush_status: ERROR_SUCCESS,
+                barrier_requested: false,
+                barrier_armed: false,
+                barrier_acknowledged: false,
+                pending_empty: false,
+                detail_sha256: super::record::digest(b"subject drain repeated"),
+            };
         }
         let drain_epoch = self.drain.request();
         let mut properties = TracePropertiesBuffer::new(&[b'm' as u16, 0])
             .expect("fixed ETW flush buffer name is valid");
         let flush_status =
             unsafe { FlushTraceW(self.control_handle, null(), &raw mut properties.properties) };
-        let drain_error = if flush_status != ERROR_SUCCESS {
+        let barrier_requested = drain_epoch.is_some();
+        let barrier_armed = flush_status == ERROR_SUCCESS
+            && drain_epoch.is_some_and(|epoch| {
+                self.drain
+                    .arm(epoch, u64::from(properties.properties.BuffersWritten))
+            });
+        let barrier_acknowledged =
+            barrier_armed && drain_epoch.is_some_and(|epoch| self.drain.wait(epoch, DRAIN_TIMEOUT));
+        let mut error = if flush_status != ERROR_SUCCESS {
             Some("flush-failed")
-        } else if let Some(epoch) = drain_epoch {
-            if !self
-                .drain
-                .arm(epoch, u64::from(properties.properties.BuffersWritten))
-            {
-                Some("flush-drain-barrier")
-            } else if !self.drain.wait(epoch, DRAIN_TIMEOUT) {
-                Some("flush-drain-timeout")
-            } else {
-                None
-            }
-        } else {
+        } else if !barrier_requested || !barrier_armed {
             Some("flush-drain-barrier")
+        } else if !barrier_acknowledged {
+            Some("flush-drain-timeout")
+        } else {
+            None
         };
+        let mut pending_empty = false;
         if let Ok(mut state) = self.state.lock() {
-            if let Some(error) = drain_error {
+            if let Some(error) = error {
                 state.flush_failed = true;
                 state.overflow = Some(error);
                 state.incomplete = true;
             }
             if state.active.as_ref().map(|active| active.cell) != Some(self.cell) {
+                error.get_or_insert("subject-binding-changed");
                 state.incomplete = true;
             }
             if state
@@ -1285,16 +2001,40 @@ impl Drop for PassiveAccessLocalizationSubjectGuardV1 {
                 .as_ref()
                 .is_some_and(|active| active.started.elapsed() > MAX_SUBJECT_WINDOW)
             {
+                error.get_or_insert("subject-window");
                 state.overflow = Some("subject-window");
                 state.incomplete = true;
             }
-            if !state.pending.is_empty() {
+            pending_empty = state.pending.is_empty();
+            if !pending_empty {
+                error.get_or_insert("pending-operation");
                 state.incomplete = true;
                 state.pending.clear();
             }
             state.active = None;
+        } else {
+            error.get_or_insert("state-poisoned");
         }
         self.active = false;
+        PassiveAccessLocalizationDrainReceiptV1 {
+            flush_status,
+            barrier_requested,
+            barrier_armed,
+            barrier_acknowledged,
+            pending_empty,
+            detail_sha256: error.map_or_else(
+                || "none".to_owned(),
+                |detail| super::record::digest(detail.as_bytes()),
+            ),
+        }
+    }
+}
+
+impl Drop for PassiveAccessLocalizationSubjectGuardV1 {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.finish_once();
+        }
     }
 }
 
@@ -1580,9 +2320,13 @@ pub(crate) fn passive_access_setup_cleanup_failure_for_test(
             true,
             false,
             false,
+            super::record::digest(b"test-provider-enable"),
+            PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
             PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),
             PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
             PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+            PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_WMI_INSTANCE_NOT_FOUND),
+            true,
             b"test provider enable",
         ),
     )
@@ -1602,9 +2346,13 @@ pub(crate) fn passive_access_consumer_open_failure_for_test(
             true,
             false,
             false,
+            super::record::digest(b"test-consumer-open"),
+            PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_SUCCESS),
             PassiveAccessLocalizationCleanupStatusV1::Native(cleanup_stop),
             PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
             PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+            PassiveAccessLocalizationCleanupStatusV1::Native(ERROR_WMI_INSTANCE_NOT_FOUND),
+            true,
             b"OpenTraceW",
         ),
     )
@@ -1622,6 +2370,10 @@ pub(crate) fn passive_access_runtime_cleanup_for_test(
         stop: PassiveAccessLocalizationCleanupStatusV1::Native(stop),
         process_trace: PassiveAccessLocalizationCleanupStatusV1::Native(process_trace),
         close: PassiveAccessLocalizationCleanupStatusV1::Native(close),
+        absence_query: PassiveAccessLocalizationCleanupStatusV1::Native(
+            ERROR_WMI_INSTANCE_NOT_FOUND,
+        ),
+        session_absence_proven: true,
         repeated: false,
     };
     let successful = receipt.successful();
@@ -1643,10 +2395,13 @@ pub(crate) fn passive_access_runtime_cleanup_for_test(
         consumer_opened: true,
         consumer_ready: true,
         schema_observed: true,
+        session_name_sha256: super::record::digest(b"test-runtime-cleanup"),
         cleanup_provider_disable_status: receipt.provider_disable,
         cleanup_stop_status: receipt.stop,
         cleanup_close_status: receipt.close,
         cleanup_process_trace_status: receipt.process_trace,
+        cleanup_absence_query_status: receipt.absence_query,
+        session_absence_proven: receipt.session_absence_proven,
         subject_binding_sha256: "test-binding".to_owned(),
         canonical_events: 0,
         target_user_events: 0,
@@ -1671,9 +2426,13 @@ pub(crate) fn passive_access_session_start_unavailable_for_test(
             false,
             false,
             false,
+            super::record::digest(b"test-session-start"),
             PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
             PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
             PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+            PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+            PassiveAccessLocalizationCleanupStatusV1::NotAttempted,
+            false,
             b"StartTraceW",
         ),
     )
@@ -1857,6 +2616,7 @@ pub(crate) fn passive_access_localization_for_test(
         consumer_opened: true,
         consumer_ready: true,
         schema_observed: state.total_events != 0 || unsupported_schema,
+        session_name_sha256: super::record::digest(b"test-localization"),
         cleanup_provider_disable_status: PassiveAccessLocalizationCleanupStatusV1::Native(
             ERROR_SUCCESS,
         ),
@@ -1865,6 +2625,10 @@ pub(crate) fn passive_access_localization_for_test(
         cleanup_process_trace_status: PassiveAccessLocalizationCleanupStatusV1::Native(
             ERROR_SUCCESS,
         ),
+        cleanup_absence_query_status: PassiveAccessLocalizationCleanupStatusV1::Native(
+            ERROR_WMI_INSTANCE_NOT_FOUND,
+        ),
+        session_absence_proven: true,
         subject_binding_sha256: "test-binding".to_owned(),
         canonical_events: if invalid || unsupported_schema {
             0

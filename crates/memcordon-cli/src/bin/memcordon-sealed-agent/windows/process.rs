@@ -6133,10 +6133,278 @@ fn loader_restriction_presence_capability_prefix(
     logon_state: &str,
     authenticated_users_state: &str,
     trace_session_capability_diagnostic: &str,
+    broker_passive_trace_diagnostic: &str,
 ) -> String {
     format!(
-        "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state={presence_state} identity_state={identity_state} logon_state={logon_state} authenticated_users_state={authenticated_users_state} {trace_session_capability_diagnostic}"
+        "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state={presence_state} identity_state={identity_state} logon_state={logon_state} authenticated_users_state={authenticated_users_state} {trace_session_capability_diagnostic} {broker_passive_trace_diagnostic}"
     )
+}
+
+fn broker_passive_trace_environment_observation_sha256(
+    admitted: &UserEnvironmentInventoryV1,
+    observation: &SharedEnvironmentObservationV1,
+    checkpoint: &str,
+) -> String {
+    let mut material = b"memcordon-broker-passive-trace-environment-observation-v1\0".to_vec();
+    for value in [
+        admitted.sha256.as_str(),
+        admitted.keys_sha256.as_str(),
+        checkpoint,
+        observation.scan,
+        observation.detail_sha256.as_str(),
+    ] {
+        material.extend_from_slice(value.as_bytes());
+        material.push(0);
+    }
+    material.extend_from_slice(&(admitted.units as u64).to_le_bytes());
+    material.extend_from_slice(&(admitted.entries as u64).to_le_bytes());
+    material.push(u8::from(observation.metadata_match));
+    super::record::digest(&material)
+}
+
+fn broker_passive_trace_profile_observation_sha256(
+    before: &LoaderProfileObservationV1,
+    after: &LoaderProfileObservationV1,
+) -> String {
+    fn state_material(state: LoaderProfileHiveStateV1) -> (u8, u32) {
+        match state {
+            LoaderProfileHiveStateV1::AlreadyLoadedBorrowed => (1, 0),
+            LoaderProfileHiveStateV1::Absent => (2, 0),
+            LoaderProfileHiveStateV1::AccessDenied => (3, 0),
+            LoaderProfileHiveStateV1::QueryFailed(status) => (4, status),
+        }
+    }
+    let mut material = b"memcordon-broker-passive-trace-profile-observation-v1\0".to_vec();
+    for observation in [before, after] {
+        let (state, status) = state_material(observation.state);
+        material.push(state);
+        material.extend_from_slice(&status.to_le_bytes());
+        material.extend_from_slice(observation.profile_directory_sha256.as_bytes());
+        material.push(u8::from(observation.profile_directory_exists));
+    }
+    super::record::digest(&material)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_broker_passive_trace_pair(
+    capability: Option<&super::session_broker::TraceSessionCapabilityEvidenceV1>,
+    admitted_environment: &UserEnvironmentInventoryV1,
+    baseline_token: HANDLE,
+    same_access_token: HANDLE,
+    same_access_envelope: &WindowsCallerTokenEnvelopeV1,
+    same_access_snapshot: &super::token::TokenAttestationSnapshot,
+    target_user_token: HANDLE,
+    target_user_envelope: &WindowsCallerTokenEnvelopeV1,
+    target_user_snapshot: &super::token::TokenAttestationSnapshot,
+    original_same_access: &Result<String, TargetDesktopLeaseCreateError>,
+    original_target_user: &Result<String, TargetDesktopLeaseCreateError>,
+    profile: HANDLE,
+    profile_sid: &str,
+    exact_desktop: &str,
+    launch_context: &TargetDesktopBootstrapLaunchContext,
+    association_preflight: &TargetUserObjectOpenPreflightV1,
+    holder_identity: &WindowsProcessIdentityV1,
+) -> String {
+    let Some(capability_binding_sha256) = capability
+        .and_then(super::session_broker::TraceSessionCapabilityEvidenceV1::broker_passive_trace_binding_sha256)
+    else {
+        return super::session_broker::BrokerPassiveTraceEvidenceV1::not_run().diagnostic();
+    };
+    let before_profile = observe_loader_profile(profile, profile_sid);
+    if before_profile.state != LoaderProfileHiveStateV1::AlreadyLoadedBorrowed {
+        let state = match before_profile.state {
+            LoaderProfileHiveStateV1::AlreadyLoadedBorrowed => "already-loaded-borrowed",
+            LoaderProfileHiveStateV1::Absent => "absent",
+            LoaderProfileHiveStateV1::AccessDenied => "access-denied",
+            LoaderProfileHiveStateV1::QueryFailed(_) => "query-failed",
+        };
+        return super::session_broker::BrokerPassiveTraceEvidenceV1::invalid(
+            "traced-profile-prerequisite",
+            state.as_bytes(),
+        )
+        .diagnostic();
+    }
+    let mut environment = match OwnedUserEnvironmentBlock::create(baseline_token) {
+        Ok(environment) => environment,
+        Err(error) => {
+            return super::session_broker::BrokerPassiveTraceEvidenceV1::invalid(
+                "traced-environment-create",
+                error.detail,
+            )
+            .diagnostic();
+        }
+    };
+    let initial_inventory = environment.inventory();
+    let initial_observation = shared_environment_observation(
+        admitted_environment,
+        &initial_inventory,
+        "broker-trace-created",
+    );
+    if !initial_observation.stable() {
+        let destroyed = environment.destroy_after_create().is_ok();
+        return super::session_broker::BrokerPassiveTraceEvidenceV1::invalid(
+            "traced-environment-admission",
+            initial_observation.detail_sha256.as_bytes(),
+        )
+        .with_launcher_environment_destruction(destroyed)
+        .diagnostic();
+    }
+    let environment_binding_sha256 = broker_passive_trace_environment_observation_sha256(
+        admitted_environment,
+        &initial_observation,
+        "broker-trace-created",
+    );
+    let mut lease = match super::session_broker::start_broker_passive_trace(
+        capability_binding_sha256,
+        environment_binding_sha256.clone(),
+    ) {
+        Ok(lease) => lease,
+        Err(evidence) => {
+            let destroyed = environment.destroy_after_create().is_ok();
+            return evidence
+                .with_launcher_environment_destruction(destroyed)
+                .diagnostic();
+        }
+    };
+    let traced_c = launch_target_desktop_loader_control_cell_with_shared_environment(
+        same_access_token,
+        same_access_envelope,
+        same_access_snapshot,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+        LoaderControlMatrixCellV4::PRODUCTION,
+        &mut environment,
+        admitted_environment,
+        LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+        None,
+        Some((
+            &mut lease,
+            super::session_broker::BrokerPassiveTraceCellV1::CanonicalSameAccess,
+            environment_binding_sha256,
+        )),
+    );
+    let after_c_inventory = environment.inventory();
+    let after_c_observation = shared_environment_observation(
+        admitted_environment,
+        &after_c_inventory,
+        "broker-trace-after-c",
+    );
+    let traced_c_outcome =
+        loader_environment_canary_outcome("canonical-same-access/broker-passive-trace", &traced_c);
+    let traced_f = if after_c_observation.stable()
+        && traced_c_outcome.outcome == LoaderControlMatrixOutcomeKindV6::Passed
+        && lease.ready_for_target_user()
+    {
+        Some(
+            launch_target_desktop_loader_control_cell_with_shared_environment(
+                target_user_token,
+                target_user_envelope,
+                target_user_snapshot,
+                exact_desktop,
+                launch_context,
+                association_preflight,
+                holder_identity,
+                LoaderControlMatrixCellV4::PRODUCTION,
+                &mut environment,
+                admitted_environment,
+                LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+                None,
+                Some((
+                    &mut lease,
+                    super::session_broker::BrokerPassiveTraceCellV1::TargetUser,
+                    broker_passive_trace_environment_observation_sha256(
+                        admitted_environment,
+                        &after_c_observation,
+                        "broker-trace-after-c",
+                    ),
+                )),
+            ),
+        )
+    } else {
+        None
+    };
+    let after_f_inventory = environment.inventory();
+    let after_f_observation = shared_environment_observation(
+        admitted_environment,
+        &after_f_inventory,
+        "broker-trace-after-f",
+    );
+    let after_profile = observe_loader_profile(profile, profile_sid);
+    let preserved_fields = [
+        "environment_classification",
+        "environment_sha256",
+        "environment_keys_sha256",
+        "environment_units",
+        "environment_entries",
+        "environment_profile_loaded",
+        "source_authentication_id",
+        "source_session_id",
+        "desktop_sha256",
+        "binary_sha256",
+        "current_directory_sha256",
+        "command_semantics_sha256",
+        "command_dynamic_fields",
+        "creation_flags",
+        "job_membership_attested",
+        "object_security_authority",
+        "process_policy_sha256",
+        "thread_policy_sha256",
+        "process_object_live_sha256",
+        "thread_object_live_sha256",
+        "descriptor_readback",
+    ];
+    let f_outcome = traced_f.as_ref().map(|result| {
+        loader_environment_canary_outcome("target-user/broker-passive-trace", result)
+    });
+    let projections_exact = traced_f.as_ref().is_some_and(|traced_f| {
+        preserved_fields.iter().all(|field| {
+            loader_common_result_field(original_same_access, &traced_c, field).is_ok()
+                && loader_common_result_field(original_target_user, traced_f, field).is_ok()
+                && loader_common_result_field(&traced_c, traced_f, field).is_ok()
+        })
+    });
+    let after_environment_sha256 = broker_passive_trace_environment_observation_sha256(
+        admitted_environment,
+        &after_f_observation,
+        "broker-trace-after-f",
+    );
+    let pair_evidence = super::session_broker::BrokerPassiveTracePairEvidenceV1::new(
+        traced_c_outcome.outcome.diagnostic(),
+        traced_c_outcome.native_status,
+        traced_c_outcome.failure_phase,
+        traced_c_outcome.detail_sha256.clone(),
+        f_outcome
+            .as_ref()
+            .map_or("not-run", |outcome| outcome.outcome.diagnostic()),
+        f_outcome.as_ref().and_then(|outcome| outcome.native_status),
+        f_outcome
+            .as_ref()
+            .map_or("not-run", |outcome| outcome.failure_phase),
+        f_outcome.as_ref().map_or_else(
+            || super::record::digest(b"broker passive trace target-user cell was not run"),
+            |outcome| outcome.detail_sha256.clone(),
+        ),
+        projections_exact,
+        after_c_observation.stable(),
+        after_f_observation.stable(),
+        before_profile.state == LoaderProfileHiveStateV1::AlreadyLoadedBorrowed,
+        before_profile == after_profile,
+        loader_control_cell_job_empty_attested(&traced_c),
+        traced_f
+            .as_ref()
+            .is_some_and(loader_control_cell_job_empty_attested),
+        broker_passive_trace_profile_observation_sha256(&before_profile, &after_profile),
+    );
+    let pair_evidence = pair_evidence.unwrap_or_else(|error| {
+        super::session_broker::BrokerPassiveTracePairEvidenceV1::invalid(error.as_bytes())
+    });
+    let evidence = lease.finish(pair_evidence, after_environment_sha256);
+    let destroyed = environment.destroy_after_create().is_ok();
+    evidence
+        .with_launcher_environment_destruction(destroyed)
+        .diagnostic()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6358,6 +6626,7 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
         &admitted_environment,
         LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
         None,
+        None,
     );
     let after_baseline_environment = shared_environment.inventory();
     let after_baseline_observation = shared_environment_observation(
@@ -6394,6 +6663,7 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
         &mut shared_environment,
         &admitted_environment,
         LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+        None,
         None,
     );
     let after_comparison_environment = shared_environment.inventory();
@@ -6440,6 +6710,7 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
                 super::access_trace::PassiveAccessLocalizationCellV1::CanonicalSameAccess,
             )
         }),
+        None,
     );
     let after_same_access_environment = shared_environment.inventory();
     let after_same_access_observation = shared_environment_observation(
@@ -6477,6 +6748,7 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
         &mut shared_environment,
         &admitted_environment,
         LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+        None,
         None,
     );
     let after_logon_environment = shared_environment.inventory();
@@ -6516,6 +6788,7 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
         &mut shared_environment,
         &admitted_environment,
         LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+        None,
         None,
     );
     let after_authenticated_users_environment = shared_environment.inventory();
@@ -6562,6 +6835,7 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
                 super::access_trace::PassiveAccessLocalizationCellV1::TargetUser,
             )
         }),
+        None,
     );
     let after_target_user_environment = shared_environment.inventory();
     let after_target_user_observation = shared_environment_observation(
@@ -6703,6 +6977,7 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
             &admitted_environment,
             LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
             None,
+            None,
         );
         let after_debug_c_environment = shared_environment.inventory();
         let after_debug_c_observation = shared_environment_observation(
@@ -6726,6 +7001,7 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
                 &mut shared_environment,
                 &admitted_environment,
                 LoaderObjectSecurityAuthorityV1::LauncherExplicitRestrictingSidCanary,
+                None,
                 None,
             );
             let after_environment = shared_environment.inventory();
@@ -7057,6 +7333,25 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
         Some(evidence) => evidence.diagnostic(),
         None => super::session_broker::trace_session_capability_not_run_diagnostic().to_owned(),
     };
+    let broker_passive_trace_diagnostic = run_broker_passive_trace_pair(
+        trace_session_capability_evidence.as_ref(),
+        &admitted_environment,
+        tokens.baseline.raw(),
+        same_access_restricted.raw(),
+        &same_access_envelope,
+        &same_access_snapshot,
+        target_user_restricted.raw(),
+        &target_user_envelope,
+        &target_user_snapshot,
+        &same_access,
+        &target_user,
+        tokens.profile.raw(),
+        &baseline_envelope.user_sid,
+        exact_desktop,
+        launch_context,
+        association_preflight,
+        holder_identity,
+    );
     let common = common_fields
         .iter()
         .filter_map(|result| result.as_ref().ok())
@@ -7110,6 +7405,7 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
                 logon_state,
                 authenticated_users_state,
                 &trace_session_capability_diagnostic,
+                &broker_passive_trace_diagnostic,
             ),
             tokens.source_binding_sha256,
             tokens.restriction_presence_binding_sha256,
@@ -7877,9 +8173,32 @@ pub(crate) fn render_bounded_loader_trace_session_capability_for_test(
         "test",
         "test",
         trace_session_capability_diagnostic,
+        &super::session_broker::BrokerPassiveTraceEvidenceV1::not_run().diagnostic(),
     );
     super::record::pretarget_rejection(
         "MCSEALED-WINDOWS-LOADER-TRACE-CAPABILITY-BOUND-TEST",
+        format!("{prefix} {trailing_observer_diagnostic}"),
+    )
+    .detail
+}
+
+#[cfg(test)]
+pub(crate) fn render_bounded_loader_broker_passive_trace_for_test(
+    trace_session_capability_diagnostic: &str,
+    broker_passive_trace_diagnostic: &str,
+    trailing_observer_diagnostic: &str,
+) -> String {
+    let prefix = loader_restriction_presence_capability_prefix(
+        "test",
+        "test",
+        "test",
+        "test",
+        "test",
+        trace_session_capability_diagnostic,
+        broker_passive_trace_diagnostic,
+    );
+    super::record::pretarget_rejection(
+        "MCSEALED-WINDOWS-LOADER-BROKER-PASSIVE-TRACE-BOUND-TEST",
         format!("{prefix} {trailing_observer_diagnostic}"),
     )
     .detail
@@ -9976,6 +10295,7 @@ fn launch_target_desktop_loader_control_cell_with_environment_authority(
         LoaderCellEnvironmentSourceV6::Create(environment_authority),
         object_security_authority,
         None,
+        None,
     )
 }
 
@@ -9996,6 +10316,11 @@ fn launch_target_desktop_loader_control_cell_with_shared_environment(
         &super::access_trace::PassiveAccessLocalizationObserverV1,
         super::access_trace::PassiveAccessLocalizationCellV1,
     )>,
+    broker_passive_trace: Option<(
+        &mut super::session_broker::BrokerPassiveTraceLease,
+        super::session_broker::BrokerPassiveTraceCellV1,
+        String,
+    )>,
 ) -> Result<String, TargetDesktopLeaseCreateError> {
     launch_target_desktop_loader_control_cell_with_environment_source(
         target_token,
@@ -10012,6 +10337,7 @@ fn launch_target_desktop_loader_control_cell_with_shared_environment(
         },
         object_security_authority,
         passive_access_localization,
+        broker_passive_trace,
     )
 }
 
@@ -10030,6 +10356,11 @@ fn launch_target_desktop_loader_control_cell_with_environment_source(
     passive_access_localization: Option<(
         &super::access_trace::PassiveAccessLocalizationObserverV1,
         super::access_trace::PassiveAccessLocalizationCellV1,
+    )>,
+    broker_passive_trace: Option<(
+        &mut super::session_broker::BrokerPassiveTraceLease,
+        super::session_broker::BrokerPassiveTraceCellV1,
+        String,
     )>,
 ) -> Result<String, TargetDesktopLeaseCreateError> {
     super::token::require_thread_token_absent(unsafe { GetCurrentThread() }).map_err(|error| {
@@ -10090,6 +10421,7 @@ fn launch_target_desktop_loader_control_cell_with_environment_source(
         environment_source,
         object_security_authority,
         passive_access_localization,
+        broker_passive_trace,
     );
     let child_outcome_sha256 = match &result {
         Ok(evidence) => {
@@ -10190,6 +10522,11 @@ fn launch_target_desktop_loader_control_cell_inner(
     passive_access_localization: Option<(
         &super::access_trace::PassiveAccessLocalizationObserverV1,
         super::access_trace::PassiveAccessLocalizationCellV1,
+    )>,
+    broker_passive_trace: Option<(
+        &mut super::session_broker::BrokerPassiveTraceLease,
+        super::session_broker::BrokerPassiveTraceCellV1,
+        String,
     )>,
 ) -> Result<String, TargetDesktopLeaseCreateError> {
     let loader_debug_observer = matrix_cell.debugger.observer();
@@ -10501,6 +10838,22 @@ fn launch_target_desktop_loader_control_cell_inner(
                 TargetDesktopLeaseCreateError::from(error)
                     .at_loader_phase(LoaderLaunchFailurePhaseV1::PreResumeAttestation)
             })?;
+        let mut broker_passive_trace_subject = match broker_passive_trace {
+            Some((lease, cell, environment_observation_sha256)) => Some(
+                lease
+                    .arm_suspended_child(
+                        cell,
+                        control_process.raw(),
+                        control_identity.clone(),
+                        environment_observation_sha256,
+                    )
+                    .map_err(|error| {
+                        TargetDesktopLeaseCreateError::from(error)
+                            .at_loader_phase(LoaderLaunchFailurePhaseV1::PreResumeAttestation)
+                    })?,
+            ),
+            None => None,
+        };
         if unsafe { ResumeThread(control_thread.raw()) } != 1 {
             let error = format!(
                 "loader-control primary thread did not resume exactly once: {}",
@@ -10705,6 +11058,12 @@ fn launch_target_desktop_loader_control_cell_inner(
                 )
                 .at_loader_phase(LoaderLaunchFailurePhaseV1::PostLoaderReadyContainment));
             }
+            if let Some(subject) = broker_passive_trace_subject.take() {
+                subject.finish().map_err(|error| {
+                    TargetDesktopLeaseCreateError::from(error)
+                        .at_loader_phase(LoaderLaunchFailurePhaseV1::PostLoaderReadyContainment)
+                })?;
+            }
             return Ok(format!(
                 "loader_control_cell=v5 cell={} debug_observer={} object_security_authority={} process_policy_sha256={} thread_policy_sha256={} target_logon_trustee={} restricting_trustee_count={} phase=loader-ready-contained {} {} {} descriptor_readback=true job_empty=true workload_executed=false qualification_promoted=false{}",
                 matrix_cell.diagnostic(),
@@ -10754,6 +11113,12 @@ fn launch_target_desktop_loader_control_cell_inner(
         }
         if !control_job.wait_empty(Instant::now() + Duration::from_secs(30))? {
             return Err("loader-control Job did not become empty".to_owned().into());
+        }
+        if let Some(subject) = broker_passive_trace_subject.take() {
+            subject.finish().map_err(|error| {
+                TargetDesktopLeaseCreateError::from(error)
+                    .at_loader_phase(LoaderLaunchFailurePhaseV1::ExitDrain)
+            })?;
         }
         Ok(format!(
             "loader_control_cell=v5 cell={} debug_observer={} object_security_authority={} process_policy_sha256={} thread_policy_sha256={} target_logon_trustee={} restricting_trustee_count={} phase=loader-ready-and-clean-exit exit=0x00000000 exit_status_symbol=STATUS_SUCCESS {} {} {}{}",

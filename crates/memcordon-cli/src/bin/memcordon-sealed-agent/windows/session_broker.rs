@@ -33,7 +33,7 @@ use windows_sys::Win32::System::Threading::{
 
 use super::pipe::OwnedHandle;
 
-pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;
+pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 7;
 const BROKER_ROLE: u8 = 3;
 const BROKER_TRANSACTION_DEADLINE: Duration = Duration::from_secs(30);
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
@@ -66,7 +66,10 @@ pub(crate) const BROKER_FAILURE_SOURCE_PRIVILEGE_NORMALIZATION: u32 = 0x4d43_071
 static BROKER_TRANSACTION_LEASE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 const LOADER_SNAPS_SCHEMA_VERSION: u32 = 2;
 const TRACE_SESSION_CAPABILITY_SCHEMA_VERSION: u32 = 1;
+const BROKER_PASSIVE_TRACE_SCHEMA_VERSION: u32 = 1;
+const STATUS_ACCESS_DENIED: i32 = 0xc000_0022_u32 as i32;
 const TRACE_SESSION_CAPABILITY_DEADLINE: Duration = Duration::from_secs(5);
+const BROKER_PASSIVE_TRACE_DEADLINE: Duration = Duration::from_secs(180);
 const LOADER_SNAPS_REGISTRY_PARENT: &str =
     r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
 const LOADER_SNAPS_IMAGE_NAME: &str = "memcordon-target-desktop-bootstrap.exe";
@@ -1863,10 +1866,825 @@ impl TraceSessionCapabilityEvidenceV1 {
             Self::REDACTION,
         )
     }
+
+    pub(crate) fn broker_passive_trace_binding_sha256(&self) -> Option<String> {
+        let receipt = self.receipt.as_ref()?;
+        if self.retirement != "retired"
+            || self.failure_stage.is_some()
+            || self.retirement_failure_sha256.is_some()
+            || receipt.state != TraceSessionCapabilityStateV1::BrokerSessionAvailable
+            || receipt.start_status != ERROR_SUCCESS
+            || !receipt.session_created
+            || !receipt.stop_attempted
+            || receipt.stop_status != Some(ERROR_SUCCESS)
+            || receipt.cleanup_count != 1
+            || !receipt.session_absence_proven
+            || !receipt.authority_equal
+            || receipt.deadline_exceeded
+            || receipt.provider_enable_attempted
+            || receipt.consumer_opened
+            || receipt.process_trace_started
+            || receipt.child_bound
+            || receipt.events_collected != 0
+        {
+            return None;
+        }
+        let mut material = b"memcordon-broker-passive-trace-capability-binding-v1\0".to_vec();
+        for digest in [
+            &receipt.trigger_sha256,
+            &receipt.request_binding_sha256,
+            &receipt.receipt_sha256,
+            &receipt.transaction_sha256,
+            &receipt.broker_source_sha256,
+            &receipt.authority_before_sha256,
+            &receipt.authority_after_sha256,
+        ] {
+            super::record::validate_attempt_id(digest).ok()?;
+            material.extend_from_slice(digest.as_bytes());
+        }
+        material.extend_from_slice(&receipt.broker_identity.process_id.to_le_bytes());
+        material.extend_from_slice(&receipt.broker_identity.creation_time_100ns.to_le_bytes());
+        Some(super::record::digest(&material))
+    }
 }
 
 pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {
     "broker_trace_session_capability=v1 state=not-run broker_receipt_state=none trigger=none trigger_sha256=none request_binding_sha256=none receipt_sha256=none transaction_sha256=none broker_source_sha256=none broker_pid=0 broker_creation_time_100ns=0 authority_before_sha256=none authority_after_sha256=none session_name_sha256=none start_status=none session_created=false stop_attempted=false stop_status=none cleanup_count=0 session_absence_proven=false retirement=not-run elapsed_ms=0 deadline_exceeded=false failure_stage=none failure_sha256=none retirement_failure_sha256=none provider_enable_attempted=false consumer_opened=false process_trace_started=false child_bound=false events_collected=0 requested_access_available=false exact_resource_identified=false acl_fix_identified=false primary_failure=original-a release_sent=false workload_executed=false qualification_promoted=false session_name_redacted=true transaction_nonce_redacted=true broker_source_values_redacted=true token_values_redacted=true object_values_redacted=true"
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum BrokerPassiveTraceCellV1 {
+    CanonicalSameAccess,
+    TargetUser,
+}
+
+impl BrokerPassiveTraceCellV1 {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::CanonicalSameAccess => "canonical-same-access",
+            Self::TargetUser => "target-user-singleton",
+        }
+    }
+
+    const fn access_trace_cell(self) -> super::access_trace::PassiveAccessLocalizationCellV1 {
+        match self {
+            Self::CanonicalSameAccess => {
+                super::access_trace::PassiveAccessLocalizationCellV1::CanonicalSameAccess
+            }
+            Self::TargetUser => super::access_trace::PassiveAccessLocalizationCellV1::TargetUser,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BrokerPassiveTraceArmRequestV1 {
+    trace_schema_version: u32,
+    broker_schema_version: u32,
+    start_nonce: String,
+    challenge: String,
+    transaction_nonce: String,
+    launcher_identity: WindowsProcessIdentityV1,
+    broker_identity: WindowsProcessIdentityV1,
+    broker_source_sha256: String,
+    capability_binding_sha256: String,
+    environment_binding_sha256: String,
+    provider_sha256: String,
+    limits_sha256: String,
+    keyword_mask: u64,
+    create_event_id: u16,
+    create_versions: Vec<u8>,
+    operation_end_event_id: u16,
+    operation_end_version: u8,
+    ephemeral_ci: bool,
+    release_sent: bool,
+    workload_executed: bool,
+    qualification_promoted: bool,
+    request_binding_sha256: String,
+}
+
+impl BrokerPassiveTraceArmRequestV1 {
+    fn calculated_sha256(&self) -> Result<String, String> {
+        let mut copy = self.clone();
+        copy.request_binding_sha256.clear();
+        let mut material = b"memcordon-broker-passive-trace-arm-request-v1\0".to_vec();
+        material.extend(serde_json::to_vec(&copy).map_err(|error| error.to_string())?);
+        Ok(super::record::digest(&material))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BrokerPassiveTraceReadyReceiptV1 {
+    trace_schema_version: u32,
+    broker_schema_version: u32,
+    request_binding_sha256: String,
+    transaction_sha256: String,
+    broker_identity: WindowsProcessIdentityV1,
+    broker_source_sha256: String,
+    authority_before_sha256: String,
+    session_name_sha256: String,
+    session_start_status: u32,
+    provider_enable_status: u32,
+    consumer_open_status: u32,
+    consumer_ready_status: u32,
+    provider_enabled: bool,
+    consumer_opened: bool,
+    consumer_ready: bool,
+    ready_receipt_sha256: String,
+}
+
+impl BrokerPassiveTraceReadyReceiptV1 {
+    fn seal(mut self) -> Result<Self, String> {
+        self.ready_receipt_sha256.clear();
+        let mut material = b"memcordon-broker-passive-trace-ready-receipt-v1\0".to_vec();
+        material.extend(serde_json::to_vec(&self).map_err(|error| error.to_string())?);
+        self.ready_receipt_sha256 = super::record::digest(&material);
+        Ok(self)
+    }
+
+    fn validate_seal(&self) -> Result<(), String> {
+        if self.clone().seal()?.ready_receipt_sha256 != self.ready_receipt_sha256 {
+            return Err("broker passive trace ready receipt seal is invalid".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BrokerPassiveTraceSubjectArmV1 {
+    trace_schema_version: u32,
+    request_binding_sha256: String,
+    transaction_sha256: String,
+    ordinal: u32,
+    cell: BrokerPassiveTraceCellV1,
+    process_handle: u64,
+    process_identity: WindowsProcessIdentityV1,
+    environment_observation_sha256: String,
+    cell_binding_sha256: String,
+    frame_sha256: String,
+}
+
+impl BrokerPassiveTraceSubjectArmV1 {
+    fn seal(mut self) -> Result<Self, String> {
+        self.frame_sha256.clear();
+        let mut material = b"memcordon-broker-passive-trace-subject-arm-v1\0".to_vec();
+        material.extend(serde_json::to_vec(&self).map_err(|error| error.to_string())?);
+        self.frame_sha256 = super::record::digest(&material);
+        Ok(self)
+    }
+
+    fn validate_seal(&self) -> Result<(), String> {
+        if self.clone().seal()?.frame_sha256 != self.frame_sha256 {
+            return Err("broker passive trace subject-arm seal is invalid".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn broker_passive_trace_cell_binding_sha256(
+    request_binding_sha256: &str,
+    ordinal: u32,
+    cell: BrokerPassiveTraceCellV1,
+    process_identity: &WindowsProcessIdentityV1,
+    environment_observation_sha256: &str,
+) -> String {
+    let mut material = b"memcordon-broker-passive-trace-cell-v1\0".to_vec();
+    material.extend_from_slice(request_binding_sha256.as_bytes());
+    material.extend_from_slice(&ordinal.to_le_bytes());
+    material.extend_from_slice(cell.diagnostic().as_bytes());
+    material.extend_from_slice(&process_identity.process_id.to_le_bytes());
+    material.extend_from_slice(&process_identity.creation_time_100ns.to_le_bytes());
+    material.extend_from_slice(environment_observation_sha256.as_bytes());
+    super::record::digest(&material)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BrokerPassiveTraceSubjectReceiptV1 {
+    trace_schema_version: u32,
+    request_binding_sha256: String,
+    transaction_sha256: String,
+    ordinal: u32,
+    cell: BrokerPassiveTraceCellV1,
+    process_identity: WindowsProcessIdentityV1,
+    cell_binding_sha256: String,
+    stage: String,
+    flush_status: Option<u32>,
+    drain_requested: bool,
+    drain_armed: bool,
+    drain_acknowledged: bool,
+    pending_empty: bool,
+    drain_detail_sha256: String,
+    receipt_sha256: String,
+}
+
+impl BrokerPassiveTraceSubjectReceiptV1 {
+    fn seal(mut self) -> Result<Self, String> {
+        self.receipt_sha256.clear();
+        let mut material = b"memcordon-broker-passive-trace-subject-receipt-v1\0".to_vec();
+        material.extend(serde_json::to_vec(&self).map_err(|error| error.to_string())?);
+        self.receipt_sha256 = super::record::digest(&material);
+        Ok(self)
+    }
+
+    fn validate_seal(&self) -> Result<(), String> {
+        if self.clone().seal()?.receipt_sha256 != self.receipt_sha256 {
+            return Err("broker passive trace subject receipt seal is invalid".to_owned());
+        }
+        Ok(())
+    }
+
+    fn valid_ready_for(&self, subject: &BrokerPassiveTraceSubjectArmV1) -> bool {
+        self.validate_seal().is_ok()
+            && self.trace_schema_version == BROKER_PASSIVE_TRACE_SCHEMA_VERSION
+            && self.request_binding_sha256 == subject.request_binding_sha256
+            && self.transaction_sha256 == subject.transaction_sha256
+            && self.ordinal == subject.ordinal
+            && self.cell == subject.cell
+            && self.process_identity == subject.process_identity
+            && self.cell_binding_sha256 == subject.cell_binding_sha256
+            && self.stage == "subject-ready"
+            && self.flush_status.is_none()
+            && !self.drain_requested
+            && !self.drain_armed
+            && !self.drain_acknowledged
+            && !self.pending_empty
+            && self.drain_detail_sha256 == "none"
+    }
+
+    fn valid_finished_for(&self, subject: &BrokerPassiveTraceSubjectArmV1) -> bool {
+        self.validate_seal().is_ok()
+            && self.trace_schema_version == BROKER_PASSIVE_TRACE_SCHEMA_VERSION
+            && self.request_binding_sha256 == subject.request_binding_sha256
+            && self.transaction_sha256 == subject.transaction_sha256
+            && self.ordinal == subject.ordinal
+            && self.cell == subject.cell
+            && self.process_identity == subject.process_identity
+            && self.cell_binding_sha256 == subject.cell_binding_sha256
+            && self.stage == "subject-finished-drained"
+            && self.flush_status == Some(0)
+            && self.drain_requested
+            && self.drain_armed
+            && self.drain_acknowledged
+            && self.pending_empty
+            && self.drain_detail_sha256 == "none"
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BrokerPassiveTraceSubjectFinishV1 {
+    trace_schema_version: u32,
+    request_binding_sha256: String,
+    transaction_sha256: String,
+    ordinal: u32,
+    cell: BrokerPassiveTraceCellV1,
+    cell_binding_sha256: String,
+    frame_sha256: String,
+}
+
+impl BrokerPassiveTraceSubjectFinishV1 {
+    fn seal(mut self) -> Result<Self, String> {
+        self.frame_sha256.clear();
+        let mut material = b"memcordon-broker-passive-trace-subject-finish-v1\0".to_vec();
+        material.extend(serde_json::to_vec(&self).map_err(|error| error.to_string())?);
+        self.frame_sha256 = super::record::digest(&material);
+        Ok(self)
+    }
+
+    fn validate_seal(&self) -> Result<(), String> {
+        if self.clone().seal()?.frame_sha256 != self.frame_sha256 {
+            return Err("broker passive trace subject-finish seal is invalid".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BrokerPassiveTracePairEvidenceV1 {
+    canonical_outcome: String,
+    canonical_status: Option<i32>,
+    canonical_phase: String,
+    canonical_detail_sha256: String,
+    target_user_outcome: String,
+    target_user_status: Option<i32>,
+    target_user_phase: String,
+    target_user_detail_sha256: String,
+    projections_exact: bool,
+    after_c_environment_stable: bool,
+    after_f_environment_stable: bool,
+    profile_before_borrowed: bool,
+    profile_after_equal: bool,
+    canonical_job_empty: bool,
+    target_user_job_empty: bool,
+    profile_observation_sha256: String,
+    pair_binding_sha256: String,
+}
+
+impl BrokerPassiveTracePairEvidenceV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        canonical_outcome: &str,
+        canonical_status: Option<i32>,
+        canonical_phase: &str,
+        canonical_detail_sha256: String,
+        target_user_outcome: &str,
+        target_user_status: Option<i32>,
+        target_user_phase: &str,
+        target_user_detail_sha256: String,
+        projections_exact: bool,
+        after_c_environment_stable: bool,
+        after_f_environment_stable: bool,
+        profile_before_borrowed: bool,
+        profile_after_equal: bool,
+        canonical_job_empty: bool,
+        target_user_job_empty: bool,
+        profile_observation_sha256: String,
+    ) -> Result<Self, String> {
+        let mut evidence = Self {
+            canonical_outcome: canonical_outcome.to_owned(),
+            canonical_status,
+            canonical_phase: canonical_phase.to_owned(),
+            canonical_detail_sha256,
+            target_user_outcome: target_user_outcome.to_owned(),
+            target_user_status,
+            target_user_phase: target_user_phase.to_owned(),
+            target_user_detail_sha256,
+            projections_exact,
+            after_c_environment_stable,
+            after_f_environment_stable,
+            profile_before_borrowed,
+            profile_after_equal,
+            canonical_job_empty,
+            target_user_job_empty,
+            profile_observation_sha256,
+            pair_binding_sha256: String::new(),
+        };
+        evidence.pair_binding_sha256 = evidence.calculated_sha256()?;
+        Ok(evidence)
+    }
+
+    pub(crate) fn invalid(detail: impl AsRef<[u8]>) -> Self {
+        let detail_sha256 = super::record::digest(detail.as_ref());
+        Self::new(
+            "invalid",
+            None,
+            "none",
+            detail_sha256.clone(),
+            "not-run",
+            None,
+            "none",
+            detail_sha256,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            super::record::digest(b"broker passive trace invalid pair evidence"),
+        )
+        .expect("fixed invalid broker passive trace pair evidence must seal")
+    }
+
+    fn calculated_sha256(&self) -> Result<String, String> {
+        for digest in [
+            &self.canonical_detail_sha256,
+            &self.target_user_detail_sha256,
+            &self.profile_observation_sha256,
+        ] {
+            super::record::validate_attempt_id(digest)?;
+        }
+        let mut copy = self.clone();
+        copy.pair_binding_sha256.clear();
+        let mut material = b"memcordon-broker-passive-trace-pair-evidence-v1\0".to_vec();
+        material.extend(serde_json::to_vec(&copy).map_err(|error| error.to_string())?);
+        Ok(super::record::digest(&material))
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.calculated_sha256()? != self.pair_binding_sha256 {
+            return Err("broker passive trace pair evidence seal is invalid".to_owned());
+        }
+        Ok(())
+    }
+
+    fn reproduction_valid(&self) -> bool {
+        self.canonical_outcome == "passed"
+            && self.canonical_status.is_none()
+            && self.canonical_phase == "none"
+            && self.target_user_outcome == "failed"
+            && self.target_user_status == Some(STATUS_ACCESS_DENIED)
+            && self.target_user_phase == "post-resume-pre-loader-ready"
+    }
+
+    fn invariants_valid(&self) -> bool {
+        self.reproduction_valid()
+            && self.projections_exact
+            && self.after_c_environment_stable
+            && self.after_f_environment_stable
+            && self.profile_before_borrowed
+            && self.profile_after_equal
+            && self.canonical_job_empty
+            && self.target_user_job_empty
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BrokerPassiveTraceFinishRequestV1 {
+    trace_schema_version: u32,
+    request_binding_sha256: String,
+    transaction_sha256: String,
+    reproduction_valid: bool,
+    invariants_valid: bool,
+    pair_evidence: BrokerPassiveTracePairEvidenceV1,
+    canonical_drain_receipt_sha256: String,
+    target_user_drain_receipt_sha256: String,
+    after_target_environment_sha256: String,
+    frame_sha256: String,
+}
+
+impl BrokerPassiveTraceFinishRequestV1 {
+    fn seal(mut self) -> Result<Self, String> {
+        self.frame_sha256.clear();
+        let mut material = b"memcordon-broker-passive-trace-finish-v1\0".to_vec();
+        material.extend(serde_json::to_vec(&self).map_err(|error| error.to_string())?);
+        self.frame_sha256 = super::record::digest(&material);
+        Ok(self)
+    }
+
+    fn validate_seal(&self) -> Result<(), String> {
+        if self.clone().seal()?.frame_sha256 != self.frame_sha256 {
+            return Err("broker passive trace finish seal is invalid".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BrokerPassiveTraceFinalReceiptV1 {
+    trace_schema_version: u32,
+    broker_schema_version: u32,
+    request_binding_sha256: String,
+    transaction_sha256: String,
+    broker_identity: WindowsProcessIdentityV1,
+    broker_source_sha256: String,
+    capability_binding_sha256: String,
+    environment_binding_sha256: String,
+    provider_sha256: String,
+    limits_sha256: String,
+    keyword_mask: u64,
+    create_event_id: u16,
+    create_versions: Vec<u8>,
+    operation_end_event_id: u16,
+    operation_end_version: u8,
+    session_name_sha256: String,
+    session_start_status: u32,
+    provider_enable_status: u32,
+    consumer_open_status: u32,
+    consumer_ready_status: u32,
+    authority_before_sha256: String,
+    authority_after_sha256: String,
+    authority_equal: bool,
+    lifecycle_sha256: String,
+    after_target_environment_sha256: String,
+    reproduction_valid: bool,
+    invariants_valid: bool,
+    pair_evidence: BrokerPassiveTracePairEvidenceV1,
+    canonical_drain_receipt_sha256: String,
+    target_user_drain_receipt_sha256: String,
+    elapsed_ms: u64,
+    deadline_exceeded: bool,
+    evidence: super::access_trace::BrokerPassiveAccessEvidenceV1,
+    receipt_sha256: String,
+}
+
+impl BrokerPassiveTraceFinalReceiptV1 {
+    fn seal(mut self) -> Result<Self, String> {
+        self.receipt_sha256.clear();
+        let mut material = b"memcordon-broker-passive-trace-final-receipt-v1\0".to_vec();
+        material.extend(serde_json::to_vec(&self).map_err(|error| error.to_string())?);
+        self.receipt_sha256 = super::record::digest(&material);
+        Ok(self)
+    }
+
+    fn validate_seal(&self) -> Result<(), String> {
+        if self.clone().seal()?.receipt_sha256 != self.receipt_sha256 {
+            return Err("broker passive trace final receipt seal is invalid".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BrokerPassiveTraceFailureV1 {
+    trace_schema_version: u32,
+    broker_schema_version: u32,
+    request_binding_sha256: String,
+    transaction_sha256: String,
+    broker_identity: WindowsProcessIdentityV1,
+    broker_source_sha256: String,
+    capability_binding_sha256: String,
+    environment_binding_sha256: String,
+    provider_sha256: String,
+    limits_sha256: String,
+    authority_before_sha256: String,
+    authority_after_sha256: String,
+    authority_equal: bool,
+    elapsed_ms: u64,
+    deadline_exceeded: bool,
+    evidence: super::access_trace::BrokerPassiveAccessEvidenceV1,
+    stage: String,
+    detail_sha256: String,
+    receipt_sha256: String,
+}
+
+impl BrokerPassiveTraceFailureV1 {
+    fn seal(mut self) -> Result<Self, String> {
+        self.receipt_sha256.clear();
+        let mut material = b"memcordon-broker-passive-trace-failure-v1\0".to_vec();
+        material.extend(serde_json::to_vec(&self).map_err(|error| error.to_string())?);
+        self.receipt_sha256 = super::record::digest(&material);
+        Ok(self)
+    }
+
+    fn validate_seal(&self) -> Result<(), String> {
+        if self.clone().seal()?.receipt_sha256 != self.receipt_sha256 {
+            return Err("broker passive trace failure receipt seal is invalid".to_owned());
+        }
+        Ok(())
+    }
+
+    fn valid_for_diagnostic(&self) -> bool {
+        self.validate_seal().is_ok()
+            && self.trace_schema_version == BROKER_PASSIVE_TRACE_SCHEMA_VERSION
+            && self.broker_schema_version == SESSION_BROKER_SCHEMA_VERSION
+            && self.authority_equal == (self.authority_before_sha256 == self.authority_after_sha256)
+            && self.authority_before_sha256 == self.broker_source_sha256
+            && self.deadline_exceeded
+                == (self.elapsed_ms > BROKER_PASSIVE_TRACE_DEADLINE.as_millis() as u64)
+            && matches!(self.stage.as_str(), "observer-start" | "transaction")
+            && [
+                &self.request_binding_sha256,
+                &self.transaction_sha256,
+                &self.broker_source_sha256,
+                &self.capability_binding_sha256,
+                &self.environment_binding_sha256,
+                &self.provider_sha256,
+                &self.limits_sha256,
+                &self.authority_before_sha256,
+                &self.authority_after_sha256,
+                &self.detail_sha256,
+                &self.receipt_sha256,
+            ]
+            .iter()
+            .all(|digest| super::record::validate_attempt_id(digest).is_ok())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BrokerPassiveTraceRequestProvenanceV1 {
+    request_binding_sha256: String,
+    transaction_sha256: String,
+    broker_identity: WindowsProcessIdentityV1,
+    broker_source_sha256: String,
+    capability_binding_sha256: String,
+    environment_binding_sha256: String,
+    provider_sha256: String,
+    limits_sha256: String,
+}
+
+impl BrokerPassiveTraceRequestProvenanceV1 {
+    fn from_request(request: &BrokerPassiveTraceArmRequestV1) -> Self {
+        Self {
+            request_binding_sha256: request.request_binding_sha256.clone(),
+            transaction_sha256: super::record::digest(request.transaction_nonce.as_bytes()),
+            broker_identity: request.broker_identity.clone(),
+            broker_source_sha256: request.broker_source_sha256.clone(),
+            capability_binding_sha256: request.capability_binding_sha256.clone(),
+            environment_binding_sha256: request.environment_binding_sha256.clone(),
+            provider_sha256: request.provider_sha256.clone(),
+            limits_sha256: request.limits_sha256.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BrokerPassiveTraceEvidenceV1 {
+    final_receipt: Option<BrokerPassiveTraceFinalReceiptV1>,
+    failure_receipt: Option<BrokerPassiveTraceFailureV1>,
+    request_provenance: Option<BrokerPassiveTraceRequestProvenanceV1>,
+    launcher_environment_destroyed_once: bool,
+    retirement: &'static str,
+    failure_stage: &'static str,
+    failure_sha256: String,
+    retirement_failure_sha256: String,
+}
+
+impl BrokerPassiveTraceEvidenceV1 {
+    pub(crate) fn not_run() -> Self {
+        Self {
+            final_receipt: None,
+            failure_receipt: None,
+            request_provenance: None,
+            launcher_environment_destroyed_once: false,
+            retirement: "not-run",
+            failure_stage: "none",
+            failure_sha256: "none".to_owned(),
+            retirement_failure_sha256: "none".to_owned(),
+        }
+    }
+
+    pub(crate) fn invalid(stage: &'static str, detail: impl AsRef<[u8]>) -> Self {
+        broker_passive_trace_failure(stage, detail)
+    }
+
+    pub(crate) fn with_launcher_environment_destruction(mut self, destroyed_once: bool) -> Self {
+        self.launcher_environment_destroyed_once = destroyed_once;
+        self
+    }
+
+    pub(crate) fn diagnostic(&self) -> String {
+        let Some(receipt) = &self.final_receipt else {
+            if let Some(failure) = self
+                .failure_receipt
+                .as_ref()
+                .filter(|failure| failure.valid_for_diagnostic())
+            {
+                return format!(
+                    "broker_passive_access_localization=v1 state=invalid request_binding_sha256={} receipt_sha256={} transaction_sha256={} broker_pid={} broker_creation_time_100ns={} broker_source_sha256={} capability_binding_sha256={} environment_binding_sha256={} provider_sha256={} limits_sha256={} authority_before_sha256={} authority_after_sha256={} authority_equal={} lifecycle_sha256=unavailable after_target_environment_sha256=unavailable reproduction_valid=unavailable invariants_valid=unavailable elapsed_ms={} deadline_exceeded={} retirement={} failure_stage={} failure_sha256={} retirement_failure_sha256={} traced_environment_destroyed_once={} {} primary_failure=original-a session_name_redacted=true pipe_values_redacted=true nonce_values_redacted=true irp_values_redacted=true token_values_redacted=true object_values_redacted=true environment_values_redacted=true debugger_attached=false ifeo_changed=false sacl_changed=false acl_changed=false grant_created=false release_sent=false workload_executed=false qualification_promoted=false",
+                    failure.request_binding_sha256,
+                    failure.receipt_sha256,
+                    failure.transaction_sha256,
+                    failure.broker_identity.process_id,
+                    failure.broker_identity.creation_time_100ns,
+                    failure.broker_source_sha256,
+                    failure.capability_binding_sha256,
+                    failure.environment_binding_sha256,
+                    failure.provider_sha256,
+                    failure.limits_sha256,
+                    failure.authority_before_sha256,
+                    failure.authority_after_sha256,
+                    failure.authority_equal,
+                    failure.elapsed_ms,
+                    failure.deadline_exceeded,
+                    self.retirement,
+                    failure.stage,
+                    failure.detail_sha256,
+                    self.retirement_failure_sha256,
+                    self.launcher_environment_destroyed_once,
+                    failure.evidence.diagnostic_without_frontier(),
+                );
+            }
+            let provenance = self.request_provenance.as_ref();
+            return format!(
+                "broker_passive_access_localization=v1 state={} request_binding_sha256={} receipt_sha256=unavailable transaction_sha256={} broker_pid={} broker_creation_time_100ns={} broker_source_sha256={} capability_binding_sha256={} environment_binding_sha256={} provider_sha256={} limits_sha256={} lifecycle_sha256=unavailable after_target_environment_sha256=unavailable authority_equal=unavailable reproduction_valid=unavailable invariants_valid=unavailable retirement={} failure_stage={} failure_sha256={} retirement_failure_sha256={} traced_environment_destroyed_once={} coverage=kernel-file-create-operation-end/no-requested-access requested_access_available=false frontier=[] exact_resource_identified=false acl_fix_identified=false primary_failure=original-a session_name_redacted=true pipe_values_redacted=true nonce_values_redacted=true irp_values_redacted=true token_values_redacted=true object_values_redacted=true environment_values_redacted=true debugger_attached=false ifeo_changed=false sacl_changed=false acl_changed=false grant_created=false release_sent=false workload_executed=false qualification_promoted=false",
+                if self.retirement == "not-run" {
+                    "not-run"
+                } else {
+                    "invalid"
+                },
+                provenance.map_or("unavailable", |value| value.request_binding_sha256.as_str()),
+                provenance.map_or("unavailable", |value| value.transaction_sha256.as_str()),
+                provenance.map_or_else(
+                    || "unavailable".to_owned(),
+                    |value| value.broker_identity.process_id.to_string()
+                ),
+                provenance.map_or_else(
+                    || "unavailable".to_owned(),
+                    |value| value.broker_identity.creation_time_100ns.to_string()
+                ),
+                provenance.map_or("unavailable", |value| value.broker_source_sha256.as_str()),
+                provenance.map_or("unavailable", |value| value
+                    .capability_binding_sha256
+                    .as_str()),
+                provenance.map_or("unavailable", |value| value
+                    .environment_binding_sha256
+                    .as_str()),
+                provenance.map_or("unavailable", |value| value.provider_sha256.as_str()),
+                provenance.map_or("unavailable", |value| value.limits_sha256.as_str()),
+                self.retirement,
+                self.failure_stage,
+                self.failure_sha256,
+                self.retirement_failure_sha256,
+                self.launcher_environment_destroyed_once,
+            );
+        };
+        let admitted = self.retirement == "retired"
+            && self.launcher_environment_destroyed_once
+            && receipt.validate_seal().is_ok()
+            && receipt.authority_equal
+            && receipt.authority_before_sha256 == receipt.authority_after_sha256
+            && receipt.authority_before_sha256 == receipt.broker_source_sha256
+            && receipt.reproduction_valid
+            && receipt.invariants_valid
+            && receipt.pair_evidence.validate().is_ok()
+            && receipt.pair_evidence.reproduction_valid()
+            && receipt.pair_evidence.invariants_valid()
+            && receipt.capability_binding_sha256.len() == 64
+            && receipt.provider_sha256 == broker_passive_trace_provider_sha256()
+            && receipt.limits_sha256 == super::access_trace::broker_passive_trace_limits_sha256()
+            && receipt.keyword_mask == 0xc0
+            && receipt.create_event_id == 12
+            && receipt.create_versions == [0, 1]
+            && receipt.operation_end_event_id == 24
+            && receipt.operation_end_version == 0
+            && receipt.session_start_status == 0
+            && receipt.provider_enable_status == 0
+            && receipt.consumer_open_status == 0
+            && receipt.consumer_ready_status == 0
+            && receipt.elapsed_ms <= BROKER_PASSIVE_TRACE_DEADLINE.as_millis() as u64
+            && !receipt.deadline_exceeded
+            && super::record::validate_attempt_id(&receipt.lifecycle_sha256).is_ok()
+            && super::record::validate_attempt_id(&receipt.after_target_environment_sha256).is_ok()
+            && super::record::validate_attempt_id(&receipt.capability_binding_sha256).is_ok()
+            && super::record::validate_attempt_id(&receipt.environment_binding_sha256).is_ok()
+            && super::record::validate_attempt_id(&receipt.session_name_sha256).is_ok()
+            && super::record::validate_attempt_id(&receipt.canonical_drain_receipt_sha256).is_ok()
+            && super::record::validate_attempt_id(&receipt.target_user_drain_receipt_sha256)
+                .is_ok()
+            && receipt.evidence.admissible();
+        let state = if admitted {
+            receipt.evidence.classification()
+        } else {
+            "invalid"
+        };
+        let evidence_diagnostic = if admitted {
+            receipt.evidence.diagnostic()
+        } else {
+            receipt.evidence.diagnostic_without_frontier()
+        };
+        format!(
+            "broker_passive_access_localization=v1 state={} request_binding_sha256={} receipt_sha256={} transaction_sha256={} broker_pid={} broker_creation_time_100ns={} broker_source_sha256={} capability_binding_sha256={} environment_binding_sha256={} provider_sha256={} limits_sha256={} keyword_mask={:#x} create_event_id={} create_versions=0,1 operation_end_event_id={} operation_end_version={} session_name_sha256={} session_start_status={} provider_enable_status={} consumer_open_status={} consumer_ready_status={} authority_before_sha256={} authority_after_sha256={} authority_equal={} lifecycle_sha256={} canonical_drain_receipt_sha256={} target_user_drain_receipt_sha256={} pair_binding_sha256={} canonical_outcome={} canonical_status={} canonical_phase={} canonical_detail_sha256={} target_user_outcome={} target_user_status={} target_user_phase={} target_user_detail_sha256={} projections_exact={} after_c_environment_stable={} after_f_environment_stable={} profile_before_borrowed={} profile_after_equal={} profile_observation_sha256={} canonical_job_empty={} target_user_job_empty={} after_target_environment_sha256={} reproduction_valid={} invariants_valid={} elapsed_ms={} deadline_exceeded={} retirement={} failure_stage={} failure_sha256={} retirement_failure_sha256={} traced_environment_destroyed_once={} {} primary_failure=original-a session_name_redacted=true pipe_values_redacted=true nonce_values_redacted=true irp_values_redacted=true token_values_redacted=true object_values_redacted=true environment_values_redacted=true debugger_attached=false ifeo_changed=false sacl_changed=false acl_changed=false grant_created=false release_sent=false workload_executed=false qualification_promoted=false",
+            state,
+            receipt.request_binding_sha256,
+            receipt.receipt_sha256,
+            receipt.transaction_sha256,
+            receipt.broker_identity.process_id,
+            receipt.broker_identity.creation_time_100ns,
+            receipt.broker_source_sha256,
+            receipt.capability_binding_sha256,
+            receipt.environment_binding_sha256,
+            receipt.provider_sha256,
+            receipt.limits_sha256,
+            receipt.keyword_mask,
+            receipt.create_event_id,
+            receipt.operation_end_event_id,
+            receipt.operation_end_version,
+            receipt.session_name_sha256,
+            receipt.session_start_status,
+            receipt.provider_enable_status,
+            receipt.consumer_open_status,
+            receipt.consumer_ready_status,
+            receipt.authority_before_sha256,
+            receipt.authority_after_sha256,
+            receipt.authority_equal,
+            receipt.lifecycle_sha256,
+            receipt.canonical_drain_receipt_sha256,
+            receipt.target_user_drain_receipt_sha256,
+            receipt.pair_evidence.pair_binding_sha256,
+            receipt.pair_evidence.canonical_outcome,
+            receipt.pair_evidence.canonical_status.map_or_else(
+                || "none".to_owned(),
+                |status| format!("{:#010x}", status as u32)
+            ),
+            receipt.pair_evidence.canonical_phase,
+            receipt.pair_evidence.canonical_detail_sha256,
+            receipt.pair_evidence.target_user_outcome,
+            receipt.pair_evidence.target_user_status.map_or_else(
+                || "none".to_owned(),
+                |status| format!("{:#010x}", status as u32)
+            ),
+            receipt.pair_evidence.target_user_phase,
+            receipt.pair_evidence.target_user_detail_sha256,
+            receipt.pair_evidence.projections_exact,
+            receipt.pair_evidence.after_c_environment_stable,
+            receipt.pair_evidence.after_f_environment_stable,
+            receipt.pair_evidence.profile_before_borrowed,
+            receipt.pair_evidence.profile_after_equal,
+            receipt.pair_evidence.profile_observation_sha256,
+            receipt.pair_evidence.canonical_job_empty,
+            receipt.pair_evidence.target_user_job_empty,
+            receipt.after_target_environment_sha256,
+            receipt.reproduction_valid,
+            receipt.invariants_valid,
+            receipt.elapsed_ms,
+            receipt.deadline_exceeded,
+            self.retirement,
+            self.failure_stage,
+            self.failure_sha256,
+            self.retirement_failure_sha256,
+            self.launcher_environment_destroyed_once,
+            evidence_diagnostic,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2007,6 +2825,15 @@ enum SessionBrokerFrameV1 {
     TraceSessionCapabilityRequest(TraceSessionCapabilityRequestV1),
     TraceSessionCapabilityReceipt(TraceSessionCapabilityReceiptV1),
     TraceSessionCapabilityFailed(TraceSessionCapabilityFailureV1),
+    BrokerPassiveTraceArm(BrokerPassiveTraceArmRequestV1),
+    BrokerPassiveTraceReady(BrokerPassiveTraceReadyReceiptV1),
+    BrokerPassiveTraceSubjectArm(BrokerPassiveTraceSubjectArmV1),
+    BrokerPassiveTraceSubjectReady(BrokerPassiveTraceSubjectReceiptV1),
+    BrokerPassiveTraceSubjectFinish(BrokerPassiveTraceSubjectFinishV1),
+    BrokerPassiveTraceSubjectFinished(BrokerPassiveTraceSubjectReceiptV1),
+    BrokerPassiveTraceFinish(BrokerPassiveTraceFinishRequestV1),
+    BrokerPassiveTraceFinal(BrokerPassiveTraceFinalReceiptV1),
+    BrokerPassiveTraceFailed(BrokerPassiveTraceFailureV1),
     Launched(SessionBrokerLaunchedV1),
     Ack {
         binding_sha256: String,
@@ -2099,6 +2926,7 @@ enum BrokerClientOperation {
     Holder,
     LoaderSnaps,
     TraceSessionCapability,
+    BrokerPassiveTrace,
 }
 
 impl BrokerClientOperation {
@@ -2107,6 +2935,7 @@ impl BrokerClientOperation {
             Self::Holder => "holder",
             Self::LoaderSnaps => "loader-snaps",
             Self::TraceSessionCapability => "trace-session-capability",
+            Self::BrokerPassiveTrace => "broker-passive-trace",
         }
     }
 
@@ -2739,6 +3568,18 @@ unsafe fn broker_service_transaction(
                 SessionBrokerServiceError::startup(SessionBrokerStartupStage::Transaction, error)
             });
         }
+        SessionBrokerFrameV1::BrokerPassiveTraceArm(request) => {
+            return run_broker_passive_trace_authority_transaction(
+                pipe.raw(),
+                launcher_process.raw(),
+                &hello,
+                &launcher_identity,
+                request,
+            )
+            .map_err(|error| {
+                SessionBrokerServiceError::startup(SessionBrokerStartupStage::Transaction, error)
+            });
+        }
         _ => {
             return Err("session broker expected Request after Hello"
                 .to_owned()
@@ -3341,6 +4182,510 @@ fn run_trace_session_capability_authority_transaction(
         &SessionBrokerFrameV1::TraceSessionCapabilityReceipt(receipt),
     )
     .map_err(|error| error.to_string())
+}
+
+pub(crate) struct BrokerPassiveTraceLease {
+    authenticated: Option<AuthenticatedBrokerClient>,
+    request: BrokerPassiveTraceArmRequestV1,
+    ready: BrokerPassiveTraceReadyReceiptV1,
+    lifecycle_receipt_sha256: Vec<String>,
+    deadline: Instant,
+    completed_subjects: u32,
+    active_subject: bool,
+    failure_sha256: Option<String>,
+    failure_receipt: Option<BrokerPassiveTraceFailureV1>,
+    finalized: bool,
+}
+
+pub(crate) struct BrokerPassiveTraceSubjectGuardV1<'a> {
+    lease: &'a mut BrokerPassiveTraceLease,
+    subject: BrokerPassiveTraceSubjectArmV1,
+    active: bool,
+}
+
+fn broker_passive_trace_provider_sha256() -> String {
+    super::record::digest(b"Microsoft-Windows-Kernel-File/edd08927-9cc4-4e65-b970-c2560fb5c289")
+}
+
+fn broker_passive_trace_lifecycle_sha256(
+    request_binding_sha256: &str,
+    receipt_sha256: &[String],
+    finish_frame_sha256: &str,
+) -> Result<String, String> {
+    if receipt_sha256.len() != 5 {
+        return Err(
+            "broker passive trace lifecycle requires ready plus four subject receipts".to_owned(),
+        );
+    }
+    let mut material = b"memcordon-broker-passive-trace-lifecycle-v1\0".to_vec();
+    for digest in std::iter::once(request_binding_sha256)
+        .chain(receipt_sha256.iter().map(String::as_str))
+        .chain(std::iter::once(finish_frame_sha256))
+    {
+        super::record::validate_attempt_id(digest)?;
+        material.extend_from_slice(digest.as_bytes());
+    }
+    Ok(super::record::digest(&material))
+}
+
+fn validate_broker_passive_trace_arm_request(
+    request: &BrokerPassiveTraceArmRequestV1,
+    hello: &SessionBrokerHelloV1,
+    launcher_identity: &WindowsProcessIdentityV1,
+) -> Result<(), String> {
+    if request.trace_schema_version != BROKER_PASSIVE_TRACE_SCHEMA_VERSION
+        || request.broker_schema_version != SESSION_BROKER_SCHEMA_VERSION
+        || request.start_nonce != hello.start_nonce
+        || request.challenge != hello.challenge
+        || &request.launcher_identity != launcher_identity
+        || request.broker_identity != hello.broker_identity
+        || request.provider_sha256 != broker_passive_trace_provider_sha256()
+        || request.limits_sha256 != super::access_trace::broker_passive_trace_limits_sha256()
+        || request.keyword_mask != 0xc0
+        || request.create_event_id != 12
+        || request.create_versions != [0, 1]
+        || request.operation_end_event_id != 24
+        || request.operation_end_version != 0
+        || !request.ephemeral_ci
+        || !super::package::ephemeral_ci_enabled()
+        || request.release_sent
+        || request.workload_executed
+        || request.qualification_promoted
+        || request.calculated_sha256()? != request.request_binding_sha256
+    {
+        return Err("broker passive trace arm request binding is invalid".to_owned());
+    }
+    if !memcordon_core::windows_service_attestation_challenge_is_valid(&request.transaction_nonce) {
+        return Err("broker passive trace transaction nonce is invalid".to_owned());
+    }
+    for digest in [
+        &request.broker_source_sha256,
+        &request.capability_binding_sha256,
+        &request.environment_binding_sha256,
+        &request.provider_sha256,
+        &request.limits_sha256,
+        &request.request_binding_sha256,
+    ] {
+        super::record::validate_attempt_id(digest)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_broker_passive_trace_failure(
+    pipe: HANDLE,
+    launcher_process: HANDLE,
+    deadline: Instant,
+    transaction_started: Instant,
+    hello: &SessionBrokerHelloV1,
+    request: &BrokerPassiveTraceArmRequestV1,
+    transaction_sha256: &str,
+    authority_before_sha256: &str,
+    evidence: super::access_trace::BrokerPassiveAccessEvidenceV1,
+    stage: &'static str,
+    detail: &str,
+) -> Result<(), String> {
+    let authority_after_sha256 = attest_trace_session_capability_authority(hello)?;
+    let elapsed_ms = transaction_started.elapsed().as_millis() as u64;
+    let failure = BrokerPassiveTraceFailureV1 {
+        trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+        broker_schema_version: SESSION_BROKER_SCHEMA_VERSION,
+        request_binding_sha256: request.request_binding_sha256.clone(),
+        transaction_sha256: transaction_sha256.to_owned(),
+        broker_identity: hello.broker_identity.clone(),
+        broker_source_sha256: request.broker_source_sha256.clone(),
+        capability_binding_sha256: request.capability_binding_sha256.clone(),
+        environment_binding_sha256: request.environment_binding_sha256.clone(),
+        provider_sha256: request.provider_sha256.clone(),
+        limits_sha256: request.limits_sha256.clone(),
+        authority_equal: authority_before_sha256 == authority_after_sha256,
+        authority_before_sha256: authority_before_sha256.to_owned(),
+        authority_after_sha256,
+        elapsed_ms,
+        deadline_exceeded: elapsed_ms > BROKER_PASSIVE_TRACE_DEADLINE.as_millis() as u64,
+        evidence,
+        stage: stage.to_owned(),
+        detail_sha256: super::record::digest(detail.as_bytes()),
+        receipt_sha256: String::new(),
+    }
+    .seal()?;
+    super::pipe::write_frame_bounded(
+        pipe,
+        Some(launcher_process),
+        deadline,
+        super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceFinalWrite,
+        &SessionBrokerFrameV1::BrokerPassiveTraceFailed(failure),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn validate_broker_passive_trace_failure(
+    failure: &BrokerPassiveTraceFailureV1,
+    request: &BrokerPassiveTraceArmRequestV1,
+) -> Result<(), String> {
+    failure.validate_seal()?;
+    if failure.trace_schema_version != BROKER_PASSIVE_TRACE_SCHEMA_VERSION
+        || failure.broker_schema_version != SESSION_BROKER_SCHEMA_VERSION
+        || failure.request_binding_sha256 != request.request_binding_sha256
+        || failure.transaction_sha256 != super::record::digest(request.transaction_nonce.as_bytes())
+        || failure.broker_identity != request.broker_identity
+        || failure.broker_source_sha256 != request.broker_source_sha256
+        || failure.capability_binding_sha256 != request.capability_binding_sha256
+        || failure.environment_binding_sha256 != request.environment_binding_sha256
+        || failure.provider_sha256 != request.provider_sha256
+        || failure.limits_sha256 != request.limits_sha256
+        || failure.authority_before_sha256 != request.broker_source_sha256
+        || failure.authority_equal
+            != (failure.authority_before_sha256 == failure.authority_after_sha256)
+        || failure.deadline_exceeded
+            != (failure.elapsed_ms > BROKER_PASSIVE_TRACE_DEADLINE.as_millis() as u64)
+        || !matches!(failure.stage.as_str(), "observer-start" | "transaction")
+        || super::record::validate_attempt_id(&failure.detail_sha256).is_err()
+    {
+        return Err("broker passive trace failure receipt relation is invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn run_broker_passive_trace_authority_transaction(
+    pipe: HANDLE,
+    launcher_process: HANDLE,
+    hello: &SessionBrokerHelloV1,
+    launcher_identity: &WindowsProcessIdentityV1,
+    request: BrokerPassiveTraceArmRequestV1,
+) -> Result<(), String> {
+    let transaction_started = Instant::now();
+    let deadline = transaction_started + BROKER_PASSIVE_TRACE_DEADLINE;
+    let transaction_sha256 = super::record::digest(request.transaction_nonce.as_bytes());
+    if let Err(error) =
+        validate_broker_passive_trace_arm_request(&request, hello, launcher_identity)
+    {
+        return Err(error);
+    }
+    let expected_source = trace_session_capability_source_sha256(
+        &hello.broker_identity,
+        &hello.broker_source,
+        &hello.broker_source.query_evidence(),
+    )?;
+    if request.broker_source_sha256 != expected_source {
+        return Err("broker passive trace source binding is invalid".to_owned());
+    }
+    let authority_before_sha256 = attest_trace_session_capability_authority(hello)?;
+    if authority_before_sha256 != request.broker_source_sha256 {
+        return Err("broker passive trace before-authority binding is invalid".to_owned());
+    }
+    let observer = match super::access_trace::PassiveAccessLocalizationObserverV1::start_ready_before_child_creation() {
+        Ok(observer) => observer,
+        Err(error) => {
+            let typed_evidence =
+                super::access_trace::PassiveAccessLocalizationEvidenceV1::observer_unavailable(
+                    &error,
+                );
+            let detail = typed_evidence.diagnostic();
+            let evidence = typed_evidence.into_broker_evidence();
+            send_broker_passive_trace_failure(
+                pipe,
+                launcher_process,
+                deadline,
+                transaction_started,
+                hello,
+                &request,
+                &transaction_sha256,
+                &authority_before_sha256,
+                evidence,
+                "observer-start",
+                &detail,
+            )?;
+            return Ok(());
+        }
+    };
+    let ready = BrokerPassiveTraceReadyReceiptV1 {
+        trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+        broker_schema_version: SESSION_BROKER_SCHEMA_VERSION,
+        request_binding_sha256: request.request_binding_sha256.clone(),
+        transaction_sha256: transaction_sha256.clone(),
+        broker_identity: hello.broker_identity.clone(),
+        broker_source_sha256: request.broker_source_sha256.clone(),
+        authority_before_sha256: authority_before_sha256.clone(),
+        session_name_sha256: observer.session_name_sha256(),
+        session_start_status: 0,
+        provider_enable_status: 0,
+        consumer_open_status: 0,
+        consumer_ready_status: 0,
+        provider_enabled: true,
+        consumer_opened: true,
+        consumer_ready: true,
+        ready_receipt_sha256: String::new(),
+    }
+    .seal()?;
+    super::pipe::write_frame_bounded(
+        pipe,
+        Some(launcher_process),
+        deadline,
+        super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceReadyWrite,
+        &SessionBrokerFrameV1::BrokerPassiveTraceReady(ready.clone()),
+    )
+    .map_err(|error| error.to_string())?;
+
+    let mut observer = Some(observer);
+    let transaction = (|| -> Result<(), String> {
+        let mut active: Option<(
+            super::access_trace::PassiveAccessLocalizationSubjectGuardV1,
+            OwnedHandle,
+            BrokerPassiveTraceSubjectArmV1,
+        )> = None;
+        let mut completed = 0_u32;
+        let mut lifecycle_receipt_sha256 = vec![ready.ready_receipt_sha256];
+        loop {
+            let frame: SessionBrokerFrameV1 = super::pipe::read_frame_bounded(
+                pipe,
+                Some(launcher_process),
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceSubjectArmRead,
+            )
+            .map_err(|error| error.to_string())?;
+            match frame {
+                SessionBrokerFrameV1::BrokerPassiveTraceSubjectArm(subject) => {
+                    subject.validate_seal()?;
+                    let expected_cell = match completed {
+                        0 => BrokerPassiveTraceCellV1::CanonicalSameAccess,
+                        1 => BrokerPassiveTraceCellV1::TargetUser,
+                        _ => {
+                            return Err("broker passive trace received an extra subject".to_owned());
+                        }
+                    };
+                    if active.is_some()
+                        || subject.trace_schema_version != BROKER_PASSIVE_TRACE_SCHEMA_VERSION
+                        || subject.request_binding_sha256 != request.request_binding_sha256
+                        || subject.transaction_sha256 != transaction_sha256
+                        || subject.ordinal != completed + 1
+                        || subject.cell != expected_cell
+                        || super::record::validate_attempt_id(
+                            &subject.environment_observation_sha256,
+                        )
+                        .is_err()
+                        || subject.cell_binding_sha256
+                            != broker_passive_trace_cell_binding_sha256(
+                                &subject.request_binding_sha256,
+                                subject.ordinal,
+                                subject.cell,
+                                &subject.process_identity,
+                                &subject.environment_observation_sha256,
+                            )
+                    {
+                        return Err(
+                            "broker passive trace subject-arm relation is invalid".to_owned()
+                        );
+                    }
+                    let process = OwnedHandle::new(decode_protocol_handle(
+                        subject.process_handle,
+                        "broker-passive-trace-subject",
+                    )?)?;
+                    verify_exact_handle(
+                        process.raw(),
+                        PROCESS_QUERY_LIMITED_INFORMATION,
+                        PROCESS_QUERY_LIMITED_INFORMATION,
+                        "broker-passive-trace-subject",
+                        "protocol-receive",
+                    )?;
+                    let guard = observer
+                        .as_ref()
+                        .ok_or_else(|| "broker passive trace observer is absent".to_owned())?
+                        .bind_suspended_child(
+                            subject.cell.access_trace_cell(),
+                            process.raw(),
+                            subject.process_identity.process_id,
+                            subject.process_identity.creation_time_100ns,
+                        )?;
+                    let receipt = BrokerPassiveTraceSubjectReceiptV1 {
+                        trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+                        request_binding_sha256: request.request_binding_sha256.clone(),
+                        transaction_sha256: transaction_sha256.clone(),
+                        ordinal: subject.ordinal,
+                        cell: subject.cell,
+                        process_identity: subject.process_identity.clone(),
+                        cell_binding_sha256: subject.cell_binding_sha256.clone(),
+                        stage: "subject-ready".to_owned(),
+                        flush_status: None,
+                        drain_requested: false,
+                        drain_armed: false,
+                        drain_acknowledged: false,
+                        pending_empty: false,
+                        drain_detail_sha256: "none".to_owned(),
+                        receipt_sha256: String::new(),
+                    }
+                    .seal()?;
+                    super::pipe::write_frame_bounded(
+                    pipe,
+                    Some(launcher_process),
+                    deadline,
+                    super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceSubjectReadyWrite,
+                    &SessionBrokerFrameV1::BrokerPassiveTraceSubjectReady(receipt.clone()),
+                )
+                .map_err(|error| error.to_string())?;
+                    lifecycle_receipt_sha256.push(receipt.receipt_sha256);
+                    active = Some((guard, process, subject));
+                }
+                SessionBrokerFrameV1::BrokerPassiveTraceSubjectFinish(finish) => {
+                    finish.validate_seal()?;
+                    let Some((guard, process, subject)) = active.take() else {
+                        return Err(
+                            "broker passive trace subject-finish has no active subject".to_owned()
+                        );
+                    };
+                    if finish.trace_schema_version != BROKER_PASSIVE_TRACE_SCHEMA_VERSION
+                        || finish.request_binding_sha256 != request.request_binding_sha256
+                        || finish.transaction_sha256 != transaction_sha256
+                        || finish.ordinal != subject.ordinal
+                        || finish.cell != subject.cell
+                        || finish.cell_binding_sha256 != subject.cell_binding_sha256
+                    {
+                        return Err(
+                            "broker passive trace subject-finish relation is invalid".to_owned()
+                        );
+                    }
+                    let drain = guard.finish();
+                    if !drain.successful() {
+                        return Err("broker passive trace subject drain failed".to_owned());
+                    }
+                    drop(process);
+                    completed += 1;
+                    let receipt = BrokerPassiveTraceSubjectReceiptV1 {
+                        trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+                        request_binding_sha256: request.request_binding_sha256.clone(),
+                        transaction_sha256: transaction_sha256.clone(),
+                        ordinal: finish.ordinal,
+                        cell: finish.cell,
+                        process_identity: subject.process_identity,
+                        cell_binding_sha256: finish.cell_binding_sha256,
+                        stage: "subject-finished-drained".to_owned(),
+                        flush_status: Some(drain.flush_status),
+                        drain_requested: drain.barrier_requested,
+                        drain_armed: drain.barrier_armed,
+                        drain_acknowledged: drain.barrier_acknowledged,
+                        pending_empty: drain.pending_empty,
+                        drain_detail_sha256: drain.detail_sha256,
+                        receipt_sha256: String::new(),
+                    }
+                    .seal()?;
+                    super::pipe::write_frame_bounded(
+                    pipe,
+                    Some(launcher_process),
+                    deadline,
+                    super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceSubjectFinishedWrite,
+                    &SessionBrokerFrameV1::BrokerPassiveTraceSubjectFinished(receipt.clone()),
+                )
+                .map_err(|error| error.to_string())?;
+                    lifecycle_receipt_sha256.push(receipt.receipt_sha256);
+                }
+                SessionBrokerFrameV1::BrokerPassiveTraceFinish(finish) => {
+                    finish.validate_seal()?;
+                    finish.pair_evidence.validate()?;
+                    if active.is_some()
+                        || completed != 2
+                        || lifecycle_receipt_sha256.len() != 5
+                        || finish.trace_schema_version != BROKER_PASSIVE_TRACE_SCHEMA_VERSION
+                        || finish.request_binding_sha256 != request.request_binding_sha256
+                        || finish.transaction_sha256 != transaction_sha256
+                        || super::record::validate_attempt_id(
+                            &finish.after_target_environment_sha256,
+                        )
+                        .is_err()
+                        || finish.reproduction_valid != finish.pair_evidence.reproduction_valid()
+                        || finish.invariants_valid != finish.pair_evidence.invariants_valid()
+                        || finish.canonical_drain_receipt_sha256 != lifecycle_receipt_sha256[2]
+                        || finish.target_user_drain_receipt_sha256 != lifecycle_receipt_sha256[4]
+                    {
+                        return Err("broker passive trace final relation is invalid".to_owned());
+                    }
+                    let reproduction_valid = finish.reproduction_valid && finish.invariants_valid;
+                    let lifecycle_sha256 = broker_passive_trace_lifecycle_sha256(
+                        &request.request_binding_sha256,
+                        &lifecycle_receipt_sha256,
+                        &finish.frame_sha256,
+                    )?;
+                    let evidence = observer
+                        .take()
+                        .ok_or_else(|| {
+                            "broker passive trace observer is absent at finish".to_owned()
+                        })?
+                        .finish(reproduction_valid)
+                        .into_broker_evidence();
+                    let authority_after_sha256 = attest_trace_session_capability_authority(hello)?;
+                    let elapsed_ms = transaction_started.elapsed().as_millis() as u64;
+                    let final_receipt = BrokerPassiveTraceFinalReceiptV1 {
+                        trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+                        broker_schema_version: SESSION_BROKER_SCHEMA_VERSION,
+                        request_binding_sha256: request.request_binding_sha256.clone(),
+                        transaction_sha256: transaction_sha256.clone(),
+                        broker_identity: hello.broker_identity.clone(),
+                        broker_source_sha256: request.broker_source_sha256.clone(),
+                        capability_binding_sha256: request.capability_binding_sha256.clone(),
+                        environment_binding_sha256: request.environment_binding_sha256.clone(),
+                        provider_sha256: request.provider_sha256.clone(),
+                        limits_sha256: request.limits_sha256.clone(),
+                        keyword_mask: request.keyword_mask,
+                        create_event_id: request.create_event_id,
+                        create_versions: request.create_versions.clone(),
+                        operation_end_event_id: request.operation_end_event_id,
+                        operation_end_version: request.operation_end_version,
+                        session_name_sha256: ready.session_name_sha256.clone(),
+                        session_start_status: ready.session_start_status,
+                        provider_enable_status: ready.provider_enable_status,
+                        consumer_open_status: ready.consumer_open_status,
+                        consumer_ready_status: ready.consumer_ready_status,
+                        authority_equal: authority_before_sha256 == authority_after_sha256,
+                        authority_before_sha256: authority_before_sha256.clone(),
+                        authority_after_sha256,
+                        lifecycle_sha256,
+                        after_target_environment_sha256: finish.after_target_environment_sha256,
+                        reproduction_valid: finish.reproduction_valid,
+                        invariants_valid: finish.invariants_valid,
+                        pair_evidence: finish.pair_evidence,
+                        canonical_drain_receipt_sha256: finish.canonical_drain_receipt_sha256,
+                        target_user_drain_receipt_sha256: finish.target_user_drain_receipt_sha256,
+                        elapsed_ms,
+                        deadline_exceeded: elapsed_ms
+                            > BROKER_PASSIVE_TRACE_DEADLINE.as_millis() as u64,
+                        evidence,
+                        receipt_sha256: String::new(),
+                    }
+                    .seal()?;
+                    return super::pipe::write_frame_bounded(
+                    pipe,
+                    Some(launcher_process),
+                    deadline,
+                    super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceFinalWrite,
+                    &SessionBrokerFrameV1::BrokerPassiveTraceFinal(final_receipt),
+                )
+                .map_err(|error| error.to_string());
+                }
+                _ => return Err("broker passive trace received an out-of-order frame".to_owned()),
+            }
+        }
+    })();
+    match transaction {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let Some(observer) = observer.take() else {
+                return Err(error);
+            };
+            let evidence = observer.finish(false).into_broker_evidence();
+            send_broker_passive_trace_failure(
+                pipe,
+                launcher_process,
+                deadline,
+                transaction_started,
+                hello,
+                &request,
+                &transaction_sha256,
+                &authority_before_sha256,
+                evidence,
+                "transaction",
+                &error,
+            )
+        }
+    }
 }
 
 fn run_creation_authority_transaction(
@@ -4088,6 +5433,535 @@ pub(crate) fn request_trace_session_capability(
     }
 }
 
+fn broker_passive_trace_failure(
+    stage: &'static str,
+    detail: impl AsRef<[u8]>,
+) -> BrokerPassiveTraceEvidenceV1 {
+    BrokerPassiveTraceEvidenceV1 {
+        final_receipt: None,
+        failure_receipt: None,
+        request_provenance: None,
+        launcher_environment_destroyed_once: false,
+        retirement: "not-started",
+        failure_stage: stage,
+        failure_sha256: super::record::digest(detail.as_ref()),
+        retirement_failure_sha256: "none".to_owned(),
+    }
+}
+
+pub(crate) fn start_broker_passive_trace(
+    capability_binding_sha256: String,
+    environment_binding_sha256: String,
+) -> Result<BrokerPassiveTraceLease, BrokerPassiveTraceEvidenceV1> {
+    for binding in [&capability_binding_sha256, &environment_binding_sha256] {
+        if let Err(error) = super::record::validate_attempt_id(binding) {
+            return Err(broker_passive_trace_failure("typed-gate", error));
+        }
+    }
+    if !super::package::ephemeral_ci_enabled() {
+        return Err(broker_passive_trace_failure(
+            "ephemeral-gate",
+            "ephemeral-ci-disabled",
+        ));
+    }
+    let authenticated = start_authenticated_broker(BrokerClientOperation::BrokerPassiveTrace)
+        .map_err(|error| broker_passive_trace_failure(error.stage.diagnostic(), error.detail))?;
+    let mut request_provenance = None;
+    let mut failure_receipt = None;
+    let result = (|| -> Result<(BrokerPassiveTraceArmRequestV1, BrokerPassiveTraceReadyReceiptV1, Instant), String> {
+        let hello = &authenticated.hello;
+        let launcher_identity = super::process::process_identity(unsafe { GetCurrentProcess() })?;
+        let transaction_nonce =
+            super::token::service_attestation_challenge("broker-passive-trace-transaction")
+                .map_err(|error| error.to_string())?;
+        let broker_source_sha256 = trace_session_capability_source_sha256(
+            &hello.broker_identity,
+            &hello.broker_source,
+            &authenticated.broker_source_query,
+        )?;
+        let mut request = BrokerPassiveTraceArmRequestV1 {
+            trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+            broker_schema_version: SESSION_BROKER_SCHEMA_VERSION,
+            start_nonce: hello.start_nonce.clone(),
+            challenge: hello.challenge.clone(),
+            transaction_nonce,
+            launcher_identity,
+            broker_identity: hello.broker_identity.clone(),
+            broker_source_sha256,
+            capability_binding_sha256: capability_binding_sha256.clone(),
+            environment_binding_sha256: environment_binding_sha256.clone(),
+            provider_sha256: broker_passive_trace_provider_sha256(),
+            limits_sha256: super::access_trace::broker_passive_trace_limits_sha256(),
+            keyword_mask: 0xc0,
+            create_event_id: 12,
+            create_versions: vec![0, 1],
+            operation_end_event_id: 24,
+            operation_end_version: 0,
+            ephemeral_ci: true,
+            release_sent: false,
+            workload_executed: false,
+            qualification_promoted: false,
+            request_binding_sha256: String::new(),
+        };
+        request.request_binding_sha256 = request.calculated_sha256()?;
+        request_provenance = Some(BrokerPassiveTraceRequestProvenanceV1::from_request(&request));
+        let deadline = Instant::now() + BROKER_PASSIVE_TRACE_DEADLINE;
+        super::pipe::write_frame_bounded(
+            authenticated.pipe().raw(),
+            Some(authenticated.broker().handle.raw()),
+            deadline,
+            super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceArmWrite,
+            &SessionBrokerFrameV1::BrokerPassiveTraceArm(request.clone()),
+        )
+        .map_err(|error| error.to_string())?;
+        let ready = match super::pipe::read_frame_bounded(
+            authenticated.pipe().raw(),
+            Some(authenticated.broker().handle.raw()),
+            deadline,
+            super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceReadyRead,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            SessionBrokerFrameV1::BrokerPassiveTraceReady(receipt) => receipt,
+            SessionBrokerFrameV1::BrokerPassiveTraceFailed(failure) => {
+                validate_broker_passive_trace_failure(&failure, &request)?;
+                let stage = bounded_broker_detail(failure.stage.clone());
+                let detail = failure.detail_sha256.clone();
+                failure_receipt = Some(failure);
+                return Err(format!(
+                    "broker passive trace failed at {} ({})",
+                    stage, detail
+                ));
+            }
+            _ => return Err("session broker returned an invalid passive-trace ready frame".to_owned()),
+        };
+        ready.validate_seal()?;
+        if ready.trace_schema_version != BROKER_PASSIVE_TRACE_SCHEMA_VERSION
+            || ready.broker_schema_version != SESSION_BROKER_SCHEMA_VERSION
+            || ready.request_binding_sha256 != request.request_binding_sha256
+            || ready.transaction_sha256 != super::record::digest(request.transaction_nonce.as_bytes())
+            || ready.broker_identity != request.broker_identity
+            || ready.broker_source_sha256 != request.broker_source_sha256
+            || super::record::validate_attempt_id(&ready.authority_before_sha256).is_err()
+            || super::record::validate_attempt_id(&ready.session_name_sha256).is_err()
+            || ready.session_start_status != 0
+            || ready.provider_enable_status != 0
+            || ready.consumer_open_status != 0
+            || ready.consumer_ready_status != 0
+            || !ready.provider_enabled
+            || !ready.consumer_opened
+            || !ready.consumer_ready
+        {
+            return Err("broker passive trace ready receipt relation is invalid".to_owned());
+        }
+        Ok((request, ready, deadline))
+    })();
+    match result {
+        Ok((request, ready, deadline)) => {
+            let lifecycle_receipt_sha256 = vec![ready.ready_receipt_sha256.clone()];
+            Ok(BrokerPassiveTraceLease {
+                authenticated: Some(authenticated),
+                request,
+                ready,
+                lifecycle_receipt_sha256,
+                deadline,
+                completed_subjects: 0,
+                active_subject: false,
+                failure_sha256: None,
+                failure_receipt: None,
+                finalized: false,
+            })
+        }
+        Err(error) => {
+            let mut evidence = broker_passive_trace_failure("broker-protocol", error);
+            evidence.failure_receipt = failure_receipt;
+            evidence.request_provenance = request_provenance;
+            match authenticated.retire() {
+                Ok(()) => evidence.retirement = "retired",
+                Err(retirement) => {
+                    evidence.retirement = "retirement-failed";
+                    evidence.retirement_failure_sha256 =
+                        super::record::digest(retirement.as_bytes());
+                }
+            }
+            Err(evidence)
+        }
+    }
+}
+
+impl BrokerPassiveTraceLease {
+    pub(crate) fn ready_for_target_user(&self) -> bool {
+        !self.finalized
+            && !self.active_subject
+            && self.failure_sha256.is_none()
+            && self.completed_subjects == 1
+            && self.lifecycle_receipt_sha256.len() == 3
+    }
+
+    pub(crate) fn arm_suspended_child(
+        &mut self,
+        cell: BrokerPassiveTraceCellV1,
+        process: HANDLE,
+        process_identity: WindowsProcessIdentityV1,
+        environment_observation_sha256: String,
+    ) -> Result<BrokerPassiveTraceSubjectGuardV1<'_>, String> {
+        if self.finalized || self.active_subject || self.failure_sha256.is_some() {
+            return Err("broker passive trace lease is not available for a subject".to_owned());
+        }
+        let expected_cell = match self.completed_subjects {
+            0 => BrokerPassiveTraceCellV1::CanonicalSameAccess,
+            1 => BrokerPassiveTraceCellV1::TargetUser,
+            _ => return Err("broker passive trace already completed both subjects".to_owned()),
+        };
+        if cell != expected_cell {
+            return Err("broker passive trace subject order is invalid".to_owned());
+        }
+        super::record::validate_attempt_id(&environment_observation_sha256)?;
+        let authenticated = self
+            .authenticated
+            .as_ref()
+            .ok_or_else(|| "broker passive trace authenticated client is absent".to_owned())?;
+        let mut remote = ptr::null_mut();
+        // SAFETY: source and authenticated broker process handles are live. The broker receives
+        // only the exact query right required to bind PID plus creation time before resume.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                process,
+                authenticated.broker().handle.raw(),
+                &raw mut remote,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                0,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let remote = encode_protocol_handle(remote, "broker-passive-trace-subject")?;
+        let ordinal = self.completed_subjects + 1;
+        let cell_binding_sha256 = broker_passive_trace_cell_binding_sha256(
+            &self.request.request_binding_sha256,
+            ordinal,
+            cell,
+            &process_identity,
+            &environment_observation_sha256,
+        );
+        let subject = BrokerPassiveTraceSubjectArmV1 {
+            trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+            request_binding_sha256: self.request.request_binding_sha256.clone(),
+            transaction_sha256: super::record::digest(self.request.transaction_nonce.as_bytes()),
+            ordinal,
+            cell,
+            process_handle: remote,
+            process_identity,
+            environment_observation_sha256,
+            cell_binding_sha256,
+            frame_sha256: String::new(),
+        }
+        .seal()?;
+        let deadline = self.deadline;
+        if let Err(error) = super::pipe::write_frame_bounded(
+            authenticated.pipe().raw(),
+            Some(authenticated.broker().handle.raw()),
+            deadline,
+            super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceSubjectArmWrite,
+            &SessionBrokerFrameV1::BrokerPassiveTraceSubjectArm(subject.clone()),
+        ) {
+            let native = decode_protocol_handle(remote, "broker-passive-trace-rollback")?;
+            let _ = super::process::revoke_remote_native_handle(
+                native,
+                authenticated.broker().handle.raw(),
+            );
+            return Err(error.to_string());
+        }
+        let ready = match super::pipe::read_frame_bounded(
+            authenticated.pipe().raw(),
+            Some(authenticated.broker().handle.raw()),
+            deadline,
+            super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceSubjectReadyRead,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            SessionBrokerFrameV1::BrokerPassiveTraceSubjectReady(receipt) => receipt,
+            SessionBrokerFrameV1::BrokerPassiveTraceFailed(failure) => {
+                validate_broker_passive_trace_failure(&failure, &self.request)?;
+                let stage = bounded_broker_detail(failure.stage.clone());
+                let detail = failure.detail_sha256.clone();
+                let error = format!("broker passive trace failed at {} ({})", stage, detail);
+                self.failure_receipt = Some(failure);
+                self.failure_sha256 = Some(super::record::digest(error.as_bytes()));
+                return Err(error);
+            }
+            _ => {
+                return Err(
+                    "session broker returned an invalid passive-trace subject-ready frame"
+                        .to_owned(),
+                );
+            }
+        };
+        if !ready.valid_ready_for(&subject) {
+            return Err(
+                "broker passive trace subject-ready receipt relation is invalid".to_owned(),
+            );
+        }
+        self.lifecycle_receipt_sha256
+            .push(ready.receipt_sha256.clone());
+        self.active_subject = true;
+        Ok(BrokerPassiveTraceSubjectGuardV1 {
+            lease: self,
+            subject,
+            active: true,
+        })
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        pair_evidence: BrokerPassiveTracePairEvidenceV1,
+        after_target_environment_sha256: String,
+    ) -> BrokerPassiveTraceEvidenceV1 {
+        self.finalized = true;
+        let request_provenance = BrokerPassiveTraceRequestProvenanceV1::from_request(&self.request);
+        let mut failure_receipt = self.failure_receipt.take();
+        let transaction = (|| -> Result<BrokerPassiveTraceFinalReceiptV1, String> {
+            if self.active_subject || self.completed_subjects != 2 || self.failure_sha256.is_some()
+            {
+                return Err("broker passive trace subject lifecycle is incomplete".to_owned());
+            }
+            super::record::validate_attempt_id(&after_target_environment_sha256)?;
+            pair_evidence.validate()?;
+            let reproduction_valid = pair_evidence.reproduction_valid();
+            let invariants_valid = pair_evidence.invariants_valid();
+            let authenticated = self.authenticated.as_ref().ok_or_else(|| {
+                "broker passive trace authenticated client is absent before finish".to_owned()
+            })?;
+            let finish = BrokerPassiveTraceFinishRequestV1 {
+                trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+                request_binding_sha256: self.request.request_binding_sha256.clone(),
+                transaction_sha256: super::record::digest(
+                    self.request.transaction_nonce.as_bytes(),
+                ),
+                reproduction_valid,
+                invariants_valid,
+                pair_evidence: pair_evidence.clone(),
+                canonical_drain_receipt_sha256: self.lifecycle_receipt_sha256[2].clone(),
+                target_user_drain_receipt_sha256: self.lifecycle_receipt_sha256[4].clone(),
+                after_target_environment_sha256,
+                frame_sha256: String::new(),
+            }
+            .seal()?;
+            let expected_lifecycle_sha256 = broker_passive_trace_lifecycle_sha256(
+                &self.request.request_binding_sha256,
+                &self.lifecycle_receipt_sha256,
+                &finish.frame_sha256,
+            )?;
+            let expected_after_target_environment_sha256 =
+                finish.after_target_environment_sha256.clone();
+            let deadline = self.deadline;
+            super::pipe::write_frame_bounded(
+                authenticated.pipe().raw(),
+                Some(authenticated.broker().handle.raw()),
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceFinishWrite,
+                &SessionBrokerFrameV1::BrokerPassiveTraceFinish(finish.clone()),
+            )
+            .map_err(|error| error.to_string())?;
+            let receipt = match super::pipe::read_frame_bounded(
+                authenticated.pipe().raw(),
+                Some(authenticated.broker().handle.raw()),
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceFinalRead,
+            )
+            .map_err(|error| error.to_string())?
+            {
+                SessionBrokerFrameV1::BrokerPassiveTraceFinal(receipt) => receipt,
+                SessionBrokerFrameV1::BrokerPassiveTraceFailed(failure) => {
+                    validate_broker_passive_trace_failure(&failure, &self.request)?;
+                    let stage = bounded_broker_detail(failure.stage.clone());
+                    let detail = failure.detail_sha256.clone();
+                    failure_receipt = Some(failure);
+                    return Err(format!(
+                        "broker passive trace failed at {} ({})",
+                        stage, detail
+                    ));
+                }
+                _ => {
+                    return Err(
+                        "session broker returned an invalid passive-trace final frame".to_owned(),
+                    );
+                }
+            };
+            receipt.validate_seal()?;
+            if receipt.trace_schema_version != BROKER_PASSIVE_TRACE_SCHEMA_VERSION
+                || receipt.broker_schema_version != SESSION_BROKER_SCHEMA_VERSION
+                || receipt.request_binding_sha256 != self.request.request_binding_sha256
+                || receipt.transaction_sha256
+                    != super::record::digest(self.request.transaction_nonce.as_bytes())
+                || receipt.broker_identity != self.request.broker_identity
+                || receipt.broker_source_sha256 != self.request.broker_source_sha256
+                || receipt.capability_binding_sha256 != self.request.capability_binding_sha256
+                || receipt.environment_binding_sha256 != self.request.environment_binding_sha256
+                || receipt.provider_sha256 != self.request.provider_sha256
+                || receipt.limits_sha256 != self.request.limits_sha256
+                || receipt.keyword_mask != self.request.keyword_mask
+                || receipt.create_event_id != self.request.create_event_id
+                || receipt.create_versions != self.request.create_versions
+                || receipt.operation_end_event_id != self.request.operation_end_event_id
+                || receipt.operation_end_version != self.request.operation_end_version
+                || receipt.session_name_sha256 != self.ready.session_name_sha256
+                || receipt.session_start_status != 0
+                || receipt.provider_enable_status != 0
+                || receipt.consumer_open_status != 0
+                || receipt.consumer_ready_status != 0
+                || receipt.authority_before_sha256 != self.ready.authority_before_sha256
+                || receipt.authority_after_sha256 != receipt.authority_before_sha256
+                || !receipt.authority_equal
+                || receipt.lifecycle_sha256 != expected_lifecycle_sha256
+                || receipt.after_target_environment_sha256
+                    != expected_after_target_environment_sha256
+                || receipt.reproduction_valid != reproduction_valid
+                || receipt.invariants_valid != invariants_valid
+                || receipt.pair_evidence != pair_evidence
+                || receipt.canonical_drain_receipt_sha256 != self.lifecycle_receipt_sha256[2]
+                || receipt.target_user_drain_receipt_sha256 != self.lifecycle_receipt_sha256[4]
+                || receipt.elapsed_ms > BROKER_PASSIVE_TRACE_DEADLINE.as_millis() as u64
+                || receipt.deadline_exceeded
+            {
+                return Err("broker passive trace final receipt relation is invalid".to_owned());
+            }
+            Ok(receipt)
+        })();
+        let retirement = self
+            .authenticated
+            .take()
+            .ok_or_else(|| "broker passive trace authenticated client is absent".to_owned())
+            .and_then(AuthenticatedBrokerClient::retire);
+        let (retirement_state, retirement_failure_sha256) = match retirement {
+            Ok(()) => ("retired", "none".to_owned()),
+            Err(error) => ("retirement-failed", super::record::digest(error.as_bytes())),
+        };
+        match transaction {
+            Ok(receipt) => BrokerPassiveTraceEvidenceV1 {
+                final_receipt: Some(receipt),
+                failure_receipt: None,
+                request_provenance: Some(request_provenance),
+                launcher_environment_destroyed_once: false,
+                retirement: retirement_state,
+                failure_stage: "none",
+                failure_sha256: "none".to_owned(),
+                retirement_failure_sha256,
+            },
+            Err(error) => BrokerPassiveTraceEvidenceV1 {
+                final_receipt: None,
+                failure_receipt,
+                request_provenance: Some(request_provenance),
+                launcher_environment_destroyed_once: false,
+                retirement: retirement_state,
+                failure_stage: "broker-protocol",
+                failure_sha256: super::record::digest(error.as_bytes()),
+                retirement_failure_sha256,
+            },
+        }
+    }
+}
+
+impl Drop for BrokerPassiveTraceLease {
+    fn drop(&mut self) {
+        if !self.finalized {
+            if let Some(authenticated) = self.authenticated.take() {
+                let _ = authenticated.retire();
+            }
+        }
+    }
+}
+
+impl BrokerPassiveTraceSubjectGuardV1<'_> {
+    pub(crate) fn finish(mut self) -> Result<(), String> {
+        self.finish_once()
+    }
+
+    fn finish_once(&mut self) -> Result<(), String> {
+        if !self.active {
+            return Err("broker passive trace subject was already finished".to_owned());
+        }
+        self.active = false;
+        let result = (|| -> Result<(), String> {
+            let authenticated = self.lease.authenticated.as_ref().ok_or_else(|| {
+                "broker passive trace authenticated client is absent during subject finish"
+                    .to_owned()
+            })?;
+            let finish = BrokerPassiveTraceSubjectFinishV1 {
+                trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+                request_binding_sha256: self.subject.request_binding_sha256.clone(),
+                transaction_sha256: self.subject.transaction_sha256.clone(),
+                ordinal: self.subject.ordinal,
+                cell: self.subject.cell,
+                cell_binding_sha256: self.subject.cell_binding_sha256.clone(),
+                frame_sha256: String::new(),
+            }
+            .seal()?;
+            let deadline = self.lease.deadline;
+            super::pipe::write_frame_bounded(
+                authenticated.pipe().raw(),
+                Some(authenticated.broker().handle.raw()),
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceSubjectFinishWrite,
+                &SessionBrokerFrameV1::BrokerPassiveTraceSubjectFinish(finish),
+            )
+            .map_err(|error| error.to_string())?;
+            let receipt = match super::pipe::read_frame_bounded(
+                authenticated.pipe().raw(),
+                Some(authenticated.broker().handle.raw()),
+                deadline,
+                super::pipe::TargetDesktopBootstrapPipeOperation::BrokerPassiveTraceSubjectFinishedRead,
+            )
+            .map_err(|error| error.to_string())?
+            {
+                SessionBrokerFrameV1::BrokerPassiveTraceSubjectFinished(receipt) => receipt,
+                SessionBrokerFrameV1::BrokerPassiveTraceFailed(failure) => {
+                    validate_broker_passive_trace_failure(&failure, &self.lease.request)?;
+                    let stage = bounded_broker_detail(failure.stage.clone());
+                    let detail = failure.detail_sha256.clone();
+                    self.lease.failure_receipt = Some(failure);
+                    return Err(format!(
+                        "broker passive trace failed at {} ({})",
+                        stage, detail
+                    ));
+                }
+                _ => return Err("session broker returned an invalid passive-trace subject-finished frame".to_owned()),
+            };
+            if !receipt.valid_finished_for(&self.subject) {
+                return Err(
+                    "broker passive trace subject-finished receipt relation is invalid".to_owned(),
+                );
+            }
+            self.lease
+                .lifecycle_receipt_sha256
+                .push(receipt.receipt_sha256);
+            Ok(())
+        })();
+        self.lease.active_subject = false;
+        match result {
+            Ok(()) => {
+                self.lease.completed_subjects += 1;
+                Ok(())
+            }
+            Err(error) => {
+                self.lease.failure_sha256 = Some(super::record::digest(error.as_bytes()));
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for BrokerPassiveTraceSubjectGuardV1<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.finish_once();
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn trace_session_capability_state_for_test(
@@ -4293,6 +6167,384 @@ pub(crate) fn trace_session_capability_receipt_for_test(
             .then(|| super::record::digest(b"test-retirement-failure")),
     };
     (admission_valid, seal_valid, evidence.diagnostic())
+}
+
+#[cfg(test)]
+pub(crate) fn broker_passive_trace_diagnostic_for_test(
+    classification: &str,
+    authority_equal: bool,
+    destroyed_once: bool,
+    retired: bool,
+    invalid: bool,
+) -> String {
+    broker_passive_trace_diagnostic_with_evidence_for_test(
+        super::access_trace::BrokerPassiveAccessEvidenceV1::for_test(classification, invalid),
+        authority_equal,
+        destroyed_once,
+        retired,
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn broker_passive_trace_max_frontier_diagnostic_for_test() -> String {
+    broker_passive_trace_diagnostic_with_evidence_for_test(
+        super::access_trace::BrokerPassiveAccessEvidenceV1::max_frontier_for_test(),
+        true,
+        true,
+        true,
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn broker_passive_trace_reordered_max_frontier_diagnostic_for_test() -> String {
+    broker_passive_trace_diagnostic_with_evidence_for_test(
+        super::access_trace::BrokerPassiveAccessEvidenceV1::reordered_max_frontier_for_test(),
+        true,
+        true,
+        true,
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn broker_passive_trace_mutated_diagnostic_for_test(
+    mutation: super::access_trace::BrokerPassiveAccessMutationForTest,
+) -> String {
+    broker_passive_trace_diagnostic_with_evidence_for_test(
+        super::access_trace::BrokerPassiveAccessEvidenceV1::mutated_for_test(mutation),
+        true,
+        true,
+        true,
+        None,
+    )
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BrokerPassiveTracePairMutationForTest {
+    CanonicalOutcome,
+    TargetStatus,
+    TargetPhase,
+    EnvironmentStability,
+    ProfilePrerequisite,
+    ProfilePostcondition,
+    JobContainment,
+    MalformedDetailDigest,
+    MalformedProfileDigest,
+}
+
+#[cfg(test)]
+pub(crate) fn broker_passive_trace_pair_mutated_diagnostic_for_test(
+    mutation: BrokerPassiveTracePairMutationForTest,
+) -> String {
+    broker_passive_trace_diagnostic_with_evidence_for_test(
+        super::access_trace::BrokerPassiveAccessEvidenceV1::for_test(
+            "candidate-file-denial-differential",
+            false,
+        ),
+        true,
+        true,
+        true,
+        Some(mutation),
+    )
+}
+
+#[cfg(test)]
+fn broker_passive_trace_diagnostic_with_evidence_for_test(
+    evidence: super::access_trace::BrokerPassiveAccessEvidenceV1,
+    authority_equal: bool,
+    destroyed_once: bool,
+    retired: bool,
+    pair_mutation: Option<BrokerPassiveTracePairMutationForTest>,
+) -> String {
+    let broker_source_sha256 = super::record::digest(b"broker-passive-test-source");
+    let authority_after_sha256 = if authority_equal {
+        broker_source_sha256.clone()
+    } else {
+        super::record::digest(b"broker-passive-test-changed-source")
+    };
+    let mut pair_evidence = BrokerPassiveTracePairEvidenceV1::new(
+        "passed",
+        None,
+        "none",
+        super::record::digest(b"broker-passive-test-canonical-detail"),
+        "failed",
+        Some(STATUS_ACCESS_DENIED),
+        "post-resume-pre-loader-ready",
+        super::record::digest(b"broker-passive-test-target-user-detail"),
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        super::record::digest(b"broker-passive-test-profile-observation"),
+    )
+    .expect("synthetic broker passive trace pair evidence must seal");
+    let mut pair_requires_reseal = false;
+    if let Some(mutation) = pair_mutation {
+        pair_requires_reseal = true;
+        match mutation {
+            BrokerPassiveTracePairMutationForTest::CanonicalOutcome => {
+                pair_evidence.canonical_outcome = "failed".to_owned();
+            }
+            BrokerPassiveTracePairMutationForTest::TargetStatus => {
+                pair_evidence.target_user_status = Some(0);
+            }
+            BrokerPassiveTracePairMutationForTest::TargetPhase => {
+                pair_evidence.target_user_phase = "none".to_owned();
+            }
+            BrokerPassiveTracePairMutationForTest::EnvironmentStability => {
+                pair_evidence.after_c_environment_stable = false;
+            }
+            BrokerPassiveTracePairMutationForTest::ProfilePrerequisite => {
+                pair_evidence.profile_before_borrowed = false;
+            }
+            BrokerPassiveTracePairMutationForTest::ProfilePostcondition => {
+                pair_evidence.profile_after_equal = false;
+            }
+            BrokerPassiveTracePairMutationForTest::JobContainment => {
+                pair_evidence.target_user_job_empty = false;
+            }
+            BrokerPassiveTracePairMutationForTest::MalformedDetailDigest => {
+                pair_evidence = BrokerPassiveTracePairEvidenceV1::invalid(
+                    b"malformed traced-pair outcome detail digest",
+                );
+                pair_requires_reseal = false;
+            }
+            BrokerPassiveTracePairMutationForTest::MalformedProfileDigest => {
+                pair_evidence = BrokerPassiveTracePairEvidenceV1::invalid(
+                    b"malformed traced-pair profile observation digest",
+                );
+                pair_requires_reseal = false;
+            }
+        }
+    }
+    if pair_requires_reseal {
+        pair_evidence.pair_binding_sha256 = pair_evidence
+            .calculated_sha256()
+            .expect("mutated synthetic broker passive trace pair evidence must seal");
+    }
+    let receipt = BrokerPassiveTraceFinalReceiptV1 {
+        trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+        broker_schema_version: SESSION_BROKER_SCHEMA_VERSION,
+        request_binding_sha256: super::record::digest(b"broker-passive-test-request"),
+        transaction_sha256: super::record::digest(b"broker-passive-test-transaction"),
+        broker_identity: WindowsProcessIdentityV1 {
+            process_id: 43,
+            creation_time_100ns: 44,
+        },
+        broker_source_sha256: broker_source_sha256.clone(),
+        capability_binding_sha256: super::record::digest(b"broker-passive-test-capability"),
+        environment_binding_sha256: super::record::digest(b"broker-passive-test-environment"),
+        provider_sha256: broker_passive_trace_provider_sha256(),
+        limits_sha256: super::access_trace::broker_passive_trace_limits_sha256(),
+        keyword_mask: 0xc0,
+        create_event_id: 12,
+        create_versions: vec![0, 1],
+        operation_end_event_id: 24,
+        operation_end_version: 0,
+        session_name_sha256: super::record::digest(b"broker-passive-test-session"),
+        session_start_status: 0,
+        provider_enable_status: 0,
+        consumer_open_status: 0,
+        consumer_ready_status: 0,
+        authority_before_sha256: broker_source_sha256,
+        authority_after_sha256,
+        authority_equal,
+        lifecycle_sha256: super::record::digest(b"broker-passive-test-lifecycle"),
+        after_target_environment_sha256: super::record::digest(
+            b"broker-passive-test-after-environment",
+        ),
+        reproduction_valid: true,
+        invariants_valid: true,
+        pair_evidence,
+        canonical_drain_receipt_sha256: super::record::digest(
+            b"broker-passive-test-canonical-drain",
+        ),
+        target_user_drain_receipt_sha256: super::record::digest(
+            b"broker-passive-test-target-user-drain",
+        ),
+        elapsed_ms: 1,
+        deadline_exceeded: false,
+        evidence,
+        receipt_sha256: String::new(),
+    }
+    .seal()
+    .expect("synthetic broker passive trace receipt must seal");
+    BrokerPassiveTraceEvidenceV1 {
+        final_receipt: Some(receipt),
+        failure_receipt: None,
+        request_provenance: None,
+        launcher_environment_destroyed_once: destroyed_once,
+        retirement: if retired {
+            "retired"
+        } else {
+            "retirement-failed"
+        },
+        failure_stage: "none",
+        failure_sha256: "none".to_owned(),
+        retirement_failure_sha256: if retired {
+            "none".to_owned()
+        } else {
+            super::record::digest(b"broker-passive-test-retirement-failure")
+        },
+    }
+    .diagnostic()
+}
+
+#[cfg(test)]
+pub(crate) fn broker_passive_trace_no_receipt_diagnostics_for_test() -> [String; 2] {
+    [
+        BrokerPassiveTraceEvidenceV1::not_run().diagnostic(),
+        BrokerPassiveTraceEvidenceV1::invalid(
+            "broker-protocol",
+            b"test-passive-trace-protocol-detail",
+        )
+        .diagnostic(),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn broker_passive_trace_typed_setup_failure_diagnostic_for_test() -> String {
+    let broker_source_sha256 = super::record::digest(b"broker-passive-test-source");
+    let failure = BrokerPassiveTraceFailureV1 {
+        trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+        broker_schema_version: SESSION_BROKER_SCHEMA_VERSION,
+        request_binding_sha256: super::record::digest(b"broker-passive-test-request"),
+        transaction_sha256: super::record::digest(b"broker-passive-test-transaction"),
+        broker_identity: WindowsProcessIdentityV1 {
+            process_id: 43,
+            creation_time_100ns: 44,
+        },
+        broker_source_sha256: broker_source_sha256.clone(),
+        capability_binding_sha256: super::record::digest(b"broker-passive-test-capability"),
+        environment_binding_sha256: super::record::digest(b"broker-passive-test-environment"),
+        provider_sha256: broker_passive_trace_provider_sha256(),
+        limits_sha256: super::access_trace::broker_passive_trace_limits_sha256(),
+        authority_before_sha256: broker_source_sha256.clone(),
+        authority_after_sha256: broker_source_sha256,
+        authority_equal: true,
+        elapsed_ms: 1,
+        deadline_exceeded: false,
+        evidence: super::access_trace::passive_access_session_start_unavailable_for_test(5)
+            .into_broker_evidence(),
+        stage: "observer-start".to_owned(),
+        detail_sha256: super::record::digest(b"broker-passive-test-observer-start"),
+        receipt_sha256: String::new(),
+    }
+    .seal()
+    .expect("synthetic broker passive trace failure receipt must seal");
+    BrokerPassiveTraceEvidenceV1 {
+        final_receipt: None,
+        failure_receipt: Some(failure),
+        request_provenance: None,
+        launcher_environment_destroyed_once: true,
+        retirement: "retired",
+        failure_stage: "broker-protocol",
+        failure_sha256: super::record::digest(b"broker-passive-test-primary-failure"),
+        retirement_failure_sha256: "none".to_owned(),
+    }
+    .diagnostic()
+}
+
+#[cfg(test)]
+pub(crate) fn broker_passive_trace_typed_subject_failure_diagnostic_for_test() -> String {
+    let broker_source_sha256 = super::record::digest(b"broker-passive-test-source");
+    let failure = BrokerPassiveTraceFailureV1 {
+        trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+        broker_schema_version: SESSION_BROKER_SCHEMA_VERSION,
+        request_binding_sha256: super::record::digest(b"broker-passive-test-request"),
+        transaction_sha256: super::record::digest(b"broker-passive-test-transaction"),
+        broker_identity: WindowsProcessIdentityV1 {
+            process_id: 43,
+            creation_time_100ns: 44,
+        },
+        broker_source_sha256: broker_source_sha256.clone(),
+        capability_binding_sha256: super::record::digest(b"broker-passive-test-capability"),
+        environment_binding_sha256: super::record::digest(b"broker-passive-test-environment"),
+        provider_sha256: broker_passive_trace_provider_sha256(),
+        limits_sha256: super::access_trace::broker_passive_trace_limits_sha256(),
+        authority_before_sha256: broker_source_sha256.clone(),
+        authority_after_sha256: broker_source_sha256,
+        authority_equal: true,
+        elapsed_ms: 2,
+        deadline_exceeded: false,
+        evidence:
+            super::access_trace::BrokerPassiveAccessEvidenceV1::drained_subject_failure_for_test(),
+        stage: "transaction".to_owned(),
+        detail_sha256: super::record::digest(b"broker-passive-test-subject-drain"),
+        receipt_sha256: String::new(),
+    }
+    .seal()
+    .expect("synthetic broker passive trace subject failure receipt must seal");
+    BrokerPassiveTraceEvidenceV1 {
+        final_receipt: None,
+        failure_receipt: Some(failure),
+        request_provenance: None,
+        launcher_environment_destroyed_once: true,
+        retirement: "retired",
+        failure_stage: "broker-protocol",
+        failure_sha256: super::record::digest(b"broker-passive-test-subject-primary-failure"),
+        retirement_failure_sha256: "none".to_owned(),
+    }
+    .diagnostic()
+}
+
+#[cfg(test)]
+pub(crate) fn broker_passive_trace_subject_receipt_schema_valid_for_test(
+    trace_schema_version: u32,
+    finished: bool,
+) -> bool {
+    let subject = BrokerPassiveTraceSubjectArmV1 {
+        trace_schema_version: BROKER_PASSIVE_TRACE_SCHEMA_VERSION,
+        request_binding_sha256: super::record::digest(b"broker-passive-test-request"),
+        transaction_sha256: super::record::digest(b"broker-passive-test-transaction"),
+        ordinal: 1,
+        cell: BrokerPassiveTraceCellV1::CanonicalSameAccess,
+        process_handle: 1,
+        process_identity: WindowsProcessIdentityV1 {
+            process_id: 43,
+            creation_time_100ns: 44,
+        },
+        environment_observation_sha256: super::record::digest(
+            b"broker-passive-test-environment-observation",
+        ),
+        cell_binding_sha256: super::record::digest(b"broker-passive-test-cell"),
+        frame_sha256: String::new(),
+    };
+    let receipt = BrokerPassiveTraceSubjectReceiptV1 {
+        trace_schema_version,
+        request_binding_sha256: subject.request_binding_sha256.clone(),
+        transaction_sha256: subject.transaction_sha256.clone(),
+        ordinal: subject.ordinal,
+        cell: subject.cell,
+        process_identity: subject.process_identity.clone(),
+        cell_binding_sha256: subject.cell_binding_sha256.clone(),
+        stage: if finished {
+            "subject-finished-drained"
+        } else {
+            "subject-ready"
+        }
+        .to_owned(),
+        flush_status: finished.then_some(0),
+        drain_requested: finished,
+        drain_armed: finished,
+        drain_acknowledged: finished,
+        pending_empty: finished,
+        drain_detail_sha256: "none".to_owned(),
+        receipt_sha256: String::new(),
+    }
+    .seal()
+    .expect("synthetic broker passive trace subject receipt must seal");
+    if finished {
+        receipt.valid_finished_for(&subject)
+    } else {
+        receipt.valid_ready_for(&subject)
+    }
 }
 
 #[cfg(test)]

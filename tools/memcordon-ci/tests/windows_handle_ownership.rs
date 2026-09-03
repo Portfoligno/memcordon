@@ -172,8 +172,16 @@ fn broker_raw_duplicate_inventory_holds(session_broker: &str) -> bool {
     ) else {
         return false;
     };
-    if session_broker.matches("DuplicateHandle(").count() != 1
+    let Some(passive_trace_duplicate) = bounded_region(
+        session_broker,
+        "    pub(crate) fn arm_suspended_child(",
+        "    pub(crate) fn finish(",
+    ) else {
+        return false;
+    };
+    if session_broker.matches("DuplicateHandle(").count() != 2
         || duplicate.matches("DuplicateHandle(").count() != 1
+        || passive_trace_duplicate.matches("DuplicateHandle(").count() != 1
         || duplicate.matches(BROKER_TRANSFER_DUPLICATE).count() != 1
         || !fragments_are_ordered(
             duplicate,
@@ -245,6 +253,19 @@ fn broker_raw_duplicate_inventory_holds(session_broker: &str) -> bool {
     {
         return false;
     }
+    if !fragments_are_ordered(
+        passive_trace_duplicate,
+        &[
+            "DuplicateHandle(\n                GetCurrentProcess(),\n                process,\n                authenticated.broker().handle.raw(),",
+            "&raw mut remote,\n                PROCESS_QUERY_LIMITED_INFORMATION,\n                0,\n                0,",
+            "encode_protocol_handle(remote, \"broker-passive-trace-subject\")",
+            "SessionBrokerFrameV1::BrokerPassiveTraceSubjectArm(subject.clone())",
+            "revoke_remote_native_handle(\n                native,\n                authenticated.broker().handle.raw(),",
+            "SessionBrokerFrameV1::BrokerPassiveTraceSubjectReady(receipt)",
+        ],
+    ) {
+        return false;
+    }
 
     let Some(creation_transaction) = bounded_region(
         session_broker,
@@ -300,7 +321,7 @@ fn broker_raw_duplicate_inventory_holds(session_broker: &str) -> bool {
         return false;
     }
 
-    session_broker.contains("pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;")
+    session_broker.contains("pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 7;")
         && session_broker.contains(
         "const LAUNCHER_PROCESS_BROKER_ACCESS: u32 =\n    SYNCHRONIZE_ACCESS | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE;",
     )
@@ -1135,6 +1156,27 @@ fn broker_handle_transfer_contract_rejects_namespace_and_ownership_mutants() {
     assert_broker_raw_duplicate_mutant_rejected(|sources| {
         replace_once(
             &mut sources.session_broker,
+            "DuplicateHandle(\n                GetCurrentProcess(),\n                process,\n                authenticated.broker().handle.raw(),",
+            "DuplicateHandle(\n                authenticated.broker().handle.raw(),\n                process,\n                GetCurrentProcess(),",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
+            "&raw mut remote,\n                PROCESS_QUERY_LIMITED_INFORMATION,\n                0,\n                0,",
+            "&raw mut remote,\n                0,\n                0,\n                0,",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
+            "let _ = super::process::revoke_remote_native_handle(\n                native,\n                authenticated.broker().handle.raw(),",
+            "let _ = Ok::<(), String>(/* remote handle left live */",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
             "DuplicateHandle(\n            GetCurrentProcess(),\n            source,\n            launcher,",
             "DuplicateHandle(\n            launcher,\n            source,\n            GetCurrentProcess(),",
         );
@@ -1229,8 +1271,8 @@ fn broker_handle_transfer_contract_rejects_namespace_and_ownership_mutants() {
     assert_broker_raw_duplicate_mutant_rejected(|sources| {
         replace_once(
             &mut sources.session_broker,
+            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 7;",
             "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;",
-            "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 5;",
         );
     });
     assert_broker_raw_duplicate_mutant_rejected(|sources| {
