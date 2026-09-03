@@ -1758,8 +1758,18 @@ struct TraceSessionCapabilityFailureV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct TraceSessionCapabilityRequestProvenanceV1 {
+    request_binding_sha256: String,
+    transaction_sha256: String,
+    broker_source_sha256: String,
+    broker_identity: WindowsProcessIdentityV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TraceSessionCapabilityEvidenceV1 {
     receipt: Option<TraceSessionCapabilityReceiptV1>,
+    admitted_trigger_sha256: Option<String>,
+    request_provenance: Option<TraceSessionCapabilityRequestProvenanceV1>,
     retirement: &'static str,
     failure_stage: Option<&'static str>,
     failure_sha256: Option<String>,
@@ -1771,8 +1781,44 @@ impl TraceSessionCapabilityEvidenceV1 {
 
     pub(crate) fn diagnostic(&self) -> String {
         let Some(receipt) = &self.receipt else {
+            let trigger = if self.admitted_trigger_sha256.is_some() {
+                TraceSessionCapabilityTriggerReasonV1::StableModuleZeroPrefixNonlocalizing
+                    .diagnostic()
+            } else {
+                "none"
+            };
+            let trigger_sha256 = self.admitted_trigger_sha256.as_deref().unwrap_or("none");
+            let request_binding_sha256 = self
+                .request_provenance
+                .as_ref()
+                .map_or("unavailable", |value| value.request_binding_sha256.as_str());
+            let transaction_sha256 = self
+                .request_provenance
+                .as_ref()
+                .map_or("unavailable", |value| value.transaction_sha256.as_str());
+            let broker_source_sha256 = self
+                .request_provenance
+                .as_ref()
+                .map_or("unavailable", |value| value.broker_source_sha256.as_str());
+            let broker_pid = self
+                .request_provenance
+                .as_ref()
+                .map(|value| value.broker_identity.process_id.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned());
+            let broker_creation_time_100ns = self
+                .request_provenance
+                .as_ref()
+                .map(|value| value.broker_identity.creation_time_100ns.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned());
             return format!(
-                "broker_trace_session_capability=v1 state=broker-session-invalid trigger=stable-module-zero-prefix-nonlocalizing trigger_sha256=none request_binding_sha256=none receipt_sha256=none transaction_sha256=none broker_source_sha256=none broker_pid=0 broker_creation_time_100ns=0 authority_before_sha256=none authority_after_sha256=none session_name_sha256=none start_status=none session_created=false stop_attempted=false stop_status=none cleanup_count=0 session_absence_proven=false retirement={} elapsed_ms=0 failure_stage={} failure_sha256={} retirement_failure_sha256={} provider_enable_attempted=false consumer_opened=false process_trace_started=false child_bound=false events_collected=0 requested_access_available=false exact_resource_identified=false acl_fix_identified=false primary_failure=original-a release_sent=false workload_executed=false qualification_promoted=false {}",
+                "broker_trace_session_capability=v1 state=broker-session-invalid broker_receipt_state=none trigger={} trigger_sha256={} request_binding_sha256={} receipt_sha256=unavailable transaction_sha256={} broker_source_sha256={} broker_pid={} broker_creation_time_100ns={} authority_before_sha256=unavailable authority_after_sha256=unavailable session_name_sha256=unavailable start_status=unavailable session_created=unavailable stop_attempted=unavailable stop_status=unavailable cleanup_count=unavailable session_absence_proven=unavailable retirement={} elapsed_ms=unavailable deadline_exceeded=unavailable failure_stage={} failure_sha256={} retirement_failure_sha256={} provider_enable_attempted=false consumer_opened=false process_trace_started=false child_bound=false events_collected=0 requested_access_available=false exact_resource_identified=false acl_fix_identified=false primary_failure=original-a release_sent=false workload_executed=false qualification_promoted=false {}",
+                trigger,
+                trigger_sha256,
+                request_binding_sha256,
+                transaction_sha256,
+                broker_source_sha256,
+                broker_pid,
+                broker_creation_time_100ns,
                 self.retirement,
                 self.failure_stage.unwrap_or("broker-protocol"),
                 self.failure_sha256.as_deref().unwrap_or("none"),
@@ -1786,7 +1832,7 @@ impl TraceSessionCapabilityEvidenceV1 {
             TraceSessionCapabilityStateV1::BrokerSessionInvalid
         };
         format!(
-            "broker_trace_session_capability=v1 state={} broker_receipt_state={} trigger={} trigger_sha256={} request_binding_sha256={} receipt_sha256={} transaction_sha256={} broker_source_sha256={} broker_pid={} broker_creation_time_100ns={} authority_before_sha256={} authority_after_sha256={} session_name_sha256={} start_status={} session_created={} stop_attempted={} stop_status={} cleanup_count={} session_absence_proven={} retirement={} elapsed_ms={} failure_stage={} failure_sha256={} retirement_failure_sha256={} provider_enable_attempted=false consumer_opened=false process_trace_started=false child_bound=false events_collected=0 requested_access_available=false exact_resource_identified=false acl_fix_identified=false primary_failure=original-a release_sent=false workload_executed=false qualification_promoted=false {}",
+            "broker_trace_session_capability=v1 state={} broker_receipt_state={} trigger={} trigger_sha256={} request_binding_sha256={} receipt_sha256={} transaction_sha256={} broker_source_sha256={} broker_pid={} broker_creation_time_100ns={} authority_before_sha256={} authority_after_sha256={} session_name_sha256={} start_status={} session_created={} stop_attempted={} stop_status={} cleanup_count={} session_absence_proven={} retirement={} elapsed_ms={} deadline_exceeded={} failure_stage={} failure_sha256={} retirement_failure_sha256={} provider_enable_attempted=false consumer_opened=false process_trace_started=false child_bound=false events_collected=0 requested_access_available=false exact_resource_identified=false acl_fix_identified=false primary_failure=original-a release_sent=false workload_executed=false qualification_promoted=false {}",
             effective_state.diagnostic(),
             receipt.state.diagnostic(),
             receipt.trigger_reason.diagnostic(),
@@ -1810,12 +1856,17 @@ impl TraceSessionCapabilityEvidenceV1 {
             receipt.session_absence_proven,
             self.retirement,
             receipt.elapsed_ms,
+            receipt.deadline_exceeded,
             self.failure_stage.unwrap_or("none"),
             self.failure_sha256.as_deref().unwrap_or("none"),
             self.retirement_failure_sha256.as_deref().unwrap_or("none"),
             Self::REDACTION,
         )
     }
+}
+
+pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {
+    "broker_trace_session_capability=v1 state=not-run broker_receipt_state=none trigger=none trigger_sha256=none request_binding_sha256=none receipt_sha256=none transaction_sha256=none broker_source_sha256=none broker_pid=0 broker_creation_time_100ns=0 authority_before_sha256=none authority_after_sha256=none session_name_sha256=none start_status=none session_created=false stop_attempted=false stop_status=none cleanup_count=0 session_absence_proven=false retirement=not-run elapsed_ms=0 deadline_exceeded=false failure_stage=none failure_sha256=none retirement_failure_sha256=none provider_enable_attempted=false consumer_opened=false process_trace_started=false child_bound=false events_collected=0 requested_access_available=false exact_resource_identified=false acl_fix_identified=false primary_failure=original-a release_sent=false workload_executed=false qualification_promoted=false session_name_redacted=true transaction_nonce_redacted=true broker_source_values_redacted=true token_values_redacted=true object_values_redacted=true"
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3884,14 +3935,26 @@ fn trace_session_capability_receipt_state_relation(
 pub(crate) fn request_trace_session_capability(
     trigger_sha256: String,
 ) -> TraceSessionCapabilityEvidenceV1 {
-    if super::record::validate_attempt_id(&trigger_sha256).is_err()
-        || !super::package::ephemeral_ci_enabled()
-    {
+    if super::record::validate_attempt_id(&trigger_sha256).is_err() {
         return TraceSessionCapabilityEvidenceV1 {
             receipt: None,
+            admitted_trigger_sha256: None,
+            request_provenance: None,
             retirement: "not-started",
             failure_stage: Some("typed-gate"),
             failure_sha256: Some(super::record::digest(b"invalid-typed-trigger")),
+            retirement_failure_sha256: None,
+        };
+    }
+    let admitted_trigger_sha256 = trigger_sha256.clone();
+    if !super::package::ephemeral_ci_enabled() {
+        return TraceSessionCapabilityEvidenceV1 {
+            receipt: None,
+            admitted_trigger_sha256: Some(admitted_trigger_sha256),
+            request_provenance: None,
+            retirement: "not-started",
+            failure_stage: Some("ephemeral-gate"),
+            failure_sha256: Some(super::record::digest(b"ephemeral-ci-disabled")),
             retirement_failure_sha256: None,
         };
     }
@@ -3901,6 +3964,8 @@ pub(crate) fn request_trace_session_capability(
             Err(error) => {
                 return TraceSessionCapabilityEvidenceV1 {
                     receipt: None,
+                    admitted_trigger_sha256: Some(admitted_trigger_sha256),
+                    request_provenance: None,
                     retirement: "startup-failed",
                     failure_stage: Some(error.stage.diagnostic()),
                     failure_sha256: Some(super::record::digest(error.detail.as_bytes())),
@@ -3908,6 +3973,7 @@ pub(crate) fn request_trace_session_capability(
                 };
             }
         };
+    let mut request_provenance = None;
     let result = (|| -> Result<TraceSessionCapabilityReceiptV1, String> {
         let pipe = authenticated.pipe();
         let broker = authenticated.broker();
@@ -3937,6 +4003,12 @@ pub(crate) fn request_trace_session_capability(
             request_binding_sha256: String::new(),
         };
         request.request_binding_sha256 = request.calculated_sha256()?;
+        request_provenance = Some(TraceSessionCapabilityRequestProvenanceV1 {
+            request_binding_sha256: request.request_binding_sha256.clone(),
+            transaction_sha256: super::record::digest(request.transaction_nonce.as_bytes()),
+            broker_source_sha256: request.broker_source_sha256.clone(),
+            broker_identity: request.broker_identity.clone(),
+        });
         let deadline = Instant::now() + BROKER_TRANSACTION_DEADLINE;
         super::pipe::write_frame_bounded(
             pipe.raw(),
@@ -3978,6 +4050,8 @@ pub(crate) fn request_trace_session_capability(
         Ok(receipt) => match authenticated.retire() {
             Ok(()) => TraceSessionCapabilityEvidenceV1 {
                 receipt: Some(receipt),
+                admitted_trigger_sha256: Some(admitted_trigger_sha256.clone()),
+                request_provenance: request_provenance.clone(),
                 retirement: "retired",
                 failure_stage: None,
                 failure_sha256: None,
@@ -3985,6 +4059,8 @@ pub(crate) fn request_trace_session_capability(
             },
             Err(error) => TraceSessionCapabilityEvidenceV1 {
                 receipt: Some(receipt),
+                admitted_trigger_sha256: Some(admitted_trigger_sha256.clone()),
+                request_provenance: request_provenance.clone(),
                 retirement: "retirement-failed",
                 failure_stage: Some("broker-retire"),
                 failure_sha256: None,
@@ -4001,6 +4077,8 @@ pub(crate) fn request_trace_session_capability(
             };
             TraceSessionCapabilityEvidenceV1 {
                 receipt: None,
+                admitted_trigger_sha256: Some(admitted_trigger_sha256),
+                request_provenance,
                 retirement,
                 failure_stage: Some("broker-protocol"),
                 failure_sha256: Some(super::record::digest(error.as_bytes())),
@@ -4197,6 +4275,13 @@ pub(crate) fn trace_session_capability_receipt_for_test(
         mutation == TraceSessionCapabilityReceiptMutationForTest::RetirementFailure;
     let evidence = TraceSessionCapabilityEvidenceV1 {
         receipt: Some(receipt),
+        admitted_trigger_sha256: Some(request.trigger_sha256.clone()),
+        request_provenance: Some(TraceSessionCapabilityRequestProvenanceV1 {
+            request_binding_sha256: request.request_binding_sha256.clone(),
+            transaction_sha256: super::record::digest(request.transaction_nonce.as_bytes()),
+            broker_source_sha256: request.broker_source_sha256.clone(),
+            broker_identity: request.broker_identity.clone(),
+        }),
         retirement: if retirement_failed {
             "retirement-failed"
         } else {
@@ -4211,15 +4296,49 @@ pub(crate) fn trace_session_capability_receipt_for_test(
 }
 
 #[cfg(test)]
-pub(crate) fn trace_session_capability_dual_failure_diagnostic_for_test() -> String {
-    TraceSessionCapabilityEvidenceV1 {
+pub(crate) fn trace_session_capability_no_receipt_diagnostics_for_test() -> (String, String, String)
+{
+    let admitted_trigger_sha256 = super::record::digest(b"test-typed-trigger");
+    let request_provenance = TraceSessionCapabilityRequestProvenanceV1 {
+        request_binding_sha256: super::record::digest(b"test-request-binding"),
+        transaction_sha256: super::record::digest(b"test-transaction-nonce-not-rendered"),
+        broker_source_sha256: super::record::digest(b"test-normalized-broker-source"),
+        broker_identity: WindowsProcessIdentityV1 {
+            process_id: 43,
+            creation_time_100ns: 44,
+        },
+    };
+    let startup = TraceSessionCapabilityEvidenceV1 {
         receipt: None,
+        admitted_trigger_sha256: Some(admitted_trigger_sha256.clone()),
+        request_provenance: None,
+        retirement: "startup-failed",
+        failure_stage: Some("broker-start"),
+        failure_sha256: Some(super::record::digest(b"test-startup-failure")),
+        retirement_failure_sha256: None,
+    }
+    .diagnostic();
+    let protocol = TraceSessionCapabilityEvidenceV1 {
+        receipt: None,
+        admitted_trigger_sha256: Some(admitted_trigger_sha256.clone()),
+        request_provenance: Some(request_provenance.clone()),
+        retirement: "retired",
+        failure_stage: Some("broker-protocol"),
+        failure_sha256: Some(super::record::digest(b"test-primary-protocol-failure")),
+        retirement_failure_sha256: None,
+    }
+    .diagnostic();
+    let dual_failure = TraceSessionCapabilityEvidenceV1 {
+        receipt: None,
+        admitted_trigger_sha256: Some(admitted_trigger_sha256),
+        request_provenance: Some(request_provenance),
         retirement: "retirement-failed",
         failure_stage: Some("broker-protocol"),
         failure_sha256: Some(super::record::digest(b"test-primary-protocol-failure")),
         retirement_failure_sha256: Some(super::record::digest(b"test-retirement-failure")),
     }
-    .diagnostic()
+    .diagnostic();
+    (startup, protocol, dual_failure)
 }
 
 #[allow(clippy::too_many_arguments)]

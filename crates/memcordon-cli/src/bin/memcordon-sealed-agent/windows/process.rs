@@ -6126,6 +6126,19 @@ fn loader_restriction_presence_required(
         && object_security_invariants_valid
 }
 
+fn loader_restriction_presence_capability_prefix(
+    state: &str,
+    presence_state: &str,
+    identity_state: &str,
+    logon_state: &str,
+    authenticated_users_state: &str,
+    trace_session_capability_diagnostic: &str,
+) -> String {
+    format!(
+        "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state={presence_state} identity_state={identity_state} logon_state={logon_state} authenticated_users_state={authenticated_users_state} {trace_session_capability_diagnostic}"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn loader_restriction_presence_prerequisite_canary_diagnostic(
     exact_desktop: &str,
@@ -7036,16 +7049,13 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
             None,
         ),
     };
-    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {
-        Some(trigger_sha256) => format!(
-            "{} {}",
-            debug_observer_diagnostic,
-            super::session_broker::request_trace_session_capability(trigger_sha256).diagnostic(),
-        ),
-        None => format!(
-            "{} broker_trace_session_capability=v1 state=not-run trigger=none primary_failure=original-a release_sent=false workload_executed=false qualification_promoted=false",
-            debug_observer_diagnostic,
-        ),
+    let trace_session_capability_evidence =
+        trace_session_capability_trigger_sha256.map(|trigger_sha256| {
+            super::session_broker::request_trace_session_capability(trigger_sha256)
+        });
+    let trace_session_capability_diagnostic = match trace_session_capability_evidence.as_ref() {
+        Some(evidence) => evidence.diagnostic(),
+        None => super::session_broker::trace_session_capability_not_run_diagnostic().to_owned(),
     };
     let common = common_fields
         .iter()
@@ -7092,7 +7102,15 @@ fn loader_restriction_presence_prerequisite_canary_diagnostic(
     };
     LoaderRestrictionPresencePrerequisiteEvaluationV1 {
         diagnostic: format!(
-            "loader_restriction_presence_prerequisite_canary=v2 state={state} presence_state={presence_state} identity_state={identity_state} logon_state={logon_state} authenticated_users_state={authenticated_users_state} baseline_semantics=full-restricted comparison_semantics=privilege-disabled/no-restricting-SID same_access_semantics=privilege-disabled/canonical-same-access-restricted logon_semantics=privilege-disabled/target-logon-SID-restricted authenticated_users_semantics=privilege-disabled/authenticated-users-SID-restricted target_user_semantics=privilege-disabled/target-user-SID-restricted differing_fields=[restricting_sid_inventory,token_is_restricted,token_instance_ids] failed_common_fields=[{failed_common_fields}] source_binding_sha256={} restriction_presence_binding_sha256={} restriction_identity_binding_sha256={} logon_restriction_binding_sha256={} authenticated_users_restriction_binding_sha256={} target_user_restriction_binding_sha256={} shared_environment_sha256={} shared_environment_keys_sha256={} shared_environment_units={} shared_environment_entries={} shared_environment_profile_loaded=true after_baseline_scan={} after_baseline_metadata_match={} after_baseline_observation_sha256={} after_comparison_scan={} after_comparison_metadata_match={} after_comparison_observation_sha256={} after_same_access_scan={} after_same_access_metadata_match={} after_same_access_observation_sha256={} after_logon_scan={} after_logon_metadata_match={} after_logon_observation_sha256={} after_authenticated_users_scan={} after_authenticated_users_metadata_match={} after_authenticated_users_observation_sha256={} after_target_user_scan={} after_target_user_metadata_match={} after_target_user_observation_sha256={} shared_environment_scan={} shared_environment_metadata_match={} shared_environment_observation_sha256={} shared_environment_stable={} shared_environment_destroyed={} baseline=[{}] comparison=[{}] same_access=[{}] logon=[{}] authenticated_users=[{}] target_user=[{}] profile_state=already-loaded-borrowed profile_stable={} launcher_explicit={} invariants_valid={} {} invariant_error_sha256={} {} {} environment_values_redacted=true token_values_redacted=true job_empty={job_empty_exact} workload_executed=false qualification_promoted=false",
+            "{} baseline_semantics=full-restricted comparison_semantics=privilege-disabled/no-restricting-SID same_access_semantics=privilege-disabled/canonical-same-access-restricted logon_semantics=privilege-disabled/target-logon-SID-restricted authenticated_users_semantics=privilege-disabled/authenticated-users-SID-restricted target_user_semantics=privilege-disabled/target-user-SID-restricted differing_fields=[restricting_sid_inventory,token_is_restricted,token_instance_ids] failed_common_fields=[{failed_common_fields}] source_binding_sha256={} restriction_presence_binding_sha256={} restriction_identity_binding_sha256={} logon_restriction_binding_sha256={} authenticated_users_restriction_binding_sha256={} target_user_restriction_binding_sha256={} shared_environment_sha256={} shared_environment_keys_sha256={} shared_environment_units={} shared_environment_entries={} shared_environment_profile_loaded=true after_baseline_scan={} after_baseline_metadata_match={} after_baseline_observation_sha256={} after_comparison_scan={} after_comparison_metadata_match={} after_comparison_observation_sha256={} after_same_access_scan={} after_same_access_metadata_match={} after_same_access_observation_sha256={} after_logon_scan={} after_logon_metadata_match={} after_logon_observation_sha256={} after_authenticated_users_scan={} after_authenticated_users_metadata_match={} after_authenticated_users_observation_sha256={} after_target_user_scan={} after_target_user_metadata_match={} after_target_user_observation_sha256={} shared_environment_scan={} shared_environment_metadata_match={} shared_environment_observation_sha256={} shared_environment_stable={} shared_environment_destroyed={} baseline=[{}] comparison=[{}] same_access=[{}] logon=[{}] authenticated_users=[{}] target_user=[{}] profile_state=already-loaded-borrowed profile_stable={} launcher_explicit={} invariants_valid={} {} invariant_error_sha256={} {} {} environment_values_redacted=true token_values_redacted=true job_empty={job_empty_exact} workload_executed=false qualification_promoted=false",
+            loader_restriction_presence_capability_prefix(
+                state,
+                presence_state,
+                identity_state,
+                logon_state,
+                authenticated_users_state,
+                &trace_session_capability_diagnostic,
+            ),
             tokens.source_binding_sha256,
             tokens.restriction_presence_binding_sha256,
             restriction_identity_binding_sha256,
@@ -7845,6 +7863,26 @@ pub(crate) fn render_loader_restriction_presence_canary_for_test(
         super::record::digest(comparison_detail.as_bytes()),
         super::record::digest(same_access_detail.as_bytes()),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn render_bounded_loader_trace_session_capability_for_test(
+    trace_session_capability_diagnostic: &str,
+    trailing_observer_diagnostic: &str,
+) -> String {
+    let prefix = loader_restriction_presence_capability_prefix(
+        "test",
+        "test",
+        "test",
+        "test",
+        "test",
+        trace_session_capability_diagnostic,
+    );
+    super::record::pretarget_rejection(
+        "MCSEALED-WINDOWS-LOADER-TRACE-CAPABILITY-BOUND-TEST",
+        format!("{prefix} {trailing_observer_diagnostic}"),
+    )
+    .detail
 }
 
 #[cfg(test)]

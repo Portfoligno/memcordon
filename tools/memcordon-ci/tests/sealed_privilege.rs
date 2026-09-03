@@ -13149,10 +13149,6 @@ fn validate_windows_shared_userenv_restriction_presence_contract(
                 "typed A/B/C/D/E/F outcome classifier after invariant admission",
             ),
             (
-                "logon_state={logon_state}",
-                "distinct D result retained beside E classification",
-            ),
-            (
                 "authenticated_users_semantics=privilege-disabled/authenticated-users-SID-restricted",
                 "bounded E semantic label",
             ),
@@ -15161,7 +15157,7 @@ fn validate_windows_passive_access_localization_contract(
         )
         .and_then(|(_, suffix)| {
             suffix
-                .split_once("    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256")
+                .split_once("    let trace_session_capability_evidence =")
                 .map(|(region, _)| region)
         })
         .ok_or_else(|| "debug observer evidence has no semantic boundary".to_owned())?;
@@ -16053,6 +16049,90 @@ fn validate_windows_trace_session_capability_contract(
             ),
         ],
     )?;
+    require_source(
+        &sources.process,
+        "state={state} presence_state={presence_state} identity_state={identity_state} logon_state={logon_state} authenticated_users_state={authenticated_users_state}",
+        "leading typed A-F classifier inventory",
+    )?;
+    let capability_prefix = semantic_function_region(
+        &sources.process,
+        "fn loader_restriction_presence_capability_prefix(",
+        "#[allow(clippy::too_many_arguments)]",
+    )
+    .ok_or_else(|| "trace-session capability priority prefix has no boundary".to_owned())?;
+    require_source_order(
+        &capability_prefix,
+        &[
+            (
+                "state={state} presence_state={presence_state} identity_state={identity_state} logon_state={logon_state} authenticated_users_state={authenticated_users_state}",
+                "leading typed restriction classifiers",
+            ),
+            (
+                "{trace_session_capability_diagnostic}",
+                "prioritized complete broker capability record",
+            ),
+        ],
+    )?;
+    if capability_prefix
+        .matches("{trace_session_capability_diagnostic}")
+        .count()
+        != 1
+    {
+        return Err("trace-session capability priority prefix is dropped or duplicated".to_owned());
+    }
+    let restriction_diagnostic = semantic_function_region(
+        &sources.process,
+        "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+        "#[cfg(test)]",
+    )
+    .ok_or_else(|| "restriction diagnostic has no semantic boundary".to_owned())?;
+    require_source_order(
+        &restriction_diagnostic,
+        &[
+            (
+                "let trace_session_capability_evidence =",
+                "separate typed capability evidence",
+            ),
+            (
+                "let trace_session_capability_diagnostic = match trace_session_capability_evidence.as_ref()",
+                "late capability rendering",
+            ),
+            (
+                "trace_session_capability_not_run_diagnostic()",
+                "complete typed not-run record",
+            ),
+            ("let common =", "lower-priority A-F common evidence"),
+            (
+                "\"{} baseline_semantics=full-restricted",
+                "capability prefix before variable-length evidence",
+            ),
+            (
+                "loader_restriction_presence_capability_prefix(",
+                "shared priority prefix renderer",
+            ),
+            (
+                "&trace_session_capability_diagnostic,",
+                "separate capability record passed to prefix",
+            ),
+            (
+                "passive_access_localization.diagnostic(),",
+                "lower-priority passive evidence",
+            ),
+            (
+                "debug_observer_diagnostic,",
+                "lower-priority FullObserver evidence",
+            ),
+        ],
+    )?;
+    require_source(
+        &restriction_diagnostic,
+        "original_reproduction_valid,\n                        original_invariants_valid,",
+        "capability trigger preserves pre-debug A-F provenance",
+    )?;
+    if restriction_diagnostic.contains("debug_observer_diagnostic,\n            super::session_broker::request_trace_session_capability")
+    {
+        return Err("trace-session capability record was restored after FullObserver evidence".to_owned());
+    }
     let native = semantic_function_region(
         &sources.access_trace,
         "pub(super) fn run_trace_session_capability(",
@@ -16317,6 +16397,38 @@ fn validate_windows_trace_session_capability_contract(
             "failure_sha256: Some(super::record::digest(error.as_bytes())),\n                retirement_failure_sha256: retirement_failure,",
             "primary and retirement failures preserved separately",
         ),
+        (
+            "let admitted_trigger_sha256 = trigger_sha256.clone();",
+            "validated trigger retained independently of receipt availability",
+        ),
+        (
+            "let mut request_provenance = None;",
+            "optional sealed request provenance",
+        ),
+        (
+            "request_provenance = Some(TraceSessionCapabilityRequestProvenanceV1 {",
+            "constructed request provenance retention",
+        ),
+        (
+            "request_binding_sha256: request.request_binding_sha256.clone(),",
+            "request provenance sealed-request binding",
+        ),
+        (
+            "transaction_sha256: super::record::digest(request.transaction_nonce.as_bytes()),",
+            "request provenance transaction-nonce digest",
+        ),
+        (
+            "broker_source_sha256: request.broker_source_sha256.clone(),",
+            "request provenance broker-source binding",
+        ),
+        (
+            "broker_identity: request.broker_identity.clone(),",
+            "request provenance broker identity binding",
+        ),
+        (
+            "receipt: None,\n                admitted_trigger_sha256: Some(admitted_trigger_sha256),\n                request_provenance,",
+            "protocol failure trigger and request provenance retention",
+        ),
     ] {
         require_source(&client, needle, purpose)?;
     }
@@ -16332,6 +16444,19 @@ fn validate_windows_trace_session_capability_contract(
         "transaction_sha256=",
         "broker_source_sha256=",
         "retirement_failure_sha256=",
+        "deadline_exceeded=",
+        "receipt_sha256=unavailable",
+        "authority_before_sha256=unavailable",
+        "authority_after_sha256=unavailable",
+        "session_name_sha256=unavailable",
+        "start_status=unavailable",
+        "session_created=unavailable",
+        "stop_attempted=unavailable",
+        "stop_status=unavailable",
+        "cleanup_count=unavailable",
+        "session_absence_proven=unavailable",
+        "elapsed_ms=unavailable",
+        "deadline_exceeded=unavailable",
         "requested_access_available=false",
         "exact_resource_identified=false",
         "acl_fix_identified=false",
@@ -16347,7 +16472,67 @@ fn validate_windows_trace_session_capability_contract(
     ] {
         require_source(&diagnostic, field, field)?;
     }
+    if diagnostic
+        .matches("transaction_nonce_redacted=true")
+        .count()
+        != 2
+    {
+        return Err(
+            "executed and not-run capability renderers must both attest nonce redaction".to_owned(),
+        );
+    }
+    let not_run = semantic_function_region(
+        &sources.session_broker,
+        "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+        "#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]",
+    )
+    .ok_or_else(|| "trace-session capability not-run renderer has no boundary".to_owned())?;
+    for field in [
+        "state=not-run",
+        "broker_receipt_state=none",
+        "trigger=none",
+        "receipt_sha256=none",
+        "start_status=none",
+        "stop_attempted=false",
+        "stop_status=none",
+        "cleanup_count=0",
+        "session_absence_proven=false",
+        "retirement=not-run",
+        "deadline_exceeded=false",
+        "primary_failure=original-a",
+        "release_sent=false",
+        "workload_executed=false",
+        "qualification_promoted=false",
+        "transaction_nonce_redacted=true",
+        "object_values_redacted=true",
+    ] {
+        require_source(&not_run, field, field)?;
+    }
     for (needle, purpose) in [
+        (
+            "self.admitted_trigger_sha256.as_deref().unwrap_or(\"none\")",
+            "receipt-less admitted trigger rendering",
+        ),
+        (
+            ".map_or(\"unavailable\", |value| value.request_binding_sha256.as_str())",
+            "receipt-less request provenance rendering",
+        ),
+        (
+            ".map_or(\"unavailable\", |value| value.transaction_sha256.as_str())",
+            "receipt-less transaction provenance rendering",
+        ),
+        (
+            ".map_or(\"unavailable\", |value| value.broker_source_sha256.as_str())",
+            "receipt-less broker-source provenance rendering",
+        ),
+        (
+            ".map(|value| value.broker_identity.process_id.to_string())",
+            "receipt-less broker PID provenance rendering",
+        ),
+        (
+            ".map(|value| value.broker_identity.creation_time_100ns.to_string())",
+            "receipt-less broker creation-time provenance rendering",
+        ),
         ("receipt.receipt_sha256", "sealed receipt digest rendering"),
         (
             "receipt.transaction_sha256",
@@ -16360,6 +16545,21 @@ fn validate_windows_trace_session_capability_contract(
         (
             "let effective_state = if self.retirement == \"retired\"",
             "retirement-derived effective invalid state",
+        ),
+        ("receipt.start_status", "native start status rendering"),
+        ("receipt.stop_attempted", "native STOP attempt rendering"),
+        (
+            "receipt\n                .stop_status",
+            "native STOP status rendering",
+        ),
+        ("receipt.cleanup_count", "native cleanup count rendering"),
+        (
+            "receipt.session_absence_proven",
+            "native session-absence rendering",
+        ),
+        (
+            "receipt.deadline_exceeded",
+            "native deadline result rendering",
         ),
     ] {
         require_source(&diagnostic, needle, purpose)?;
@@ -20766,6 +20966,54 @@ fn windows_trace_session_capability_region_mutations_are_rejected() {
         ),
         (
             WindowsLoaderControlContractSource::Process,
+            "fn loader_restriction_presence_capability_prefix(",
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            " {trace_session_capability_diagnostic}",
+            "",
+            "trace-capability-priority-record-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_restriction_presence_capability_prefix(",
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            " {trace_session_capability_diagnostic}",
+            " {trace_session_capability_diagnostic} {trace_session_capability_diagnostic}",
+            "trace-capability-priority-record-duplicated",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "pub(crate) fn loader_restriction_presence_gate_for_test(",
+            "&trace_session_capability_diagnostic,",
+            "&debug_observer_diagnostic,",
+            "trace-capability-priority-record-replaced-by-observer",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "pub(crate) fn loader_restriction_presence_gate_for_test(",
+            "&trace_session_capability_diagnostic,",
+            "&format!(\"{debug_observer_diagnostic} {trace_session_capability_diagnostic}\"),",
+            "trace-capability-record-restored-after-full-observer",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "fn loader_restriction_presence_prerequisite_canary_diagnostic(",
+            "pub(crate) fn loader_restriction_presence_gate_for_test(",
+            "super::session_broker::trace_session_capability_not_run_diagnostic().to_owned()",
+            "String::new()",
+            "trace-capability-not-run-record-dropped",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
+            "        Some((debug_c, after_debug_c, Some((debug_f, after_debug_f)))) => {",
+            "        Some((debug_c, after_debug_c, None)) => {",
+            "                        original_reproduction_valid,\n                        original_invariants_valid,",
+            "                        original_reproduction_valid,\n                        invariants_valid,",
+            "trace-capability-trigger-original-invariants-rewired-to-aggregate",
+        ),
+        (
+            WindowsLoaderControlContractSource::Process,
             "fn loader_trace_session_capability_trigger_sha256(",
             "fn classify_loader_full_observer_pair(",
             "        target_user_restricted,\n        debug_c,",
@@ -21038,8 +21286,120 @@ fn windows_trace_session_capability_region_mutations_are_rejected() {
         ),
         (
             WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn request_trace_session_capability(",
+            "pub(crate) fn trace_session_capability_state_for_test(",
+            "request_binding_sha256: request.request_binding_sha256.clone(),",
+            "request_binding_sha256: request.broker_source_sha256.clone(),",
+            "trace-capability-request-provenance-binding-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn request_trace_session_capability(",
+            "pub(crate) fn trace_session_capability_state_for_test(",
+            "transaction_sha256: super::record::digest(request.transaction_nonce.as_bytes()),",
+            "transaction_sha256: request.request_binding_sha256.clone(),",
+            "trace-capability-request-provenance-transaction-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn request_trace_session_capability(",
+            "pub(crate) fn trace_session_capability_state_for_test(",
+            "broker_source_sha256: request.broker_source_sha256.clone(),",
+            "broker_source_sha256: request.request_binding_sha256.clone(),",
+            "trace-capability-request-provenance-source-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn request_trace_session_capability(",
+            "pub(crate) fn trace_session_capability_state_for_test(",
+            "broker_identity: request.broker_identity.clone(),",
+            "broker_identity: request.launcher_identity.clone(),",
+            "trace-capability-request-provenance-identity-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn request_trace_session_capability(",
+            "pub(crate) fn trace_session_capability_state_for_test(",
+            "receipt: None,\n                admitted_trigger_sha256: Some(admitted_trigger_sha256),\n                request_provenance,",
+            "receipt: None,\n                admitted_trigger_sha256: None,\n                request_provenance,",
+            "trace-capability-protocol-failure-drops-admitted-trigger",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn request_trace_session_capability(",
+            "pub(crate) fn trace_session_capability_state_for_test(",
+            "receipt: None,\n                admitted_trigger_sha256: Some(admitted_trigger_sha256),\n                request_provenance,",
+            "receipt: None,\n                admitted_trigger_sha256: Some(admitted_trigger_sha256),\n                request_provenance: None,",
+            "trace-capability-protocol-failure-drops-request-provenance",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
             "impl TraceSessionCapabilityEvidenceV1 {",
-            "pub(crate) struct LoaderSnapsArmedReceiptV2 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            "self.admitted_trigger_sha256.as_deref().unwrap_or(\"none\")",
+            "None::<&str>.unwrap_or(\"none\")",
+            "trace-capability-receiptless-renderer-drops-admitted-trigger",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            ".map_or(\"unavailable\", |value| value.request_binding_sha256.as_str())",
+            ".map_or(\"unavailable\", |value| value.transaction_sha256.as_str())",
+            "trace-capability-receiptless-request-binding-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            ".map_or(\"unavailable\", |value| value.transaction_sha256.as_str())",
+            ".map_or(\"unavailable\", |value| value.request_binding_sha256.as_str())",
+            "trace-capability-receiptless-transaction-binding-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            ".map_or(\"unavailable\", |value| value.broker_source_sha256.as_str())",
+            ".map_or(\"unavailable\", |value| value.request_binding_sha256.as_str())",
+            "trace-capability-receiptless-source-binding-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            ".map(|value| value.broker_identity.process_id.to_string())",
+            ".map(|value| value.broker_identity.creation_time_100ns.to_string())",
+            "trace-capability-receiptless-broker-pid-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            ".map(|value| value.broker_identity.creation_time_100ns.to_string())",
+            ".map(|value| value.broker_identity.process_id.to_string())",
+            "trace-capability-receiptless-broker-creation-time-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            "start_status=unavailable session_created=unavailable stop_attempted=unavailable stop_status=unavailable cleanup_count=unavailable session_absence_proven=unavailable",
+            "start_status=none session_created=false stop_attempted=false stop_status=none cleanup_count=0 session_absence_proven=false",
+            "trace-capability-receiptless-native-facts-fabricated",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            "elapsed_ms=unavailable deadline_exceeded=unavailable",
+            "elapsed_ms=0 deadline_exceeded=false",
+            "trace-capability-receiptless-deadline-facts-fabricated",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
             "            receipt.receipt_sha256,",
             "            super::record::digest(b\"omitted-receipt\"),",
             "trace-capability-rendered-receipt-digest-omitted",
@@ -21047,7 +21407,7 @@ fn windows_trace_session_capability_region_mutations_are_rejected() {
         (
             WindowsLoaderControlContractSource::SessionBroker,
             "impl TraceSessionCapabilityEvidenceV1 {",
-            "pub(crate) struct LoaderSnapsArmedReceiptV2 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
             "            receipt.transaction_sha256,",
             "            receipt.receipt_sha256,",
             "trace-capability-rendered-transaction-binding-substituted",
@@ -21055,7 +21415,7 @@ fn windows_trace_session_capability_region_mutations_are_rejected() {
         (
             WindowsLoaderControlContractSource::SessionBroker,
             "impl TraceSessionCapabilityEvidenceV1 {",
-            "pub(crate) struct LoaderSnapsArmedReceiptV2 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
             "            receipt.broker_source_sha256,",
             "            receipt.receipt_sha256,",
             "trace-capability-rendered-source-binding-substituted",
@@ -21063,10 +21423,50 @@ fn windows_trace_session_capability_region_mutations_are_rejected() {
         (
             WindowsLoaderControlContractSource::SessionBroker,
             "impl TraceSessionCapabilityEvidenceV1 {",
-            "pub(crate) struct LoaderSnapsArmedReceiptV2 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
             "transaction_nonce_redacted=true",
             "transaction_nonce_redacted=false",
             "trace-capability-transaction-redaction-removed",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            "            receipt.start_status,",
+            "            0,",
+            "trace-capability-rendered-start-status-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            "            receipt.cleanup_count,",
+            "            0,",
+            "trace-capability-rendered-cleanup-count-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            "            receipt.session_absence_proven,",
+            "            false,",
+            "trace-capability-rendered-absence-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "impl TraceSessionCapabilityEvidenceV1 {",
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            "            receipt.deadline_exceeded,",
+            "            false,",
+            "trace-capability-rendered-deadline-substituted",
+        ),
+        (
+            WindowsLoaderControlContractSource::SessionBroker,
+            "pub(crate) fn trace_session_capability_not_run_diagnostic() -> &'static str {",
+            "pub(crate) struct LoaderSnapsArmedReceiptV2 {",
+            "retirement=not-run",
+            "retirement=none",
+            "trace-capability-not-run-retirement-provenance-dropped",
         ),
         (
             WindowsLoaderControlContractSource::SessionBroker,
@@ -22222,21 +22622,21 @@ fn windows_passive_access_localization_mutations_are_rejected() {
         ),
         (
             "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
-            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "    let trace_session_capability_evidence =",
             ".map(|(canonical, target)| loader_full_observer_module_frontier(canonical, target));",
             ".map(|_| panic!(\"stable module frontier omitted\"));",
             "full-observer-stable-module-frontier-derivation-removed",
         ),
         (
             "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
-            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "    let trace_session_capability_evidence =",
             "module_frontier.as_ref().map(|frontier| frontier.useful),",
             "Some(true),",
             "full-observer-stable-module-frontier-classification-bypassed",
         ),
         (
             "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
-            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "    let trace_session_capability_evidence =",
             "module_frontier.as_ref(),",
             "None,",
             "full-observer-stable-module-frontier-rendering-removed",
@@ -22327,7 +22727,7 @@ fn windows_passive_access_localization_mutations_are_rejected() {
         ),
         (
             "        Some((debug_c, after_debug_c, None)) => {",
-            "        None => format!(",
+            "        None => (",
             "                original_reproduction_valid,\n                original_invariants_valid,",
             "                original_reproduction_valid,\n                invariants_valid,",
             "full-observer-c-only-original-invariants-rewired-to-aggregate",
@@ -22460,28 +22860,28 @@ fn windows_passive_access_localization_mutations_are_rejected() {
         ),
         (
             "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
-            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "    let trace_session_capability_evidence =",
             "loader_common_result_field(&same_access, debug_c, field).is_ok()",
             "true",
             "debug-c-original-projection-check-removed",
         ),
         (
             "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
-            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "    let trace_session_capability_evidence =",
             "== Some(\"0x00080406\")",
             "== Some(\"0x00080402\")",
             "debug-creation-flags-changed",
         ),
         (
             "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
-            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "    let trace_session_capability_evidence =",
             "let detail_hash =\n                |label: &[u8], result: &Result<String, TargetDesktopLeaseCreateError>| {\n                    let mut material =\n                        b\"memcordon-loader-observer-perturbation-detail-v1\\0\".to_vec();",
             "let detail_hash =\n                |label: &[u8], result: &Result<String, TargetDesktopLeaseCreateError>| {\n                    let mut material = Vec::new();",
             "debug-detail-hash-domain-dropped",
         ),
         (
             "    let (debug_observer_diagnostic, trace_session_capability_trigger_sha256) = match debug_pair",
-            "    let debug_observer_diagnostic = match trace_session_capability_trigger_sha256 {",
+            "    let trace_session_capability_evidence =",
             "&debug_invariants,\n                    debug_pair_job_empty_exact,",
             "&debug_invariants,\n                    debug_containment_exact,",
             "debug-job-empty-reconnected-to-containment-aggregate",

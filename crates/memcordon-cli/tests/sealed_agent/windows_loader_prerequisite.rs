@@ -33,6 +33,7 @@ use crate::windows::{
         loader_shared_environment_triplet_valid_for_test,
         loader_trace_session_capability_gate_for_test,
         loader_trace_session_capability_trigger_binding_for_test,
+        render_bounded_loader_trace_session_capability_for_test,
         render_loader_full_observer_canary_for_test,
         render_loader_restriction_authenticated_users_canary_for_test,
         render_loader_restriction_canary_for_test, render_loader_restriction_logon_canary_for_test,
@@ -42,8 +43,8 @@ use crate::windows::{
     },
     session_broker::{
         TraceSessionCapabilityReceiptMutationForTest,
-        trace_session_capability_dual_failure_diagnostic_for_test,
-        trace_session_capability_receipt_for_test,
+        trace_session_capability_no_receipt_diagnostics_for_test,
+        trace_session_capability_not_run_diagnostic, trace_session_capability_receipt_for_test,
         trace_session_capability_schema_versions_for_test, trace_session_capability_state_for_test,
     },
     token::{
@@ -1431,11 +1432,162 @@ fn trace_session_capability_renderer_preserves_sealed_and_retirement_provenance(
         "capability diagnostic is unbounded"
     );
 
-    let dual_failure = trace_session_capability_dual_failure_diagnostic_for_test();
+    let (startup_failure, protocol_failure, dual_failure) =
+        trace_session_capability_no_receipt_diagnostics_for_test();
+    for (stage, diagnostic) in [
+        ("startup", &startup_failure),
+        ("protocol", &protocol_failure),
+        ("dual", &dual_failure),
+    ] {
+        for unknown in [
+            "receipt_sha256=unavailable",
+            "authority_before_sha256=unavailable",
+            "authority_after_sha256=unavailable",
+            "session_name_sha256=unavailable",
+            "start_status=unavailable",
+            "session_created=unavailable",
+            "stop_attempted=unavailable",
+            "stop_status=unavailable",
+            "cleanup_count=unavailable",
+            "session_absence_proven=unavailable",
+            "elapsed_ms=unavailable",
+            "deadline_exceeded=unavailable",
+        ] {
+            assert!(
+                diagnostic.contains(unknown),
+                "{stage} failure fabricated or omitted unknown evidence: {unknown}"
+            );
+        }
+        assert!(diagnostic.contains("trigger=stable-module-zero-prefix-nonlocalizing"));
+        assert!(diagnostic.contains(
+            "trigger_sha256=c7259d12c704a77db222d6050c728a8717bd758adf2712d310eea3a209eadcc3"
+        ));
+    }
+    assert!(startup_failure.contains("request_binding_sha256=unavailable"));
+    assert!(startup_failure.contains("transaction_sha256=unavailable"));
+    assert!(startup_failure.contains("broker_source_sha256=unavailable"));
+    for retained in [
+        "request_binding_sha256=701f0f6202d00bf6b5e86c6932fd7e2d7fa1b9fa18fd1ddfac9ec79c0dc926f4",
+        "transaction_sha256=61316271f9407a70694b32ed2558921a7f8545515a799f66290811d651fafd71",
+        "broker_source_sha256=6ce0db95de810595c80a51c9f83c4357474bbc50b5d43dec13b15db0266db4cb",
+        "broker_pid=43",
+        "broker_creation_time_100ns=44",
+    ] {
+        assert!(protocol_failure.contains(retained));
+        assert!(dual_failure.contains(retained));
+    }
     assert!(dual_failure.contains("failure_stage=broker-protocol"));
     assert!(!dual_failure.contains("failure_sha256=none"));
     assert!(!dual_failure.contains("retirement_failure_sha256=none"));
     assert!(dual_failure.contains("primary_failure=original-a"));
+}
+
+#[test]
+fn trace_session_capability_record_survives_the_actual_rejection_detail_bound() {
+    assert_eq!(
+        memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES,
+        8 * 1024,
+        "this regression must exercise the exact hosted rejection-detail frontier"
+    );
+    let mut cases = vec![(
+        "not-run",
+        trace_session_capability_not_run_diagnostic().to_owned(),
+    )];
+    for (state, mutation) in [
+        (
+            "broker-session-available",
+            TraceSessionCapabilityReceiptMutationForTest::Available,
+        ),
+        (
+            "broker-session-unavailable",
+            TraceSessionCapabilityReceiptMutationForTest::Unavailable,
+        ),
+        (
+            "broker-session-invalid",
+            TraceSessionCapabilityReceiptMutationForTest::ClosedInvalidStopFailure,
+        ),
+        (
+            "broker-session-invalid",
+            TraceSessionCapabilityReceiptMutationForTest::RetirementFailure,
+        ),
+    ] {
+        let (_, _, diagnostic) = trace_session_capability_receipt_for_test(mutation);
+        cases.push((state, diagnostic));
+    }
+    let (_, _, dual_failure) = trace_session_capability_no_receipt_diagnostics_for_test();
+    cases.push(("broker-session-invalid", dual_failure));
+
+    let trailing = format!(
+        "loader_observer_perturbation=v1 {} lower_priority_observer_end=true",
+        "bounded-observer-field=value ".repeat(memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES)
+    );
+    for (state, capability) in cases {
+        let bounded =
+            render_bounded_loader_trace_session_capability_for_test(&capability, &trailing);
+        assert_eq!(
+            bounded.len(),
+            memcordon_core::PROVIDER_REJECTION_MAX_DETAIL_BYTES,
+            "state={state} did not exercise the exact rejection-detail bound"
+        );
+        assert_eq!(
+            bounded
+                .matches("broker_trace_session_capability=v1")
+                .count(),
+            1,
+            "state={state} did not retain exactly one capability record"
+        );
+        assert!(bounded.contains(&format!(" state={state} ")));
+        for field in [
+            "broker_receipt_state=",
+            "trigger=",
+            "trigger_sha256=",
+            "request_binding_sha256=",
+            "receipt_sha256=",
+            "transaction_sha256=",
+            "broker_source_sha256=",
+            "broker_pid=",
+            "broker_creation_time_100ns=",
+            "authority_before_sha256=",
+            "authority_after_sha256=",
+            "session_name_sha256=",
+            "start_status=",
+            "session_created=",
+            "stop_attempted=",
+            "stop_status=",
+            "cleanup_count=",
+            "session_absence_proven=",
+            "retirement=",
+            "elapsed_ms=",
+            "deadline_exceeded=",
+            "failure_stage=",
+            "failure_sha256=",
+            "retirement_failure_sha256=",
+            "provider_enable_attempted=false",
+            "consumer_opened=false",
+            "process_trace_started=false",
+            "child_bound=false",
+            "events_collected=0",
+            "requested_access_available=false",
+            "exact_resource_identified=false",
+            "acl_fix_identified=false",
+            "primary_failure=original-a",
+            "release_sent=false",
+            "workload_executed=false",
+            "qualification_promoted=false",
+            "session_name_redacted=true",
+            "transaction_nonce_redacted=true",
+            "broker_source_values_redacted=true",
+            "token_values_redacted=true",
+            "object_values_redacted=true",
+        ] {
+            assert!(bounded.contains(field), "state={state} missing {field}");
+        }
+        assert!(bounded.contains("loader_observer_perturbation=v1"));
+        assert!(
+            !bounded.contains("lower_priority_observer_end=true"),
+            "state={state} did not exercise suffix truncation"
+        );
+    }
 }
 
 #[test]
@@ -2880,9 +3032,50 @@ fn full_observer_octet_borrows_one_owned_environment_sequentially() {
         canary
             .matches("original_reproduction_valid,\noriginal_invariants_valid,")
             .count(),
-        2,
-        "both FullObserver receipt paths must preserve pre-debug A-F invariant provenance",
+        3,
+        "both FullObserver receipt paths and the capability trigger must preserve pre-debug A-F invariant provenance",
     );
+    for (region, purpose) in [
+        (
+            source_region(
+                canary,
+                "let debug_invariants = LoaderFullObserverInvariantReceiptV1::evaluated(",
+                "let debug_invariants_valid = debug_invariants.valid();",
+            ),
+            "complete debug-C/debug-F invariant receipt",
+        ),
+        (
+            source_region(
+                canary,
+                "let trigger_sha256 = debug_c_trace",
+                "render_loader_full_observer_diagnostic(",
+            ),
+            "trace-session capability trigger",
+        ),
+        (
+            source_region(
+                canary,
+                "let debug_invariants = LoaderFullObserverInvariantReceiptV1::after_debug_c_rejection(",
+                "render_loader_full_observer_diagnostic(",
+            ),
+            "partial debug-C invariant receipt",
+        ),
+    ] {
+        assert_eq!(
+            region
+                .matches("original_reproduction_valid,\noriginal_invariants_valid,")
+                .count(),
+            1,
+            "{purpose} did not independently preserve pre-debug A-F provenance",
+        );
+        assert_eq!(
+            region
+                .matches("original_reproduction_valid,\ninvariants_valid,")
+                .count(),
+            0,
+            "{purpose} substituted post-debug aggregate provenance",
+        );
+    }
     assert_eq!(
         canary
             .matches("original_reproduction_valid,\ninvariants_valid,")

@@ -234,13 +234,41 @@ fn broker_raw_duplicate_inventory_holds(session_broker: &str) -> bool {
             "SessionBrokerFrameV1::Launched(launched.clone())",
             "transfer_rollback.disarm_after_launched_delivery();",
             "SessionBrokerFrameV1::Ack { binding_sha256 }",
-            "run_creation_authority_transaction(",
-            "holder.disarm();",
+            "run_creation_authority_transaction(pipe.raw(), launcher_process.raw(), &launched, &mut holder)?;",
+            "Ok(())",
         ],
     ) || server.matches("transfer_rollback.failure_detail(").count() != 2
         || server
             .split_once("transfer_rollback.disarm_after_launched_delivery();")
             .is_some_and(|(_, delivered)| delivered.contains("revoke_remote_handle(remote_"))
+        || server.contains("holder.disarm();")
+    {
+        return false;
+    }
+
+    let Some(creation_transaction) = bounded_region(
+        session_broker,
+        "fn run_creation_authority_transaction(",
+        "fn loader_snaps_client_failure(",
+    ) else {
+        return false;
+    };
+    if session_broker.matches("holder.disarm();").count() != 1
+        || creation_transaction.matches("holder.disarm();").count() != 1
+        || !fragments_are_ordered(
+            creation_transaction,
+            &[
+                "SessionBrokerFrameV1::FinalAck {",
+                "binding_sha256 == launched.binding_sha256",
+                "holder_binding.as_deref() == Some(holder_binding_sha256.as_str())",
+                "completed_phases == completed",
+                "(completed == 2 || failed)",
+                "holder.disarm();",
+                "TargetDesktopBootstrapPipeOperation::BrokerDoneWrite",
+                "SessionBrokerFrameV1::Done {",
+                "return Ok(());",
+            ],
+        )
     {
         return false;
     }
@@ -1040,6 +1068,10 @@ fn assert_broker_raw_duplicate_mutant_rejected(
             sources.convert_line_endings_to_crlf();
             sources.normalize_line_endings();
         }
+        assert!(
+            broker_raw_duplicate_inventory_holds(&sources.session_broker),
+            "broker raw-duplicate ownership baseline must hold before mutation"
+        );
         mutate(&mut sources);
         assert!(!broker_raw_duplicate_inventory_holds(
             &sources.session_broker
@@ -1199,6 +1231,87 @@ fn broker_handle_transfer_contract_rejects_namespace_and_ownership_mutants() {
             &mut sources.session_broker,
             "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 6;",
             "pub(crate) const SESSION_BROKER_SCHEMA_VERSION: u32 = 5;",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
+            "                holder.disarm();",
+            "                let _ = &holder;",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
+            "                holder.disarm();",
+            "                holder.disarm();\n                holder.disarm();",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        let final_ack = "            SessionBrokerFrameV1::FinalAck {\n                binding_sha256,\n                holder_binding_sha256,\n                completed_phases,\n            } if";
+        replace_once(
+            &mut sources.session_broker,
+            final_ack,
+            "            holder.disarm();\n            SessionBrokerFrameV1::FinalAck {\n                binding_sha256,\n                holder_binding_sha256,\n                completed_phases,\n            } if",
+        );
+        replace_once(
+            &mut sources.session_broker,
+            "                holder.disarm();",
+            "                let _ = &holder;",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
+            "    run_creation_authority_transaction(pipe.raw(), launcher_process.raw(), &launched, &mut holder)?;",
+            "    holder.disarm();\n    run_creation_authority_transaction(pipe.raw(), launcher_process.raw(), &launched, &mut holder)?;",
+        );
+        replace_once(
+            &mut sources.session_broker,
+            "                holder.disarm();",
+            "                let _ = &holder;",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
+            "&& holder_binding.as_deref() == Some(holder_binding_sha256.as_str())",
+            "&& true",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
+            "&& completed_phases == completed",
+            "&& true",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
+            "    run_creation_authority_transaction(pipe.raw(), launcher_process.raw(), &launched, &mut holder)?;",
+            "    Ok::<(), String>(())?;",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
+            "&launched, &mut holder)?;",
+            "&launched, &mut replacement_holder)?;",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
+            "super::pipe::TargetDesktopBootstrapPipeOperation::BrokerDoneWrite,",
+            "super::pipe::TargetDesktopBootstrapPipeOperation::BrokerClearedWrite,",
+        );
+    });
+    assert_broker_raw_duplicate_mutant_rejected(|sources| {
+        replace_once(
+            &mut sources.session_broker,
+            "&& (completed == 2 || failed) =>",
+            "&& true =>",
         );
     });
     assert_broker_raw_duplicate_mutant_rejected(|sources| {
