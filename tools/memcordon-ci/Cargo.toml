@@ -15,6 +15,7 @@ hex.workspace = true
 libc.workspace = true
 memcordon-core = { path = "../../crates/memcordon-core", version = "=0.5.2-dev" }
 memcordon-testkit = { path = "../../crates/memcordon-testkit", version = "=0.5.2-dev" }
+memcordon-windows-launch-core = { path = "../../crates/memcordon-windows-launch-core", version = "=0.5.2-dev" }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

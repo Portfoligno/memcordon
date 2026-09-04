@@ -679,18 +679,43 @@ pub fn record_terminalization_diagnostic(
 }
 
 pub fn recover() -> Result<(), String> {
-    recover_until(Instant::now() + Duration::from_secs(35))
+    recover_until(Instant::now() + Duration::from_secs(35)).map_err(|error| error.to_string())
+}
+
+#[derive(Debug)]
+pub(crate) enum PackageCleanupError {
+    Active(String),
+    Ambiguous(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for PackageCleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active(detail) => write!(formatter, "MCSEALED-WINDOWS-PACKAGE-ACTIVE: {detail}"),
+            Self::Ambiguous(detail) => {
+                write!(formatter, "MCSEALED-WINDOWS-RECOVERY-AMBIGUOUS: {detail}")
+            }
+            Self::Failed(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+impl From<String> for PackageCleanupError {
+    fn from(detail: String) -> Self {
+        Self::Failed(detail)
+    }
 }
 
 /// Converges active attempt state within the package transaction's single
 /// deadline. The launcher first terminates every Job for which it still owns
 /// authority; this durable phase then waits for guardian/process-zero proof
 /// and retires only records without an unacknowledged terminal outbox.
-pub fn converge_package_cleanup(deadline: Instant) -> Result<(), String> {
+pub fn converge_package_cleanup(deadline: Instant) -> Result<(), PackageCleanupError> {
     recover_until(deadline)
 }
 
-fn recover_until(deadline: Instant) -> Result<(), String> {
+fn recover_until(deadline: Instant) -> Result<(), PackageCleanupError> {
     let attempts = attempts_root();
     fs::create_dir_all(&attempts).map_err(|error| error.to_string())?;
     fs::create_dir_all(quarantine_root()).map_err(|error| error.to_string())?;
@@ -821,10 +846,10 @@ fn recover_until(deadline: Instant) -> Result<(), String> {
     if ambiguous.is_empty() {
         Ok(())
     } else {
-        Err(format!(
-            "MCSEALED-WINDOWS-RECOVERY-AMBIGUOUS: quarantined records: {}",
+        Err(PackageCleanupError::Ambiguous(format!(
+            "quarantined records: {}",
             ambiguous.join(", ")
-        ))
+        )))
     }
 }
 
@@ -869,16 +894,20 @@ pub fn certify_machine_restart_recovery() -> Result<bool, String> {
     Ok(!record_path(&attempt_id)?.exists() && attempts_empty()?)
 }
 
-pub fn remove_empty_attempt_state() -> Result<(), String> {
+pub fn remove_empty_attempt_state() -> Result<(), PackageCleanupError> {
     if !attempts_empty()? {
-        return Err("MCSEALED-WINDOWS-PACKAGE-ACTIVE: attempt state is not empty".to_owned());
+        return Err(PackageCleanupError::Active(
+            "attempt state is not empty".to_owned(),
+        ));
     }
     require_empty_guardian_slot_state()?;
     // The replay ledger is intentionally not active-attempt state: completed
     // attempts remain replay-protected for the lifetime of an installation.
     // It is retired only by this authenticated, idle package-cleanup path.
     if replay_retiring_root().exists() {
-        return Err("replay ledger retirement is already in progress".to_owned());
+        return Err("replay ledger retirement is already in progress"
+            .to_owned()
+            .into());
     }
     if replay_root().exists() {
         validate_replay_directory(&replay_root())?;
@@ -1299,29 +1328,34 @@ pub fn rejection_evidence(
     detail: String,
     phase_override: Option<memcordon_core::BoundarySetupPhase>,
     os_code: Option<i32>,
+    loader_qualification: Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
     terminal_receipt: Option<Box<memcordon_core::WindowsTerminalReceiptV1>>,
 ) -> Result<memcordon_core::ProviderRejectionEvidence, String> {
     let detail = bounded_rejection_detail(detail);
     let path = match record_path(attempt_id) {
         Ok(path) => path,
         Err(_) => {
-            return Ok(match terminal_receipt {
+            let mut rejection = match terminal_receipt {
                 Some(terminal) => {
                     posttarget_rejection(code, detail, phase_override, os_code, terminal)
                 }
                 None => pretarget_rejection(code, detail),
-            });
+            };
+            rejection.loader_qualification = loader_qualification;
+            return Ok(rejection);
         }
     };
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(match terminal_receipt {
+            let mut rejection = match terminal_receipt {
                 Some(terminal) => {
                     posttarget_rejection(code, detail, phase_override, os_code, terminal)
                 }
                 None => pretarget_rejection(code, detail),
-            });
+            };
+            rejection.loader_qualification = loader_qualification;
+            return Ok(rejection);
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -1378,6 +1412,7 @@ pub fn rejection_evidence(
         phase,
         detail,
         os_code,
+        loader_qualification,
         target_created,
         target_released: record.target_released || record.resume_attempted,
         cleanup_attempted,
@@ -1400,6 +1435,7 @@ fn posttarget_rejection(
         phase: phase.unwrap_or(memcordon_core::BoundarySetupPhase::Retirement),
         detail: bounded_rejection_detail(detail),
         os_code,
+        loader_qualification: None,
         target_created: true,
         target_released: true,
         cleanup_attempted: true,
@@ -1941,6 +1977,7 @@ pub fn pretarget_rejection_at(
         phase,
         detail: bounded_rejection_detail(detail),
         os_code: None,
+        loader_qualification: None,
         target_created: false,
         target_released: false,
         cleanup_attempted: false,

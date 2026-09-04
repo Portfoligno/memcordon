@@ -1609,7 +1609,7 @@ fn validate_public_rejection_report(
         && attempt.number == 1
         && attempt.phase == memcordon_core::AttemptPhase::Failed
         && attempt.outcome.is_none()
-        && attempt_error == terminal_error
+        && attempt_error == terminal_error.as_ref()
         && attempt_error.code == "MCSEALED-PROVIDER-REJECTION"
         && attempt_error.launch_phase.as_deref() == Some(expected_phase)
         && attempt_error.target_released == rejection.target_released

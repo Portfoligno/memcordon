@@ -14,7 +14,7 @@ use crate::{
 
 pub const WINDOWS_PUBLIC_PROTOCOL_VERSION: u32 = 1;
 pub const WINDOWS_PRIVATE_PROTOCOL_VERSION: u32 = 1;
-pub const WINDOWS_QUALIFICATION_SCHEMA_VERSION: u32 = 1;
+pub const WINDOWS_QUALIFICATION_SCHEMA_VERSION: u32 = 2;
 pub const WINDOWS_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const WINDOWS_MAX_JOB_PROCESS_IDENTITIES: usize = 256;
 pub const WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS: usize = 4;
@@ -1839,19 +1839,6 @@ pub struct WindowsLaunchRequestV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WindowsLoaderRestrictionCanaryHandlesV1 {
-    pub remote_baseline_token_handle: u64,
-    pub remote_comparison_token_handle: u64,
-    pub remote_no_restricting_sid_token_handle: u64,
-    pub remote_profile_token_handle: u64,
-    pub source_binding_sha256: String,
-    pub pair_invariants_sha256: String,
-    pub restriction_presence_binding_sha256: String,
-    pub profile_binding_sha256: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct WindowsLaunchBrokerRequestV1 {
     pub schema_version: u32,
     pub attempt_id: String,
@@ -1864,10 +1851,6 @@ pub struct WindowsLaunchBrokerRequestV1 {
     /// duplicated into the launcher. They are absent from ordinary launches.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_frontend_canary_handles: Vec<u64>,
-    /// Control-derived, certification-only token-semantics pair. The
-    /// authenticated frontend cannot nominate either handle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub loader_restriction_canary: Option<WindowsLoaderRestrictionCanaryHandlesV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certification_fault: Option<WindowsSealedFault>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2597,7 +2580,7 @@ impl WindowsTerminalReceiptV1 {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsQualificationReceiptV1 {
     pub schema_version: u32,
@@ -2632,6 +2615,7 @@ pub struct WindowsQualificationReceiptV1 {
     pub active_processes_zero_verified: bool,
     pub relays_retired_verified: bool,
     pub recovery_complete: bool,
+    pub loader_qualification: crate::WindowsLoaderQualificationOutcomeV2,
     pub qualified: bool,
 }
 
@@ -2653,6 +2637,7 @@ impl WindowsQualificationReceiptV1 {
             && self.launcher_service_identity == "MemCordonSealedLauncher:LocalSystem:restricted"
             && self.guardian_pool_identity
                 == "MemCordonSealedGuardian-000..007:LocalSystem:restricted:demand"
+            && self.loader_qualification.is_consistent()
             && (!self.qualified
                 || (self.package_verified
                     && self.public_pipe_security_verified
@@ -2663,7 +2648,6 @@ impl WindowsQualificationReceiptV1 {
                     && self.guardian_slot_loader_verified
                     && self.guardian_capacity_verified
                     && self.caller_token_authentication_verified
-                    && self.restricted_caller_token_verified
                     && self.primary_token_duplication_verified
                     && self.create_process_as_user_verified
                     && self.job_list_supported
@@ -2673,13 +2657,13 @@ impl WindowsQualificationReceiptV1 {
                     && self.breakaway_denied
                     && self.completion_port_verified
                     && self.guardian_verified
-                    && self.frontend_loss_cleanup_verified
-                    && self.alternate_token_child_contained
-                    && self.nested_child_job_contained
-                    && self.recursive_provider_request_denied
                     && self.exact_handle_inheritance_verified
                     && self.active_processes_zero_verified
                     && self.relays_retired_verified
-                    && self.recovery_complete))
+                    && self.recovery_complete
+                    && matches!(
+                        self.loader_qualification,
+                        crate::WindowsLoaderQualificationOutcomeV2::Ready(_)
+                    )))
     }
 }

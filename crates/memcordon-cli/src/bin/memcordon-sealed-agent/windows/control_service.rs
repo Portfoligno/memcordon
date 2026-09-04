@@ -5,9 +5,9 @@ use memcordon_core::{
     WINDOWS_CONTROL_PIPE, WINDOWS_CONTROL_SERVICE_NAME, WINDOWS_LAUNCHER_PIPE,
     WINDOWS_LAUNCHER_SERVICE_NAME, WINDOWS_PRIVATE_PROTOCOL_VERSION,
     WINDOWS_PUBLIC_PROTOCOL_VERSION, WindowsLaunchBrokerRequestV1, WindowsLauncherRequestV1,
-    WindowsLauncherResponseV1, WindowsLoaderRestrictionCanaryHandlesV1, WindowsProcessIdentityV1,
-    WindowsProviderRequestV1, WindowsProviderResponseV1, WindowsRelayEventV1, WindowsRelayPhaseV1,
-    WindowsSealedFault, WindowsSealedMutant, WindowsServiceSelfAttestationV1,
+    WindowsLauncherResponseV1, WindowsProcessIdentityV1, WindowsProviderRequestV1,
+    WindowsProviderResponseV1, WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsSealedFault,
+    WindowsSealedMutant, WindowsServiceSelfAttestationV1,
 };
 use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
@@ -380,21 +380,15 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                     Some(true),
                     "package cleanup is ready".to_owned(),
                 ),
-                Err(error)
-                    if error
-                        .strip_prefix("MCSEALED-WINDOWS-PACKAGE-ACTIVE:")
-                        .is_some() =>
-                {
-                    (
-                        memcordon_core::WindowsControlRequestStatusV1::Active,
-                        Some(false),
-                        error,
-                    )
-                }
+                Err(super::record::PackageCleanupError::Active(detail)) => (
+                    memcordon_core::WindowsControlRequestStatusV1::Active,
+                    Some(false),
+                    super::record::PackageCleanupError::Active(detail).to_string(),
+                ),
                 Err(error) => (
                     memcordon_core::WindowsControlRequestStatusV1::Failed,
                     None,
-                    error,
+                    error.to_string(),
                 ),
             };
             let terminal_outboxes = match super::record::terminal_outbox_count() {
@@ -684,7 +678,7 @@ fn qualification_session(public: HANDLE, scope: &str, challenge: &str) -> Result
     if unsafe { GetNamedPipeClientProcessId(public, &raw mut client_pid) } == 0 {
         return Err(io::Error::last_os_error().to_string());
     }
-    let (source_token, envelope, source_frontend, owner) =
+    let (_source_token, envelope, _source_frontend, owner) =
         super::token::authenticate_pipe_client(public, client_pid, None)?;
     if !envelope.elevated {
         return Err("MCSEALED-WINDOWS-ELEVATION: qualification requires elevation".to_owned());
@@ -707,13 +701,6 @@ fn qualification_session(public: HANDLE, scope: &str, challenge: &str) -> Result
         );
     }
     let admission = super::record::reserve_qualification_admission_for(scope, owner.clone())?;
-    let loader_restriction_source = super::token::install_qualification_loader_restriction_source(
-        scope,
-        challenge,
-        &owner,
-        source_token,
-        source_frontend,
-    )?;
     pipe::write_frame(
         public,
         &WindowsProviderResponseV1::QualificationAuthenticated {
@@ -754,7 +741,6 @@ fn qualification_session(public: HANDLE, scope: &str, challenge: &str) -> Result
             WindowsProviderRequestV1::QualificationEnd { schema_version }
                 if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
             {
-                drop(loader_restriction_source);
                 drop(admission);
                 return pipe::write_frame(
                     public,
@@ -813,19 +799,6 @@ fn launch_client_inner(
                 .to_owned(),
         );
     }
-    let loader_restriction_canary = if qualification_in_progress
-        && super::loader_debug::enabled(super::process::TargetDesktopBootstrapRoleV1::LoaderControl)
-        && super::token::is_exact_full_restricted_loader_canary_source(primary_token.raw())?
-    {
-        Some(
-            super::token::loader_restriction_diagnostic_pair_for_qualification(
-                &before,
-                primary_token.raw(),
-            )?,
-        )
-    } else {
-        None
-    };
     let request_bytes = serde_json::to_vec(&launch).map_err(|error| error.to_string())?;
     let request_sha256 = hex(Sha256::digest(request_bytes));
     let mut attempt_digest = Sha256::new();
@@ -1011,85 +984,6 @@ fn launch_client_inner(
         }
         Err(error) => return Err(remote_transfers.abort(error)),
     };
-    let remote_loader_restriction_canary = if let Some(pair) = &loader_restriction_canary {
-        let baseline = match duplicate_for_launcher(
-            ProcessRelativeHandle {
-                owner: control_namespace,
-                raw: pair.baseline.raw(),
-                role: "loader-restriction-baseline-token",
-                inventory_index: None,
-            },
-            launcher_namespace,
-            None,
-        ) {
-            Ok(handle) => {
-                remote_transfers.push(handle);
-                handle
-            }
-            Err(error) => return Err(remote_transfers.abort(error)),
-        };
-        let comparison = match duplicate_for_launcher(
-            ProcessRelativeHandle {
-                owner: control_namespace,
-                raw: pair.comparison.raw(),
-                role: "loader-restriction-comparison-token",
-                inventory_index: None,
-            },
-            launcher_namespace,
-            None,
-        ) {
-            Ok(handle) => {
-                remote_transfers.push(handle);
-                handle
-            }
-            Err(error) => return Err(remote_transfers.abort(error)),
-        };
-        let no_restricting_sid = match duplicate_for_launcher(
-            ProcessRelativeHandle {
-                owner: control_namespace,
-                raw: pair.no_restricting_sid.raw(),
-                role: "loader-no-restricting-sid-token",
-                inventory_index: None,
-            },
-            launcher_namespace,
-            None,
-        ) {
-            Ok(handle) => {
-                remote_transfers.push(handle);
-                handle
-            }
-            Err(error) => return Err(remote_transfers.abort(error)),
-        };
-        let profile = match duplicate_for_launcher(
-            ProcessRelativeHandle {
-                owner: control_namespace,
-                raw: pair.profile.raw(),
-                role: "loader-profile-token",
-                inventory_index: None,
-            },
-            launcher_namespace,
-            None,
-        ) {
-            Ok(handle) => {
-                remote_transfers.push(handle);
-                handle
-            }
-            Err(error) => return Err(remote_transfers.abort(error)),
-        };
-        Some(WindowsLoaderRestrictionCanaryHandlesV1 {
-            remote_baseline_token_handle: baseline,
-            remote_comparison_token_handle: comparison,
-            remote_no_restricting_sid_token_handle: no_restricting_sid,
-            remote_profile_token_handle: profile,
-            source_binding_sha256: pair.source_binding_sha256.clone(),
-            pair_invariants_sha256: pair.pair_invariants_sha256.clone(),
-            restriction_presence_binding_sha256: pair.restriction_presence_binding_sha256.clone(),
-            profile_binding_sha256: pair.profile_binding_sha256.clone(),
-        })
-    } else {
-        None
-    };
-
     let broker = WindowsLaunchBrokerRequestV1 {
         schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
         attempt_id: attempt_id.clone(),
@@ -1099,7 +993,6 @@ fn launch_client_inner(
         remote_primary_token_handle: remote_token,
         remote_frontend_process_handle: remote_frontend,
         remote_frontend_canary_handles: remote_frontend_canaries.clone(),
-        loader_restriction_canary: remote_loader_restriction_canary,
         certification_fault,
         certification_mutant,
         launch,
@@ -1497,7 +1390,9 @@ fn authenticated_launcher() -> Result<
     authenticated_launcher_detailed().map_err(|error| error.to_string())
 }
 
-fn converge_launcher_package_cleanup(deadline_millis: u64) -> Result<(), String> {
+fn converge_launcher_package_cleanup(
+    deadline_millis: u64,
+) -> Result<(), super::record::PackageCleanupError> {
     let (launcher, _process, _identity) = authenticated_launcher()?;
     pipe::write_frame(
         launcher.raw(),
@@ -1518,20 +1413,20 @@ fn converge_launcher_package_cleanup(deadline_millis: u64) -> Result<(), String>
             status: memcordon_core::WindowsControlRequestStatusV1::Active,
             attempts_empty: Some(false),
             detail,
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION
-            && detail
-                .strip_prefix("MCSEALED-WINDOWS-PACKAGE-ACTIVE:")
-                .is_some() =>
-        {
-            Err(detail)
+        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => {
+            Err(super::record::PackageCleanupError::Active(detail))
         }
         WindowsLauncherResponseV1::PackageCleanup {
             schema_version,
             status: memcordon_core::WindowsControlRequestStatusV1::Failed,
             detail,
             ..
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => Err(detail),
-        _ => Err("launcher returned contradictory package cleanup state".to_owned()),
+        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => {
+            Err(super::record::PackageCleanupError::Failed(detail))
+        }
+        _ => Err(super::record::PackageCleanupError::Failed(
+            "launcher returned contradictory package cleanup state".to_owned(),
+        )),
     }
 }
 

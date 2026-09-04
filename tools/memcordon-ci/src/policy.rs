@@ -686,8 +686,8 @@ fn check_certification_job(
     ];
     if windows {
         expected_run_commands.extend([
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite package-windows-sealed",
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite channel-parity-windows-sealed",
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-provider-lifecycle",
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-package-channel",
         ]);
     }
     if run_commands != expected_run_commands {
@@ -778,68 +778,349 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
     {
         return Err(failure("backend certification concurrency differs"));
     }
-    exact_mapping_keys(jobs, &["linux", "windows"], "backend certification jobs")?;
+    exact_mapping_keys(
+        jobs,
+        &[
+            "linux",
+            "windows-loader-production",
+            "windows-provider-lifecycle",
+            "windows-package-channel",
+            "windows-loader-lab",
+        ],
+        "backend certification jobs",
+    )?;
 
     let linux_dependency_key = "cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}";
     let linux_target_key = "cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
-    for (job_name, runner, dependency_key, target_key, suite, artifact_name, artifact_path) in [
-        (
-            "linux",
-            "ubuntu-24.04",
-            linux_dependency_key,
-            linux_target_key,
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2",
-            "backend-linux-sealed-v2",
-            "target/ci/reports/linux-sealed-v2",
-        ),
-        (
-            "windows",
-            "${{ matrix.runner }}",
-            linux_dependency_key,
-            linux_target_key,
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-sealed-v2",
-            "backend-windows-sealed-v2-${{ matrix.id }}",
-            "target/ci/reports/windows-sealed-v2",
-        ),
+    let linux = mapping(
+        jobs.get(key("linux"))
+            .ok_or_else(|| failure("backend certification linux job is absent"))?,
+        "backend certification linux job",
+    )?;
+    exact_mapping_keys(
+        linux,
+        &["name", "runs-on", "timeout-minutes", "steps"],
+        "backend certification linux job",
+    )?;
+    check_certification_job(
+        linux,
+        "ubuntu-24.04",
+        45,
+        1,
+        linux_dependency_key,
+        linux_target_key,
+        "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2",
+        "backend-linux-sealed-v2",
+        "target/ci/reports/linux-sealed-v2",
+        "backend certification linux job",
+    )?;
+
+    for job_name in [
+        "windows-loader-production",
+        "windows-provider-lifecycle",
+        "windows-package-channel",
+        "windows-loader-lab",
     ] {
-        let job = mapping(
-            jobs.get(key(job_name)).ok_or_else(|| {
-                failure(format!("backend certification {job_name} job is absent"))
-            })?,
+        check_runner_matrix(
+            jobs,
+            job_name,
+            &[("x64", "windows-2025"), ("arm64", "windows-11-arm")],
             job_name,
         )?;
-        let context = format!("backend certification {job_name} job");
-        if job_name == "windows" {
-            exact_mapping_keys(
-                job,
-                &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
-                &context,
-            )?;
-            check_runner_matrix(
-                jobs,
-                job_name,
-                &[("x64", "windows-2025"), ("arm64", "windows-11-arm")],
-                &context,
-            )?;
-        } else {
-            exact_mapping_keys(
-                job,
-                &["name", "runs-on", "timeout-minutes", "steps"],
-                &context,
-            )?;
-        }
-        check_certification_job(
-            job,
-            runner,
-            45,
-            1,
-            dependency_key,
-            target_key,
-            suite,
-            artifact_name,
-            artifact_path,
-            &context,
+    }
+    for (job_name, required_dependency) in [
+        ("windows-provider-lifecycle", "windows-loader-production"),
+        ("windows-package-channel", "windows-provider-lifecycle"),
+        ("windows-loader-lab", "windows-loader-production"),
+    ] {
+        let job = mapping(
+            jobs.get(key(job_name))
+                .ok_or_else(|| failure(format!("{job_name} job is absent")))?,
+            job_name,
         )?;
+        if scalar(job, "needs") != Some(required_dependency) {
+            return Err(failure(format!(
+                "{job_name} does not depend on {required_dependency}"
+            )));
+        }
+    }
+    let lab = mapping(
+        jobs.get(key("windows-loader-lab"))
+            .ok_or_else(|| failure("windows-loader-lab job is absent"))?,
+        "windows-loader-lab",
+    )?;
+    if scalar(lab, "if") != Some("always() && github.event_name == 'workflow_dispatch'") {
+        return Err(failure(
+            "Windows loader lab must remain dispatch-only and run after a failed production gate",
+        ));
+    }
+
+    for contract in [
+        SplitWindowsJobContract {
+            name: "windows-loader-production",
+            suite: concat!(
+                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap ",
+                "--package memcordon-ci -- suite windows-loader-production"
+            ),
+            artifact_name: "windows-loader-production-${{ matrix.id }}",
+            artifact_path: "target/ci/reports/windows-sealed-v2/loader-production",
+            dependency: None,
+            condition: None,
+            downloads: &[],
+            dependency_cache_id: "certification-deps",
+            target_cache_id: "certification-target",
+            target_cache_path: "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n",
+            checkout_count: 1,
+            timeout_minutes: 45,
+        },
+        SplitWindowsJobContract {
+            name: "windows-provider-lifecycle",
+            suite: concat!(
+                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap ",
+                "--package memcordon-ci -- suite windows-provider-lifecycle"
+            ),
+            artifact_name: "windows-provider-lifecycle-${{ matrix.id }}",
+            artifact_path: "target/ci/reports/windows-sealed-v2",
+            dependency: Some("windows-loader-production"),
+            condition: None,
+            downloads: &[(
+                ("windows-loader-production-${{ matrix.id }}"),
+                "target/ci/reports/windows-sealed-v2/loader-production",
+            )],
+            dependency_cache_id: "lifecycle-deps",
+            target_cache_id: "lifecycle-target",
+            target_cache_path: "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\n",
+            checkout_count: 1,
+            timeout_minutes: 45,
+        },
+        SplitWindowsJobContract {
+            name: "windows-package-channel",
+            suite: concat!(
+                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap ",
+                "--package memcordon-ci -- suite windows-package-channel"
+            ),
+            artifact_name: "windows-package-channel-${{ matrix.id }}",
+            artifact_path: "target/ci/windows-sealed-cargo",
+            dependency: Some("windows-provider-lifecycle"),
+            condition: None,
+            downloads: &[(
+                "windows-provider-lifecycle-${{ matrix.id }}",
+                "target/ci/reports/windows-sealed-v2",
+            )],
+            dependency_cache_id: "package-deps",
+            target_cache_id: "package-target",
+            target_cache_path: "target/ci/bootstrap\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n",
+            checkout_count: 1,
+            timeout_minutes: 45,
+        },
+        SplitWindowsJobContract {
+            name: "windows-loader-lab",
+            suite: concat!(
+                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap ",
+                "--package memcordon-ci -- suite windows-loader-lab"
+            ),
+            artifact_name: "windows-loader-lab-${{ matrix.id }}",
+            artifact_path: "target/ci/reports/windows-sealed-v2/loader-lab",
+            dependency: Some("windows-loader-production"),
+            condition: Some("always() && github.event_name == 'workflow_dispatch'"),
+            downloads: &[(
+                ("windows-loader-production-${{ matrix.id }}"),
+                "target/ci/reports/windows-sealed-v2/loader-production",
+            )],
+            dependency_cache_id: "lab-deps",
+            target_cache_id: "lab-target",
+            target_cache_path: "target/ci/bootstrap\ntarget/ci/windows-sealed\ntarget/ci/windows-loader-lab\n",
+            checkout_count: 1,
+            timeout_minutes: 45,
+        },
+    ] {
+        let job = mapping(
+            jobs.get(key(contract.name))
+                .ok_or_else(|| failure(format!("{} job is absent", contract.name)))?,
+            contract.name,
+        )?;
+        check_split_windows_job(job, contract)?;
+    }
+    Ok(())
+}
+
+struct SplitWindowsJobContract<'a> {
+    name: &'a str,
+    suite: &'a str,
+    artifact_name: &'a str,
+    artifact_path: &'a str,
+    dependency: Option<&'a str>,
+    condition: Option<&'a str>,
+    downloads: &'a [(&'a str, &'a str)],
+    dependency_cache_id: &'a str,
+    target_cache_id: &'a str,
+    target_cache_path: &'a str,
+    checkout_count: usize,
+    timeout_minutes: u64,
+}
+
+fn check_split_windows_job(job: &Mapping, contract: SplitWindowsJobContract<'_>) -> Result<()> {
+    let context = contract.name;
+    let expected_keys: &[&str] = match (contract.dependency, contract.condition) {
+        (Some(_), Some(_)) => &[
+            "name",
+            "if",
+            "needs",
+            "strategy",
+            "runs-on",
+            "timeout-minutes",
+            "steps",
+        ],
+        (Some(_), None) => &[
+            "name",
+            "needs",
+            "strategy",
+            "runs-on",
+            "timeout-minutes",
+            "steps",
+        ],
+        (None, None) => &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
+        (None, Some(_)) => return Err(failure(format!("{context} has an invalid contract"))),
+    };
+    exact_mapping_keys(job, expected_keys, context)?;
+    if scalar(job, "needs") != contract.dependency
+        || scalar(job, "if") != contract.condition
+        || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(contract.timeout_minutes)
+    {
+        return Err(failure(format!(
+            "{context} dependency, condition, or timeout differs"
+        )));
+    }
+
+    let steps = certification_steps(job, context)?;
+    let checkout_action = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
+    let restore_action = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
+    let save_action = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
+    let upload_action = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+    let download_action = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
+    if action_steps(steps, checkout_action)?.len() != contract.checkout_count
+        || action_steps(steps, restore_action)?.len() != 2
+        || action_steps(steps, save_action)?.len() != 2
+        || action_steps(steps, upload_action)?.len() != 1
+    {
+        return Err(failure(format!("{context} action cardinality differs")));
+    }
+    const DEPENDENCY_CACHE_PATH: &str =
+        "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n";
+    for (id, expected_path) in [
+        (contract.dependency_cache_id, DEPENDENCY_CACHE_PATH),
+        (contract.target_cache_id, contract.target_cache_path),
+    ] {
+        let restore = step_with_id(steps, id, context)?;
+        let inputs = restore
+            .get(key("with"))
+            .and_then(Value::as_mapping)
+            .ok_or_else(|| failure(format!("{context} {id} restore inputs are absent")))?;
+        if scalar(restore, "uses") != Some(restore_action)
+            || scalar(inputs, "path") != Some(expected_path)
+            || scalar(inputs, "key").is_none()
+        {
+            return Err(failure(format!("{context} {id} restore differs")));
+        }
+        let expected_condition = format!("always() && steps.{id}.outputs.cache-hit != 'true'");
+        let expected_key = format!("${{{{ steps.{id}.outputs.cache-primary-key }}}}");
+        let matching_saves: Vec<&Mapping> = action_steps(steps, save_action)?
+            .into_iter()
+            .filter(|save| scalar(save, "if") == Some(expected_condition.as_str()))
+            .collect();
+        if matching_saves.len() != 1 {
+            return Err(failure(format!("{context} {id} cache save differs")));
+        }
+        let save_inputs = matching_saves[0]
+            .get(key("with"))
+            .and_then(Value::as_mapping)
+            .ok_or_else(|| failure(format!("{context} {id} save inputs are absent")))?;
+        if scalar(save_inputs, "path") != Some(expected_path)
+            || scalar(save_inputs, "key") != Some(expected_key.as_str())
+        {
+            return Err(failure(format!("{context} {id} save inputs differ")));
+        }
+    }
+    for checkout in action_steps(steps, checkout_action)? {
+        if checkout
+            .get(key("with"))
+            .and_then(Value::as_mapping)
+            .and_then(|inputs| inputs.get(key("persist-credentials")))
+            .and_then(Value::as_bool)
+            != Some(false)
+        {
+            return Err(failure(format!(
+                "{context} checkout must not persist credentials"
+            )));
+        }
+    }
+
+    let expected_runs = [
+        "rustup toolchain install 1.97.1 --profile minimal",
+        contract.suite,
+    ];
+    let actual_runs: Vec<&str> = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter_map(|step| scalar(step, "run"))
+        .collect();
+    if actual_runs != expected_runs {
+        return Err(failure(format!("{context} run commands differ")));
+    }
+
+    let downloads = action_steps(steps, download_action)?;
+    if downloads.len() != contract.downloads.len() {
+        return Err(failure(format!("{context} download cardinality differs")));
+    }
+    for ((name, path), download) in contract.downloads.iter().zip(downloads) {
+        let inputs = download
+            .get(key("with"))
+            .and_then(Value::as_mapping)
+            .ok_or_else(|| failure(format!("{context} download inputs are absent")))?;
+        exact_mapping_keys(inputs, &["name", "path"], context)?;
+        if scalar(inputs, "name") != Some(*name) || scalar(inputs, "path") != Some(*path) {
+            return Err(failure(format!("{context} download inputs differ")));
+        }
+    }
+
+    for save in action_steps(steps, save_action)? {
+        let condition = scalar(save, "if")
+            .ok_or_else(|| failure(format!("{context} cache save condition is absent")))?;
+        if !condition.starts_with("always() && steps.")
+            || !condition.ends_with(".outputs.cache-hit != 'true'")
+        {
+            return Err(failure(format!("{context} cache save is not failure-safe")));
+        }
+    }
+
+    let upload = action_steps(steps, upload_action)?[0];
+    if scalar(upload, "if") != Some("always()") {
+        return Err(failure(format!(
+            "{context} artifact upload must run under always()"
+        )));
+    }
+    let inputs = upload
+        .get(key("with"))
+        .and_then(Value::as_mapping)
+        .ok_or_else(|| failure(format!("{context} artifact inputs are absent")))?;
+    exact_mapping_keys(
+        inputs,
+        &[
+            "name",
+            "path",
+            "if-no-files-found",
+            "retention-days",
+            "compression-level",
+        ],
+        context,
+    )?;
+    if scalar(inputs, "name") != Some(contract.artifact_name)
+        || scalar(inputs, "path") != Some(contract.artifact_path)
+        || scalar(inputs, "if-no-files-found") != Some("error")
+        || inputs.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
+        || inputs.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
+    {
+        return Err(failure(format!("{context} artifact inputs differ")));
     }
     Ok(())
 }
@@ -964,11 +1245,6 @@ fn check_release_credentials(
     release: &config::Release,
     auth_action: &str,
 ) -> Result<()> {
-    if release.publish_packages.len() != 3 {
-        return Err(failure(
-            "release credential slot count must equal the three configured public packages",
-        ));
-    }
     let steps = named_steps(jobs, "publish")?;
     let publish_job = mapping(
         jobs.get(key("publish"))
@@ -1026,11 +1302,12 @@ fn check_release_credentials(
     if oidc_count != release.publish_packages.len() {
         return Err(failure("crates.io OIDC action slot count differs"));
     }
+    let github_credential_steps = ["Stage GitHub draft and assets", "Finalize GitHub release"];
     if steps
         .values()
         .filter(|step| step.contains_key(key("env")))
         .count()
-        != 5
+        != release.publish_packages.len() + github_credential_steps.len()
     {
         return Err(failure(
             "publish job credential mapping count differs from profile",
@@ -1162,67 +1439,27 @@ fn check_release_structure(
     }
     let linux_dependency_key = "cargo-deps-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}";
     let linux_target_key = "cargo-target-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
-    for (job_name, runner, dependency_key, target_key, suite, artifact_name, artifact_path) in [
-        (
-            "linux-certification",
-            "ubuntu-24.04",
-            linux_dependency_key,
-            linux_target_key,
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2",
-            "release-certification-linux",
-            "target/ci/reports/linux-sealed-v2",
-        ),
-        (
-            "windows-certification",
-            "${{ matrix.runner }}",
-            linux_dependency_key,
-            linux_target_key,
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-sealed-v2",
-            "release-certification-windows-${{ matrix.id }}",
-            "target/ci/reports/windows-sealed-v2",
-        ),
-    ] {
+    for (job_name, runner, dependency_key, target_key, suite, artifact_name, artifact_path) in [(
+        "linux-certification",
+        "ubuntu-24.04",
+        linux_dependency_key,
+        linux_target_key,
+        "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2",
+        "release-certification-linux",
+        "target/ci/reports/linux-sealed-v2",
+    )] {
         let job = mapping(
             jobs.get(key(job_name))
                 .ok_or_else(|| failure(format!("release {job_name} job is absent")))?,
             job_name,
         )?;
         let context = format!("release {job_name} job");
-        if job_name == "windows-certification" {
-            exact_mapping_keys(
-                job,
-                &[
-                    "name",
-                    "needs",
-                    "strategy",
-                    "runs-on",
-                    "timeout-minutes",
-                    "steps",
-                ],
-                &context,
-            )?;
-            check_runner_matrix(
-                jobs,
-                job_name,
-                &[("x64", "windows-2025"), ("arm64", "windows-11-arm")],
-                &context,
-            )?;
-        } else {
-            exact_mapping_keys(
-                job,
-                &["name", "needs", "runs-on", "timeout-minutes", "steps"],
-                &context,
-            )?;
-        }
-        if job_name == "windows-certification" {
-            exact_string_sequence(
-                job.get(key("needs")).ok_or_else(|| {
-                    failure("release Windows certification dependencies are absent")
-                })?,
-                &["preflight", "native"],
-                "release Windows certification dependencies",
-            )?;
-        } else if scalar(job, "needs") != Some("preflight") {
+        exact_mapping_keys(
+            job,
+            &["name", "needs", "runs-on", "timeout-minutes", "steps"],
+            &context,
+        )?;
+        if scalar(job, "needs") != Some("preflight") {
             return Err(failure(format!(
                 "release {job_name} must depend on preflight"
             )));
@@ -1240,6 +1477,94 @@ fn check_release_structure(
             &context,
         )?;
     }
+    for job_name in [
+        "windows-loader-production",
+        "windows-provider-lifecycle",
+        "windows-package-channel",
+    ] {
+        check_runner_matrix(
+            jobs,
+            job_name,
+            &[("x64", "windows-2025"), ("arm64", "windows-11-arm")],
+            job_name,
+        )?;
+    }
+    for contract in [
+        SplitWindowsJobContract {
+            name: "windows-loader-production",
+            suite: "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-loader-production",
+            artifact_name: "release-windows-loader-production-${{ matrix.id }}",
+            artifact_path: "target/ci/reports/windows-sealed-v2/loader-production",
+            dependency: Some("native"),
+            condition: None,
+            downloads: &[(
+                "release-native-windows-${{ matrix.id }}",
+                "target/ci/release-input",
+            )],
+            dependency_cache_id: "production-deps",
+            target_cache_id: "production-target",
+            target_cache_path: "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\n",
+            checkout_count: 2,
+            timeout_minutes: 75,
+        },
+        SplitWindowsJobContract {
+            name: "windows-provider-lifecycle",
+            suite: "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-provider-lifecycle",
+            artifact_name: "release-windows-provider-lifecycle-${{ matrix.id }}",
+            artifact_path: "target/ci/reports/windows-sealed-v2/provider-lifecycle",
+            dependency: Some("windows-loader-production"),
+            condition: None,
+            downloads: &[
+                (
+                    "release-native-windows-${{ matrix.id }}",
+                    "target/ci/release-input",
+                ),
+                (
+                    "release-windows-loader-production-${{ matrix.id }}",
+                    "target/ci/reports/windows-sealed-v2/loader-production",
+                ),
+            ],
+            dependency_cache_id: "lifecycle-deps",
+            target_cache_id: "lifecycle-target",
+            target_cache_path: "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\n",
+            checkout_count: 2,
+            timeout_minutes: 75,
+        },
+        SplitWindowsJobContract {
+            name: "windows-package-channel",
+            suite: "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-package-channel",
+            artifact_name: "release-windows-package-channel-${{ matrix.id }}",
+            artifact_path: "target/ci/windows-sealed-cargo",
+            dependency: Some("windows-provider-lifecycle"),
+            condition: None,
+            downloads: &[
+                (
+                    "release-native-windows-${{ matrix.id }}",
+                    "target/ci/release-input",
+                ),
+                (
+                    "release-windows-provider-lifecycle-${{ matrix.id }}",
+                    "target/ci/reports/windows-sealed-v2",
+                ),
+                (
+                    "release-windows-loader-production-${{ matrix.id }}",
+                    "target/ci/reports/windows-sealed-v2/loader-production",
+                ),
+            ],
+            dependency_cache_id: "package-deps",
+            target_cache_id: "package-target",
+            target_cache_path: "target/ci/bootstrap\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n",
+            checkout_count: 2,
+            timeout_minutes: 75,
+        },
+    ] {
+        let job = mapping(
+            jobs.get(key(contract.name))
+                .ok_or_else(|| failure(format!("release {} job is absent", contract.name)))?,
+            contract.name,
+        )?;
+        check_split_windows_job(job, contract)?;
+    }
     let assemble = mapping(
         jobs.get(key("assemble"))
             .ok_or_else(|| failure("release assemble job is absent"))?,
@@ -1254,7 +1579,7 @@ fn check_release_structure(
             "miri",
             "fuzz",
             "linux-certification",
-            "windows-certification",
+            "windows-package-channel",
             "macos-acceptance",
         ],
         "release assemble dependencies",
@@ -1724,15 +2049,16 @@ fn validate_workflow_bytes_into(
         if text.contains("release-bootstrap") || text.contains("bootstrap-crates") {
             return Err(failure("obsolete crates.io bootstrap path is forbidden"));
         }
-        if text.matches("CARGO_REGISTRIES_CRATES_IO_TOKEN").count() != 3 {
+        let publication_slots = release.publish_packages.len();
+        if text.matches("CARGO_REGISTRIES_CRATES_IO_TOKEN").count() != publication_slots {
             return Err(failure(
                 "release credential text occurs outside exact step-local mappings",
             ));
         }
         if text.contains("CARGO_REGISTRY_TOKEN")
             || text.contains(&stored_token_source())
-            || text.matches("release publish-next").count() != 3
-            || text.matches("outputs.token").count() != 3
+            || text.matches("release publish-next").count() != publication_slots
+            || text.matches("outputs.token").count() != publication_slots
             || text.contains("secrets.")
         {
             return Err(failure(
@@ -1823,22 +2149,25 @@ impl<'ast> Visit<'ast> for RustPolicy {
             {
                 self.calls_current_exe = true;
             }
-            if segments.last().is_some_and(|segment| segment == "new")
-                && let Some(syn::Expr::Lit(literal)) = expression.args.first()
-                && let syn::Lit::Str(program) = &literal.lit
-                && [
-                    "sh",
-                    "bash",
-                    "cmd",
-                    "powershell",
-                    "pwsh",
-                    "/bin/sh",
-                    "/bin/bash",
-                ]
-                .contains(&program.value().as_str())
-            {
-                self.violations
-                    .push("shell process spawn is forbidden".to_owned());
+            if segments.last().is_some_and(|segment| segment == "new") {
+                if let Some(syn::Expr::Lit(literal)) = expression.args.first() {
+                    if let syn::Lit::Str(program) = &literal.lit {
+                        if [
+                            "sh",
+                            "bash",
+                            "cmd",
+                            "powershell",
+                            "pwsh",
+                            "/bin/sh",
+                            "/bin/bash",
+                        ]
+                        .contains(&program.value().as_str())
+                        {
+                            self.violations
+                                .push("shell process spawn is forbidden".to_owned());
+                        }
+                    }
+                }
             }
         }
         syn::visit::visit_expr_call(self, expression);
@@ -2584,9 +2913,10 @@ pub fn run(root: &Path) -> Result<()> {
         .iter()
         .filter(|definition| definition.file == ".github/workflows/release.yml")
         .collect();
-    if release_environment.len() != 9 {
+    let expected_release_environment_count = 3 + policy.workspace.publish_packages.len() * 2;
+    if release_environment.len() != expected_release_environment_count {
         return Err(failure(
-            "release workflow must have exactly nine step-local environment mappings",
+            "release workflow step-local environment mapping count does not match the publish package set",
         ));
     }
     for name in ["Stage GitHub draft and assets", "Finalize GitHub release"] {

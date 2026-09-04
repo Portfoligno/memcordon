@@ -300,19 +300,38 @@ fn stress(root: &Path, stable: &str) -> Result<()> {
         .as_nanos() as u64
         ^ u64::from(std::process::id());
     fs::write(reports.join("stress-seed.txt"), format!("{seed}\n"))?;
-    cargo(
-        root,
-        stable,
-        "test",
-        [
-            "--target-dir",
-            "target/ci/stress",
-            "--workspace",
-            "--all-targets",
-            "--all-features",
-            "--locked",
-            "--release",
-        ],
+    for package in [
+        "memcordon-core",
+        "memcordon-windows-launch-core",
+        "memcordon-platform",
+        "memcordon",
+        "memcordon-testkit",
+        "memcordon-ci",
+        "memcordon-windows-loader-lab",
+    ] {
+        fs::write(
+            reports.join("stress-active-target.txt"),
+            format!("package={package}\n"),
+        )?;
+        cargo(
+            root,
+            stable,
+            "test",
+            [
+                "--target-dir",
+                "target/ci/stress",
+                "--package",
+                package,
+                "--all-targets",
+                "--all-features",
+                "--locked",
+                "--release",
+            ],
+        )?;
+    }
+    fs::write(
+        reports.join("stress-active-target.txt"),
+        "package-suite=complete\n",
     )?;
     let probe = capability::probe(
         root,
@@ -876,6 +895,17 @@ pub fn run(root: &Path, suite: Suite) -> Result<()> {
             cfg!(target_os = "windows"),
         ),
         Suite::BackendWindowsSealedV2 => crate::sealed_windows::certify(root, &toolchains.stable),
+        Suite::WindowsLoaderProduction => {
+            crate::sealed_windows::loader_production(root, &toolchains.stable)
+        }
+        Suite::WindowsProviderLifecycle => {
+            crate::sealed_windows::provider_lifecycle(root, &toolchains.stable)
+        }
+        Suite::WindowsPackageChannel => {
+            crate::sealed_windows::package_certify(root, &toolchains.stable)?;
+            crate::sealed_windows::channel_parity(root, &toolchains.stable)
+        }
+        Suite::WindowsLoaderLab => crate::sealed_windows::loader_lab(root, &toolchains.stable),
         Suite::PackageWindowsSealed => {
             crate::sealed_windows::package_certify(root, &toolchains.stable)
         }

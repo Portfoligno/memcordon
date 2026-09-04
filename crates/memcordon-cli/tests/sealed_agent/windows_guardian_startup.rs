@@ -55,8 +55,12 @@ fn native_guardian_wait_distinguishes_ready_live_timeout_and_wait_failure() {
 
 #[test]
 fn native_guardian_wait_reports_early_exit_and_ready_then_exit() {
-    let mut exited = Command::new("cmd.exe")
-        .args(["/C", "exit", "37"])
+    let mut exited = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "windows_guardian_startup::guardian_native_exit_child_fixture",
+            "--ignored",
+        ])
         .spawn()
         .unwrap();
     let process = exited.as_raw_handle() as _;
@@ -146,13 +150,29 @@ fn guardian_slot_pool_names_are_bounded_canonical_and_non_fallback() {
 }
 
 fn long_lived_child() -> std::process::Child {
-    Command::new("cmd.exe")
-        .args(["/C", "ping -n 30 127.0.0.1 >nul"])
+    Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "windows_guardian_startup::guardian_native_wait_child_fixture",
+            "--ignored",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap()
+}
+
+#[test]
+#[ignore = "subprocess fixture invoked by the guardian startup contract"]
+fn guardian_native_exit_child_fixture() {
+    std::process::exit(37);
+}
+
+#[test]
+#[ignore = "subprocess fixture invoked by the guardian startup contract"]
+fn guardian_native_wait_child_fixture() {
+    std::thread::park_timeout(std::time::Duration::from_secs(30));
 }
 
 #[test]

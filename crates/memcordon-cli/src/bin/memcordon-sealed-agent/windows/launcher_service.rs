@@ -39,6 +39,7 @@ struct LaunchAttemptError {
     phase: Option<memcordon_core::BoundarySetupPhase>,
     connection_must_close: bool,
     mutant_observation: Option<Box<memcordon_core::WindowsMutantNativeObservationV1>>,
+    loader_qualification: Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
     terminal_candidate: Option<Box<WindowsTerminalReceiptV1>>,
 }
 
@@ -51,6 +52,7 @@ impl From<String> for LaunchAttemptError {
             phase: None,
             connection_must_close: false,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -84,6 +86,7 @@ impl LaunchAttemptError {
             phase: Some(memcordon_core::BoundarySetupPhase::GuardianStartup),
             connection_must_close: false,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -109,6 +112,7 @@ impl LaunchAttemptError {
             phase: Some(memcordon_core::BoundarySetupPhase::GuardianStartup),
             connection_must_close: false,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -126,6 +130,7 @@ impl LaunchAttemptError {
             phase: Some(memcordon_core::BoundarySetupPhase::TargetCreation),
             connection_must_close: false,
             mutant_observation: None,
+            loader_qualification: error.loader_qualification,
             terminal_candidate: None,
         }
     }
@@ -138,6 +143,7 @@ impl LaunchAttemptError {
             phase: Some(memcordon_core::BoundarySetupPhase::Monitoring),
             connection_must_close: false,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -154,6 +160,7 @@ impl LaunchAttemptError {
             phase: Some(memcordon_core::BoundarySetupPhase::Retirement),
             connection_must_close: false,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -181,6 +188,7 @@ impl LaunchAttemptError {
             phase: Some(memcordon_core::BoundarySetupPhase::Retirement),
             connection_must_close: false,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -202,6 +210,7 @@ impl LaunchAttemptError {
             phase: Some(memcordon_core::BoundarySetupPhase::Retirement),
             connection_must_close: false,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -214,6 +223,7 @@ impl LaunchAttemptError {
             phase: Some(memcordon_core::BoundarySetupPhase::Retirement),
             connection_must_close: false,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -226,6 +236,7 @@ impl LaunchAttemptError {
             phase: Some(memcordon_core::BoundarySetupPhase::Retirement),
             connection_must_close: false,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -243,6 +254,7 @@ impl LaunchAttemptError {
             phase: Some(phase),
             connection_must_close: false,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -258,6 +270,7 @@ impl LaunchAttemptError {
             phase: Some(phase),
             connection_must_close: false,
             mutant_observation: Some(Box::new(observation)),
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -283,6 +296,7 @@ impl LaunchAttemptError {
             phase: Some(memcordon_core::BoundarySetupPhase::Retirement),
             connection_must_close: true,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -295,6 +309,7 @@ impl LaunchAttemptError {
             phase: Some(memcordon_core::BoundarySetupPhase::Retirement),
             connection_must_close: true,
             mutant_observation: None,
+            loader_qualification: None,
             terminal_candidate: None,
         }
     }
@@ -556,32 +571,18 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                     Some(true),
                     "launcher package cleanup converged".to_owned(),
                 ),
-                Err(error)
-                    if error
-                        .strip_prefix("MCSEALED-WINDOWS-PACKAGE-ACTIVE:")
-                        .is_some()
-                        || error
-                            .strip_prefix("MCSEALED-WINDOWS-RECOVERY-AMBIGUOUS:")
-                            .is_some() =>
-                {
-                    let detail = if error
-                        .strip_prefix("MCSEALED-WINDOWS-PACKAGE-ACTIVE:")
-                        .is_some()
-                    {
-                        error
-                    } else {
-                        format!("MCSEALED-WINDOWS-PACKAGE-ACTIVE: {error}")
-                    };
-                    (
-                        memcordon_core::WindowsControlRequestStatusV1::Active,
-                        Some(false),
-                        detail,
-                    )
-                }
-                Err(error) => (
+                Err(
+                    super::record::PackageCleanupError::Active(detail)
+                    | super::record::PackageCleanupError::Ambiguous(detail),
+                ) => (
+                    memcordon_core::WindowsControlRequestStatusV1::Active,
+                    Some(false),
+                    super::record::PackageCleanupError::Active(detail).to_string(),
+                ),
+                Err(super::record::PackageCleanupError::Failed(detail)) => (
                     memcordon_core::WindowsControlRequestStatusV1::Failed,
                     None,
-                    error,
+                    detail,
                 ),
             };
             pipe::write_frame(
@@ -802,6 +803,7 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                                 failure.detail,
                                 failure.phase,
                                 failure.os_code,
+                                failure.loader_qualification,
                                 failure.terminal_candidate,
                             )?;
                             let response = WindowsLauncherResponseV1::Reject {
@@ -902,7 +904,9 @@ pub(crate) fn bound_launcher_replay_failure_response_for_test(
     bound_launcher_replay_failure_response(attempt_id, nonce, request_sha256, relay_phase, error)
 }
 
-fn converge_package_cleanup(deadline_millis: u64) -> Result<(), String> {
+fn converge_package_cleanup(
+    deadline_millis: u64,
+) -> Result<(), super::record::PackageCleanupError> {
     let deadline = Instant::now()
         .checked_add(Duration::from_millis(deadline_millis))
         .ok_or_else(|| "package cleanup deadline overflowed".to_owned())?;
@@ -926,9 +930,9 @@ fn converge_package_cleanup(deadline_millis: u64) -> Result<(), String> {
         }
         let now = Instant::now();
         if now >= deadline {
-            return Err(format!(
-                "MCSEALED-WINDOWS-PACKAGE-ACTIVE: phase=wait-launcher-jobs active_jobs={active_count} deadline_millis={deadline_millis}"
-            ));
+            return Err(super::record::PackageCleanupError::Active(format!(
+                "phase=wait-launcher-jobs active_jobs={active_count} deadline_millis={deadline_millis}"
+            )));
         }
         std::thread::sleep(Duration::from_millis(50).min(deadline - now));
     }
@@ -936,10 +940,9 @@ fn converge_package_cleanup(deadline_millis: u64) -> Result<(), String> {
     if super::record::attempts_empty()? {
         Ok(())
     } else {
-        Err(
-            "MCSEALED-WINDOWS-PACKAGE-ACTIVE: phase=durable-recovery attempts_empty=false"
-                .to_owned(),
-        )
+        Err(super::record::PackageCleanupError::Active(
+            "phase=durable-recovery attempts_empty=false".to_owned(),
+        ))
     }
 }
 
@@ -1314,22 +1317,6 @@ fn launch_attempt(
         .copied()
         .map(|raw| OwnedHandle::new(raw as usize as HANDLE))
         .collect::<Result<Vec<_>, _>>()?;
-    let loader_restriction_canary_handles = request
-        .loader_restriction_canary
-        .as_ref()
-        .map(|pair| {
-            Ok::<_, String>((
-                OwnedHandle::new(pair.remote_baseline_token_handle as usize as HANDLE)?,
-                OwnedHandle::new(pair.remote_comparison_token_handle as usize as HANDLE)?,
-                OwnedHandle::new(pair.remote_no_restricting_sid_token_handle as usize as HANDLE)?,
-                OwnedHandle::new(pair.remote_profile_token_handle as usize as HANDLE)?,
-                pair.source_binding_sha256.clone(),
-                pair.pair_invariants_sha256.clone(),
-                pair.restriction_presence_binding_sha256.clone(),
-                pair.profile_binding_sha256.clone(),
-            ))
-        })
-        .transpose()?;
     if request.attempt_id != expected_attempt_id
         || request.launch.nonce != expected_nonce
         || request.request_sha256 != expected_request_sha256
@@ -1408,32 +1395,6 @@ fn launch_attempt(
         )
         .into());
     }
-    let loader_restriction_canary = loader_restriction_canary_handles
-        .map(
-            |(
-                baseline,
-                comparison,
-                no_restricting_sid,
-                profile,
-                source_binding_sha256,
-                pair_invariants_sha256,
-                restriction_presence_binding_sha256,
-                profile_binding_sha256,
-            )| {
-                super::process::LoaderRestrictionCanaryTokens::from_transferred(
-                    primary_token.raw(),
-                    baseline,
-                    comparison,
-                    no_restricting_sid,
-                    profile,
-                    source_binding_sha256,
-                    pair_invariants_sha256,
-                    restriction_presence_binding_sha256,
-                    profile_binding_sha256,
-                )
-            },
-        )
-        .transpose()?;
     super::record::reserve_attempt(&request.attempt_id, &request.request_sha256)?;
     // Keep the durable admission until the first authenticated attempt record
     // has been stored. Package mutation therefore sees either the admission or
@@ -1697,7 +1658,6 @@ fn launch_attempt(
     };
     let target_result = SuspendedTarget::create(
         primary_token.raw(),
-        loader_restriction_canary.as_ref(),
         &job,
         &target_command,
         &request.launch.environment,
@@ -1784,7 +1744,7 @@ fn launch_attempt(
             return Err($failure);
         }};
     }
-    let creation = target.creation_observation;
+    let creation = target.creation_observation.clone();
     if request.certification_mutant
         == Some(memcordon_core::WindowsSealedMutant::AssignJobAfterCreate)
         && !creation.job_list_present
@@ -2071,6 +2031,7 @@ fn launch_attempt(
                 guardian_reaped,
                 final_handles_closed,
                 record_retired,
+                loader_qualification: creation.loader_qualification.clone(),
             };
             failure.terminal_candidate = Some(Box::new(build_terminal_receipt(
                 &request,
@@ -2486,6 +2447,7 @@ fn launch_attempt(
         guardian_reaped,
         final_handles_closed,
         record_retired,
+        loader_qualification: creation.loader_qualification,
     };
     let receipt = build_terminal_receipt(&request, started, authorization_offset, completed);
     if let Some(
@@ -2637,6 +2599,7 @@ struct CompletedRetirement {
     guardian_reaped: GuardianReaped,
     final_handles_closed: FinalHandlesClosed,
     record_retired: RecordRetired,
+    loader_qualification: Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
 }
 
 fn build_terminal_receipt(
@@ -2745,6 +2708,7 @@ fn complete_windows_boundary_evidence(
         relays_retired: completed.relays_retired.verified(),
         guardian_reaped: completed.guardian_reaped.verified(),
         final_job_handles_closed: completed.final_handles_closed.verified(),
+        loader_qualification: completed.loader_qualification.clone(),
     })
 }
 
@@ -2775,6 +2739,7 @@ fn complete_windows_boundary_evidence_for_candidate() -> BoundaryMechanismEviden
         relays_retired: true,
         guardian_reaped: true,
         final_job_handles_closed: true,
+        loader_qualification: None,
     })
 }
 

@@ -22,7 +22,7 @@ fn main() {
     #[cfg(target_os = "windows")]
     {
         windows::token::revert_entry_thread_token().unwrap_or_else(|_| std::process::abort());
-        if let Err(error) = windows::session_broker() {
+        if let Err(error) = windows::session_broker::run() {
             eprintln!("{error}");
             std::process::exit(1);
         }

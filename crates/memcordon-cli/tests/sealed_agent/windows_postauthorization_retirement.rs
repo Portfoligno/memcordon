@@ -5,66 +5,6 @@ use memcordon_core::{
     WindowsTerminalReceiptV1,
 };
 
-fn normalized_source_variants(source: &str) -> [String; 2] {
-    let lf = source.lines().collect::<Vec<_>>().join("\n");
-    let crlf = lf.replace('\n', "\r\n");
-    [lf, crlf]
-}
-
-fn normalized_line_position(lines: &[&str], expected: &str) -> usize {
-    lines
-        .iter()
-        .position(|line| *line == expected)
-        .unwrap_or_else(|| panic!("missing normalized source line: {expected}"))
-}
-
-fn normalized_line_containing(lines: &[&str], token: &str) -> usize {
-    lines
-        .iter()
-        .position(|line| line.contains(token))
-        .unwrap_or_else(|| panic!("missing normalized source token: {token}"))
-}
-
-#[test]
-fn resume_fault_uses_postauthorization_retirement_and_attaches_terminal_candidate() {
-    let source = include_str!("../../src/bin/memcordon-sealed-agent/windows/launcher_service.rs");
-    let authorize = source
-        .find("cleanup_guard.record.authorize()")
-        .expect("launcher must durably authorize the attempt");
-    let resume_fault = source
-        .find("if request.certification_fault == Some(WindowsSealedFault::Resume)")
-        .expect("launcher must inject the Resume certification fault");
-    let resume_attempt = source
-        .find("cleanup_guard.record.mark_resume_attempted()")
-        .expect("launcher must persist native resume intent");
-    assert!(authorize < resume_fault);
-    assert!(resume_fault < resume_attempt);
-
-    let resume_branch = &source[resume_fault..resume_attempt];
-    assert!(resume_branch.contains("retire_postauthorization_before_resume!"));
-    assert!(!resume_branch.contains("retire_preauthorization_with_target!"));
-
-    let retirement_start = source
-        .find("macro_rules! retire_postauthorization_before_resume")
-        .expect("postauthorization retirement macro must exist");
-    let retirement = &source[retirement_start..resume_fault];
-    let begin = retirement
-        .find("begin_postauthorization_retirement")
-        .expect("retirement must durably select Posttarget before cleanup");
-    let terminate = retirement
-        .find("job.terminate(CANCEL_STATUS)")
-        .expect("retirement must terminate the suspended Job");
-    let complete = retirement
-        .find("record.complete_retirement()")
-        .expect("retirement must persist complete cleanup");
-    let attach = retirement
-        .find("failure.terminal_candidate")
-        .expect("retirement must attach the bound receipt to the rejection");
-    assert!(begin < terminate && terminate < complete && complete < attach);
-    assert!(retirement.contains("TargetReleaseDisposition::CancelledWhileSuspended"));
-    assert!(retirement.contains("build_terminal_receipt"));
-}
-
 #[test]
 fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox() {
     let digest = "9a".repeat(32);
@@ -153,6 +93,7 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
         phase: BoundarySetupPhase::Authorization,
         detail: "Resume certification fault".to_owned(),
         os_code: None,
+        loader_qualification: None,
         target_created: true,
         target_released: false,
         cleanup_attempted: true,
@@ -189,98 +130,6 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
 }
 
 #[test]
-fn completed_terminal_is_staged_before_disconnected_delivery_gate() {
-    let source = include_str!("../../src/bin/memcordon-sealed-agent/windows/launcher_service.rs");
-
-    for source in normalized_source_variants(source) {
-        let helper_start = source
-            .find("fn stage_completed_terminal_response(")
-            .expect("completed terminal staging helper must exist");
-        let helper_end = source[helper_start..]
-            .find("struct DirectTargetReaped;")
-            .map(|offset| helper_start + offset)
-            .expect("completed terminal staging helper must have a stable end boundary");
-        let helper_lines = source[helper_start..helper_end]
-            .lines()
-            .map(str::trim)
-            .collect::<Vec<_>>();
-        let response = normalized_line_position(
-            &helper_lines,
-            "let response = WindowsLauncherResponseV1::Terminal(receipt.clone());",
-        );
-        let stage =
-            normalized_line_containing(&helper_lines, "record.stage_terminal_response(&response)");
-        let digest = normalized_line_position(
-            &helper_lines,
-            "let terminal_response_sha256 = super::record::digest(",
-        );
-        assert!(response < stage && stage < digest);
-
-        let completed_start = source
-            .find("let (response, terminal_response_sha256) =")
-            .expect("completed response must be durably staged");
-        let completed_end = source[completed_start..]
-            .find("struct DirectTargetReaped;")
-            .map(|offset| completed_start + offset)
-            .expect("completed terminal path must have a stable end boundary");
-        let completed_lines = source[completed_start..completed_end]
-            .lines()
-            .map(str::trim)
-            .collect::<Vec<_>>();
-        let stage_call = normalized_line_position(
-            &completed_lines,
-            "stage_completed_terminal_response(&mut record, receipt)?;",
-        );
-        let delivery_gate = normalized_line_position(&completed_lines, "if control_connected {");
-        let live_delivery = normalized_line_containing(
-            &completed_lines,
-            "pipe::write_frame(connection, &response)",
-        );
-        let acknowledgment =
-            normalized_line_position(&completed_lines, "wait_for_terminal_acknowledgment(");
-        let retirement =
-            normalized_line_containing(&completed_lines, "record.acknowledge_terminal_response()");
-        assert!(
-            stage_call < delivery_gate
-                && delivery_gate < live_delivery
-                && live_delivery < acknowledgment
-                && acknowledgment < retirement
-        );
-    }
-}
-
-#[test]
-fn retirement_faults_attach_bound_terminal_before_rejection() {
-    let source = include_str!("../../src/bin/memcordon-sealed-agent/windows/launcher_service.rs");
-
-    for source in normalized_source_variants(source) {
-        let receipt_start = source
-            .find("let receipt = build_terminal_receipt(&request, started, authorization_offset, completed);")
-            .expect("completed retirement must produce a terminal receipt");
-        let fault_end = source[receipt_start..]
-            .find("if let Some(mut cleanup_failure) = cleanup_probe_failure {")
-            .map(|offset| receipt_start + offset)
-            .expect("retirement fault path must have a stable end boundary");
-        let fault_lines = source[receipt_start..fault_end]
-            .lines()
-            .map(str::trim)
-            .collect::<Vec<_>>();
-        let receipt = normalized_line_position(
-            &fault_lines,
-            "let receipt = build_terminal_receipt(&request, started, authorization_offset, completed);",
-        );
-        let record_retire =
-            normalized_line_position(&fault_lines, "fault @ (WindowsSealedFault::RecordRetire");
-        let guardian = normalized_line_position(
-            &fault_lines,
-            "| WindowsSealedFault::GuardianKilledAfterAuthorization),",
-        );
-        let bind = normalized_line_position(&fault_lines, ".with_terminal_candidate(receipt));");
-        assert!(receipt < record_retire && record_retire < guardian && guardian < bind);
-    }
-}
-
-#[test]
 fn receiptless_posttarget_rejection_cannot_bypass_terminal_binding() {
     let digest = "8b".repeat(32);
     let nonce = "receiptless-posttarget-rejection";
@@ -314,6 +163,7 @@ fn receiptless_posttarget_rejection_cannot_bypass_terminal_binding() {
         phase: BoundarySetupPhase::Retirement,
         detail: "receipt-less posttarget certification fault".to_owned(),
         os_code: None,
+        loader_qualification: None,
         target_created: true,
         target_released: false,
         cleanup_attempted: true,

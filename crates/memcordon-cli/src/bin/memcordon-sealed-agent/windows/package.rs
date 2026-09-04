@@ -758,21 +758,17 @@ fn service_owned_cleanup_barrier() -> Result<(), String> {
             .max(1);
         match super::qualification::prepare_package_cleanup(deadline_millis) {
             Ok(()) => return Ok(()),
-            Err(error)
-                if error
-                    .strip_prefix("MCSEALED-WINDOWS-PACKAGE-ACTIVE:")
-                    .is_some() =>
-            {
+            Err(super::record::PackageCleanupError::Active(detail)) => {
                 let recovery_empty = super::qualification::recovery_status()?;
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(format!(
-                        "MCSEALED-WINDOWS-PACKAGE-CLEANUP-TIMEOUT: recovery_empty={recovery_empty}; last={error}"
+                        "MCSEALED-WINDOWS-PACKAGE-CLEANUP-TIMEOUT: recovery_empty={recovery_empty}; last={detail}"
                     ));
                 }
                 std::thread::sleep(PACKAGE_CLEANUP_RETRY_INTERVAL.min(deadline - now));
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.to_string()),
         }
     }
 }

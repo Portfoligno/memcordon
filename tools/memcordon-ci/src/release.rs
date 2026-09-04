@@ -1153,7 +1153,7 @@ fn package_crate(
     let inventory = utf8(inventory, "Cargo package inventory")?;
     let canonical_tree_sha256 = canonical_source_tree(root, package, &inventory)?;
     let filename = format!("{package}-{version}.crate");
-    let archive = root.join("target").join("package").join(filename);
+    let archive = package_archive_directory(root).join(filename);
     if !archive.is_file() {
         return Err(failure(format!(
             "Cargo did not produce package archive for {package}"
@@ -1211,6 +1211,17 @@ pub(crate) fn create_package_archives(
     }
     rustup_cargo(root, stable, arguments, RELEASE_DEADLINE).run()?;
     Ok(())
+}
+
+pub(crate) fn package_archive_directory(root: &Path) -> PathBuf {
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("target"));
+    if target.is_absolute() {
+        target.join("package")
+    } else {
+        root.join(target).join("package")
+    }
 }
 
 pub(crate) fn extract_crate_source(archive_path: &Path, destination: &Path) -> Result<()> {
@@ -1406,16 +1417,15 @@ fn smoke_packaged_memcordon_install(
     let sources = temporary.path().join("sources");
     let core = sources.join("memcordon-core");
     let platform = sources.join("memcordon-platform");
+    let launch_core = sources.join("memcordon-windows-launch-core");
     let cli = sources.join("memcordon");
     for (package, destination) in [
         ("memcordon-core", &core),
         ("memcordon-platform", &platform),
+        ("memcordon-windows-launch-core", &launch_core),
         ("memcordon", &cli),
     ] {
-        let archive = root
-            .join("target")
-            .join("package")
-            .join(format!("{package}-{version}.crate"));
+        let archive = package_archive_directory(root).join(format!("{package}-{version}.crate"));
         extract_crate_source(&archive, destination)?;
     }
     let cargo_configuration = temporary.path().join(".cargo");
@@ -1430,6 +1440,11 @@ fn smoke_packaged_memcordon_install(
         "path".to_owned(),
         toml::Value::String(platform.to_string_lossy().into_owned()),
     );
+    let mut launch_core_specification = toml::Table::new();
+    launch_core_specification.insert(
+        "path".to_owned(),
+        toml::Value::String(launch_core.to_string_lossy().into_owned()),
+    );
     let mut crates_io = toml::Table::new();
     crates_io.insert(
         "memcordon-core".to_owned(),
@@ -1438,6 +1453,10 @@ fn smoke_packaged_memcordon_install(
     crates_io.insert(
         "memcordon-platform".to_owned(),
         toml::Value::Table(platform_specification),
+    );
+    crates_io.insert(
+        "memcordon-windows-launch-core".to_owned(),
+        toml::Value::Table(launch_core_specification),
     );
     let mut patch_table = toml::Table::new();
     patch_table.insert("crates-io".to_owned(), toml::Value::Table(crates_io));
@@ -2510,10 +2529,8 @@ fn assemble(root: &Path) -> Result<()> {
             &identity.commit,
             release.maximum_package_bytes,
         )?);
-        let archive = root
-            .join("target")
-            .join("package")
-            .join(format!("{package}-{}.crate", identity.version));
+        let archive =
+            package_archive_directory(root).join(format!("{package}-{}.crate", identity.version));
         let package_output = output.join("packages");
         fs::create_dir_all(&package_output)?;
         fs::copy(

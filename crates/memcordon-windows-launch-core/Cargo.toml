@@ -1,0 +1,33 @@
+[package]
+name = "memcordon-windows-launch-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+readme = "../../docs/package-readme-windows-launch-core.md"
+description = "Typed, observer-free Windows loader launch contract shared by MemCordon and its loader lab"
+keywords = ["windows", "sandbox", "process", "job-object"]
+categories = ["os::windows-apis"]
+
+[dependencies]
+hex.workspace = true
+memcordon-core = { path = "../memcordon-core", version = "=0.5.2-dev" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_JobObjects",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

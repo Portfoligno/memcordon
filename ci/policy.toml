@@ -1,14 +1,15 @@
 [workspace]
 production_packages = [
   "memcordon-core",
+  "memcordon-windows-launch-core",
   "memcordon-platform",
   "memcordon",
   "memcordon-testkit",
 ]
-ci_packages = ["memcordon-ci"]
-ci_package_rust_versions = { memcordon-ci = "1.88.0" }
-publish_packages = ["memcordon-core", "memcordon-platform", "memcordon"]
-non_publish_packages = ["memcordon-testkit", "memcordon-ci"]
+ci_packages = ["memcordon-ci", "memcordon-windows-loader-lab"]
+ci_package_rust_versions = { memcordon-ci = "1.88.0", memcordon-windows-loader-lab = "1.85.0" }
+publish_packages = ["memcordon-core", "memcordon-windows-launch-core", "memcordon-platform", "memcordon"]
+non_publish_packages = ["memcordon-testkit", "memcordon-ci", "memcordon-windows-loader-lab"]
 
 [workflow]
 required_public_matrix = [
@@ -34,6 +35,10 @@ allowed_run_commands = [
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite stress",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-sealed-v2",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-loader-production",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-provider-lifecycle",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-package-channel",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-loader-lab",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite package-windows-sealed",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite channel-parity-windows-sealed",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-macos-watchdog",
@@ -101,6 +106,18 @@ file = ".github/workflows/release.yml"
 variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
 source = "${{ steps.crates_auth_3.outputs.token }}"
 steps = ["Publish next crate in slot 3"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_HOME"
+source = "target/ci/cargo-publish-home/slot-4"
+steps = ["Publish next crate in slot 4"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ steps.crates_auth_4.outputs.token }}"
+steps = ["Publish next crate in slot 4"]
 
 [test]
 fast_short_child_iterations = 128

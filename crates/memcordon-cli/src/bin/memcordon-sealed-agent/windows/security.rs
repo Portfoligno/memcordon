@@ -7,22 +7,24 @@ use serde::{Deserialize, Serialize};
 
 use super::user_api::get_user_object_security as GetUserObjectSecurity;
 use windows_sys::Wdk::Storage::FileSystem::RtlCreateServiceSid;
-use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HLOCAL, LocalFree, UNICODE_STRING,
-};
+#[cfg(test)]
+use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree, UNICODE_STRING};
 use windows_sys::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
     EXPLICIT_ACCESS_W, GetSecurityInfo, REVOKE_ACCESS, SDDL_REVISION_1, SE_FILE_OBJECT,
     SE_KERNEL_OBJECT, SE_SERVICE, SET_ACCESS, SetEntriesInAclW, SetSecurityInfo, TRUSTEE_W,
 };
+#[cfg(test)]
+use windows_sys::Win32::Security::IsValidAcl;
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Security::{
     ACL, ACL_SIZE_INFORMATION, AccessCheck, AclSizeInformation, DACL_SECURITY_INFORMATION,
     DuplicateTokenEx, EqualSid, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION, GetAce,
     GetAclInformation, GetFileSecurityW, GetKernelObjectSecurity, GetLengthSid,
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorGroup,
-    GetSecurityDescriptorLength, GetSecurityDescriptorOwner, GetSecurityDescriptorSacl, IsValidAcl,
+    GetSecurityDescriptorLength, GetSecurityDescriptorOwner, GetSecurityDescriptorSacl,
     IsValidSecurityDescriptor, IsValidSid, LABEL_SECURITY_INFORMATION, MakeAbsoluteSD,
     MapGenericMask, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION,
     SE_DACL_PRESENT, SE_DACL_PROTECTED, SE_SELF_RELATIVE, SecurityImpersonation, SetFileSecurityW,

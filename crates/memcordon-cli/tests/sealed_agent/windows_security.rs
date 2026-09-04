@@ -23,7 +23,6 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
-use windows_sys::Win32::System::Registry::{REG_DWORD, REG_SZ};
 use windows_sys::Win32::System::Services::SERVICE_STOPPED;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CreateEventW, CreateMutexW, CreateThread, GetCurrentProcess,
@@ -52,10 +51,9 @@ use crate::windows::loader_access::{
 use crate::windows::package::{CONTROL_PRIVILEGES, LAUNCHER_PRIVILEGES, SESSION_BROKER_PRIVILEGES};
 use crate::windows::pipe::{PipeListener, PipePreparationError};
 use crate::windows::process::{
-    attest_current_user_binding_duplicates_for_test, loader_snaps_failure_precedence_for_test,
-    target_association_preflight_grants_for_test, target_association_preflight_progress_for_test,
-    validate_guardian_desktop_binding, validate_target_desktop_binding,
-    validate_target_desktop_input_state,
+    attest_current_user_binding_duplicates_for_test, target_association_preflight_grants_for_test,
+    target_association_preflight_progress_for_test, validate_guardian_desktop_binding,
+    validate_target_desktop_binding, validate_target_desktop_input_state,
 };
 use crate::windows::security::{
     CERTIFICATION_ADMIN_DIRECTORY_ACCESS, NamedPipeSecurityError, NamedPipeSecurityMismatch,
@@ -76,10 +74,6 @@ use crate::windows::security::{
     token_dacl_diagnostic_from_exit, token_dacl_nonpeer_fingerprint,
     user_object_policy_fingerprint_for_test, user_object_resultant_fingerprint_for_test,
     utf16_nul_terminated, utf16_nul_terminated_with_reported_length,
-};
-use crate::windows::session_broker::{
-    loader_snaps_journal_fixture_for_test, loader_snaps_journal_mutation_for_test,
-    loader_snaps_value_round_trip_for_test, validate_loader_snaps_journal_bytes_for_test,
 };
 
 const SE_SACL_PRESENT_CONTROL: u16 = 0x0010;
@@ -1947,180 +1941,6 @@ fn native_architectures_never_select_wow64_known_dll_namespaces() {
         );
     }
     assert!(native_known_dll_namespace_for_test(0x014c).is_err());
-}
-
-#[test]
-fn loader_snaps_value_and_durable_journal_schema_are_exact() {
-    loader_snaps_failure_precedence_for_test().unwrap();
-    let (value_type, bytes) =
-        loader_snaps_value_round_trip_for_test(REG_DWORD, 0x40_u32.to_le_bytes().to_vec()).unwrap();
-    assert_eq!(value_type, REG_DWORD);
-    assert_eq!(u32::from_le_bytes(bytes.try_into().unwrap()), 0x42);
-
-    let encoded = "0x00000040\0"
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
-    let (value_type, bytes) = loader_snaps_value_round_trip_for_test(REG_SZ, encoded).unwrap();
-    assert_eq!(value_type, REG_SZ);
-    let units = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect::<Vec<_>>();
-    assert_eq!(String::from_utf16(&units).unwrap(), "0x00000042\0");
-
-    let journal = loader_snaps_journal_fixture_for_test().unwrap();
-    validate_loader_snaps_journal_bytes_for_test(&journal).unwrap();
-    for mutation in [
-        "applied",
-        "prior-key",
-        "digest",
-        "registry-view",
-        "authority",
-        "holder",
-        "admission",
-        "matrix",
-        "native-machine",
-    ] {
-        assert!(loader_snaps_journal_mutation_for_test(mutation).is_err());
-    }
-    let mut unknown: serde_json::Value = serde_json::from_slice(&journal).unwrap();
-    unknown["unknown"] = serde_json::json!(true);
-    assert!(
-        validate_loader_snaps_journal_bytes_for_test(&serde_json::to_vec(&unknown).unwrap())
-            .is_err()
-    );
-}
-
-#[test]
-fn loader_debug_reducer_bounds_diagnostics_and_labels_candidates() {
-    let names = (0..20)
-        .map(|ordinal| format!("module-{ordinal}-{}.dll", "x".repeat(160)))
-        .collect::<Vec<_>>();
-    let loads = names
-        .iter()
-        .enumerate()
-        .map(|(ordinal, name)| {
-            (
-                0x1000 + ordinal * 0x1000,
-                name.as_str(),
-                if ordinal % 2 == 0 {
-                    "mapped-file"
-                } else {
-                    "file-handle"
-                },
-                ordinal == 0,
-            )
-        })
-        .collect::<Vec<_>>();
-    let diagnostic = crate::windows::loader_debug::reduce_loader_trace_for_test(
-        &["MISSING.DLL"],
-        &loads,
-        &[0x2000, 0xdead],
-        &[0x1234_5678],
-        &[(true, 0x8000_0003, 0x2000), (false, 0xC000_0142, 0x9000)],
-        0xC000_0142,
-    );
-    assert!(diagnostic.len() <= 8_192);
-    assert!(diagnostic.contains("loader_trace=v4"));
-    assert!(diagnostic.contains("events=26 accounted_events=26"));
-    assert!(diagnostic.contains("modules=20"));
-    assert!(diagnostic.contains("dll_loads=19"));
-    assert!(diagnostic.contains("unloads=2"));
-    assert!(diagnostic.contains("exceptions=2"));
-    assert!(diagnostic.contains("trace_sha256="));
-    assert!(diagnostic.contains("unknown_events=1"));
-    assert!(diagnostic.contains("missing_hosts=[MISSING.DLL]"));
-}
-
-#[test]
-fn loader_debug_trace_v4_resolves_paths_by_strongest_available_source() {
-    let resolve = crate::windows::loader_debug::loader_path_resolution_precedence_for_test;
-    assert_eq!(
-        resolve(
-            Some(r"C:\Windows\System32\kernel32.dll"),
-            Some(r"\Device\HarddiskVolume3\Windows\System32\ntdll.dll"),
-            Some("advapi32.dll"),
-        ),
-        ("file-handle".to_owned(), "kernel32.dll".to_owned()),
-    );
-    assert_eq!(
-        resolve(
-            None,
-            Some(r"\Device\HarddiskVolume3\Windows\System32\ntdll.dll"),
-            Some("advapi32.dll"),
-        ),
-        ("mapped-file".to_owned(), "ntdll.dll".to_owned()),
-    );
-    assert_eq!(
-        resolve(None, None, Some("advapi32.dll")),
-        (
-            "event-image-name-untrusted".to_owned(),
-            "advapi32.dll".to_owned(),
-        ),
-    );
-    assert_eq!(
-        resolve(None, None, None),
-        ("unavailable".to_owned(), "unavailable".to_owned()),
-    );
-}
-
-#[test]
-fn loader_debug_trace_v4_accounts_pre_breakpoint_rollback_and_host_fan_in() {
-    let loads = [
-        (0x1000, "bootstrap.exe", "file-handle", true),
-        (0x2000, "KERNELBASE.DLL", "mapped-file", false),
-        (0x3000, "NTDLL.DLL", "mapped-file", false),
-    ];
-    let reduce = crate::windows::loader_debug::reduce_loader_trace_for_test;
-    let first = reduce(
-        &["KERNELBASE.DLL", "KERNELBASE.DLL", "ADVAPI32.DLL"],
-        &loads,
-        &[0x2000],
-        &[0x0bad_f00d],
-        &[],
-        0xC000_0142,
-    );
-    let second = reduce(
-        &["KERNELBASE.DLL", "KERNELBASE.DLL", "ADVAPI32.DLL"],
-        &loads,
-        &[0x2000],
-        &[0x0bad_f00d],
-        &[],
-        0xC000_0142,
-    );
-    assert_eq!(first, second);
-    assert!(first.contains("events=6 accounted_events=6"));
-    assert!(first.contains("failure_phase=pre-initial-breakpoint-static-loader"));
-    assert!(first.contains("ever_mapped=[KERNELBASE.DLL]"));
-    assert!(first.contains("active_at_exit=[]"));
-    assert!(first.contains("missing_hosts=[ADVAPI32.DLL]"));
-    assert!(first.contains("extra_hosts=[NTDLL.DLL]"));
-    assert!(first.contains("unload_tail=[1@0x2000:load=2(KERNELBASE.DLL)]"));
-    assert!(first.contains("unknown_event_tail=[0x0badf00d]"));
-}
-
-#[test]
-fn loader_debug_trace_v4_reports_missing_direct_roots_and_blocked_descendants() {
-    let diagnostic = crate::windows::loader_debug::reduce_loader_root_frontier_for_test(
-        &[
-            (0, "KERNEL32.DLL", "KERNEL32.DLL"),
-            (1, "ADVAPI32.DLL", "ADVAPI32.DLL"),
-        ],
-        &[
-            ("ADVAPI32.DLL", "MSVCRT.DLL", "MSVCRT.DLL"),
-            ("MSVCRT.DLL", "RPCRT4.DLL", "RPCRT4.DLL"),
-            ("RPCRT4.DLL", "SECHOST.DLL", "SECHOST.DLL"),
-        ],
-        &["KERNEL32.DLL"],
-    );
-    assert!(diagnostic.contains("loader_trace=v4"));
-    assert!(diagnostic.contains(
-        "missing_direct_roots=[1:ADVAPI32.DLL>ADVAPI32.DLL:resolution=physical-direct:selection=known-dll-section:preflight_nt_status=0x00000000:loader_native_status=unavailable"
-    ));
-    assert!(diagnostic.contains("source_target_object_attested=true"));
-    assert!(diagnostic.contains("blocked_descendants=[MSVCRT.DLL,RPCRT4.DLL,SECHOST.DLL]"));
-    assert!(diagnostic.contains("edge_frontier=[none]"));
 }
 
 #[test]

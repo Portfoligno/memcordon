@@ -48,6 +48,10 @@ pub struct ProviderRejectionEvidence {
     pub phase: BoundarySetupPhase,
     pub detail: String,
     pub os_code: Option<i32>,
+    /// Typed Windows loader qualification evidence when target creation failed
+    /// in the production loader-control probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loader_qualification: Option<crate::WindowsLoaderQualificationOutcomeV2>,
     pub target_created: bool,
     pub target_released: bool,
     pub cleanup_attempted: bool,
@@ -76,6 +80,10 @@ impl ProviderRejectionEvidence {
             && !self.detail.is_empty()
             && self.detail.len() <= PROVIDER_REJECTION_MAX_DETAIL_BYTES
             && !self.detail.contains('\0')
+            && self
+                .loader_qualification
+                .as_ref()
+                .is_none_or(crate::WindowsLoaderQualificationOutcomeV2::is_consistent)
             && (!self.target_released || self.target_created)
             && self.restart_safety.errors.len() <= MAX_CLEANUP_ERRORS
             && self

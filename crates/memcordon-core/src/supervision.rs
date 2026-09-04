@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     BoundaryRequirement, ByteSize, ChildTermination, CircuitState, CleanupSummary,
@@ -159,6 +160,128 @@ pub struct WindowsSealedEvidenceV2 {
     pub relays_retired: bool,
     pub guardian_reaped: bool,
     pub final_job_handles_closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loader_qualification: Option<WindowsLoaderQualificationOutcomeV2>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsLoaderQualificationStageV2 {
+    PlanValidation,
+    DesktopPreflight,
+    ProcessCreate,
+    SuspendedAttestation,
+    Resume,
+    LoaderReadyHandshake,
+    ContainmentReadback,
+    ExitDrain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowsLoaderNativeStatusV1 {
+    Win32 { code: u32 },
+    NtStatus { code: u32 },
+    TargetExit { code: u32 },
+    Stable { code: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowsLoaderCleanupStatusV1 {
+    NotStarted,
+    Complete,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsLoaderCleanupOutcomeV1 {
+    pub status: WindowsLoaderCleanupStatusV1,
+    pub stable_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsLoaderReadyEvidenceV1 {
+    pub schema_version: u32,
+    pub launch_plan_sha256: String,
+    pub elapsed_millis: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsLoaderQualificationFailureV2 {
+    pub schema_version: u32,
+    pub stable_code: String,
+    pub stage: WindowsLoaderQualificationStageV2,
+    pub native_status: Option<WindowsLoaderNativeStatusV1>,
+    pub elapsed_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_plan_sha256: Option<String>,
+    pub qualification_id: String,
+    pub cleanup: WindowsLoaderCleanupOutcomeV1,
+    pub diagnostic_id: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "result", rename_all = "kebab-case")]
+pub enum WindowsLoaderQualificationOutcomeV2 {
+    Ready(WindowsLoaderReadyEvidenceV1),
+    Failed(WindowsLoaderQualificationFailureV2),
+}
+
+impl WindowsLoaderQualificationOutcomeV2 {
+    pub fn is_consistent(&self) -> bool {
+        const MAX_CODE_BYTES: usize = 128;
+        const MAX_DETAIL_BYTES: usize = 512;
+        let digest_is_valid = |value: &str| {
+            value.len() == Sha256::digest([]).len() * 2
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        match self {
+            Self::Ready(ready) => {
+                ready.schema_version == 1 && digest_is_valid(&ready.launch_plan_sha256)
+            }
+            Self::Failed(failure) => {
+                failure.schema_version == 2
+                    && !failure.stable_code.is_empty()
+                    && failure.stable_code.len() <= MAX_CODE_BYTES
+                    && !failure.qualification_id.is_empty()
+                    && failure.qualification_id.len() <= MAX_CODE_BYTES
+                    && !failure.detail.is_empty()
+                    && failure.detail.len() <= MAX_DETAIL_BYTES
+                    && failure
+                        .launch_plan_sha256
+                        .as_ref()
+                        .is_none_or(|digest| digest_is_valid(digest))
+                    && (failure.launch_plan_sha256.is_some()
+                        || matches!(
+                            failure.stage,
+                            WindowsLoaderQualificationStageV2::PlanValidation
+                                | WindowsLoaderQualificationStageV2::DesktopPreflight
+                        ))
+                    && failure
+                        .diagnostic_id
+                        .as_ref()
+                        .is_none_or(|value| !value.is_empty() && value.len() <= MAX_CODE_BYTES)
+                    && match failure.cleanup.status {
+                        WindowsLoaderCleanupStatusV1::Failed => {
+                            failure.cleanup.stable_code.as_ref().is_some_and(|value| {
+                                !value.is_empty() && value.len() <= MAX_DETAIL_BYTES
+                            })
+                        }
+                        WindowsLoaderCleanupStatusV1::NotStarted
+                        | WindowsLoaderCleanupStatusV1::Complete => {
+                            failure.cleanup.stable_code.is_none()
+                        }
+                    }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -294,6 +417,10 @@ pub fn boundary_evidence_is_consistent(
                 && native.relays_retired
                 && native.guardian_reaped
                 && native.final_job_handles_closed
+                && native
+                    .loader_qualification
+                    .as_ref()
+                    .is_none_or(WindowsLoaderQualificationOutcomeV2::is_consistent)
         }
         BoundaryMechanismEvidence::MacosEndpointSecurityV1(native) => {
             sealed_generic_evidence_is_consistent(launch, restart_safety)
@@ -768,7 +895,7 @@ pub enum SupervisionTerminal {
     },
     Error {
         attempt_number: Option<u64>,
-        error: SupervisionErrorRecord,
+        error: Box<SupervisionErrorRecord>,
     },
 }
 
@@ -984,7 +1111,8 @@ impl SupervisionExecution {
                 error.provenance_is_consistent()
                     && error.attempt_number == Some(*attempt_number)
                     && latest.is_some_and(|record| {
-                        record.number == *attempt_number && record.error.as_ref() == Some(error)
+                        record.number == *attempt_number
+                            && record.error.as_ref() == Some(error.as_ref())
                     })
             }
             SupervisionTerminal::Error {

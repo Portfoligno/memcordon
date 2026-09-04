@@ -346,8 +346,8 @@ fn certification_runner_regressions_are_rejected_structurally() {
         (
             Path::new(".github/workflows/release.yml"),
             release.as_str(),
-            "  windows-certification:\n    name: Release / Windows sealed certification / ${{ matrix.id }}\n    needs:\n      - preflight\n      - native\n",
-            "  windows-certification:\n    name: Release / Windows sealed certification / ${{ matrix.id }}\n    needs:\n      - preflight\n      - native\n    runs-on: [self-hosted, memcordon, windows, x64, job-object, ephemeral]\n",
+            "  windows-loader-production:\n    name: Release / Windows loader production / ${{ matrix.id }}\n    needs: native\n",
+            "  windows-loader-production:\n    name: Release / Windows loader production / ${{ matrix.id }}\n    needs: native\n    runs-on: [self-hosted, memcordon, windows, x64, job-object, ephemeral]\n",
         ),
         (
             Path::new(".github/workflows/backend-certification.yml"),
@@ -370,8 +370,8 @@ fn certification_runner_regressions_are_rejected_structurally() {
         (
             Path::new(".github/workflows/release.yml"),
             release.as_str(),
-            "  windows-certification:\n    name: Release / Windows sealed certification / ${{ matrix.id }}\n    needs:\n      - preflight\n      - native\n",
-            "  windows-certification:\n    name: Release / Windows sealed certification / ${{ matrix.id }}\n    needs:\n      - preflight\n      - native\n    runs-on: windows-latest\n",
+            "  windows-loader-production:\n    name: Release / Windows loader production / ${{ matrix.id }}\n    needs: native\n",
+            "  windows-loader-production:\n    name: Release / Windows loader production / ${{ matrix.id }}\n    needs: native\n    runs-on: windows-latest\n",
         ),
     ];
 

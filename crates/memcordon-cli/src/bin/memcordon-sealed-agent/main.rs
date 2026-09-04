@@ -106,75 +106,10 @@ fn main() {
             windows::qualification::orphan_descendant_canary()
         }
         #[cfg(target_os = "windows")]
-        [command, release_marker] if command == "windows-certification-frontend" => {
-            windows::qualification::frontend_loss_client(release_marker)
-        }
-        #[cfg(target_os = "windows")]
-        [command, fault, marker] if command == "windows-certification-authority-frontend" => {
-            windows::qualification::authority_loss_client(fault, marker)
-        }
-        #[cfg(target_os = "windows")]
-        [command] if command == "windows-authority-loss-observations" => {
-            windows::qualification::authority_loss_observations()
-                .and_then(|value| {
-                    serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
-                })
-                .map(|value| println!("{value}"))
-        }
-        #[cfg(target_os = "windows")]
-        [command] if command == "windows-runtime-mutant-observations" => {
-            windows::qualification::runtime_mutant_observations()
-                .and_then(|value| {
-                    serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
-                })
-                .map(|value| println!("{value}"))
-        }
-        #[cfg(target_os = "windows")]
-        [command, marker] if command == "windows-certification-recursive-mutant" => {
-            windows::qualification::recursive_mutant_target(marker)
-        }
-        #[cfg(target_os = "windows")]
-        [command] if command == "windows-certification-appcontainer" => {
-            windows::qualification::appcontainer_rejection_client()
-        }
-        #[cfg(target_os = "windows")]
-        [command, marker] if command == "windows-certification-marker" => {
-            std::fs::write(marker, b"released\n").map_err(|error| error.to_string())
-        }
-        #[cfg(target_os = "windows")]
-        [command, marker, tag, kind, handle]
-            if command == "windows-certification-marker-hold"
-                && tag == "windows-mutant-leaked-handle" =>
-        {
-            windows::qualification::leaked_handle_mutant_target(marker, kind, handle)
-        }
-        #[cfg(target_os = "windows")]
-        [command, marker] if command == "windows-certification-marker-hold" => (|| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
-            let mut heartbeat = 0_u64;
-            while std::time::Instant::now() < deadline {
-                std::fs::write(marker, format!("{} {heartbeat}\n", std::process::id()))
-                    .map_err(|error| error.to_string())?;
-                heartbeat = heartbeat.saturating_add(1);
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Ok(())
-        })(),
-        #[cfg(target_os = "windows")]
         [command] if command == "windows-recovery-status" => windows_recovery_status(),
-        #[cfg(target_os = "windows")]
-        [command] if command == "windows-certification-observations" => {
-            windows_certification_observations()
-        }
-        #[cfg(target_os = "windows")]
-        [command] if command == "windows-token-observations" => windows_token_observations(),
         #[cfg(target_os = "windows")]
         [command] if command == "windows-provider-state-absent" => {
             windows::package::provider_state_absent().map(|absent| println!("{absent}"))
-        }
-        #[cfg(target_os = "windows")]
-        [command, canary_handles @ ..] if command == "windows-certification-target" => {
-            windows::qualification::certification_target_canary(canary_handles)
         }
         #[cfg(target_os = "windows")]
         [command, canary_handles @ ..] if command == "windows-certification-nested-target" => {
@@ -216,26 +151,6 @@ fn main() {
 #[cfg(target_os = "windows")]
 fn windows_recovery_status() -> Result<(), String> {
     println!("{}", windows::qualification::recovery_status()?);
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn windows_certification_observations() -> Result<(), String> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&windows::qualification::certification_observations()?)
-            .map_err(|error| error.to_string())?
-    );
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn windows_token_observations() -> Result<(), String> {
-    let observations = windows::qualification::token_observations()?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&observations).map_err(|error| error.to_string())?
-    );
     Ok(())
 }
 

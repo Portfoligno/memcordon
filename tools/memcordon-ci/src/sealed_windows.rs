@@ -20,7 +20,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
-use crate::release::{create_package_archives, extract_crate_source};
+use crate::release::{create_package_archives, extract_crate_source, package_archive_directory};
 
 const DEADLINE: Duration = Duration::from_secs(30 * 60);
 const REPORT_DIRECTORY: &str = "target/ci/reports/windows-sealed-v2";
@@ -181,12 +181,499 @@ struct ChannelFingerprint {
     package_identity: Value,
     qualification_schema: u32,
     provider_identity: String,
-    qualification_receipt_digest: String,
+    qualification_contract_sha256: String,
+    launch_plan_template_sha256: String,
     provider_protocol_schema: u32,
     execution_report_schema: u32,
     boundary_evidence_schema: u32,
     execution_mechanism: String,
     sealed_behavior: Value,
+}
+
+/// Certifies only the shipped, unobserved loader-control path.
+///
+/// Token variants, fault injection, provider lifecycle, and package/channel
+/// comparisons deliberately live in their own suites so none of them can
+/// influence the production loader result.
+pub fn loader_production(root: &Path, stable: &str) -> Result<()> {
+    require_windows()?;
+    require_native_architecture()?;
+    let reports = report_directory(root).join("loader-production");
+    if reports.exists() {
+        fs::remove_dir_all(&reports)?;
+    }
+    fs::create_dir_all(&reports)?;
+    write_json(
+        &reports.join("harness.json"),
+        &serde_json::json!({
+            "schema_version": 1,
+            "phase": "started",
+            "architecture": std::env::consts::ARCH,
+        }),
+    )?;
+    let native = native_channel_binaries(root, stable)?;
+    let agent = native.root.join("memcordon-sealed-agent.exe");
+    let bootstrap = native.root.join("memcordon-target-desktop-bootstrap.exe");
+    for binary in [
+        native.root.join("memcordon.exe").as_path(),
+        agent.as_path(),
+        bootstrap.as_path(),
+        native.root.join("memcordon-session-broker.exe").as_path(),
+    ] {
+        verify_production_windows_binary(binary)?;
+    }
+    verify_target_desktop_bootstrap(&bootstrap)?;
+    let qualification_output = CommandSpec::new(&agent, root, DEADLINE)
+        .args(["package", "install", "--ephemeral-ci"])
+        .output();
+    let artifact_result = collect_loader_production_artifacts(&reports);
+    let qualification_result = fs::read(
+        windows_provider_state_root()
+            .join("package")
+            .join("qualification.json"),
+    );
+    let uninstall_result = CommandSpec::new(&agent, root, DEADLINE)
+        .args(["package", "uninstall", "--ephemeral-ci"])
+        .run();
+    write_json(
+        &reports.join("harness.json"),
+        &serde_json::json!({
+            "schema_version": 1,
+            "phase": "complete",
+            "architecture": std::env::consts::ARCH,
+            "install_command_returned": qualification_output.is_ok(),
+            "typed_artifacts_collected": artifact_result.is_ok(),
+            "qualification_receipt_collected": qualification_result.is_ok(),
+            "cleanup_command_returned": uninstall_result.is_ok(),
+        }),
+    )?;
+    let gate_result = (|| -> Result<()> {
+        let output = qualification_output?;
+        let (plan, outcome) = artifact_result?;
+        if !output.status.success() {
+            return match outcome {
+                memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(failure) => {
+                    Err(CiError::Message(format!(
+                        "Windows production loader qualification failed: stage={:?} status={:?} cleanup={:?}",
+                        failure.stage, failure.native_status, failure.cleanup
+                    )))
+                }
+                memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(_) => {
+                    Err(CiError::Message(
+                        "Windows production loader command failed after reporting Ready".to_owned(),
+                    ))
+                }
+            };
+        }
+        let plan = plan.ok_or_else(|| {
+            CiError::Message(
+                "Windows production loader reported Ready without a launch-plan artifact"
+                    .to_owned(),
+            )
+        })?;
+        let qualification_value: Value = serde_json::from_slice(&qualification_result?)?;
+        let qualification: WindowsQualificationReceiptV1 =
+            serde_json::from_value(qualification_value.clone())?;
+        if qualification.schema_version != WINDOWS_QUALIFICATION_SCHEMA_VERSION
+            || !qualification.qualified
+            || !qualification.is_consistent()
+            || qualification.loader_qualification != outcome
+        {
+            return Err(CiError::Message(
+                "Windows production loader qualification is incomplete or contradictory".to_owned(),
+            ));
+        }
+        let reported_digest = match &qualification.loader_qualification {
+            memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(ready) => {
+                &ready.launch_plan_sha256
+            }
+            memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(_) => unreachable!(
+                "a qualified receipt cannot contain a failed loader outcome after validation"
+            ),
+        };
+        if plan.launch_plan_sha256() != reported_digest {
+            return Err(CiError::Message(
+                "Windows production loader plan digest does not match its typed outcome".to_owned(),
+            ));
+        }
+        write_json(&reports.join("qualification.json"), &qualification_value)?;
+        Ok(())
+    })();
+    let absence_result = provider_state_absent(root, &agent).and_then(|absent| {
+        if absent {
+            Ok(())
+        } else {
+            Err(CiError::Message(
+                "Windows production loader qualification left provider state".to_owned(),
+            ))
+        }
+    });
+    merge_primary_and_cleanup(gate_result, uninstall_result.map(|_| ()), absence_result)
+}
+
+fn collect_loader_production_artifacts(
+    reports: &Path,
+) -> Result<(
+    Option<memcordon_windows_launch_core::ProductionLoaderPlanV1>,
+    memcordon_core::WindowsLoaderQualificationOutcomeV2,
+)> {
+    let package_state = windows_provider_state_root().join("package");
+    let outcome_bytes = fs::read(package_state.join("production-loader-result-v2.json"))?;
+    let outcome: memcordon_core::WindowsLoaderQualificationOutcomeV2 =
+        serde_json::from_slice(&outcome_bytes)?;
+    if !outcome.is_consistent() {
+        return Err(CiError::Message(
+            "Windows production loader outcome artifact is inconsistent".to_owned(),
+        ));
+    }
+    fs::write(reports.join("production-result.json"), &outcome_bytes)?;
+    let mut artifacts = vec![
+        memcordon_windows_launch_core::ArtifactRefV1::new(
+            String::from("production-result.json"),
+            hex::encode(Sha256::digest(&outcome_bytes)),
+            u64::try_from(outcome_bytes.len()).unwrap_or(u64::MAX),
+            String::from("application/json"),
+            memcordon_windows_launch_core::RedactionClassV1::RedactedSummary,
+        )
+        .map_err(|error| CiError::Message(error.to_string()))?,
+    ];
+    let plan = match loader_outcome_plan_digest(&outcome) {
+        Some(expected_digest) => {
+            let plan_bytes = fs::read(package_state.join("production-loader-plan-v1.json"))?;
+            let plan: memcordon_windows_launch_core::ProductionLoaderPlanV1 =
+                serde_json::from_slice(&plan_bytes)?;
+            if plan.launch_plan_sha256() != expected_digest {
+                return Err(CiError::Message(
+                    "Windows production loader plan and typed outcome digests differ".to_owned(),
+                ));
+            }
+            fs::write(reports.join("launch-plan.json"), &plan_bytes)?;
+            artifacts.push(
+                memcordon_windows_launch_core::ArtifactRefV1::new(
+                    String::from("launch-plan.json"),
+                    hex::encode(Sha256::digest(&plan_bytes)),
+                    u64::try_from(plan_bytes.len()).unwrap_or(u64::MAX),
+                    String::from("application/json"),
+                    memcordon_windows_launch_core::RedactionClassV1::RestrictedTrace,
+                )
+                .map_err(|error| CiError::Message(error.to_string()))?,
+            );
+            Some(plan)
+        }
+        None => None,
+    };
+    write_json(
+        &reports.join("manifest.json"),
+        &serde_json::json!({
+            "schema_version": 1,
+            "artifacts": artifacts,
+        }),
+    )?;
+    Ok((plan, outcome))
+}
+
+/// Certifies provider supervision and retirement after the independent loader
+/// gate. Package mutation/channel checks and diagnostic token/fault matrices
+/// intentionally do not run in this suite.
+pub fn provider_lifecycle(root: &Path, stable: &str) -> Result<()> {
+    require_windows()?;
+    require_native_architecture()?;
+    let production_reports = report_directory(root).join("loader-production");
+    let production_plan: memcordon_windows_launch_core::ProductionLoaderPlanV1 =
+        serde_json::from_slice(&fs::read(production_reports.join("launch-plan.json"))?)?;
+    let production_outcome: memcordon_core::WindowsLoaderQualificationOutcomeV2 =
+        serde_json::from_slice(&fs::read(
+            production_reports.join("production-result.json"),
+        )?)?;
+    let production_digest = match &production_outcome {
+        memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(ready)
+            if production_outcome.is_consistent() =>
+        {
+            &ready.launch_plan_sha256
+        }
+        _ => {
+            return Err(CiError::Message(
+                "provider lifecycle requires a successful typed production loader result"
+                    .to_owned(),
+            ));
+        }
+    };
+    if production_plan.launch_plan_sha256() != production_digest {
+        return Err(CiError::Message(
+            "provider lifecycle input plan and result digests differ".to_owned(),
+        ));
+    }
+    let native = native_channel_binaries(root, stable)?;
+    let reports = report_directory(root).join("provider-lifecycle");
+    if reports.exists() {
+        fs::remove_dir_all(&reports)?;
+    }
+    fs::create_dir_all(&reports)?;
+    let agent = native.root.join("memcordon-sealed-agent.exe");
+    let cli = native.root.join("memcordon.exe");
+
+    let install_result = CommandSpec::new(&agent, root, DEADLINE)
+        .args(["package", "install", "--ephemeral-ci"])
+        .run()
+        .map(|_| ());
+    let lifecycle_result = install_result.and_then(|()| (|| -> Result<()> {
+        let qualification_path = windows_provider_state_root()
+            .join("package")
+            .join("qualification.json");
+        let qualification: WindowsQualificationReceiptV1 =
+            serde_json::from_slice(&fs::read(&qualification_path)?)?;
+        if !qualification.qualified || !qualification.is_consistent() {
+            return Err(CiError::Message(
+                "installed provider has no consistent successful qualification".to_owned(),
+            ));
+        }
+        match &qualification.loader_qualification {
+            memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(_) => {}
+            memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(_) => {
+                return Err(CiError::Message(
+                    "provider lifecycle package install reported loader failure".to_owned(),
+                ));
+            }
+        }
+
+        let public_report_path = reports.join("normal-completion.json");
+        CommandSpec::new(&cli, root, DEADLINE)
+            .args([
+                OsString::from("--sealed"),
+                OsString::from("--report"),
+                public_report_path.as_os_str().to_os_string(),
+                OsString::from("--"),
+                agent.as_os_str().to_os_string(),
+                OsString::from("--version"),
+            ])
+            .run()?;
+        let public_report: MemcordonReport =
+            serde_json::from_slice(&fs::read(&public_report_path)?)?;
+        validate_public_launch(&public_report, &qualification)?;
+
+        let runner = StatusScenarioRunner {
+            root,
+            cli: &cli,
+            agent: &agent,
+            reports: &reports,
+            qualification: &qualification,
+        };
+        let deadline = runner.run("deadline", Some("+100ms"), "windows-certification-hold")?;
+        let descendant = runner.run("descendant", None, "windows-certification-orphan")?;
+
+        let cancellation_report = reports.join("frontend-cancellation.json");
+        with_active_attempt(root, &cli, &agent, &cancellation_report, || Ok(()))?;
+
+        write_json(
+            &reports.join("lifecycle-outcomes.json"),
+            &serde_json::json!({
+                "schema_version": 1,
+                "normal_completion": public_report.attempts.last().and_then(|attempt| attempt.outcome.clone()),
+                "deadline": deadline,
+                "descendant": descendant,
+                "frontend_cancellation_retired": true,
+                "qualification": qualification,
+            }),
+        )?;
+        Ok(())
+    })());
+    let uninstall_result = CommandSpec::new(&agent, root, DEADLINE)
+        .args(["package", "uninstall", "--ephemeral-ci"])
+        .run();
+    let absence_result = provider_state_absent(root, &agent).and_then(|absent| {
+        if absent {
+            Ok(())
+        } else {
+            Err(CiError::Message(
+                "provider lifecycle suite left provider state".to_owned(),
+            ))
+        }
+    });
+    merge_primary_and_cleanup(
+        lifecycle_result,
+        uninstall_result.map(|_| ()),
+        absence_result,
+    )
+}
+
+/// Runs the diagnostic laboratory. The controller itself distinguishes target
+/// observations from harness/cleanup failures; only the latter fail this suite.
+pub fn loader_lab(root: &Path, stable: &str) -> Result<()> {
+    require_windows()?;
+    require_native_architecture()?;
+    let native = native_channel_binaries(root, stable)?;
+    let output = report_directory(root).join("loader-lab");
+    if output.exists() {
+        fs::remove_dir_all(&output)?;
+    }
+    let gate_plan_path = report_directory(root)
+        .join("loader-production")
+        .join("launch-plan.json");
+    let gate_outcome_path = report_directory(root)
+        .join("loader-production")
+        .join("production-result.json");
+    if !gate_plan_path.is_file() || !gate_outcome_path.is_file() {
+        return Err(CiError::Message(
+            "Windows loader lab requires the typed production gate artifacts".to_owned(),
+        ));
+    }
+    let gate_plan: memcordon_windows_launch_core::ProductionLoaderPlanV1 =
+        serde_json::from_slice(&fs::read(&gate_plan_path)?)?;
+    let gate_outcome: memcordon_core::WindowsLoaderQualificationOutcomeV2 =
+        serde_json::from_slice(&fs::read(&gate_outcome_path)?)?;
+    let gate_digest = loader_outcome_plan_digest(&gate_outcome).ok_or_else(|| {
+        CiError::Message("Windows loader lab production gate outcome is inconsistent".to_owned())
+    })?;
+    if gate_plan.launch_plan_sha256() != gate_digest {
+        return Err(CiError::Message(
+            "Windows loader lab production gate artifacts are not mutually bound".to_owned(),
+        ));
+    }
+    let agent = native.root.join("memcordon-sealed-agent.exe");
+    let local_state = windows_provider_state_root().join("package");
+    for stale in [
+        local_state.join("production-loader-plan-v1.json"),
+        local_state.join("production-loader-result-v2.json"),
+    ] {
+        if stale.exists() {
+            fs::remove_file(stale)?;
+        }
+    }
+    let local_install = CommandSpec::new(&agent, root, DEADLINE)
+        .args(["package", "install", "--ephemeral-ci"])
+        .output();
+    let lab_result = (|| -> Result<()> {
+        let install_output = local_install?;
+        let local_plan_bytes = fs::read(local_state.join("production-loader-plan-v1.json"))?;
+        let local_outcome: memcordon_core::WindowsLoaderQualificationOutcomeV2 =
+            serde_json::from_slice(&fs::read(
+                local_state.join("production-loader-result-v2.json"),
+            )?)?;
+        let local_plan: memcordon_windows_launch_core::ProductionLoaderPlanV1 =
+            serde_json::from_slice(&local_plan_bytes)?;
+        if loader_outcome_plan_digest(&local_outcome) != Some(local_plan.launch_plan_sha256()) {
+            return Err(CiError::Message(
+                "Windows loader lab local production input is inconsistent".to_owned(),
+            ));
+        }
+        if install_output.status.success()
+            != matches!(
+                local_outcome,
+                memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(_)
+            )
+        {
+            return Err(CiError::Message(
+                "Windows loader lab local install status contradicts its typed outcome".to_owned(),
+            ));
+        }
+        let production_plan = report_directory(root).join("loader-lab-input-plan.json");
+        fs::write(&production_plan, local_plan_bytes)?;
+        let local_bootstrap = path_from_windows_units(local_plan.executable_path_utf16())?;
+        rustup_cargo(
+            root,
+            stable,
+            [
+                OsString::from("build"),
+                OsString::from("--locked"),
+                OsString::from("--package"),
+                OsString::from("memcordon-windows-loader-lab"),
+                OsString::from("--bins"),
+                OsString::from("--target-dir"),
+                OsString::from("target/ci/windows-loader-lab"),
+            ],
+            DEADLINE,
+        )
+        .run()?;
+        rustup_cargo(
+            root,
+            stable,
+            [
+                OsString::from("run"),
+                OsString::from("--locked"),
+                OsString::from("--package"),
+                OsString::from("memcordon-windows-loader-lab"),
+                OsString::from("--bin"),
+                OsString::from("memcordon-windows-loader-lab"),
+                OsString::from("--target-dir"),
+                OsString::from("target/ci/windows-loader-lab"),
+                OsString::from("--"),
+                OsString::from("run"),
+                OsString::from("--output"),
+                output.into_os_string(),
+                OsString::from("--production-plan"),
+                production_plan.into_os_string(),
+                OsString::from("--bootstrap"),
+                local_bootstrap.into_os_string(),
+            ],
+            DEADLINE,
+        )
+        .run()
+        .map(|_| ())
+    })();
+    let uninstall_result = CommandSpec::new(&agent, root, DEADLINE)
+        .args(["package", "uninstall", "--ephemeral-ci"])
+        .run();
+    let absence_result = provider_state_absent(root, &agent).and_then(|absent| {
+        if absent {
+            Ok(())
+        } else {
+            Err(CiError::Message(
+                "Windows loader lab left provider state".to_owned(),
+            ))
+        }
+    });
+    merge_primary_and_cleanup(lab_result, uninstall_result.map(|_| ()), absence_result)
+}
+
+fn loader_outcome_plan_digest(
+    outcome: &memcordon_core::WindowsLoaderQualificationOutcomeV2,
+) -> Option<&str> {
+    if !outcome.is_consistent() {
+        return None;
+    }
+    match outcome {
+        memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(ready) => {
+            Some(&ready.launch_plan_sha256)
+        }
+        memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(failure) => {
+            failure.launch_plan_sha256.as_ref()
+        }
+    }
+    .map(String::as_str)
+}
+
+fn merge_primary_and_cleanup<T>(
+    primary: Result<T>,
+    uninstall: Result<()>,
+    absence: Result<()>,
+) -> Result<T> {
+    let cleanup = uninstall.and(absence);
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(CiError::Message(format!(
+            "{primary}; secondary cleanup failure: {cleanup}"
+        ))),
+    }
+}
+
+#[cfg(windows)]
+fn path_from_windows_units(units: &[u16]) -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    if units.is_empty() || units.contains(&0) {
+        return Err(CiError::Message(
+            "production plan executable path is empty or contains NUL".to_owned(),
+        ));
+    }
+    Ok(PathBuf::from(OsString::from_wide(units)))
+}
+
+#[cfg(not(windows))]
+fn path_from_windows_units(_units: &[u16]) -> Result<PathBuf> {
+    Err(CiError::Message(
+        "Windows production plan paths are unavailable on this platform".to_owned(),
+    ))
 }
 
 pub fn certify(root: &Path, stable: &str) -> Result<()> {
@@ -270,24 +757,31 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
         .run()?;
 
     let active_report = reports.join("active-attempt.json");
-    let mut active = spawn_hold(root, &cli, &agent, &active_report)?;
-    wait_for_active_attempt(root, &agent)?;
-    let upgrade_refused = command_failed_with(
-        &CommandSpec::new(&agent, root, DEADLINE).args(["package", "upgrade", "--ephemeral-ci"]),
-        "MCSEALED-WINDOWS-UPGRADE-ACTIVE",
-    )?;
-    let uninstall_refused = command_failed_with(
-        &CommandSpec::new(&agent, root, DEADLINE).args(["package", "uninstall", "--ephemeral-ci"]),
-        "MCSEALED-WINDOWS-UNINSTALL-ACTIVE",
-    )?;
+    let (upgrade_refused, uninstall_refused) =
+        with_active_attempt(root, &cli, &agent, &active_report, || {
+            let upgrade_refused = command_failed_with(
+                &CommandSpec::new(&agent, root, DEADLINE).args([
+                    "package",
+                    "upgrade",
+                    "--ephemeral-ci",
+                ]),
+                "MCSEALED-WINDOWS-UPGRADE-ACTIVE",
+            )?;
+            let uninstall_refused = command_failed_with(
+                &CommandSpec::new(&agent, root, DEADLINE).args([
+                    "package",
+                    "uninstall",
+                    "--ephemeral-ci",
+                ]),
+                "MCSEALED-WINDOWS-UNINSTALL-ACTIVE",
+            )?;
+            Ok((upgrade_refused, uninstall_refused))
+        })?;
     if !upgrade_refused || !uninstall_refused {
-        terminate_child(&mut active);
         return Err(CiError::Message(
             "Windows package mutation did not refuse an active attempt".to_owned(),
         ));
     }
-    terminate_child(&mut active);
-    wait_for_attempts_empty(root, &agent)?;
 
     let public_report_path = reports.join("public-launch.json");
     let arguments = vec![
@@ -1019,6 +1513,7 @@ impl StatusScenarioRunner<'_> {
 pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
     require_windows()?;
     require_native_architecture()?;
+    let native = native_channel_binaries(root, stable)?;
     let channel = root.join("target").join("ci").join("windows-sealed-cargo");
     fs::create_dir_all(&channel)?;
     let install_root = channel.join("install");
@@ -1034,26 +1529,26 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
     let packages = [
         "memcordon-core".to_owned(),
         "memcordon-platform".to_owned(),
+        "memcordon-windows-launch-core".to_owned(),
         "memcordon".to_owned(),
     ];
     create_package_archives(root, stable, &packages)?;
     let core = sources.join("memcordon-core");
     let platform = sources.join("memcordon-platform");
+    let launch_core = sources.join("memcordon-windows-launch-core");
     let cli_source = sources.join("memcordon");
     for (package, destination) in [
         ("memcordon-core", &core),
         ("memcordon-platform", &platform),
+        ("memcordon-windows-launch-core", &launch_core),
         ("memcordon", &cli_source),
     ] {
         extract_crate_source(
-            &root
-                .join("target")
-                .join("package")
-                .join(format!("{package}-{version}.crate")),
+            &package_archive_directory(root).join(format!("{package}-{version}.crate")),
             destination,
         )?;
     }
-    write_packaged_source_configuration(&sources, &core, &platform)?;
+    write_packaged_source_configuration(&sources, &core, &platform, &launch_core)?;
     rustup_cargo(
         &sources,
         stable,
@@ -1081,8 +1576,32 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
             .join("bin")
             .join("memcordon-session-broker.exe"),
     )?;
+    let native_evidence = channel.join("native");
+    fs::create_dir_all(&native_evidence)?;
+    let native_agent = native.root.join("memcordon-sealed-agent.exe");
+    let rollback_verified = certify_rollback_with_cleanup(root, &native_agent)?;
+    write_json(
+        &native_evidence.join("rollback.json"),
+        &serde_json::json!({
+            "schema_version": 1,
+            "fresh_install_rollback_verified": rollback_verified,
+        }),
+    )?;
+    let native_fingerprint = channel_smoke(
+        root,
+        &native_agent,
+        &native.root.join("memcordon.exe"),
+        &native_evidence,
+    )?;
+    let cargo_rollback_verified = certify_rollback_with_cleanup(root, &agent)?;
+    write_json(
+        &channel.join("rollback.json"),
+        &serde_json::json!({
+            "schema_version": 1,
+            "fresh_install_rollback_verified": cargo_rollback_verified,
+        }),
+    )?;
     let cargo_fingerprint = channel_smoke(root, &agent, &cli, &channel)?;
-    let native_fingerprint = fingerprint_from_reports(&report_directory(root))?;
     if cargo_fingerprint != native_fingerprint {
         return Err(CiError::Message(format!(
             "Cargo/native Windows sealed channel identity differs: cargo={cargo_fingerprint:?} native={native_fingerprint:?}"
@@ -1092,10 +1611,111 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
     write_json(
         &channel.join("native-fingerprint.json"),
         &native_fingerprint,
+    )?;
+    write_split_windows_release_certification(root, &channel, &native)
+}
+
+fn certify_rollback_with_cleanup(root: &Path, agent: &Path) -> Result<bool> {
+    let primary = certify_fresh_install_rollback(root, agent);
+    let uninstall = CommandSpec::new(agent, root, DEADLINE)
+        .args(["package", "uninstall", "--ephemeral-ci"])
+        .run()
+        .map(|_| ());
+    let absence = provider_state_absent(root, agent).and_then(|absent| {
+        if absent {
+            Ok(())
+        } else {
+            Err(CiError::Message(
+                "rollback certification left provider state".to_owned(),
+            ))
+        }
+    });
+    merge_primary_and_cleanup(primary, uninstall, absence)
+}
+
+fn write_split_windows_release_certification(
+    root: &Path,
+    channel: &Path,
+    native: &NativeChannel,
+) -> Result<()> {
+    let reports = report_directory(root);
+    let production = reports.join("loader-production");
+    let lifecycle = reports.join("provider-lifecycle");
+    let evidence = channel.join("release-evidence");
+    if evidence.exists() {
+        fs::remove_dir_all(&evidence)?;
+    }
+    fs::create_dir_all(&evidence)?;
+    let required = [
+        (
+            "production-result.json",
+            production.join("production-result.json"),
+        ),
+        ("production-manifest.json", production.join("manifest.json")),
+        (
+            "lifecycle-outcomes.json",
+            lifecycle.join("lifecycle-outcomes.json"),
+        ),
+        (
+            "package-lifecycle.json",
+            channel.join("package-lifecycle.json"),
+        ),
+        ("cargo-rollback.json", channel.join("rollback.json")),
+        (
+            "native-rollback.json",
+            channel.join("native").join("rollback.json"),
+        ),
+        (
+            "cargo-fingerprint.json",
+            channel.join("cargo-fingerprint.json"),
+        ),
+        (
+            "native-fingerprint.json",
+            channel.join("native-fingerprint.json"),
+        ),
+    ];
+    let mut bindings = serde_json::Map::new();
+    for (name, path) in required {
+        let destination = evidence.join(name);
+        fs::copy(&path, &destination)?;
+        bindings.insert(name.to_owned(), Value::String(sha256_file(&destination)?));
+    }
+    let plan = production.join("launch-plan.json");
+    if plan.is_file() {
+        let destination = evidence.join("launch-plan.json");
+        fs::copy(&plan, &destination)?;
+        bindings.insert(
+            "launch-plan.json".to_owned(),
+            Value::String(sha256_file(&destination)?),
+        );
+    }
+    let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
+        .map_err(|error| CiError::Message(format!("git commit identity was not UTF-8: {error}")))?;
+    write_json(
+        &channel.join("windows-release-certification.json"),
+        &serde_json::json!({
+            "schema_version": 1,
+            "backend": "windows-job-object-v2",
+            "certified": true,
+            "commit": commit.trim_end_matches(['\r', '\n']),
+            "runner_class": "ephemeral-certified",
+            "runner_provider": "github-hosted",
+            "runner_label": runner_label(),
+            "architecture": std::env::consts::ARCH,
+            "native_archive_sha256": native.archive_sha256,
+            "runtime_manifest_sha256": native.runtime_manifest_sha256,
+            "native_target": native.target,
+            "evidence_bindings": bindings,
+        }),
     )
 }
 
-fn write_packaged_source_configuration(sources: &Path, core: &Path, platform: &Path) -> Result<()> {
+fn write_packaged_source_configuration(
+    sources: &Path,
+    core: &Path,
+    platform: &Path,
+    launch_core: &Path,
+) -> Result<()> {
     let cargo_configuration = sources.join(".cargo");
     fs::create_dir_all(&cargo_configuration)?;
     let mut core_specification = toml::Table::new();
@@ -1108,6 +1728,11 @@ fn write_packaged_source_configuration(sources: &Path, core: &Path, platform: &P
         "path".to_owned(),
         toml::Value::String(platform.to_string_lossy().into_owned()),
     );
+    let mut launch_core_specification = toml::Table::new();
+    launch_core_specification.insert(
+        "path".to_owned(),
+        toml::Value::String(launch_core.to_string_lossy().into_owned()),
+    );
     let mut crates_io = toml::Table::new();
     crates_io.insert(
         "memcordon-core".to_owned(),
@@ -1116,6 +1741,10 @@ fn write_packaged_source_configuration(sources: &Path, core: &Path, platform: &P
     crates_io.insert(
         "memcordon-platform".to_owned(),
         toml::Value::Table(platform_specification),
+    );
+    crates_io.insert(
+        "memcordon-windows-launch-core".to_owned(),
+        toml::Value::Table(launch_core_specification),
     );
     let mut patch_table = toml::Table::new();
     patch_table.insert("crates-io".to_owned(), toml::Value::Table(crates_io));
@@ -1168,7 +1797,7 @@ fn native_channel_binaries(root: &Path, stable: &str) -> Result<NativeChannel> {
                 .join("target")
                 .join("ci")
                 .join("windows-sealed")
-                .join("debug"),
+                .join("release"),
             archive_sha256: None,
             runtime_manifest_sha256: None,
             target: None,
@@ -1336,11 +1965,66 @@ fn channel_smoke(
 ) -> Result<ChannelFingerprint> {
     let package =
         run_json(&CommandSpec::new(agent, root, DEADLINE).args(["package", "inspect", "--json"]))?;
-    CommandSpec::new(agent, root, DEADLINE)
+    let install_result = CommandSpec::new(agent, root, DEADLINE)
         .args(["package", "install", "--ephemeral-ci"])
-        .run()?;
-    let qualification_value = run_json(&CommandSpec::new(agent, root, DEADLINE).arg("qualify"))?;
-    let qualification: WindowsQualificationReceiptV1 = serde_json::from_value(qualification_value)?;
+        .run()
+        .map(|_| ());
+    let primary =
+        install_result.and_then(|()| channel_smoke_installed(root, agent, cli, channel, package));
+    let uninstall = CommandSpec::new(agent, root, DEADLINE)
+        .args(["package", "uninstall", "--ephemeral-ci"])
+        .run()
+        .map(|_| ());
+    let absence = provider_state_absent(root, agent).and_then(|absent| {
+        if absent {
+            Ok(())
+        } else {
+            Err(CiError::Message(
+                "Cargo-installed Windows provider left persistent state".to_owned(),
+            ))
+        }
+    });
+    merge_primary_and_cleanup(primary, uninstall, absence)
+}
+
+fn channel_smoke_installed(
+    root: &Path,
+    agent: &Path,
+    cli: &Path,
+    channel: &Path,
+    package: Value,
+) -> Result<ChannelFingerprint> {
+    let qualification: WindowsQualificationReceiptV1 = serde_json::from_slice(&fs::read(
+        windows_provider_state_root()
+            .join("package")
+            .join("qualification.json"),
+    )?)?;
+    let launch_plan: memcordon_windows_launch_core::ProductionLoaderPlanV1 =
+        serde_json::from_slice(&fs::read(
+            windows_provider_state_root()
+                .join("package")
+                .join("production-loader-plan-v1.json"),
+        )?)?;
+    let installed =
+        run_json(&CommandSpec::new(agent, root, DEADLINE).args(["package", "verify", "--json"]))?;
+    if installed
+        .get("qualification_complete")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || installed
+            .get("installed_artifacts_valid")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || installed
+            .get("installed_executable_sha256")
+            .and_then(Value::as_str)
+            != package.get("executable_sha256").and_then(Value::as_str)
+    {
+        return Err(CiError::Message(
+            "channel package verification did not retain qualification, ACLs, and exact artifact digest"
+                .to_owned(),
+        ));
+    }
     let report_path = channel.join("cargo-public-launch.json");
     CommandSpec::new(cli, root, DEADLINE)
         .args([
@@ -1354,38 +2038,57 @@ fn channel_smoke(
         .run()?;
     let report: MemcordonReport = serde_json::from_slice(&fs::read(&report_path)?)?;
     validate_public_launch(&report, &qualification)?;
-    let fingerprint = channel_fingerprint(package, &qualification, &report)?;
-    CommandSpec::new(agent, root, DEADLINE)
-        .args(["package", "uninstall", "--ephemeral-ci"])
-        .run()?;
-    if !provider_state_absent(root, agent)? {
+    let fingerprint = channel_fingerprint(package, &qualification, &launch_plan, &report)?;
+    let active_report = channel.join("active-package-mutation.json");
+    let (upgrade_refused, uninstall_refused) =
+        with_active_attempt(root, cli, agent, &active_report, || {
+            let upgrade_refused = command_failed_with(
+                &CommandSpec::new(agent, root, DEADLINE).args([
+                    "package",
+                    "upgrade",
+                    "--ephemeral-ci",
+                ]),
+                "MCSEALED-WINDOWS-UPGRADE-ACTIVE",
+            )?;
+            let uninstall_refused = command_failed_with(
+                &CommandSpec::new(agent, root, DEADLINE).args([
+                    "package",
+                    "uninstall",
+                    "--ephemeral-ci",
+                ]),
+                "MCSEALED-WINDOWS-UNINSTALL-ACTIVE",
+            )?;
+            Ok((upgrade_refused, uninstall_refused))
+        })?;
+    if !upgrade_refused || !uninstall_refused {
         return Err(CiError::Message(
-            "Cargo-installed Windows provider left persistent state".to_owned(),
+            "package mutation did not fail closed while an attempt was active".to_owned(),
         ));
     }
-    Ok(fingerprint)
-}
-
-fn fingerprint_from_reports(reports: &Path) -> Result<ChannelFingerprint> {
-    let package: Value =
-        serde_json::from_slice(&fs::read(reports.join("windows-package-inspection.json"))?)?;
-    let qualification: WindowsQualificationReceiptV1 =
-        serde_json::from_slice(&fs::read(reports.join("windows-qualification.json"))?)?;
-    let cleanup: Value = serde_json::from_slice(&fs::read(reports.join("windows-cleanup.json"))?)?;
-    let report: MemcordonReport = serde_json::from_value(
-        cleanup
-            .pointer("/runtime/public_launch")
-            .cloned()
-            .ok_or_else(|| {
-                CiError::Message("native channel launch evidence is missing".to_owned())
-            })?,
+    seed_retired_certification_workspace(root, agent)?;
+    CommandSpec::new(agent, root, DEADLINE)
+        .args(["package", "upgrade", "--ephemeral-ci"])
+        .run()?;
+    write_json(
+        &channel.join("package-lifecycle.json"),
+        &serde_json::json!({
+            "schema_version": 1,
+            "installed_verification": installed,
+            "package_acl_and_artifact_digest_verified": true,
+            "active_upgrade_refused": upgrade_refused,
+            "active_uninstall_refused": uninstall_refused,
+            "stale_workspace_recovered": true,
+            "upgrade_complete": true,
+            "uninstall_complete": true,
+        }),
     )?;
-    channel_fingerprint(package, &qualification, &report)
+    Ok(fingerprint)
 }
 
 fn channel_fingerprint(
     mut package: Value,
     qualification: &WindowsQualificationReceiptV1,
+    launch_plan: &memcordon_windows_launch_core::ProductionLoaderPlanV1,
     report: &MemcordonReport,
 ) -> Result<ChannelFingerprint> {
     validate_public_launch(report, qualification)?;
@@ -1406,7 +2109,8 @@ fn channel_fingerprint(
         package_identity: package,
         qualification_schema: qualification.schema_version,
         provider_identity: qualification.provider_identity.clone(),
-        qualification_receipt_digest: qualification_receipt_digest(qualification)?,
+        qualification_contract_sha256: qualification_contract_sha256(qualification)?,
+        launch_plan_template_sha256: launch_plan.template_sha256(),
         provider_protocol_schema: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
         execution_report_schema: memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
         boundary_evidence_schema: native.schema_version,
@@ -1436,10 +2140,61 @@ fn build(root: &Path, stable: &str) -> Result<()> {
             "--package",
             "memcordon",
             "--bins",
+            "--release",
         ],
         DEADLINE,
     )
     .run()?;
+    Ok(())
+}
+
+fn verify_production_windows_binary(path: &Path) -> Result<()> {
+    let bytes = fs::read(path)?;
+    let contract = memcordon_core::parse_windows_pe_loader_contract(&bytes).map_err(|error| {
+        CiError::Message(format!(
+            "production Windows PE imports are invalid for {}: {error}",
+            path.display()
+        ))
+    })?;
+    let forbidden = [
+        "DebugActiveProcess",
+        "DebugSetProcessKillOnExit",
+        "WaitForDebugEvent",
+        "WaitForDebugEventEx",
+        "ContinueDebugEvent",
+        "StartTraceW",
+        "EnableTraceEx2",
+        "ControlTraceW",
+    ];
+    for descriptor in contract.normal.iter().chain(&contract.delayed) {
+        for symbol in &descriptor.symbols {
+            let memcordon_core::WindowsPeImportSymbol::Name { name, .. } = symbol else {
+                continue;
+            };
+            if forbidden.contains(&name.as_str()) {
+                return Err(CiError::Message(format!(
+                    "production Windows binary {} imports diagnostic-only symbol {name}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    for reference in [
+        b"loader-snaps".as_slice(),
+        b"broker-passive-trace".as_slice(),
+        b"trace-session".as_slice(),
+    ] {
+        if bytes
+            .windows(reference.len())
+            .any(|candidate| candidate == reference)
+        {
+            return Err(CiError::Message(format!(
+                "production Windows binary {} retains diagnostic-only configuration reference {}",
+                path.display(),
+                String::from_utf8_lossy(reference)
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1495,18 +2250,46 @@ fn spawn_hold(root: &Path, cli: &Path, agent: &Path, report: &Path) -> Result<Ch
     command.spawn().map_err(Into::into)
 }
 
-fn terminate_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn with_active_attempt<T>(
+    root: &Path,
+    cli: &Path,
+    agent: &Path,
+    report: &Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let mut child = spawn_hold(root, cli, agent, report)?;
+    let primary = wait_for_active_attempt(root, agent).and_then(|()| operation());
+    let termination = terminate_child(&mut child);
+    let retirement = wait_for_attempts_empty(root, agent);
+    merge_primary_and_cleanup(primary, termination, retirement)
+}
+
+fn terminate_child(child: &mut Child) -> Result<()> {
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => child.kill()?,
+        Err(poll) => {
+            let kill = child.kill();
+            let wait = child.wait();
+            return Err(CiError::Message(format!(
+                "poll active attempt child: {poll}; kill={kill:?}; wait={wait:?}"
+            )));
+        }
+    }
+    let _status = child.wait()?;
+    Ok(())
 }
 
 fn attempts_root() -> PathBuf {
+    windows_provider_state_root().join("attempts")
+}
+
+fn windows_provider_state_root() -> PathBuf {
     std::env::var_os("ProgramData")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
         .join("MemCordon")
         .join("sealed")
-        .join("attempts")
 }
 
 fn attempts_empty(root: &Path, agent: &Path) -> Result<bool> {
@@ -1564,6 +2347,24 @@ fn wait_for_attempt_state(
 fn qualification_receipt_digest(qualification: &WindowsQualificationReceiptV1) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(
         qualification,
+    )?)))
+}
+
+fn qualification_contract_sha256(qualification: &WindowsQualificationReceiptV1) -> Result<String> {
+    let mut normalized = qualification.clone();
+    match &mut normalized.loader_qualification {
+        memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(ready) => {
+            ready.launch_plan_sha256 = "0".repeat(Sha256::output_size() * 2);
+            ready.elapsed_millis = 0;
+        }
+        memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(_) => {
+            return Err(CiError::Message(
+                "channel fingerprint requires a successful loader qualification".to_owned(),
+            ));
+        }
+    }
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
+        &normalized,
     )?)))
 }
 

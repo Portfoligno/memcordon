@@ -70,21 +70,6 @@ mod windows_guardian_startup;
 #[path = "sealed_agent/windows_handle_provenance.rs"]
 mod windows_handle_provenance;
 #[cfg(target_os = "windows")]
-#[path = "sealed_agent/windows_loader_diagnostics.rs"]
-mod windows_loader_diagnostics;
-#[cfg(target_os = "windows")]
-#[path = "sealed_agent/windows_loader_environment.rs"]
-mod windows_loader_environment;
-#[cfg(target_os = "windows")]
-#[path = "sealed_agent/windows_loader_object_security.rs"]
-mod windows_loader_object_security;
-#[cfg(target_os = "windows")]
-#[path = "sealed_agent/windows_loader_prerequisite.rs"]
-mod windows_loader_prerequisite;
-#[cfg(target_os = "windows")]
-#[path = "sealed_agent/windows_loader_profile.rs"]
-mod windows_loader_profile;
-#[cfg(target_os = "windows")]
 #[path = "sealed_agent/windows_postauthorization_retirement.rs"]
 mod windows_postauthorization_retirement;
 #[cfg(target_os = "windows")]

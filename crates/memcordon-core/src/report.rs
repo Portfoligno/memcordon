@@ -244,7 +244,8 @@ fn validate_attempt_history(
         } => {
             *attempt_number == total
                 && last.is_some_and(|record| {
-                    record.number == *attempt_number && record.error.as_ref() == Some(error)
+                    record.number == *attempt_number
+                        && record.error.as_ref() == Some(error.as_ref())
                 })
         }
         SupervisionTerminal::Error {

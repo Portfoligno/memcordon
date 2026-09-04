@@ -1,14 +1,13 @@
-pub(crate) mod access_trace;
 pub mod control_service;
 pub mod guardian;
 pub mod guardian_service;
 pub mod job;
 pub mod launcher_service;
 pub(crate) mod loader_access;
-pub(crate) mod loader_debug;
 pub mod package;
 pub mod pipe;
 pub mod process;
+mod process_impl;
 pub mod qualification;
 pub mod record;
 pub mod security;
@@ -24,10 +23,6 @@ pub fn control() -> Result<(), String> {
 
 pub fn launcher() -> Result<(), String> {
     launcher_service::run()
-}
-
-pub fn session_broker() -> Result<(), String> {
-    session_broker::run()
 }
 
 pub fn guardian_service(slot: &std::ffi::OsString) -> Result<(), String> {

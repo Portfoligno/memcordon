@@ -354,6 +354,13 @@ fn windows_qualification() -> WindowsQualificationReceiptV1 {
         active_processes_zero_verified: true,
         relays_retired_verified: true,
         recovery_complete: true,
+        loader_qualification: memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(
+            memcordon_core::WindowsLoaderReadyEvidenceV1 {
+                schema_version: 1,
+                launch_plan_sha256: hex::encode(Sha256::digest(b"production-plan")),
+                elapsed_millis: 1,
+            },
+        ),
         qualified: true,
     };
     assert!(receipt.qualified && receipt.is_consistent());
@@ -860,6 +867,57 @@ fn write_report(path: &Path, value: &Value) {
 }
 
 fn write_windows_artifact(input: &Path, id: &str, architecture: &str, runner_label: &str) {
+    let directory = input.join(format!("release-windows-package-channel-{id}"));
+    let evidence = directory.join("release-evidence");
+    fs::create_dir_all(&evidence).expect("split Windows evidence directory should exist");
+    let names = [
+        "production-result.json",
+        "production-manifest.json",
+        "lifecycle-outcomes.json",
+        "package-lifecycle.json",
+        "cargo-rollback.json",
+        "native-rollback.json",
+        "cargo-fingerprint.json",
+        "native-fingerprint.json",
+        "launch-plan.json",
+    ];
+    let mut bindings = serde_json::Map::new();
+    for name in names {
+        let path = evidence.join(name);
+        write_report(&path, &json!({"schema_version": 1, "name": name}));
+        let bytes = fs::read(&path).expect("split Windows evidence should read");
+        bindings.insert(
+            name.to_owned(),
+            Value::String(hex::encode(Sha256::digest(bytes))),
+        );
+    }
+    let native_target = match architecture {
+        "x86_64" => "x86_64-pc-windows-msvc",
+        "aarch64" => "aarch64-pc-windows-msvc",
+        _ => panic!("unsupported Windows fixture architecture"),
+    };
+    write_report(
+        &directory.join("windows-release-certification.json"),
+        &json!({
+            "schema_version": 1,
+            "backend": "windows-job-object-v2",
+            "certified": true,
+            "commit": COMMIT,
+            "runner_class": "ephemeral-certified",
+            "runner_provider": "github-hosted",
+            "runner_label": runner_label,
+            "architecture": architecture,
+            "native_archive_sha256": "91".repeat(32),
+            "runtime_manifest_sha256": "92".repeat(32),
+            "native_target": native_target,
+            "evidence_bindings": bindings,
+        }),
+    );
+    write_legacy_windows_artifact(input, id, architecture, runner_label);
+}
+
+#[allow(dead_code)]
+fn write_legacy_windows_artifact(input: &Path, id: &str, architecture: &str, runner_label: &str) {
     let directory = input.join(format!("release-certification-windows-{id}"));
     let qualification = windows_qualification();
     let qualification_value =
@@ -1373,7 +1431,7 @@ fn valid_reports_are_copied_and_digest_bound() {
     let records = collect_certification(&input, &output, COMMIT)
         .expect("valid certification reports should collect");
 
-    assert_eq!(records.len(), 32);
+    assert_eq!(records.len(), 12);
     for (backend, report_name) in [
         ("linux-pid-namespace-cgroup-v2", "cleanup-leak-check.json"),
         ("macos-watchdog", "backend-macos-watchdog.json"),
@@ -1391,7 +1449,9 @@ fn valid_reports_are_copied_and_digest_bound() {
         let record = records.get(key).expect("Windows record should exist");
         assert_eq!(
             record.evidence_path,
-            format!("certification/windows-sealed-v2/{architecture}-windows-cleanup.json")
+            format!(
+                "certification/windows-sealed-v2/{architecture}-windows-release-certification.json"
+            )
         );
     }
     for name in [

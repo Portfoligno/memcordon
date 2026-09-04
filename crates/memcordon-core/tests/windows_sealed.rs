@@ -5,15 +5,15 @@ use memcordon_core::{
     WINDOWS_QUALIFICATION_SCHEMA_VERSION, WindowsAttemptRetainedV1, WindowsAttemptStateV1,
     WindowsAttemptTerminalDispositionV1, WindowsCleanupProcessCreationEvidenceV1,
     WindowsDurableAttemptRecordV1, WindowsDurableCleanupStateV1, WindowsEnvironmentEntryV1,
-    WindowsLauncherResponseV1, WindowsProcessIdentityV1, WindowsProviderRequestV1,
-    WindowsPublicFrameFailureV1, WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1,
-    WindowsQualificationReceiptV1, WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsRemoteStreamV1,
-    WindowsReplayOutboxStageV1, WindowsReplayPendingV1, WindowsSealedEvidenceV2,
-    WindowsServiceSelfAttestationV1, WindowsStreamRoleV1, WindowsTerminalReceiptV1,
-    WindowsTerminalReplayDecisionV1, WindowsTerminalRetiredV1, WindowsTerminalizationCheckpointV1,
-    WindowsTerminalizationOwnerV1, WindowsTerminalizationStatusV1, decode_windows_command_line,
-    encode_windows_command_line, encode_windows_environment_block,
-    parse_and_authenticate_windows_attempt_record,
+    WindowsLaunchBrokerRequestV1, WindowsLauncherResponseV1, WindowsProcessIdentityV1,
+    WindowsProviderRequestV1, WindowsPublicFrameFailureV1, WindowsPublicFramePhaseV1,
+    WindowsPublicTerminalRecoveryV1, WindowsQualificationReceiptV1, WindowsRelayEventV1,
+    WindowsRelayPhaseV1, WindowsRemoteStreamV1, WindowsReplayOutboxStageV1, WindowsReplayPendingV1,
+    WindowsSealedEvidenceV2, WindowsServiceSelfAttestationV1, WindowsStreamRoleV1,
+    WindowsTerminalReceiptV1, WindowsTerminalReplayDecisionV1, WindowsTerminalRetiredV1,
+    WindowsTerminalizationCheckpointV1, WindowsTerminalizationOwnerV1,
+    WindowsTerminalizationStatusV1, decode_windows_command_line, encode_windows_command_line,
+    encode_windows_environment_block, parse_and_authenticate_windows_attempt_record,
     parse_windows_certification_frontend_handle_values, validate_windows_security_descriptor_text,
     validate_windows_stream_manifest, windows_attempt_transition_allowed,
     windows_certification_argument_prelude_len,
@@ -83,6 +83,13 @@ fn qualification() -> WindowsQualificationReceiptV1 {
         active_processes_zero_verified: true,
         relays_retired_verified: true,
         recovery_complete: true,
+        loader_qualification: memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(
+            memcordon_core::WindowsLoaderReadyEvidenceV1 {
+                schema_version: 1,
+                launch_plan_sha256: sha256(b"production-plan"),
+                elapsed_millis: 1,
+            },
+        ),
         qualified: true,
     }
 }
@@ -422,6 +429,16 @@ fn windows_protocol_rejects_unknown_fields() {
         "unexpected": true
     });
     assert!(serde_json::from_value::<WindowsProviderRequestV1>(value).is_err());
+}
+
+#[test]
+fn windows_launch_broker_protocol_rejects_restricted_diagnostic_token_relay() {
+    let error = serde_json::from_value::<WindowsLaunchBrokerRequestV1>(serde_json::json!({
+        "loader_restriction_canary": null
+    }))
+    .unwrap_err();
+    assert!(error.to_string().contains("loader_restriction_canary"));
+    assert!(error.to_string().contains("unknown field"));
 }
 
 #[test]
@@ -769,6 +786,7 @@ fn windows_nonspawn_provider_rejection_has_consistent_public_provenance() {
         phase: BoundarySetupPhase::BoundaryCreation,
         detail: "certification rejection".to_owned(),
         os_code: Some(5),
+        loader_qualification: None,
         target_created: false,
         target_released: false,
         cleanup_attempted: false,
@@ -806,6 +824,7 @@ fn windows_posttarget_rejection_retains_truthful_terminal_receipt() {
         detail: "producer_phase=StartObserved attempted_phase=SpawnEntered operation=state-publish-rename"
             .to_owned(),
         os_code: Some(5),
+        loader_qualification: None,
         target_created: true,
         target_released: true,
         cleanup_attempted: true,
@@ -817,6 +836,17 @@ fn windows_posttarget_rejection_retains_truthful_terminal_receipt() {
     let round_trip: ProviderRejectionEvidence =
         serde_json::from_slice(&serde_json::to_vec(&rejection).unwrap()).unwrap();
     assert_eq!(round_trip.terminal_receipt.as_deref(), Some(&terminal));
+
+    let mut malformed_loader_evidence = rejection.clone();
+    malformed_loader_evidence.loader_qualification =
+        Some(memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(
+            memcordon_core::WindowsLoaderReadyEvidenceV1 {
+                schema_version: 1,
+                launch_plan_sha256: String::from("not-a-sha256"),
+                elapsed_millis: 1,
+            },
+        ));
+    assert!(!malformed_loader_evidence.is_consistent());
 
     let mut contradictory = rejection;
     contradictory.target_released = false;
@@ -831,6 +861,7 @@ fn windows_preauthorization_abort_can_require_ack_without_target_receipt() {
         phase: BoundarySetupPhase::TargetCreation,
         detail: "target creation failed after stream publication".to_owned(),
         os_code: Some(5),
+        loader_qualification: None,
         target_created: false,
         target_released: false,
         cleanup_attempted: true,
@@ -1029,6 +1060,7 @@ fn complete_windows_certification_terminal() -> WindowsTerminalReceiptV1 {
             relays_retired: true,
             guardian_reaped: true,
             final_job_handles_closed: true,
+            loader_qualification: None,
         }),
     }
 }

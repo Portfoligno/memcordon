@@ -99,6 +99,7 @@ fn fallback_rejection_finalizes_before_staging_bound_terminal_outbox() {
         phase: memcordon_core::BoundarySetupPhase::Retirement,
         detail: "certification rejection after fallback cleanup".to_owned(),
         os_code: None,
+        loader_qualification: None,
         target_created: true,
         target_released: true,
         cleanup_attempted: true,
@@ -176,39 +177,6 @@ fn completed_posttarget_rejection_skips_duplicate_finalization_and_stages_bound_
     );
     assert!(record.cleanup_state.final_handles_closed);
     record.validate_for_store_for_test().unwrap();
-    let rejection_cleanup_is_guarded = |source: &str| {
-        let rejection_source = source
-            .split_once("pub fn rejection_evidence(")
-            .expect("rejection evidence function must exist")
-            .1
-            .split_once("fn posttarget_rejection(")
-            .expect("posttarget rejection boundary must exist")
-            .0;
-        let lines = rejection_source.lines().map(str::trim).collect::<Vec<_>>();
-        let expected = [
-            "if cleanup_attempted",
-            "&& record.cleanup_state.active_processes_zero",
-            "&& record.cleanup_state.guardian_reaped",
-            "&& !record.cleanup_state.final_handles_closed",
-            "&& !live",
-            "{",
-            "record.complete_rejection_cleanup()?;",
-            "}",
-        ];
-        lines
-            .windows(expected.len())
-            .any(|window| window == expected.as_slice())
-    };
-    let source = include_str!("../../src/bin/memcordon-sealed-agent/windows/record.rs");
-    assert!(
-        rejection_cleanup_is_guarded(source),
-        "completed rejection cleanup must be skipped while unfinished cleanup is finalized"
-    );
-    let canonical = source.lines().collect::<Vec<_>>().join("\n");
-    assert!(rejection_cleanup_is_guarded(&canonical));
-    let crlf = canonical.replace('\n', "\r\n");
-    assert!(rejection_cleanup_is_guarded(&crlf));
-
     let restart_safety = memcordon_core::RestartSafetyProof {
         direct_child_reaped: true,
         workload_empty: Some(true),
@@ -251,6 +219,7 @@ fn completed_posttarget_rejection_skips_duplicate_finalization_and_stages_bound_
         phase: memcordon_core::BoundarySetupPhase::Retirement,
         detail: "certification rejection after completed posttarget cleanup".to_owned(),
         os_code: None,
+        loader_qualification: None,
         target_created: true,
         target_released: true,
         cleanup_attempted: true,
@@ -553,64 +522,4 @@ fn qualification_pending_diagnostic_preserves_authenticated_terminalization_snap
         &"b7".repeat(32),
         WindowsRelayPhaseV1::AwaitTerminal,
     ));
-
-    let rendered = crate::windows::qualification::render_replay_pending(&pending);
-    let ordered_labels = [
-        "attempt_id=",
-        "relay_phase=",
-        "durable_state=",
-        "terminal_disposition=",
-        "authorization_present=",
-        "resume_attempted=",
-        "target_released=",
-        "termination_requested=",
-        "active_processes_zero=",
-        "guardian_reaped=",
-        "final_handles_closed=",
-        "outbox_stage=",
-        "terminalization_owner=",
-        "terminalization_sequence=",
-        "terminalization_checkpoint=",
-        "last_error_stage=",
-        "last_error_code=",
-        "last_error_detail=",
-        "last_error_native_code=",
-        "last_error_observed_unix_millis=",
-    ];
-    let mut remainder = rendered.as_str();
-    for label in ordered_labels {
-        remainder = remainder
-            .split_once(label)
-            .unwrap_or_else(|| panic!("missing qualification diagnostic label: {label}"))
-            .1;
-    }
-    for value in [
-        attempt_id.as_str(),
-        "AwaitTerminal",
-        "Terminating",
-        "Posttarget",
-        "Failed",
-        "StartupRecovery",
-        "RetainedFailure",
-        "LaunchRelay",
-        "MCSEALED-WINDOWS-RELAY-WRITE",
-        "TargetAuthorized delivery failed",
-        "109",
-        "1725000000456",
-    ] {
-        assert!(
-            rendered.contains(value),
-            "missing diagnostic value: {value}"
-        );
-    }
-
-    let source = include_str!("../../src/bin/memcordon-sealed-agent/windows/qualification.rs");
-    let canary_start = source
-        .find("fn native_public_canary(")
-        .expect("native public canary must exist");
-    let canary_end = source[canary_start..]
-        .find("fn prepare_frontend_canaries(")
-        .map(|offset| canary_start + offset)
-        .expect("native public canary must have a stable end boundary");
-    assert!(source[canary_start..canary_end].contains("render_replay_pending(&pending)"));
 }

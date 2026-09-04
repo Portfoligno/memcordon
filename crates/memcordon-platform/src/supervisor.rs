@@ -446,7 +446,7 @@ fn supervise_with<I: InterruptionWait>(
                     capability,
                     SupervisionTerminal::Error {
                         attempt_number: Some(number),
-                        error: record_error,
+                        error: Box::new(record_error),
                     },
                     history,
                     aggregates,

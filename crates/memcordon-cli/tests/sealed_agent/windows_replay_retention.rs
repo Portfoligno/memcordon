@@ -10,19 +10,6 @@ use memcordon_core::{
     parse_and_authenticate_windows_attempt_record,
 };
 
-fn normalized_source_variants(source: &str) -> [String; 2] {
-    let lf = source.lines().collect::<Vec<_>>().join("\n");
-    let crlf = lf.replace('\n', "\r\n");
-    [lf, crlf]
-}
-
-fn normalized_line_position(lines: &[&str], expected: &str) -> usize {
-    lines
-        .iter()
-        .position(|line| *line == expected)
-        .unwrap_or_else(|| panic!("missing normalized source line: {expected}"))
-}
-
 fn binding() -> (String, String, String) {
     (
         "ab".repeat(32),
@@ -106,6 +93,7 @@ fn bound_preauthorization_rejection(
             phase: BoundarySetupPhase::TargetCreation,
             detail: "preauthorization target creation failed".to_owned(),
             os_code: Some(5),
+            loader_qualification: None,
             target_created: true,
             target_released: false,
             cleanup_attempted: true,
@@ -422,67 +410,6 @@ fn cleanup_complete_retained_failure_classifies_terminal_attempt_retained() {
     assert_eq!(retained.secondary_failures.len(), 1);
     assert!(retained.secondary_failures[0].contains("MCSEALED-WINDOWS-CONTROL-RELAY"));
     assert!(retained.secondary_failures[0].contains("public replay relay failed"));
-}
-
-#[test]
-fn bound_launch_pending_replay_emits_one_public_response_and_returns() {
-    let source = include_str!("../../src/bin/memcordon-sealed-agent/windows/control_service.rs");
-
-    for source in normalized_source_variants(source) {
-        let replay_start = source
-            .find("fn replay_terminal(")
-            .expect("terminal replay must have a stable start boundary");
-        let replay_end = source[replay_start..]
-            .find("#[derive(Clone, Copy, Debug, Eq, PartialEq)]")
-            .map(|offset| replay_start + offset)
-            .expect("terminal replay must have a stable end boundary");
-        let replay = &source[replay_start..replay_end];
-        let replay_lines = replay.lines().map(str::trim).collect::<Vec<_>>();
-        let pending_write = normalized_line_position(
-            &replay_lines,
-            "pipe::write_frame(public, &WindowsProviderResponseV1::ReplayPending(pending))?;",
-        );
-        let pending_return =
-            normalized_line_position(&replay_lines, "return Ok(ReplayTerminalProgress::Pending);");
-        assert!(pending_write < pending_return);
-        assert_eq!(
-            replay_lines
-                .iter()
-                .filter(|line| line.contains("WindowsProviderResponseV1::ReplayPending"))
-                .count(),
-            1
-        );
-
-        let branch_start = source
-            .find("let primary = failure.detail.clone();")
-            .expect("bound launch failure must preserve its primary diagnostic");
-        let branch_end = source[branch_start..]
-            .find("_ => Err(failure.diagnostic()),")
-            .map(|offset| branch_start + offset)
-            .expect("bound launch failure branch must have a stable end boundary");
-        let branch = &source[branch_start..branch_end];
-        let lines = branch.lines().map(str::trim).collect::<Vec<_>>();
-
-        let primary = normalized_line_position(&lines, "let primary = failure.detail.clone();");
-        let complete = normalized_line_position(
-            &lines,
-            "Ok(ReplayTerminalProgress::Complete) => return Ok(()),",
-        );
-        let pending = normalized_line_position(
-            &lines,
-            "Ok(ReplayTerminalProgress::Pending) => return Ok(()),",
-        );
-        let retained = normalized_line_position(
-            &lines,
-            "let retained = super::record::retained_attempt_evidence(",
-        );
-        let retained_primary = normalized_line_position(&lines, "primary,");
-
-        assert!(primary < complete && complete < pending);
-        assert!(pending < retained && retained < retained_primary);
-        assert!(!branch.contains("Ok(_) => return Ok(()),"));
-        assert!(!branch.contains("Ok(ReplayTerminalProgress::Pending) => {"));
-    }
 }
 
 #[test]

@@ -168,6 +168,7 @@ fn only_exact_retired_sealed_retry_deadline_rejection_is_outside_attempt() {
         phase: BoundarySetupPhase::Authorization,
         detail: "authorization deadline elapsed before gate release".to_owned(),
         os_code: None,
+        loader_qualification: None,
         target_created: true,
         target_released: false,
         cleanup_attempted: true,

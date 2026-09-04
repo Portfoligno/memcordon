@@ -1,10 +1,12 @@
 [workspace]
 members = [
     "crates/memcordon-core",
+    "crates/memcordon-windows-launch-core",
     "crates/memcordon-platform",
     "crates/memcordon-cli",
     "crates/memcordon-testkit",
     "tools/memcordon-ci",
+    "tools/memcordon-windows-loader-lab",
 ]
 resolver = "2"
 

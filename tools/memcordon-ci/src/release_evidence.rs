@@ -141,7 +141,7 @@ pub struct CertificationRecord {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ReportKind {
     LinuxSealed,
-    Windows,
+    WindowsSplit,
     Macos,
 }
 
@@ -155,6 +155,23 @@ struct ReportSpec {
     kind: ReportKind,
     architecture: Option<&'static str>,
     runner_label: Option<&'static str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SplitWindowsCertificationV1 {
+    schema_version: u32,
+    backend: String,
+    certified: bool,
+    commit: String,
+    runner_class: String,
+    runner_provider: String,
+    runner_label: String,
+    architecture: String,
+    native_archive_sha256: Option<String>,
+    runtime_manifest_sha256: Option<String>,
+    native_target: Option<String>,
+    evidence_bindings: BTreeMap<String, String>,
 }
 
 const REPORTS: &[ReportSpec] = &[
@@ -171,20 +188,20 @@ const REPORTS: &[ReportSpec] = &[
     ReportSpec {
         record_key: "windows-job-object-v2/x86_64-pc-windows-msvc",
         backend: "windows-job-object-v2",
-        artifact_directory: "release-certification-windows-x64",
-        report_name: "windows-cleanup.json",
-        evidence_path: "certification/windows-sealed-v2/x64-windows-cleanup.json",
-        kind: ReportKind::Windows,
+        artifact_directory: "release-windows-package-channel-x64",
+        report_name: "windows-release-certification.json",
+        evidence_path: "certification/windows-sealed-v2/x64-windows-release-certification.json",
+        kind: ReportKind::WindowsSplit,
         architecture: Some("x86_64"),
         runner_label: Some("windows-2025"),
     },
     ReportSpec {
         record_key: "windows-job-object-v2/aarch64-pc-windows-msvc",
         backend: "windows-job-object-v2",
-        artifact_directory: "release-certification-windows-arm64",
-        report_name: "windows-cleanup.json",
-        evidence_path: "certification/windows-sealed-v2/arm64-windows-cleanup.json",
-        kind: ReportKind::Windows,
+        artifact_directory: "release-windows-package-channel-arm64",
+        report_name: "windows-release-certification.json",
+        evidence_path: "certification/windows-sealed-v2/arm64-windows-release-certification.json",
+        kind: ReportKind::WindowsSplit,
         architecture: Some("aarch64"),
         runner_label: Some("windows-11-arm"),
     },
@@ -1176,7 +1193,7 @@ fn validate_hard_report<R: DeserializeOwned>(
         .all(|test| test.result == CertificationTestResult::Passed);
     let derived_count = u32::try_from(report.tests.len())
         .map_err(|_| failure("too many certification test results"))?;
-    let native_identity_valid = spec.kind != ReportKind::Windows
+    let native_identity_valid = spec.kind != ReportKind::WindowsSplit
         || (report.native_target.as_deref()
             == Some(match expected_architecture {
                 "x86_64" => "x86_64-pc-windows-msvc",
@@ -1220,6 +1237,76 @@ fn valid_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_split_windows_certification(
+    bytes: &[u8],
+    directory: &Path,
+    spec: ReportSpec,
+    expected_commit: &str,
+) -> Result<()> {
+    let report: SplitWindowsCertificationV1 = serde_json::from_slice(bytes)?;
+    let expected_architecture = spec
+        .architecture
+        .expect("Windows split report has an architecture");
+    let expected_target = match expected_architecture {
+        "x86_64" => "x86_64-pc-windows-msvc",
+        "aarch64" => "aarch64-pc-windows-msvc",
+        _ => return Err(failure("unsupported Windows release architecture")),
+    };
+    let expected_names: BTreeSet<&str> = [
+        "production-result.json",
+        "production-manifest.json",
+        "lifecycle-outcomes.json",
+        "package-lifecycle.json",
+        "cargo-rollback.json",
+        "native-rollback.json",
+        "cargo-fingerprint.json",
+        "native-fingerprint.json",
+        "launch-plan.json",
+    ]
+    .into_iter()
+    .collect();
+    if report.schema_version != 1
+        || report.backend != spec.backend
+        || !report.certified
+        || report.commit != expected_commit
+        || report.runner_class != HARD_CERTIFICATION_RUNNER_CLASS
+        || report.runner_provider != HARD_CERTIFICATION_RUNNER_PROVIDER
+        || report.runner_label
+            != spec
+                .runner_label
+                .expect("Windows split report has a runner label")
+        || report.architecture != expected_architecture
+        || report.native_target.as_deref() != Some(expected_target)
+        || !report
+            .native_archive_sha256
+            .as_deref()
+            .is_some_and(valid_sha256)
+        || !report
+            .runtime_manifest_sha256
+            .as_deref()
+            .is_some_and(valid_sha256)
+        || report
+            .evidence_bindings
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            != expected_names
+    {
+        return Err(failure("Windows split certification is incomplete"));
+    }
+    let evidence = directory.join("release-evidence");
+    for (name, expected_sha256) in &report.evidence_bindings {
+        if !valid_sha256(expected_sha256)
+            || sha256_bytes(&read_report(&evidence.join(name))?) != *expected_sha256
+        {
+            return Err(failure(format!(
+                "Windows split evidence binding differs: {name}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_macos_report(bytes: &[u8], spec: ReportSpec, expected_commit: &str) -> Result<()> {
@@ -1863,6 +1950,10 @@ fn validate_linux_auxiliary(
 fn validate_artifact_inventory(input: &Path) -> Result<()> {
     let allowed_directories: BTreeSet<&str> =
         REPORTS.iter().map(|spec| spec.artifact_directory).collect();
+    let legacy_windows_directories = [
+        "release-certification-windows-x64",
+        "release-certification-windows-arm64",
+    ];
     for entry in fs::read_dir(input)? {
         let entry = entry?;
         let name = entry
@@ -1871,7 +1962,10 @@ fn validate_artifact_inventory(input: &Path) -> Result<()> {
             .map_err(|_| failure("release input artifact name is not UTF-8"))?;
         let certification_namespace =
             name.starts_with("release-certification-") || name.starts_with("release-acceptance-");
-        if certification_namespace && !allowed_directories.contains(name.as_str()) {
+        if certification_namespace
+            && !allowed_directories.contains(name.as_str())
+            && !legacy_windows_directories.contains(&name.as_str())
+        {
             return Err(failure(format!(
                 "unexpected certification artifact: {name}"
             )));
@@ -1886,35 +1980,37 @@ fn validate_artifact_inventory(input: &Path) -> Result<()> {
                 directory.display()
             )));
         }
-        let entries = fs::read_dir(&directory)?.collect::<std::io::Result<Vec<_>>>()?;
-        let expected: BTreeSet<&str> = match spec.kind {
-            ReportKind::LinuxSealed => LINUX_SEALED_FILES.iter().copied().collect(),
-            ReportKind::Windows => WINDOWS_SEALED_FILES.iter().copied().collect(),
-            ReportKind::Macos => [spec.report_name].into_iter().collect(),
-        };
-        let actual: BTreeSet<String> = entries
-            .iter()
-            .map(|entry| {
-                if !entry.file_type()?.is_file() {
-                    return Err(failure("certification artifact entry is not a file"));
-                }
-                entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| failure("certification artifact name is not UTF-8"))
-            })
-            .collect::<Result<_>>()?;
-        if actual.len() != expected.len()
-            || !actual.iter().all(|name| expected.contains(name.as_str()))
-        {
-            return Err(failure(format!(
-                "certification artifact has an unexpected inventory: {}",
-                spec.artifact_directory
-            )));
+        if !matches!(spec.kind, ReportKind::WindowsSplit) {
+            let entries = fs::read_dir(&directory)?.collect::<std::io::Result<Vec<_>>>()?;
+            let expected: BTreeSet<&str> = match spec.kind {
+                ReportKind::LinuxSealed => LINUX_SEALED_FILES.iter().copied().collect(),
+                ReportKind::Macos => [spec.report_name].into_iter().collect(),
+                ReportKind::WindowsSplit => unreachable!(),
+            };
+            let actual: BTreeSet<String> = entries
+                .iter()
+                .map(|entry| {
+                    if !entry.file_type()?.is_file() {
+                        return Err(failure("certification artifact entry is not a file"));
+                    }
+                    entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| failure("certification artifact name is not UTF-8"))
+                })
+                .collect::<Result<_>>()?;
+            if actual.len() != expected.len()
+                || !actual.iter().all(|name| expected.contains(name.as_str()))
+            {
+                return Err(failure(format!(
+                    "certification artifact has an unexpected inventory: {}",
+                    spec.artifact_directory
+                )));
+            }
         }
 
         let expected_path = directory.join(spec.report_name);
-        let search_root = if matches!(spec.kind, ReportKind::Windows) {
+        let search_root = if matches!(spec.kind, ReportKind::WindowsSplit) {
             &directory
         } else {
             input
@@ -1982,11 +2078,7 @@ fn validate_output_inventory(output: &Path) -> Result<()> {
         if name == "windows-sealed-v2" && entry.file_type()?.is_dir() {
             let expected: BTreeSet<String> = ["x64", "arm64"]
                 .into_iter()
-                .flat_map(|architecture| {
-                    WINDOWS_SEALED_FILES
-                        .iter()
-                        .map(move |name| format!("{architecture}-{name}"))
-                })
+                .map(|architecture| format!("{architecture}-windows-release-certification.json"))
                 .collect();
             let actual: BTreeSet<String> = fs::read_dir(entry.path())?
                 .map(|file| {
@@ -2021,6 +2113,40 @@ pub fn collect_certification(
     validate_artifact_inventory(input)?;
     validate_output_inventory(output)?;
 
+    for (id, architecture, runner_label) in [
+        ("x64", "x86_64", "windows-2025"),
+        ("arm64", "aarch64", "windows-11-arm"),
+    ] {
+        let directory = input.join(format!("release-certification-windows-{id}"));
+        if directory.is_dir() {
+            let spec = ReportSpec {
+                record_key: "legacy-windows-validation-only",
+                backend: "windows-job-object-v2",
+                artifact_directory: "legacy-windows-validation-only",
+                report_name: "windows-cleanup.json",
+                evidence_path: "legacy-windows-validation-only",
+                kind: ReportKind::WindowsSplit,
+                architecture: Some(architecture),
+                runner_label: Some(runner_label),
+            };
+            let cleanup = read_report(&directory.join("windows-cleanup.json"))?;
+            validate_hard_report::<WindowsRuntimeEvidence>(
+                &cleanup,
+                spec,
+                expected_commit,
+                runner_label,
+                architecture,
+                WINDOWS_TESTS,
+                WindowsRuntimeEvidence::complete,
+            )?;
+            for name in WINDOWS_SEALED_FILES {
+                let auxiliary = read_report(&directory.join(name))?;
+                validate_windows_auxiliary(name, &auxiliary, expected_commit, architecture)?;
+            }
+            validate_windows_cross_report_bindings(&directory, &cleanup)?;
+        }
+    }
+
     let mut validated = Vec::new();
     for spec in REPORTS {
         let path = input.join(spec.artifact_directory).join(spec.report_name);
@@ -2034,29 +2160,12 @@ pub fn collect_certification(
                     validate_linux_auxiliary(name, &auxiliary, expected_commit, &binding)?;
                 }
             }
-            ReportKind::Windows => {
-                let architecture = spec
-                    .architecture
-                    .expect("Windows report has an architecture");
-                validate_hard_report::<WindowsRuntimeEvidence>(
-                    &bytes,
-                    *spec,
-                    expected_commit,
-                    spec.runner_label
-                        .expect("Windows report has a runner label"),
-                    architecture,
-                    WINDOWS_TESTS,
-                    WindowsRuntimeEvidence::complete,
-                )?;
-                for name in WINDOWS_SEALED_FILES {
-                    let auxiliary = read_report(&input.join(spec.artifact_directory).join(name))?;
-                    validate_windows_auxiliary(name, &auxiliary, expected_commit, architecture)?;
-                }
-                validate_windows_cross_report_bindings(
-                    &input.join(spec.artifact_directory),
-                    &bytes,
-                )?;
-            }
+            ReportKind::WindowsSplit => validate_split_windows_certification(
+                &bytes,
+                &input.join(spec.artifact_directory),
+                *spec,
+                expected_commit,
+            )?,
             ReportKind::Macos => validate_macos_report(&bytes, *spec, expected_commit)?,
         }
         validated.push(ValidatedReport {
@@ -2102,34 +2211,6 @@ pub fn collect_certification(
                 sha256: sha256_bytes(&bytes),
             },
         );
-    }
-    for spec in REPORTS
-        .iter()
-        .filter(|spec| matches!(spec.kind, ReportKind::Windows))
-    {
-        let architecture = spec
-            .architecture
-            .expect("Windows report has an architecture");
-        let output_architecture = if architecture == "x86_64" {
-            "x64"
-        } else {
-            "arm64"
-        };
-        for name in WINDOWS_SEALED_FILES {
-            if *name == spec.report_name {
-                continue;
-            }
-            let bytes = read_report(&input.join(spec.artifact_directory).join(name))?;
-            let relative = format!("certification/windows-sealed-v2/{output_architecture}-{name}");
-            fs::write(output.join(&relative), &bytes)?;
-            records.insert(
-                format!("{}/{name}", spec.record_key),
-                CertificationRecord {
-                    evidence_path: relative,
-                    sha256: sha256_bytes(&bytes),
-                },
-            );
-        }
     }
     Ok(records)
 }

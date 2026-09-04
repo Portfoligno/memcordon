@@ -1177,194 +1177,20 @@ fn qualify_and_store_admitted(
             &frontend_canaries,
         )?
     };
-    let (restricted_observation, restricted_native) = {
-        // Canaries are unrelated capability sentinels, so prepare them before
-        // installing the restricted identity. Declaring the token guard after
-        // the bundle also guarantees that error unwinding reverts the thread
-        // before closing any canary handle.
-        let frontend_canaries = prepare_frontend_canaries("restricted")?;
-        let restricted =
-            super::token::impersonate_restricted_current_thread().map_err(|detail| {
-                token_fixture_failure(
-                    "restricted",
-                    "token-prepare",
-                    "token-fixture-prepare",
-                    detail,
-                )
-            })?;
-        let observation = TokenFixtureObservation::retained(&restricted);
-        if observation.restricted_sid_count == 0 {
-            return Err("restricted-token fixture has no restricting SID".to_owned());
-        }
-        (
-            observation,
-            native_public_canary(
-                "windows-certification-target",
-                "restricted",
-                &frontend_canaries,
-            )?,
-        )
-    };
-    let (ordinary_observation, ordinary_native) = {
-        let frontend_canaries = prepare_frontend_canaries("ordinary-user")?;
-        let ordinary = super::token::impersonate_ordinary_current_thread().map_err(|detail| {
-            token_fixture_failure(
-                "ordinary-user",
-                "token-prepare",
-                "token-fixture-prepare",
-                detail,
-            )
-        })?;
-        let observation = TokenFixtureObservation::retained(&ordinary);
-        if observation.envelope.elevated {
-            return Err("ordinary-token fixture remained elevated".to_owned());
-        }
-        (
-            observation,
-            native_public_canary(
-                "windows-certification-target",
-                "ordinary-user",
-                &frontend_canaries,
-            )?,
-        )
-    };
-    let (write_restricted_observation, write_restricted_native) = {
-        let frontend_canaries = prepare_frontend_canaries("write-restricted")?;
-        let restricted =
-            super::token::impersonate_write_restricted_current_thread().map_err(|detail| {
-                token_fixture_failure(
-                    "write-restricted",
-                    "token-prepare",
-                    "token-fixture-prepare",
-                    detail,
-                )
-            })?;
-        let observation = TokenFixtureObservation::retained(&restricted);
-        if observation.restricted_sid_count == 0 {
-            return Err("write-restricted fixture has no restricting SID".to_owned());
-        }
-        (
-            observation,
-            native_public_canary(
-                "windows-certification-target",
-                "write-restricted",
-                &frontend_canaries,
-            )?,
-        )
-    };
-    let (low_integrity_observation, low_integrity_native) = {
-        let frontend_canaries = prepare_frontend_canaries("low-integrity")?;
-        let restricted =
-            super::token::impersonate_low_integrity_current_thread().map_err(|detail| {
-                token_fixture_failure(
-                    "low-integrity",
-                    "token-prepare",
-                    "token-fixture-prepare",
-                    detail,
-                )
-            })?;
-        let observation = TokenFixtureObservation::retained(&restricted);
-        if observation.envelope.integrity_level != "S-1-16-4096" {
-            return Err("low-integrity fixture did not acquire the low mandatory label".to_owned());
-        }
-        (
-            observation,
-            native_public_canary(
-                "windows-certification-target",
-                "low-integrity",
-                &frontend_canaries,
-            )?,
-        )
-    };
-    let (deny_only_observation, deny_only_native) = {
-        let frontend_canaries = prepare_frontend_canaries("deny-only-admin")?;
-        let restricted =
-            super::token::impersonate_deny_only_admin_current_thread().map_err(|detail| {
-                token_fixture_failure(
-                    "deny-only-admin",
-                    "token-prepare",
-                    "token-fixture-prepare",
-                    detail,
-                )
-            })?;
-        let observation = TokenFixtureObservation::retained(&restricted);
-        if !observation.administrator_deny_only || observation.restricted_sid_count == 0 {
-            return Err(
-                "deny-only fixture lacks its deny-only administrator/restricting SID".to_owned(),
-            );
-        }
-        (
-            observation,
-            native_public_canary(
-                "windows-certification-target",
-                "deny-only-admin",
-                &frontend_canaries,
-            )?,
-        )
-    };
-    super::process::run_appcontainer_rejection_client()?;
-    let launcher_session = admission.launcher_attestation.token_session_id;
-    let different_session_supported = elevated_observation.envelope.session_id != launcher_session;
-    let token_matrix = WindowsTokenMatrixEvidenceV1 {
-        schema_version: 2,
-        scenarios: vec![
-            elevated_observation
-                .scenario("elevated-admin", native.initial_target_token_matches_caller),
-            ordinary_observation.scenario(
-                "ordinary-user",
-                ordinary_native.initial_target_token_matches_caller,
-            ),
-            restricted_observation.scenario(
-                "restricted",
-                restricted_native.initial_target_token_matches_caller,
-            ),
-            TokenFixtureObservation {
-                envelope: write_restricted_observation.envelope.clone(),
-                restricted_sid_count: write_restricted_observation.restricted_sid_count,
-                restricting_sids: write_restricted_observation.restricting_sids.clone(),
-                token_is_restricted: write_restricted_observation.token_is_restricted,
-                write_restricted: write_restricted_observation.write_restricted,
-                enabled_sensitive_privilege_count: write_restricted_observation
-                    .enabled_sensitive_privilege_count,
-                administrator_deny_only: false,
-            }
-            .scenario(
-                "write-restricted",
-                write_restricted_native.initial_target_token_matches_caller,
-            ),
-            write_restricted_observation.scenario(
-                "disabled-privileges",
-                write_restricted_native.initial_target_token_matches_caller,
-            ),
-            deny_only_observation.scenario(
-                "deny-only-admin",
-                deny_only_native.initial_target_token_matches_caller,
-            ),
-            low_integrity_observation.scenario(
-                "low-integrity",
-                low_integrity_native.initial_target_token_matches_caller,
-            ),
-        ],
-        appcontainer_rejected_before_target: true,
-        different_session_supported,
-        different_session_verified: different_session_supported
-            && native.initial_target_token_matches_caller,
-    };
-    if !token_matrix.is_complete() {
-        return Err("native Windows token-matrix evidence is incomplete".to_owned());
-    }
-    let frontend_loss_cleanup_verified = frontend_loss_canary(admission)?;
-    let recursive_provider_request_denied = recursive_provider_canary().map(|()| true)?;
+    // Token variants, AppContainer rejection, frontend-loss, recursive-provider,
+    // and fault experiments belong to the explicit diagnostic/lifecycle suites.
+    // Package qualification runs exactly one unobserved production launch.
+    let frontend_loss_cleanup_verified = false;
+    let recursive_provider_request_denied = false;
     super::process::certify_target_handle_list_negatives()?;
     super::process::certify_guardian_loader_context_negatives()?;
     super::guardian_service::certify_slot_contract_negatives()?;
-    let nested_alternate_token = native.nested_alternate_token_verified
-        && native.active_processes_zero
-        && native.job_membership_independent_of_token;
-    if crate::windows::package::certification_faults_enabled() {
-        preauthorization_fault_matrix()?;
-        retirement_fault_matrix()?;
-    }
+    let nested_alternate_token = false;
+    let loader_qualification = native
+        .evidence
+        .loader_qualification
+        .clone()
+        .ok_or_else(|| "production loader qualification outcome is absent".to_owned())?;
     let mut receipt = WindowsQualificationReceiptV1 {
         schema_version: WINDOWS_QUALIFICATION_SCHEMA_VERSION,
         provider_identity: format!(
@@ -1384,21 +1210,7 @@ fn qualify_and_store_admitted(
         guardian_slot_loader_verified: native.guardian_ready && native.guardian_reaped,
         guardian_capacity_verified: true,
         caller_token_authentication_verified: native.caller_token_authenticated,
-        restricted_caller_token_verified: restricted_native.caller_token_authenticated
-            && restricted_native.initial_target_token_matches_caller
-            && restricted_native.job_membership_independent_of_token
-            && write_restricted_native.caller_token_authenticated
-            && write_restricted_native.initial_target_token_matches_caller
-            && write_restricted_native.job_membership_independent_of_token
-            && low_integrity_native.caller_token_authenticated
-            && low_integrity_native.initial_target_token_matches_caller
-            && low_integrity_native.job_membership_independent_of_token
-            && deny_only_native.caller_token_authenticated
-            && deny_only_native.initial_target_token_matches_caller
-            && deny_only_native.job_membership_independent_of_token
-            && ordinary_native.caller_token_authenticated
-            && ordinary_native.initial_target_token_matches_caller
-            && ordinary_native.job_membership_independent_of_token,
+        restricted_caller_token_verified: false,
         primary_token_duplication_verified: native.caller_token_authenticated
             && native.initial_target_token_matches_caller,
         create_process_as_user_verified: native.target_created_suspended,
@@ -1418,13 +1230,13 @@ fn qualify_and_store_admitted(
         active_processes_zero_verified: native.active_processes_zero,
         relays_retired_verified: native.relays_retired,
         recovery_complete: recovery_complete()?,
+        loader_qualification,
         qualified: false,
     };
     receipt.qualified = receipt.is_consistent_if_qualified();
     if !receipt.is_consistent() {
         return Err("native Windows qualification produced an inconsistent receipt".to_owned());
     }
-    store_package_evidence("token-matrix.json", &token_matrix)?;
     let path = qualification_path();
     let parent = path
         .parent()
@@ -6520,9 +6332,13 @@ pub fn recovery_status() -> Result<bool, String> {
     }
 }
 
-pub fn prepare_package_cleanup(deadline_millis: u64) -> Result<(), String> {
+pub fn prepare_package_cleanup(
+    deadline_millis: u64,
+) -> Result<(), super::record::PackageCleanupError> {
     if deadline_millis == 0 {
-        return Err("package cleanup deadline must be nonzero".to_owned());
+        return Err(super::record::PackageCleanupError::Failed(
+            "package cleanup deadline must be nonzero".to_owned(),
+        ));
     }
     let pipe = super::pipe::connect(WINDOWS_CONTROL_PIPE)?;
     let challenge = control_request_challenge("package-cleanup");
@@ -6547,22 +6363,24 @@ pub fn prepare_package_cleanup(deadline_millis: u64) -> Result<(), String> {
         {
             match (status, attempts_empty) {
                 (memcordon_core::WindowsControlRequestStatusV1::Ready, Some(true)) => Ok(()),
-                (memcordon_core::WindowsControlRequestStatusV1::Active, Some(false))
-                    if detail
-                        .strip_prefix("MCSEALED-WINDOWS-PACKAGE-ACTIVE:")
-                        .is_some() =>
-                {
-                    Err(format!(
+                (memcordon_core::WindowsControlRequestStatusV1::Active, Some(false)) => {
+                    Err(super::record::PackageCleanupError::Active(format!(
                         "{detail}; authenticated_terminal_outboxes={}",
                         terminal_outboxes
                             .map_or_else(|| "unavailable".to_owned(), |count| count.to_string())
-                    ))
+                    )))
                 }
-                (memcordon_core::WindowsControlRequestStatusV1::Failed, _) => Err(detail),
-                _ => Err("control service returned contradictory package cleanup state".to_owned()),
+                (memcordon_core::WindowsControlRequestStatusV1::Failed, _) => {
+                    Err(super::record::PackageCleanupError::Failed(detail))
+                }
+                _ => Err(super::record::PackageCleanupError::Failed(
+                    "control service returned contradictory package cleanup state".to_owned(),
+                )),
             }
         }
-        _ => Err("control service returned an invalid package cleanup response".to_owned()),
+        _ => Err(super::record::PackageCleanupError::Failed(
+            "control service returned an invalid package cleanup response".to_owned(),
+        )),
     }
 }
 

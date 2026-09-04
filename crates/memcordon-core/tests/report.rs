@@ -88,6 +88,7 @@ fn typed_provider_rejection_round_trips_with_cleanup_proof() {
         phase: memcordon_core::BoundarySetupPhase::ResourceVerification,
         detail: "permission denied".to_owned(),
         os_code: Some(13),
+        loader_qualification: None,
         target_created: true,
         target_released: false,
         cleanup_attempted: true,
@@ -1015,7 +1016,7 @@ fn schema_five_later_helper_error_preserves_prior_attempt() {
         BackendCapabilityReport::default(),
         SupervisionTerminal::Error {
             attempt_number: Some(2),
-            error,
+            error: Box::new(error),
         },
         history,
         aggregates,
@@ -1064,7 +1065,7 @@ fn schema_five_initial_spawn_status_round_trips_typed_provenance() {
             BackendCapabilityReport::default(),
             SupervisionTerminal::Error {
                 attempt_number: Some(1),
-                error,
+                error: Box::new(error),
             },
             history,
             aggregates,
@@ -1097,6 +1098,7 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
         phase: memcordon_core::BoundarySetupPhase::TargetCreation,
         detail: "authenticated target exec failed with ENOENT".to_owned(),
         os_code: Some(2),
+        loader_qualification: None,
         target_created: true,
         target_released: true,
         cleanup_attempted: true,
@@ -1129,7 +1131,7 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
         BackendCapabilityReport::default(),
         SupervisionTerminal::Error {
             attempt_number: Some(1),
-            error,
+            error: Box::new(error),
         },
         history,
         aggregates,
@@ -1156,6 +1158,7 @@ fn request_validation_provider_rejection_round_trips_in_schema_eight() {
         phase: memcordon_core::BoundarySetupPhase::RequestValidation,
         detail: "stable package lease is unavailable".to_owned(),
         os_code: Some(30),
+        loader_qualification: None,
         target_created: false,
         target_released: false,
         cleanup_attempted: false,
@@ -1188,7 +1191,7 @@ fn request_validation_provider_rejection_round_trips_in_schema_eight() {
         BackendCapabilityReport::default(),
         SupervisionTerminal::Error {
             attempt_number: Some(1),
-            error,
+            error: Box::new(error),
         },
         history,
         aggregates,
@@ -1279,7 +1282,7 @@ fn supervision_constructor_rejects_mismatched_or_misclassified_error_terminal() 
             BackendCapabilityReport::default(),
             SupervisionTerminal::Error {
                 attempt_number: Some(1),
-                error: error.clone(),
+                error: Box::new(error.clone()),
             },
             history.clone(),
             aggregates.clone(),
@@ -1297,7 +1300,7 @@ fn supervision_constructor_rejects_mismatched_or_misclassified_error_terminal() 
             BackendCapabilityReport::default(),
             SupervisionTerminal::Error {
                 attempt_number: Some(1),
-                error,
+                error: Box::new(error),
             },
             history,
             aggregates,
@@ -1343,7 +1346,7 @@ fn supervision_constructor_rejects_stale_error_terminal() {
             BackendCapabilityReport::default(),
             SupervisionTerminal::Error {
                 attempt_number: Some(1),
-                error: first,
+                error: Box::new(first),
             },
             history,
             aggregates,
@@ -1384,7 +1387,7 @@ fn supervision_constructor_rejects_embedded_error_attempt_mismatch() {
             BackendCapabilityReport::default(),
             SupervisionTerminal::Error {
                 attempt_number: Some(1),
-                error,
+                error: Box::new(error),
             },
             history,
             aggregates,
