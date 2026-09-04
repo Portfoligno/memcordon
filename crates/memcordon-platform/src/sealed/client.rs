@@ -192,7 +192,7 @@ pub enum TerminalExecFailureClass {
 #[derive(Debug)]
 pub enum LaunchError {
     Transport(String),
-    Rejected(memcordon_core::ProviderRejectionEvidence),
+    Rejected(Box<memcordon_core::ProviderRejectionEvidence>),
 }
 
 #[derive(Deserialize)]
@@ -244,6 +244,7 @@ pub fn run(
             detail,
         ),
         LaunchError::Rejected(rejection) => {
+            let rejection = *rejection;
             let restart_safety = rejection.restart_safety.clone();
             let mut error = memcordon_core::Error::new(
                 memcordon_core::ErrorCategory::Setup,
@@ -461,6 +462,7 @@ pub(crate) fn terminal_spawn_error(
         phase: memcordon_core::BoundarySetupPhase::TargetCreation,
         detail: detail.clone(),
         os_code: Some(os_code),
+        loader_qualification: None,
         target_created: true,
         target_released: true,
         cleanup_attempted: true,
@@ -536,9 +538,11 @@ pub(crate) fn launch(
         ));
     }
     if kind == 106 {
-        return Err(LaunchError::Rejected(parse_rejection(&payload).map_err(
-            |error| LaunchError::Transport(format!("invalid provider rejection: {error}")),
-        )?));
+        return Err(LaunchError::Rejected(Box::new(
+            parse_rejection(&payload).map_err(|error| {
+                LaunchError::Transport(format!("invalid provider rejection: {error}"))
+            })?,
+        )));
     }
     if kind != 105 {
         return Err(LaunchError::Transport(
@@ -601,6 +605,7 @@ pub(crate) fn parse_rejection(
         phase: receipt.phase,
         detail: receipt.detail,
         os_code: receipt.os_code,
+        loader_qualification: None,
         target_created: receipt.target_created,
         target_released: receipt.target_released,
         cleanup_attempted: receipt.cleanup.attempted,

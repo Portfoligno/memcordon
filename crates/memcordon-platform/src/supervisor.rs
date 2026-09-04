@@ -3,12 +3,13 @@ use std::time::{Duration, Instant};
 
 use memcordon_core::{
     AttemptHistory, AttemptKind, AttemptPhase, AttemptRecord, BackendCapabilityReport,
-    BoundaryCapability, BoundaryClass, BoundaryRequirement, CapabilityStatusReport, CommandSpec,
-    Error, ErrorCategory, LaunchEvidence, MemoryCapabilityReport, Policy, RestartAction,
-    RestartCondition, RestartCoordinator, RestartDecisionKind, RestartDecisionRecord,
-    RestartPolicy, RestartSafetyProof, RestartSummary, RestartWaitKind, RunOutcome,
-    SupervisionAggregates, SupervisionDeadlineEvidence, SupervisionErrorRecord,
-    SupervisionExecution, SupervisionPhase, SupervisionTerminal, WaitCompletion,
+    BackendSelectionDriftEvidence, BoundaryCapability, BoundaryClass, BoundaryRequirement,
+    CapabilityStatusReport, CommandSpec, Error, ErrorCategory, LaunchEvidence,
+    MemoryCapabilityReport, Policy, RestartAction, RestartCondition, RestartCoordinator,
+    RestartDecisionKind, RestartDecisionRecord, RestartPolicy, RestartSafetyProof, RestartSummary,
+    RestartWaitKind, RunOutcome, SupervisionAggregates, SupervisionDeadlineEvidence,
+    SupervisionErrorRecord, SupervisionExecution, SupervisionPhase, SupervisionTerminal,
+    WaitCompletion,
 };
 
 use crate::backend::{BackendInfo, Execution};
@@ -468,15 +469,32 @@ fn supervise_with<I: InterruptionWait>(
                 }
                 let observed =
                     capabilities_for(&attempt.execution.backend, request.policy.boundary());
-                if backend.as_ref().is_some_and(|selected| {
-                    !backend_selection_matches(selected, &observed, request.policy.metric)
+                if let Some((selected, mismatched_fields)) = backend.as_ref().and_then(|selected| {
+                    let fields =
+                        backend_selection_drift_fields(selected, &observed, request.policy.metric);
+                    (!fields.is_empty()).then(|| (selected.clone(), fields))
                 }) {
-                    return Err(Error::new(
-                        ErrorCategory::Monitor,
-                        "MCBACKEND-SELECTION-DRIFT",
-                        "runtime backend evidence disagrees with the resolved backend",
-                    )
-                    .with_restart_safety(attempt.restart_safety));
+                    targets_authorized = targets_authorized
+                        .checked_add(1)
+                        .ok_or_else(counter_error)?;
+                    let number = history.total.checked_add(1).ok_or_else(counter_error)?;
+                    return finish_backend_selection_drift(
+                        selected,
+                        observed,
+                        mismatched_fields,
+                        request.policy.metric,
+                        attempt,
+                        number,
+                        kind,
+                        attempt_started,
+                        started.elapsed(),
+                        history,
+                        aggregates,
+                        coordinator
+                            .as_ref()
+                            .map_or_else(RestartSummary::default, |value| value.summary().clone()),
+                        targets_authorized,
+                    );
                 }
                 backend = Some(observed);
                 targets_authorized = targets_authorized
@@ -771,11 +789,10 @@ fn supervision_remaining(
     })
 }
 
-fn backend_selection_matches(
+fn selected_backend_for_metric(
     selected: &BackendCapabilityReport,
-    observed: &BackendCapabilityReport,
     metric: memcordon_core::Metric,
-) -> bool {
+) -> BackendCapabilityReport {
     let mut expected = selected.clone();
     if metric != memcordon_core::Metric::Native {
         if let Some(memory) = expected
@@ -786,7 +803,143 @@ fn backend_selection_matches(
             memory.metric = watchdog_metric(metric).to_owned();
         }
     }
-    expected == *observed
+    expected
+}
+
+fn backend_selection_drift_fields(
+    selected: &BackendCapabilityReport,
+    observed: &BackendCapabilityReport,
+    metric: memcordon_core::Metric,
+) -> Vec<String> {
+    let expected = selected_backend_for_metric(selected, metric);
+    let mut fields = Vec::new();
+    if expected.name != observed.name {
+        fields.push("name".to_owned());
+    }
+    if expected.containment != observed.containment {
+        fields.push("containment".to_owned());
+    }
+    if expected.boundary != observed.boundary {
+        fields.push("boundary".to_owned());
+    }
+    if expected.memory != observed.memory {
+        fields.push("memory".to_owned());
+    }
+    if expected.deadline != observed.deadline {
+        fields.push("deadline".to_owned());
+    }
+    if expected.restart != observed.restart {
+        fields.push("restart".to_owned());
+    }
+    if expected.deadline_scopes != observed.deadline_scopes {
+        fields.push("deadline_scopes".to_owned());
+    }
+    if expected.deadline_origin != observed.deadline_origin {
+        fields.push("deadline_origin".to_owned());
+    }
+    if expected.restart_conditions != observed.restart_conditions {
+        fields.push("restart_conditions".to_owned());
+    }
+    if expected.persistent_restart_state != observed.persistent_restart_state {
+        fields.push("persistent_restart_state".to_owned());
+    }
+    if expected.startup_containment != observed.startup_containment {
+        fields.push("startup_containment".to_owned());
+    }
+    if expected.restart_cleanup_condition != observed.restart_cleanup_condition {
+        fields.push("restart_cleanup_condition".to_owned());
+    }
+    if expected.limitations != observed.limitations {
+        fields.push("limitations".to_owned());
+    }
+    if expected.boundary_qualification != observed.boundary_qualification {
+        fields.push("boundary_qualification".to_owned());
+    }
+    if expected.sealed_unavailable != observed.sealed_unavailable {
+        fields.push("sealed_unavailable".to_owned());
+    }
+    fields.sort_unstable();
+    fields
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
+fn finish_backend_selection_drift(
+    selected: BackendCapabilityReport,
+    observed: BackendCapabilityReport,
+    mismatched_fields: Vec<String>,
+    metric: memcordon_core::Metric,
+    attempt: AttemptExecution,
+    number: u64,
+    kind: AttemptKind,
+    attempt_started: Duration,
+    elapsed: Duration,
+    mut history: AttemptHistory,
+    mut aggregates: SupervisionAggregates,
+    restart: RestartSummary,
+    targets_authorized: u64,
+) -> Result<SupervisionExecution, Error> {
+    let message = format!(
+        "runtime backend evidence disagrees with the resolved backend: {}",
+        mismatched_fields.join(", ")
+    );
+    let record_error = SupervisionErrorRecord {
+        category: "monitor".to_owned(),
+        code: "MCBACKEND-SELECTION-DRIFT".to_owned(),
+        message,
+        os_code: None,
+        attempt_number: Some(number),
+        supervision_phase: SupervisionPhase::ActiveAttempt,
+        launch_phase: Some("runtime-backend-evidence".to_owned()),
+        target_released: attempt.launch.target_released,
+        workload_may_be_alive: attempt.restart_safety.workload_empty != Some(true),
+        initial_spawn_failure: None,
+        provider_rejection: None,
+        backend_selection_drift: Some(BackendSelectionDriftEvidence {
+            selected: Box::new(selected.clone()),
+            comparison_expected: Box::new(selected_backend_for_metric(&selected, metric)),
+            observed: Box::new(observed),
+            mismatched_fields,
+        }),
+    };
+    history
+        .append(
+            AttemptRecord {
+                number,
+                kind,
+                phase: AttemptPhase::Failed,
+                target_pid: Some(attempt.execution.child_pid),
+                started_offset_ms: Some(millis(attempt_started)),
+                authorized_offset_ms: attempt
+                    .execution
+                    .authorization_offset
+                    .map(|offset| millis(attempt_started + offset)),
+                terminal_offset_ms: Some(millis(attempt_started + attempt.execution.duration)),
+                finished_offset_ms: millis(elapsed),
+                outcome: None,
+                error: Some(record_error.clone()),
+                restart_decision: RestartDecisionRecord::default(),
+                launch: attempt.launch,
+                restart_safety: attempt.restart_safety,
+                boundary_detail: attempt.execution.boundary_detail,
+            },
+            &mut aggregates,
+        )
+        .map_err(model_error)?;
+    SupervisionExecution::new(
+        selected,
+        SupervisionTerminal::Error {
+            attempt_number: Some(number),
+            error: Box::new(record_error),
+        },
+        history,
+        aggregates,
+        restart,
+        None,
+        millis(elapsed),
+        targets_authorized,
+    )
+    .map_err(model_error)
 }
 
 const fn watchdog_metric(metric: memcordon_core::Metric) -> &'static str {
@@ -805,7 +958,93 @@ pub(crate) fn test_backend_selection_matches(
     observed: &BackendCapabilityReport,
     metric: memcordon_core::Metric,
 ) -> bool {
-    backend_selection_matches(selected, observed, metric)
+    backend_selection_drift_fields(selected, observed, metric).is_empty()
+}
+
+#[cfg(feature = "test-support")]
+#[allow(clippy::result_large_err)]
+pub(crate) fn test_backend_selection_drift_execution(
+    selected: BackendCapabilityReport,
+    observed: BackendCapabilityReport,
+    metric: memcordon_core::Metric,
+) -> Result<SupervisionExecution, Error> {
+    let mismatched_fields = backend_selection_drift_fields(&selected, &observed, metric);
+    let backend = BackendInfo {
+        name: "drift-fixture",
+        containment_supported: true,
+        memory_supported: true,
+        class: "hard",
+        metric: "fixture-memory",
+        hard_limit: true,
+        startup_containment: "fixture containment",
+        limitations: Vec::new(),
+        boundary_support: crate::backend::standard_boundary_support(
+            "fixture-standard",
+            true,
+            "fixture sealed provider unavailable",
+            &[],
+        ),
+    };
+    let launch = LaunchEvidence {
+        mechanism: "fixture-standard".to_owned(),
+        target_released: true,
+        containment_verified_before_authorization: true,
+        guardian_started_before_authorization: false,
+        target_spawn_error_reported: false,
+        boundary_requested: BoundaryRequirement::Standard,
+        boundary_effective: BoundaryClass::Standard,
+        boundary_assignment_verified: false,
+        boundary_reconfiguration_denied: false,
+        inherited_resources_restricted: false,
+        frontend_loss_cleanup_authority_verified: false,
+    };
+    let restart_safety = RestartSafetyProof {
+        direct_child_reaped: true,
+        workload_empty: Some(true),
+        helpers_reaped: true,
+        containment_removed: true,
+        containment_incapable_of_live_members: true,
+        sealed_boundary_retired: false,
+        errors: Vec::new(),
+    };
+    finish_backend_selection_drift(
+        selected,
+        observed,
+        mismatched_fields,
+        metric,
+        AttemptExecution {
+            execution: Execution {
+                outcome: RunOutcome::Exited {
+                    child: memcordon_core::ChildTermination::ExitCode { code: 0 },
+                    peak: None,
+                    cleanup: memcordon_core::CleanupSummary {
+                        direct_child_reaped: true,
+                        workload_empty: Some(true),
+                        ..memcordon_core::CleanupSummary::default()
+                    },
+                },
+                backend,
+                child_pid: 42,
+                duration: Duration::from_millis(2),
+                authorization_offset: Some(Duration::from_millis(1)),
+                launch: launch.clone(),
+                restart_safety: restart_safety.clone(),
+                boundary_detail: memcordon_core::BoundaryMechanismEvidence::Standard {
+                    backend: "drift-fixture".to_owned(),
+                },
+            },
+            launch,
+            restart_safety,
+        },
+        1,
+        AttemptKind::Initial,
+        Duration::ZERO,
+        Duration::from_millis(3),
+        AttemptHistory::default(),
+        SupervisionAggregates::default(),
+        RestartSummary::default(),
+        1,
+    )
 }
 
 fn outside_deadline_evidence(
@@ -899,6 +1138,7 @@ fn error_record(
             None
         },
         provider_rejection: error.provider_rejection.clone(),
+        backend_selection_drift: None,
     }
 }
 fn proof_from_error(error: &Error) -> RestartSafetyProof {

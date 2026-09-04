@@ -317,6 +317,7 @@ const STRESS_MATRIX: [(&str, &str); 5] = [
     ("windows-x64", "windows-2025"),
     ("windows-arm64", "windows-11-arm"),
 ];
+const DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES: u64 = 45;
 
 fn check_runner_matrix(
     jobs: &Mapping,
@@ -392,6 +393,18 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
             != Some(true)
     {
         return Err(failure("deep CI concurrency differs"));
+    }
+    let fuzz = mapping(
+        jobs.get(key("fuzz"))
+            .ok_or_else(|| failure("deep CI fuzz job is absent"))?,
+        "deep CI fuzz",
+    )?;
+    let fuzz_timeout = fuzz
+        .get(key("timeout-minutes"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| failure("deep CI fuzz timeout is absent or nonnumeric"))?;
+    if fuzz_timeout < DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES {
+        return Err(failure("deep CI fuzz timeout is below workload minimum"));
     }
     check_runner_matrix(jobs, "stress", &STRESS_MATRIX, "deep CI stress")?;
     Ok(())
@@ -1439,44 +1452,35 @@ fn check_release_structure(
     }
     let linux_dependency_key = "cargo-deps-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}";
     let linux_target_key = "cargo-target-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
-    for (job_name, runner, dependency_key, target_key, suite, artifact_name, artifact_path) in [(
-        "linux-certification",
+    let linux_job_name = "linux-certification";
+    let linux_job = mapping(
+        jobs.get(key(linux_job_name))
+            .ok_or_else(|| failure(format!("release {linux_job_name} job is absent")))?,
+        linux_job_name,
+    )?;
+    let linux_context = format!("release {linux_job_name} job");
+    exact_mapping_keys(
+        linux_job,
+        &["name", "needs", "runs-on", "timeout-minutes", "steps"],
+        &linux_context,
+    )?;
+    if scalar(linux_job, "needs") != Some("preflight") {
+        return Err(failure(format!(
+            "release {linux_job_name} must depend on preflight"
+        )));
+    }
+    check_certification_job(
+        linux_job,
         "ubuntu-24.04",
+        75,
+        2,
         linux_dependency_key,
         linux_target_key,
         "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2",
         "release-certification-linux",
         "target/ci/reports/linux-sealed-v2",
-    )] {
-        let job = mapping(
-            jobs.get(key(job_name))
-                .ok_or_else(|| failure(format!("release {job_name} job is absent")))?,
-            job_name,
-        )?;
-        let context = format!("release {job_name} job");
-        exact_mapping_keys(
-            job,
-            &["name", "needs", "runs-on", "timeout-minutes", "steps"],
-            &context,
-        )?;
-        if scalar(job, "needs") != Some("preflight") {
-            return Err(failure(format!(
-                "release {job_name} must depend on preflight"
-            )));
-        }
-        check_certification_job(
-            job,
-            runner,
-            75,
-            2,
-            dependency_key,
-            target_key,
-            suite,
-            artifact_name,
-            artifact_path,
-            &context,
-        )?;
-    }
+        &linux_context,
+    )?;
     for job_name in [
         "windows-loader-production",
         "windows-provider-lifecycle",
@@ -2149,25 +2153,28 @@ impl<'ast> Visit<'ast> for RustPolicy {
             {
                 self.calls_current_exe = true;
             }
-            if segments.last().is_some_and(|segment| segment == "new") {
-                if let Some(syn::Expr::Lit(literal)) = expression.args.first() {
-                    if let syn::Lit::Str(program) = &literal.lit {
-                        if [
-                            "sh",
-                            "bash",
-                            "cmd",
-                            "powershell",
-                            "pwsh",
-                            "/bin/sh",
-                            "/bin/bash",
-                        ]
-                        .contains(&program.value().as_str())
-                        {
-                            self.violations
-                                .push("shell process spawn is forbidden".to_owned());
-                        }
-                    }
-                }
+            let constructs_shell = segments.last().is_some_and(|segment| segment == "new")
+                && expression.args.first().is_some_and(|argument| {
+                    let syn::Expr::Lit(literal) = argument else {
+                        return false;
+                    };
+                    let syn::Lit::Str(program) = &literal.lit else {
+                        return false;
+                    };
+                    [
+                        "sh",
+                        "bash",
+                        "cmd",
+                        "powershell",
+                        "pwsh",
+                        "/bin/sh",
+                        "/bin/bash",
+                    ]
+                    .contains(&program.value().as_str())
+                });
+            if constructs_shell {
+                self.violations
+                    .push("shell process spawn is forbidden".to_owned());
             }
         }
         syn::visit::visit_expr_call(self, expression);
@@ -3024,6 +3031,14 @@ jobs:
         env:
           CARGO_HOME: target/ci/cargo-publish-home/slot-3
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_3.outputs.token }}
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
+      - name: Acquire crates.io token for publication slot 4
+        id: crates_auth_4
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+      - name: Publish next crate in slot 4
+        env:
+          CARGO_HOME: target/ci/cargo-publish-home/slot-4
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_4.outputs.token }}
         run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
       - name: Finalize GitHub release
         env:

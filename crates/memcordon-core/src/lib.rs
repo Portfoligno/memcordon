@@ -54,11 +54,11 @@ pub use restart::{
 pub use state_machine::{RunState, StateMachine, StateTransitionError};
 pub use supervision::{
     AttemptHistory, AttemptKind, AttemptPhase, AttemptRecord, BackendCapabilityReport,
-    BoundaryCapability, BoundaryClass, BoundaryMechanismEvidence, BoundaryQualificationReport,
-    CapabilityStatusReport, CredentialTransitionDisposition, DETAILED_ATTEMPT_CAPACITY,
-    LaunchEvidence, LinuxSealedEvidenceV2, MacosSealedEvidence, MemoryCapabilityReport,
-    RestartDecisionKind, RestartDecisionRecord, RestartSafetyProof, RestartSummary,
-    SealedUnavailableReport, SupervisionAggregates, SupervisionDeadlineEvidence,
+    BackendSelectionDriftEvidence, BoundaryCapability, BoundaryClass, BoundaryMechanismEvidence,
+    BoundaryQualificationReport, CapabilityStatusReport, CredentialTransitionDisposition,
+    DETAILED_ATTEMPT_CAPACITY, LaunchEvidence, LinuxSealedEvidenceV2, MacosSealedEvidence,
+    MemoryCapabilityReport, RestartDecisionKind, RestartDecisionRecord, RestartSafetyProof,
+    RestartSummary, SealedUnavailableReport, SupervisionAggregates, SupervisionDeadlineEvidence,
     SupervisionErrorRecord, SupervisionExecution, SupervisionModelError, SupervisionPhase,
     SupervisionTerminal, WindowsLoaderCleanupOutcomeV1, WindowsLoaderCleanupStatusV1,
     WindowsLoaderNativeStatusV1, WindowsLoaderQualificationFailureV2,

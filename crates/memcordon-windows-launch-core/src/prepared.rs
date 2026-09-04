@@ -52,6 +52,7 @@ impl PreparedLoaderCommandV1 {
         &self.units
     }
 
+    #[cfg(windows)]
     pub(crate) fn units_mut(&mut self) -> &mut [u16] {
         &mut self.units
     }
@@ -107,6 +108,7 @@ impl PreparedLoaderEnvironmentV1 {
         &self.units
     }
 
+    #[cfg(windows)]
     pub(crate) fn units_mut(&mut self) -> &mut [u16] {
         &mut self.units
     }

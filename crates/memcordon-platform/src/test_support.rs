@@ -146,6 +146,35 @@ pub fn backend_selection_matches(
     crate::supervisor::test_backend_selection_matches(selected, observed, metric)
 }
 
+#[allow(clippy::result_large_err)]
+pub fn backend_selection_drift_execution(
+    selected: memcordon_core::BackendCapabilityReport,
+    observed: memcordon_core::BackendCapabilityReport,
+    metric: memcordon_core::Metric,
+) -> Result<memcordon_core::SupervisionExecution, memcordon_core::Error> {
+    crate::supervisor::test_backend_selection_drift_execution(selected, observed, metric)
+}
+
+#[cfg(windows)]
+pub fn windows_preflight_backend_capabilities(
+    qualification: memcordon_core::WindowsQualificationReceiptV1,
+) -> memcordon_core::BackendCapabilityReport {
+    crate::capabilities_for(
+        &crate::windows_job::info_from_qualification(qualification),
+        memcordon_core::BoundaryRequirement::Sealed,
+    )
+}
+
+#[cfg(windows)]
+pub fn windows_runtime_backend_capabilities(
+    qualification: memcordon_core::WindowsQualificationReceiptV1,
+) -> memcordon_core::BackendCapabilityReport {
+    crate::capabilities_for(
+        &crate::sealed::windows::info(qualification),
+        memcordon_core::BoundaryRequirement::Sealed,
+    )
+}
+
 pub fn sealed_deadline_rejection_is_outside_attempt(
     policy: &memcordon_core::Policy,
     context: crate::AttemptContext,
@@ -181,6 +210,121 @@ pub fn windows_nested_assignment() -> io::Result<bool> {
 #[cfg(windows)]
 pub fn windows_assignment_failure() -> io::Result<bool> {
     crate::windows_job::test_assignment_failure()
+}
+
+#[cfg(windows)]
+pub fn windows_token_group_entries_range(
+    byte_length: usize,
+    entry_count: usize,
+) -> Result<std::ops::Range<usize>, String> {
+    crate::sealed::windows::checked_token_group_entries_range(byte_length, entry_count)
+}
+
+#[cfg(windows)]
+pub fn windows_token_group_entries(
+    storage: &[u8],
+    byte_length: usize,
+) -> Result<Vec<(usize, u32)>, String> {
+    crate::sealed::windows::token_group_entries(storage, byte_length).map(|entries| {
+        entries
+            .iter()
+            .map(|entry| (entry.Sid as usize, entry.Attributes))
+            .collect()
+    })
+}
+
+#[cfg(windows)]
+pub fn windows_token_group_sid_range(
+    storage: &[u8],
+    byte_length: usize,
+    sid_offset: usize,
+) -> Result<std::ops::Range<usize>, String> {
+    let sid = storage.as_ptr().wrapping_add(sid_offset).cast();
+    crate::sealed::windows::checked_token_group_sid_range(storage, byte_length, sid)
+}
+
+#[cfg(windows)]
+pub fn windows_token_group_storage_contains(
+    storage: &[u8],
+    byte_length: usize,
+    expected: &[u32],
+) -> Result<bool, String> {
+    crate::sealed::windows::token_group_storage_contains(storage, byte_length, expected)
+}
+
+#[cfg(windows)]
+pub fn windows_token_user_sid_range(
+    storage: &[u8],
+    byte_length: usize,
+) -> Result<std::ops::Range<usize>, String> {
+    crate::sealed::windows::token_user_sid(storage, byte_length).map(|sid| {
+        let start = sid.as_ptr() as usize - storage.as_ptr() as usize;
+        start..start + sid.len()
+    })
+}
+
+#[cfg(windows)]
+pub fn windows_token_user_storage_matches(
+    storage: &[u8],
+    byte_length: usize,
+    expected: &[u32],
+) -> Result<bool, String> {
+    crate::sealed::windows::token_user_storage_matches(storage, byte_length, expected)
+}
+
+#[cfg(windows)]
+struct WindowsTestToken(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for WindowsTestToken {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn windows_current_token_contains_world_sid() -> Result<bool, String> {
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TokenGroups, WinWorldSid,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    let token = WindowsTestToken(token);
+    let word_size = std::mem::size_of::<u32>();
+    let mut expected = vec![0_u32; (SECURITY_MAX_SID_SIZE as usize).div_ceil(word_size)];
+    let mut expected_byte_length = u32::try_from(expected.len() * word_size)
+        .map_err(|_| "well-known SID buffer length exceeds u32".to_owned())?;
+    if unsafe {
+        CreateWellKnownSid(
+            WinWorldSid,
+            std::ptr::null_mut(),
+            expected.as_mut_ptr().cast(),
+            &raw mut expected_byte_length,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    crate::sealed::windows::token_groups_contain(token.0, TokenGroups, &expected)
+}
+
+#[cfg(windows)]
+pub fn windows_current_token_user_sid_string() -> Result<String, String> {
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    let token = WindowsTestToken(token);
+    crate::sealed::windows::token_user_sid_string(token.0)
 }
 
 impl ProcessIdentity {

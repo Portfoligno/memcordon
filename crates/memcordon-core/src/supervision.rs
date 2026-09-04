@@ -206,6 +206,11 @@ pub struct WindowsLoaderCleanupOutcomeV1 {
 pub struct WindowsLoaderReadyEvidenceV1 {
     pub schema_version: u32,
     pub launch_plan_sha256: String,
+    /// Canonical serialized production plan carried with the typed outcome.
+    /// The package frontend validates it as `ProductionLoaderPlanV1` before
+    /// exporting it outside rollback-owned state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_plan_json: Option<String>,
     pub elapsed_millis: u64,
 }
 
@@ -219,6 +224,9 @@ pub struct WindowsLoaderQualificationFailureV2 {
     pub elapsed_millis: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_plan_sha256: Option<String>,
+    /// Canonical serialized production plan carried with post-plan failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_plan_json: Option<String>,
     pub qualification_id: String,
     pub cleanup: WindowsLoaderCleanupOutcomeV1,
     pub diagnostic_id: Option<String>,
@@ -233,9 +241,31 @@ pub enum WindowsLoaderQualificationOutcomeV2 {
 }
 
 impl WindowsLoaderQualificationOutcomeV2 {
+    pub fn launch_plan_json(&self) -> Option<&str> {
+        match self {
+            Self::Ready(ready) => ready.launch_plan_json.as_deref(),
+            Self::Failed(failure) => failure.launch_plan_json.as_deref(),
+        }
+    }
+
+    pub fn set_launch_plan_json(&mut self, plan_json: String) {
+        match self {
+            Self::Ready(ready) => ready.launch_plan_json = Some(plan_json),
+            Self::Failed(failure) => failure.launch_plan_json = Some(plan_json),
+        }
+    }
+
+    pub fn clear_launch_plan_json(&mut self) {
+        match self {
+            Self::Ready(ready) => ready.launch_plan_json = None,
+            Self::Failed(failure) => failure.launch_plan_json = None,
+        }
+    }
+
     pub fn is_consistent(&self) -> bool {
         const MAX_CODE_BYTES: usize = 128;
         const MAX_DETAIL_BYTES: usize = 512;
+        const MAX_PLAN_JSON_BYTES: usize = 64 * 1024;
         let digest_is_valid = |value: &str| {
             value.len() == Sha256::digest([]).len() * 2
                 && value
@@ -244,7 +274,15 @@ impl WindowsLoaderQualificationOutcomeV2 {
         };
         match self {
             Self::Ready(ready) => {
-                ready.schema_version == 1 && digest_is_valid(&ready.launch_plan_sha256)
+                ready.schema_version == 1
+                    && digest_is_valid(&ready.launch_plan_sha256)
+                    && ready.launch_plan_json.as_ref().is_none_or(|json| {
+                        loader_plan_json_is_bound(
+                            json,
+                            &ready.launch_plan_sha256,
+                            MAX_PLAN_JSON_BYTES,
+                        )
+                    })
             }
             Self::Failed(failure) => {
                 failure.schema_version == 2
@@ -258,6 +296,13 @@ impl WindowsLoaderQualificationOutcomeV2 {
                         .launch_plan_sha256
                         .as_ref()
                         .is_none_or(|digest| digest_is_valid(digest))
+                    && match (&failure.launch_plan_sha256, &failure.launch_plan_json) {
+                        (Some(digest), Some(json)) => {
+                            loader_plan_json_is_bound(json, digest, MAX_PLAN_JSON_BYTES)
+                        }
+                        (None, Some(_)) => false,
+                        (_, None) => true,
+                    }
                     && (failure.launch_plan_sha256.is_some()
                         || matches!(
                             failure.stage,
@@ -282,6 +327,22 @@ impl WindowsLoaderQualificationOutcomeV2 {
             }
         }
     }
+}
+
+fn loader_plan_json_is_bound(json: &str, expected_digest: &str, maximum: usize) -> bool {
+    if json.is_empty() || json.len() > maximum || json.contains('\0') {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()?
+                .get("launch_plan_sha256")?
+                .as_str()
+                .map(|digest| digest == expected_digest)
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -495,6 +556,87 @@ impl RestartSafetyProof {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BackendSelectionDriftEvidence {
+    pub selected: Box<BackendCapabilityReport>,
+    pub comparison_expected: Box<BackendCapabilityReport>,
+    pub observed: Box<BackendCapabilityReport>,
+    pub mismatched_fields: Vec<String>,
+}
+
+impl BackendSelectionDriftEvidence {
+    pub fn is_consistent(&self) -> bool {
+        let normalization_is_valid = if self.selected == self.comparison_expected {
+            true
+        } else {
+            let mut denormalized = self.comparison_expected.as_ref().clone();
+            match (&self.selected.memory, &mut denormalized.memory) {
+                (Some(selected), Some(expected)) => expected.metric.clone_from(&selected.metric),
+                _ => return false,
+            }
+            denormalized == *self.selected
+        };
+        normalization_is_valid
+            && self.selected != self.observed
+            && self.mismatched_fields
+                == backend_capability_mismatched_fields(&self.comparison_expected, &self.observed)
+    }
+}
+
+fn backend_capability_mismatched_fields(
+    expected: &BackendCapabilityReport,
+    observed: &BackendCapabilityReport,
+) -> Vec<String> {
+    let mut fields = Vec::new();
+    if expected.name != observed.name {
+        fields.push("name".to_owned());
+    }
+    if expected.containment != observed.containment {
+        fields.push("containment".to_owned());
+    }
+    if expected.boundary != observed.boundary {
+        fields.push("boundary".to_owned());
+    }
+    if expected.memory != observed.memory {
+        fields.push("memory".to_owned());
+    }
+    if expected.deadline != observed.deadline {
+        fields.push("deadline".to_owned());
+    }
+    if expected.restart != observed.restart {
+        fields.push("restart".to_owned());
+    }
+    if expected.deadline_scopes != observed.deadline_scopes {
+        fields.push("deadline_scopes".to_owned());
+    }
+    if expected.deadline_origin != observed.deadline_origin {
+        fields.push("deadline_origin".to_owned());
+    }
+    if expected.restart_conditions != observed.restart_conditions {
+        fields.push("restart_conditions".to_owned());
+    }
+    if expected.persistent_restart_state != observed.persistent_restart_state {
+        fields.push("persistent_restart_state".to_owned());
+    }
+    if expected.startup_containment != observed.startup_containment {
+        fields.push("startup_containment".to_owned());
+    }
+    if expected.restart_cleanup_condition != observed.restart_cleanup_condition {
+        fields.push("restart_cleanup_condition".to_owned());
+    }
+    if expected.limitations != observed.limitations {
+        fields.push("limitations".to_owned());
+    }
+    if expected.boundary_qualification != observed.boundary_qualification {
+        fields.push("boundary_qualification".to_owned());
+    }
+    if expected.sealed_unavailable != observed.sealed_unavailable {
+        fields.push("sealed_unavailable".to_owned());
+    }
+    fields.sort_unstable();
+    fields
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SupervisionErrorRecord {
     pub category: String,
     pub code: String,
@@ -507,6 +649,8 @@ pub struct SupervisionErrorRecord {
     pub workload_may_be_alive: bool,
     pub initial_spawn_failure: Option<crate::InitialSpawnFailure>,
     pub provider_rejection: Option<crate::ProviderRejectionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_selection_drift: Option<BackendSelectionDriftEvidence>,
 }
 
 impl SupervisionErrorRecord {
@@ -554,7 +698,23 @@ impl SupervisionErrorRecord {
                             && value.restart_safety.workload_empty != Some(true))
                     && value.is_consistent()
             });
-        initial_spawn_is_consistent && provider_rejection_is_consistent
+        let backend_drift_is_consistent = match &self.backend_selection_drift {
+            Some(value) => {
+                self.category == "monitor"
+                    && self.code == "MCBACKEND-SELECTION-DRIFT"
+                    && self.supervision_phase == SupervisionPhase::ActiveAttempt
+                    && self.launch_phase.as_deref() == Some("runtime-backend-evidence")
+                    && self.attempt_number.is_some()
+                    && self.target_released
+                    && self.initial_spawn_failure.is_none()
+                    && self.provider_rejection.is_none()
+                    && value.is_consistent()
+            }
+            None => self.code != "MCBACKEND-SELECTION-DRIFT",
+        };
+        initial_spawn_is_consistent
+            && provider_rejection_is_consistent
+            && backend_drift_is_consistent
     }
 }
 
@@ -689,8 +849,8 @@ impl AttemptHistory {
         let mut next_aggregates = aggregates.clone();
         if let Some(outcome) = &record.outcome {
             next_aggregates.observe_outcome(outcome)?;
-        } else if record.error.is_some() {
-            next_aggregates.observe_setup_failure()?;
+        } else if let Some(error) = &record.error {
+            next_aggregates.observe_error(error)?;
         }
         let next_omitted =
             if self.first.is_some() && self.recent.len() == DETAILED_ATTEMPT_CAPACITY - 1 {
@@ -874,6 +1034,21 @@ impl SupervisionAggregates {
             .checked_add(1)
             .ok_or(SupervisionModelError::CounterRange)?;
         Ok(())
+    }
+
+    pub fn observe_error(
+        &mut self,
+        error: &SupervisionErrorRecord,
+    ) -> Result<(), SupervisionModelError> {
+        if error.supervision_phase == SupervisionPhase::ActiveAttempt {
+            self.monitor_failures = self
+                .monitor_failures
+                .checked_add(1)
+                .ok_or(SupervisionModelError::CounterRange)?;
+            Ok(())
+        } else {
+            self.observe_setup_failure()
+        }
     }
 }
 

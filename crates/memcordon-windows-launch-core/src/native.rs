@@ -11,11 +11,14 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
+    ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
-    GetSecurityDescriptorLength, OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
+    ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION, GENERIC_MAPPING,
+    GROUP_SECURITY_INFORMATION, GetAce, GetAclInformation, GetKernelObjectSecurity,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorLength,
+    MapGenericMask, OWNER_SECURITY_INFORMATION, SE_SELF_RELATIVE, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::System::IO::CreateIoCompletionPort;
 use windows_sys::Win32::System::JobObjects::{
@@ -26,16 +29,28 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
+use windows_sys::Win32::System::SystemServices::{
+    JOB_OBJECT_ASSIGN_PROCESS, JOB_OBJECT_IMPERSONATE, JOB_OBJECT_QUERY, JOB_OBJECT_SET_ATTRIBUTES,
+    JOB_OBJECT_SET_SECURITY_ATTRIBUTES, JOB_OBJECT_TERMINATE,
+};
 use windows_sys::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW,
-    STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_ALL_ACCESS, PROCESS_CREATE_PROCESS,
+    PROCESS_CREATE_THREAD, PROCESS_DUP_HANDLE, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
+    PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+    PROCESS_VM_WRITE, ResumeThread, STARTUPINFOEXW, STARTUPINFOW, THREAD_ALL_ACCESS,
+    THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_QUERY_LIMITED_INFORMATION, THREAD_RESUME,
+    THREAD_SET_CONTEXT, THREAD_SET_INFORMATION, THREAD_SET_THREAD_TOKEN, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 const PROCESS_HANDLE_INFORMATION_CLASS: u32 = 51;
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xc000_0004_u32 as i32;
 const MAX_PROCESS_HANDLE_SNAPSHOT_BYTES: usize = 1024 * 1024;
+const READ_CONTROL_ACCESS: u32 = 0x0002_0000;
+const STANDARD_RIGHTS_REQUIRED_ACCESS: u32 = 0x000f_0000;
+const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 
 #[link(name = "ntdll")]
 unsafe extern "system" {
@@ -131,6 +146,7 @@ pub unsafe fn create_process_native(
 pub struct NativeSecurityDescriptorV1 {
     raw: *mut c_void,
     sddl_sha256: String,
+    information: u32,
 }
 
 impl NativeSecurityDescriptorV1 {
@@ -157,9 +173,19 @@ impl NativeSecurityDescriptorV1 {
         {
             return Err(last_error("security-descriptor-parse"));
         }
+        let information = selected_security_information(sddl);
+        if information == 0 {
+            // SAFETY: raw is the exact LocalAlloc result and has not escaped.
+            unsafe { LocalFree(raw as HLOCAL) };
+            return Err(contract_error(
+                "security-descriptor-selection",
+                "security descriptor SDDL selects no owner, group, or DACL",
+            ));
+        }
         Ok(Self {
             raw,
             sddl_sha256: hex::encode(Sha256::digest(sddl.as_bytes())),
+            information,
         })
     }
 
@@ -195,6 +221,115 @@ impl NativeSecurityDescriptorV1 {
             )
         };
         Ok(hex::encode(Sha256::digest(bytes)))
+    }
+
+    /// Verifies the selected owner/group/DACL policy of a live kernel object.
+    ///
+    /// Windows maps generic ACE rights to object-specific rights during object
+    /// creation and may materialize unselected descriptor fields. This method
+    /// therefore compares canonical selected semantics rather than allocation
+    /// bytes.
+    pub fn verify_kernel_object(
+        &self,
+        handle: HANDLE,
+        kind: NativeKernelObjectKindV1,
+    ) -> Result<(), NativeCreateErrorV1> {
+        verify_kernel_object_security(handle, self, kind)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeKernelObjectKindV1 {
+    Job,
+    Process,
+    Thread,
+}
+
+impl NativeKernelObjectKindV1 {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Job => "Job",
+            Self::Process => "Process",
+            Self::Thread => "Thread",
+        }
+    }
+
+    const fn size_code(self) -> &'static str {
+        match self {
+            Self::Job => "job-security-size-readback",
+            Self::Process => "process-security-size-readback",
+            Self::Thread => "thread-security-size-readback",
+        }
+    }
+
+    const fn readback_code(self) -> &'static str {
+        match self {
+            Self::Job => "job-security-readback",
+            Self::Process => "process-security-readback",
+            Self::Thread => "thread-security-readback",
+        }
+    }
+
+    const fn normalization_code(self) -> &'static str {
+        match self {
+            Self::Job => "job-security-normalization",
+            Self::Process => "process-security-normalization",
+            Self::Thread => "thread-security-normalization",
+        }
+    }
+
+    const fn mismatch_code(self) -> &'static str {
+        match self {
+            Self::Job => "job-security-mismatch",
+            Self::Process => "process-security-mismatch",
+            Self::Thread => "thread-security-mismatch",
+        }
+    }
+
+    const fn generic_mapping(self) -> GENERIC_MAPPING {
+        match self {
+            Self::Job => GENERIC_MAPPING {
+                GenericRead: READ_CONTROL_ACCESS | JOB_OBJECT_QUERY,
+                GenericWrite: READ_CONTROL_ACCESS
+                    | JOB_OBJECT_ASSIGN_PROCESS
+                    | JOB_OBJECT_SET_ATTRIBUTES
+                    | JOB_OBJECT_TERMINATE,
+                GenericExecute: READ_CONTROL_ACCESS | SYNCHRONIZE_ACCESS,
+                GenericAll: STANDARD_RIGHTS_REQUIRED_ACCESS
+                    | SYNCHRONIZE_ACCESS
+                    | JOB_OBJECT_ASSIGN_PROCESS
+                    | JOB_OBJECT_SET_ATTRIBUTES
+                    | JOB_OBJECT_QUERY
+                    | JOB_OBJECT_TERMINATE
+                    | JOB_OBJECT_SET_SECURITY_ATTRIBUTES
+                    | JOB_OBJECT_IMPERSONATE,
+            },
+            Self::Process => GENERIC_MAPPING {
+                GenericRead: READ_CONTROL_ACCESS | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                GenericWrite: READ_CONTROL_ACCESS
+                    | PROCESS_CREATE_PROCESS
+                    | PROCESS_CREATE_THREAD
+                    | PROCESS_DUP_HANDLE
+                    | PROCESS_SET_INFORMATION
+                    | PROCESS_SET_QUOTA
+                    | PROCESS_VM_OPERATION
+                    | PROCESS_VM_WRITE,
+                GenericExecute: READ_CONTROL_ACCESS | SYNCHRONIZE_ACCESS,
+                GenericAll: PROCESS_ALL_ACCESS,
+            },
+            Self::Thread => GENERIC_MAPPING {
+                GenericRead: READ_CONTROL_ACCESS | THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT,
+                GenericWrite: READ_CONTROL_ACCESS
+                    | THREAD_SET_INFORMATION
+                    | THREAD_SET_CONTEXT
+                    | THREAD_SET_THREAD_TOKEN,
+                GenericExecute: READ_CONTROL_ACCESS
+                    | SYNCHRONIZE_ACCESS
+                    | THREAD_QUERY_LIMITED_INFORMATION
+                    | THREAD_RESUME,
+                GenericAll: THREAD_ALL_ACCESS,
+            },
+        }
     }
 }
 
@@ -289,7 +424,7 @@ impl ProductionJobV1 {
             handle,
             _completion_port: completion_port,
         };
-        verify_kernel_object_security(job.handle(), &security)?;
+        verify_kernel_object_security(job.handle(), &security, NativeKernelObjectKindV1::Job)?;
         let configured = job.query_limits()?;
         let flags = configured.BasicLimitInformation.LimitFlags;
         if flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0
@@ -372,20 +507,15 @@ impl ProductionJobV1 {
 fn verify_kernel_object_security(
     handle: HANDLE,
     expected: &NativeSecurityDescriptorV1,
+    kind: NativeKernelObjectKindV1,
 ) -> Result<(), NativeCreateErrorV1> {
-    let information =
-        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let information = expected.information;
     let mut required = 0_u32;
     unsafe { GetKernelObjectSecurity(handle, information, ptr::null_mut(), 0, &raw mut required) };
     if required == 0 {
-        return Err(last_error("job-security-size-readback"));
+        return Err(last_error(kind.size_code()));
     }
-    let mut observed =
-        vec![
-            0_u8;
-            usize::try_from(required)
-                .map_err(|_| contract_error("job-security-size", "Job security size overflow"))?
-        ];
+    let mut observed = descriptor_buffer(required, kind)?;
     if unsafe {
         GetKernelObjectSecurity(
             handle,
@@ -396,28 +526,212 @@ fn verify_kernel_object_security(
         )
     } == 0
     {
-        return Err(last_error("job-security-readback"));
+        return Err(last_error(kind.readback_code()));
     }
-    let expected_length = unsafe { GetSecurityDescriptorLength(expected.raw.cast()) };
-    let expected_bytes = unsafe {
-        std::slice::from_raw_parts(
-            expected.raw.cast::<u8>(),
-            usize::try_from(expected_length).map_err(|_| {
-                contract_error("job-security-size", "Job security descriptor size overflow")
-            })?,
-        )
-    };
-    observed.truncate(
-        usize::try_from(required)
-            .map_err(|_| contract_error("job-security-size", "Job security size overflow"))?,
-    );
-    if observed != expected_bytes {
+    let expected_sddl = normalized_descriptor_sddl(expected.raw, information, kind)?;
+    let observed_sddl =
+        normalized_descriptor_sddl(observed.as_mut_ptr().cast(), information, kind)?;
+    if observed_sddl != expected_sddl {
         return Err(contract_error(
-            "job-security-mismatch",
-            "Job security descriptor readback differs from the production plan",
+            kind.mismatch_code(),
+            &format!(
+                "{} security descriptor readback differs from the production plan",
+                kind.label()
+            ),
         ));
     }
     Ok(())
+}
+
+fn selected_security_information(sddl: &str) -> u32 {
+    let mut information = 0_u32;
+    if sddl.contains("O:") {
+        information |= OWNER_SECURITY_INFORMATION;
+    }
+    if sddl.contains("G:") {
+        information |= GROUP_SECURITY_INFORMATION;
+    }
+    if sddl.contains("D:") {
+        information |= DACL_SECURITY_INFORMATION;
+    }
+    information
+}
+
+fn descriptor_buffer(
+    bytes: u32,
+    kind: NativeKernelObjectKindV1,
+) -> Result<Vec<usize>, NativeCreateErrorV1> {
+    let bytes = usize::try_from(bytes).map_err(|_| {
+        contract_error(
+            kind.size_code(),
+            &format!("{} security descriptor size overflow", kind.label()),
+        )
+    })?;
+    let words = bytes.div_ceil(std::mem::size_of::<usize>());
+    Ok(vec![0_usize; words])
+}
+
+fn normalized_descriptor_sddl(
+    descriptor: *mut c_void,
+    information: u32,
+    kind: NativeKernelObjectKindV1,
+) -> Result<String, NativeCreateErrorV1> {
+    let mut normalized = normalized_descriptor_copy(descriptor, kind)?;
+    let mut text = ptr::null_mut();
+    let mut text_units = 0_u32;
+    // SAFETY: normalized is a live self-relative descriptor and the API
+    // returns a LocalAlloc-owned NUL-terminated UTF-16 string.
+    if unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            normalized.as_mut_ptr().cast(),
+            SDDL_REVISION_1,
+            information,
+            &raw mut text,
+            &raw mut text_units,
+        )
+    } == 0
+    {
+        return Err(last_error(kind.normalization_code()));
+    }
+    let text = LocalWideString(text);
+    let units = unsafe {
+        std::slice::from_raw_parts(
+            text.0,
+            usize::try_from(text_units).map_err(|_| {
+                contract_error(
+                    kind.normalization_code(),
+                    "security descriptor text size overflow",
+                )
+            })?,
+        )
+    };
+    let units = units.strip_suffix(&[0]).ok_or_else(|| {
+        contract_error(
+            kind.normalization_code(),
+            "security descriptor text is not NUL-terminated",
+        )
+    })?;
+    String::from_utf16(units).map_err(|error| NativeCreateErrorV1 {
+        stable_code: kind.normalization_code(),
+        win32_error: None,
+        detail: error.to_string(),
+    })
+}
+
+fn normalized_descriptor_copy(
+    descriptor: *mut c_void,
+    kind: NativeKernelObjectKindV1,
+) -> Result<Vec<usize>, NativeCreateErrorV1> {
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: descriptor is live and both outputs are writable.
+    if unsafe { GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) } == 0
+    {
+        return Err(last_error(kind.normalization_code()));
+    }
+    if control & SE_SELF_RELATIVE == 0 {
+        return Err(contract_error(
+            kind.normalization_code(),
+            "kernel object security descriptor is not self-relative",
+        ));
+    }
+    // SAFETY: descriptor is a live self-relative descriptor.
+    let bytes = unsafe { GetSecurityDescriptorLength(descriptor) };
+    if bytes == 0 {
+        return Err(last_error(kind.normalization_code()));
+    }
+    let mut normalized = descriptor_buffer(bytes, kind)?;
+    // SAFETY: normalized is aligned and has at least bytes of writable storage.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            descriptor.cast::<u8>(),
+            normalized.as_mut_ptr().cast::<u8>(),
+            usize::try_from(bytes).map_err(|_| {
+                contract_error(kind.size_code(), "security descriptor size overflow")
+            })?,
+        );
+    }
+    normalize_descriptor_dacl(normalized.as_mut_ptr().cast(), kind)?;
+    Ok(normalized)
+}
+
+fn normalize_descriptor_dacl(
+    descriptor: *mut c_void,
+    kind: NativeKernelObjectKindV1,
+) -> Result<(), NativeCreateErrorV1> {
+    let mut present = 0_i32;
+    let mut defaulted = 0_i32;
+    let mut acl = ptr::null_mut();
+    // SAFETY: descriptor is a writable descriptor copy and all outputs are writable.
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &raw mut present,
+            &raw mut acl,
+            &raw mut defaulted,
+        )
+    } == 0
+    {
+        return Err(last_error(kind.normalization_code()));
+    }
+    if present == 0 || acl.is_null() {
+        return Ok(());
+    }
+    let mut acl_information = ACL_SIZE_INFORMATION::default();
+    // SAFETY: acl belongs to the writable descriptor copy and the output size
+    // matches ACL_SIZE_INFORMATION.
+    if unsafe {
+        GetAclInformation(
+            acl,
+            (&raw mut acl_information).cast(),
+            u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>()).map_err(|_| {
+                contract_error(kind.normalization_code(), "ACL information size overflow")
+            })?,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(last_error(kind.normalization_code()));
+    }
+    for index in 0..acl_information.AceCount {
+        let mut ace = ptr::null_mut();
+        // SAFETY: index is bounded by the queried ACE count and output is writable.
+        if unsafe { GetAce(acl, index, &raw mut ace) } == 0 {
+            return Err(last_error(kind.normalization_code()));
+        }
+        let bytes = ace.cast::<u8>();
+        let ace_size = u16::from_le_bytes([
+            // SAFETY: GetAce returned a live ACE header.
+            unsafe { *bytes.add(2) },
+            // SAFETY: GetAce returned a live ACE header.
+            unsafe { *bytes.add(3) },
+        ]);
+        if ace_size < 8 {
+            return Err(contract_error(
+                kind.normalization_code(),
+                "security descriptor ACE has no access mask",
+            ));
+        }
+        // SAFETY: the validated ACE contains an unaligned access mask at byte four.
+        let mut mask = unsafe { ptr::read_unaligned(bytes.add(4).cast::<u32>()) };
+        let mapping = kind.generic_mapping();
+        // SAFETY: both pointers reference initialized values for this call.
+        unsafe { MapGenericMask(&raw mut mask, &raw const mapping) };
+        // SAFETY: the writable descriptor copy contains this access-mask field.
+        unsafe { ptr::write_unaligned(bytes.add(4).cast::<u32>(), mask) };
+    }
+    Ok(())
+}
+
+struct LocalWideString(*mut u16);
+
+impl Drop for LocalWideString {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: this is the exact LocalAlloc result and is freed once.
+            unsafe { LocalFree(self.0 as HLOCAL) };
+        }
+    }
 }
 
 impl SuspendedNativeProcessV1 {
@@ -587,26 +901,22 @@ fn create_suspended_in_job_inner(
     }
     let process_handle = OwnedHandle::new(process.hProcess)?;
     let thread_handle = OwnedHandle::new(process.hThread)?;
-    for (handle, descriptor, stable_code) in [
+    for (handle, descriptor, kind) in [
         (
             process_handle.raw(),
             request.process_security,
-            "process-security-readback",
+            NativeKernelObjectKindV1::Process,
         ),
         (
             thread_handle.raw(),
             request.thread_security,
-            "thread-security-readback",
+            NativeKernelObjectKindV1::Thread,
         ),
     ] {
         if let Some(descriptor) = descriptor {
-            if let Err(error) = verify_kernel_object_security(handle, descriptor) {
+            if let Err(error) = verify_kernel_object_security(handle, descriptor, kind) {
                 terminate_created_process(process_handle.raw());
-                return Err(NativeCreateErrorV1 {
-                    stable_code,
-                    win32_error: error.win32_error,
-                    detail: error.detail,
-                });
+                return Err(error);
             }
         }
     }

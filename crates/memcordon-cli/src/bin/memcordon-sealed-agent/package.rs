@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::io::Read;
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
@@ -29,7 +30,12 @@ const LEGACY_PACKAGE_LEASE: &str = "/run/memcordon/sealed-package.lock";
 #[cfg(target_os = "linux")]
 const RUNTIME_DIRECTORY: &str = "/run/memcordon";
 
-pub fn run(operation: &OsStr, json: bool, ephemeral_ci: bool) -> Result<(), String> {
+pub fn run(
+    operation: &OsStr,
+    json: bool,
+    ephemeral_ci: bool,
+    qualification_artifact_directory: Option<&Path>,
+) -> Result<(), String> {
     if operation == "inspect" {
         if ephemeral_ci {
             return Err("--ephemeral-ci is valid only for package mutations".to_owned());
@@ -48,15 +54,20 @@ pub fn run(operation: &OsStr, json: bool, ephemeral_ci: bool) -> Result<(), Stri
     }
     #[cfg(target_os = "linux")]
     {
+        if qualification_artifact_directory.is_some() {
+            return Err(
+                "external qualification artifacts are available only on Windows".to_owned(),
+            );
+        }
         linux_mutation(operation, ephemeral_ci)
     }
     #[cfg(target_os = "windows")]
     {
-        crate::windows::package::mutate(operation, ephemeral_ci)
+        crate::windows::package::mutate(operation, ephemeral_ci, qualification_artifact_directory)
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        let _ = ephemeral_ci;
+        let _ = (ephemeral_ci, qualification_artifact_directory);
         Err("provider package mutation is unavailable on this platform".to_owned())
     }
 }

@@ -153,17 +153,26 @@ pub fn probe() -> ProbeReport {
 }
 
 pub(crate) fn info() -> BackendInfo {
-    let sealed = crate::sealed::windows::probe()
-        .map(crate::sealed::windows::info)
-        .map(|backend| backend.boundary_support.sealed)
-        .unwrap_or_else(|reason| crate::backend::SealedAvailability::Unavailable {
+    match crate::sealed::windows::probe() {
+        Ok(qualification) => info_from_qualification(qualification),
+        Err(reason) => info_with_sealed(crate::backend::SealedAvailability::Unavailable {
             reason: format!("Windows sealed provider is not installed or qualified: {reason}"),
             prerequisites: vec![
                 "matching memcordon-sealed-agent.exe package installation".to_owned(),
                 "qualified MemCordonSealedControl and MemCordonSealedLauncher services".to_owned(),
                 "native creation-time Job-list and exact handle-list certification".to_owned(),
             ],
-        });
+        }),
+    }
+}
+
+pub(crate) fn info_from_qualification(
+    qualification: memcordon_core::WindowsQualificationReceiptV1,
+) -> BackendInfo {
+    info_with_sealed(crate::sealed::windows::availability(qualification))
+}
+
+pub(crate) fn info_with_sealed(sealed: crate::backend::SealedAvailability) -> BackendInfo {
     BackendInfo {
         name: "windows-job-object",
         containment_supported: true,

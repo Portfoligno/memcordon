@@ -18,6 +18,7 @@ fn failed_loader_outcome() -> WindowsLoaderQualificationOutcomeV2 {
         native_status: Some(WindowsLoaderNativeStatusV1::Win32 { code: 5 }),
         elapsed_millis: 1,
         launch_plan_sha256: Some(digest('a')),
+        launch_plan_json: None,
         qualification_id: String::from("qualification-1"),
         cleanup: WindowsLoaderCleanupOutcomeV1 {
             status: WindowsLoaderCleanupStatusV1::Complete,

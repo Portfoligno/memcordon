@@ -667,7 +667,21 @@ pub(super) struct TargetDesktopLease {
     desktop_live_equality_sha256: String,
     pub(super) exact_name: String,
     pub(super) startup_name: Vec<u16>,
-    _loader_ready_evidence: Option<LoaderReadyEvidenceV1>,
+    loader_qualification: Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
+}
+
+#[derive(Clone)]
+pub(super) struct LoaderReadyQualificationV1 {
+    evidence: LoaderReadyEvidenceV1,
+    plan_json: String,
+}
+
+impl LoaderReadyQualificationV1 {
+    fn to_wire(&self) -> memcordon_core::WindowsLoaderQualificationOutcomeV2 {
+        let mut outcome = LaunchQualificationOutcomeV2::Ready(self.evidence.clone()).to_wire();
+        outcome.set_launch_plan_json(self.plan_json.clone());
+        outcome
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1282,6 +1296,114 @@ impl TargetUserObjectOpenPreflightV1 {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LoaderDesktopBindingV1 {
+    pub(crate) window_station_name: String,
+    pub(crate) desktop_name: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum LoaderDesktopBindingReadFailureKindV1 {
+    WindowStationHandle,
+    WindowStationName,
+    DesktopHandle,
+    DesktopName,
+}
+
+impl LoaderDesktopBindingReadFailureKindV1 {
+    const fn loader_control_stable_code(self) -> &'static str {
+        match self {
+            Self::WindowStationHandle | Self::WindowStationName => {
+                "loader-control-window-station-binding-readback"
+            }
+            Self::DesktopHandle | Self::DesktopName => "loader-control-desktop-binding-readback",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LoaderDesktopBindingReadFailureV1 {
+    pub(crate) kind: LoaderDesktopBindingReadFailureKindV1,
+    pub(crate) native_code: Option<i32>,
+    pub(crate) detail: String,
+}
+
+impl LoaderDesktopBindingReadFailureV1 {
+    fn native(kind: LoaderDesktopBindingReadFailureKindV1, detail: &'static str) -> Self {
+        let error = io::Error::last_os_error();
+        Self {
+            kind,
+            native_code: error.raw_os_error(),
+            detail: format!("{detail}: {error}"),
+        }
+    }
+
+    fn from_user_object(
+        kind: LoaderDesktopBindingReadFailureKindV1,
+        error: UserObjectQueryError,
+    ) -> Self {
+        Self {
+            kind,
+            native_code: error.native_code,
+            detail: error.detail,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LoaderControlDesktopEvidenceV1 {
+    Observed(LoaderDesktopBindingV1),
+    ReadFailed(LoaderDesktopBindingReadFailureV1),
+}
+
+pub(crate) fn validate_loader_control_desktop_evidence(
+    expected_exact_desktop: &str,
+    evidence: &LoaderControlDesktopEvidenceV1,
+) -> Result<(), ProcessCreateFailure> {
+    let (expected_window_station, expected_desktop) = expected_exact_desktop
+        .split_once('\\')
+        .ok_or_else(|| ProcessCreateFailure {
+            stable_code: String::from("loader-control-ready-frame-invalid"),
+            native_status: None,
+            detail: String::from("production desktop binding is not fully qualified"),
+        })?;
+    match evidence {
+        LoaderControlDesktopEvidenceV1::Observed(binding)
+            if binding.window_station_name == expected_window_station
+                && binding.desktop_name == expected_desktop =>
+        {
+            Ok(())
+        }
+        LoaderControlDesktopEvidenceV1::Observed(_) => Err(ProcessCreateFailure {
+            stable_code: String::from("loader-control-desktop-binding-mismatch"),
+            native_status: None,
+            detail: String::from(
+                "running loader-control USER binding differs from the production plan",
+            ),
+        }),
+        LoaderControlDesktopEvidenceV1::ReadFailed(failure)
+            if !failure.detail.is_empty()
+                && failure.detail.len() <= TARGET_DESKTOP_BOOTSTRAP_DETAIL_MAX_BYTES =>
+        {
+            Err(ProcessCreateFailure {
+                stable_code: String::from(failure.kind.loader_control_stable_code()),
+                native_status: failure
+                    .native_code
+                    .map(|code| NativeStatusV1::Win32 { code: code as u32 }),
+                detail: failure.detail.clone(),
+            })
+        }
+        LoaderControlDesktopEvidenceV1::ReadFailed(_) => Err(ProcessCreateFailure {
+            stable_code: String::from("loader-control-ready-frame-invalid"),
+            native_status: None,
+            detail: String::from("loader-control desktop readback failure is malformed"),
+        }),
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "kebab-case")]
 pub(super) enum TargetDesktopBootstrapMessageV1 {
@@ -1289,9 +1411,16 @@ pub(super) enum TargetDesktopBootstrapMessageV1 {
         schema_version: u32,
         nonce: String,
         expected_desktop: Option<String>,
+        observed_desktop_binding: Option<LoaderDesktopBindingV1>,
         bootstrap_identity: WindowsProcessIdentityV1,
         process_envelope: WindowsCallerTokenEnvelopeV1,
         process_snapshot: super::token::TokenQueryAttestationSnapshot,
+    },
+    LoaderReadyFailed {
+        schema_version: u32,
+        nonce: String,
+        role: TargetDesktopBootstrapRoleV1,
+        failure: LoaderDesktopBindingReadFailureV1,
     },
     LoaderControlRelease {
         schema_version: u32,
@@ -1367,9 +1496,7 @@ impl TargetDesktopLease {
     pub(super) fn loader_qualification(
         &self,
     ) -> Option<memcordon_core::WindowsLoaderQualificationOutcomeV2> {
-        self._loader_ready_evidence
-            .as_ref()
-            .map(|evidence| LaunchQualificationOutcomeV2::Ready(evidence.clone()).to_wire())
+        self.loader_qualification.clone()
     }
 
     pub(super) fn create(
@@ -1519,12 +1646,14 @@ impl TargetDesktopLease {
                 schema_version,
                 nonce: observed_nonce,
                 expected_desktop: observed_desktop,
+                observed_desktop_binding,
                 bootstrap_identity: observed_identity,
                 process_envelope: observed_envelope,
                 process_snapshot: observed_snapshot,
             } if schema_version == TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION
                 && observed_nonce == binding.nonce
                 && observed_desktop.is_none()
+                && observed_desktop_binding.is_none()
                 && observed_identity == bootstrap_identity
                 && observed_envelope == holder_envelope
                 && observed_snapshot == observed_holder_snapshot => {}
@@ -1598,10 +1727,10 @@ impl TargetDesktopLease {
             desktop_live_equality_sha256: frame.desktop_live_equality_sha256,
             exact_name,
             startup_name,
-            _loader_ready_evidence: None,
+            loader_qualification: None,
         };
         lease.attest_live()?;
-        let loader_ready_evidence = launch_target_desktop_probe(
+        let loader_ready_qualification = launch_target_desktop_probe(
             token,
             &target_envelope,
             &launcher_token,
@@ -1619,8 +1748,12 @@ impl TargetDesktopLease {
             &launch_context,
             &lease,
         )?;
-        lease._loader_ready_evidence = Some(loader_ready_evidence);
-        lease.attest_live()?;
+        lease.loader_qualification = Some(loader_ready_qualification.to_wire());
+        lease.attest_live().map_err(|detail| {
+            let mut error = TargetDesktopLeaseCreateError::from(detail);
+            error.loader_qualification = lease.loader_qualification.clone();
+            error
+        })?;
         Ok(lease)
     }
 
@@ -2195,7 +2328,7 @@ pub(super) fn launch_target_desktop_loader_control(
     association_preflight: &TargetUserObjectOpenPreflightV1,
     window_station_security_descriptor_sddl: &str,
     desktop_security_descriptor_sddl: &str,
-) -> Result<LoaderReadyEvidenceV1, TargetDesktopLeaseCreateError> {
+) -> Result<LoaderReadyQualificationV1, TargetDesktopLeaseCreateError> {
     let started = Instant::now();
     let mut result = launch_target_desktop_loader_control_inner(
         target_token,
@@ -2277,6 +2410,7 @@ pub(super) fn attach_preplan_loader_failure(
             native_status,
             elapsed_millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             launch_plan_sha256: None,
+            launch_plan_json: None,
             qualification_id: super::record::digest(&identity),
             cleanup: memcordon_core::WindowsLoaderCleanupOutcomeV1 {
                 status: memcordon_core::WindowsLoaderCleanupStatusV1::Complete,
@@ -2498,27 +2632,6 @@ impl SuspendedProcessAttestor<PackageLoaderProcess> for PackageLoaderAttestor<'_
                 TargetDesktopLeaseCreateError::from(error.to_string()),
             )
         })?;
-        let desktop_name =
-            suspended_thread_desktop_name(process.native.thread_id()).map_err(|detail| {
-                package_process_failure(
-                    "loader-control-desktop-binding-readback",
-                    TargetDesktopLeaseCreateError::from(detail),
-                )
-            })?;
-        let expected_desktop_name = plan
-            .desktop()
-            .exact_name
-            .rsplit_once('\\')
-            .map_or(plan.desktop().exact_name.as_str(), |(_, desktop)| desktop);
-        if desktop_name != expected_desktop_name {
-            return Err(ProcessCreateFailure {
-                stable_code: String::from("loader-control-desktop-binding-mismatch"),
-                native_status: None,
-                detail: String::from(
-                    "suspended loader-control thread desktop differs from the production plan",
-                ),
-            });
-        }
         let handle_count = memcordon_windows_launch_core::query_process_handle_count(
             &process.native,
         )
@@ -2554,48 +2667,6 @@ impl SuspendedProcessAttestor<PackageLoaderProcess> for PackageLoaderAttestor<'_
             exact_handle_list_attested: true,
         })
     }
-}
-
-fn suspended_thread_desktop_name(thread_id: u32) -> Result<String, String> {
-    let desktop = unsafe { GetThreadDesktop(thread_id) };
-    if desktop.is_null() {
-        return Err(format!(
-            "read suspended loader-control thread desktop: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let mut required = 0_u32;
-    unsafe { GetUserObjectInformationW(desktop, UOI_NAME, ptr::null_mut(), 0, &raw mut required) };
-    let unit_size = u32::try_from(std::mem::size_of::<u16>())
-        .map_err(|_| String::from("UTF-16 unit size exceeds the native range"))?;
-    if required == 0 || required % unit_size != 0 {
-        return Err(String::from(
-            "suspended loader-control thread desktop name size is invalid",
-        ));
-    }
-    let unit_count = usize::try_from(required / unit_size)
-        .map_err(|_| String::from("desktop name size exceeds the platform range"))?;
-    let mut units = vec![0_u16; unit_count];
-    if unsafe {
-        GetUserObjectInformationW(
-            desktop,
-            UOI_NAME,
-            units.as_mut_ptr().cast(),
-            required,
-            &raw mut required,
-        )
-    } == 0
-    {
-        return Err(format!(
-            "read suspended loader-control thread desktop name: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    while units.last() == Some(&0) {
-        units.pop();
-    }
-    String::from_utf16(&units)
-        .map_err(|_| String::from("suspended loader-control desktop name is invalid UTF-16"))
 }
 
 struct PackageLoaderChannel<'a> {
@@ -2700,11 +2771,12 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
                 TargetDesktopLeaseCreateError::from(detail),
             )
         })?;
-        match loader_ready {
+        let desktop_evidence = match loader_ready {
             TargetDesktopBootstrapMessageV1::LoaderReady {
                 schema_version,
                 nonce: observed_nonce,
                 expected_desktop: observed_desktop,
+                observed_desktop_binding: Some(observed_desktop_binding),
                 bootstrap_identity,
                 process_envelope,
                 process_snapshot,
@@ -2713,7 +2785,20 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
                 && observed_desktop.as_deref() == Some(self.exact_desktop)
                 && bootstrap_identity == identity
                 && process_envelope == *self.target_envelope
-                && process_snapshot == snapshot => {}
+                && process_snapshot == snapshot =>
+            {
+                LoaderControlDesktopEvidenceV1::Observed(observed_desktop_binding)
+            }
+            TargetDesktopBootstrapMessageV1::LoaderReadyFailed {
+                schema_version,
+                nonce: observed_nonce,
+                role: TargetDesktopBootstrapRoleV1::LoaderControl,
+                failure,
+            } if schema_version == TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION
+                && observed_nonce == self.nonce =>
+            {
+                LoaderControlDesktopEvidenceV1::ReadFailed(failure)
+            }
             _ => {
                 return Err(ProcessCreateFailure {
                     stable_code: String::from("loader-control-ready-frame-invalid"),
@@ -2721,7 +2806,8 @@ impl LoaderReadyChannel<PackageLoaderProcess> for PackageLoaderChannel<'_> {
                     detail: String::from("loader-control LoaderReady frame is invalid"),
                 });
             }
-        }
+        };
+        validate_loader_control_desktop_evidence(self.exact_desktop, &desktop_evidence)?;
         super::pipe::write_frame_bounded(
             connection.raw(),
             Some(process.native.process_handle()),
@@ -2828,7 +2914,7 @@ pub(super) fn launch_target_desktop_loader_control_inner(
     association_preflight: &TargetUserObjectOpenPreflightV1,
     window_station_security_descriptor_sddl: &str,
     desktop_security_descriptor_sddl: &str,
-) -> Result<LoaderReadyEvidenceV1, TargetDesktopLeaseCreateError> {
+) -> Result<LoaderReadyQualificationV1, TargetDesktopLeaseCreateError> {
     use std::os::windows::ffi::OsStrExt;
 
     let target_source_before = super::token::token_attestation_snapshot(target_token)?;
@@ -3033,17 +3119,30 @@ pub(super) fn launch_target_desktop_loader_control_inner(
             })
         }
     };
-    let wire_outcome = outcome.to_wire();
+    let plan_json = serde_json::to_string(&production)
+        .map_err(|error| TargetDesktopLeaseCreateError::from(error.to_string()))?;
+    let mut wire_outcome = outcome.to_wire();
+    wire_outcome.set_launch_plan_json(plan_json.clone());
+    if !wire_outcome.is_consistent() {
+        return Err(TargetDesktopLeaseCreateError::from(
+            "production loader outcome and serialized plan are inconsistent".to_owned(),
+        ));
+    }
     if let Err(primary) = &mut result {
         primary.loader_qualification = Some(wire_outcome.clone());
     }
-    if let Err(error) = store_production_loader_outcome(&wire_outcome) {
+    let mut persisted_outcome = wire_outcome.clone();
+    persisted_outcome.clear_launch_plan_json();
+    if let Err(error) = store_production_loader_outcome(&persisted_outcome) {
         eprintln!(
             "secondary production loader outcome artifact persistence failure: {}",
             error.detail
         );
     }
-    result
+    result.map(|evidence| LoaderReadyQualificationV1 {
+        evidence,
+        plan_json,
+    })
 }
 
 #[cfg(test)]
@@ -3069,7 +3168,7 @@ pub(super) fn launch_target_desktop_probe(
     expected_desktop_policy_sha256: &str,
     launch_context: &TargetDesktopBootstrapLaunchContext,
     holder_lease: &TargetDesktopLease,
-) -> Result<LoaderReadyEvidenceV1, TargetDesktopLeaseCreateError> {
+) -> Result<LoaderReadyQualificationV1, TargetDesktopLeaseCreateError> {
     let preflight_started = Instant::now();
     let preflight = (|| {
         let target_source_before = super::token::token_attestation_snapshot(target_token)?;
@@ -3110,7 +3209,7 @@ pub(super) fn launch_target_desktop_probe(
             return Err(error);
         }
     };
-    let loader_ready_evidence = launch_target_desktop_loader_control(
+    let loader_ready_qualification = launch_target_desktop_loader_control(
         target_token,
         target_envelope,
         target_snapshot,
@@ -3120,285 +3219,321 @@ pub(super) fn launch_target_desktop_probe(
         &target_user_object_policy.window_station_sddl(),
         &target_user_object_policy.desktop_sddl(),
     )?;
-    holder_lease
-        .attest_live()
-        .map_err(TargetDesktopLeaseCreateError::from)?;
-    let nonce = target_desktop_nonce()?;
-    let pipe_name = format!(
-        "{}{}",
-        super::pipe::TARGET_DESKTOP_BOOTSTRAP_PIPE_PREFIX,
-        nonce,
-    );
-    let pipe_security = SecurityDescriptor::from_sddl(
-        &super::security::target_desktop_bootstrap_pipe_sddl(target_token)?,
-    )?;
-    let prepared_pipe =
-        super::pipe::prepare_target_desktop_bootstrap_pipe(&pipe_name, &pipe_security)?;
-    clear_inherit(prepared_pipe.raw())?;
-    verify_not_inheritable(prepared_pipe.raw())?;
-    let probe_job = Job::create(None, None, None)?;
-    let jobs = [probe_job.handle()];
-    let attributes = AttributeList::new(
-        &[Attribute::new(
-            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-            jobs.as_ptr().cast(),
-            std::mem::size_of_val(&jobs),
-        )],
-        None,
-    )?;
-    let process_security =
-        SecurityDescriptor::from_sddl(&super::security::launcher_process_sddl()?)?;
-    let process_attributes = process_security.attributes(false);
-    let thread_security = SecurityDescriptor::from_sddl(&super::security::launcher_thread_sddl()?)?;
-    let thread_attributes = thread_security.attributes(false);
-    let executable = super::package::installed_target_desktop_bootstrap();
-    let bootstrap_image_sha256 = super::package::validate_installed_target_desktop_bootstrap()?;
-    use std::os::windows::ffi::OsStrExt;
-    let mut application = executable.as_os_str().encode_wide().collect::<Vec<_>>();
-    application.push(0);
-    let mut command_line = encode_command_line(&[
-        executable.as_os_str().encode_wide().collect(),
-        "probe".encode_utf16().collect(),
-        pipe_name.encode_utf16().collect(),
-        nonce.encode_utf16().collect(),
-        exact_desktop.encode_utf16().collect(),
-    ]);
-    command_line.push(0);
-    let mut startup = STARTUPINFOEXW::default();
-    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    let mut startup_desktop = exact_desktop.encode_utf16().collect::<Vec<_>>();
-    startup_desktop.push(0);
-    startup.StartupInfo.lpDesktop = startup_desktop.as_mut_ptr();
-    startup.lpAttributeList = attributes.raw();
-    let mut environment = [0_u16, 0_u16];
-    let install_root = super::package::install_root();
-    let mut current_directory = install_root.as_os_str().encode_wide().collect::<Vec<_>>();
-    current_directory.push(0);
-    let mut process = PROCESS_INFORMATION::default();
-    if unsafe {
-        create_process_as_user_native(
-            target_token,
-            application.as_ptr(),
-            command_line.as_mut_ptr(),
-            &raw const process_attributes,
-            &raw const thread_attributes,
-            0,
-            CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-            environment.as_mut_ptr().cast(),
-            current_directory.as_ptr(),
-            &raw const startup.StartupInfo,
-            &raw mut process,
-        )
-    } == 0
-    {
-        return Err(format!(
-            "CreateProcessAsUserW failed for exact-token desktop probe: {}",
-            io::Error::last_os_error(),
-        )
-        .into());
-    }
-    let probe_process = OwnedHandle::new(process.hProcess)?;
-    let probe_thread = OwnedHandle::new(process.hThread)?;
-    if !probe_job.contains(probe_process.raw())? {
-        return Err("restricted desktop probe is absent from its atomic Job"
-            .to_owned()
+    let probe_result = (|| -> Result<(), TargetDesktopLeaseCreateError> {
+        holder_lease
+            .attest_live()
+            .map_err(TargetDesktopLeaseCreateError::from)?;
+        let nonce = target_desktop_nonce()?;
+        let pipe_name = format!(
+            "{}{}",
+            super::pipe::TARGET_DESKTOP_BOOTSTRAP_PIPE_PREFIX,
+            nonce,
+        );
+        let pipe_security = SecurityDescriptor::from_sddl(
+            &super::security::target_desktop_bootstrap_pipe_sddl(target_token)?,
+        )?;
+        let prepared_pipe =
+            super::pipe::prepare_target_desktop_bootstrap_pipe(&pipe_name, &pipe_security)?;
+        clear_inherit(prepared_pipe.raw())?;
+        verify_not_inheritable(prepared_pipe.raw())?;
+        let probe_job = Job::create(None, None, None)?;
+        let jobs = [probe_job.handle()];
+        let attributes = AttributeList::new(
+            &[Attribute::new(
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                jobs.as_ptr().cast(),
+                std::mem::size_of_val(&jobs),
+            )],
+            None,
+        )?;
+        let process_security =
+            SecurityDescriptor::from_sddl(&super::security::launcher_process_sddl()?)?;
+        let process_attributes = process_security.attributes(false);
+        let thread_security =
+            SecurityDescriptor::from_sddl(&super::security::launcher_thread_sddl()?)?;
+        let thread_attributes = thread_security.attributes(false);
+        let executable = super::package::installed_target_desktop_bootstrap();
+        let bootstrap_image_sha256 = super::package::validate_installed_target_desktop_bootstrap()?;
+        use std::os::windows::ffi::OsStrExt;
+        let mut application = executable.as_os_str().encode_wide().collect::<Vec<_>>();
+        application.push(0);
+        let mut command_line = encode_command_line(&[
+            executable.as_os_str().encode_wide().collect(),
+            "probe".encode_utf16().collect(),
+            pipe_name.encode_utf16().collect(),
+            nonce.encode_utf16().collect(),
+            exact_desktop.encode_utf16().collect(),
+        ]);
+        command_line.push(0);
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        let mut startup_desktop = exact_desktop.encode_utf16().collect::<Vec<_>>();
+        startup_desktop.push(0);
+        startup.StartupInfo.lpDesktop = startup_desktop.as_mut_ptr();
+        startup.lpAttributeList = attributes.raw();
+        let mut environment = [0_u16, 0_u16];
+        let install_root = super::package::install_root();
+        let mut current_directory = install_root.as_os_str().encode_wide().collect::<Vec<_>>();
+        current_directory.push(0);
+        let mut process = PROCESS_INFORMATION::default();
+        if unsafe {
+            create_process_as_user_native(
+                target_token,
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                &raw const process_attributes,
+                &raw const thread_attributes,
+                0,
+                CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                environment.as_mut_ptr().cast(),
+                current_directory.as_ptr(),
+                &raw const startup.StartupInfo,
+                &raw mut process,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "CreateProcessAsUserW failed for exact-token desktop probe: {}",
+                io::Error::last_os_error(),
+            )
             .into());
-    }
-    process_security.verify_kernel_object(
-        probe_process.raw(),
-        super::security::SecurityObjectKind::Process,
-    )?;
-    thread_security.verify_kernel_object(
-        probe_thread.raw(),
-        super::security::SecurityObjectKind::Thread,
-    )?;
-    let observed_probe_snapshot =
-        super::token::process_token_query_attestation(probe_process.raw())?;
-    let target_source_after = super::token::token_attestation_snapshot(target_token)?;
-    super::token::require_same_token_instance(
-        "probe-target-request-invariance",
-        &target_source_before,
-        &target_source_after,
-    )?;
-    let probe_assignment = super::token::require_assigned_process_authority(
-        "target-request-to-probe-process",
-        &target_source_before,
-        &observed_probe_snapshot,
-    )?;
-    if observed_probe_snapshot.behavior.envelope != *target_envelope {
-        return Err("restricted desktop probe token envelope changed"
-            .to_owned()
-            .into());
-    }
-    let probe_identity = process_identity(probe_process.raw())?;
-    verify_image_path(probe_process.raw(), &executable)?;
-    let launcher_process_handle =
-        duplicate_remote_process_query(unsafe { GetCurrentProcess() }, probe_process.raw())?;
-    let launcher_token_handle =
-        duplicate_remote_token_query(launcher_token.raw(), probe_process.raw())?;
-    let binding = TargetDesktopBootstrapBindingV3 {
-        schema_version: TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION,
-        role: TargetDesktopBootstrapRoleV1::Probe,
-        target_user_object_policy_role: policy_role,
-        nonce: nonce.clone(),
-        binding_sha256: String::new(),
-        bootstrap_image_sha256: bootstrap_image_sha256.clone(),
-        launcher_identity: launcher_identity.clone(),
-        launcher_session_id: launcher_envelope.session_id,
-        launcher_envelope: launcher_envelope.clone(),
-        launcher_process_snapshot: launcher_process_snapshot.clone(),
-        broker_source_snapshot: broker_source_snapshot.clone(),
-        holder_launch_snapshot: holder_launch_snapshot.clone(),
-        holder_assignment: super::token::require_assigned_process_authority(
-            "holder-launch-to-process",
-            holder_launch_snapshot,
-            holder_process_snapshot,
-        )?,
-        bootstrap_identity: probe_identity.clone(),
-        bootstrap_envelope: target_envelope.clone(),
-        bootstrap_process_snapshot: observed_probe_snapshot.clone(),
-        bootstrap_assignment: probe_assignment,
-        holder_process_snapshot: holder_process_snapshot.clone(),
-        target_envelope: target_envelope.clone(),
-        target_request_snapshot: target_snapshot.clone(),
-    }
-    .seal()?;
-    let target_pre_resume = super::token::token_attestation_snapshot(target_token)?;
-    super::token::require_same_token_instance(
-        "probe-target-request-pre-resume",
-        target_snapshot,
-        &target_pre_resume,
-    )?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    if unsafe { ResumeThread(probe_thread.raw()) } != 1 {
-        return Err(format!(
-            "restricted desktop probe primary thread did not resume exactly once: {}",
-            io::Error::last_os_error(),
-        )
-        .into());
-    }
-    drop(probe_thread);
-    let connection = super::pipe::accept_target_desktop_bootstrap_pipe(
-        prepared_pipe,
-        probe_process.raw(),
-        deadline,
-    )
-    .map_err(|error| {
-        launch_context.accept_error(
-            TargetDesktopBootstrapRoleV1::Probe,
-            probe_identity.process_id,
-            &bootstrap_image_sha256,
-            &format!(
-                "nonce-private-sha256:{}",
-                super::record::digest(exact_desktop.as_bytes())
-            ),
-            &format!(
-                "loader_control=loader-ready loader_control_desktop_sha256={} {}",
-                super::record::digest(exact_desktop.as_bytes()),
-                association_preflight.diagnostic()
-            ),
-            error,
-        )
-    })?;
-    authenticate_target_desktop_bootstrap_client(
-        connection.raw(),
-        probe_process.raw(),
-        &probe_job,
-        &probe_identity,
-        target_envelope,
-        &observed_probe_snapshot,
-        &executable,
-    )?;
-    let loader_ready: TargetDesktopBootstrapMessageV1 = super::pipe::read_frame_bounded(
-        connection.raw(),
-        Some(probe_process.raw()),
-        deadline,
-        super::pipe::TargetDesktopBootstrapPipeOperation::LoaderReadyRead,
-    )?;
-    match loader_ready {
-        TargetDesktopBootstrapMessageV1::LoaderReady {
-            schema_version,
-            nonce: observed_nonce,
-            expected_desktop: observed_desktop,
-            bootstrap_identity,
-            process_envelope,
-            process_snapshot,
-        } if schema_version == TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION
-            && observed_nonce == nonce
-            && observed_desktop.as_deref() == Some(exact_desktop)
-            && bootstrap_identity == probe_identity
-            && process_envelope == *target_envelope
-            && process_snapshot == observed_probe_snapshot => {}
-        _ => {
-            return Err("restricted desktop probe LoaderReady frame is invalid"
+        }
+        let probe_process = OwnedHandle::new(process.hProcess)?;
+        let probe_thread = OwnedHandle::new(process.hThread)?;
+        if !probe_job.contains(probe_process.raw())? {
+            return Err("restricted desktop probe is absent from its atomic Job"
                 .to_owned()
                 .into());
         }
-    }
-    super::pipe::write_frame_bounded(
-        connection.raw(),
-        Some(probe_process.raw()),
-        deadline,
-        super::pipe::TargetDesktopBootstrapPipeOperation::AdmissionWrite,
-        &TargetDesktopBootstrapMessageV1::Admission {
-            binding: binding.clone(),
-            launcher_process_query_handle: launcher_process_handle,
-            launcher_token_query_handle: launcher_token_handle,
-            target_token_capability_handle: None,
-        },
-    )?;
-    let frame = read_target_desktop_bootstrap_attestation(
-        connection.raw(),
-        probe_process.raw(),
-        deadline,
-        &binding,
-        None,
-    )?;
-    let (expected_station, expected_desktop) = exact_desktop.split_once('\\').ok_or_else(|| {
-        TargetDesktopLeaseCreateError::from("probe desktop is not qualified".to_owned())
-    })?;
-    if frame.bootstrap_identity != probe_identity
-        || frame.target_envelope != *target_envelope
-        || frame.window_station_name != expected_station
-        || frame.desktop_name != expected_desktop
-        || frame.window_station_policy_sha256 != expected_station_policy_sha256
-        || frame.desktop_policy_sha256 != expected_desktop_policy_sha256
-        || frame.window_station_policy_sha256 != holder_lease.window_station_policy_sha256
-        || frame.desktop_policy_sha256 != holder_lease.desktop_policy_sha256
-        || frame.window_station_live_equality_sha256
-            != holder_lease.window_station_live_equality_sha256
-        || frame.desktop_live_equality_sha256 != holder_lease.desktop_live_equality_sha256
-        || !frame.private_station_assigned
-        || !frame.private_desktop_assigned
-        || !frame.window_station_policy_verified
-        || !frame.desktop_policy_verified
-        || !frame.noninteractive
-    {
-        return Err(
-            "restricted desktop probe attestation is incomplete or mismatched"
+        process_security.verify_kernel_object(
+            probe_process.raw(),
+            super::security::SecurityObjectKind::Process,
+        )?;
+        thread_security.verify_kernel_object(
+            probe_thread.raw(),
+            super::security::SecurityObjectKind::Thread,
+        )?;
+        let observed_probe_snapshot =
+            super::token::process_token_query_attestation(probe_process.raw())?;
+        let target_source_after = super::token::token_attestation_snapshot(target_token)?;
+        super::token::require_same_token_instance(
+            "probe-target-request-invariance",
+            &target_source_before,
+            &target_source_after,
+        )?;
+        let probe_assignment = super::token::require_assigned_process_authority(
+            "target-request-to-probe-process",
+            &target_source_before,
+            &observed_probe_snapshot,
+        )?;
+        if observed_probe_snapshot.behavior.envelope != *target_envelope {
+            return Err("restricted desktop probe token envelope changed"
                 .to_owned()
-                .into(),
-        );
-    }
-    drop(connection);
-    if unsafe { WaitForSingleObject(probe_process.raw(), 30_000) } != WAIT_OBJECT_0 {
-        return Err("restricted desktop probe did not exit after attestation"
-            .to_owned()
+                .into());
+        }
+        let probe_identity = process_identity(probe_process.raw())?;
+        verify_image_path(probe_process.raw(), &executable)?;
+        let launcher_process_handle =
+            duplicate_remote_process_query(unsafe { GetCurrentProcess() }, probe_process.raw())?;
+        let launcher_token_handle =
+            duplicate_remote_token_query(launcher_token.raw(), probe_process.raw())?;
+        let binding = TargetDesktopBootstrapBindingV3 {
+            schema_version: TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION,
+            role: TargetDesktopBootstrapRoleV1::Probe,
+            target_user_object_policy_role: policy_role,
+            nonce: nonce.clone(),
+            binding_sha256: String::new(),
+            bootstrap_image_sha256: bootstrap_image_sha256.clone(),
+            launcher_identity: launcher_identity.clone(),
+            launcher_session_id: launcher_envelope.session_id,
+            launcher_envelope: launcher_envelope.clone(),
+            launcher_process_snapshot: launcher_process_snapshot.clone(),
+            broker_source_snapshot: broker_source_snapshot.clone(),
+            holder_launch_snapshot: holder_launch_snapshot.clone(),
+            holder_assignment: super::token::require_assigned_process_authority(
+                "holder-launch-to-process",
+                holder_launch_snapshot,
+                holder_process_snapshot,
+            )?,
+            bootstrap_identity: probe_identity.clone(),
+            bootstrap_envelope: target_envelope.clone(),
+            bootstrap_process_snapshot: observed_probe_snapshot.clone(),
+            bootstrap_assignment: probe_assignment,
+            holder_process_snapshot: holder_process_snapshot.clone(),
+            target_envelope: target_envelope.clone(),
+            target_request_snapshot: target_snapshot.clone(),
+        }
+        .seal()?;
+        let target_pre_resume = super::token::token_attestation_snapshot(target_token)?;
+        super::token::require_same_token_instance(
+            "probe-target-request-pre-resume",
+            target_snapshot,
+            &target_pre_resume,
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        if unsafe { ResumeThread(probe_thread.raw()) } != 1 {
+            return Err(format!(
+                "restricted desktop probe primary thread did not resume exactly once: {}",
+                io::Error::last_os_error(),
+            )
             .into());
-    }
-    let mut exit_code = 0_u32;
-    if unsafe { GetExitCodeProcess(probe_process.raw(), &raw mut exit_code) } == 0 || exit_code != 0
-    {
-        return Err(
-            format!("restricted desktop probe exited unsuccessfully: {exit_code:#010x}").into(),
-        );
-    }
-    if !probe_job.wait_empty(Instant::now() + Duration::from_secs(30))? {
-        return Err("restricted desktop probe Job did not become empty"
-            .to_owned()
+        }
+        drop(probe_thread);
+        let connection = super::pipe::accept_target_desktop_bootstrap_pipe(
+            prepared_pipe,
+            probe_process.raw(),
+            deadline,
+        )
+        .map_err(|error| {
+            launch_context.accept_error(
+                TargetDesktopBootstrapRoleV1::Probe,
+                probe_identity.process_id,
+                &bootstrap_image_sha256,
+                &format!(
+                    "nonce-private-sha256:{}",
+                    super::record::digest(exact_desktop.as_bytes())
+                ),
+                &format!(
+                    "loader_control=loader-ready loader_control_desktop_sha256={} {}",
+                    super::record::digest(exact_desktop.as_bytes()),
+                    association_preflight.diagnostic()
+                ),
+                error,
+            )
+        })?;
+        authenticate_target_desktop_bootstrap_client(
+            connection.raw(),
+            probe_process.raw(),
+            &probe_job,
+            &probe_identity,
+            target_envelope,
+            &observed_probe_snapshot,
+            &executable,
+        )?;
+        let loader_ready: TargetDesktopBootstrapMessageV1 = super::pipe::read_frame_bounded(
+            connection.raw(),
+            Some(probe_process.raw()),
+            deadline,
+            super::pipe::TargetDesktopBootstrapPipeOperation::LoaderReadyRead,
+        )?;
+        let (expected_station, expected_desktop) =
+            exact_desktop.split_once('\\').ok_or_else(|| {
+                TargetDesktopLeaseCreateError::from("probe desktop is not qualified".to_owned())
+            })?;
+        match loader_ready {
+            TargetDesktopBootstrapMessageV1::LoaderReady {
+                schema_version,
+                nonce: observed_nonce,
+                expected_desktop: observed_desktop,
+                observed_desktop_binding: Some(observed_desktop_binding),
+                bootstrap_identity,
+                process_envelope,
+                process_snapshot,
+            } if schema_version == TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION
+                && observed_nonce == nonce
+                && observed_desktop.as_deref() == Some(exact_desktop)
+                && observed_desktop_binding.window_station_name == expected_station
+                && observed_desktop_binding.desktop_name == expected_desktop
+                && bootstrap_identity == probe_identity
+                && process_envelope == *target_envelope
+                && process_snapshot == observed_probe_snapshot => {}
+            TargetDesktopBootstrapMessageV1::LoaderReadyFailed {
+                schema_version,
+                nonce: observed_nonce,
+                role: TargetDesktopBootstrapRoleV1::Probe,
+                failure,
+            } if schema_version == TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION
+                && observed_nonce == nonce
+                && !failure.detail.is_empty()
+                && failure.detail.len() <= TARGET_DESKTOP_BOOTSTRAP_DETAIL_MAX_BYTES =>
+            {
+                return Err(TargetDesktopLeaseCreateError {
+                    detail: failure.detail,
+                    os_code: failure.native_code,
+                    loader_phase: LoaderLaunchFailurePhaseV1::PostResumePreLoaderReady,
+                    native_status: failure
+                        .native_code
+                        .map(|code| NativeStatusV1::Win32 { code: code as u32 }),
+                    loader_qualification: None,
+                });
+            }
+            _ => {
+                return Err("restricted desktop probe LoaderReady frame is invalid"
+                    .to_owned()
+                    .into());
+            }
+        }
+        super::pipe::write_frame_bounded(
+            connection.raw(),
+            Some(probe_process.raw()),
+            deadline,
+            super::pipe::TargetDesktopBootstrapPipeOperation::AdmissionWrite,
+            &TargetDesktopBootstrapMessageV1::Admission {
+                binding: binding.clone(),
+                launcher_process_query_handle: launcher_process_handle,
+                launcher_token_query_handle: launcher_token_handle,
+                target_token_capability_handle: None,
+            },
+        )?;
+        let frame = read_target_desktop_bootstrap_attestation(
+            connection.raw(),
+            probe_process.raw(),
+            deadline,
+            &binding,
+            None,
+        )?;
+        if frame.bootstrap_identity != probe_identity
+            || frame.target_envelope != *target_envelope
+            || frame.window_station_name != expected_station
+            || frame.desktop_name != expected_desktop
+            || frame.window_station_policy_sha256 != expected_station_policy_sha256
+            || frame.desktop_policy_sha256 != expected_desktop_policy_sha256
+            || frame.window_station_policy_sha256 != holder_lease.window_station_policy_sha256
+            || frame.desktop_policy_sha256 != holder_lease.desktop_policy_sha256
+            || frame.window_station_live_equality_sha256
+                != holder_lease.window_station_live_equality_sha256
+            || frame.desktop_live_equality_sha256 != holder_lease.desktop_live_equality_sha256
+            || !frame.private_station_assigned
+            || !frame.private_desktop_assigned
+            || !frame.window_station_policy_verified
+            || !frame.desktop_policy_verified
+            || !frame.noninteractive
+        {
+            return Err(
+                "restricted desktop probe attestation is incomplete or mismatched"
+                    .to_owned()
+                    .into(),
+            );
+        }
+        drop(connection);
+        if unsafe { WaitForSingleObject(probe_process.raw(), 30_000) } != WAIT_OBJECT_0 {
+            return Err("restricted desktop probe did not exit after attestation"
+                .to_owned()
+                .into());
+        }
+        let mut exit_code = 0_u32;
+        if unsafe { GetExitCodeProcess(probe_process.raw(), &raw mut exit_code) } == 0
+            || exit_code != 0
+        {
+            return Err(format!(
+                "restricted desktop probe exited unsuccessfully: {exit_code:#010x}"
+            )
             .into());
+        }
+        if !probe_job.wait_empty(Instant::now() + Duration::from_secs(30))? {
+            return Err("restricted desktop probe Job did not become empty"
+                .to_owned()
+                .into());
+        }
+        Ok(())
+    })();
+    match probe_result {
+        Ok(()) => Ok(loader_ready_qualification),
+        Err(mut error) => {
+            error.loader_qualification = Some(loader_ready_qualification.to_wire());
+            Err(error)
+        }
     }
-    Ok(loader_ready_evidence)
 }
 
 pub(super) fn read_target_desktop_bootstrap_attestation(
@@ -3737,6 +3872,40 @@ pub(crate) fn validate_target_desktop_input_state(receives_input: bool) -> Resul
     }
 }
 
+fn observe_current_loader_desktop_binding()
+-> Result<LoaderDesktopBindingV1, LoaderDesktopBindingReadFailureV1> {
+    let window_station = unsafe { GetProcessWindowStation() };
+    if window_station.is_null() {
+        return Err(LoaderDesktopBindingReadFailureV1::native(
+            LoaderDesktopBindingReadFailureKindV1::WindowStationHandle,
+            "read running loader process window station",
+        ));
+    }
+    let desktop = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
+    if desktop.is_null() {
+        return Err(LoaderDesktopBindingReadFailureV1::native(
+            LoaderDesktopBindingReadFailureKindV1::DesktopHandle,
+            "read running loader thread desktop",
+        ));
+    }
+    let window_station_name = user_object_name(window_station).map_err(|error| {
+        LoaderDesktopBindingReadFailureV1::from_user_object(
+            LoaderDesktopBindingReadFailureKindV1::WindowStationName,
+            error,
+        )
+    })?;
+    let desktop_name = user_object_name(desktop).map_err(|error| {
+        LoaderDesktopBindingReadFailureV1::from_user_object(
+            LoaderDesktopBindingReadFailureKindV1::DesktopName,
+            error,
+        )
+    })?;
+    Ok(LoaderDesktopBindingV1 {
+        window_station_name,
+        desktop_name,
+    })
+}
+
 pub(crate) fn target_desktop_bootstrap(
     pipe_name: &std::ffi::OsStr,
     nonce: &std::ffi::OsStr,
@@ -3798,6 +3967,35 @@ pub(crate) fn target_desktop_bootstrap(
     let bootstrap_identity = process_identity(unsafe { GetCurrentProcess() })?;
     let process_envelope = super::token::envelope(process_token.raw())?;
     let process_snapshot = super::token::token_query_attestation_snapshot(process_token.raw())?;
+    let observed_desktop_binding = match role {
+        TargetDesktopBootstrapRoleV1::Holder => None,
+        TargetDesktopBootstrapRoleV1::LoaderControl | TargetDesktopBootstrapRoleV1::Probe => {
+            match observe_current_loader_desktop_binding() {
+                Ok(binding) => Some(binding),
+                Err(failure) => {
+                    let primary_detail = failure.detail.clone();
+                    super::pipe::write_frame_bounded(
+                        connection.raw(),
+                        None,
+                        deadline,
+                        super::pipe::TargetDesktopBootstrapPipeOperation::LoaderReadyWrite,
+                        &TargetDesktopBootstrapMessageV1::LoaderReadyFailed {
+                            schema_version: TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION,
+                            nonce: nonce.to_owned(),
+                            role,
+                            failure,
+                        },
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "{primary_detail}; additionally cannot send typed LoaderReady failure: {error}"
+                        )
+                    })?;
+                    return Err(primary_detail);
+                }
+            }
+        }
+    };
     super::pipe::write_frame_bounded(
         connection.raw(),
         None,
@@ -3807,6 +4005,7 @@ pub(crate) fn target_desktop_bootstrap(
             schema_version: TARGET_DESKTOP_BOOTSTRAP_SCHEMA_VERSION,
             nonce: nonce.to_owned(),
             expected_desktop: expected_desktop_name.clone(),
+            observed_desktop_binding,
             bootstrap_identity,
             process_envelope: process_envelope.clone(),
             process_snapshot: process_snapshot.clone(),

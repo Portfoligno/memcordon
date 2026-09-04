@@ -70,11 +70,17 @@ mod windows_guardian_startup;
 #[path = "sealed_agent/windows_handle_provenance.rs"]
 mod windows_handle_provenance;
 #[cfg(target_os = "windows")]
+#[path = "sealed_agent/windows_install_intent.rs"]
+mod windows_install_intent;
+#[cfg(target_os = "windows")]
 #[path = "sealed_agent/windows_postauthorization_retirement.rs"]
 mod windows_postauthorization_retirement;
 #[cfg(target_os = "windows")]
 #[path = "sealed_agent/windows_qualification.rs"]
 mod windows_qualification;
+#[cfg(target_os = "windows")]
+#[path = "sealed_agent/windows_qualification_artifacts.rs"]
+mod windows_qualification_artifacts;
 #[cfg(target_os = "windows")]
 #[path = "sealed_agent/windows_replay_retention.rs"]
 mod windows_replay_retention;

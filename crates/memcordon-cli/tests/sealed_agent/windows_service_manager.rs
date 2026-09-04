@@ -79,7 +79,7 @@ fn demand_start_builder_passes_only_extras_and_scm_binds_argv_zero() {
     let broker_name = memcordon_core::WINDOWS_SESSION_BROKER_SERVICE_NAME;
     assert_eq!(
         crate::windows::session_broker::SESSION_BROKER_SCHEMA_VERSION,
-        6
+        7
     );
     let broker_payload = vec![
         crate::windows::session_broker::SESSION_BROKER_SCHEMA_VERSION.to_string(),

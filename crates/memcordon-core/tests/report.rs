@@ -1002,6 +1002,7 @@ fn schema_five_later_helper_error_preserves_prior_attempt() {
         workload_may_be_alive: false,
         initial_spawn_failure: None,
         provider_rejection: None,
+        backend_selection_drift: None,
     };
     history
         .append(
@@ -1052,6 +1053,7 @@ fn schema_five_initial_spawn_status_round_trips_typed_provenance() {
             workload_may_be_alive: false,
             initial_spawn_failure: Some(failure),
             provider_rejection: None,
+            backend_selection_drift: None,
         };
         let mut history = AttemptHistory::default();
         let mut aggregates = SupervisionAggregates::default();
@@ -1118,6 +1120,7 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
         workload_may_be_alive: false,
         initial_spawn_failure: Some(InitialSpawnFailure::NotFound),
         provider_rejection: Some(provider_rejection),
+        backend_selection_drift: None,
     };
     let mut history = AttemptHistory::default();
     let mut aggregates = SupervisionAggregates::default();
@@ -1178,6 +1181,7 @@ fn request_validation_provider_rejection_round_trips_in_schema_eight() {
         workload_may_be_alive: false,
         initial_spawn_failure: None,
         provider_rejection: Some(provider_rejection),
+        backend_selection_drift: None,
     };
     let mut history = AttemptHistory::default();
     let mut aggregates = SupervisionAggregates::default();
@@ -1267,6 +1271,7 @@ fn supervision_constructor_rejects_mismatched_or_misclassified_error_terminal() 
         workload_may_be_alive: false,
         initial_spawn_failure: Some(InitialSpawnFailure::NotFound),
         provider_rejection: None,
+        backend_selection_drift: None,
     };
     let mut history = AttemptHistory::default();
     let mut aggregates = SupervisionAggregates::default();
@@ -1327,6 +1332,7 @@ fn supervision_constructor_rejects_stale_error_terminal() {
         workload_may_be_alive: false,
         initial_spawn_failure: None,
         provider_rejection: None,
+        backend_selection_drift: None,
     };
     let first = error(1);
     let second = error(2);
@@ -1373,6 +1379,7 @@ fn supervision_constructor_rejects_embedded_error_attempt_mismatch() {
         workload_may_be_alive: false,
         initial_spawn_failure: None,
         provider_rejection: None,
+        backend_selection_drift: None,
     };
     let mut history = AttemptHistory::default();
     let mut aggregates = SupervisionAggregates::default();

@@ -32,6 +32,7 @@ fuzz_target!(|count: u16| {
                         workload_may_be_alive: false,
                         initial_spawn_failure: None,
                         provider_rejection: None,
+                        backend_selection_drift: None,
                     }),
                     restart_decision: memcordon_core::RestartDecisionRecord::default(),
                     launch: memcordon_core::LaunchEvidence::default(),

@@ -340,6 +340,7 @@ impl WindowsLoaderQualificationOutcomeV2 {
                 memcordon_core::WindowsLoaderReadyEvidenceV1 {
                     schema_version: 1,
                     launch_plan_sha256: ready.launch_plan_sha256().to_owned(),
+                    launch_plan_json: None,
                     elapsed_millis: ready.elapsed_millis(),
                 },
             ),
@@ -400,6 +401,7 @@ impl WindowsLoaderQualificationOutcomeV2 {
                         native_status,
                         elapsed_millis: failure.elapsed_millis,
                         launch_plan_sha256: Some(failure.launch_plan_sha256.clone()),
+                        launch_plan_json: None,
                         qualification_id: failure.qualification_id.clone(),
                         cleanup,
                         diagnostic_id: failure.diagnostic_id.clone(),

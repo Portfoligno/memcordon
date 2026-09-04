@@ -87,6 +87,7 @@ fn qualification() -> WindowsQualificationReceiptV1 {
             memcordon_core::WindowsLoaderReadyEvidenceV1 {
                 schema_version: 1,
                 launch_plan_sha256: sha256(b"production-plan"),
+                launch_plan_json: None,
                 elapsed_millis: 1,
             },
         ),
@@ -806,6 +807,7 @@ fn windows_nonspawn_provider_rejection_has_consistent_public_provenance() {
         workload_may_be_alive: false,
         initial_spawn_failure: None,
         provider_rejection: Some(rejection),
+        backend_selection_drift: None,
     };
     assert!(record.is_consistent());
 
@@ -843,6 +845,7 @@ fn windows_posttarget_rejection_retains_truthful_terminal_receipt() {
             memcordon_core::WindowsLoaderReadyEvidenceV1 {
                 schema_version: 1,
                 launch_plan_sha256: String::from("not-a-sha256"),
+                launch_plan_json: None,
                 elapsed_millis: 1,
             },
         ));
@@ -1220,4 +1223,38 @@ fn windows_public_terminal_pending_is_exactly_bound() {
         recovery.begin_replay_after_bound_pending(),
         WindowsTerminalReplayDecisionV1::FailClosed,
     );
+}
+
+#[test]
+fn windows_loader_outcome_binds_optional_plan_json_to_its_digest() {
+    let digest = sha256(b"production-plan");
+    let plan_json = serde_json::json!({
+        "schema_version": 1,
+        "launch_plan_sha256": digest,
+    })
+    .to_string();
+    let outcome = memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(
+        memcordon_core::WindowsLoaderReadyEvidenceV1 {
+            schema_version: 1,
+            launch_plan_sha256: digest.clone(),
+            launch_plan_json: Some(plan_json),
+            elapsed_millis: 1,
+        },
+    );
+    assert!(outcome.is_consistent());
+    assert!(outcome.launch_plan_json().is_some());
+
+    let mut mismatched = outcome.clone();
+    mismatched.set_launch_plan_json(
+        serde_json::json!({
+            "schema_version": 1,
+            "launch_plan_sha256": sha256(b"different-plan"),
+        })
+        .to_string(),
+    );
+    assert!(!mismatched.is_consistent());
+
+    let mut malformed = outcome;
+    malformed.set_launch_plan_json(String::from("not-json"));
+    assert!(!malformed.is_consistent());
 }

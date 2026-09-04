@@ -133,12 +133,31 @@ fn main() {
                 session,
             )
         }
-        [package, operation] if package == "package" => package::run(operation, false, false),
+        [package, operation] if package == "package" => package::run(operation, false, false, None),
         [package, operation, option] if package == "package" && option == "--json" => {
-            package::run(operation, true, false)
+            package::run(operation, true, false, None)
         }
         [package, operation, option] if package == "package" && option == "--ephemeral-ci" => {
-            package::run(operation, false, true)
+            package::run(operation, false, true, None)
+        }
+        #[cfg(target_os = "windows")]
+        [
+            package,
+            operation,
+            ephemeral,
+            artifact_option,
+            artifact_directory,
+        ] if package == "package"
+            && operation == "install"
+            && ephemeral == "--ephemeral-ci"
+            && artifact_option == "--qualification-artifact-directory" =>
+        {
+            package::run(
+                operation,
+                false,
+                true,
+                Some(std::path::Path::new(artifact_directory)),
+            )
         }
         _ => Err(format!("invalid arguments\n\n{HELP}")),
     };

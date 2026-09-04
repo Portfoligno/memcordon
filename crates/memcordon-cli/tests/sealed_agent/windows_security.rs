@@ -51,9 +51,12 @@ use crate::windows::loader_access::{
 use crate::windows::package::{CONTROL_PRIVILEGES, LAUNCHER_PRIVILEGES, SESSION_BROKER_PRIVILEGES};
 use crate::windows::pipe::{PipeListener, PipePreparationError};
 use crate::windows::process::{
+    LoaderControlDesktopEvidenceV1, LoaderDesktopBindingReadFailureKindV1,
+    LoaderDesktopBindingReadFailureV1, LoaderDesktopBindingV1,
     attest_current_user_binding_duplicates_for_test, target_association_preflight_grants_for_test,
     target_association_preflight_progress_for_test, validate_guardian_desktop_binding,
-    validate_target_desktop_binding, validate_target_desktop_input_state,
+    validate_loader_control_desktop_evidence, validate_target_desktop_binding,
+    validate_target_desktop_input_state,
 };
 use crate::windows::security::{
     CERTIFICATION_ADMIN_DIRECTORY_ACCESS, NamedPipeSecurityError, NamedPipeSecurityMismatch,
@@ -2127,6 +2130,83 @@ fn private_target_desktop_binding_is_station_class_agnostic() {
         (station.as_str(), "Restricted\\Bad"),
     ] {
         assert!(validate_target_desktop_binding(station, desktop).is_err());
+    }
+}
+
+#[test]
+fn loader_control_requires_the_full_child_observed_desktop_binding() {
+    let station = format!("MemCordonTarget-{}", "ab".repeat(32));
+    let expected = format!("{station}\\Restricted");
+    let exact = LoaderControlDesktopEvidenceV1::Observed(LoaderDesktopBindingV1 {
+        window_station_name: station.clone(),
+        desktop_name: String::from("Restricted"),
+    });
+    validate_loader_control_desktop_evidence(&expected, &exact)
+        .expect("the exact child-observed binding should be accepted");
+
+    for observed in [
+        LoaderDesktopBindingV1 {
+            window_station_name: format!("MemCordonTarget-{}", "cd".repeat(32)),
+            desktop_name: String::from("Restricted"),
+        },
+        LoaderDesktopBindingV1 {
+            window_station_name: station,
+            desktop_name: String::from("Other"),
+        },
+    ] {
+        let failure = validate_loader_control_desktop_evidence(
+            &expected,
+            &LoaderControlDesktopEvidenceV1::Observed(observed),
+        )
+        .expect_err("either half of the child-observed binding must match exactly");
+        assert_eq!(
+            failure.stable_code,
+            "loader-control-desktop-binding-mismatch"
+        );
+        assert!(failure.native_status.is_none());
+        assert_eq!(
+            failure.detail,
+            "running loader-control USER binding differs from the production plan"
+        );
+    }
+}
+
+#[test]
+fn loader_control_desktop_read_failures_preserve_typed_native_evidence() {
+    let expected = format!("MemCordonTarget-{}\\Restricted", "ab".repeat(32));
+    for (kind, stable_code) in [
+        (
+            LoaderDesktopBindingReadFailureKindV1::WindowStationHandle,
+            "loader-control-window-station-binding-readback",
+        ),
+        (
+            LoaderDesktopBindingReadFailureKindV1::WindowStationName,
+            "loader-control-window-station-binding-readback",
+        ),
+        (
+            LoaderDesktopBindingReadFailureKindV1::DesktopHandle,
+            "loader-control-desktop-binding-readback",
+        ),
+        (
+            LoaderDesktopBindingReadFailureKindV1::DesktopName,
+            "loader-control-desktop-binding-readback",
+        ),
+    ] {
+        let failure = validate_loader_control_desktop_evidence(
+            &expected,
+            &LoaderControlDesktopEvidenceV1::ReadFailed(LoaderDesktopBindingReadFailureV1 {
+                kind,
+                native_code: Some(14_007),
+                detail: String::from("child USER binding query failed"),
+            }),
+        )
+        .expect_err("a child USER binding query failure must fail closed");
+        assert_eq!(failure.stable_code, stable_code);
+        assert_eq!(
+            failure.native_status,
+            Some(memcordon_windows_launch_core::NativeStatusV1::Win32 { code: 14_007 })
+        );
+        assert_eq!(failure.detail, "child USER binding query failed");
     }
 }
 

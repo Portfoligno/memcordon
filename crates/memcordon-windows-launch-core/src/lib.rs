@@ -41,7 +41,7 @@ pub use handshake::{
 };
 #[cfg(windows)]
 pub use native::{
-    NativeCreateErrorV1, NativeSecurityDescriptorV1, ProductionJobV1,
+    NativeCreateErrorV1, NativeKernelObjectKindV1, NativeSecurityDescriptorV1, ProductionJobV1,
     ProductionNativeCreateRequestV1, SuspendedNativeProcessV1, create_process_as_user_native,
     create_process_native, create_suspended_in_job, query_process_handle_count,
 };

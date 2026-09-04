@@ -1,9 +1,71 @@
 use std::path::{Path, PathBuf};
 
 use memcordon_ci::{config, policy};
+use serde_yaml::Value;
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
+fn workflow_with_job_timeout(fixture: &str, job_id: &str, timeout_minutes: u64) -> Vec<u8> {
+    let mut document: Value =
+        serde_yaml::from_str(fixture).expect("workflow fixture should deserialize");
+    let jobs_key = Value::String(String::from("jobs"));
+    let timeout_key = Value::String(String::from("timeout-minutes"));
+    let job_key = Value::String(job_id.to_owned());
+    let jobs = document
+        .as_mapping_mut()
+        .and_then(|workflow| workflow.get_mut(&jobs_key))
+        .and_then(Value::as_mapping_mut)
+        .expect("workflow fixture should contain jobs");
+    let job = jobs
+        .get_mut(&job_key)
+        .and_then(Value::as_mapping_mut)
+        .expect("workflow fixture should contain the selected job");
+    job.insert(timeout_key, Value::Number(timeout_minutes.into()));
+    serde_yaml::to_string(&document)
+        .expect("workflow fixture should serialize")
+        .into_bytes()
+}
+
+#[test]
+fn deep_ci_fuzz_timeout_covers_the_complete_target_set() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    let fixture = include_str!("../../../.github/workflows/deep-ci.yml");
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/deep-ci.yml"),
+        fixture.as_bytes(),
+        &repository_policy,
+    )
+    .expect("the exact deep CI workflow should pass");
+
+    for timeout_minutes in [30, 44] {
+        let invalid = workflow_with_job_timeout(fixture, "fuzz", timeout_minutes);
+        let error = policy::validate_workflow_bytes(
+            &root,
+            Path::new(".github/workflows/deep-ci.yml"),
+            &invalid,
+            &repository_policy,
+        )
+        .expect_err("an insufficient fuzz workload budget must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("deep CI fuzz timeout is below workload minimum"),
+            "unexpected workflow policy error: {error}"
+        );
+    }
+
+    let increased = workflow_with_job_timeout(fixture, "fuzz", 60);
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/deep-ci.yml"),
+        &increased,
+        &repository_policy,
+    )
+    .expect("a larger fuzz workload budget should remain valid");
 }
 
 #[test]

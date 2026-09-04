@@ -20,6 +20,44 @@ struct NativeCanary {
     nested_alternate_token_verified: bool,
 }
 
+pub(super) struct QualificationFailure {
+    pub(super) detail: String,
+    pub(super) loader_qualification: Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
+}
+
+impl QualificationFailure {
+    fn with_loader_qualification(
+        detail: String,
+        loader_qualification: memcordon_core::WindowsLoaderQualificationOutcomeV2,
+    ) -> Self {
+        Self {
+            detail,
+            loader_qualification: Some(loader_qualification),
+        }
+    }
+
+    fn append_secondary(mut self, detail: impl std::fmt::Display) -> Self {
+        self.detail.push_str("; ");
+        self.detail.push_str(&detail.to_string());
+        self
+    }
+}
+
+impl From<String> for QualificationFailure {
+    fn from(detail: String) -> Self {
+        Self {
+            detail,
+            loader_qualification: None,
+        }
+    }
+}
+
+impl std::fmt::Display for QualificationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct NestedChildReceiptV1 {
@@ -1048,7 +1086,7 @@ pub fn probe() -> Result<WindowsQualificationReceiptV1, String> {
 pub fn qualify_and_store() -> Result<WindowsQualificationReceiptV1, String> {
     let lease = crate::windows::package::PackageLease::acquire()?;
     let (result, _lease) = qualify_and_store_for_scope("direct", lease)?;
-    result
+    result.map_err(|failure| failure.detail)
 }
 
 pub(super) fn qualify_and_store_for_scope(
@@ -1056,24 +1094,29 @@ pub(super) fn qualify_and_store_for_scope(
     lease: crate::windows::package::PackageLease,
 ) -> Result<
     (
-        Result<WindowsQualificationReceiptV1, String>,
+        Result<WindowsQualificationReceiptV1, QualificationFailure>,
         crate::windows::package::PackageLease,
     ),
     String,
 > {
     let mut admission = match QualificationAdmission::begin(scope, &lease) {
         Ok(admission) => admission,
-        Err(error) => return Ok((Err(error), lease)),
+        Err(error) => return Ok((Err(QualificationFailure::from(error)), lease)),
     };
-    let result = qualify_and_store_admitted(&mut admission);
-    let finish = admission.finish();
-    let result = match (result, finish) {
-        (Ok(receipt), Ok(())) => Ok(receipt),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(finish)) => Err(format!(
-            "{error}; qualification admission retirement failed: {finish}"
-        )),
+    let result = qualify_admitted(&mut admission);
+    let result = match result {
+        Ok(receipt) => finalize_qualification_after_admission(
+            receipt,
+            || admission.finish(),
+            recovery_complete,
+            store_qualification_receipt,
+        ),
+        Err(error) => match admission.finish() {
+            Ok(()) => Err(error),
+            Err(finish) => Err(error.append_secondary(format_args!(
+                "qualification admission retirement failed: {finish}"
+            ))),
+        },
     };
     Ok((result, lease))
 }
@@ -1109,9 +1152,9 @@ fn service_process_identity(
     })
 }
 
-fn qualify_and_store_admitted(
+fn qualify_admitted(
     admission: &mut QualificationAdmission,
-) -> Result<WindowsQualificationReceiptV1, String> {
+) -> Result<WindowsQualificationReceiptV1, QualificationFailure> {
     crate::windows::package::verify_installed()?;
     let manager = super::service_manager::manager()?;
     let control_process_id = super::service_manager::running_process_id(
@@ -1167,87 +1210,176 @@ fn qualify_and_store_admitted(
     super::security::prepare_current_process_for_restricted_broker()?;
     let elevated_observation = TokenFixtureObservation::current()?;
     if !elevated_observation.envelope.elevated {
-        return Err("elevated-admin qualification fixture is not elevated".to_owned());
+        return Err("elevated-admin qualification fixture is not elevated"
+            .to_owned()
+            .into());
     }
     let native = {
         let frontend_canaries = prepare_frontend_canaries("elevated-admin")?;
-        native_public_canary(
+        let mut loader_rejection = None;
+        match native_public_canary(
             "windows-certification-nested-target",
             "elevated-admin",
             &frontend_canaries,
-        )?
+            &mut loader_rejection,
+        ) {
+            Ok(native) => native,
+            Err(detail) => {
+                return Err(QualificationFailure {
+                    detail,
+                    loader_qualification: loader_rejection,
+                });
+            }
+        }
     };
-    // Token variants, AppContainer rejection, frontend-loss, recursive-provider,
-    // and fault experiments belong to the explicit diagnostic/lifecycle suites.
-    // Package qualification runs exactly one unobserved production launch.
-    let frontend_loss_cleanup_verified = false;
-    let recursive_provider_request_denied = false;
-    super::process::certify_target_handle_list_negatives()?;
-    super::process::certify_guardian_loader_context_negatives()?;
-    super::guardian_service::certify_slot_contract_negatives()?;
-    let nested_alternate_token = false;
     let loader_qualification = native
         .evidence
         .loader_qualification
         .clone()
-        .ok_or_else(|| "production loader qualification outcome is absent".to_owned())?;
-    let mut receipt = WindowsQualificationReceiptV1 {
-        schema_version: WINDOWS_QUALIFICATION_SCHEMA_VERSION,
-        provider_identity: format!(
-            "memcordon-sealed-agent-windows-v1:{}",
-            env!("CARGO_PKG_VERSION")
-        ),
-        control_service_identity: "MemCordonSealedControl:LocalService:restricted".to_owned(),
-        launcher_service_identity: "MemCordonSealedLauncher:LocalSystem:restricted".to_owned(),
-        guardian_pool_identity: "MemCordonSealedGuardian-000..007:LocalSystem:restricted:demand"
-            .to_owned(),
-        package_verified: crate::windows::package::verify_installed().is_ok(),
-        public_pipe_security_verified: native.public_pipe_security_verified,
-        private_pipe_security_verified: native.private_pipe_security_verified,
-        control_service_privileges_verified: control_service_privileges_observed,
-        launcher_service_privileges_verified: launcher_service_privileges_observed,
-        guardian_slot_tokens_verified: native.guardian_ready && native.guardian_reaped,
-        guardian_slot_loader_verified: native.guardian_ready && native.guardian_reaped,
-        guardian_capacity_verified: true,
-        caller_token_authentication_verified: native.caller_token_authenticated,
-        restricted_caller_token_verified: false,
-        primary_token_duplication_verified: native.caller_token_authenticated
-            && native.initial_target_token_matches_caller,
-        create_process_as_user_verified: native.target_created_suspended,
-        job_list_supported: native.job_list_applied_at_creation,
-        handle_list_supported: native.handle_list_applied_at_creation,
-        nested_host_job_supported: native.job_list_applied_at_creation,
-        kill_on_close_verified: native.kill_on_close_verified,
-        breakaway_denied: native.breakaway_denied,
-        completion_port_verified: native.completion_port_associated,
-        guardian_verified: native.guardian_ready && native.guardian_reaped,
-        frontend_loss_cleanup_verified,
-        alternate_token_child_contained: nested_alternate_token,
-        nested_child_job_contained: nested_alternate_token,
-        recursive_provider_request_denied,
-        exact_handle_inheritance_verified: native.exact_handle_inheritance_verified
-            && native.inherited_handles_verified,
-        active_processes_zero_verified: native.active_processes_zero,
-        relays_retired_verified: native.relays_retired,
-        recovery_complete: recovery_complete()?,
-        loader_qualification,
-        qualified: false,
-    };
-    receipt.qualified = receipt.is_consistent_if_qualified();
-    if !receipt.is_consistent() {
-        return Err("native Windows qualification produced an inconsistent receipt".to_owned());
-    }
+        .ok_or_else(|| {
+            QualificationFailure::from(
+                "production loader qualification outcome is absent".to_owned(),
+            )
+        })?;
+    let failure_loader_qualification = loader_qualification.clone();
+    (|| -> Result<WindowsQualificationReceiptV1, String> {
+        // Token variants, AppContainer rejection, frontend-loss, recursive-provider,
+        // and fault experiments belong to the explicit diagnostic/lifecycle suites.
+        // Package qualification runs exactly one unobserved production launch.
+        let frontend_loss_cleanup_verified = false;
+        let recursive_provider_request_denied = false;
+        super::process::certify_target_handle_list_negatives()?;
+        super::process::certify_guardian_loader_context_negatives()?;
+        super::guardian_service::certify_slot_contract_negatives()?;
+        let nested_alternate_token = false;
+        let receipt = WindowsQualificationReceiptV1 {
+            schema_version: WINDOWS_QUALIFICATION_SCHEMA_VERSION,
+            provider_identity: format!(
+                "memcordon-sealed-agent-windows-v1:{}",
+                env!("CARGO_PKG_VERSION")
+            ),
+            control_service_identity: "MemCordonSealedControl:LocalService:restricted".to_owned(),
+            launcher_service_identity: "MemCordonSealedLauncher:LocalSystem:restricted".to_owned(),
+            guardian_pool_identity:
+                "MemCordonSealedGuardian-000..007:LocalSystem:restricted:demand".to_owned(),
+            package_verified: crate::windows::package::verify_installed().is_ok(),
+            public_pipe_security_verified: native.public_pipe_security_verified,
+            private_pipe_security_verified: native.private_pipe_security_verified,
+            control_service_privileges_verified: control_service_privileges_observed,
+            launcher_service_privileges_verified: launcher_service_privileges_observed,
+            guardian_slot_tokens_verified: native.guardian_ready && native.guardian_reaped,
+            guardian_slot_loader_verified: native.guardian_ready && native.guardian_reaped,
+            guardian_capacity_verified: true,
+            caller_token_authentication_verified: native.caller_token_authenticated,
+            restricted_caller_token_verified: false,
+            primary_token_duplication_verified: native.caller_token_authenticated
+                && native.initial_target_token_matches_caller,
+            create_process_as_user_verified: native.target_created_suspended,
+            job_list_supported: native.job_list_applied_at_creation,
+            handle_list_supported: native.handle_list_applied_at_creation,
+            nested_host_job_supported: native.job_list_applied_at_creation,
+            kill_on_close_verified: native.kill_on_close_verified,
+            breakaway_denied: native.breakaway_denied,
+            completion_port_verified: native.completion_port_associated,
+            guardian_verified: native.guardian_ready && native.guardian_reaped,
+            frontend_loss_cleanup_verified,
+            alternate_token_child_contained: nested_alternate_token,
+            nested_child_job_contained: nested_alternate_token,
+            recursive_provider_request_denied,
+            exact_handle_inheritance_verified: native.exact_handle_inheritance_verified
+                && native.inherited_handles_verified,
+            active_processes_zero_verified: native.active_processes_zero,
+            relays_retired_verified: native.relays_retired,
+            // The live recovery-empty proof must run only after the durable
+            // qualification admission has been retired and acknowledged.
+            recovery_complete: false,
+            loader_qualification,
+            qualified: false,
+        };
+        if !receipt.is_consistent() {
+            return Err("native Windows qualification produced an inconsistent draft".to_owned());
+        }
+        Ok(receipt)
+    })()
+    .map_err(|detail| {
+        QualificationFailure::with_loader_qualification(detail, failure_loader_qualification)
+    })
+}
+
+fn finalize_qualification_after_admission<Finish, Recovery, Store>(
+    mut receipt: WindowsQualificationReceiptV1,
+    finish_admission: Finish,
+    observe_recovery_complete: Recovery,
+    store_receipt: Store,
+) -> Result<WindowsQualificationReceiptV1, QualificationFailure>
+where
+    Finish: FnOnce() -> Result<(), String>,
+    Recovery: FnOnce() -> Result<bool, String>,
+    Store: FnOnce(&WindowsQualificationReceiptV1) -> Result<(), String>,
+{
+    let loader_qualification = receipt.loader_qualification.clone();
+    (|| -> Result<WindowsQualificationReceiptV1, String> {
+        finish_admission()
+            .map_err(|error| format!("qualification admission retirement failed: {error}"))?;
+        receipt.recovery_complete = observe_recovery_complete()
+            .map_err(|error| format!("post-retirement recovery proof failed: {error}"))?;
+        receipt.qualified = receipt.is_consistent_if_qualified();
+        if !receipt.recovery_complete {
+            return Err(
+                "post-retirement recovery proof found active attempt or admission state".to_owned(),
+            );
+        }
+        if !receipt.qualified || !receipt.is_consistent() {
+            return Err(
+                "native Windows qualification did not produce a qualified consistent receipt"
+                    .to_owned(),
+            );
+        }
+        store_receipt(&receipt)
+            .map_err(|error| format!("qualification receipt persistence failed: {error}"))?;
+        Ok(receipt)
+    })()
+    .map_err(|detail| QualificationFailure::with_loader_qualification(detail, loader_qualification))
+}
+
+#[cfg(test)]
+pub(crate) fn finalize_qualification_after_admission_for_test<Finish, Recovery, Store>(
+    receipt: WindowsQualificationReceiptV1,
+    finish_admission: Finish,
+    observe_recovery_complete: Recovery,
+    store_receipt: Store,
+) -> Result<
+    WindowsQualificationReceiptV1,
+    (
+        String,
+        Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
+    ),
+>
+where
+    Finish: FnOnce() -> Result<(), String>,
+    Recovery: FnOnce() -> Result<bool, String>,
+    Store: FnOnce(&WindowsQualificationReceiptV1) -> Result<(), String>,
+{
+    finalize_qualification_after_admission(
+        receipt,
+        finish_admission,
+        observe_recovery_complete,
+        store_receipt,
+    )
+    .map_err(|failure| (failure.detail, failure.loader_qualification))
+}
+
+fn store_qualification_receipt(receipt: &WindowsQualificationReceiptV1) -> Result<(), String> {
     let path = qualification_path();
     let parent = path
         .parent()
         .ok_or_else(|| "qualification path has no parent".to_owned())?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let staged = path.with_extension("json.new");
-    let mut bytes = serde_json::to_vec_pretty(&receipt).map_err(|error| error.to_string())?;
+    let mut bytes = serde_json::to_vec_pretty(receipt).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
     std::fs::write(&staged, bytes).map_err(|error| error.to_string())?;
-    super::record::replace_atomically(&staged, &path)?;
-    Ok(receipt)
+    super::record::replace_atomically(&staged, &path)
 }
 
 fn store_package_evidence<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> {
@@ -3182,6 +3314,7 @@ fn native_public_canary(
     target_mode: &str,
     token_scenario: &str,
     frontend_canaries: &PreparedFrontendCanaries,
+    loader_rejection: &mut Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
 ) -> Result<NativeCanary, String> {
     use std::os::windows::ffi::OsStrExt;
 
@@ -3646,6 +3779,7 @@ fn native_public_canary(
                     ));
                 }
                 if rejection.terminal_ack_required {
+                    *loader_rejection = rejection.loader_qualification.clone();
                     return acknowledge_latched_qualification_terminal(
                         Err(primary),
                         &returned_attempt,
@@ -3662,6 +3796,7 @@ fn native_public_canary(
                         },
                     );
                 }
+                *loader_rejection = rejection.loader_qualification;
                 return Err(primary);
             }
             WindowsProviderResponseV1::ReplayPending(pending)

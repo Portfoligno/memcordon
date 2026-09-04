@@ -7,6 +7,15 @@ use std::time::{Duration, Instant};
 
 use memcordon_ci::command::{CommandSpec, git, rustup_cargo};
 use memcordon_ci::runtime_manifest::{RuntimeManifestV1, SealedRuntimeV1};
+use memcordon_ci::scenario_diagnostic::BoundedStream;
+use memcordon_ci::windows_package_cleanup::complete_optional_install_cleanup;
+use memcordon_ci::windows_package_staging::{
+    ExternalWindowsPackageSources, WINDOWS_PACKAGE_NAMES, WindowsPackageSourceLayout,
+};
+use memcordon_ci::windows_qualification_artifacts::{
+    prepare_windows_qualification_artifact_directory, read_ready_windows_qualification_artifacts,
+    windows_ephemeral_install_arguments,
+};
 use memcordon_ci::{CiError, Result};
 use memcordon_core::{
     BoundaryClass, BoundaryMechanismEvidence, CredentialTransitionDisposition, MemcordonReport,
@@ -224,18 +233,35 @@ pub fn loader_production(root: &Path, stable: &str) -> Result<()> {
     }
     verify_target_desktop_bootstrap(&bootstrap)?;
     let qualification_output = CommandSpec::new(&agent, root, DEADLINE)
-        .args(["package", "install", "--ephemeral-ci"])
+        .args([
+            OsString::from("package"),
+            OsString::from("install"),
+            OsString::from("--ephemeral-ci"),
+            OsString::from("--qualification-artifact-directory"),
+            reports.as_os_str().to_os_string(),
+        ])
         .output();
+    let qualification_command_failure = match qualification_output.as_ref() {
+        Ok(output) if !output.status.success() => Some(format!(
+            "package install exited with {}; stdout={}; stderr={}",
+            output.status,
+            render_bounded_stream(&output.stdout),
+            render_bounded_stream(&output.stderr),
+        )),
+        Ok(_) | Err(_) => None,
+    };
     let artifact_result = collect_loader_production_artifacts(&reports);
-    let qualification_result = fs::read(
-        windows_provider_state_root()
-            .join("package")
-            .join("qualification.json"),
-    );
-    let uninstall_result = CommandSpec::new(&agent, root, DEADLINE)
-        .args(["package", "uninstall", "--ephemeral-ci"])
-        .run();
-    write_json(
+    let qualification_result = fs::read(reports.join("qualification.json"));
+    let installed_image_present = installed_provider_image_present();
+    let uninstall_result = match installed_image_present.as_ref() {
+        Ok(true) => CommandSpec::new(&agent, root, DEADLINE)
+            .args(["package", "uninstall", "--ephemeral-ci"])
+            .run()
+            .map(|_| ()),
+        Ok(false) => Ok(()),
+        Err(error) => Err(CiError::Message(error.clone())),
+    };
+    let harness_result = write_json(
         &reports.join("harness.json"),
         &serde_json::json!({
             "schema_version": 1,
@@ -244,27 +270,31 @@ pub fn loader_production(root: &Path, stable: &str) -> Result<()> {
             "install_command_returned": qualification_output.is_ok(),
             "typed_artifacts_collected": artifact_result.is_ok(),
             "qualification_receipt_collected": qualification_result.is_ok(),
+            "installed_image_present_after_command": installed_image_present.as_ref().copied().ok(),
             "cleanup_command_returned": uninstall_result.is_ok(),
         }),
-    )?;
+    );
     let gate_result = (|| -> Result<()> {
-        let output = qualification_output?;
-        let (plan, outcome) = artifact_result?;
-        if !output.status.success() {
-            return match outcome {
-                memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(failure) => {
+        qualification_output?;
+        if let Some(command_failure) = qualification_command_failure {
+            return match artifact_result {
+                Ok((_, memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(failure))) => {
                     Err(CiError::Message(format!(
-                        "Windows production loader qualification failed: stage={:?} status={:?} cleanup={:?}",
-                        failure.stage, failure.native_status, failure.cleanup
+                        "Windows production loader qualification failed: code={} stage={:?} status={:?} cleanup={:?}; {command_failure}",
+                        failure.stable_code, failure.stage, failure.native_status, failure.cleanup
                     )))
                 }
-                memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(_) => {
-                    Err(CiError::Message(
-                        "Windows production loader command failed after reporting Ready".to_owned(),
-                    ))
+                Ok((_, memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(_))) => {
+                    Err(CiError::Message(format!(
+                        "Windows production loader command failed after reporting Ready; {command_failure}"
+                    )))
                 }
+                Err(artifact_error) => Err(CiError::Message(format!(
+                    "Windows production loader command failed before a typed outcome could be collected: {command_failure}; secondary typed artifact failure: {artifact_error}"
+                ))),
             };
         }
+        let (plan, outcome) = artifact_result?;
         let plan = plan.ok_or_else(|| {
             CiError::Message(
                 "Windows production loader reported Ready without a launch-plan artifact"
@@ -308,7 +338,13 @@ pub fn loader_production(root: &Path, stable: &str) -> Result<()> {
             ))
         }
     });
-    merge_primary_and_cleanup(gate_result, uninstall_result.map(|_| ()), absence_result)
+    let gate_result = merge_primary_and_cleanup(gate_result, harness_result, Ok(()));
+    merge_primary_and_cleanup(gate_result, uninstall_result, absence_result)
+}
+
+fn render_bounded_stream(bytes: &[u8]) -> String {
+    serde_json::to_string(&BoundedStream::capture(bytes))
+        .unwrap_or_else(|error| format!("bounded command diagnostic serialization failed: {error}"))
 }
 
 fn collect_loader_production_artifacts(
@@ -317,8 +353,7 @@ fn collect_loader_production_artifacts(
     Option<memcordon_windows_launch_core::ProductionLoaderPlanV1>,
     memcordon_core::WindowsLoaderQualificationOutcomeV2,
 )> {
-    let package_state = windows_provider_state_root().join("package");
-    let outcome_bytes = fs::read(package_state.join("production-loader-result-v2.json"))?;
+    let outcome_bytes = fs::read(reports.join("production-loader-result-v2.json"))?;
     let outcome: memcordon_core::WindowsLoaderQualificationOutcomeV2 =
         serde_json::from_slice(&outcome_bytes)?;
     if !outcome.is_consistent() {
@@ -339,7 +374,7 @@ fn collect_loader_production_artifacts(
     ];
     let plan = match loader_outcome_plan_digest(&outcome) {
         Some(expected_digest) => {
-            let plan_bytes = fs::read(package_state.join("production-loader-plan-v1.json"))?;
+            let plan_bytes = fs::read(reports.join("production-loader-plan-v1.json"))?;
             let plan: memcordon_windows_launch_core::ProductionLoaderPlanV1 =
                 serde_json::from_slice(&plan_bytes)?;
             if plan.launch_plan_sha256() != expected_digest {
@@ -1520,47 +1555,32 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
     if install_root.exists() {
         fs::remove_dir_all(&install_root)?;
     }
-    let sources = channel.join("packaged-sources");
-    if sources.exists() {
-        fs::remove_dir_all(&sources)?;
+    let durable_sources = channel.join("packaged-sources");
+    if durable_sources.exists() {
+        fs::remove_dir_all(&durable_sources)?;
     }
-    fs::create_dir_all(&sources)?;
+    fs::create_dir_all(&durable_sources)?;
     let version = env!("CARGO_PKG_VERSION");
-    let packages = [
-        "memcordon-core".to_owned(),
-        "memcordon-platform".to_owned(),
-        "memcordon-windows-launch-core".to_owned(),
-        "memcordon".to_owned(),
-    ];
+    let packages = WINDOWS_PACKAGE_NAMES.map(str::to_owned);
     create_package_archives(root, stable, &packages)?;
-    let core = sources.join("memcordon-core");
-    let platform = sources.join("memcordon-platform");
-    let launch_core = sources.join("memcordon-windows-launch-core");
-    let cli_source = sources.join("memcordon");
-    for (package, destination) in [
-        ("memcordon-core", &core),
-        ("memcordon-platform", &platform),
-        ("memcordon-windows-launch-core", &launch_core),
-        ("memcordon", &cli_source),
-    ] {
-        extract_crate_source(
-            &package_archive_directory(root).join(format!("{package}-{version}.crate")),
-            destination,
-        )?;
+    let durable_layout = WindowsPackageSourceLayout::new(durable_sources);
+    let execution_sources = ExternalWindowsPackageSources::new(root)?;
+    for layout in [&durable_layout, execution_sources.layout()] {
+        for (package, destination) in layout.package_destinations() {
+            extract_crate_source(
+                &package_archive_directory(root).join(format!("{package}-{version}.crate")),
+                destination,
+            )?;
+        }
     }
-    write_packaged_source_configuration(&sources, &core, &platform, &launch_core)?;
+    execution_sources.layout().write_cargo_configuration()?;
+    let target_root = channel.join("build");
     rustup_cargo(
-        &sources,
+        execution_sources.layout().root(),
         stable,
-        [
-            OsString::from("install"),
-            OsString::from("--locked"),
-            OsString::from("--path"),
-            cli_source.into_os_string(),
-            OsString::from("--root"),
-            install_root.clone().into_os_string(),
-            OsString::from("--force"),
-        ],
+        execution_sources
+            .layout()
+            .cargo_install_arguments(&install_root, &target_root),
         DEADLINE,
     )
     .run()?;
@@ -1617,20 +1637,17 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
 
 fn certify_rollback_with_cleanup(root: &Path, agent: &Path) -> Result<bool> {
     let primary = certify_fresh_install_rollback(root, agent);
-    let uninstall = CommandSpec::new(agent, root, DEADLINE)
-        .args(["package", "uninstall", "--ephemeral-ci"])
-        .run()
-        .map(|_| ());
-    let absence = provider_state_absent(root, agent).and_then(|absent| {
-        if absent {
-            Ok(())
-        } else {
-            Err(CiError::Message(
-                "rollback certification left provider state".to_owned(),
-            ))
-        }
-    });
-    merge_primary_and_cleanup(primary, uninstall, absence)
+    complete_optional_install_cleanup(
+        primary,
+        || installed_provider_image_present().map_err(CiError::Message),
+        || {
+            CommandSpec::new(agent, root, DEADLINE)
+                .args(["package", "uninstall", "--ephemeral-ci"])
+                .run()
+                .map(|_| ())
+        },
+        || provider_state_absent(root, agent),
+    )
 }
 
 fn write_split_windows_release_certification(
@@ -1708,77 +1725,6 @@ fn write_split_windows_release_certification(
             "evidence_bindings": bindings,
         }),
     )
-}
-
-fn write_packaged_source_configuration(
-    sources: &Path,
-    core: &Path,
-    platform: &Path,
-    launch_core: &Path,
-) -> Result<()> {
-    let cargo_configuration = sources.join(".cargo");
-    fs::create_dir_all(&cargo_configuration)?;
-    let mut core_specification = toml::Table::new();
-    core_specification.insert(
-        "path".to_owned(),
-        toml::Value::String(core.to_string_lossy().into_owned()),
-    );
-    let mut platform_specification = toml::Table::new();
-    platform_specification.insert(
-        "path".to_owned(),
-        toml::Value::String(platform.to_string_lossy().into_owned()),
-    );
-    let mut launch_core_specification = toml::Table::new();
-    launch_core_specification.insert(
-        "path".to_owned(),
-        toml::Value::String(launch_core.to_string_lossy().into_owned()),
-    );
-    let mut crates_io = toml::Table::new();
-    crates_io.insert(
-        "memcordon-core".to_owned(),
-        toml::Value::Table(core_specification),
-    );
-    crates_io.insert(
-        "memcordon-platform".to_owned(),
-        toml::Value::Table(platform_specification),
-    );
-    crates_io.insert(
-        "memcordon-windows-launch-core".to_owned(),
-        toml::Value::Table(launch_core_specification),
-    );
-    let mut patch_table = toml::Table::new();
-    patch_table.insert("crates-io".to_owned(), toml::Value::Table(crates_io));
-    let mut configuration = toml::Table::new();
-    configuration.insert("patch".to_owned(), toml::Value::Table(patch_table));
-    configuration.insert(
-        "target".to_owned(),
-        windows_static_crt_target_configuration(),
-    );
-    fs::write(
-        cargo_configuration.join("config.toml"),
-        toml::to_string(&toml::Value::Table(configuration)).map_err(|error| {
-            CiError::Message(format!(
-                "packaged-source Cargo configuration serialization failed: {error}"
-            ))
-        })?,
-    )?;
-    Ok(())
-}
-
-fn windows_static_crt_target_configuration() -> toml::Value {
-    let rustflags = || {
-        toml::Value::Array(vec![
-            toml::Value::String("-C".to_owned()),
-            toml::Value::String("target-feature=+crt-static".to_owned()),
-        ])
-    };
-    let mut targets = toml::Table::new();
-    for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
-        let mut specification = toml::Table::new();
-        specification.insert("rustflags".to_owned(), rustflags());
-        targets.insert(target.to_owned(), toml::Value::Table(specification));
-    }
-    toml::Value::Table(targets)
 }
 
 struct NativeChannel {
@@ -1965,8 +1911,9 @@ fn channel_smoke(
 ) -> Result<ChannelFingerprint> {
     let package =
         run_json(&CommandSpec::new(agent, root, DEADLINE).args(["package", "inspect", "--json"]))?;
+    prepare_windows_qualification_artifact_directory(channel)?;
     let install_result = CommandSpec::new(agent, root, DEADLINE)
-        .args(["package", "install", "--ephemeral-ci"])
+        .args(windows_ephemeral_install_arguments(channel))
         .run()
         .map(|_| ());
     let primary =
@@ -1994,17 +1941,9 @@ fn channel_smoke_installed(
     channel: &Path,
     package: Value,
 ) -> Result<ChannelFingerprint> {
-    let qualification: WindowsQualificationReceiptV1 = serde_json::from_slice(&fs::read(
-        windows_provider_state_root()
-            .join("package")
-            .join("qualification.json"),
-    )?)?;
-    let launch_plan: memcordon_windows_launch_core::ProductionLoaderPlanV1 =
-        serde_json::from_slice(&fs::read(
-            windows_provider_state_root()
-                .join("package")
-                .join("production-loader-plan-v1.json"),
-        )?)?;
+    let artifacts = read_ready_windows_qualification_artifacts(channel)?;
+    let qualification = artifacts.receipt;
+    let launch_plan = artifacts.plan;
     let installed =
         run_json(&CommandSpec::new(agent, root, DEADLINE).args(["package", "verify", "--json"]))?;
     if installed
@@ -2599,14 +2538,33 @@ fn provider_state_absent(root: &Path, agent: &Path) -> Result<bool> {
         .arg("windows-provider-state-absent")
         .output()?;
     if !native_absence.status.success() {
-        return Err(CiError::Message(
-            "native Windows provider absence probe failed".to_owned(),
-        ));
+        return Err(CiError::Message(format!(
+            "native Windows provider absence probe exited with {}; stdout={}; stderr={}",
+            native_absence.status,
+            render_bounded_stream(&native_absence.stdout),
+            render_bounded_stream(&native_absence.stderr),
+        )));
     }
     let native_absence = String::from_utf8(native_absence.stdout).map_err(|error| {
         CiError::Message(format!("provider absence result was not UTF-8: {error}"))
     })?;
     Ok(program_data && !program_files.exists() && native_absence.trim() == "true")
+}
+
+fn installed_provider_image_present() -> std::result::Result<bool, String> {
+    let image = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+        .join("MemCordon")
+        .join("memcordon-sealed-agent.exe");
+    match fs::symlink_metadata(&image) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "cannot inspect installed Windows provider image at {}: {error}",
+            image.display()
+        )),
+    }
 }
 
 fn runner_label() -> String {

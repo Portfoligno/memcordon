@@ -1,3 +1,4 @@
+#[cfg(windows)]
 use crate::{artifact, scenario::LoaderLabScenarioV1};
 use std::path::Path;
 
@@ -5,21 +6,22 @@ pub fn lab_service_name(run_id: &str, scenario_id: &str) -> String {
     format!("MemCordonLoaderLab-{run_id}-{scenario_id}")
 }
 
+#[cfg(windows)]
 pub fn run(scenario_path: &Path, result_path: &Path) -> Result<(), String> {
     let scenario: LoaderLabScenarioV1 = artifact::read_json(scenario_path)?;
     scenario.validate(&scenario.production_plan_sha256)?;
-    #[cfg(windows)]
     let result = windows::run_scenario(&scenario)?;
-    #[cfg(not(windows))]
-    let result = {
-        let _ = scenario;
-        return Err(String::from(
-            "the loader laboratory spawner is Windows-only",
-        ));
-    };
     result.validate_against(&scenario)?;
     artifact::write_json(result_path, &result)?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn run(scenario_path: &Path, result_path: &Path) -> Result<(), String> {
+    let _ = (scenario_path, result_path);
+    Err(String::from(
+        "the loader laboratory spawner is Windows-only",
+    ))
 }
 
 pub fn run_as_service(

@@ -358,6 +358,7 @@ fn windows_qualification() -> WindowsQualificationReceiptV1 {
             memcordon_core::WindowsLoaderReadyEvidenceV1 {
                 schema_version: 1,
                 launch_plan_sha256: hex::encode(Sha256::digest(b"production-plan")),
+                launch_plan_json: None,
                 elapsed_millis: 1,
             },
         ),

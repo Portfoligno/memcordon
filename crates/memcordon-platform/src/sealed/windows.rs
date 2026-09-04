@@ -29,9 +29,10 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, EqualSid, GetTokenInformation, LookupAccountNameW,
-    PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity, TOKEN_GROUPS, TOKEN_QUERY,
-    TOKEN_USER, TokenGroups, TokenRestrictedSids, TokenUser,
+    DACL_SECURITY_INFORMATION, EqualSid, GetLengthSid, GetTokenInformation, IsValidSid,
+    LookupAccountNameW, PROTECTED_DACL_SECURITY_INFORMATION, SID, SID_AND_ATTRIBUTES,
+    SetKernelObjectSecurity, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups,
+    TokenRestrictedSids, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, FILE_TYPE_PIPE, GetFileType,
@@ -50,9 +51,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-use crate::backend::{
-    BackendInfo, BoundaryQualification, BoundarySupport, Execution, SealedAvailability,
-};
+use crate::backend::{BackendInfo, BoundaryQualification, Execution, SealedAvailability};
 
 const PIPE_CLIENT_READ_WRITE: u32 = 0x0012_019b;
 const TOKEN_GROUP_ENABLED: u32 = 0x0000_0004;
@@ -132,10 +131,7 @@ fn prepare_current_process_for_restricted_broker() -> Result<(), String> {
         return Err(io::Error::last_os_error().to_string());
     }
     let token = OwnedHandle::new(token)?;
-    let user = token_information(token.raw(), TokenUser)?;
-    // SAFETY: token_information returned a complete TOKEN_USER allocation.
-    let user = unsafe { ptr::read_unaligned(user.as_ptr().cast::<TOKEN_USER>()) };
-    let user = sid_string(user.User.Sid)?;
+    let user = token_user_sid_string(token.raw())?;
     // The broker opens this process while impersonating the authenticated
     // caller. A restricted token must satisfy the normal user and restricting
     // SID checks, so RC receives only query, duplicate-handle and synchronize.
@@ -195,58 +191,36 @@ fn sid_string(sid: *mut core::ffi::c_void) -> Result<String, String> {
 }
 
 pub fn info(qualification: WindowsQualificationReceiptV1) -> BackendInfo {
+    crate::windows_job::info_from_qualification(qualification)
+}
+
+pub(crate) fn availability(qualification: WindowsQualificationReceiptV1) -> SealedAvailability {
     let receipt = serde_json::to_vec(&qualification)
         .expect("qualification receipt always has a bounded serialization");
     let digest: String = Sha256::digest(receipt)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    BackendInfo {
-        name: "windows-job-object",
-        containment_supported: true,
-        memory_supported: true,
-        class: "hard",
-        metric: "windows-job-commit",
-        hard_limit: true,
-        startup_containment:
-            "target created suspended with creation-time Job and exact handle lists, then verified and resumed",
-        limitations: vec![
-            "standard streams are provider-owned pipes rather than direct console handles",
-            "interactive console and desktop semantics are not certified",
-            "AppContainer caller tokens are not supported by Windows sealed v2",
-        ],
-        boundary_support: BoundarySupport {
-            standard: BoundaryCapability {
-                class: BoundaryClass::Standard,
-                mechanism: "suspended-job-assignment-v1".to_owned(),
-                target_gated: true,
-                boundary_verified_before_authorization: true,
-                target_can_reconfigure_boundary: true,
-                frontend_loss_cleanup_authority: false,
-                workload_empty_proof: true,
-                limitations: vec!["standard supervision is not a sealed boundary".to_owned()],
-            },
-            sealed: SealedAvailability::Available {
-                capability: BoundaryCapability {
-                    class: BoundaryClass::Sealed,
-                    mechanism: "windows-job-object-v2".to_owned(),
-                    target_gated: true,
-                    boundary_verified_before_authorization: true,
-                    target_can_reconfigure_boundary: false,
-                    frontend_loss_cleanup_authority: true,
-                    workload_empty_proof: true,
-                    limitations: vec![
-                        "standard streams are provider-owned pipes rather than direct console handles".to_owned(),
-                        "interactive console and desktop semantics are not certified".to_owned(),
-                        "AppContainer caller tokens are not supported by Windows sealed v2".to_owned(),
-                    ],
-                },
-                qualification: BoundaryQualification {
-                    provider_identity: qualification.provider_identity,
-                    receipt_digest: digest,
-                    mechanism: "windows-job-object-v2".to_owned(),
-                },
-            },
+    SealedAvailability::Available {
+        capability: BoundaryCapability {
+            class: BoundaryClass::Sealed,
+            mechanism: "windows-job-object-v2".to_owned(),
+            target_gated: true,
+            boundary_verified_before_authorization: true,
+            target_can_reconfigure_boundary: false,
+            frontend_loss_cleanup_authority: true,
+            workload_empty_proof: true,
+            limitations: vec![
+                "standard streams are provider-owned pipes rather than direct console handles"
+                    .to_owned(),
+                "interactive console and desktop semantics are not certified".to_owned(),
+                "AppContainer caller tokens are not supported by Windows sealed v2".to_owned(),
+            ],
+        },
+        qualification: BoundaryQualification {
+            provider_identity: qualification.provider_identity,
+            receipt_digest: digest,
+            mechanism: "windows-job-object-v2".to_owned(),
         },
     }
 }
@@ -1000,10 +974,7 @@ fn authenticate_peer(pipe: HANDLE) -> Result<(), String> {
         r"NT SERVICE\{}",
         memcordon_core::WINDOWS_CONTROL_SERVICE_NAME
     ))?;
-    let user = token_information(token.raw(), TokenUser)?;
-    // SAFETY: token_information returned a complete TOKEN_USER allocation.
-    let user = unsafe { ptr::read_unaligned(user.as_ptr().cast::<TOKEN_USER>()) };
-    if unsafe { EqualSid(user.User.Sid, local_service.as_ptr().cast_mut().cast()) } == 0
+    if !token_user_matches(token.raw(), &local_service)?
         || !token_groups_contain(token.raw(), TokenGroups, &control_service)?
         || !token_groups_contain(token.raw(), TokenRestrictedSids, &control_service)?
     {
@@ -1067,6 +1038,16 @@ impl TokenInformationBuffer {
     fn as_ptr(&self) -> *const u8 {
         self.words.as_ptr().cast()
     }
+
+    fn allocated_byte_length(&self) -> usize {
+        std::mem::size_of_val(self.words.as_slice())
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: every word is initialized when the allocation is created,
+        // and the byte view cannot outlive the owning word vector.
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.allocated_byte_length()) }
+    }
 }
 
 fn token_information(token: HANDLE, class: i32) -> Result<TokenInformationBuffer, String> {
@@ -1092,27 +1073,235 @@ fn token_information(token: HANDLE, class: i32) -> Result<TokenInformationBuffer
     {
         return Err(io::Error::last_os_error().to_string());
     }
-    Ok(TokenInformationBuffer {
+    let buffer = TokenInformationBuffer {
         words,
         byte_length: length as usize,
-    })
+    };
+    if buffer.byte_length > buffer.allocated_byte_length() {
+        return Err("token information response exceeds its allocation".to_owned());
+    }
+    Ok(buffer)
 }
 
-fn token_groups_contain(token: HANDLE, class: i32, expected: &[u32]) -> Result<bool, String> {
-    let buffer = token_information(token, class)?;
-    if buffer.byte_length < std::mem::size_of::<TOKEN_GROUPS>() {
+pub(crate) fn checked_token_group_entries_range(
+    byte_length: usize,
+    entry_count: usize,
+) -> Result<std::ops::Range<usize>, String> {
+    let entries_offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+    if byte_length < entries_offset {
         return Err("token group response is truncated".to_owned());
     }
-    // SAFETY: buffer contains the requested TOKEN_GROUPS header and the count
-    // describes its trailing SID_AND_ATTRIBUTES entries.
-    let groups = unsafe { ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_GROUPS>()) };
-    let entries =
-        unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize) };
-    Ok(entries.iter().any(|entry| {
-        (unsafe { EqualSid(entry.Sid, expected.as_ptr().cast_mut().cast()) }) != 0
+    let entries_byte_length = entry_count
+        .checked_mul(std::mem::size_of::<SID_AND_ATTRIBUTES>())
+        .ok_or_else(|| "token group entry count overflows response bounds".to_owned())?;
+    let entries_end = entries_offset
+        .checked_add(entries_byte_length)
+        .ok_or_else(|| "token group response length overflows".to_owned())?;
+    if entries_end > byte_length {
+        return Err("token group response is truncated".to_owned());
+    }
+    Ok(entries_offset..entries_end)
+}
+
+pub(crate) fn token_group_entries(
+    storage: &[u8],
+    byte_length: usize,
+) -> Result<&[SID_AND_ATTRIBUTES], String> {
+    if byte_length > storage.len() {
+        return Err("token information response exceeds its allocation".to_owned());
+    }
+    let entries_offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+    if byte_length < entries_offset {
+        return Err("token group response is truncated".to_owned());
+    }
+    let groups = storage.as_ptr().cast::<TOKEN_GROUPS>();
+    // SAFETY: the checked prefix contains GroupCount, and addr_of does not
+    // create a reference to the variable-length TOKEN_GROUPS value.
+    let entry_count = unsafe { ptr::read_unaligned(ptr::addr_of!((*groups).GroupCount)) } as usize;
+    let entries_range = checked_token_group_entries_range(byte_length, entry_count)?;
+    // SAFETY: the range is checked against byte_length, which is itself
+    // checked against the live storage allocation.
+    let entries_pointer =
+        unsafe { storage.as_ptr().add(entries_range.start) }.cast::<SID_AND_ATTRIBUTES>();
+    if (entries_pointer as usize) % std::mem::align_of::<SID_AND_ATTRIBUTES>() != 0 {
+        return Err("token group response entries are misaligned".to_owned());
+    }
+    // SAFETY: alignment and the full count-times-entry-size range were checked
+    // against the live buffer above.
+    Ok(unsafe { std::slice::from_raw_parts(entries_pointer, entry_count) })
+}
+
+fn checked_token_sid_range(
+    storage: &[u8],
+    byte_length: usize,
+    sid: *const core::ffi::c_void,
+) -> Result<std::ops::Range<usize>, String> {
+    if byte_length > storage.len() {
+        return Err("token information response exceeds its allocation".to_owned());
+    }
+    let storage_start = storage.as_ptr() as usize;
+    let storage_end = storage_start
+        .checked_add(byte_length)
+        .ok_or_else(|| "token information response address overflows".to_owned())?;
+    let sid_address = sid as usize;
+    if sid_address < storage_start || sid_address >= storage_end {
+        return Err("token SID pointer is outside its response".to_owned());
+    }
+    let sid_offset = sid_address - storage_start;
+    let sub_authorities_offset = std::mem::offset_of!(SID, SubAuthority);
+    let sid_prefix_end = sid_offset
+        .checked_add(sub_authorities_offset)
+        .ok_or_else(|| "token SID prefix overflows response bounds".to_owned())?;
+    if sid_prefix_end > byte_length {
+        return Err("token SID response is truncated".to_owned());
+    }
+    // Re-anchor the validated address in storage before reading from it.
+    // SAFETY: the prefix range was checked against the live storage above.
+    let sid_pointer = unsafe { storage.as_ptr().add(sid_offset) }.cast::<SID>();
+    // SAFETY: SubAuthorityCount lies entirely before SubAuthority, whose
+    // offset was checked above. read_unaligned also supports packed fixtures.
+    let sub_authority_count =
+        unsafe { ptr::read_unaligned(ptr::addr_of!((*sid_pointer).SubAuthorityCount)) } as usize;
+    let sub_authorities_byte_length = sub_authority_count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| "token SID sub-authority count overflows".to_owned())?;
+    let sid_end = sid_prefix_end
+        .checked_add(sub_authorities_byte_length)
+        .ok_or_else(|| "token SID length overflows response bounds".to_owned())?;
+    if sid_end > byte_length {
+        return Err("token SID response is truncated".to_owned());
+    }
+    Ok(sid_offset..sid_end)
+}
+
+fn validated_token_sid_range(
+    storage: &[u8],
+    byte_length: usize,
+    sid: *const core::ffi::c_void,
+) -> Result<std::ops::Range<usize>, String> {
+    let sid_range = checked_token_sid_range(storage, byte_length, sid)?;
+    // Re-anchor the native pointer in the borrowed storage instead of relying
+    // on the provenance of the interior pointer copied out of the wire header.
+    // SAFETY: checked_token_sid_range proved sid_range starts in storage.
+    let bounded_sid = unsafe { storage.as_ptr().add(sid_range.start) }
+        .cast_mut()
+        .cast();
+    // SAFETY: checked_token_sid_range proved the complete SID lies in the live
+    // storage allocation before either Windows routine can inspect it.
+    if unsafe { IsValidSid(bounded_sid) } == 0 {
+        return Err("token SID is invalid".to_owned());
+    }
+    // SAFETY: IsValidSid accepted the completely bounded SID above.
+    if unsafe { GetLengthSid(bounded_sid) } as usize != sid_range.len() {
+        return Err("token SID length differs from its bounded response".to_owned());
+    }
+    Ok(sid_range)
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn checked_token_group_sid_range(
+    storage: &[u8],
+    byte_length: usize,
+    sid: *const core::ffi::c_void,
+) -> Result<std::ops::Range<usize>, String> {
+    checked_token_sid_range(storage, byte_length, sid)
+}
+
+pub(crate) fn token_user_sid(storage: &[u8], byte_length: usize) -> Result<&[u8], String> {
+    if byte_length > storage.len() {
+        return Err("token information response exceeds its allocation".to_owned());
+    }
+    let user_offset = std::mem::offset_of!(TOKEN_USER, User);
+    let user_end = user_offset
+        .checked_add(std::mem::size_of::<SID_AND_ATTRIBUTES>())
+        .ok_or_else(|| "token user response length overflows".to_owned())?;
+    if user_end > byte_length {
+        return Err("token user response is truncated".to_owned());
+    }
+    // SAFETY: the complete SID_AND_ATTRIBUTES field is within byte_length;
+    // read_unaligned avoids creating a reference into an unaligned fixture.
+    let user = unsafe {
+        ptr::read_unaligned(
+            storage
+                .as_ptr()
+                .add(user_offset)
+                .cast::<SID_AND_ATTRIBUTES>(),
+        )
+    };
+    let sid_range = validated_token_sid_range(storage, byte_length, user.Sid.cast_const())?;
+    Ok(&storage[sid_range])
+}
+
+pub(crate) fn token_user_storage_matches(
+    storage: &[u8],
+    byte_length: usize,
+    expected: &[u32],
+) -> Result<bool, String> {
+    let user = token_user_sid(storage, byte_length)?;
+    // SAFETY: u32 storage is initialized, naturally aligned, and the byte view
+    // remains borrowed from expected for the entire validation and comparison.
+    let expected_bytes = unsafe {
+        std::slice::from_raw_parts(
+            expected.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(expected),
+        )
+    };
+    validated_token_sid_range(
+        expected_bytes,
+        expected_bytes.len(),
+        expected.as_ptr().cast(),
+    )?;
+    // SAFETY: both SIDs were validated as complete within their live owners.
+    Ok(unsafe {
+        EqualSid(
+            user.as_ptr().cast_mut().cast(),
+            expected.as_ptr().cast_mut().cast(),
+        )
+    } != 0)
+}
+
+pub(crate) fn token_user_sid_string(token: HANDLE) -> Result<String, String> {
+    let buffer = token_information(token, TokenUser)?;
+    let user = token_user_sid(buffer.as_bytes(), buffer.byte_length)?;
+    sid_string(user.as_ptr().cast_mut().cast())
+}
+
+fn token_user_matches(token: HANDLE, expected: &[u32]) -> Result<bool, String> {
+    let buffer = token_information(token, TokenUser)?;
+    token_user_storage_matches(buffer.as_bytes(), buffer.byte_length, expected)
+}
+
+pub(crate) fn token_group_storage_contains(
+    storage: &[u8],
+    byte_length: usize,
+    expected: &[u32],
+) -> Result<bool, String> {
+    let entries = token_group_entries(storage, byte_length)?;
+    for entry in entries {
+        let sid_range = validated_token_sid_range(storage, byte_length, entry.Sid.cast_const())?;
+        // SAFETY: the validated range starts within the live storage.
+        let sid = unsafe { storage.as_ptr().add(sid_range.start) }
+            .cast_mut()
+            .cast();
+        // SAFETY: the validated entry SID and the trusted account SID returned
+        // by LookupAccountNameW remain live while EqualSid inspects them.
+        if unsafe { EqualSid(sid, expected.as_ptr().cast_mut().cast()) } != 0
             && entry.Attributes & TOKEN_GROUP_ENABLED != 0
             && entry.Attributes & TOKEN_GROUP_USE_FOR_DENY_ONLY == 0
-    }))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn token_groups_contain(
+    token: HANDLE,
+    class: i32,
+    expected: &[u32],
+) -> Result<bool, String> {
+    let buffer = token_information(token, class)?;
+    token_group_storage_contains(buffer.as_bytes(), buffer.byte_length, expected)
 }
 
 fn write_frame<T: Serialize>(handle: HANDLE, value: &T) -> Result<(), String> {

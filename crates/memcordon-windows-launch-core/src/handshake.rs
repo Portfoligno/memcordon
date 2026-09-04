@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 const MAX_STABLE_CODE_BYTES: usize = 128;
 
 /// Version of the production target-desktop bootstrap ready/release frame.
-pub const PRODUCTION_LOADER_READY_SCHEMA_VERSION: u32 = 18;
+pub const PRODUCTION_LOADER_READY_SCHEMA_VERSION: u32 = 19;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
