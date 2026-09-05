@@ -1630,6 +1630,20 @@ fn archive_member_inventory_name(path: &Path) -> Result<String> {
     Ok(name)
 }
 
+fn read_archive_member(
+    extraction_root: &Path,
+    member: &str,
+    relative: &Path,
+    operation: &str,
+) -> Result<Vec<u8>> {
+    let path = extraction_root.join(relative);
+    fs::read(&path).map_err(|error| {
+        failure(format!(
+            "release archive member read failed: operation={operation} member={member:?} path={path:?}: {error}"
+        ))
+    })
+}
+
 struct ArchiveInspection {
     runtime_manifest_sha256: String,
     components: Vec<RuntimeComponentRecord>,
@@ -1645,7 +1659,7 @@ fn inspect_extract_and_smoke(
     execute: bool,
 ) -> Result<ArchiveInspection> {
     let temporary = TempDir::new()?;
-    let mut extracted_files = BTreeSet::<String>::new();
+    let mut extracted_files = BTreeMap::<String, PathBuf>::new();
     let mut archive_modes = BTreeMap::<String, u32>::new();
     if target.archive == "zip" {
         let mut archive = zip::ZipArchive::new(File::open(archive_path)?)?;
@@ -1672,7 +1686,7 @@ fn inspect_extract_and_smoke(
                         .ok_or_else(|| failure("ZIP archive member has no Unix mode"))?
                         & 0o7777,
                 );
-                extracted_files.insert(member);
+                extracted_files.insert(member, relative);
             } else {
                 return Err(failure("ZIP archive contains a non-file member"));
             }
@@ -1694,7 +1708,7 @@ fn inspect_extract_and_smoke(
                 let mut output = File::create(&destination)?;
                 std::io::copy(&mut entry, &mut output)?;
                 archive_modes.insert(member.clone(), entry.header().mode()? & 0o7777);
-                extracted_files.insert(member);
+                extracted_files.insert(member, relative);
             } else {
                 return Err(failure("tar archive contains a non-file member"));
             }
@@ -1714,9 +1728,10 @@ fn inspect_extract_and_smoke(
     for relative in NATIVE_ARCHIVE_STATIC_PATHS {
         expected.insert(archive_member_inventory_name(&top.join(relative))?);
     }
-    if extracted_files != expected {
+    let actual_members = extracted_files.keys().cloned().collect::<BTreeSet<_>>();
+    if actual_members != expected {
         return Err(failure(format!(
-            "release archive member set differs: expected={expected:?} actual={extracted_files:?}"
+            "release archive member set differs: expected={expected:?} actual={actual_members:?}"
         )));
     }
     for component in &target.executable {
@@ -1756,10 +1771,10 @@ fn inspect_extract_and_smoke(
         ));
     }
     let mut documents = BTreeMap::new();
-    for member in &extracted_files {
+    for (member, relative) in &extracted_files {
         documents.insert(
-            PathBuf::from(member),
-            fs::read(temporary.path().join(&top).join(member))?,
+            relative.clone(),
+            read_archive_member(temporary.path(), member, relative, "document validation")?,
         );
     }
     validate_markdown_documents(&documents)?;
@@ -1843,7 +1858,7 @@ fn inspect_extract_and_smoke(
         }
     }
     let mut inventory = Sha256::new();
-    for member in &extracted_files {
+    for (member, relative) in &extracted_files {
         inventory.update(member.as_bytes());
         inventory.update([0]);
         inventory.update(
@@ -1852,7 +1867,8 @@ fn inspect_extract_and_smoke(
                 .ok_or_else(|| failure("archive member mode is missing"))?
                 .to_le_bytes(),
         );
-        inventory.update(sha256_file(&temporary.path().join(&top).join(member))?.as_bytes());
+        let bytes = read_archive_member(temporary.path(), member, relative, "inventory hashing")?;
+        inventory.update(sha256_bytes(&bytes).as_bytes());
     }
     Ok(ArchiveInspection {
         runtime_manifest_sha256: sha256_bytes(&manifest_bytes),
@@ -5512,6 +5528,83 @@ mod tests {
             safe_archive_path(Path::new("root/bin")).expect("safe path"),
             PathBuf::from("root/bin")
         );
+    }
+
+    #[test]
+    fn archive_member_read_diagnostics_identify_operation_member_and_path() {
+        let temporary = TempDir::new().expect("temporary extraction root should exist");
+        let relative = Path::new("top/CHANGELOG.md");
+        let expected_path = temporary.path().join(relative);
+        let error = read_archive_member(
+            temporary.path(),
+            "top/CHANGELOG.md",
+            relative,
+            "document validation",
+        )
+        .expect_err("missing archive member read should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("operation=document validation")
+                && message.contains("member=\"top/CHANGELOG.md\"")
+                && message.contains(format!("path={expected_path:?}").as_str()),
+            "archive member diagnostics should identify the exact operation and path: {message}"
+        );
+    }
+
+    #[test]
+    fn canonical_archive_members_read_through_their_extracted_paths_once() {
+        let temporary = TempDir::new().expect("temporary release root should exist");
+        let root = temporary.path();
+        let component = config::AssetExecutable {
+            package: "memcordon".to_owned(),
+            binary: "memcordon".to_owned(),
+            archive_path: "bin/memcordon".to_owned(),
+            mode: 0o755,
+            role: RuntimeComponentRole::PublicCli,
+        };
+        let mut target = AssetTarget {
+            id: "release-fixture".to_owned(),
+            rust_target: "x86_64-unknown-linux-gnu".to_owned(),
+            archive: "tar-gz".to_owned(),
+            executable: vec![component],
+            sealed: SealedAssetPolicy::NotApplicable,
+        };
+        for relative in NATIVE_ARCHIVE_STATIC_PATHS {
+            let source = root.join(Path::new(*relative));
+            fs::create_dir_all(source.parent().expect("static member parent should exist"))
+                .expect("static member parent should exist");
+            fs::write(&source, b"fixture\n").expect("static member fixture should write");
+        }
+        let identity = ReleaseIdentity {
+            tag: "1.2.3".to_owned(),
+            version: Version::parse("1.2.3").expect("version should parse"),
+            commit: "0123456789abcdef".to_owned(),
+            changelog_section: String::new(),
+            source_date: "2025-01-01T00:00:00Z".to_owned(),
+        };
+        for archive_kind in ["tar-gz", "zip"] {
+            target.archive = archive_kind.to_owned();
+            let executable = built_executable_path(root, &target, &target.executable[0]);
+            fs::create_dir_all(executable.parent().expect("executable parent should exist"))
+                .expect("executable parent should exist");
+            fs::write(&executable, b"cli fixture\n").expect("executable fixture should write");
+            let built = build_archive(root, &identity, &target)
+                .expect("synthetic release archive fixture should build");
+            let inspection =
+                inspect_extract_and_smoke(root, &built.path, &target, &identity, false)
+                    .unwrap_or_else(|error| {
+                        panic!("{archive_kind} archive inspection should succeed: {error}")
+                    });
+            assert_eq!(
+                inspection.components.len(),
+                1,
+                "{archive_kind} archive should retain its public CLI component"
+            );
+            assert!(
+                !inspection.archive_member_inventory_sha256.is_empty(),
+                "{archive_kind} archive should produce a member inventory digest"
+            );
+        }
     }
 
     #[test]
