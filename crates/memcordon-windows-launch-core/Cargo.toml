@@ -13,7 +13,7 @@ categories = ["os::windows-apis"]
 
 [dependencies]
 hex.workspace = true
-memcordon-core = { path = "../memcordon-core", version = "=0.5.2-dev" }
+memcordon-core = { path = "../memcordon-core", version = "=0.5.2-rc.11" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

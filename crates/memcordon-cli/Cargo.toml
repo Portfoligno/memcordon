@@ -56,9 +56,9 @@ anstyle.workspace = true
 anstyle-query.workspace = true
 clap.workspace = true
 libc.workspace = true
-memcordon-core = { path = "../memcordon-core", version = "=0.5.2-dev" }
-memcordon-platform = { path = "../memcordon-platform", version = "=0.5.2-dev" }
-memcordon-windows-launch-core = { path = "../memcordon-windows-launch-core", version = "=0.5.2-dev" }
+memcordon-core = { path = "../memcordon-core", version = "=0.5.2-rc.11" }
+memcordon-platform = { path = "../memcordon-platform", version = "=0.5.2-rc.11" }
+memcordon-windows-launch-core = { path = "../memcordon-windows-launch-core", version = "=0.5.2-rc.11" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

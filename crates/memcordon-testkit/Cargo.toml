@@ -11,7 +11,7 @@ publish = false
 libc.workspace = true
 
 [dependencies]
-memcordon-platform = { path = "../memcordon-platform", version = "=0.5.2-dev", features = ["test-support"] }
+memcordon-platform = { path = "../memcordon-platform", version = "=0.5.2-rc.11", features = ["test-support"] }
 
 [lints]
 workspace = true

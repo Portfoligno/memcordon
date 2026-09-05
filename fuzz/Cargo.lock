@@ -654,7 +654,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memcordon"
-version = "0.5.2-dev"
+version = "0.5.2-rc.11"
 dependencies = [
  "anstream",
  "anstyle",
@@ -663,6 +663,7 @@ dependencies = [
  "libc",
  "memcordon-core",
  "memcordon-platform",
+ "memcordon-windows-launch-core",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -671,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "memcordon-ci"
-version = "0.5.2-dev"
+version = "0.5.2-rc.11"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -680,6 +681,7 @@ dependencies = [
  "libc",
  "memcordon-core",
  "memcordon-testkit",
+ "memcordon-windows-launch-core",
  "semver",
  "serde",
  "serde_json",
@@ -697,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "memcordon-core"
-version = "0.5.2-dev"
+version = "0.5.2-rc.11"
 dependencies = [
  "base64",
  "serde",
@@ -725,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "memcordon-platform"
-version = "0.5.2-dev"
+version = "0.5.2-rc.11"
 dependencies = [
  "libc",
  "memcordon-core",
@@ -738,10 +740,23 @@ dependencies = [
 
 [[package]]
 name = "memcordon-testkit"
-version = "0.5.2-dev"
+version = "0.5.2-rc.11"
 dependencies = [
  "libc",
  "memcordon-platform",
+]
+
+[[package]]
+name = "memcordon-windows-launch-core"
+version = "0.5.2-rc.11"
+dependencies = [
+ "hex",
+ "memcordon-core",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
