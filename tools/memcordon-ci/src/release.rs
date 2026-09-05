@@ -18,9 +18,9 @@ use walkdir::WalkDir;
 
 use memcordon_ci::capability;
 use memcordon_ci::release_archive::{
-    configured_default_cargo_binaries,
+    NATIVE_ARCHIVE_STATIC_PATHS, RUNTIME_MANIFEST, cargo_install_inventory,
+    configured_default_cargo_binaries, validate_markdown_documents,
     validate_memcordon_crate_distribution as validate_reviewed_memcordon_distribution,
-    validate_markdown_documents, NATIVE_ARCHIVE_STATIC_PATHS, RUNTIME_MANIFEST,
 };
 use memcordon_ci::release_evidence::{CertificationRecord, collect_certification};
 use memcordon_ci::runtime_manifest::{RuntimeComponentRecord, RuntimeManifestV1, SealedRuntimeV1};
@@ -1179,13 +1179,6 @@ fn installed_binary_name(name: &str) -> OsString {
     binary
 }
 
-fn cargo_install_inventory(default_binaries: &BTreeSet<String>) -> BTreeSet<OsString> {
-    default_binaries
-        .iter()
-        .map(|name| installed_binary_name(name))
-        .collect()
-}
-
 fn smoke_packaged_memcordon_install(
     root: &Path,
     stable: &str,
@@ -1272,6 +1265,8 @@ fn smoke_packaged_memcordon_install(
     let binaries = install_root.join("bin");
     let cli_name = installed_binary_name("memcordon");
     let agent_name = installed_binary_name("memcordon-sealed-agent");
+    let bootstrap_name = installed_binary_name("memcordon-target-desktop-bootstrap");
+    let broker_name = installed_binary_name("memcordon-session-broker");
     let actual = fs::read_dir(&binaries)?
         .map(|entry| entry.map(|entry| entry.file_name()).map_err(CiError::from))
         .collect::<Result<BTreeSet<_>>>()?;
@@ -1288,6 +1283,20 @@ fn smoke_packaged_memcordon_install(
     verify_component_version(
         &installed_agent,
         "memcordon-sealed-agent",
+        &expected_version,
+        root,
+    )?;
+    let installed_bootstrap = binaries.join(bootstrap_name);
+    verify_component_version(
+        &installed_bootstrap,
+        "memcordon-target-desktop-bootstrap",
+        &expected_version,
+        root,
+    )?;
+    let installed_broker = binaries.join(broker_name);
+    verify_component_version(
+        &installed_broker,
+        "memcordon-session-broker",
         &expected_version,
         root,
     )?;
@@ -3260,6 +3269,8 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
         let binary_directory = install_root.join("bin");
         let cli_name = installed_binary_name("memcordon");
         let agent_name = installed_binary_name("memcordon-sealed-agent");
+        let bootstrap_name = installed_binary_name("memcordon-target-desktop-bootstrap");
+        let broker_name = installed_binary_name("memcordon-session-broker");
         let actual = fs::read_dir(&binary_directory)?
             .map(|entry| entry.map(|entry| entry.file_name()).map_err(CiError::from))
             .collect::<Result<BTreeSet<_>>>()?;
@@ -3273,6 +3284,15 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
         verify_component_version(&executable, "memcordon", &record.version, root)?;
         let agent = binary_directory.join(agent_name);
         verify_component_version(&agent, "memcordon-sealed-agent", &record.version, root)?;
+        let bootstrap = binary_directory.join(bootstrap_name);
+        verify_component_version(
+            &bootstrap,
+            "memcordon-target-desktop-bootstrap",
+            &record.version,
+            root,
+        )?;
+        let broker = binary_directory.join(broker_name);
+        verify_component_version(&broker, "memcordon-session-broker", &record.version, root)?;
         let output = CommandSpec::new(&agent, root, Duration::from_secs(30))
             .args(["package", "inspect", "--json"])
             .run()?;

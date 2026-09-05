@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -84,9 +84,8 @@ fn failure(message: impl Into<String>) -> CiError {
     CiError::Message(message.into())
 }
 
-pub fn configured_default_cargo_binaries(
-    release: &config::Release,
-) -> Result<BTreeSet<String>> {
+pub fn configured_default_cargo_binaries(release: &config::Release) -> Result<BTreeSet<String>> {
+    config::validate_release_configuration_identity(release)?;
     let actual = release
         .assets
         .target
@@ -105,6 +104,21 @@ pub fn configured_default_cargo_binaries(
         ));
     }
     Ok(actual)
+}
+
+pub fn cargo_install_inventory(default_binaries: &BTreeSet<String>) -> BTreeSet<OsString> {
+    default_binaries
+        .iter()
+        .map(|name| installed_binary_name(name))
+        .collect()
+}
+
+fn installed_binary_name(name: &str) -> OsString {
+    let mut binary = OsString::from(name);
+    if cfg!(windows) {
+        binary.push(".exe");
+    }
+    binary
 }
 
 pub fn normalized_member_path(path: &Path) -> Result<PathBuf> {
@@ -262,9 +276,7 @@ pub fn validate_memcordon_crate_distribution(
                 Some(binary.name),
                 Some(binary.path),
                 binary.doc,
-                binary
-                    .required_features
-                    .map(|features| features.to_vec()),
+                binary.required_features.map(|features| features.to_vec()),
             )
         })
         .collect::<Vec<_>>();

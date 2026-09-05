@@ -8,6 +8,35 @@ fn agent(arguments: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn windows_companions_have_safe_exact_version_contracts() {
+    for (component, executable) in [
+        (
+            "memcordon-target-desktop-bootstrap",
+            env!("CARGO_BIN_EXE_memcordon-target-desktop-bootstrap"),
+        ),
+        (
+            "memcordon-session-broker",
+            env!("CARGO_BIN_EXE_memcordon-session-broker"),
+        ),
+    ] {
+        let version = Command::new(executable)
+            .arg("--version")
+            .output()
+            .unwrap_or_else(|error| panic!("{component} should run: {error}"));
+        assert!(
+            version.status.success(),
+            "{}",
+            String::from_utf8_lossy(&version.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(version.stdout).expect("version output should be UTF-8"),
+            format!("{component} {}\n", env!("CARGO_PKG_VERSION")),
+            "{component} version contract differs"
+        );
+    }
+}
+
+#[test]
 fn companion_version_and_help_are_administrative_and_exact() {
     let version = agent(&["--version"]);
     assert!(version.status.success());

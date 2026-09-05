@@ -3,7 +3,7 @@
 #[cfg(all(target_os = "windows", not(target_feature = "crt-static")))]
 compile_error!("the target desktop bootstrap requires a statically linked CRT");
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 
 #[cfg(target_os = "windows")]
 #[path = "memcordon-sealed-agent/inspection_schema.rs"]
@@ -22,10 +22,17 @@ mod windows;
 include!(concat!(env!("OUT_DIR"), "/source_commit.rs"));
 
 fn main() {
+    let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if arguments.len() == 1 && arguments[0].as_os_str() == OsStr::new("--version") {
+        println!(
+            "memcordon-target-desktop-bootstrap {}",
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
     #[cfg(target_os = "windows")]
     {
         windows::token::revert_entry_thread_token().unwrap_or_else(|_| std::process::abort());
-        let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
         let result = match arguments.as_slice() {
             [role, pipe_name, nonce] if role == "holder" => {
                 windows::target_desktop_holder(pipe_name, nonce)
@@ -45,7 +52,6 @@ fn main() {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = OsString::new();
         eprintln!("target desktop bootstrap is Windows-only");
         std::process::exit(1);
     }
