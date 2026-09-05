@@ -6496,6 +6496,16 @@ pub fn prepare_package_cleanup(
         } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
             && returned_challenge == challenge =>
         {
+            let outcome = memcordon_core::WindowsPackageCleanupOutcomeV1 {
+                status,
+                attempts_empty,
+                terminal_outboxes,
+                detail,
+            };
+            outcome
+                .validate()
+                .map_err(|error| super::record::PackageCleanupError::Failed(error.to_owned()))?;
+            let detail = outcome.detail;
             match (status, attempts_empty) {
                 (memcordon_core::WindowsControlRequestStatusV1::Ready, Some(true)) => Ok(()),
                 (memcordon_core::WindowsControlRequestStatusV1::Active, Some(false)) => {

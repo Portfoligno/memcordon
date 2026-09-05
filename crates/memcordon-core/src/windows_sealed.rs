@@ -1991,6 +1991,31 @@ pub enum WindowsControlRequestStatusV1 {
     Failed,
 }
 
+/// Authenticated launcher evidence retained across both package cleanup boundaries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowsPackageCleanupOutcomeV1 {
+    pub status: WindowsControlRequestStatusV1,
+    pub attempts_empty: Option<bool>,
+    pub terminal_outboxes: Option<u32>,
+    pub detail: String,
+}
+
+impl WindowsPackageCleanupOutcomeV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (self.status, self.attempts_empty, self.terminal_outboxes) {
+            (WindowsControlRequestStatusV1::Ready, Some(true), Some(0))
+            | (WindowsControlRequestStatusV1::Active, Some(false), Some(_)) => Ok(()),
+            (_, Some(true), Some(count)) if count != 0 => {
+                Err("empty attempts contradict authenticated terminal outboxes")
+            }
+            (WindowsControlRequestStatusV1::Failed, _, _) => Ok(()),
+            _ => Err(
+                "package cleanup requires consistent authenticated attempt and inventory evidence",
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsAttemptRetainedV1 {
@@ -2283,6 +2308,7 @@ pub enum WindowsLauncherResponseV1 {
         schema_version: u32,
         status: WindowsControlRequestStatusV1,
         attempts_empty: Option<bool>,
+        terminal_outboxes: Option<u32>,
         detail: String,
     },
     Membership {

@@ -98,7 +98,7 @@ const WINDOWS_TESTS: &[&str] = &[
     "fresh_qualification_failure_rollback_is_repeatable",
     "package_install_verify_probe_and_same_version_upgrade",
     "stale_low_integrity_workspace_upgrade_and_uninstall_cleanup",
-    "active_attempt_upgrade_and_uninstall_are_refused",
+    "active_attempt_upgrade_and_uninstall_converge",
     "public_sealed_launch_preserves_status_and_native_evidence",
     "frontend_loss_retires_the_job_and_durable_record",
     "package_uninstall_leaves_no_provider_state",
@@ -599,8 +599,8 @@ struct WindowsRuntimeEvidence {
     qualification: WindowsQualificationReceiptV1,
     public_launch: MemcordonReport,
     fresh_install_rollback_verified: bool,
-    active_attempt_upgrade_refused: bool,
-    active_attempt_uninstall_refused: bool,
+    active_attempt_upgrade_converged: bool,
+    active_attempt_uninstall_converged: bool,
     frontend_loss_record_retired: bool,
     provider_state_removed: bool,
     status_matrix: WindowsStatusMatrixEvidence,
@@ -771,8 +771,8 @@ impl WindowsRuntimeEvidence {
             && self.qualification.is_consistent()
             && validate_windows_public_launch(&self.public_launch, &self.qualification)
             && self.fresh_install_rollback_verified
-            && self.active_attempt_upgrade_refused
-            && self.active_attempt_uninstall_refused
+            && self.active_attempt_upgrade_converged
+            && self.active_attempt_uninstall_converged
             && self.frontend_loss_record_retired
             && self.provider_state_removed
             && self.status_matrix.complete()

@@ -89,7 +89,7 @@ pub use windows_sealed::{
     WindowsFaultRejectionObservationV1, WindowsLaunchBrokerRequestV1, WindowsLaunchPolicyV1,
     WindowsLaunchRequestV1, WindowsLauncherRequestV1, WindowsLauncherResponseV1, WindowsLifetimeV1,
     WindowsMutantHookObservationV1, WindowsMutantKillEvidenceV1, WindowsMutantNativeObservationV1,
-    WindowsMutantNativeReceiptV1, WindowsMutantObservationV1,
+    WindowsMutantNativeReceiptV1, WindowsMutantObservationV1, WindowsPackageCleanupOutcomeV1,
     WindowsPreauthorizationFaultMatrixEvidenceV1, WindowsProcessIdentityV1,
     WindowsProviderRequestV1, WindowsProviderResponseV1, WindowsPublicFrameFailureV1,
     WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1, WindowsQualificationReceiptV1,

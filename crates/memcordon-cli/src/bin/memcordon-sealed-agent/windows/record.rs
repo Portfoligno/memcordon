@@ -860,6 +860,10 @@ pub fn attempts_empty() -> Result<bool, String> {
         && directory_empty(&guardian_receipts_root())?)
 }
 
+pub fn admissions_empty() -> Result<bool, String> {
+    directory_empty(&admissions_root())
+}
+
 pub fn recovery_clear() -> Result<bool, String> {
     directory_empty(&quarantine_root())
 }

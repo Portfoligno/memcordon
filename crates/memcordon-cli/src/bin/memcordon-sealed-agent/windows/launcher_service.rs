@@ -402,6 +402,7 @@ impl JobView {
 }
 
 static ACTIVE_JOBS: LazyLock<Mutex<Vec<ActiveJob>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static SETTLEMENT: LazyLock<super::settlement::SettlementGate> = LazyLock::new(Default::default);
 static FALLBACK_CLEANUP_FAILURES: LazyLock<Mutex<std::collections::BTreeMap<String, Vec<String>>>> =
     LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
 
@@ -551,6 +552,8 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
         WindowsLauncherRequestV1::CertificationMachineRestart { schema_version }
             if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION =>
         {
+            let _settlement =
+                SETTLEMENT.settle_until(Instant::now() + Duration::from_secs(30), || Ok(true))?;
             let recovered = super::record::certify_machine_restart_recovery()?;
             pipe::write_frame(
                 connection,
@@ -564,8 +567,21 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
             schema_version,
             deadline_millis,
         } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION && deadline_millis != 0 => {
-            let result = converge_package_cleanup(deadline_millis);
-            let (status, attempts_empty, detail) = match result {
+            let deadline = Instant::now()
+                .checked_add(Duration::from_millis(deadline_millis))
+                .ok_or_else(|| "package cleanup deadline overflowed".to_owned())?;
+            // The package lease excludes new public admissions. Existing admissions
+            // may not have reached Membership yet, so wait for those as well as
+            // workers whose Job handles have closed but terminal writes continue.
+            let settlement = SETTLEMENT.settle_until(deadline, || {
+                terminate_active_jobs()?;
+                super::record::admissions_empty()
+            });
+            let result = match &settlement {
+                Ok(_) => converge_package_cleanup(deadline),
+                Err(error) => Err(super::record::PackageCleanupError::Failed(error.clone())),
+            };
+            let (mut status, mut attempts_empty, mut detail) = match result {
                 Ok(()) => (
                     memcordon_core::WindowsControlRequestStatusV1::Ready,
                     Some(true),
@@ -585,12 +601,41 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                     detail,
                 ),
             };
+            // Attempt files belong to the launcher security boundary. The control
+            // service relays this authenticated inventory without reading them.
+            let inventory = match &settlement {
+                Ok(_) => super::record::terminal_outbox_count(),
+                Err(error) => Err(format!("inventory unavailable before settlement: {error}")),
+            };
+            let terminal_outboxes = match inventory {
+                Ok(count) => Some(count),
+                Err(error) => {
+                    status = memcordon_core::WindowsControlRequestStatusV1::Failed;
+                    attempts_empty = None;
+                    detail = format!(
+                        "{detail}; authenticated terminal outbox inventory failed: {error}"
+                    );
+                    None
+                }
+            };
+            let outcome = memcordon_core::WindowsPackageCleanupOutcomeV1 {
+                status,
+                attempts_empty,
+                terminal_outboxes,
+                detail: detail.clone(),
+            };
+            if let Err(error) = outcome.validate() {
+                status = memcordon_core::WindowsControlRequestStatusV1::Failed;
+                attempts_empty = None;
+                detail = format!("{detail}; {error}");
+            }
             pipe::write_frame(
                 connection,
                 &WindowsLauncherResponseV1::PackageCleanup {
                     schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
                     status,
                     attempts_empty,
+                    terminal_outboxes,
                     detail,
                 },
             )
@@ -612,6 +657,7 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
             && caller_process_identity.creation_time_100ns != 0
             && !caller_token_sha256.is_empty() =>
         {
+            let _settlement = SETTLEMENT.enter()?;
             if let Some(error) = terminalization_error {
                 super::record::record_terminalization_diagnostic(&attempt_id, error)?;
             }
@@ -724,6 +770,9 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
             request_sha256,
             remote_process_handle,
         } => {
+            // This lease spans the following Launch request, including rejection
+            // staging performed after launch_attempt returns an error.
+            let _settlement = SETTLEMENT.enter()?;
             let process = OwnedHandle::new(remote_process_handle as usize as HANDLE)?;
             if schema_version != WINDOWS_PRIVATE_PROTOCOL_VERSION
                 || attempt_id.is_empty()
@@ -904,38 +953,22 @@ pub(crate) fn bound_launcher_replay_failure_response_for_test(
     bound_launcher_replay_failure_response(attempt_id, nonce, request_sha256, relay_phase, error)
 }
 
-fn converge_package_cleanup(
-    deadline_millis: u64,
-) -> Result<(), super::record::PackageCleanupError> {
-    let deadline = Instant::now()
-        .checked_add(Duration::from_millis(deadline_millis))
-        .ok_or_else(|| "package cleanup deadline overflowed".to_owned())?;
-    loop {
-        let active_count = {
-            let jobs = ACTIVE_JOBS
-                .lock()
-                .map_err(|_| "active Job registry is poisoned".to_owned())?;
-            for active in jobs.iter() {
-                active.job.terminate().map_err(|error| {
-                    format!(
-                        "phase=terminate-job attempt_id={} error={error}",
-                        active.attempt_id
-                    )
-                })?;
-            }
-            jobs.len()
-        };
-        if active_count == 0 {
-            break;
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(super::record::PackageCleanupError::Active(format!(
-                "phase=wait-launcher-jobs active_jobs={active_count} deadline_millis={deadline_millis}"
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(50).min(deadline - now));
+fn terminate_active_jobs() -> Result<(), String> {
+    let jobs = ACTIVE_JOBS
+        .lock()
+        .map_err(|_| "active Job registry is poisoned".to_owned())?;
+    for active in jobs.iter() {
+        active.job.terminate().map_err(|error| {
+            format!(
+                "phase=terminate-job attempt_id={} error={error}",
+                active.attempt_id
+            )
+        })?;
     }
+    Ok(())
+}
+
+fn converge_package_cleanup(deadline: Instant) -> Result<(), super::record::PackageCleanupError> {
     super::record::converge_package_cleanup(deadline)?;
     if super::record::attempts_empty()? {
         Ok(())

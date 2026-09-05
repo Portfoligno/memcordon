@@ -71,6 +71,19 @@ fn main() {
             Ok(())
         }
         #[cfg(target_os = "windows")]
+        [command] if command == "windows-certification-hold-ready" => {
+            use std::io::Write;
+
+            let readiness = {
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(b"memcordon-certification-hold-ready\n")
+                    .and_then(|()| stdout.flush())
+                    .map_err(|error| error.to_string())
+            };
+            readiness.map(|()| std::thread::sleep(std::time::Duration::from_secs(5 * 60)))
+        }
+        #[cfg(target_os = "windows")]
         [command] if command == "windows-certification-memory" => {
             let mut allocations = Vec::new();
             loop {

@@ -11,6 +11,7 @@ pub mod runtime_manifest;
 pub mod scenario_diagnostic;
 pub mod sealed_identity;
 pub mod sealed_selector;
+pub mod windows_channel_identity;
 pub mod windows_package_cleanup;
 pub mod windows_package_staging;
 pub mod windows_qualification_artifacts;

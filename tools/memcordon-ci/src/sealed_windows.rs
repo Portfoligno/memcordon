@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use memcordon_ci::command::{CommandSpec, git, rustup_cargo};
 use memcordon_ci::runtime_manifest::{RuntimeManifestV1, SealedRuntimeV1};
 use memcordon_ci::scenario_diagnostic::BoundedStream;
-use memcordon_ci::windows_package_cleanup::complete_optional_install_cleanup;
+use memcordon_ci::windows_package_cleanup::{
+    ActivePackageMutation, certify_active_package_mutation, complete_optional_install_cleanup,
+};
 use memcordon_ci::windows_package_staging::{
     ExternalWindowsPackageSources, WINDOWS_PACKAGE_NAMES, WindowsPackageSourceLayout,
 };
@@ -37,7 +39,7 @@ const WINDOWS_TESTS: &[&str] = &[
     "fresh_qualification_failure_rollback_is_repeatable",
     "package_install_verify_probe_and_same_version_upgrade",
     "stale_low_integrity_workspace_upgrade_and_uninstall_cleanup",
-    "active_attempt_upgrade_and_uninstall_are_refused",
+    "active_attempt_upgrade_and_uninstall_converge",
     "public_sealed_launch_preserves_status_and_native_evidence",
     "frontend_loss_retires_the_job_and_durable_record",
     "package_uninstall_leaves_no_provider_state",
@@ -71,8 +73,8 @@ struct WindowsRuntimeEvidence<'a> {
     qualification: &'a WindowsQualificationReceiptV1,
     public_launch: &'a MemcordonReport,
     fresh_install_rollback_verified: bool,
-    active_attempt_upgrade_refused: bool,
-    active_attempt_uninstall_refused: bool,
+    active_attempt_upgrade_converged: bool,
+    active_attempt_uninstall_converged: bool,
     frontend_loss_record_retired: bool,
     provider_state_removed: bool,
     status_matrix: StatusMatrixEvidence,
@@ -252,6 +254,9 @@ pub fn loader_production(root: &Path, stable: &str) -> Result<()> {
     };
     let artifact_result = collect_loader_production_artifacts(&reports);
     let qualification_result = fs::read(reports.join("qualification.json"));
+    // Validate the authoritative receipt against the detached artifacts before
+    // cleanup, retaining its inline plan and all captured failure evidence.
+    let ready_artifacts_result = read_ready_windows_qualification_artifacts(&reports);
     let installed_image_present = installed_provider_image_present();
     let uninstall_result = match installed_image_present.as_ref() {
         Ok(true) => CommandSpec::new(&agent, root, DEADLINE)
@@ -294,39 +299,9 @@ pub fn loader_production(root: &Path, stable: &str) -> Result<()> {
                 ))),
             };
         }
-        let (plan, outcome) = artifact_result?;
-        let plan = plan.ok_or_else(|| {
-            CiError::Message(
-                "Windows production loader reported Ready without a launch-plan artifact"
-                    .to_owned(),
-            )
-        })?;
-        let qualification_value: Value = serde_json::from_slice(&qualification_result?)?;
-        let qualification: WindowsQualificationReceiptV1 =
-            serde_json::from_value(qualification_value.clone())?;
-        if qualification.schema_version != WINDOWS_QUALIFICATION_SCHEMA_VERSION
-            || !qualification.qualified
-            || !qualification.is_consistent()
-            || qualification.loader_qualification != outcome
-        {
-            return Err(CiError::Message(
-                "Windows production loader qualification is incomplete or contradictory".to_owned(),
-            ));
-        }
-        let reported_digest = match &qualification.loader_qualification {
-            memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(ready) => {
-                &ready.launch_plan_sha256
-            }
-            memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(_) => unreachable!(
-                "a qualified receipt cannot contain a failed loader outcome after validation"
-            ),
-        };
-        if plan.launch_plan_sha256() != reported_digest {
-            return Err(CiError::Message(
-                "Windows production loader plan digest does not match its typed outcome".to_owned(),
-            ));
-        }
-        write_json(&reports.join("qualification.json"), &qualification_value)?;
+        artifact_result?;
+        qualification_result?;
+        ready_artifacts_result?;
         Ok(())
     })();
     let absence_result = provider_state_absent(root, &agent).and_then(|absent| {
@@ -786,38 +761,6 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
         "sealed",
     ]))?;
 
-    seed_retired_certification_workspace(root, &agent)?;
-    CommandSpec::new(&agent, root, DEADLINE)
-        .args(["package", "upgrade", "--ephemeral-ci"])
-        .run()?;
-
-    let active_report = reports.join("active-attempt.json");
-    let (upgrade_refused, uninstall_refused) =
-        with_active_attempt(root, &cli, &agent, &active_report, || {
-            let upgrade_refused = command_failed_with(
-                &CommandSpec::new(&agent, root, DEADLINE).args([
-                    "package",
-                    "upgrade",
-                    "--ephemeral-ci",
-                ]),
-                "MCSEALED-WINDOWS-UPGRADE-ACTIVE",
-            )?;
-            let uninstall_refused = command_failed_with(
-                &CommandSpec::new(&agent, root, DEADLINE).args([
-                    "package",
-                    "uninstall",
-                    "--ephemeral-ci",
-                ]),
-                "MCSEALED-WINDOWS-UNINSTALL-ACTIVE",
-            )?;
-            Ok((upgrade_refused, uninstall_refused))
-        })?;
-    if !upgrade_refused || !uninstall_refused {
-        return Err(CiError::Message(
-            "Windows package mutation did not refuse an active attempt".to_owned(),
-        ));
-    }
-
     let public_report_path = reports.join("public-launch.json");
     let arguments = vec![
         OsString::from("--sealed"),
@@ -855,10 +798,29 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
 
     seed_retired_certification_workspace(root, &agent)?;
     CommandSpec::new(&agent, root, DEADLINE)
-        .args(["package", "uninstall", "--ephemeral-ci"])
+        .args(["package", "upgrade", "--ephemeral-ci"])
         .run()?;
+    certify_active_mutation(
+        root,
+        &cli,
+        &agent,
+        &reports.join("active-upgrade.json"),
+        ActivePackageMutation::Upgrade,
+        &package,
+    )?;
+    let upgrade_converged = true;
+    seed_retired_certification_workspace(root, &agent)?;
+    certify_active_mutation(
+        root,
+        &cli,
+        &agent,
+        &reports.join("active-uninstall.json"),
+        ActivePackageMutation::Uninstall,
+        &package,
+    )?;
+    let uninstall_converged = true;
     let stale_workspace_cleanup_verified = provider_state_absent(root, &agent)?;
-    certify_production_lifecycle(root, &agent, &cli, &reports, &qualification)?;
+    certify_production_lifecycle(root, &agent, &cli, &reports)?;
     let provider_state_removed = provider_state_absent(root, &agent)?;
     if !provider_state_removed {
         return Err(CiError::Message(
@@ -870,8 +832,8 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
         public_launch: &public_launch,
         fresh_install_rollback_verified,
         stale_workspace_cleanup_verified,
-        upgrade_refused,
-        uninstall_refused,
+        upgrade_converged,
+        uninstall_converged,
         provider_state_removed,
         native_archive_bound: native.target.is_some(),
     })?;
@@ -891,8 +853,8 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
             qualification: &qualification,
             public_launch: &public_launch,
             fresh_install_rollback_verified,
-            active_attempt_upgrade_refused: upgrade_refused,
-            active_attempt_uninstall_refused: uninstall_refused,
+            active_attempt_upgrade_converged: upgrade_converged,
+            active_attempt_uninstall_converged: uninstall_converged,
             frontend_loss_record_retired: qualification.frontend_loss_cleanup_verified,
             provider_state_removed,
             status_matrix,
@@ -904,9 +866,6 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
     };
     write_json(&reports.join("windows-cleanup.json"), &summary)?;
     fs::remove_file(public_report_path)?;
-    if active_report.exists() {
-        fs::remove_file(active_report)?;
-    }
     Ok(())
 }
 
@@ -1193,8 +1152,8 @@ struct CertificationTestContext<'a> {
     public_launch: &'a MemcordonReport,
     fresh_install_rollback_verified: bool,
     stale_workspace_cleanup_verified: bool,
-    upgrade_refused: bool,
-    uninstall_refused: bool,
+    upgrade_converged: bool,
+    uninstall_converged: bool,
     provider_state_removed: bool,
     native_archive_bound: bool,
 }
@@ -1207,8 +1166,8 @@ fn certification_test_results(
         public_launch,
         fresh_install_rollback_verified,
         stale_workspace_cleanup_verified,
-        upgrade_refused,
-        uninstall_refused,
+        upgrade_converged,
+        uninstall_converged,
         provider_state_removed,
         native_archive_bound,
     } = context;
@@ -1228,7 +1187,7 @@ fn certification_test_results(
         fresh_install_rollback_verified,
         qualification.qualified,
         stale_workspace_cleanup_verified,
-        upgrade_refused && uninstall_refused,
+        upgrade_converged && uninstall_converged,
         validate_public_launch(public_launch, qualification).is_ok(),
         qualification.frontend_loss_cleanup_verified,
         provider_state_removed,
@@ -1282,11 +1241,13 @@ fn certify_production_lifecycle(
     agent: &Path,
     cli: &Path,
     reports: &Path,
-    qualification: &WindowsQualificationReceiptV1,
 ) -> Result<()> {
     CommandSpec::new(agent, root, DEADLINE)
         .args(["package", "install"])
         .run()?;
+    let qualification: WindowsQualificationReceiptV1 = serde_json::from_value(run_json(
+        &CommandSpec::new(agent, root, DEADLINE).arg("probe"),
+    )?)?;
     let installed =
         run_json(&CommandSpec::new(agent, root, DEADLINE).args(["package", "verify", "--json"]))?;
     if installed
@@ -1310,7 +1271,7 @@ fn certify_production_lifecycle(
         ])
         .run()?;
     let report: MemcordonReport = serde_json::from_slice(&fs::read(&report_path)?)?;
-    validate_public_launch(&report, qualification)?;
+    validate_public_launch(&report, &qualification)?;
     fs::remove_file(report_path)?;
     CommandSpec::new(agent, root, DEADLINE)
         .args(["package", "upgrade"])
@@ -1622,16 +1583,16 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
         }),
     )?;
     let cargo_fingerprint = channel_smoke(root, &agent, &cli, &channel)?;
-    if cargo_fingerprint != native_fingerprint {
-        return Err(CiError::Message(format!(
-            "Cargo/native Windows sealed channel identity differs: cargo={cargo_fingerprint:?} native={native_fingerprint:?}"
-        )));
-    }
     write_json(&channel.join("cargo-fingerprint.json"), &cargo_fingerprint)?;
     write_json(
         &channel.join("native-fingerprint.json"),
         &native_fingerprint,
     )?;
+    if cargo_fingerprint != native_fingerprint {
+        return Err(CiError::Message(format!(
+            "Cargo/native Windows sealed channel identity differs: cargo={cargo_fingerprint:?} native={native_fingerprint:?}"
+        )));
+    }
     write_split_windows_release_certification(root, &channel, &native)
 }
 
@@ -1909,6 +1870,10 @@ fn channel_smoke(
     cli: &Path,
     channel: &Path,
 ) -> Result<ChannelFingerprint> {
+    let lifecycle_report = channel.join("package-lifecycle.json");
+    if lifecycle_report.exists() {
+        fs::remove_file(lifecycle_report)?;
+    }
     let package =
         run_json(&CommandSpec::new(agent, root, DEADLINE).args(["package", "inspect", "--json"]))?;
     prepare_windows_qualification_artifact_directory(channel)?;
@@ -1918,20 +1883,157 @@ fn channel_smoke(
         .map(|_| ());
     let primary =
         install_result.and_then(|()| channel_smoke_installed(root, agent, cli, channel, package));
-    let uninstall = CommandSpec::new(agent, root, DEADLINE)
-        .args(["package", "uninstall", "--ephemeral-ci"])
-        .run()
-        .map(|_| ());
-    let absence = provider_state_absent(root, agent).and_then(|absent| {
-        if absent {
-            Ok(())
-        } else {
-            Err(CiError::Message(
-                "Cargo-installed Windows provider left persistent state".to_owned(),
-            ))
-        }
+    complete_optional_install_cleanup(
+        primary,
+        || installed_provider_image_present().map_err(CiError::Message),
+        || {
+            CommandSpec::new(agent, root, DEADLINE)
+                .args(["package", "uninstall", "--ephemeral-ci"])
+                .run()
+                .map(|_| ())
+        },
+        || provider_state_absent(root, agent),
+    )
+}
+
+fn verify_channel_installation(root: &Path, agent: &Path, package: &Value) -> Result<Value> {
+    let installed =
+        run_json(&CommandSpec::new(agent, root, DEADLINE).args(["package", "verify", "--json"]))?;
+    if [
+        "qualification_complete",
+        "installed_artifacts_valid",
+        "provider_reachable",
+    ]
+    .iter()
+    .any(|field| installed.get(field).and_then(Value::as_bool) != Some(true))
+        || installed
+            .get("installed_executable_sha256")
+            .and_then(Value::as_str)
+            != package.get("executable_sha256").and_then(Value::as_str)
+    {
+        return Err(CiError::Message(
+            "channel package verification did not retain qualification, reachability, ACLs, and exact artifact digest"
+                .to_owned(),
+        ));
+    }
+    Ok(installed)
+}
+
+fn certify_active_mutation(
+    root: &Path,
+    cli: &Path,
+    agent: &Path,
+    report: &Path,
+    mutation: ActivePackageMutation,
+    package: &Value,
+) -> Result<()> {
+    // Upgrade rotates qualification. Bind this hold to the receipt in effect
+    // immediately before its launch, rather than an earlier install receipt.
+    let qualification: WindowsQualificationReceiptV1 = serde_json::from_value(run_json(
+        &CommandSpec::new(agent, root, DEADLINE).arg("probe"),
+    )?)?;
+    if !qualification.qualified || !qualification.is_consistent() {
+        return Err(CiError::Message(
+            "active package hold requires a qualified provider".to_owned(),
+        ));
+    }
+    if report.exists() {
+        fs::remove_file(report)?;
+    }
+    let mut child = Command::new(cli)
+        .args([
+            OsString::from("--sealed"),
+            OsString::from("--report"),
+            report.as_os_str().to_os_string(),
+            OsString::from("--"),
+            agent.as_os_str().to_os_string(),
+            OsString::from("windows-certification-hold-ready"),
+        ])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("active hold stdout is piped");
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    // Only the released target can produce this marker. Reading a bounded
+    // marker also avoids buffering arbitrary output while waiting for readiness.
+    let reader = thread::spawn(move || {
+        use std::io::Read;
+        let marker = b"memcordon-certification-hold-ready\n";
+        let mut bytes = vec![0; marker.len()];
+        let result = stdout
+            .take(marker.len() as u64)
+            .read_exact(&mut bytes)
+            .map_err(CiError::from)
+            .and_then(|()| {
+                if bytes == marker {
+                    Ok(())
+                } else {
+                    Err(CiError::Message(
+                        "active package target emitted an invalid readiness marker".to_owned(),
+                    ))
+                }
+            });
+        let _ = sender.send(result);
     });
-    merge_primary_and_cleanup(primary, uninstall, absence)
+    let primary = certify_active_package_mutation(
+        mutation,
+        || {
+            receiver
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(|error| {
+                    CiError::Message(format!("active package target readiness failed: {error}"))
+                })??;
+            wait_for_active_attempt(root, agent)
+        },
+        || {
+            CommandSpec::new(agent, root, DEADLINE)
+                .args(["package", mutation.argument(), "--ephemeral-ci"])
+                .run()
+                .map(|_| ())
+        },
+        || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if child.try_wait()?.is_some() {
+                    let terminal: MemcordonReport = serde_json::from_slice(&fs::read(report)?)?;
+                    break validate_public_launch(&terminal, &qualification);
+                }
+                if Instant::now() >= deadline {
+                    break Err(CiError::Message(
+                        "active package mutation did not complete its client".to_owned(),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        },
+        || {
+            verify_channel_installation(root, agent, package)?;
+            wait_for_attempts_empty(root, agent)
+        },
+        || {
+            if provider_state_absent(root, agent)? {
+                Ok(())
+            } else {
+                Err(CiError::Message(
+                    "active package uninstall left provider state".to_owned(),
+                ))
+            }
+        },
+    );
+    // Killing the frontend is failure cleanup, never evidence of convergence.
+    let termination = terminate_child(&mut child);
+    // A failed readiness read may still be waiting for inherited writers. Do
+    // not block cleanup on it; successful readiness has already ended the read.
+    let reader_result = if reader.is_finished() {
+        reader
+            .join()
+            .map_err(|_| CiError::Message("active package readiness reader panicked".to_owned()))
+    } else {
+        Ok(())
+    };
+    merge_primary_and_cleanup(primary, termination, reader_result)
 }
 
 fn channel_smoke_installed(
@@ -1944,26 +2046,7 @@ fn channel_smoke_installed(
     let artifacts = read_ready_windows_qualification_artifacts(channel)?;
     let qualification = artifacts.receipt;
     let launch_plan = artifacts.plan;
-    let installed =
-        run_json(&CommandSpec::new(agent, root, DEADLINE).args(["package", "verify", "--json"]))?;
-    if installed
-        .get("qualification_complete")
-        .and_then(Value::as_bool)
-        != Some(true)
-        || installed
-            .get("installed_artifacts_valid")
-            .and_then(Value::as_bool)
-            != Some(true)
-        || installed
-            .get("installed_executable_sha256")
-            .and_then(Value::as_str)
-            != package.get("executable_sha256").and_then(Value::as_str)
-    {
-        return Err(CiError::Message(
-            "channel package verification did not retain qualification, ACLs, and exact artifact digest"
-                .to_owned(),
-        ));
-    }
+    let installed = verify_channel_installation(root, agent, &package)?;
     let report_path = channel.join("cargo-public-launch.json");
     CommandSpec::new(cli, root, DEADLINE)
         .args([
@@ -1977,45 +2060,38 @@ fn channel_smoke_installed(
         .run()?;
     let report: MemcordonReport = serde_json::from_slice(&fs::read(&report_path)?)?;
     validate_public_launch(&report, &qualification)?;
-    let fingerprint = channel_fingerprint(package, &qualification, &launch_plan, &report)?;
-    let active_report = channel.join("active-package-mutation.json");
-    let (upgrade_refused, uninstall_refused) =
-        with_active_attempt(root, cli, agent, &active_report, || {
-            let upgrade_refused = command_failed_with(
-                &CommandSpec::new(agent, root, DEADLINE).args([
-                    "package",
-                    "upgrade",
-                    "--ephemeral-ci",
-                ]),
-                "MCSEALED-WINDOWS-UPGRADE-ACTIVE",
-            )?;
-            let uninstall_refused = command_failed_with(
-                &CommandSpec::new(agent, root, DEADLINE).args([
-                    "package",
-                    "uninstall",
-                    "--ephemeral-ci",
-                ]),
-                "MCSEALED-WINDOWS-UNINSTALL-ACTIVE",
-            )?;
-            Ok((upgrade_refused, uninstall_refused))
-        })?;
-    if !upgrade_refused || !uninstall_refused {
-        return Err(CiError::Message(
-            "package mutation did not fail closed while an attempt was active".to_owned(),
-        ));
-    }
+    let fingerprint = channel_fingerprint(package.clone(), &qualification, &launch_plan, &report)?;
+    certify_active_mutation(
+        root,
+        cli,
+        agent,
+        &channel.join("active-upgrade.json"),
+        ActivePackageMutation::Upgrade,
+        &package,
+    )?;
     seed_retired_certification_workspace(root, agent)?;
     CommandSpec::new(agent, root, DEADLINE)
         .args(["package", "upgrade", "--ephemeral-ci"])
         .run()?;
+    let upgraded = verify_channel_installation(root, agent, &package)?;
+    wait_for_attempts_empty(root, agent)?;
+    certify_active_mutation(
+        root,
+        cli,
+        agent,
+        &channel.join("active-uninstall.json"),
+        ActivePackageMutation::Uninstall,
+        &package,
+    )?;
     write_json(
         &channel.join("package-lifecycle.json"),
         &serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "installed_verification": installed,
+            "upgraded_verification": upgraded,
             "package_acl_and_artifact_digest_verified": true,
-            "active_upgrade_refused": upgrade_refused,
-            "active_uninstall_refused": uninstall_refused,
+            "active_upgrade_converged": true,
+            "active_uninstall_converged": true,
             "stale_workspace_recovered": true,
             "upgrade_complete": true,
             "uninstall_complete": true,
@@ -2025,16 +2101,13 @@ fn channel_smoke_installed(
 }
 
 fn channel_fingerprint(
-    mut package: Value,
+    package: Value,
     qualification: &WindowsQualificationReceiptV1,
     launch_plan: &memcordon_windows_launch_core::ProductionLoaderPlanV1,
     report: &MemcordonReport,
 ) -> Result<ChannelFingerprint> {
     validate_public_launch(report, qualification)?;
-    package
-        .as_object_mut()
-        .ok_or_else(|| CiError::Message("Windows package inspection is not an object".to_owned()))?
-        .remove("executable_sha256");
+    let package = memcordon_ci::windows_channel_identity::package_contract(package)?;
     let attempt = report
         .attempts
         .last()
@@ -2048,7 +2121,11 @@ fn channel_fingerprint(
         package_identity: package,
         qualification_schema: qualification.schema_version,
         provider_identity: qualification.provider_identity.clone(),
-        qualification_contract_sha256: qualification_contract_sha256(qualification)?,
+        qualification_contract_sha256:
+            memcordon_ci::windows_channel_identity::qualification_contract_sha256(
+                qualification,
+                launch_plan,
+            )?,
         launch_plan_template_sha256: launch_plan.template_sha256(),
         provider_protocol_schema: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
         execution_report_schema: memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
@@ -2166,11 +2243,6 @@ fn run_json(spec: &CommandSpec) -> Result<Value> {
     Ok(serde_json::from_slice(&spec.run()?)?)
 }
 
-fn command_failed_with(spec: &CommandSpec, diagnostic: &str) -> Result<bool> {
-    let output = spec.output()?;
-    Ok(!output.status.success() && String::from_utf8_lossy(&output.stderr).contains(diagnostic))
-}
-
 fn spawn_hold(root: &Path, cli: &Path, agent: &Path, report: &Path) -> Result<Child> {
     let mut command = Command::new(cli);
     command
@@ -2286,24 +2358,6 @@ fn wait_for_attempt_state(
 fn qualification_receipt_digest(qualification: &WindowsQualificationReceiptV1) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(
         qualification,
-    )?)))
-}
-
-fn qualification_contract_sha256(qualification: &WindowsQualificationReceiptV1) -> Result<String> {
-    let mut normalized = qualification.clone();
-    match &mut normalized.loader_qualification {
-        memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(ready) => {
-            ready.launch_plan_sha256 = "0".repeat(Sha256::output_size() * 2);
-            ready.elapsed_millis = 0;
-        }
-        memcordon_core::WindowsLoaderQualificationOutcomeV2::Failed(_) => {
-            return Err(CiError::Message(
-                "channel fingerprint requires a successful loader qualification".to_owned(),
-            ));
-        }
-    }
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
-        &normalized,
     )?)))
 }
 

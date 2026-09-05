@@ -29,7 +29,7 @@ const WINDOWS_TESTS: &[&str] = &[
     "fresh_qualification_failure_rollback_is_repeatable",
     "package_install_verify_probe_and_same_version_upgrade",
     "stale_low_integrity_workspace_upgrade_and_uninstall_cleanup",
-    "active_attempt_upgrade_and_uninstall_are_refused",
+    "active_attempt_upgrade_and_uninstall_converge",
     "public_sealed_launch_preserves_status_and_native_evidence",
     "frontend_loss_retires_the_job_and_durable_record",
     "package_uninstall_leaves_no_provider_state",
@@ -646,8 +646,8 @@ fn windows_report(
             "qualification": qualification,
             "public_launch": windows_public_launch_report(qualification),
             "fresh_install_rollback_verified": true,
-            "active_attempt_upgrade_refused": true,
-            "active_attempt_uninstall_refused": true,
+            "active_attempt_upgrade_converged": true,
+            "active_attempt_uninstall_converged": true,
             "frontend_loss_record_retired": true,
             "provider_state_removed": true,
             "status_matrix": windows_status_matrix()
@@ -1583,6 +1583,56 @@ fn windows_cross_report_identity_mutations_fail_closed() {
             "{name} mutation must fail closed"
         );
     }
+}
+
+#[test]
+fn windows_package_convergence_requires_both_mutations_and_full_removal() {
+    for field in [
+        "active_attempt_upgrade_converged",
+        "active_attempt_uninstall_converged",
+        "provider_state_removed",
+    ] {
+        let (temporary, _, _, _) = fixture();
+        let path = temporary
+            .path()
+            .join("input/release-certification-windows-x64/windows-cleanup.json");
+        let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        report["runtime"][field] = json!(false);
+        write_report(&path, &report);
+        assert!(
+            collect_certification(
+                &temporary.path().join("input"),
+                &temporary.path().join("output"),
+                COMMIT,
+            )
+            .is_err(),
+            "missing {field} must prevent release certification"
+        );
+    }
+}
+
+#[test]
+fn legacy_active_refusal_evidence_does_not_certify_convergence() {
+    let (temporary, _, _, _) = fixture();
+    let path = temporary
+        .path()
+        .join("input/release-certification-windows-x64/windows-cleanup.json");
+    let mut report: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let runtime = report["runtime"].as_object_mut().unwrap();
+    runtime.remove("active_attempt_upgrade_converged");
+    runtime.remove("active_attempt_uninstall_converged");
+    runtime.insert("active_attempt_upgrade_refused".to_owned(), json!(true));
+    runtime.insert("active_attempt_uninstall_refused".to_owned(), json!(true));
+    write_report(&path, &report);
+    assert!(
+        collect_certification(
+            &temporary.path().join("input"),
+            &temporary.path().join("output"),
+            COMMIT,
+        )
+        .is_err(),
+        "an old refusal report cannot prove service-owned convergence"
+    );
 }
 
 #[test]

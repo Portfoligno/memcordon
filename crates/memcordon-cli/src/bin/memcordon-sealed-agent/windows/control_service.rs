@@ -372,44 +372,39 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                         .to_owned(),
                 );
             }
-            let result = converge_launcher_package_cleanup(deadline_millis)
-                .and_then(|()| super::record::remove_empty_attempt_state());
-            let (mut status, attempts_empty, mut detail) = match result {
-                Ok(()) => (
-                    memcordon_core::WindowsControlRequestStatusV1::Ready,
-                    Some(true),
-                    "package cleanup is ready".to_owned(),
-                ),
-                Err(super::record::PackageCleanupError::Active(detail)) => (
-                    memcordon_core::WindowsControlRequestStatusV1::Active,
-                    Some(false),
-                    super::record::PackageCleanupError::Active(detail).to_string(),
-                ),
-                Err(error) => (
-                    memcordon_core::WindowsControlRequestStatusV1::Failed,
-                    None,
-                    error.to_string(),
-                ),
+            let mut outcome = match converge_launcher_package_cleanup(deadline_millis) {
+                Ok(outcome) => outcome,
+                Err(error) => memcordon_core::WindowsPackageCleanupOutcomeV1 {
+                    status: memcordon_core::WindowsControlRequestStatusV1::Failed,
+                    attempts_empty: None,
+                    terminal_outboxes: None,
+                    detail: error.to_string(),
+                },
             };
-            let terminal_outboxes = match super::record::terminal_outbox_count() {
-                Ok(count) => Some(count),
-                Err(error) => {
-                    status = memcordon_core::WindowsControlRequestStatusV1::Failed;
-                    detail = format!(
-                        "{detail}; authenticated terminal outbox inventory failed: {error}"
-                    );
-                    None
+            if outcome.status == memcordon_core::WindowsControlRequestStatusV1::Ready {
+                if let Err(error) = super::record::remove_empty_attempt_state() {
+                    match &error {
+                        super::record::PackageCleanupError::Active(_) => {
+                            outcome.status = memcordon_core::WindowsControlRequestStatusV1::Active;
+                            outcome.attempts_empty = Some(false);
+                        }
+                        _ => {
+                            outcome.status = memcordon_core::WindowsControlRequestStatusV1::Failed;
+                            outcome.attempts_empty = None;
+                        }
+                    }
+                    outcome.detail = error.to_string();
                 }
-            };
+            }
             pipe::write_frame(
                 public,
                 &WindowsProviderResponseV1::PackageCleanupResult {
                     schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
                     challenge,
-                    status,
-                    attempts_empty,
-                    terminal_outboxes,
-                    detail,
+                    status: outcome.status,
+                    attempts_empty: outcome.attempts_empty,
+                    terminal_outboxes: outcome.terminal_outboxes,
+                    detail: outcome.detail,
                 },
             )
         }
@@ -1392,7 +1387,7 @@ fn authenticated_launcher() -> Result<
 
 fn converge_launcher_package_cleanup(
     deadline_millis: u64,
-) -> Result<(), super::record::PackageCleanupError> {
+) -> Result<memcordon_core::WindowsPackageCleanupOutcomeV1, super::record::PackageCleanupError> {
     let (launcher, _process, _identity) = authenticated_launcher()?;
     pipe::write_frame(
         launcher.raw(),
@@ -1404,25 +1399,21 @@ fn converge_launcher_package_cleanup(
     match pipe::read_frame::<WindowsLauncherResponseV1>(launcher.raw())? {
         WindowsLauncherResponseV1::PackageCleanup {
             schema_version,
-            status: memcordon_core::WindowsControlRequestStatusV1::Ready,
-            attempts_empty: Some(true),
-            ..
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => Ok(()),
-        WindowsLauncherResponseV1::PackageCleanup {
-            schema_version,
-            status: memcordon_core::WindowsControlRequestStatusV1::Active,
-            attempts_empty: Some(false),
+            status,
+            attempts_empty,
+            terminal_outboxes,
             detail,
         } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => {
-            Err(super::record::PackageCleanupError::Active(detail))
-        }
-        WindowsLauncherResponseV1::PackageCleanup {
-            schema_version,
-            status: memcordon_core::WindowsControlRequestStatusV1::Failed,
-            detail,
-            ..
-        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => {
-            Err(super::record::PackageCleanupError::Failed(detail))
+            let outcome = memcordon_core::WindowsPackageCleanupOutcomeV1 {
+                status,
+                attempts_empty,
+                terminal_outboxes,
+                detail,
+            };
+            outcome
+                .validate()
+                .map_err(|error| super::record::PackageCleanupError::Failed(error.to_owned()))?;
+            Ok(outcome)
         }
         _ => Err(super::record::PackageCleanupError::Failed(
             "launcher returned contradictory package cleanup state".to_owned(),

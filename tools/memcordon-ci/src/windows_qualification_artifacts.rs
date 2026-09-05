@@ -61,62 +61,59 @@ pub fn read_ready_windows_qualification_artifacts(
 
     if !outcome.is_consistent() {
         return Err(CiError::Message(
-            "Windows package-channel loader outcome is inconsistent".to_owned(),
+            "Windows qualification loader outcome is inconsistent".to_owned(),
         ));
     }
     let WindowsLoaderQualificationOutcomeV2::Ready(ready) = &outcome else {
         return Err(CiError::Message(
-            "Windows package-channel install exported a failed loader outcome".to_owned(),
+            "Windows qualification install exported a failed loader outcome".to_owned(),
         ));
     };
     if outcome.launch_plan_json().is_some() {
         return Err(CiError::Message(
-            "Windows package-channel loader outcome retained an inline plan instead of its detached artifact"
+            "Windows qualification loader outcome retained an inline plan instead of its detached artifact"
                 .to_owned(),
         ));
     }
     if !receipt.qualified || !receipt.is_consistent() {
         return Err(CiError::Message(
-            "Windows package-channel qualification receipt is incomplete or inconsistent"
-                .to_owned(),
+            "Windows qualification receipt is incomplete or inconsistent".to_owned(),
         ));
     }
     let WindowsLoaderQualificationOutcomeV2::Ready(receipt_ready) = &receipt.loader_qualification
     else {
         return Err(CiError::Message(
-            "Windows package-channel qualification receipt has a failed loader outcome".to_owned(),
+            "Windows qualification receipt has a failed loader outcome".to_owned(),
         ));
     };
     let receipt_plan_json = receipt_ready.launch_plan_json.as_deref().ok_or_else(|| {
         CiError::Message(
-            "Windows package-channel qualification receipt is missing its inline loader plan"
-                .to_owned(),
+            "Windows qualification receipt is missing its inline loader plan".to_owned(),
         )
     })?;
-    let receipt_plan: ProductionLoaderPlanV1 = serde_json::from_str(receipt_plan_json).map_err(
-        |error| {
+    let receipt_plan: ProductionLoaderPlanV1 =
+        serde_json::from_str(receipt_plan_json).map_err(|error| {
             CiError::Message(format!(
-                "Windows package-channel qualification receipt has an invalid inline loader plan: {error}"
+                "Windows qualification receipt has an invalid inline loader plan: {error}"
             ))
-        },
-    )?;
+        })?;
     if receipt_plan.launch_plan_sha256() != receipt_ready.launch_plan_sha256 || receipt_plan != plan
     {
         return Err(CiError::Message(
-            "Windows package-channel receipt and detached loader plans differ".to_owned(),
+            "Windows qualification receipt and detached loader plans differ".to_owned(),
         ));
     }
     let mut normalized_receipt_outcome = receipt.loader_qualification.clone();
     normalized_receipt_outcome.clear_launch_plan_json();
     if normalized_receipt_outcome != outcome {
         return Err(CiError::Message(
-            "Windows package-channel normalized receipt and detached loader outcome differ"
+            "Windows qualification normalized receipt and detached loader outcome differ"
                 .to_owned(),
         ));
     }
     if plan.launch_plan_sha256() != ready.launch_plan_sha256 {
         return Err(CiError::Message(
-            "Windows package-channel loader plan and outcome digests differ".to_owned(),
+            "Windows qualification loader plan and outcome digests differ".to_owned(),
         ));
     }
 
