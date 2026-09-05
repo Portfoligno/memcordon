@@ -1,8 +1,10 @@
 use std::ffi::OsString;
 use std::path::Path;
+use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::command::CommandSpec;
 use crate::{CiError, Result};
 
 pub const SETPRIV_PATH: &str = "/usr/bin/setpriv";
@@ -70,6 +72,19 @@ pub fn parse_frontend_identity(
         uid,
         provider_gid,
     })
+}
+
+pub fn frontend_identity(root: &Path, deadline: Duration) -> Result<FrontendIdentity> {
+    let username = CommandSpec::new("/usr/bin/id", root, deadline)
+        .arg("-un")
+        .run()?;
+    let uid = CommandSpec::new("/usr/bin/id", root, deadline)
+        .arg("-u")
+        .run()?;
+    let provider_group = CommandSpec::new("/usr/bin/getent", root, deadline)
+        .args(["group", PROVIDER_GROUP])
+        .run()?;
+    parse_frontend_identity(&username, &uid, &provider_group)
 }
 
 pub fn setpriv_sudo_arguments(

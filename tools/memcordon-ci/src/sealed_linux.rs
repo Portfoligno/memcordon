@@ -16,7 +16,7 @@ use memcordon_ci::scenario_diagnostic::{
     observe_scenario_process,
 };
 use memcordon_ci::sealed_identity::{
-    FrontendIdentity, parse_credential_readback, parse_frontend_identity, setpriv_sudo_arguments,
+    FrontendIdentity, frontend_identity, parse_credential_readback, setpriv_sudo_arguments,
 };
 use memcordon_ci::{
     CiError, Result,
@@ -863,19 +863,6 @@ fn privileged_agent(
         .run()
 }
 
-fn frontend_identity(root: &Path) -> Result<FrontendIdentity> {
-    let username = CommandSpec::new("/usr/bin/id", root, DEADLINE)
-        .arg("-un")
-        .run()?;
-    let uid = CommandSpec::new("/usr/bin/id", root, DEADLINE)
-        .arg("-u")
-        .run()?;
-    let provider_group = CommandSpec::new("/usr/bin/getent", root, DEADLINE)
-        .args(["group", "memcordon"])
-        .run()?;
-    parse_frontend_identity(&username, &uid, &provider_group)
-}
-
 fn authorized_nonroot(
     root: &Path,
     identity: &FrontendIdentity,
@@ -1277,7 +1264,7 @@ fn validate_doctor(
             "memcordon",
         ],
     )?;
-    let identity = frontend_identity(root)?;
+    let identity = frontend_identity(root, DEADLINE)?;
     verify_frontend_credentials(root, &identity)?;
     let output =
         authorized_nonroot_memcordon(root, &identity, ["doctor", "--json", "--require", "sealed"])?;
@@ -1829,7 +1816,7 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
     privileged_agent(root, ["package", "upgrade", "--ephemeral-ci"])?;
     validate_service_privilege_readback(root, report_dir)?;
 
-    let identity = frontend_identity(root)?;
+    let identity = frontend_identity(root, DEADLINE)?;
     verify_frontend_credentials(root, &identity)?;
     let qualification_output =
         authorized_nonroot(root, &identity, &root.join(PROVIDER_BINARY), ["probe"])?;

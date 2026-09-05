@@ -24,6 +24,10 @@ use memcordon_ci::release_archive::{
 };
 use memcordon_ci::release_evidence::{CertificationRecord, collect_certification};
 use memcordon_ci::runtime_manifest::{RuntimeComponentRecord, RuntimeManifestV1, SealedRuntimeV1};
+#[cfg(target_os = "linux")]
+use memcordon_ci::sealed_identity::frontend_identity;
+#[cfg(any(target_os = "linux", test))]
+use memcordon_ci::sealed_identity::{FrontendIdentity, setpriv_sudo_arguments};
 
 use crate::command::{CommandSpec, git, rustup_cargo};
 use crate::config::{self, AssetTarget, RuntimeComponentRole, SealedAssetPolicy};
@@ -1883,6 +1887,34 @@ fn verify_windows_provider_absent() -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxProviderFrontendStage {
+    Doctor,
+    SealedExecution,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_provider_frontend_arguments(
+    identity: &FrontendIdentity,
+    cli: &Path,
+    stage: LinuxProviderFrontendStage,
+) -> Result<Vec<OsString>> {
+    let public_arguments = match stage {
+        LinuxProviderFrontendStage::Doctor => vec![
+            OsString::from("doctor"),
+            OsString::from("--require"),
+            OsString::from("sealed"),
+        ],
+        LinuxProviderFrontendStage::SealedExecution => vec![
+            OsString::from("--sealed"),
+            OsString::from("--"),
+            OsString::from("/usr/bin/true"),
+        ],
+    };
+    setpriv_sudo_arguments(identity, cli, &public_arguments)
+}
+
 #[cfg(target_os = "linux")]
 fn smoke_linux_provider(
     cli: &Path,
@@ -1898,6 +1930,14 @@ fn smoke_linux_provider(
             .run()
             .map(|_| ())
     };
+    let authorized_release_cli =
+        |identity: &FrontendIdentity, stage: LinuxProviderFrontendStage, cli: &Path| {
+            let sudo_arguments = linux_provider_frontend_arguments(identity, cli, stage)?;
+            CommandSpec::new("/usr/bin/sudo", root, RELEASE_DEADLINE)
+                .args(sudo_arguments)
+                .run()
+                .map(|_| ())
+        };
     let primary: Result<()> = (|| {
         privileged_agent(&["package", "install", "--ephemeral-ci"])?;
         smoke.provider_install = Some(true);
@@ -1905,12 +1945,9 @@ fn smoke_linux_provider(
         smoke.provider_verify = Some(true);
         privileged_agent(&["qualify"])?;
         smoke.provider_qualification = Some(true);
-        CommandSpec::new(cli, root, RELEASE_DEADLINE)
-            .args(["doctor", "--require", "sealed"])
-            .run()?;
-        CommandSpec::new(cli, root, RELEASE_DEADLINE)
-            .args(["--sealed", "--", "/usr/bin/true"])
-            .run()?;
+        let identity = frontend_identity(root, RELEASE_DEADLINE)?;
+        authorized_release_cli(&identity, LinuxProviderFrontendStage::Doctor, cli)?;
+        authorized_release_cli(&identity, LinuxProviderFrontendStage::SealedExecution, cli)?;
         smoke.sealed_execution = Some(true);
         Ok(())
     })();
@@ -1931,21 +1968,24 @@ fn smoke_linux_provider(
 
 #[cfg(target_os = "linux")]
 fn verify_linux_provider_absent() -> Result<()> {
-    verify_absent_paths([
-        Path::new("/usr/libexec/memcordon-sealed-agent"),
-        Path::new("/usr/lib/systemd/system/memcordon-sealed-agent.service"),
-        Path::new("/usr/lib/systemd/system/memcordon-sealed-agent.socket"),
-        Path::new("/usr/lib/systemd/system/memcordon-sealed-launcher.service"),
-        Path::new("/usr/lib/systemd/system/memcordon-sealed-launcher.socket"),
-        Path::new("/usr/lib/tmpfiles.d/memcordon.conf"),
-        Path::new("/run/memcordon/sealed-agent.sock"),
-        Path::new("/run/memcordon/sealed-launcher.sock"),
-        Path::new("/run/memcordon/sealed-package.lock"),
-        Path::new("/run/memcordon"),
-        Path::new("/var/lib/memcordon/sealed"),
-        Path::new("/sys/fs/cgroup/memcordon-sealed"),
-    ])
+    verify_absent_paths(LINUX_PROVIDER_ABSENCE_PATHS.iter().map(Path::new))
 }
+
+#[cfg(any(target_os = "linux", test))]
+const LINUX_PROVIDER_ABSENCE_PATHS: [&str; 12] = [
+    "/usr/libexec/memcordon-sealed-agent",
+    "/usr/lib/systemd/system/memcordon-sealed-agent.service",
+    "/usr/lib/systemd/system/memcordon-sealed-agent.socket",
+    "/usr/lib/systemd/system/memcordon-sealed-launcher.service",
+    "/usr/lib/systemd/system/memcordon-sealed-launcher.socket",
+    "/usr/lib/tmpfiles.d/memcordon.conf",
+    "/run/memcordon/sealed-agent.sock",
+    "/run/memcordon/sealed-launcher.sock",
+    "/run/memcordon/sealed-package.lock",
+    "/run/memcordon",
+    "/var/lib/memcordon/sealed",
+    "/sys/fs/cgroup/memcordon-sealed",
+];
 
 #[cfg(any(target_os = "linux", test))]
 fn verify_absent_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Result<()> {
@@ -4084,6 +4124,123 @@ mod tests {
         fs::remove_dir(&state).unwrap();
         verify_absent_paths([artifact.as_path(), endpoint.as_path(), state.as_path()])
             .expect("complete uninstall inventory should be absent");
+    }
+
+    #[test]
+    fn provider_uninstall_proof_accepts_an_already_absent_inventory() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let artifact = temporary.path().join("installed-agent");
+        let endpoint = temporary.path().join("sealed-agent.sock");
+        let state = temporary.path().join("state");
+        verify_absent_paths([artifact.as_path(), endpoint.as_path(), state.as_path()])
+            .expect("an already removed provider must converge successfully");
+    }
+
+    #[test]
+    fn linux_provider_absence_inventory_is_exact() {
+        assert_eq!(
+            LINUX_PROVIDER_ABSENCE_PATHS,
+            [
+                "/usr/libexec/memcordon-sealed-agent",
+                "/usr/lib/systemd/system/memcordon-sealed-agent.service",
+                "/usr/lib/systemd/system/memcordon-sealed-agent.socket",
+                "/usr/lib/systemd/system/memcordon-sealed-launcher.service",
+                "/usr/lib/systemd/system/memcordon-sealed-launcher.socket",
+                "/usr/lib/tmpfiles.d/memcordon.conf",
+                "/run/memcordon/sealed-agent.sock",
+                "/run/memcordon/sealed-launcher.sock",
+                "/run/memcordon/sealed-package.lock",
+                "/run/memcordon",
+                "/var/lib/memcordon/sealed",
+                "/sys/fs/cgroup/memcordon-sealed",
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_provider_frontend_doctor_and_execution_use_authorized_nonroot_argv() {
+        let identity = FrontendIdentity {
+            username: "runner".to_owned(),
+            uid: 1001,
+            provider_gid: 998,
+        };
+        let cli = Path::new("/opt/release/memcordon");
+        let doctor =
+            linux_provider_frontend_arguments(&identity, cli, LinuxProviderFrontendStage::Doctor)
+                .expect("doctor transition should use structured argv");
+        let execution = linux_provider_frontend_arguments(
+            &identity,
+            cli,
+            LinuxProviderFrontendStage::SealedExecution,
+        )
+        .expect("sealed execution transition should use structured argv");
+        let expected_transition = [
+            "--non-interactive",
+            "--",
+            "/usr/bin/setpriv",
+            "--reuid",
+            "1001",
+            "--regid",
+            "998",
+            "--clear-groups",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--no-new-privs",
+            "--",
+        ]
+        .map(OsString::from);
+        assert_eq!(
+            doctor,
+            [
+                expected_transition.as_slice(),
+                &[cli.as_os_str().to_os_string()],
+                &["doctor", "--require", "sealed"].map(OsString::from),
+            ]
+            .concat()
+        );
+        assert_eq!(
+            execution,
+            [
+                expected_transition.as_slice(),
+                &[cli.as_os_str().to_os_string()],
+                &["--sealed", "--", "/usr/bin/true"].map(OsString::from),
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn provider_uninstall_proof_does_not_mask_inaccessible_state() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let directory = temporary.path().join("inaccessible-state");
+        let state = directory.join("state");
+        fs::create_dir_all(&state).expect("state directory should exist");
+        let previous = fs::metadata(&directory)
+            .expect("state directory metadata should exist")
+            .permissions();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o000))
+            .expect("state directory permissions should change");
+        let result = verify_absent_paths([state.as_path()]);
+        fs::set_permissions(&directory, previous)
+            .expect("state directory permissions should be restored");
+        let identity = Command::new("/usr/bin/id")
+            .arg("-u")
+            .output()
+            .expect("frontend identity should be observable");
+        assert!(identity.status.success(), "id -u must succeed");
+        if identity.stdout == b"0\n" {
+            result.expect("root observes the directory without a permission failure");
+            return;
+        }
+        let error = result.expect_err("an inaccessible state path is not proof of absence");
+        assert!(
+            error.to_string().contains("state proof failed"),
+            "permission evidence must remain explicit: {error}"
+        );
     }
 
     #[test]

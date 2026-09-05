@@ -775,7 +775,9 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     systemctl(["restart", "memcordon-sealed-launcher.service"])?;
     systemctl(["restart", "memcordon-sealed-agent.service"])?;
     wait_provider_ready()?;
-    verify_client_access()?;
+    // Root deliberately bypasses ordinary directory and socket ACL checks. The
+    // release smoke exercises this endpoint as an authorized non-root client.
+    verify_client_access_configuration()?;
     Ok(())
 }
 
@@ -819,7 +821,7 @@ fn ensure_recovery_idle(operation: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn verify_client_access() -> Result<(), String> {
+fn verify_client_access_configuration() -> Result<(), String> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     let allowed_gid = service_group_gid()?;

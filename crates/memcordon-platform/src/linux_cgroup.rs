@@ -1837,3 +1837,40 @@ pub(crate) fn test_launcher_status_timeout() -> io::ErrorKind {
     close_pair(descriptors);
     result.kind()
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use memcordon_core::BoundaryRequirement;
+
+    #[test]
+    fn sealed_endpoint_unavailability_is_reported_without_replacing_standard_selection() {
+        for reason in [
+            "provider endpoint unavailable: Permission denied (os error 13)".to_owned(),
+            "provider endpoint unavailable: entity not found".to_owned(),
+        ] {
+            let report = compose_probe(Ok(()), Err(reason.clone()));
+            assert_eq!(
+                report
+                    .selected
+                    .as_ref()
+                    .map(|backend| backend.name.as_str()),
+                Some("linux-cgroup-v2"),
+                "the public backend must remain selected when the sealed companion is absent"
+            );
+            assert!(
+                report.selected_for(BoundaryRequirement::Sealed).is_none(),
+                "an unavailable sealed endpoint must not satisfy the sealed requirement"
+            );
+            assert_eq!(
+                report
+                    .unavailable
+                    .iter()
+                    .find(|backend| backend.name == "linux-sealed-provider")
+                    .map(|backend| backend.reason.as_str()),
+                Some(reason.as_str()),
+                "unreachable and permission-denied endpoint evidence must remain observable"
+            );
+        }
+    }
+}
