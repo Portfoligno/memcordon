@@ -6,31 +6,22 @@ All notable user-visible changes to MemCordon are documented here.
 
 ### Added
 
-- Added certified Windows sealed supervision through split LocalService and
-  LocalSystem services, authenticated named pipes, caller-token reproduction,
-  creation-time unnamed Job assignment, exact inherited handles, a per-attempt
-  guardian, and terminal Job-emptiness proof. Windows x64 and ARM64 archives
-  now include the exact-version sealed agent and platform-specific runtime
-  manifest metadata.
-
-- The published `memcordon` Cargo package now installs both the public CLI
-  and the binary-private `memcordon-sealed-agent` companion. Linux sealed
-  provider installation no longer requires a source checkout or a separately
-  versioned crate.
-- Linux native release archives now include both runtime binaries and a
-  component-digested `runtime-manifest.json`. Release and publication
-  evidence bind the internal component inventory across Cargo and native
-  channels.
+- Added `--sealed` support on Windows x64 and ARM64. After provider setup,
+  MemCordon contains the command and its descendants and verifies that they
+  have all stopped before reporting completion.
+- Cargo installations and Linux and Windows release archives now include the
+  matching `memcordon-sealed-agent` companion. Setting up sealed supervision
+  no longer requires a source checkout or a separate provider download.
+- Added provider version information and JSON output for `package inspect`
+  and `package verify`, making it easier to inspect and check an installation.
 
 ### Changed
 
-- Sealed-provider administration now exposes version, credential-free package
-  inspection JSON, and installed-package verification JSON. CLI/provider
-  version mismatch fails before target authorization and names the explicit
-  upgrade repair.
-- Package documentation now describes certified Linux mechanism v2 and its
-  fail-closed provider setup instead of reporting sealed supervision
-  unavailable on every backend.
+- A CLI/provider version mismatch now stops execution before the command
+  starts and explains how to install the matching version.
+- When backend capabilities change between preflight and execution, failure
+  reports now retain the affected attempt, identify what changed, and report
+  whether cleanup completed.
 
 ## [0.5.1-rc.2] - 2026-08-25
 
