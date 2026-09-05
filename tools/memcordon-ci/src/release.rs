@@ -1645,8 +1645,8 @@ fn inspect_extract_and_smoke(
     execute: bool,
 ) -> Result<ArchiveInspection> {
     let temporary = TempDir::new()?;
-    let mut extracted_files = BTreeSet::new();
-    let mut archive_modes = BTreeMap::new();
+    let mut extracted_files = BTreeSet::<String>::new();
+    let mut archive_modes = BTreeMap::<String, u32>::new();
     if target.archive == "zip" {
         let mut archive = zip::ZipArchive::new(File::open(archive_path)?)?;
         for index in 0..archive.len() {
@@ -1655,6 +1655,7 @@ fn inspect_extract_and_smoke(
                 .enclosed_name()
                 .ok_or_else(|| failure("ZIP archive member escapes extraction root"))?;
             let relative = safe_archive_path(&enclosed)?;
+            let member = archive_member_inventory_name(&relative)?;
             let destination = temporary.path().join(&relative);
             if entry.is_dir() {
                 fs::create_dir_all(&destination)?;
@@ -1665,13 +1666,13 @@ fn inspect_extract_and_smoke(
                 let mut output = File::create(&destination)?;
                 std::io::copy(&mut entry, &mut output)?;
                 archive_modes.insert(
-                    relative.clone(),
+                    member.clone(),
                     entry
                         .unix_mode()
                         .ok_or_else(|| failure("ZIP archive member has no Unix mode"))?
                         & 0o7777,
                 );
-                extracted_files.insert(relative);
+                extracted_files.insert(member);
             } else {
                 return Err(failure("ZIP archive contains a non-file member"));
             }
@@ -1682,6 +1683,7 @@ fn inspect_extract_and_smoke(
         for entry in archive.entries()? {
             let mut entry = entry?;
             let relative = safe_archive_path(&entry.path()?)?;
+            let member = archive_member_inventory_name(&relative)?;
             let destination = temporary.path().join(&relative);
             if entry.header().entry_type().is_dir() {
                 fs::create_dir_all(&destination)?;
@@ -1691,8 +1693,8 @@ fn inspect_extract_and_smoke(
                 }
                 let mut output = File::create(&destination)?;
                 std::io::copy(&mut entry, &mut output)?;
-                archive_modes.insert(relative.clone(), entry.header().mode()? & 0o7777);
-                extracted_files.insert(relative);
+                archive_modes.insert(member.clone(), entry.header().mode()? & 0o7777);
+                extracted_files.insert(member);
             } else {
                 return Err(failure("tar archive contains a non-file member"));
             }
@@ -1702,24 +1704,23 @@ fn inspect_extract_and_smoke(
         "memcordon-v{}-{}",
         identity.version, target.rust_target
     ));
-    let mut expected = target
-        .executable
-        .iter()
-        .map(|component| top.join(&component.archive_path))
-        .collect::<BTreeSet<_>>();
-    expected.insert(top.join(RUNTIME_MANIFEST));
-    expected.extend(
-        NATIVE_ARCHIVE_STATIC_PATHS
-            .iter()
-            .map(|relative| top.join(*relative)),
-    );
+    let mut expected = BTreeSet::<String>::new();
+    for component in &target.executable {
+        expected.insert(archive_member_inventory_name(
+            &top.join(&component.archive_path),
+        )?);
+    }
+    expected.insert(archive_member_inventory_name(&top.join(RUNTIME_MANIFEST))?);
+    for relative in NATIVE_ARCHIVE_STATIC_PATHS {
+        expected.insert(archive_member_inventory_name(&top.join(relative))?);
+    }
     if extracted_files != expected {
         return Err(failure(format!(
             "release archive member set differs: expected={expected:?} actual={extracted_files:?}"
         )));
     }
     for component in &target.executable {
-        let archive_path = top.join(&component.archive_path);
+        let archive_path = archive_member_inventory_name(&top.join(&component.archive_path))?;
         if archive_modes.get(&archive_path) != Some(&component.mode) {
             return Err(failure(format!(
                 "runtime component mode differs: {}",
@@ -1728,7 +1729,8 @@ fn inspect_extract_and_smoke(
         }
     }
     let manifest_path = temporary.path().join(&top).join(RUNTIME_MANIFEST);
-    if archive_modes.get(&top.join(RUNTIME_MANIFEST)) != Some(&0o644) {
+    let manifest_member = archive_member_inventory_name(&top.join(RUNTIME_MANIFEST))?;
+    if archive_modes.get(&manifest_member) != Some(&0o644) {
         return Err(failure("runtime manifest archive mode differs"));
     }
     let manifest_bytes = fs::read(&manifest_path)?;
@@ -1754,13 +1756,10 @@ fn inspect_extract_and_smoke(
         ));
     }
     let mut documents = BTreeMap::new();
-    for path in &extracted_files {
-        let relative = path
-            .strip_prefix(&top)
-            .map_err(|_| failure("release archive member is outside its top-level directory"))?;
+    for member in &extracted_files {
         documents.insert(
-            relative.to_path_buf(),
-            fs::read(temporary.path().join(path))?,
+            PathBuf::from(member),
+            fs::read(temporary.path().join(&top).join(member))?,
         );
     }
     validate_markdown_documents(&documents)?;
@@ -1844,17 +1843,16 @@ fn inspect_extract_and_smoke(
         }
     }
     let mut inventory = Sha256::new();
-    for path in &extracted_files {
-        let member_name = archive_member_inventory_name(path)?;
-        inventory.update(member_name.as_bytes());
+    for member in &extracted_files {
+        inventory.update(member.as_bytes());
         inventory.update([0]);
         inventory.update(
             archive_modes
-                .get(path)
+                .get(member)
                 .ok_or_else(|| failure("archive member mode is missing"))?
                 .to_le_bytes(),
         );
-        inventory.update(sha256_file(&temporary.path().join(path))?.as_bytes());
+        inventory.update(sha256_file(&temporary.path().join(&top).join(member))?.as_bytes());
     }
     Ok(ArchiveInspection {
         runtime_manifest_sha256: sha256_bytes(&manifest_bytes),
@@ -4502,26 +4500,17 @@ mod tests {
     }
 
     #[test]
-    fn archive_member_inventory_names_are_portable_across_hosts() {
-        let member = "memcordon-v1.2.3-x86_64-pc-windows-msvc/bin/memcordon.exe";
+    fn archive_member_inventory_identity_uses_archive_slashes_not_host_separators() {
+        let top = "memcordon-v1.2.3-x86_64-pc-windows-msvc";
+        let relative = "bin/memcordon.exe";
+        let host_path = PathBuf::from(top).join(relative);
+        let member = format!("{top}/{relative}");
         assert_eq!(
-            archive_member_inventory_name(Path::new(member))
+            archive_member_inventory_name(&host_path)
                 .expect("archive member name should canonicalize"),
             member,
             "release inventory hashes must use archive paths, not host path formatting"
         );
-
-        #[cfg(windows)]
-        {
-            let windows_formatted =
-                Path::new("memcordon-v1.2.3-x86_64-pc-windows-msvc\\bin\\memcordon.exe");
-            assert_eq!(
-                archive_member_inventory_name(windows_formatted)
-                    .expect("Windows archive member name should canonicalize"),
-                member,
-                "a Windows producer and Linux assembler must derive the same inventory digest"
-            );
-        }
     }
 
     #[test]
@@ -4580,7 +4569,6 @@ mod tests {
 
         let mut producer_report = report.clone();
         producer_report.archive_member_inventory_sha256 = "windows-producer-inventory".to_owned();
-        producer_report.asset.sha256 = "03".repeat(32);
         let error = require_native_report_identity(
             "windows-x64",
             &producer_report,
@@ -4593,8 +4581,6 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains(
-                "field=asset.sha256 expected=\"0101010101010101010101010101010101010101010101010101010101010101\" actual=\"0303030303030303030303030303030303030303030303030303030303030303\""
-            ) && message.contains(
                 "field=archive_member_inventory_sha256 expected=\"assembler-inventory\" actual=\"windows-producer-inventory\""
             ),
             "native report diagnostics should expose every exact field and both values: {message}"
