@@ -119,7 +119,6 @@ impl HttpEndpoints {
         }
     }
 }
-
 #[derive(Clone, Debug)]
 pub struct ReleaseIdentity {
     tag: String,
@@ -1609,6 +1608,28 @@ fn safe_archive_path(path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+fn archive_member_inventory_name(path: &Path) -> Result<String> {
+    let mut name = String::new();
+    for component in path.components() {
+        let Component::Normal(value) = component else {
+            return Err(failure(
+                "archive member inventory path is not a normal relative path",
+            ));
+        };
+        let value = value
+            .to_str()
+            .ok_or_else(|| failure("archive member inventory path is not UTF-8"))?;
+        if !name.is_empty() {
+            name.push('/');
+        }
+        name.push_str(value);
+    }
+    if name.is_empty() {
+        return Err(failure("archive member inventory path is empty"));
+    }
+    Ok(name)
+}
+
 struct ArchiveInspection {
     runtime_manifest_sha256: String,
     components: Vec<RuntimeComponentRecord>,
@@ -1824,7 +1845,8 @@ fn inspect_extract_and_smoke(
     }
     let mut inventory = Sha256::new();
     for path in &extracted_files {
-        inventory.update(path.to_string_lossy().as_bytes());
+        let member_name = archive_member_inventory_name(path)?;
+        inventory.update(member_name.as_bytes());
         inventory.update([0]);
         inventory.update(
             archive_modes
@@ -2214,6 +2236,203 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+fn record_native_report_mismatch<T: std::fmt::Debug + Eq + ?Sized>(
+    mismatches: &mut Vec<String>,
+    field: &str,
+    expected: &T,
+    actual: &T,
+) {
+    if expected != actual {
+        mismatches.push(format!(
+            "field={field} expected={expected:?} actual={actual:?}"
+        ));
+    }
+}
+
+fn require_native_report_identity(
+    target_id: &str,
+    report: &NativeAssetReport,
+    asset: &AssetRecord,
+    identity: &ReleaseIdentity,
+    archive_member_inventory_sha256: &str,
+    expected_agent_smoke: Option<bool>,
+) -> Result<()> {
+    let expected_smoke = NativeSmokeReport {
+        cli_version: true,
+        doctor: true,
+        agent_version: expected_agent_smoke,
+        agent_inspection: expected_agent_smoke,
+        provider_install: expected_agent_smoke,
+        provider_verify: expected_agent_smoke,
+        provider_qualification: expected_agent_smoke,
+        sealed_execution: expected_agent_smoke,
+        provider_uninstall: expected_agent_smoke,
+    };
+    let mut mismatches = Vec::new();
+    record_native_report_mismatch(
+        &mut mismatches,
+        "schema_version",
+        &2,
+        &report.schema_version,
+    );
+    record_native_report_mismatch(&mut mismatches, "tag", &identity.tag, &report.tag);
+    record_native_report_mismatch(
+        &mut mismatches,
+        "source_commit",
+        &identity.commit,
+        &report.source_commit,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "asset.name",
+        &asset.name,
+        &report.asset.name,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "asset.target",
+        &asset.target,
+        &report.asset.target,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "asset.size",
+        &asset.size,
+        &report.asset.size,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "asset.sha256",
+        &asset.sha256,
+        &report.asset.sha256,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "asset.runtime_manifest_sha256",
+        &asset.runtime_manifest_sha256,
+        &report.asset.runtime_manifest_sha256,
+    );
+    if report.asset.components.len() == asset.components.len() {
+        for (index, (expected, actual)) in asset
+            .components
+            .iter()
+            .zip(report.asset.components.iter())
+            .enumerate()
+        {
+            record_native_report_mismatch(
+                &mut mismatches,
+                &format!("asset.components[{index}].id"),
+                &expected.id,
+                &actual.id,
+            );
+            record_native_report_mismatch(
+                &mut mismatches,
+                &format!("asset.components[{index}].path"),
+                &expected.path,
+                &actual.path,
+            );
+            record_native_report_mismatch(
+                &mut mismatches,
+                &format!("asset.components[{index}].role"),
+                &expected.role,
+                &actual.role,
+            );
+            record_native_report_mismatch(
+                &mut mismatches,
+                &format!("asset.components[{index}].size"),
+                &expected.size,
+                &actual.size,
+            );
+            record_native_report_mismatch(
+                &mut mismatches,
+                &format!("asset.components[{index}].mode"),
+                &expected.mode,
+                &actual.mode,
+            );
+            record_native_report_mismatch(
+                &mut mismatches,
+                &format!("asset.components[{index}].sha256"),
+                &expected.sha256,
+                &actual.sha256,
+            );
+        }
+    } else {
+        record_native_report_mismatch(
+            &mut mismatches,
+            "asset.components",
+            &asset.components,
+            &report.asset.components,
+        );
+    }
+    record_native_report_mismatch(
+        &mut mismatches,
+        "smoke.cli_version",
+        &expected_smoke.cli_version,
+        &report.smoke.cli_version,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "smoke.doctor",
+        &expected_smoke.doctor,
+        &report.smoke.doctor,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "smoke.agent_version",
+        &expected_smoke.agent_version,
+        &report.smoke.agent_version,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "smoke.agent_inspection",
+        &expected_smoke.agent_inspection,
+        &report.smoke.agent_inspection,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "smoke.provider_install",
+        &expected_smoke.provider_install,
+        &report.smoke.provider_install,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "smoke.provider_verify",
+        &expected_smoke.provider_verify,
+        &report.smoke.provider_verify,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "smoke.provider_qualification",
+        &expected_smoke.provider_qualification,
+        &report.smoke.provider_qualification,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "smoke.sealed_execution",
+        &expected_smoke.sealed_execution,
+        &report.smoke.sealed_execution,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "smoke.provider_uninstall",
+        &expected_smoke.provider_uninstall,
+        &report.smoke.provider_uninstall,
+    );
+    record_native_report_mismatch(
+        &mut mismatches,
+        "archive_member_inventory_sha256",
+        archive_member_inventory_sha256,
+        &report.archive_member_inventory_sha256,
+    );
+    if !mismatches.is_empty() {
+        return Err(failure(format!(
+            "native report identity differs for {target_id}: {}",
+            mismatches.join("; ")
+        )));
+    }
+    Ok(())
+}
+
 fn copy_release_inputs(
     root: &Path,
     output: &Path,
@@ -2276,26 +2495,14 @@ fn copy_release_inputs(
         }
         let report: NativeAssetReport = serde_json::from_slice(&fs::read(&reports[0])?)?;
         let expected_agent_smoke = (target.sealed == SealedAssetPolicy::Included).then_some(true);
-        if report.schema_version != 2
-            || report.tag != identity.tag
-            || report.source_commit != identity.commit
-            || report.asset != asset
-            || !report.smoke.cli_version
-            || !report.smoke.doctor
-            || report.smoke.agent_version != expected_agent_smoke
-            || report.smoke.agent_inspection != expected_agent_smoke
-            || report.smoke.provider_install != expected_agent_smoke
-            || report.smoke.provider_verify != expected_agent_smoke
-            || report.smoke.provider_qualification != expected_agent_smoke
-            || report.smoke.sealed_execution != expected_agent_smoke
-            || report.smoke.provider_uninstall != expected_agent_smoke
-            || report.archive_member_inventory_sha256 != inspection.archive_member_inventory_sha256
-        {
-            return Err(failure(format!(
-                "native report identity differs for {}",
-                target.id
-            )));
-        }
+        require_native_report_identity(
+            target.id.as_str(),
+            &report,
+            &asset,
+            identity,
+            &inspection.archive_member_inventory_sha256,
+            expected_agent_smoke,
+        )?;
         assets.push(asset);
     }
     assets.sort_by(|left, right| left.name.cmp(&right.name));
@@ -4291,6 +4498,106 @@ mod tests {
             complete.len(),
             4,
             "the exact configured Windows companion inventory should be required"
+        );
+    }
+
+    #[test]
+    fn archive_member_inventory_names_are_portable_across_hosts() {
+        let member = "memcordon-v1.2.3-x86_64-pc-windows-msvc/bin/memcordon.exe";
+        assert_eq!(
+            archive_member_inventory_name(Path::new(member))
+                .expect("archive member name should canonicalize"),
+            member,
+            "release inventory hashes must use archive paths, not host path formatting"
+        );
+
+        #[cfg(windows)]
+        {
+            let windows_formatted =
+                Path::new("memcordon-v1.2.3-x86_64-pc-windows-msvc\\bin\\memcordon.exe");
+            assert_eq!(
+                archive_member_inventory_name(windows_formatted)
+                    .expect("Windows archive member name should canonicalize"),
+                member,
+                "a Windows producer and Linux assembler must derive the same inventory digest"
+            );
+        }
+    }
+
+    #[test]
+    fn native_report_identity_diagnostics_identify_exact_fields_and_values() {
+        let identity = ReleaseIdentity {
+            tag: "1.2.3".to_owned(),
+            version: Version::parse("1.2.3").expect("version should parse"),
+            commit: "0123456789abcdef".to_owned(),
+            changelog_section: String::new(),
+            source_date: "2025-01-01T00:00:00Z".to_owned(),
+        };
+        let component = RuntimeComponentRecord {
+            id: "cli".to_owned(),
+            path: "bin/memcordon.exe".to_owned(),
+            role: RuntimeComponentRole::PublicCli,
+            size: 7,
+            mode: 0o755,
+            sha256: "00".repeat(32),
+        };
+        let asset = AssetRecord {
+            name: "memcordon-v1.2.3-x86_64-pc-windows-msvc.zip".to_owned(),
+            target: "x86_64-pc-windows-msvc".to_owned(),
+            size: 10,
+            sha256: "01".repeat(32),
+            runtime_manifest_sha256: "02".repeat(32),
+            components: vec![component.clone()],
+        };
+        let report = NativeAssetReport {
+            schema_version: 2,
+            tag: identity.tag.clone(),
+            source_commit: identity.commit.clone(),
+            asset: asset.clone(),
+            archive_member_inventory_sha256: "assembler-inventory".to_owned(),
+            smoke: NativeSmokeReport {
+                cli_version: true,
+                doctor: true,
+                agent_version: Some(true),
+                agent_inspection: Some(true),
+                provider_install: Some(true),
+                provider_verify: Some(true),
+                provider_qualification: Some(true),
+                sealed_execution: Some(true),
+                provider_uninstall: Some(true),
+            },
+        };
+
+        require_native_report_identity(
+            "windows-x64",
+            &report,
+            &asset,
+            &identity,
+            "assembler-inventory",
+            Some(true),
+        )
+        .expect("matching native report should validate");
+
+        let mut producer_report = report.clone();
+        producer_report.archive_member_inventory_sha256 = "windows-producer-inventory".to_owned();
+        producer_report.asset.sha256 = "03".repeat(32);
+        let error = require_native_report_identity(
+            "windows-x64",
+            &producer_report,
+            &asset,
+            &identity,
+            "assembler-inventory",
+            Some(true),
+        )
+        .expect_err("native report mismatch should fail");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "field=asset.sha256 expected=\"0101010101010101010101010101010101010101010101010101010101010101\" actual=\"0303030303030303030303030303030303030303030303030303030303030303\""
+            ) && message.contains(
+                "field=archive_member_inventory_sha256 expected=\"assembler-inventory\" actual=\"windows-producer-inventory\""
+            ),
+            "native report diagnostics should expose every exact field and both values: {message}"
         );
     }
 
