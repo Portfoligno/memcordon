@@ -1415,6 +1415,60 @@ fn built_executable_path(
         .join(binary)
 }
 
+#[derive(Debug)]
+struct BuiltExecutable<'a> {
+    component: &'a config::AssetExecutable,
+    path: PathBuf,
+}
+
+fn built_executable_inventory<'a>(
+    root: &Path,
+    target: &'a AssetTarget,
+) -> Vec<BuiltExecutable<'a>> {
+    target
+        .executable
+        .iter()
+        .map(|component| BuiltExecutable {
+            component,
+            path: built_executable_path(root, target, component),
+        })
+        .collect()
+}
+
+fn require_built_executable_inventory<'a>(
+    root: &Path,
+    target: &'a AssetTarget,
+) -> Result<Vec<BuiltExecutable<'a>>> {
+    let inventory = built_executable_inventory(root, target);
+    for artifact in &inventory {
+        match fs::symlink_metadata(&artifact.path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(failure(format!(
+                    "configured native executable is not a regular file: {} ({})",
+                    artifact.component.binary,
+                    artifact.path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(failure(format!(
+                    "configured native executable was not built: {} ({})",
+                    artifact.component.binary,
+                    artifact.path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(failure(format!(
+                    "configured native executable state failed: {} ({}): {error}",
+                    artifact.component.binary,
+                    artifact.path.display()
+                )));
+            }
+        }
+    }
+    Ok(inventory)
+}
+
 fn runtime_component_id(role: RuntimeComponentRole) -> &'static str {
     match role {
         RuntimeComponentRole::PublicCli => "public-cli",
@@ -2077,30 +2131,35 @@ pub fn native_asset(root: &Path) -> Result<()> {
             OsString::from(&target.rust_target),
         ];
         rustup_cargo(root, &toolchains.stable, arguments, RELEASE_DEADLINE).run()?;
-        let executable = built_executable_path(root, target, component);
+    }
+
+    let built_executables = require_built_executable_inventory(root, target)?;
+    for built in &built_executables {
+        let component = built.component;
+        let executable = &built.path;
         verify_component_version(
-            &executable,
+            executable,
             &component.binary,
             &identity.version.to_string(),
             root,
         )?;
         match component.role {
             RuntimeComponentRole::PublicCli => {
-                CommandSpec::new(&executable, root, Duration::from_secs(30))
+                CommandSpec::new(executable, root, Duration::from_secs(30))
                     .args(["doctor", "--json"])
                     .run()?;
             }
             RuntimeComponentRole::SealedAgent => {
-                CommandSpec::new(&executable, root, Duration::from_secs(30))
+                CommandSpec::new(executable, root, Duration::from_secs(30))
                     .args(["package", "inspect", "--json"])
                     .run()?;
             }
             RuntimeComponentRole::DesktopBootstrap => {
-                let bytes = fs::read(&executable)?;
+                let bytes = fs::read(executable)?;
                 memcordon_core::verify_target_desktop_bootstrap_pe(&bytes).map_err(failure)?;
             }
             RuntimeComponentRole::SessionBroker => {
-                let bytes = fs::read(&executable)?;
+                let bytes = fs::read(executable)?;
                 memcordon_core::verify_session_broker_pe(&bytes).map_err(failure)?;
             }
         }
@@ -4039,6 +4098,68 @@ mod tests {
         } else {
             Path::new("/opt/release/memcordon")
         }
+    }
+
+    #[test]
+    fn windows_native_build_inventory_catches_a_missing_companion() {
+        let (temporary, release) = release_fixture();
+        let target = release
+            .assets
+            .target
+            .iter()
+            .find(|target| target.id == "windows-x64")
+            .expect("release policy should contain the Windows x64 target");
+        let inventory = built_executable_inventory(temporary.path(), target);
+        let configured = inventory
+            .iter()
+            .map(|artifact| artifact.component.binary.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            configured,
+            [
+                "memcordon",
+                "memcordon-sealed-agent",
+                "memcordon-target-desktop-bootstrap",
+                "memcordon-session-broker",
+            ],
+            "the configured Windows executable inventory must map to built artifacts in order"
+        );
+
+        for artifact in &inventory {
+            let parent = artifact
+                .path
+                .parent()
+                .expect("built executable should have a parent directory");
+            fs::create_dir_all(parent).expect("native release directory should be created");
+            fs::write(&artifact.path, b"native executable")
+                .expect("native executable should write");
+        }
+        let bootstrap = inventory
+            .iter()
+            .find(|artifact| artifact.component.role == RuntimeComponentRole::DesktopBootstrap)
+            .expect("Windows release inventory should contain the desktop bootstrap");
+        fs::remove_file(&bootstrap.path)
+            .expect("missing-companion fixture should remove the bootstrap");
+
+        let error = require_built_executable_inventory(temporary.path(), target)
+            .expect_err("a missing configured companion must fail native staging");
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "configured native executable was not built: memcordon-target-desktop-bootstrap"
+            ) && message.ends_with("memcordon-target-desktop-bootstrap.exe)"),
+            "missing-companion diagnostic should identify the exact configured artifact: {message}"
+        );
+
+        fs::write(&bootstrap.path, b"native executable")
+            .expect("native bootstrap should be restored");
+        let complete = require_built_executable_inventory(temporary.path(), target)
+            .expect("every configured executable should validate");
+        assert_eq!(
+            complete.len(),
+            4,
+            "the exact configured Windows companion inventory should be required"
+        );
     }
 
     #[test]
