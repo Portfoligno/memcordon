@@ -10,6 +10,8 @@ history and are not current contracts.
 The workspace separates platform-neutral contracts from native execution:
 
 - `memcordon-core` owns policies, outcomes, state, errors, and report types.
+- `memcordon-windows-launch-core` owns the typed Windows loader launch contract
+  shared by the CLI and loader lab, and depends on core.
 - `memcordon-platform` owns native backends and depends on core.
 - The `memcordon` facade and binary own `Limiter`, CLI behavior, report assembly,
   exit mapping, and stable public re-exports.
@@ -92,7 +94,7 @@ GitHub Actions selects events, runners, permissions, caches, artifacts, and the
 credential boundary. The typed `memcordon-ci` driver performs sequencing with
 argument vectors and monotonic subprocess deadlines.
 
-- `ci.yml` runs repository policy, quality, MSRV, supply-chain, and five-target
+- `ci.yml` runs repository policy, quality, MSRV, supply-chain, and six-target
   native checks.
 - `deep-ci.yml` runs Miri, fuzz smoke tests, and native stress tests.
 - `backend-certification.yml` produces exact-run Linux and Windows
@@ -145,12 +147,17 @@ required scenario with zero skips for the tagged commit.
 
 ## Release maintenance
 
-The published runtime remains three crates in dependency order:
-`memcordon-core`, `memcordon-platform`, and `memcordon`. The sealed
-agent is a binary-private module tree in the `memcordon` package, not a
-fourth crate or a public Rust API. Cargo installs two default runtime binaries.
-Linux and Windows native archives contain those same two binaries and a
-generated runtime manifest. Other native archives contain only the CLI.
+The published runtime contains four crates in deterministic dependency order:
+`memcordon-core`, `memcordon-platform`, `memcordon-windows-launch-core`, and
+`memcordon`. Repository policy and release preflight require the configured
+publication order to match the order derived from Cargo metadata.
+The sealed agent is a binary-private module tree in
+the `memcordon` package and exposes no public agent Rust API. Cargo installs four
+default binaries: `memcordon`, `memcordon-sealed-agent`,
+`memcordon-target-desktop-bootstrap`, and `memcordon-session-broker`.
+Linux native archives contain the CLI and sealed agent; Windows archives
+contain all four binaries; macOS archives contain only the CLI. Each native
+archive also contains a generated runtime manifest.
 
 Release schema 3 binds each archive's runtime-manifest digest and exact
 component size, mode, role, and digest. Native asset report schema 2 records

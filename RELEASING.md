@@ -1,16 +1,20 @@
 # Releasing MemCordon
 
-Use this runbook to publish the three MemCordon crates and their matching GitHub
+Use this runbook to publish the four MemCordon crates and their matching GitHub
 Release through the OIDC-only workflow. The release is complete only when the
 public crates, assets, checksums, publication report, and credential-free
 verification all agree.
 
-The `memcordon` crate installs both `memcordon` and
-`memcordon-sealed-agent`; there is no fourth crate or trusted-publisher slot.
-Linux and Windows native archives contain those two binaries plus
-`runtime-manifest.json`. macOS archives contain only the CLI and mark the
-sealed runtime not applicable. Release schema 3, native asset report schema 2,
-and publication report schema 2 bind that exact inventory.
+The published crates, in publication order, are `memcordon-core`,
+`memcordon-platform`, `memcordon-windows-launch-core`, and `memcordon`, each with
+its own trusted publisher.
+The `memcordon` crate installs four default binaries: `memcordon`,
+`memcordon-sealed-agent`, `memcordon-target-desktop-bootstrap`, and
+`memcordon-session-broker`. Linux native archives contain the CLI and sealed
+agent; Windows archives contain all four binaries. Each archive includes
+`runtime-manifest.json`. macOS archives contain only the CLI and mark the sealed
+runtime not applicable. Release schema 3, native asset report schema 2, and
+publication report schema 2 bind that exact inventory.
 
 Repository architecture, validation suites, and backend certification are
 described in [MAINTAINERS.md](MAINTAINERS.md). Record user-visible changes in
@@ -44,6 +48,7 @@ From the release commit, create the public crate archives locally:
 cargo package --locked --no-verify \
   --package memcordon-core \
   --package memcordon-platform \
+  --package memcordon-windows-launch-core \
   --package memcordon
 ```
 
@@ -56,9 +61,11 @@ repeat its CI and archive checks if they do not; do not defer a failure to the
 tag-triggered workflow.
 
 For the normalized `memcordon` archive, require `autobins = false`,
-exactly the CLI and sealed agent as default-install binaries, feature-gated test
+exactly the four default-install binaries listed above, feature-gated test
 fixtures, the complete binary-private agent source tree, and no public agent
-library target.
+library target. The publication order in `ci/release.toml` must match the
+deterministic dependency order derived from Cargo metadata by repository policy
+and release preflight.
 
 ## 2. Verify immutable inputs
 
@@ -109,7 +116,7 @@ Native verification checks exact archive members, runtime-manifest identity,
 component order/modes/digests, CLI and agent versions, agent package inspection,
 and Linux or Windows sealed-provider installation from the bundled agent. Public Cargo
 verification installs the released `memcordon` crate into a fresh root,
-requires exactly both runtime binaries, and exercises the same version and
+requires exactly the four default binaries, and exercises the same version and
 inspection checks.
 
 Linux cgroup v2 and Windows Job Object certification runs on fresh
@@ -167,7 +174,7 @@ continues from the first missing publication step.
 
 ## Publication security invariants
 
-- The publish job must retain `id-token: write`. Each of the three
+- The publish job must retain `id-token: write`. Each of the four
   dependency-ordered publication slots acquires its own short-lived capability
   from the pinned crates.io action.
 - The paired publication step passes that capability in memory through the
