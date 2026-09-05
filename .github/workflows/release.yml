@@ -469,7 +469,7 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: release-windows-provider-lifecycle-${{ matrix.id }}
-          path: target/ci/reports/windows-sealed-v2
+          path: target/ci/reports/windows-sealed-v2/provider-lifecycle
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: release-windows-loader-production-${{ matrix.id }}

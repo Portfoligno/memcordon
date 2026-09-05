@@ -1548,7 +1548,7 @@ fn check_release_structure(
                 ),
                 (
                     "release-windows-provider-lifecycle-${{ matrix.id }}",
-                    "target/ci/reports/windows-sealed-v2",
+                    "target/ci/reports/windows-sealed-v2/provider-lifecycle",
                 ),
                 (
                     "release-windows-loader-production-${{ matrix.id }}",

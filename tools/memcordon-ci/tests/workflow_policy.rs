@@ -174,6 +174,49 @@ fn release_preflight_binds_provisioning_and_cache_to_toolchain_config() {
 }
 
 #[test]
+fn windows_package_channel_restores_lifecycle_evidence_at_its_leaf() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy should parse");
+    let exact = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/release.yml"),
+        exact.as_bytes(),
+        &repository_policy,
+    )
+    .expect("the exact release workflow should restore lifecycle evidence at its leaf");
+
+    let restored_at_report_root = r#"      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-windows-provider-lifecycle-${{ matrix.id }}
+          path: target/ci/reports/windows-sealed-v2/provider-lifecycle
+"#;
+    let failed_layout = r#"      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-windows-provider-lifecycle-${{ matrix.id }}
+          path: target/ci/reports/windows-sealed-v2
+"#;
+    let invalid = exact.replacen(restored_at_report_root, failed_layout, 1);
+    assert_ne!(
+        invalid, exact,
+        "provider-lifecycle download mutation must apply"
+    );
+    let error = policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/release.yml"),
+        invalid.as_bytes(),
+        &repository_policy,
+    )
+    .expect_err("the failed package-channel evidence layout must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("windows-package-channel download inputs differ"),
+        "unexpected package-channel policy error: {error}"
+    );
+}
+
+#[test]
 fn windows_arm_native_matrix_entries_are_structurally_required() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
