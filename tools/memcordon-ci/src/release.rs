@@ -1117,11 +1117,7 @@ fn validate_agent_package_inspection(
                 && !control_required_privileges.is_empty()
                 && !launcher_required_privileges.is_empty()
                 && session_broker_required_privileges
-                    == &[
-                        "SeAssignPrimaryTokenPrivilege",
-                        "SeIncreaseQuotaPrivilege",
-                        "SeTcbPrivilege",
-                    ]
+                    == memcordon_core::WINDOWS_SESSION_BROKER_REQUIRED_PRIVILEGES
                 && guardian_slot_required_privileges.is_empty()
                 && [
                     control_service_config_sha256,
@@ -4092,6 +4088,146 @@ mod tests {
         })
     }
 
+    fn windows_package_inspection_fixture() -> serde_json::Value {
+        let digest = sha256_bytes(b"windows-package-inspection-fixture");
+        let digest = digest.as_str();
+        let mut inspection = serde_json::Map::new();
+        for field in [
+            "executable_sha256",
+            "control_service_config_sha256",
+            "launcher_service_config_sha256",
+            "session_broker_service_config_sha256",
+            "guardian_slot_config_sha256",
+            "target_desktop_bootstrap_sha256",
+            "target_desktop_bootstrap_loader_contract_sha256",
+            "session_broker_sha256",
+            "control_pipe_security_sha256",
+            "launcher_pipe_security_sha256",
+            "session_broker_service_security_sha256",
+            "session_broker_pipe_security_sha256",
+            "guardian_pipe_security_contract_sha256",
+            "install_directory_security_sha256",
+            "state_directory_security_sha256",
+        ] {
+            inspection.insert(field.to_owned(), serde_json::json!(digest));
+        }
+        for (field, value) in [
+            ("schema_version", serde_json::json!(3)),
+            ("version", serde_json::json!("1.2.3")),
+            ("source_commit", serde_json::json!("source-commit")),
+            ("provider_protocol", serde_json::json!(1)),
+            ("mechanism", serde_json::json!("windows-job-object-v2")),
+            ("platform", serde_json::json!("windows-service")),
+            (
+                "execution_report_schema",
+                serde_json::json!(memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION),
+            ),
+            (
+                "plan_report_schema",
+                serde_json::json!(memcordon_core::PLAN_REPORT_SCHEMA_VERSION),
+            ),
+            (
+                "doctor_report_schema",
+                serde_json::json!(memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION),
+            ),
+            (
+                "control_service_name",
+                serde_json::json!("MemCordonSealedControl"),
+            ),
+            (
+                "launcher_service_name",
+                serde_json::json!("MemCordonSealedLauncher"),
+            ),
+            (
+                "session_broker_service_name",
+                serde_json::json!("MemCordonSealedSessionBroker"),
+            ),
+            (
+                "guardian_slot_count",
+                serde_json::json!(memcordon_core::WINDOWS_GUARDIAN_SLOT_COUNT),
+            ),
+            (
+                "control_pipe",
+                serde_json::json!(memcordon_core::WINDOWS_CONTROL_PIPE),
+            ),
+            (
+                "launcher_pipe",
+                serde_json::json!(memcordon_core::WINDOWS_LAUNCHER_PIPE),
+            ),
+            (
+                "session_broker_pipe",
+                serde_json::json!(memcordon_core::WINDOWS_SESSION_BROKER_PIPE),
+            ),
+            (
+                "guardian_pipe_prefix",
+                serde_json::json!(memcordon_core::WINDOWS_GUARDIAN_PIPE_PREFIX),
+            ),
+            (
+                "binary_install_path",
+                serde_json::json!("C:\\Program Files\\MemCordon\\memcordon-sealed-agent.exe"),
+            ),
+            (
+                "target_desktop_bootstrap_install_path",
+                serde_json::json!(
+                    "C:\\Program Files\\MemCordon\\memcordon-target-desktop-bootstrap.exe"
+                ),
+            ),
+            (
+                "target_desktop_bootstrap_crt_static",
+                serde_json::json!(true),
+            ),
+            (
+                "target_desktop_bootstrap_normal_imports",
+                serde_json::json!(["KERNEL32.dll"]),
+            ),
+            (
+                "target_desktop_bootstrap_delayed_imports",
+                serde_json::json!([]),
+            ),
+            (
+                "session_broker_install_path",
+                serde_json::json!("C:\\Program Files\\MemCordon\\memcordon-session-broker.exe"),
+            ),
+            (
+                "state_root",
+                serde_json::json!("C:\\ProgramData\\MemCordon\\Sealed"),
+            ),
+            ("control_service_sid_type", serde_json::json!("restricted")),
+            ("launcher_service_sid_type", serde_json::json!("restricted")),
+            (
+                "session_broker_service_sid_type",
+                serde_json::json!("unrestricted"),
+            ),
+            (
+                "guardian_slot_service_sid_type",
+                serde_json::json!("restricted"),
+            ),
+            (
+                "control_required_privileges",
+                serde_json::json!(["SeImpersonatePrivilege"]),
+            ),
+            (
+                "launcher_required_privileges",
+                serde_json::json!([
+                    "SeAssignPrimaryTokenPrivilege",
+                    "SeBackupPrivilege",
+                    "SeIncreaseQuotaPrivilege",
+                    "SeRestorePrivilege",
+                    "SeTcbPrivilege",
+                ]),
+            ),
+            (
+                "session_broker_required_privileges",
+                serde_json::json!(memcordon_core::WINDOWS_SESSION_BROKER_REQUIRED_PRIVILEGES),
+            ),
+            ("guardian_slot_required_privileges", serde_json::json!([])),
+            ("compiled_metadata_valid", serde_json::json!(true)),
+        ] {
+            inspection.insert(field.to_owned(), value);
+        }
+        serde_json::Value::Object(inspection)
+    }
+
     fn frontend_cli() -> &'static Path {
         if cfg!(windows) {
             Path::new(r"C:\opt\release\memcordon.exe")
@@ -4233,6 +4369,45 @@ mod tests {
                 "source-commit",
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn windows_package_inspection_requires_complete_session_broker_privileges() {
+        let canonical = windows_package_inspection_fixture();
+        assert_eq!(
+            canonical["session_broker_required_privileges"],
+            serde_json::json!([
+                "SeAssignPrimaryTokenPrivilege",
+                "SeIncreaseQuotaPrivilege",
+                "SeImpersonatePrivilege",
+                "SeSecurityPrivilege",
+                "SeTcbPrivilege",
+            ])
+        );
+        validate_agent_package_inspection(
+            &serde_json::to_vec(&canonical).unwrap(),
+            "1.2.3",
+            "source-commit",
+        )
+        .expect("canonical Windows package inspection should validate");
+
+        let mut stale_validator_identity = canonical;
+        stale_validator_identity["session_broker_required_privileges"] = serde_json::json!([
+            "SeAssignPrimaryTokenPrivilege",
+            "SeIncreaseQuotaPrivilege",
+            "SeTcbPrivilege",
+        ]);
+        let error = validate_agent_package_inspection(
+            &serde_json::to_vec(&stale_validator_identity).unwrap(),
+            "1.2.3",
+            "source-commit",
+        )
+        .expect_err("the stale session-broker privilege identity should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("sealed agent package inspection differs from the release identity")
         );
     }
 

@@ -36,13 +36,8 @@ pub(crate) const LAUNCHER_PRIVILEGES: &[&str] = &[
     "SeRestorePrivilege",
     "SeTcbPrivilege",
 ];
-pub(crate) const SESSION_BROKER_PRIVILEGES: &[&str] = &[
-    "SeAssignPrimaryTokenPrivilege",
-    "SeIncreaseQuotaPrivilege",
-    "SeImpersonatePrivilege",
-    "SeSecurityPrivilege",
-    "SeTcbPrivilege",
-];
+pub(crate) const SESSION_BROKER_PRIVILEGES: &[&str] =
+    memcordon_core::WINDOWS_SESSION_BROKER_REQUIRED_PRIVILEGES;
 pub(crate) const INSTALL_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)(A;;GX;;;RC)(A;OIIO;GRGX;;;RC)(A;OICI;GRGX;;;AC)";
 const IMAGE_DELETE_DEADLINE: Duration = Duration::from_secs(5);
 const IMAGE_DELETE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
