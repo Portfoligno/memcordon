@@ -1851,10 +1851,7 @@ mod tests {
         ] {
             let report = compose_probe(Ok(()), Err(reason.clone()));
             assert_eq!(
-                report
-                    .selected
-                    .as_ref()
-                    .map(|backend| backend.name.as_str()),
+                report.selected.as_ref().map(|backend| backend.name),
                 Some("linux-cgroup-v2"),
                 "the public backend must remain selected when the sealed companion is absent"
             );
