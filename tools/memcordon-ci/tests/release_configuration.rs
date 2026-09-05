@@ -2,6 +2,40 @@ use memcordon_ci::config::{self, Release, SealedAssetPolicy};
 
 type ReleaseMutation = (&'static str, fn(&mut Release));
 
+#[test]
+fn workspace_publication_order_matches_the_dependency_graph() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .current_dir(&root)
+        .no_deps()
+        .other_options(vec!["--locked".to_owned(), "--offline".to_owned()])
+        .exec()
+        .expect("workspace metadata should be available");
+    let release = canonical_release();
+    let policy = config::policy(&root).expect("workspace policy should parse");
+    assert_eq!(release.publish_packages, policy.workspace.publish_packages);
+    config::publish_order(&metadata, &release.publish_packages)
+        .expect("configured publication order should match the actual workspace graph");
+
+    let mut previous_order = release.publish_packages.clone();
+    let platform = previous_order
+        .iter()
+        .position(|name| name == "memcordon-platform")
+        .unwrap();
+    let launch_core = previous_order
+        .iter()
+        .position(|name| name == "memcordon-windows-launch-core")
+        .unwrap();
+    previous_order.swap(platform, launch_core);
+    let error = config::publish_order(&metadata, &previous_order)
+        .expect_err("the previous sibling order must fail before tagging");
+    assert!(error.to_string().contains("does not match derived DAG"));
+
+    let mut reversed_dependencies = release.publish_packages.clone();
+    reversed_dependencies.reverse();
+    assert!(config::publish_order(&metadata, &reversed_dependencies).is_err());
+}
+
 fn canonical_release() -> Release {
     toml::from_str(include_str!("../../../ci/release.toml"))
         .expect("canonical release configuration should parse")

@@ -8,7 +8,7 @@ production_packages = [
 ]
 ci_packages = ["memcordon-ci", "memcordon-windows-loader-lab"]
 ci_package_rust_versions = { memcordon-ci = "1.88.0", memcordon-windows-loader-lab = "1.85.0" }
-publish_packages = ["memcordon-core", "memcordon-windows-launch-core", "memcordon-platform", "memcordon"]
+publish_packages = ["memcordon-core", "memcordon-platform", "memcordon-windows-launch-core", "memcordon"]
 non_publish_packages = ["memcordon-testkit", "memcordon-ci", "memcordon-windows-loader-lab"]
 
 [workflow]

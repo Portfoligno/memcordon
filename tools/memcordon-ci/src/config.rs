@@ -1,12 +1,92 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use cargo_metadata::{DependencyKind, Metadata};
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
 
 pub const RELEASE_SCHEMA_VERSION: u32 = 3;
+
+/// Derive and validate the canonical dependency order for public workspace packages.
+pub fn publish_order(metadata: &Metadata, configured: &[String]) -> Result<Vec<String>> {
+    let configured_set: BTreeSet<&str> = configured.iter().map(String::as_str).collect();
+    if configured_set.len() != configured.len() {
+        return Err(crate::CiError::Message(
+            "release publish package list contains duplicates".to_owned(),
+        ));
+    }
+    let packages: BTreeMap<&str, &cargo_metadata::Package> = metadata
+        .packages
+        .iter()
+        .map(|package| (package.name.as_str(), package))
+        .collect();
+    let mut remaining: BTreeSet<&str> = configured_set.clone();
+    let mut order = Vec::new();
+    while !remaining.is_empty() {
+        let next = remaining.iter().copied().find(|name| {
+            packages.get(name).is_some_and(|package| {
+                package.dependencies.iter().all(|dependency| {
+                    dependency.kind == DependencyKind::Development
+                        || !configured_set.contains(dependency.name.as_str())
+                        || order
+                            .iter()
+                            .any(|published| published == dependency.name.as_str())
+                })
+            })
+        });
+        let Some(next) = next else {
+            return Err(crate::CiError::Message(
+                "publishable workspace dependency graph contains a cycle".to_owned(),
+            ));
+        };
+        let package = packages.get(next).ok_or_else(|| {
+            crate::CiError::Message(format!("configured publish package is absent: {next}"))
+        })?;
+        if package.publish.as_ref().is_none_or(|registries| {
+            registries.len() != 1
+                || registries
+                    .first()
+                    .is_none_or(|registry| registry != "crates-io")
+        }) {
+            return Err(crate::CiError::Message(format!(
+                "package is not crates.io-only: {next}"
+            )));
+        }
+        for dependency in &package.dependencies {
+            if dependency.kind != DependencyKind::Development
+                && dependency.path.is_some()
+                && !configured_set.contains(dependency.name.as_str())
+            {
+                return Err(crate::CiError::Message(format!(
+                    "publishable package {next} depends on non-public workspace package {}",
+                    dependency.name
+                )));
+            }
+            if dependency.kind != DependencyKind::Development
+                && configured_set.contains(dependency.name.as_str())
+            {
+                let requirement = dependency.req.to_string();
+                let expected = format!("={}", package.version);
+                if requirement != expected {
+                    return Err(crate::CiError::Message(format!(
+                        "internal dependency {} in {next} must be exact {expected}",
+                        dependency.name
+                    )));
+                }
+            }
+        }
+        remaining.remove(next);
+        order.push(next.to_owned());
+    }
+    if order != configured {
+        return Err(crate::CiError::Message(format!(
+            "configured publish order {configured:?} does not match derived DAG {order:?}"
+        )));
+    }
+    Ok(order)
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Toolchains {

@@ -2380,6 +2380,13 @@ fn check_manifests(root: &Path, policy: &config::Policy) -> Result<()> {
         .current_dir(root)
         .no_deps()
         .exec()?;
+    let release = config::release(root)?;
+    if release.publish_packages != policy.workspace.publish_packages {
+        return Err(failure(
+            "release and workspace publish package orders differ",
+        ));
+    }
+    config::publish_order(&metadata, &release.publish_packages)?;
     let packages: BTreeMap<&str, &cargo_metadata::Package> = metadata
         .packages
         .iter()

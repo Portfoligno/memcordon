@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
+use cargo_metadata::{Metadata, MetadataCommand};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -465,80 +465,6 @@ fn parse_changelog(root: &Path, version: &Version) -> Result<(String, String)> {
     ))
 }
 
-fn publish_order(metadata: &Metadata, configured: &[String]) -> Result<Vec<String>> {
-    let configured_set: BTreeSet<&str> = configured.iter().map(String::as_str).collect();
-    if configured_set.len() != configured.len() {
-        return Err(failure("release publish package list contains duplicates"));
-    }
-    let packages: BTreeMap<&str, &cargo_metadata::Package> = metadata
-        .packages
-        .iter()
-        .map(|package| (package.name.as_str(), package))
-        .collect();
-    let mut remaining: BTreeSet<&str> = configured_set.clone();
-    let mut order = Vec::new();
-    while !remaining.is_empty() {
-        let next = remaining.iter().copied().find(|name| {
-            packages.get(name).is_some_and(|package| {
-                package.dependencies.iter().all(|dependency| {
-                    dependency.kind == DependencyKind::Development
-                        || !configured_set.contains(dependency.name.as_str())
-                        || order
-                            .iter()
-                            .any(|published| published == dependency.name.as_str())
-                })
-            })
-        });
-        let Some(next) = next else {
-            return Err(failure(
-                "publishable workspace dependency graph contains a cycle",
-            ));
-        };
-        let package = packages
-            .get(next)
-            .ok_or_else(|| failure(format!("configured publish package is absent: {next}")))?;
-        if package.publish.as_ref().is_none_or(|registries| {
-            registries.len() != 1
-                || registries
-                    .first()
-                    .is_none_or(|registry| registry != "crates-io")
-        }) {
-            return Err(failure(format!("package is not crates.io-only: {next}")));
-        }
-        for dependency in &package.dependencies {
-            if dependency.kind != DependencyKind::Development
-                && dependency.path.is_some()
-                && !configured_set.contains(dependency.name.as_str())
-            {
-                return Err(failure(format!(
-                    "publishable package {next} depends on non-public workspace package {}",
-                    dependency.name
-                )));
-            }
-            if dependency.kind != DependencyKind::Development
-                && configured_set.contains(dependency.name.as_str())
-            {
-                let requirement = dependency.req.to_string();
-                let expected = format!("={}", package.version);
-                if requirement != expected {
-                    return Err(failure(format!(
-                        "internal dependency {} in {next} must be exact {expected}",
-                        dependency.name
-                    )));
-                }
-            }
-        }
-        remaining.remove(next);
-        order.push(next.to_owned());
-    }
-    if order != configured {
-        return Err(failure(format!(
-            "configured publish order {configured:?} does not match derived DAG {order:?}"
-        )));
-    }
-    Ok(order)
-}
-
 pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
     let release = config::release(root)?;
     config::validate_release_configuration_identity(&release)?;
@@ -607,7 +533,7 @@ pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
             "release tag/version mismatch: tag={version}, workspace={workspace_version}"
         )));
     }
-    publish_order(&metadata, &release.publish_packages)?;
+    config::publish_order(&metadata, &release.publish_packages)?;
     let workflow_sha = required_platform_value("GITHUB_WORKFLOW_SHA")?;
     if workflow_sha != commit {
         return Err(failure(
@@ -3779,7 +3705,7 @@ fn publish_next(root: &Path) -> Result<()> {
     require_registry_token(token.as_deref())?;
     let (release, manifest, _) = bundle_manifest(root)?;
     let metadata = metadata(root)?;
-    let order = publish_order(&metadata, &release.publish_packages)?;
+    let order = config::publish_order(&metadata, &release.publish_packages)?;
     let mut next_absent = None;
     for package in &order {
         let record = manifest
