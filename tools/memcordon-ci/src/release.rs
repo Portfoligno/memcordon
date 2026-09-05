@@ -18,7 +18,9 @@ use walkdir::WalkDir;
 
 use memcordon_ci::capability;
 use memcordon_ci::release_archive::{
-    NATIVE_ARCHIVE_STATIC_PATHS, RUNTIME_MANIFEST, validate_markdown_documents,
+    configured_default_cargo_binaries,
+    validate_memcordon_crate_distribution as validate_reviewed_memcordon_distribution,
+    validate_markdown_documents, NATIVE_ARCHIVE_STATIC_PATHS, RUNTIME_MANIFEST,
 };
 use memcordon_ci::release_evidence::{CertificationRecord, collect_certification};
 use memcordon_ci::runtime_manifest::{RuntimeComponentRecord, RuntimeManifestV1, SealedRuntimeV1};
@@ -571,6 +573,7 @@ pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
 pub fn validate_packages(root: &Path) -> Result<()> {
     let identity = preflight(root)?;
     let release = config::release(root)?;
+    let default_cargo_binaries = configured_default_cargo_binaries(&release)?;
     let toolchains = config::toolchains(root)?;
     create_package_archives(root, &toolchains.stable, &release.publish_packages)?;
     for package in &release.publish_packages {
@@ -581,6 +584,7 @@ pub fn validate_packages(root: &Path) -> Result<()> {
             &identity.version,
             &identity.commit,
             release.maximum_package_bytes,
+            &default_cargo_binaries,
         )?;
         if crate_checksum(&release, &record.name, &record.version)?.is_some() {
             verify_public_crate(&release, &record)?;
@@ -591,6 +595,7 @@ pub fn validate_packages(root: &Path) -> Result<()> {
         &toolchains.stable,
         &identity.version,
         &identity.commit,
+        &default_cargo_binaries,
     )?;
     Ok(())
 }
@@ -668,174 +673,6 @@ fn validate_crate_readme(path: &Path, package: &str) -> Result<()> {
         .get(&readme)
         .ok_or_else(|| failure(format!("{package} normalized README is absent")))?;
     validate_markdown_documents(&documents)
-}
-
-fn validate_memcordon_crate_distribution(path: &Path) -> Result<()> {
-    let decoder = GzDecoder::new(File::open(path)?);
-    let mut archive = tar::Archive::new(decoder);
-    let mut files = BTreeSet::new();
-    let mut manifest = None;
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        if !entry.header().entry_type().is_file() {
-            continue;
-        }
-        let normalized = normalized_member_path(&entry.path()?)?;
-        if normalized == Path::new("Cargo.toml") {
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes)?;
-            manifest = Some(toml::from_str::<toml::Value>(
-                std::str::from_utf8(&bytes)
-                    .map_err(|_| failure("normalized memcordon Cargo.toml is not UTF-8"))?,
-            )?);
-        }
-        files.insert(normalized);
-    }
-    for required in [
-        "Cargo.toml",
-        "Cargo.toml.orig",
-        "Cargo.lock",
-        "src/lib.rs",
-        "src/main.rs",
-        "src/bin/memcordon-sealed-agent/main.rs",
-        "src/bin/memcordon-sealed-agent/package.rs",
-        "src/bin/memcordon-sealed-agent/protocol.rs",
-        "src/bin/memcordon-sealed-agent/linux/mod.rs",
-        "src/bin/memcordon-sealed-agent/windows/mod.rs",
-        "src/bin/memcordon-sealed-agent/windows/control_service.rs",
-        "src/bin/memcordon-sealed-agent/windows/launcher_service.rs",
-        "src/bin/memcordon-sealed-agent/windows/package.rs",
-        "src/bin/memcordon-sealed-agent/windows/qualification.rs",
-    ] {
-        if !files.contains(Path::new(required)) {
-            return Err(failure(format!(
-                "memcordon crate archive omits required runtime source: {required}"
-            )));
-        }
-    }
-    let manifest = manifest.ok_or_else(|| failure("memcordon crate manifest is absent"))?;
-    if manifest
-        .get("package")
-        .and_then(|value| value.get("autobins"))
-        .and_then(toml::Value::as_bool)
-        != Some(false)
-    {
-        return Err(failure(
-            "memcordon crate does not disable automatic binaries",
-        ));
-    }
-    let bins = manifest
-        .get("bin")
-        .and_then(toml::Value::as_array)
-        .ok_or_else(|| failure("memcordon crate has no explicit binary inventory"))?;
-    let actual_bins = bins
-        .iter()
-        .map(|bin| {
-            let features = bin
-                .get("required-features")
-                .and_then(toml::Value::as_array)
-                .map(|features| {
-                    features
-                        .iter()
-                        .filter_map(toml::Value::as_str)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            (
-                bin.get("name").and_then(toml::Value::as_str),
-                bin.get("path").and_then(toml::Value::as_str),
-                bin.get("doc").and_then(toml::Value::as_bool),
-                features,
-            )
-        })
-        .collect::<Vec<_>>();
-    if actual_bins
-        != [
-            (Some("memcordon"), Some("src/main.rs"), None, vec![]),
-            (
-                Some("memcordon-sealed-agent"),
-                Some("src/bin/memcordon-sealed-agent/main.rs"),
-                Some(false),
-                vec![],
-            ),
-            (
-                Some("memcordon-test-fixture"),
-                Some("src/bin/memcordon-test-fixture.rs"),
-                None,
-                vec!["test-fixtures"],
-            ),
-            (
-                Some("memcordon-sealed-test-fixture"),
-                Some("src/bin/memcordon-sealed-test-fixture.rs"),
-                None,
-                vec!["test-support"],
-            ),
-            (
-                Some("memcordon-embedding-fixture"),
-                Some("src/bin/memcordon-embedding-fixture.rs"),
-                None,
-                vec!["test-fixtures"],
-            ),
-        ]
-    {
-        return Err(failure(
-            "memcordon crate binary inventory differs from the exact reviewed set",
-        ));
-    }
-    let default_bins = bins
-        .iter()
-        .filter(|bin| bin.get("required-features").is_none())
-        .map(|bin| {
-            (
-                bin.get("name").and_then(toml::Value::as_str),
-                bin.get("path").and_then(toml::Value::as_str),
-                bin.get("doc").and_then(toml::Value::as_bool),
-            )
-        })
-        .collect::<Vec<_>>();
-    if default_bins
-        != [
-            (Some("memcordon"), Some("src/main.rs"), None),
-            (
-                Some("memcordon-sealed-agent"),
-                Some("src/bin/memcordon-sealed-agent/main.rs"),
-                Some(false),
-            ),
-        ]
-    {
-        return Err(failure(
-            "memcordon crate default binary inventory is not CLI plus sealed agent",
-        ));
-    }
-    if bins.iter().any(|bin| {
-        bin.get("required-features").is_none()
-            && !matches!(
-                bin.get("name").and_then(toml::Value::as_str),
-                Some("memcordon" | "memcordon-sealed-agent")
-            )
-    }) {
-        return Err(failure(
-            "memcordon crate contains an unexpected default-install binary",
-        ));
-    }
-    for table in ["dependencies", "build-dependencies"] {
-        if manifest
-            .get(table)
-            .and_then(toml::Value::as_table)
-            .is_some_and(|dependencies| {
-                dependencies.values().any(|dependency| {
-                    dependency
-                        .as_table()
-                        .is_some_and(|specification| specification.contains_key("path"))
-                })
-            })
-        {
-            return Err(failure(format!(
-                "memcordon normalized crate retains a workspace path in {table}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn canonical_crate_tree(path: &Path) -> Result<String> {
@@ -1067,6 +904,7 @@ fn package_crate(
     version: &Version,
     source_commit: &str,
     maximum_package_bytes: u64,
+    default_cargo_binaries: &BTreeSet<String>,
 ) -> Result<CrateRecord> {
     let inventory_arguments = vec![
         OsString::from("package"),
@@ -1108,7 +946,7 @@ fn package_crate(
     }
     validate_crate_readme(&archive, package)?;
     if package == "memcordon" {
-        validate_memcordon_crate_distribution(&archive)?;
+        validate_reviewed_memcordon_distribution(&archive, default_cargo_binaries)?;
     }
     let archive_sha256 = sha256_file(&archive)?;
     Ok(CrateRecord {
@@ -1333,11 +1171,27 @@ fn verify_component_version(
     Ok(())
 }
 
+fn installed_binary_name(name: &str) -> OsString {
+    let mut binary = OsString::from(name);
+    if cfg!(windows) {
+        binary.push(".exe");
+    }
+    binary
+}
+
+fn cargo_install_inventory(default_binaries: &BTreeSet<String>) -> BTreeSet<OsString> {
+    default_binaries
+        .iter()
+        .map(|name| installed_binary_name(name))
+        .collect()
+}
+
 fn smoke_packaged_memcordon_install(
     root: &Path,
     stable: &str,
     version: &Version,
     source_commit: &str,
+    default_cargo_binaries: &BTreeSet<String>,
 ) -> Result<()> {
     let temporary = TempDir::new()?;
     let sources = temporary.path().join("sources");
@@ -1416,20 +1270,12 @@ fn smoke_packaged_memcordon_install(
     )
     .run()?;
     let binaries = install_root.join("bin");
-    let cli_name = if cfg!(windows) {
-        "memcordon.exe"
-    } else {
-        "memcordon"
-    };
-    let agent_name = if cfg!(windows) {
-        "memcordon-sealed-agent.exe"
-    } else {
-        "memcordon-sealed-agent"
-    };
+    let cli_name = installed_binary_name("memcordon");
+    let agent_name = installed_binary_name("memcordon-sealed-agent");
     let actual = fs::read_dir(&binaries)?
         .map(|entry| entry.map(|entry| entry.file_name()).map_err(CiError::from))
         .collect::<Result<BTreeSet<_>>>()?;
-    let expected = BTreeSet::from([OsString::from(cli_name), OsString::from(agent_name)]);
+    let expected = cargo_install_inventory(default_cargo_binaries);
     if actual != expected {
         return Err(failure(format!(
             "packaged-source Cargo install binary inventory differs: expected={expected:?} actual={actual:?}"
@@ -2426,6 +2272,7 @@ fn workflow_provenance_at(
 fn assemble(root: &Path) -> Result<()> {
     let identity = preflight(root)?;
     let release = config::release(root)?;
+    let default_cargo_binaries = configured_default_cargo_binaries(&release)?;
     let toolchains = config::toolchains(root)?;
     let output = root.join(&release.assets.output_directory);
     fs::create_dir_all(&output)?;
@@ -2454,6 +2301,7 @@ fn assemble(root: &Path) -> Result<()> {
             &identity.version,
             &identity.commit,
             release.maximum_package_bytes,
+            &default_cargo_binaries,
         )?);
         let archive =
             package_archive_directory(root).join(format!("{package}-{}.crate", identity.version));
@@ -3365,6 +3213,8 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
     );
     let manifest_path = temporary.path().join("Cargo.toml");
     fs::write(&manifest_path, manifest)?;
+    let release = config::release(root)?;
+    let default_cargo_binaries = configured_default_cargo_binaries(&release)?;
     let toolchains = config::toolchains(root)?;
     let manifest_argument = manifest_path.into_os_string();
     rustup_cargo(
@@ -3408,20 +3258,12 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
         )
         .run()?;
         let binary_directory = install_root.join("bin");
-        let cli_name = if cfg!(windows) {
-            "memcordon.exe"
-        } else {
-            "memcordon"
-        };
-        let agent_name = if cfg!(windows) {
-            "memcordon-sealed-agent.exe"
-        } else {
-            "memcordon-sealed-agent"
-        };
+        let cli_name = installed_binary_name("memcordon");
+        let agent_name = installed_binary_name("memcordon-sealed-agent");
         let actual = fs::read_dir(&binary_directory)?
             .map(|entry| entry.map(|entry| entry.file_name()).map_err(CiError::from))
             .collect::<Result<BTreeSet<_>>>()?;
-        let expected = BTreeSet::from([OsString::from(cli_name), OsString::from(agent_name)]);
+        let expected = cargo_install_inventory(&default_cargo_binaries);
         if actual != expected {
             return Err(failure(format!(
                 "installed memcordon binary inventory differs: expected={expected:?} actual={actual:?}"

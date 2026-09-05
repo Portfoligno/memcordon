@@ -1,7 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use flate2::read::GzDecoder;
+
+use crate::config;
 use crate::{CiError, Result};
 
 pub const RUNTIME_MANIFEST: &str = "runtime-manifest.json";
@@ -22,8 +27,84 @@ pub const NATIVE_ARCHIVE_STATIC_PATHS: &[&str] = &[
     "spec/sealed-windows-v2.md",
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReviewedCargoBinary {
+    pub name: &'static str,
+    pub path: &'static str,
+    pub doc: Option<bool>,
+    pub required_features: Option<&'static [&'static str]>,
+}
+
+pub const REVIEWED_CARGO_BINARIES: &[ReviewedCargoBinary] = &[
+    ReviewedCargoBinary {
+        name: "memcordon",
+        path: "src/main.rs",
+        doc: None,
+        required_features: None,
+    },
+    ReviewedCargoBinary {
+        name: "memcordon-sealed-agent",
+        path: "src/bin/memcordon-sealed-agent/main.rs",
+        doc: Some(false),
+        required_features: None,
+    },
+    ReviewedCargoBinary {
+        name: "memcordon-target-desktop-bootstrap",
+        path: "src/bin/memcordon-target-desktop-bootstrap.rs",
+        doc: Some(false),
+        required_features: None,
+    },
+    ReviewedCargoBinary {
+        name: "memcordon-session-broker",
+        path: "src/bin/memcordon-session-broker.rs",
+        doc: Some(false),
+        required_features: None,
+    },
+    ReviewedCargoBinary {
+        name: "memcordon-test-fixture",
+        path: "src/bin/memcordon-test-fixture.rs",
+        doc: None,
+        required_features: Some(&["test-fixtures"]),
+    },
+    ReviewedCargoBinary {
+        name: "memcordon-sealed-test-fixture",
+        path: "src/bin/memcordon-sealed-test-fixture.rs",
+        doc: None,
+        required_features: Some(&["test-support"]),
+    },
+    ReviewedCargoBinary {
+        name: "memcordon-embedding-fixture",
+        path: "src/bin/memcordon-embedding-fixture.rs",
+        doc: None,
+        required_features: Some(&["test-fixtures"]),
+    },
+];
+
 fn failure(message: impl Into<String>) -> CiError {
     CiError::Message(message.into())
+}
+
+pub fn configured_default_cargo_binaries(
+    release: &config::Release,
+) -> Result<BTreeSet<String>> {
+    let actual = release
+        .assets
+        .target
+        .iter()
+        .flat_map(|target| target.executable.iter())
+        .map(|executable| executable.binary.clone())
+        .collect::<BTreeSet<_>>();
+    let expected = REVIEWED_CARGO_BINARIES
+        .iter()
+        .filter(|binary| binary.required_features.is_none())
+        .map(|binary| binary.name.to_owned())
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(failure(
+            "release configuration contradicts the reviewed four-default Cargo binary inventory",
+        ));
+    }
+    Ok(actual)
 }
 
 pub fn normalized_member_path(path: &Path) -> Result<PathBuf> {
@@ -83,7 +164,10 @@ pub fn validate_crate_readme(path: &Path, package: &str) -> Result<()> {
     validate_markdown_documents(&documents)
 }
 
-pub fn validate_memcordon_crate_distribution(path: &Path) -> Result<()> {
+pub fn validate_memcordon_crate_distribution(
+    path: &Path,
+    configured_default_binaries: &BTreeSet<String>,
+) -> Result<()> {
     let decoder = GzDecoder::new(File::open(path)?);
     let mut archive = tar::Archive::new(decoder);
     let mut files = BTreeSet::new();
@@ -144,35 +228,67 @@ pub fn validate_memcordon_crate_distribution(path: &Path) -> Result<()> {
     let actual_bins = bins
         .iter()
         .map(|bin| {
-            let features = match bin.get("required-features") {
-                None => Ok(Vec::new()),
-                Some(value) => value.as_array()
-                    .ok_or_else(|| failure("binary required-features must be an array"))?
-                    .iter()
-                    .map(|feature| feature.as_str()
-                        .ok_or_else(|| failure("binary required-features must contain strings")))
-                    .collect::<Result<Vec<_>>>(),
+            let required_features = match bin.get("required-features") {
+                None => Ok(None),
+                Some(value) => {
+                    let features = value
+                        .as_array()
+                        .ok_or_else(|| failure("binary required-features must be an array"))?;
+                    Some(
+                        features
+                            .iter()
+                            .map(|feature| {
+                                feature.as_str().ok_or_else(|| {
+                                    failure("binary required-features must contain strings")
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>(),
+                    )
+                    .transpose()
+                }
             }?;
             Ok((
                 bin.get("name").and_then(toml::Value::as_str),
                 bin.get("path").and_then(toml::Value::as_str),
                 bin.get("doc").and_then(toml::Value::as_bool),
-                features,
+                required_features,
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let expected = REVIEWED_CARGO_BINARIES.iter().map(|binary| (
-        Some(binary.name), Some(binary.path), binary.doc, binary.required_features.to_vec(),
-    )).collect::<Vec<_>>();
+    let expected = REVIEWED_CARGO_BINARIES
+        .iter()
+        .map(|binary| {
+            (
+                Some(binary.name),
+                Some(binary.path),
+                binary.doc,
+                binary
+                    .required_features
+                    .map(|features| features.to_vec()),
+            )
+        })
+        .collect::<Vec<_>>();
     if actual_bins != expected {
         return Err(failure(
             "memcordon crate binary inventory differs from the exact reviewed set",
         ));
     }
+    let actual_default_binaries = actual_bins
+        .iter()
+        .filter(|(_, _, _, required_features)| required_features.is_none())
+        .filter_map(|(name, _, _, _)| *name)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    if actual_default_binaries != *configured_default_binaries {
+        return Err(failure(
+            "configured and crate default Cargo binary inventories differ",
+        ));
+    }
     for binary in REVIEWED_CARGO_BINARIES {
         if !files.contains(Path::new(binary.path)) {
             return Err(failure(format!(
-                "memcordon crate archive omits required binary source: {}", binary.path
+                "memcordon crate archive omits required binary source: {}",
+                binary.path
             )));
         }
     }
