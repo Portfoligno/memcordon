@@ -823,17 +823,12 @@ fn windows_package_inspection() -> Value {
         "launcher_service_sid_type": "restricted",
         "session_broker_service_sid_type": "unrestricted",
         "guardian_slot_service_sid_type": "restricted",
-        "control_required_privileges": ["SeImpersonatePrivilege"],
-        "launcher_required_privileges": [
-            "SeAssignPrimaryTokenPrivilege",
-            "SeIncreaseQuotaPrivilege",
-            "SeTcbPrivilege"
-        ],
-        "session_broker_required_privileges": [
-            "SeAssignPrimaryTokenPrivilege",
-            "SeIncreaseQuotaPrivilege",
-            "SeTcbPrivilege"
-        ],
+        "control_required_privileges":
+            memcordon_core::WINDOWS_CONTROL_REQUIRED_PRIVILEGES,
+        "launcher_required_privileges":
+            memcordon_core::WINDOWS_LAUNCHER_REQUIRED_PRIVILEGES,
+        "session_broker_required_privileges":
+            memcordon_core::WINDOWS_SESSION_BROKER_REQUIRED_PRIVILEGES,
         "guardian_slot_required_privileges": [],
         "control_pipe_security_sha256": "30".repeat(32),
         "launcher_pipe_security_sha256": "40".repeat(32),
@@ -2062,6 +2057,26 @@ fn windows_package_identity_mutations_fail_closed() {
             "windows-package-inspection.json",
             "/launcher_required_privileges",
             json!([]),
+        ),
+        (
+            "stale launcher privilege inventory",
+            "windows-package-inspection.json",
+            "/launcher_required_privileges",
+            json!([
+                "SeAssignPrimaryTokenPrivilege",
+                "SeIncreaseQuotaPrivilege",
+                "SeTcbPrivilege",
+            ]),
+        ),
+        (
+            "stale session-broker privilege inventory",
+            "windows-package-inspection.json",
+            "/session_broker_required_privileges",
+            json!([
+                "SeAssignPrimaryTokenPrivilege",
+                "SeIncreaseQuotaPrivilege",
+                "SeTcbPrivilege",
+            ]),
         ),
         (
             "ACL digest",

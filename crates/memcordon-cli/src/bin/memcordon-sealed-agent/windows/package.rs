@@ -28,14 +28,9 @@ use super::service_manager::{
     SessionBrokerConfigurationFault,
 };
 
-pub(crate) const CONTROL_PRIVILEGES: &[&str] = &["SeImpersonatePrivilege"];
-pub(crate) const LAUNCHER_PRIVILEGES: &[&str] = &[
-    "SeAssignPrimaryTokenPrivilege",
-    "SeBackupPrivilege",
-    "SeIncreaseQuotaPrivilege",
-    "SeRestorePrivilege",
-    "SeTcbPrivilege",
-];
+pub(crate) const CONTROL_PRIVILEGES: &[&str] = memcordon_core::WINDOWS_CONTROL_REQUIRED_PRIVILEGES;
+pub(crate) const LAUNCHER_PRIVILEGES: &[&str] =
+    memcordon_core::WINDOWS_LAUNCHER_REQUIRED_PRIVILEGES;
 pub(crate) const SESSION_BROKER_PRIVILEGES: &[&str] =
     memcordon_core::WINDOWS_SESSION_BROKER_REQUIRED_PRIVILEGES;
 pub(crate) const INSTALL_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;GRGX;;;BU)(A;;GX;;;RC)(A;OIIO;GRGX;;;RC)(A;OICI;GRGX;;;AC)";

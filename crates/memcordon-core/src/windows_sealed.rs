@@ -22,6 +22,14 @@ pub const WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS: usize = 4;
 pub const WINDOWS_CONTROL_SERVICE_NAME: &str = "MemCordonSealedControl";
 pub const WINDOWS_LAUNCHER_SERVICE_NAME: &str = "MemCordonSealedLauncher";
 pub const WINDOWS_SESSION_BROKER_SERVICE_NAME: &str = "MemCordonSealedSessionBroker";
+pub const WINDOWS_CONTROL_REQUIRED_PRIVILEGES: &[&str] = &["SeImpersonatePrivilege"];
+pub const WINDOWS_LAUNCHER_REQUIRED_PRIVILEGES: &[&str] = &[
+    "SeAssignPrimaryTokenPrivilege",
+    "SeBackupPrivilege",
+    "SeIncreaseQuotaPrivilege",
+    "SeRestorePrivilege",
+    "SeTcbPrivilege",
+];
 pub const WINDOWS_SESSION_BROKER_REQUIRED_PRIVILEGES: &[&str] = &[
     "SeAssignPrimaryTokenPrivilege",
     "SeIncreaseQuotaPrivilege",

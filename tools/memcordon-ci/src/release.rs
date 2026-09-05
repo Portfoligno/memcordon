@@ -1114,8 +1114,10 @@ fn validate_agent_package_inspection(
                 && launcher_service_sid_type == "restricted"
                 && session_broker_service_sid_type == "unrestricted"
                 && guardian_slot_service_sid_type == "restricted"
-                && !control_required_privileges.is_empty()
-                && !launcher_required_privileges.is_empty()
+                && control_required_privileges
+                    == memcordon_core::WINDOWS_CONTROL_REQUIRED_PRIVILEGES
+                && launcher_required_privileges
+                    == memcordon_core::WINDOWS_LAUNCHER_REQUIRED_PRIVILEGES
                 && session_broker_required_privileges
                     == memcordon_core::WINDOWS_SESSION_BROKER_REQUIRED_PRIVILEGES
                 && guardian_slot_required_privileges.is_empty()
@@ -4204,17 +4206,11 @@ mod tests {
             ),
             (
                 "control_required_privileges",
-                serde_json::json!(["SeImpersonatePrivilege"]),
+                serde_json::json!(memcordon_core::WINDOWS_CONTROL_REQUIRED_PRIVILEGES),
             ),
             (
                 "launcher_required_privileges",
-                serde_json::json!([
-                    "SeAssignPrimaryTokenPrivilege",
-                    "SeBackupPrivilege",
-                    "SeIncreaseQuotaPrivilege",
-                    "SeRestorePrivilege",
-                    "SeTcbPrivilege",
-                ]),
+                serde_json::json!(memcordon_core::WINDOWS_LAUNCHER_REQUIRED_PRIVILEGES),
             ),
             (
                 "session_broker_required_privileges",

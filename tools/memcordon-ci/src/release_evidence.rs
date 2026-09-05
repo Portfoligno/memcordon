@@ -721,19 +721,12 @@ impl WindowsPackageInspection {
             && self.launcher_service_sid_type == "restricted"
             && self.session_broker_service_sid_type == "unrestricted"
             && self.guardian_slot_service_sid_type == "restricted"
-            && self.control_required_privileges == ["SeImpersonatePrivilege"]
+            && self.control_required_privileges
+                == memcordon_core::WINDOWS_CONTROL_REQUIRED_PRIVILEGES
             && self.launcher_required_privileges
-                == [
-                    "SeAssignPrimaryTokenPrivilege",
-                    "SeIncreaseQuotaPrivilege",
-                    "SeTcbPrivilege",
-                ]
+                == memcordon_core::WINDOWS_LAUNCHER_REQUIRED_PRIVILEGES
             && self.session_broker_required_privileges
-                == [
-                    "SeAssignPrimaryTokenPrivilege",
-                    "SeIncreaseQuotaPrivilege",
-                    "SeTcbPrivilege",
-                ]
+                == memcordon_core::WINDOWS_SESSION_BROKER_REQUIRED_PRIVILEGES
             && self.guardian_slot_required_privileges.is_empty()
             && [
                 &self.control_service_config_sha256,
