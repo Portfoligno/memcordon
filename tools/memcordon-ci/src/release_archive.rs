@@ -26,6 +26,176 @@ fn failure(message: impl Into<String>) -> CiError {
     CiError::Message(message.into())
 }
 
+pub fn normalized_member_path(path: &Path) -> Result<PathBuf> {
+    let mut components = path.components();
+    let package_root = components
+        .next()
+        .ok_or_else(|| failure("package archive contains an empty path"))?;
+    if !matches!(package_root, Component::Normal(_)) {
+        return Err(failure(
+            "package archive root is not a normal relative path",
+        ));
+    }
+    let mut normalized = PathBuf::new();
+    for component in components {
+        match component {
+            Component::Normal(value) => normalized.push(value),
+            _ => {
+                return Err(failure(
+                    "package archive contains a forbidden path component",
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+pub fn validate_crate_readme(path: &Path, package: &str) -> Result<()> {
+    let decoder = GzDecoder::new(File::open(path)?);
+    let mut archive = tar::Archive::new(decoder);
+    let mut documents = BTreeMap::new();
+    let mut readme = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let normalized = normalized_member_path(&entry.path()?)?;
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        if normalized == Path::new("Cargo.toml") {
+            let manifest: toml::Value = toml::from_str(
+                std::str::from_utf8(&bytes)
+                    .map_err(|_| failure("normalized Cargo.toml is not UTF-8"))?,
+            )?;
+            readme = manifest
+                .get("package")
+                .and_then(|value| value.get("readme"))
+                .and_then(toml::Value::as_str)
+                .map(PathBuf::from);
+        }
+        documents.insert(normalized, bytes);
+    }
+    let readme = readme.ok_or_else(|| failure(format!("{package} has no normalized README")))?;
+    documents
+        .get(&readme)
+        .ok_or_else(|| failure(format!("{package} normalized README is absent")))?;
+    validate_markdown_documents(&documents)
+}
+
+pub fn validate_memcordon_crate_distribution(path: &Path) -> Result<()> {
+    let decoder = GzDecoder::new(File::open(path)?);
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = BTreeSet::new();
+    let mut manifest = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let normalized = normalized_member_path(&entry.path()?)?;
+        if normalized == Path::new("Cargo.toml") {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            manifest = Some(toml::from_str::<toml::Value>(
+                std::str::from_utf8(&bytes)
+                    .map_err(|_| failure("normalized memcordon Cargo.toml is not UTF-8"))?,
+            )?);
+        }
+        files.insert(normalized);
+    }
+    for required in [
+        "Cargo.toml",
+        "Cargo.toml.orig",
+        "Cargo.lock",
+        "src/lib.rs",
+        "src/main.rs",
+        "src/bin/memcordon-sealed-agent/main.rs",
+        "src/bin/memcordon-sealed-agent/package.rs",
+        "src/bin/memcordon-sealed-agent/protocol.rs",
+        "src/bin/memcordon-sealed-agent/linux/mod.rs",
+        "src/bin/memcordon-sealed-agent/windows/mod.rs",
+        "src/bin/memcordon-sealed-agent/windows/control_service.rs",
+        "src/bin/memcordon-sealed-agent/windows/launcher_service.rs",
+        "src/bin/memcordon-sealed-agent/windows/package.rs",
+        "src/bin/memcordon-sealed-agent/windows/qualification.rs",
+    ] {
+        if !files.contains(Path::new(required)) {
+            return Err(failure(format!(
+                "memcordon crate archive omits required runtime source: {required}"
+            )));
+        }
+    }
+    let manifest = manifest.ok_or_else(|| failure("memcordon crate manifest is absent"))?;
+    if manifest
+        .get("package")
+        .and_then(|value| value.get("autobins"))
+        .and_then(toml::Value::as_bool)
+        != Some(false)
+    {
+        return Err(failure(
+            "memcordon crate does not disable automatic binaries",
+        ));
+    }
+    let bins = manifest
+        .get("bin")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| failure("memcordon crate has no explicit binary inventory"))?;
+    let actual_bins = bins
+        .iter()
+        .map(|bin| {
+            let features = match bin.get("required-features") {
+                None => Ok(Vec::new()),
+                Some(value) => value.as_array()
+                    .ok_or_else(|| failure("binary required-features must be an array"))?
+                    .iter()
+                    .map(|feature| feature.as_str()
+                        .ok_or_else(|| failure("binary required-features must contain strings")))
+                    .collect::<Result<Vec<_>>>(),
+            }?;
+            Ok((
+                bin.get("name").and_then(toml::Value::as_str),
+                bin.get("path").and_then(toml::Value::as_str),
+                bin.get("doc").and_then(toml::Value::as_bool),
+                features,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expected = REVIEWED_CARGO_BINARIES.iter().map(|binary| (
+        Some(binary.name), Some(binary.path), binary.doc, binary.required_features.to_vec(),
+    )).collect::<Vec<_>>();
+    if actual_bins != expected {
+        return Err(failure(
+            "memcordon crate binary inventory differs from the exact reviewed set",
+        ));
+    }
+    for binary in REVIEWED_CARGO_BINARIES {
+        if !files.contains(Path::new(binary.path)) {
+            return Err(failure(format!(
+                "memcordon crate archive omits required binary source: {}", binary.path
+            )));
+        }
+    }
+    for table in ["dependencies", "build-dependencies"] {
+        if manifest
+            .get(table)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|dependencies| {
+                dependencies.values().any(|dependency| {
+                    dependency
+                        .as_table()
+                        .is_some_and(|specification| specification.contains_key("path"))
+                })
+            })
+        {
+            return Err(failure(format!(
+                "memcordon normalized crate retains a workspace path in {table}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn markdown_anchor(text: &str) -> String {
     let mut anchor = String::new();
     for character in text.trim().chars() {
