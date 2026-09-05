@@ -4033,6 +4033,14 @@ mod tests {
         })
     }
 
+    fn frontend_cli() -> &'static Path {
+        if cfg!(windows) {
+            Path::new(r"C:\opt\release\memcordon.exe")
+        } else {
+            Path::new("/opt/release/memcordon")
+        }
+    }
+
     #[test]
     fn windows_runtime_manifest_uses_shared_qualification_schema() {
         let (_temporary, release) = release_fixture();
@@ -4164,7 +4172,11 @@ mod tests {
             uid: 1001,
             provider_gid: 998,
         };
-        let cli = Path::new("/opt/release/memcordon");
+        let cli = frontend_cli();
+        assert!(
+            cli.is_absolute(),
+            "the frontend fixture must remain absolute on every test host"
+        );
         let doctor =
             linux_provider_frontend_arguments(&identity, cli, LinuxProviderFrontendStage::Doctor)
                 .expect("doctor transition should use structured argv");
