@@ -46,6 +46,8 @@ const REGISTRY_USER_AGENT: &str = "memcordon-ci (https://github.com/Portfoligno/
 const GITHUB_RELEASES_PER_PAGE: usize = 100;
 const CRATES_IO_TOKEN_VARIABLE: &str = "CARGO_REGISTRIES_CRATES_IO_TOKEN";
 pub(crate) const TRUSTED_PUBLISHING_NEW_CRATE_MARKER: &str = "Trusted Publishing tokens do not support creating new crates. Publish the crate manually, first";
+const ACCESS_TOKEN_CRATE_REJECTION_MARKER: &str =
+    "The provided access token is not valid for crate `";
 const PUBLICATION_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const MAXIMUM_CARGO_DIAGNOSTIC_BYTES: usize = 65536;
 
@@ -3976,18 +3978,35 @@ fn require_registry_token(token: Option<&OsStr>) -> Result<()> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OidcFailureClass {
     TrustedPublishingNewCrate,
+    TrustedPublishingExistingCrate,
     Other,
 }
 
-fn classify_oidc_failure(stderr: &str) -> OidcFailureClass {
+fn rejected_access_token_crate(line: &str) -> Option<&str> {
+    let payload = line.split(ACCESS_TOKEN_CRATE_REJECTION_MARKER).nth(1)?;
+    let mut delimited = payload.split('`');
+    let name = delimited.next()?;
+    delimited.next()?;
+    if name.is_empty() { None } else { Some(name) }
+}
+
+fn classify_oidc_failure(stderr: &str, selected_crate: &str) -> OidcFailureClass {
+    for line in stderr.lines() {
+        if let Some(rejected_crate) = rejected_access_token_crate(line) {
+            return if rejected_crate == selected_crate {
+                OidcFailureClass::TrustedPublishingExistingCrate
+            } else {
+                OidcFailureClass::Other
+            };
+        }
+    }
     if stderr
         .lines()
         .any(|line| line.contains(TRUSTED_PUBLISHING_NEW_CRATE_MARKER))
     {
-        OidcFailureClass::TrustedPublishingNewCrate
-    } else {
-        OidcFailureClass::Other
+        return OidcFailureClass::TrustedPublishingNewCrate;
     }
+    OidcFailureClass::Other
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4048,6 +4067,7 @@ enum PublicationOutcome {
     AlreadyPublic,
     OidcPubliclyAccepted,
     OidcRejectedNewCrate,
+    OidcRejectedExistingCrate,
     OidcRejectedOther,
     NewCrateAuthorizationConflict,
     NewCrateAuthorized,
@@ -4268,6 +4288,7 @@ fn evidence_authorizes_token_provider(evidence: &PublicationSlotEvidence) -> boo
     for record in &evidence.records {
         match record.outcome {
             PublicationOutcome::OidcRejectedNewCrate => rejection = true,
+            PublicationOutcome::OidcRejectedExistingCrate => return false,
             PublicationOutcome::NewCrateAuthorized if rejection => {
                 return !evidence.records.iter().any(|record| {
                     matches!(
@@ -4277,7 +4298,7 @@ fn evidence_authorizes_token_provider(evidence: &PublicationSlotEvidence) -> boo
                     ) && record.credential_origin == CredentialOrigin::NewCrateToken
                 });
             }
-            _ => {}
+            _ => rejection = false,
         }
     }
     false
@@ -5013,7 +5034,15 @@ fn attempt_oidc_publication_at(root: &Path, publication_slot: NonZeroUsize) -> R
         CrateVersionLookup::Absent => {}
     }
 
-    match classify_oidc_failure(&attempt_stderr(&attempt)) {
+    let failure_class = classify_oidc_failure(&attempt_stderr(&attempt), &record.name);
+    let name_present = match failure_class {
+        OidcFailureClass::Other => false,
+        OidcFailureClass::TrustedPublishingNewCrate
+        | OidcFailureClass::TrustedPublishingExistingCrate => {
+            crate_name_exists(&release, &record.name)?
+        }
+    };
+    match failure_class {
         OidcFailureClass::Other => {
             append_slot_record(
                 root,
@@ -5029,7 +5058,6 @@ fn attempt_oidc_publication_at(root: &Path, publication_slot: NonZeroUsize) -> R
             Err(publication_failure(&attempt, &credential))
         }
         OidcFailureClass::TrustedPublishingNewCrate => {
-            let name_present = crate_name_exists(&release, &record.name)?;
             let (outcome, public_name_state) = if name_present {
                 (
                     PublicationOutcome::NewCrateAuthorizationConflict,
@@ -5054,27 +5082,64 @@ fn attempt_oidc_publication_at(root: &Path, publication_slot: NonZeroUsize) -> R
             )?;
             Err(publication_failure(&attempt, &credential))
         }
+        OidcFailureClass::TrustedPublishingExistingCrate => {
+            let (outcome, public_name_state) = if name_present {
+                (
+                    PublicationOutcome::OidcRejectedExistingCrate,
+                    PublicNameState::Present,
+                )
+            } else {
+                (
+                    PublicationOutcome::OidcRejectedOther,
+                    PublicNameState::NotChecked,
+                )
+            };
+            append_slot_record(
+                root,
+                &release,
+                publication_slot,
+                publication_record(
+                    CredentialOrigin::Oidc,
+                    outcome,
+                    public_name_state,
+                    Some(diagnostics),
+                ),
+            )?;
+            Err(publication_failure(&attempt, &credential))
+        }
     }
 }
 
-fn authorize_new_crate_fallback_at(
+fn authorize_new_crate_fallback_for_run(
     root: &Path,
+    release: &config::Release,
+    manifest: &ReleaseManifest,
+    order: &[String],
     publication_slot: NonZeroUsize,
+    run: &PublicationRunIdentity,
     github_output: Option<&Path>,
 ) -> Result<()> {
-    let (release, manifest) = publication_context(root)?;
-    require_fallback_profile(root, &release, &manifest)?;
-    let order = configured_publication_order(root, &release)?;
     let record = configured_slot_record(&manifest, &order, publication_slot)?;
-    let (release_binding, run, crate_binding) = slot_publication_identity(&manifest, &record)?;
+    let release_binding = ReleaseBinding::from_manifest(manifest);
+    let crate_binding = CrateBinding::from_record(&record);
     let evidence = load_slot_evidence(root, publication_slot)?;
     validate_slot_evidence_identity(
         &evidence,
         publication_slot,
         &release_binding,
-        &run,
+        run,
         &crate_binding,
     )?;
+    if evidence
+        .records
+        .iter()
+        .any(|record| record.outcome == PublicationOutcome::OidcRejectedExistingCrate)
+    {
+        return Err(failure(format!(
+            "publication slot {publication_slot} cannot use the new-crate fallback because crates.io rejected its OIDC access token for existing crate {}",
+            record.name
+        )));
+    }
     if !evidence.records.iter().any(|record| {
         record.outcome == PublicationOutcome::OidcRejectedNewCrate
             && record.public_name_state == PublicNameState::Absent
@@ -5139,6 +5204,26 @@ fn authorize_new_crate_fallback_at(
         writeln!(file, "authorized=true")?;
     }
     Ok(())
+}
+
+fn authorize_new_crate_fallback_at(
+    root: &Path,
+    publication_slot: NonZeroUsize,
+    github_output: Option<&Path>,
+) -> Result<()> {
+    let (release, manifest) = publication_context(root)?;
+    require_fallback_profile(root, &release, &manifest)?;
+    let order = configured_publication_order(root, &release)?;
+    let run = PublicationRunIdentity::from_environment()?;
+    authorize_new_crate_fallback_for_run(
+        root,
+        &release,
+        &manifest,
+        &order,
+        publication_slot,
+        &run,
+        github_output,
+    )
 }
 
 fn authorize_new_crate_fallback(root: &Path, publication_slot: NonZeroUsize) -> Result<()> {
@@ -6577,8 +6662,15 @@ mod tests {
             "error: failed to publish to registry\n\ncaused by:\n  the remote server responded with an error (status 403 Forbidden): {TRUSTED_PUBLISHING_NEW_CRATE_MARKER}\n"
         );
         assert_eq!(
-            classify_oidc_failure(&exact),
+            classify_oidc_failure(&exact, "example-crate"),
             OidcFailureClass::TrustedPublishingNewCrate
+        );
+        let existing_crate = format!(
+            "error: failed to publish to registry\n\ncaused by:\n  the remote server responded with an error (status 403 Forbidden): {ACCESS_TOKEN_CRATE_REJECTION_MARKER}example-crate`\n"
+        );
+        assert_eq!(
+            classify_oidc_failure(&existing_crate, "example-crate"),
+            OidcFailureClass::TrustedPublishingExistingCrate
         );
         for near_miss in [
             "",
@@ -6587,13 +6679,24 @@ mod tests {
             "Trusted Publishing tokens do not support creating new crates",
             "trusted publishing tokens do not support creating new crates. publish the crate manually, first",
             "error: unauthorized (status 401 Unauthorized)",
+            ACCESS_TOKEN_CRATE_REJECTION_MARKER,
+            "The provided access token is not valid for crate `other-crate`",
+            "The provided access token is not valid for crate `example-crate",
         ] {
             assert_eq!(
-                classify_oidc_failure(near_miss),
+                classify_oidc_failure(near_miss, "example-crate"),
                 OidcFailureClass::Other,
                 "near-miss diagnostics must fail closed: {near_miss}"
             );
         }
+        let conflicting_diagnostics = format!(
+            "{ACCESS_TOKEN_CRATE_REJECTION_MARKER}other-crate`\n{TRUSTED_PUBLISHING_NEW_CRATE_MARKER}\n"
+        );
+        assert_eq!(
+            classify_oidc_failure(&conflicting_diagnostics, "example-crate"),
+            OidcFailureClass::Other,
+            "an existing-crate rejection must disqualify a mixed diagnostic transcript"
+        );
     }
 
     #[test]
@@ -6701,6 +6804,19 @@ mod tests {
         };
         assert!(evidence_authorizes_token_provider(&base));
         assert!(evidence_allows_new_token_attempt(&base));
+
+        let existing_crate_rejection = PublicationSlotEvidence {
+            records: vec![publication_record(
+                CredentialOrigin::Oidc,
+                PublicationOutcome::OidcRejectedExistingCrate,
+                PublicNameState::Present,
+                None,
+            )],
+            ..base.clone()
+        };
+        assert!(!evidence_authorizes_token_provider(
+            &existing_crate_rejection
+        ));
 
         let with_token_record = |outcome: PublicationOutcome| PublicationSlotEvidence {
             records: base
