@@ -174,12 +174,14 @@ temporary OIDC-first new-crate fallback keeps the four-slot dependency order
 and typed Cargo credential provider: every slot attempts crates.io Trusted
 Publishing first, and only the exact crates.io new-crate rejection, rechecked
 against absent crate name and absent exact version, can select the narrowly
-scoped repository token for one retry of the same artifact. Later slots reset
-to OIDC. After complete reconciliation and trusted-publisher configuration,
-cleanup must revoke and delete that token and return to four unconditional
-OIDC-only slots. Stored registry tokens, named GitHub Environments,
-credential-bearing caches or artifacts, and force-moving a published tag remain
-outside steady-state policy.
+scoped repository token for one retry of the same artifact. Cargo may issue an
+authenticated crates.io index-read before the publish request; that read is
+bound to the same authorized artifact/run and does not consume the retry, while
+only the exact publish request does. Later slots reset to OIDC. After complete
+reconciliation and trusted-publisher configuration, cleanup must revoke and
+delete that token and return to four unconditional OIDC-only slots. Stored
+registry tokens, named GitHub Environments, credential-bearing caches or
+artifacts, and force-moving a published tag remain outside steady-state policy.
 
 When changing release configuration, update its tests and policy identities in
 the same change. The workflow and typed driver must agree on the tag, commit,

@@ -202,13 +202,15 @@ to OIDC.
   fallback policy keeps exactly four publication positions, each of which
   attempts OIDC first; no crate name or slot is mapped to a credential source.
 - The typed Cargo credential provider accepts only Cargo protocol version 1
-  `get` requests for a crates.io publish operation whose provider argv, Cargo
-  request arguments, credential origin, publication slot, crate name, version,
-  and checksum match the selected preassembled artifact. Its response is
-  non-cacheable and operation-dependent. The fallback origin additionally
-  requires fresh same-run evidence of the exact OIDC rejection, absent crate
-  name, absent exact version, and authorization before it reads its
-  capability, and it never answers registry reads.
+  `get` requests for crates.io read and publish operations whose provider argv,
+  credential origin, publication slot, crate name, version, and checksum match
+  the selected preassembled artifact. Publish requests must additionally carry
+  the exact Cargo crate, version, and archive checksum fields. Every response
+  is non-cacheable and operation-dependent. The fallback origin answers an
+  index-read only after fresh same-run evidence of the exact OIDC rejection,
+  absent crate name, absent exact version, and authorization matches that
+  bound artifact; the read does not consume the one-shot attempt. Only the
+  exact publish `get` records the actual token attempt.
 - The isolated Cargo configuration contains only the provider executable and
   artifact identity. The capability must never be passed as an argument,
   written by `cargo login`, persisted, cached, uploaded, or logged. A missing

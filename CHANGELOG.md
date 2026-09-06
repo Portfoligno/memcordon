@@ -23,6 +23,12 @@ All notable user-visible changes to MemCordon are documented here.
   reports now retain the affected attempt, identify what changed, and report
   whether cleanup completed.
 
+### Fixed
+
+- Corrected the new-crate publication fallback for Cargo’s authenticated
+  crates.io index-read while retaining exact artifact, run, registry, and
+  one-shot publication binding.
+
 ## [0.5.1-rc.2] - 2026-08-25
 
 ### Added

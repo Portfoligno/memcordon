@@ -364,7 +364,7 @@ fn cargo_provider_rejects_wrong_and_malformed_actions() {
 }
 
 #[test]
-fn new_crate_fallback_provider_forbids_registry_reads() {
+fn new_crate_fallback_cli_read_requires_a_publication_run() {
     let (temporary, _, manifest) = provider_fixture();
     let record = crate_record(&manifest);
     let request = json!({
@@ -379,9 +379,6 @@ fn new_crate_fallback_provider_forbids_registry_reads() {
     });
     let (_, response, output) = exchange_json(temporary.path(), request);
     assert_eq!(response["Err"]["kind"], "other");
-    assert_eq!(
-        response["Err"]["message"],
-        "the new-crate fallback credential does not support registry reads"
-    );
+    assert!(response.get("Ok").is_none());
     assert!(output.stderr.is_empty());
 }

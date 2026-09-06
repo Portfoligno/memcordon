@@ -4421,13 +4421,7 @@ fn validate_credential_request<'a>(
     match &request.action {
         CredentialAction::Get {
             operation: CredentialOperation::Read,
-        } => {
-            if expected.origin != CredentialOrigin::Oidc {
-                return Err(failure(
-                    "the new-crate fallback credential does not support registry reads",
-                ));
-            }
-        }
+        } => {}
         CredentialAction::Get {
             operation: CredentialOperation::Publish { name, vers, cksum },
         } if name == &record.name && vers == &record.version && cksum == &record.archive_sha256 => {
@@ -4455,8 +4449,9 @@ fn authorize_token_credential_request(
     expected: &ProviderBinding<'_>,
     record: &CrateRecord,
     run: &PublicationRunIdentity,
+    operation: &CredentialOperation,
 ) -> Result<()> {
-    let (_, manifest, _) = bundle_manifest(root)?;
+    let (release, manifest, _) = bundle_manifest(root)?;
     let release_binding = ReleaseBinding::from_manifest(&manifest);
     let crate_binding = CrateBinding::from_record(record);
     let evidence = load_slot_evidence(root, expected.publication_slot)?;
@@ -4472,6 +4467,25 @@ fn authorize_token_credential_request(
             "new-crate token evidence lacks a fresh OIDC rejection and authorization for slot {}",
             expected.publication_slot
         )));
+    }
+    if matches!(operation, CredentialOperation::Publish { .. }) {
+        if !evidence_allows_new_token_attempt(&evidence) {
+            return Err(failure(format!(
+                "publication slot {} already used its one new-crate token attempt",
+                expected.publication_slot
+            )));
+        }
+        append_publication_record(
+            root,
+            &release,
+            expected.publication_slot,
+            publication_record(
+                CredentialOrigin::NewCrateToken,
+                PublicationOutcome::TokenAttemptStarted,
+                PublicNameState::Absent,
+                None,
+            ),
+        )?;
     }
     Ok(())
 }
@@ -4489,8 +4503,16 @@ fn credential_response(
         Ok(request) => match validate_credential_request(root, &request) {
             Ok((expected, record)) => {
                 if expected.origin == CredentialOrigin::NewCrateToken {
+                    let operation = match &request.action {
+                        CredentialAction::Get { operation } => operation,
+                        CredentialAction::Login { .. } | CredentialAction::Logout => {
+                            unreachable!("unsupported credential actions were already rejected")
+                        }
+                    };
                     let authorization = publication_run().and_then(|run| {
-                        authorize_token_credential_request(root, &expected, &record, &run)
+                        authorize_token_credential_request(
+                            root, &expected, &record, &run, operation,
+                        )
                     });
                     if let Err(error) = authorization {
                         return credential_request_error(error.to_string());
@@ -5103,17 +5125,6 @@ fn publish_token_fallback(root: &Path, publication_slot: NonZeroUsize) -> Result
         )));
     }
 
-    append_slot_record(
-        root,
-        &release,
-        publication_slot,
-        publication_record(
-            CredentialOrigin::NewCrateToken,
-            PublicationOutcome::TokenAttemptStarted,
-            PublicNameState::Absent,
-            None,
-        ),
-    )?;
     let token = std::env::var_os(CRATES_IO_TOKEN_VARIABLE);
     require_registry_token(token.as_deref())?;
     let credential = token
@@ -6943,19 +6954,66 @@ mod tests {
             .as_object_mut()
             .expect("request should be an object")
             .insert("args".to_owned(), token_arguments.clone());
-        let token_read: CredentialRequest = serde_json::from_value(token_read_message)
+        let token_read: CredentialRequest = serde_json::from_value(token_read_message.clone())
             .expect("token-origin read request should parse");
         let read_invoked = Cell::new(false);
-        let denied_read = credential_response(
+        let unauthorized_read = credential_response(
             temporary.path(),
-            Ok(token_read),
+            Ok(token_read.clone()),
             || {
                 read_invoked.set(true);
                 Some("new-crate-capability".to_owned())
             },
             || Ok(run.clone()),
         );
-        assert_eq!(denied_read["Err"]["kind"], "other");
+        assert_eq!(unauthorized_read["Err"]["kind"], "other");
+        assert!(!read_invoked.get());
+
+        let mut foreign_origin = token_read.clone();
+        foreign_origin.args[0] = "token-first".to_owned();
+        let foreign_origin = credential_response(
+            temporary.path(),
+            Ok(foreign_origin),
+            || {
+                read_invoked.set(true);
+                Some("new-crate-capability".to_owned())
+            },
+            || Ok(run.clone()),
+        );
+        assert_eq!(foreign_origin["Err"]["kind"], "other");
+        assert_eq!(
+            foreign_origin["Err"]["message"],
+            "unknown credential-provider origin in Cargo request args: token-first"
+        );
+        assert!(!read_invoked.get());
+
+        let mut foreign_registry_message = token_read_message.clone();
+        foreign_registry_message
+            .as_object_mut()
+            .expect("request should be an object")
+            .insert(
+                "registry".to_owned(),
+                serde_json::json!({
+                    "index-url": "sparse+https://private.example/index/",
+                    "name": "private",
+                }),
+            );
+        let foreign_registry: CredentialRequest = serde_json::from_value(foreign_registry_message)
+            .expect("a foreign-registry read request should parse");
+        let foreign_registry = credential_response(
+            temporary.path(),
+            Ok(foreign_registry),
+            || {
+                read_invoked.set(true);
+                Some("new-crate-capability".to_owned())
+            },
+            || Ok(run.clone()),
+        );
+        assert_eq!(foreign_registry["Err"]["kind"], "other");
+        assert_eq!(
+            foreign_registry["Err"]["message"],
+            "Cargo credential request identity is invalid"
+        );
         assert!(!read_invoked.get());
 
         let mut token_publish_message = publish_message.clone();
@@ -7024,6 +7082,44 @@ mod tests {
             ),
         )
         .expect("authorization evidence should append");
+        let evidence_before_read =
+            fs::read(slot_evidence_path(temporary.path(), slot)).expect("evidence should read");
+        let mut fallback_read_wire =
+            serde_json::to_vec(&token_read_message).expect("fallback read request should encode");
+        fallback_read_wire.push(b'\n');
+        let mut fallback_read_output = Vec::new();
+        cargo_credential_provider_io(
+            temporary.path(),
+            Cursor::new(fallback_read_wire),
+            &mut fallback_read_output,
+            || {
+                read_invoked.set(true);
+                Some("new-crate-capability".to_owned())
+            },
+            || Ok(run.clone()),
+        )
+        .expect("fallback index-read transcript should complete");
+        let fallback_read_lines: Vec<serde_json::Value> = fallback_read_output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("provider output should be JSON"))
+            .collect();
+        assert_eq!(fallback_read_lines[0], serde_json::json!({ "v": [1] }));
+        assert_eq!(fallback_read_lines[1]["Ok"]["kind"], "get");
+        assert_eq!(fallback_read_lines[1]["Ok"]["cache"], "never");
+        assert_eq!(fallback_read_lines[1]["Ok"]["operation_independent"], false);
+        assert_eq!(
+            fallback_read_lines[1]["Ok"]["token"],
+            "new-crate-capability"
+        );
+        assert!(read_invoked.get());
+        let evidence_after_read =
+            fs::read(slot_evidence_path(temporary.path(), slot)).expect("evidence should read");
+        assert_eq!(
+            evidence_after_read, evidence_before_read,
+            "a registry read must not consume the one publication attempt"
+        );
+
         let authorized = credential_response(
             temporary.path(),
             Ok(token_publish.clone()),
@@ -7035,6 +7131,30 @@ mod tests {
         );
         assert_eq!(authorized["Ok"]["token"], "new-crate-capability");
         assert!(publish_invoked.get());
+        let evidence_after_publish =
+            load_slot_evidence(temporary.path(), slot).expect("publication evidence should read");
+        assert_eq!(
+            evidence_after_publish
+                .records
+                .iter()
+                .filter(|record| record.outcome == PublicationOutcome::TokenAttemptStarted)
+                .count(),
+            1,
+            "only the publish request should record the actual attempt"
+        );
+        assert!(!evidence_allows_new_token_attempt(&evidence_after_publish));
+        let duplicate_invoked = Cell::new(false);
+        let duplicate_publish = credential_response(
+            temporary.path(),
+            Ok(token_publish.clone()),
+            || {
+                duplicate_invoked.set(true);
+                Some("new-crate-capability".to_owned())
+            },
+            || Ok(run.clone()),
+        );
+        assert_eq!(duplicate_publish["Err"]["kind"], "other");
+        assert!(!duplicate_invoked.get());
 
         append_publication_record(
             temporary.path(),
