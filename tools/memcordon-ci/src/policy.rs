@@ -3269,7 +3269,6 @@ jobs:
         )?;
         let mut release = config::release(&root)?;
         release.registry_credentials.policy = config::RegistryCredentialPolicy::OidcOnly;
-        release.registry_credentials.fallback_version = None;
         release.registry_credentials.fallback_token_secret = None;
         let toolchains = config::toolchains(&root)?;
         check_release_structure(workflow, jobs, &release, &toolchains, AUTH_ACTION)
@@ -3311,7 +3310,6 @@ jobs:
         let text = serde_yaml::to_string(&document)?;
         let mut release = config::release(&root)?;
         release.registry_credentials.policy = config::RegistryCredentialPolicy::OidcOnly;
-        release.registry_credentials.fallback_version = None;
         release.registry_credentials.fallback_token_secret = None;
         Ok((text, release))
     }

@@ -36,20 +36,39 @@ fn workspace_publication_order_matches_the_dependency_graph() {
     assert!(config::publish_order(&metadata, &reversed_dependencies).is_err());
 }
 
+fn workspace_version() -> semver::Version {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .current_dir(&root)
+        .no_deps()
+        .other_options(vec!["--locked".to_owned(), "--offline".to_owned()])
+        .exec()
+        .expect("workspace metadata should be available");
+    metadata
+        .packages
+        .iter()
+        .find(|package| package.name == "memcordon")
+        .map(|package| package.version.clone())
+        .expect("the public CLI workspace package should be present")
+}
+
 fn canonical_release() -> Release {
     toml::from_str(include_str!("../../../ci/release.toml"))
         .expect("canonical release configuration should parse")
 }
 
 #[test]
-fn canonical_fallback_configuration_is_bounded_to_the_exact_release() {
+fn canonical_fallback_configuration_derives_the_release_bound_dynamically() {
     let release = canonical_release();
-    let development = semver::Version::parse("0.5.2-dev").unwrap();
+    let development = workspace_version();
     config::validate_registry_credentials(&release, &development)
-        .expect("the current development version should match fallback 0.5.2");
-    let stable = semver::Version::parse("0.5.2").unwrap();
-    config::validate_registry_credentials(&release, &stable)
-        .expect("the release commit should match fallback 0.5.2");
+        .expect("the current development state should validate without a release-version literal");
+    let mut actual_release = development.clone();
+    if actual_release.pre.as_str() == "dev" {
+        actual_release.pre = semver::Prerelease::EMPTY;
+    }
+    config::validate_registry_credentials(&release, &actual_release)
+        .expect("the actual release version should validate dynamically");
     assert_eq!(release.schema_version, 3);
     assert_eq!(
         release.registry_credentials.policy,
@@ -65,18 +84,7 @@ fn canonical_fallback_configuration_is_bounded_to_the_exact_release() {
         ]
     );
 
-    let mutations: [ReleaseMutation; 8] = [
-        ("missing fallback version", |release| {
-            release.registry_credentials.fallback_version = None;
-        }),
-        ("development fallback version", |release| {
-            release.registry_credentials.fallback_version =
-                Some(semver::Version::parse("0.5.2-dev").unwrap());
-        }),
-        ("build-metadata fallback version", |release| {
-            release.registry_credentials.fallback_version =
-                Some(semver::Version::parse("0.5.2+build").unwrap());
-        }),
+    let mutations: [ReleaseMutation; 4] = [
         ("missing fallback secret", |release| {
             release.registry_credentials.fallback_token_secret = None;
         }),
@@ -91,10 +99,6 @@ fn canonical_fallback_configuration_is_bounded_to_the_exact_release() {
             let last = release.publish_packages.last().cloned().unwrap();
             release.publish_packages.push(last);
         }),
-        ("wrong numeric workspace version", |release| {
-            release.registry_credentials.fallback_version =
-                Some(semver::Version::parse("0.5.3").unwrap());
-        }),
     ];
     for (case, mutate) in mutations {
         let mut invalid = release.clone();
@@ -108,14 +112,15 @@ fn canonical_fallback_configuration_is_bounded_to_the_exact_release() {
 
 #[test]
 fn registry_credential_profiles_parse_only_their_exact_fields() {
-    let fallback = "policy = \"oidc-first-new-crate-fallback\"\nfallback_version = \"0.5.2\"\nfallback_token_secret = \"MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK\"\n";
+    let fallback = "policy = \"oidc-first-new-crate-fallback\"\nfallback_token_secret = \"MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK\"\n";
     toml::from_str::<RegistryCredentials>(fallback)
         .expect("the exact fallback profile should parse");
     toml::from_str::<RegistryCredentials>("policy = \"oidc-only\"\n")
         .expect("the exact OIDC-only profile should parse");
     for invalid in [
         "policy = \"arbitrary-provider\"\n",
-        "policy = \"new-crate-token-bridge\"\nbridge_version = \"0.5.2\"\nbridge_package = \"memcordon-windows-launch-core\"\nstored_token_secret = \"MEMCORDON_WINDOWS_LAUNCH_FIRST_PUBLISH\"\n",
+        "policy = \"oidc-first-new-crate-fallback\"\nfallback_version = \"9.8.7\"\nfallback_token_secret = \"MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK\"\n",
+        "policy = \"new-crate-token-bridge\"\nbridge_version = \"9.8.7\"\nbridge_package = \"memcordon-windows-launch-core\"\nstored_token_secret = \"MEMCORDON_WINDOWS_LAUNCH_FIRST_PUBLISH\"\n",
     ] {
         assert!(
             toml::from_str::<RegistryCredentials>(invalid).is_err(),
@@ -125,23 +130,19 @@ fn registry_credential_profiles_parse_only_their_exact_fields() {
 }
 
 #[test]
-fn normal_prerelease_fallback_versions_are_bounded_but_acceptable() {
-    let mut release = canonical_release();
-    release.registry_credentials.fallback_version =
-        Some(semver::Version::parse("0.5.2-dev").unwrap());
-    let development = semver::Version::parse("0.5.2-dev").unwrap();
-    config::validate_registry_credentials(&release, &development)
-        .expect_err("the dev pre-release identifier remains forbidden in the fallback version");
-    release.registry_credentials.fallback_version =
-        Some(semver::Version::parse("0.5.2-rc.12").unwrap());
-    let candidate = semver::Version::parse("0.5.2-rc.12").unwrap();
-    release.registry_credentials.fallback_version = Some(candidate.clone());
+fn normal_prereleases_are_not_inherently_rejected() {
+    let release = canonical_release();
+    let candidate = semver::Version::parse("9.8.7-rc.1").unwrap();
     config::validate_registry_credentials(&release, &candidate)
-        .expect("a normal prerelease may bound one immutable recovery release");
-    let mismatched = semver::Version::parse("0.5.3").unwrap();
+        .expect("a normal prerelease is authorized by dynamic release identity alone");
+    let stable = semver::Version::new(9, 8, 7);
+    config::validate_registry_credentials(&release, &stable)
+        .expect("stable and prerelease identities have equal dynamic eligibility");
+    let mut build_metadata = workspace_version();
+    build_metadata.build = semver::BuildMetadata::new("build").unwrap();
     assert!(
-        config::validate_registry_credentials(&release, &mismatched).is_err(),
-        "a numerically different workspace version must fail before tagging"
+        config::validate_registry_credentials(&release, &build_metadata).is_err(),
+        "build metadata remains invalid for both development and release states"
     );
 }
 

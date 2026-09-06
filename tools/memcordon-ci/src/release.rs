@@ -367,6 +367,39 @@ fn validate_release_version(version: &Version) -> Result<()> {
     Ok(())
 }
 
+fn workspace_version(root: &Path) -> Result<Version> {
+    let metadata = metadata(root)?;
+    metadata
+        .packages
+        .iter()
+        .find(|package| package.name.as_str() == "memcordon")
+        .map(|package| package.version.clone())
+        .ok_or_else(|| failure("workspace version is unavailable"))
+}
+
+fn validate_dynamic_release_identity(
+    tag: &str,
+    manifest_version: &str,
+    workspace_version: &Version,
+) -> Result<Version> {
+    let tag_version = release_tag_version(tag)
+        .ok_or_else(|| failure(format!("release tag is not canonical SemVer: {tag}")))?;
+    let manifest_version = Version::parse(manifest_version)
+        .map_err(|error| failure(format!("release manifest version is invalid: {error}")))?;
+    validate_release_version(&tag_version)?;
+    if manifest_version != tag_version {
+        return Err(failure(format!(
+            "release tag/version mismatch: tag={tag_version}, manifest={manifest_version}"
+        )));
+    }
+    if *workspace_version != tag_version {
+        return Err(failure(format!(
+            "release tag/version mismatch: tag={tag_version}, workspace={workspace_version}"
+        )));
+    }
+    Ok(tag_version)
+}
+
 fn required_platform_value(name: &str) -> Result<String> {
     std::env::var(name).map_err(|_| {
         failure(format!(
@@ -501,7 +534,7 @@ fn parse_changelog(root: &Path, version: &Version) -> Result<(String, String)> {
     ))
 }
 
-fn validate_fallback_remote_tags(output: &[u8], fallback_version: &Version) -> Result<()> {
+fn validate_fallback_remote_tags(output: &[u8], release_version: &Version) -> Result<()> {
     let output = utf8(output, "remote release tag inventory")?;
     for reference in output
         .lines()
@@ -511,9 +544,9 @@ fn validate_fallback_remote_tags(output: &[u8], fallback_version: &Version) -> R
         let Some(version) = release_tag_version(reference) else {
             continue;
         };
-        if version > *fallback_version {
+        if version > *release_version {
             return Err(failure(format!(
-                "new-crate fallback policy survives a later release tag: fallback={fallback_version} observed={version}"
+                "new-crate fallback policy survives a later release tag: release={release_version} observed={version}"
             )));
         }
     }
@@ -575,7 +608,6 @@ pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
             "release tag is absent from origin or does not resolve to HEAD",
         ));
     }
-    validate_release_version(&version)?;
     let metadata = metadata(root)?;
     let workspace_version = metadata
         .packages
@@ -583,27 +615,14 @@ pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
         .find(|package| package.name.as_str() == "memcordon")
         .map(|package| package.version.clone())
         .ok_or_else(|| failure("workspace version is unavailable"))?;
-    if workspace_version != version {
-        return Err(failure(format!(
-            "release tag/version mismatch: tag={version}, workspace={workspace_version}"
-        )));
-    }
+    let version =
+        validate_dynamic_release_identity(&tag, &version.to_string(), &workspace_version)?;
     config::validate_registry_credentials(&release, &workspace_version)?;
     if let config::RegistryCredentialPolicy::OidcFirstNewCrateFallback =
         release.registry_credentials.policy
     {
-        let fallback_version = release
-            .registry_credentials
-            .fallback_version
-            .as_ref()
-            .ok_or_else(|| failure("new-crate fallback version is absent"))?;
-        if version != *fallback_version {
-            return Err(failure(format!(
-                "release tag differs from the bounded new-crate fallback: tag={version} fallback={fallback_version}"
-            )));
-        }
         let remote_tags = git_text(root, &["ls-remote", "--tags", "origin"])?;
-        validate_fallback_remote_tags(remote_tags.as_bytes(), fallback_version)?;
+        validate_fallback_remote_tags(remote_tags.as_bytes(), &version)?;
     }
     config::publish_order(&metadata, &release.publish_packages)?;
     let workflow_sha = required_platform_value("GITHUB_WORKFLOW_SHA")?;
@@ -4653,7 +4672,11 @@ fn select_publication_slot(
     }
 }
 
-fn require_fallback_profile(release: &config::Release, manifest: &ReleaseManifest) -> Result<()> {
+fn require_fallback_profile(
+    root: &Path,
+    release: &config::Release,
+    manifest: &ReleaseManifest,
+) -> Result<()> {
     if release.registry_credentials.policy
         != config::RegistryCredentialPolicy::OidcFirstNewCrateFallback
     {
@@ -4661,18 +4684,9 @@ fn require_fallback_profile(release: &config::Release, manifest: &ReleaseManifes
             "new-crate fallback is unavailable under the current credential policy",
         ));
     }
-    let fallback_version = release
-        .registry_credentials
-        .fallback_version
-        .as_ref()
-        .ok_or_else(|| failure("new-crate fallback version is absent"))?;
-    if manifest.tag != fallback_version.to_string()
-        || manifest.version != fallback_version.to_string()
-    {
-        return Err(failure(
-            "release manifest differs from the bounded new-crate fallback version",
-        ));
-    }
+    let workspace_version = workspace_version(root)?;
+    config::validate_registry_credentials(release, &workspace_version)?;
+    validate_dynamic_release_identity(&manifest.tag, &manifest.version, &workspace_version)?;
     Ok(())
 }
 
@@ -4853,7 +4867,7 @@ fn authorize_new_crate_fallback_at(
     github_output: Option<&Path>,
 ) -> Result<()> {
     let (release, manifest) = publication_context(root)?;
-    require_fallback_profile(&release, &manifest)?;
+    require_fallback_profile(root, &release, &manifest)?;
     let order = configured_publication_order(root, &release)?;
     let record = configured_slot_record(&manifest, &order, publication_slot)?;
     let (release_binding, run, crate_binding) = slot_publication_identity(&manifest, &record)?;
@@ -4940,7 +4954,7 @@ fn authorize_new_crate_fallback(root: &Path, publication_slot: NonZeroUsize) -> 
 
 fn publish_token_fallback(root: &Path, publication_slot: NonZeroUsize) -> Result<()> {
     let (release, manifest) = publication_context(root)?;
-    require_fallback_profile(&release, &manifest)?;
+    require_fallback_profile(root, &release, &manifest)?;
     let order = configured_publication_order(root, &release)?;
     let record = configured_slot_record(&manifest, &order, publication_slot)?;
     let (release_binding, run, crate_binding) = slot_publication_identity(&manifest, &record)?;
@@ -6505,15 +6519,74 @@ mod tests {
     }
 
     #[test]
-    fn fallback_policy_rejects_later_remote_tags_without_reusing_rc11() {
-        let fallback = Version::parse("0.5.2").expect("fallback version should parse");
-        let inventory = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\trefs/tags/0.5.2-rc.11\n\
-            0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\trefs/tags/0.5.2\n";
-        validate_fallback_remote_tags(inventory, &fallback)
-            .expect("the immutable earlier RC and exact fallback version are eligible");
+    fn dynamic_release_identity_accepts_only_one_agreeing_version() {
+        let stable = Version::new(9, 8, 7);
+        validate_dynamic_release_identity(
+            stable.to_string().as_str(),
+            stable.to_string().as_str(),
+            &stable,
+        )
+        .expect("a stable release is accepted when every identity agrees");
+
+        let prerelease = Version::parse("9.8.7-rc.1").unwrap();
+        validate_dynamic_release_identity(
+            prerelease.to_string().as_str(),
+            prerelease.to_string().as_str(),
+            &prerelease,
+        )
+        .expect("a normal prerelease is accepted when every identity agrees");
+
+        let different = Version::new(9, 8, 8);
+        assert!(
+            validate_dynamic_release_identity(
+                stable.to_string().as_str(),
+                different.to_string().as_str(),
+                &stable,
+            )
+            .is_err(),
+            "a manifest-only version change must not authorize publication"
+        );
+        assert!(
+            validate_dynamic_release_identity(
+                stable.to_string().as_str(),
+                stable.to_string().as_str(),
+                &different,
+            )
+            .is_err(),
+            "a workspace-only version change must not authorize publication"
+        );
+        let development = Version::parse("9.8.7-dev").unwrap();
+        assert!(
+            validate_dynamic_release_identity(
+                development.to_string().as_str(),
+                development.to_string().as_str(),
+                &development,
+            )
+            .is_err(),
+            "development versions remain ineligible as immutable releases"
+        );
+        assert!(
+            validate_dynamic_release_identity("not-semver", stable.to_string().as_str(), &stable)
+                .is_err(),
+            "a malformed tag must fail closed"
+        );
+        assert!(
+            validate_dynamic_release_identity(stable.to_string().as_str(), "not-semver", &stable,)
+                .is_err(),
+            "a malformed manifest version must fail closed"
+        );
+    }
+
+    #[test]
+    fn fallback_policy_rejects_tags_after_the_dynamic_release_bound() {
+        let release = Version::parse("9.8.7-rc.1").expect("release version should parse");
+        let inventory = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\trefs/tags/9.8.6\n\
+            0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\trefs/tags/9.8.7-rc.1\n";
+        validate_fallback_remote_tags(inventory, &release)
+            .expect("earlier tags and the exact dynamic release are eligible");
         let later =
-            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\trefs/tags/0.5.3\n";
-        assert!(validate_fallback_remote_tags(later, &fallback).is_err());
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\trefs/tags/9.8.8\n";
+        assert!(validate_fallback_remote_tags(later, &release).is_err());
     }
 
     #[test]
