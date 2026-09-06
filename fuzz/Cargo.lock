@@ -663,6 +663,7 @@ dependencies = [
  "libc",
  "memcordon-core",
  "memcordon-platform",
+ "memcordon-windows-launch-core",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -680,6 +681,7 @@ dependencies = [
  "libc",
  "memcordon-core",
  "memcordon-testkit",
+ "memcordon-windows-launch-core",
  "semver",
  "serde",
  "serde_json",
@@ -742,6 +744,19 @@ version = "0.5.2-dev"
 dependencies = [
  "libc",
  "memcordon-platform",
+]
+
+[[package]]
+name = "memcordon-windows-launch-core"
+version = "0.5.2-dev"
+dependencies = [
+ "hex",
+ "memcordon-core",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
