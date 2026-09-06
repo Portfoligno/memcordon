@@ -4399,33 +4399,20 @@ fn validate_credential_request<'a>(
     {
         return Err(failure("Cargo credential request identity is invalid"));
     }
-    let (_, manifest, _) = bundle_manifest(root)?;
-    let selected_name = manifest
-        .crates
-        .get(
-            expected
-                .publication_slot
-                .get()
-                .checked_sub(1)
-                .expect("nonzero slot has a preceding index"),
-        )
-        .map(|record| record.name.as_str())
-        .ok_or_else(|| {
-            failure(format!(
-                "publication slot {} is outside the selected release",
-                expected.publication_slot
-            ))
-        })?;
-    if selected_name != expected.name {
+    let (release, manifest, _) = bundle_manifest(root)?;
+    let order = configured_publication_order(root, &release)?;
+    let selected = configured_slot_record(&manifest, &order, expected.publication_slot)?;
+    if selected.name != expected.name {
         return Err(failure(
             "Cargo credential request differs from the selected publication slot",
         ));
     }
-    let record = manifest
-        .crates
-        .into_iter()
-        .find(|record| record.name == expected.name && record.version == expected.version)
-        .ok_or_else(|| failure("Cargo credential request is absent from the release manifest"))?;
+    if selected.version != expected.version {
+        return Err(failure(
+            "Cargo credential request is absent from the release manifest",
+        ));
+    }
+    let record = selected;
     if expected.archive_sha256 != record.archive_sha256.as_str() {
         return Err(failure(
             "Cargo credential request differs from the selected release artifact",
@@ -6315,6 +6302,7 @@ mod tests {
     fn release_fixture() -> (TempDir, config::Release) {
         let temporary = TempDir::new().expect("temporary repository should exist");
         let root = temporary.path();
+        write_canonical_publication_fixture(root);
         fs::create_dir_all(root.join("ci")).expect("CI directory should exist");
         fs::write(
             root.join("ci/release.toml"),
@@ -6357,6 +6345,66 @@ mod tests {
             .expect("manifest should write");
         fs::write(output.join(&release.assets.notes), "notes\n").expect("notes should write");
         (temporary, release)
+    }
+
+    fn write_canonical_publication_fixture(root: &Path) {
+        fn dependency_directory(dependency: &str) -> &str {
+            match dependency {
+                "memcordon-core" => "core",
+                "memcordon-platform" => "platform",
+                "memcordon-windows-launch-core" => "launch",
+                "memcordon" => "cli",
+                _ => panic!("unexpected fixture publication dependency"),
+            }
+        }
+
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"core\", \"platform\", \"launch\", \"cli\"]\nresolver = \"2\"\n",
+        )
+        .expect("fixture workspace should write");
+        let packages = [
+            ("core", "memcordon-core", Vec::new()),
+            (
+                "platform",
+                "memcordon-platform",
+                Vec::from(["memcordon-core"]),
+            ),
+            (
+                "launch",
+                "memcordon-windows-launch-core",
+                Vec::from(["memcordon-core", "memcordon-platform"]),
+            ),
+            (
+                "cli",
+                "memcordon",
+                Vec::from([
+                    "memcordon-core",
+                    "memcordon-platform",
+                    "memcordon-windows-launch-core",
+                ]),
+            ),
+        ];
+        for (directory, name, dependencies) in packages {
+            let package_root = root.join(directory);
+            fs::create_dir_all(package_root.join("src")).expect("fixture package should exist");
+            let mut manifest = format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.5.2\"\npublish = [\"crates-io\"]\n"
+            );
+            if !dependencies.is_empty() {
+                manifest.push_str("[dependencies]\n");
+                for dependency in dependencies {
+                    let dependency_directory = dependency_directory(dependency);
+                    manifest.push_str(&format!(
+                        "{dependency} = {{ path = \"../{dependency_directory}\", version = \"=0.5.2\" }}\n"
+                    ));
+                }
+            }
+            fs::write(package_root.join("Cargo.toml"), manifest)
+                .expect("fixture package manifest should write");
+            fs::write(package_root.join("src/lib.rs"), "")
+                .expect("fixture package source should write");
+        }
     }
 
     fn provenance_fixture() -> (TempDir, config::Release, ReleaseIdentity) {

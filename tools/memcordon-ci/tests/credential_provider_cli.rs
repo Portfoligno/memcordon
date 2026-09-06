@@ -2,16 +2,20 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
+use memcordon_ci::command::CommandSpec;
 use memcordon_ci::config;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+const PROVIDER_DEADLINE: Duration = Duration::from_secs(30);
+
 fn provider_fixture() -> (TempDir, config::Release, Value) {
     let temporary = TempDir::new().expect("provider fixture directory should exist");
     let root = temporary.path();
+    write_canonical_publication_fixture(root);
     fs::create_dir_all(root.join("ci")).expect("fixture CI directory should exist");
-    fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("workspace marker should write");
     fs::write(
         root.join("ci/release.toml"),
         include_str!("../../../ci/release.toml"),
@@ -61,13 +65,77 @@ fn provider_fixture() -> (TempDir, config::Release, Value) {
     (temporary, release, manifest)
 }
 
+fn write_canonical_publication_fixture(root: &Path) {
+    fn dependency_directory(dependency: &str) -> &str {
+        match dependency {
+            "memcordon-core" => "core",
+            "memcordon-platform" => "platform",
+            "memcordon-windows-launch-core" => "launch",
+            "memcordon" => "cli",
+            _ => panic!("unexpected fixture publication dependency"),
+        }
+    }
+
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"core\", \"platform\", \"launch\", \"cli\"]\nresolver = \"2\"\n",
+    )
+    .expect("fixture workspace should write");
+    let packages = [
+        ("core", "memcordon-core", Vec::new()),
+        (
+            "platform",
+            "memcordon-platform",
+            Vec::from(["memcordon-core"]),
+        ),
+        (
+            "launch",
+            "memcordon-windows-launch-core",
+            Vec::from(["memcordon-core", "memcordon-platform"]),
+        ),
+        (
+            "cli",
+            "memcordon",
+            Vec::from([
+                "memcordon-core",
+                "memcordon-platform",
+                "memcordon-windows-launch-core",
+            ]),
+        ),
+    ];
+    for (directory, name, dependencies) in packages {
+        let package_root = root.join(directory);
+        fs::create_dir_all(package_root.join("src")).expect("fixture package should exist");
+        let mut manifest = format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.5.2\"\npublish = [\"crates-io\"]\n"
+        );
+        if !dependencies.is_empty() {
+            manifest.push_str("[dependencies]\n");
+            for dependency in dependencies {
+                let dependency_directory = dependency_directory(dependency);
+                manifest.push_str(&format!(
+                    "{dependency} = {{ path = \"../{dependency_directory}\", version = \"=0.5.2\" }}\n"
+                ));
+            }
+        }
+        fs::write(package_root.join("Cargo.toml"), manifest)
+            .expect("fixture package manifest should write");
+        fs::write(package_root.join("src/lib.rs"), "")
+            .expect("fixture package source should write");
+    }
+}
+
 fn provider_exchange(root: &Path, request: &[u8]) -> (Value, Value, Output) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_memcordon-ci"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon-ci"));
+    command
         .arg("--cargo-plugin")
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    CommandSpec::new(env!("CARGO_BIN_EXE_memcordon-ci"), root, PROVIDER_DEADLINE)
+        .apply_environment(&mut command);
+    let mut child = command
         .spawn()
         .expect("Cargo credential provider should spawn");
     let mut stdin = child.stdin.take().expect("provider stdin should be piped");
