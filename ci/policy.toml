@@ -47,7 +47,18 @@ allowed_run_commands = [
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite release-macos",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- release assemble",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release stage-github",
-  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-next",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 1",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 1",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 1",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 2",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 2",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 2",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 3",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 3",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 3",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 4",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 4",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 4",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release verify-crates",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/verify-bootstrap --package memcordon-ci -- release verify-public",
@@ -75,49 +86,73 @@ steps = ["Stage GitHub draft and assets", "Finalize GitHub release"]
 file = ".github/workflows/release.yml"
 variable = "CARGO_HOME"
 source = "target/ci/cargo-publish-home/slot-1"
-steps = ["Publish next crate in slot 1"]
+steps = ["Attempt crates.io OIDC publication in slot 1", "Publish new crate with fallback credential in slot 1"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
 source = "${{ steps.crates_auth_1.outputs.token }}"
-steps = ["Publish next crate in slot 1"]
+steps = ["Attempt crates.io OIDC publication in slot 1"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+steps = ["Publish new crate with fallback credential in slot 1"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "CARGO_HOME"
 source = "target/ci/cargo-publish-home/slot-2"
-steps = ["Publish next crate in slot 2"]
+steps = ["Attempt crates.io OIDC publication in slot 2", "Publish new crate with fallback credential in slot 2"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
 source = "${{ steps.crates_auth_2.outputs.token }}"
-steps = ["Publish next crate in slot 2"]
+steps = ["Attempt crates.io OIDC publication in slot 2"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+steps = ["Publish new crate with fallback credential in slot 2"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "CARGO_HOME"
 source = "target/ci/cargo-publish-home/slot-3"
-steps = ["Publish next crate in slot 3"]
+steps = ["Attempt crates.io OIDC publication in slot 3", "Publish new crate with fallback credential in slot 3"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
 source = "${{ steps.crates_auth_3.outputs.token }}"
-steps = ["Publish next crate in slot 3"]
+steps = ["Attempt crates.io OIDC publication in slot 3"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+steps = ["Publish new crate with fallback credential in slot 3"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "CARGO_HOME"
 source = "target/ci/cargo-publish-home/slot-4"
-steps = ["Publish next crate in slot 4"]
+steps = ["Attempt crates.io OIDC publication in slot 4", "Publish new crate with fallback credential in slot 4"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
 source = "${{ steps.crates_auth_4.outputs.token }}"
-steps = ["Publish next crate in slot 4"]
+steps = ["Attempt crates.io OIDC publication in slot 4"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+steps = ["Publish new crate with fallback credential in slot 4"]
 
 [test]
 fast_short_child_iterations = 128

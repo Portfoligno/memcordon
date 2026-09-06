@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,10 +29,11 @@ use memcordon_ci::runtime_manifest::{RuntimeComponentRecord, RuntimeManifestV1, 
 use memcordon_ci::sealed_identity::frontend_identity;
 #[cfg(any(target_os = "linux", test))]
 use memcordon_ci::sealed_identity::{FrontendIdentity, setpriv_sudo_arguments};
+use memcordon_testkit::ObservedOutput;
 
 use crate::command::{CommandSpec, git, rustup_cargo};
 use crate::config::{self, AssetTarget, RuntimeComponentRole, SealedAssetPolicy};
-use crate::{CiError, ReleasePhase, Result};
+use crate::{CiError, ReleaseCommand, Result};
 
 const RELEASE_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const GITHUB_API_ROOT: &str = "https://api.github.com";
@@ -39,6 +41,25 @@ const GITHUB_UPLOADS_ROOT: &str = "https://uploads.github.com";
 const CRATES_IO_API_ROOT: &str = "https://crates.io";
 const GITHUB_RELEASES_PER_PAGE: usize = 100;
 const CRATES_IO_TOKEN_VARIABLE: &str = "CARGO_REGISTRIES_CRATES_IO_TOKEN";
+pub(crate) const TRUSTED_PUBLISHING_NEW_CRATE_MARKER: &str = "Trusted Publishing tokens do not support creating new crates. Publish the crate manually, first";
+const PUBLICATION_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+const MAXIMUM_CARGO_DIAGNOSTIC_BYTES: usize = 65536;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialOrigin {
+    Oidc,
+    NewCrateToken,
+}
+
+impl CredentialOrigin {
+    fn value(self) -> &'static str {
+        match self {
+            Self::Oidc => "oidc",
+            Self::NewCrateToken => "new-crate-token",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct CredentialRequest {
@@ -48,6 +69,15 @@ struct CredentialRequest {
     args: Vec<String>,
     #[serde(flatten)]
     action: CredentialAction,
+}
+
+#[derive(Clone, Copy)]
+struct ProviderBinding<'a> {
+    origin: CredentialOrigin,
+    publication_slot: NonZeroUsize,
+    name: &'a str,
+    version: &'a str,
+    archive_sha256: &'a str,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -352,7 +382,7 @@ fn workflow_event() -> Result<(String, WorkflowEvent)> {
     Ok((event_name, event))
 }
 
-fn validate_registry_auth_context(tag: &str) -> Result<()> {
+fn validate_release_event_context(tag: &str) -> Result<()> {
     let (event_name, event) = workflow_event()?;
     match event_name.as_str() {
         "push" => {
@@ -381,8 +411,9 @@ fn failure(message: impl Into<String>) -> CiError {
     CiError::Message(message.into())
 }
 
-fn utf8(bytes: Vec<u8>, context: &str) -> Result<String> {
-    String::from_utf8(bytes).map_err(|error| failure(format!("{context} is not UTF-8: {error}")))
+fn utf8(bytes: impl AsRef<[u8]>, context: &str) -> Result<String> {
+    String::from_utf8(bytes.as_ref().to_vec())
+        .map_err(|error| failure(format!("{context} is not UTF-8: {error}")))
 }
 
 fn git_text(root: &Path, arguments: &[&str]) -> Result<String> {
@@ -470,6 +501,25 @@ fn parse_changelog(root: &Path, version: &Version) -> Result<(String, String)> {
     ))
 }
 
+fn validate_fallback_remote_tags(output: &[u8], fallback_version: &Version) -> Result<()> {
+    let output = utf8(output, "remote release tag inventory")?;
+    for reference in output
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter_map(|reference| reference.strip_prefix("refs/tags/"))
+    {
+        let Some(version) = release_tag_version(reference) else {
+            continue;
+        };
+        if version > *fallback_version {
+            return Err(failure(format!(
+                "new-crate fallback policy survives a later release tag: fallback={fallback_version} observed={version}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
     let release = config::release(root)?;
     config::validate_release_configuration_identity(&release)?;
@@ -538,6 +588,23 @@ pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
             "release tag/version mismatch: tag={version}, workspace={workspace_version}"
         )));
     }
+    config::validate_registry_credentials(&release, &workspace_version)?;
+    if let config::RegistryCredentialPolicy::OidcFirstNewCrateFallback =
+        release.registry_credentials.policy
+    {
+        let fallback_version = release
+            .registry_credentials
+            .fallback_version
+            .as_ref()
+            .ok_or_else(|| failure("new-crate fallback version is absent"))?;
+        if version != *fallback_version {
+            return Err(failure(format!(
+                "release tag differs from the bounded new-crate fallback: tag={version} fallback={fallback_version}"
+            )));
+        }
+        let remote_tags = git_text(root, &["ls-remote", "--tags", "origin"])?;
+        validate_fallback_remote_tags(remote_tags.as_bytes(), fallback_version)?;
+    }
     config::publish_order(&metadata, &release.publish_packages)?;
     let workflow_sha = required_platform_value("GITHUB_WORKFLOW_SHA")?;
     if workflow_sha != commit {
@@ -558,7 +625,7 @@ pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
             "release workflow did not execute at the exact tag ref",
         ));
     }
-    validate_registry_auth_context(&tag)?;
+    validate_release_event_context(&tag)?;
     CommandSpec::new("git", root, Duration::from_secs(120))
         .args(["diff", "--quiet", "HEAD", "--", "Cargo.lock"])
         .run()
@@ -589,7 +656,10 @@ pub fn validate_packages(root: &Path) -> Result<()> {
             release.maximum_package_bytes,
             &default_cargo_binaries,
         )?;
-        if crate_checksum(&release, &record.name, &record.version)?.is_some() {
+        if matches!(
+            crate_version_state(&release, &record.name, &record.version)?,
+            CrateVersionLookup::Present(_)
+        ) {
             verify_public_crate(&release, &record)?;
         }
     }
@@ -2685,7 +2755,48 @@ fn bundle_manifest(root: &Path) -> Result<(config::Release, ReleaseManifest, Pat
     if manifest.schema_version != config::RELEASE_SCHEMA_VERSION {
         return Err(failure("release manifest schema identity is invalid"));
     }
+    validate_manifest_crates(&release, &manifest)?;
     Ok((release, manifest, output))
+}
+
+fn is_lowercase_hex_digest(value: &str) -> bool {
+    let digest_length = "00".repeat(32).len();
+    value.len() == digest_length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_manifest_crates(release: &config::Release, manifest: &ReleaseManifest) -> Result<()> {
+    let names: Vec<&str> = manifest
+        .crates
+        .iter()
+        .map(|record| record.name.as_str())
+        .collect();
+    let configured: Vec<&str> = release
+        .publish_packages
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if names != configured {
+        return Err(failure(
+            "release manifest crate inventory or order differs from configured publication order",
+        ));
+    }
+    for record in &manifest.crates {
+        if record.version != manifest.version
+            || record.vcs_commit != manifest.source_commit
+            || !is_lowercase_hex_digest(&record.archive_sha256)
+            || !is_lowercase_hex_digest(&record.canonical_tree_sha256)
+            || !is_lowercase_hex_digest(&record.canonical_identity_sha256)
+        {
+            return Err(failure(format!(
+                "release manifest crate identity is invalid: {}",
+                record.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn github_token() -> Result<String> {
@@ -3332,11 +3443,36 @@ fn stage_github_at(root: &Path, token: &str, endpoints: &HttpEndpoints) -> Resul
     Ok(())
 }
 
-fn crate_checksum(release: &config::Release, name: &str, version: &str) -> Result<Option<String>> {
-    crate_checksum_at(release, &HttpEndpoints::production(), name, version)
+#[derive(Debug, Deserialize)]
+struct CrateVersionResponse {
+    version: CrateVersionRecord,
 }
 
-#[cfg(test)]
+#[derive(Debug, Deserialize)]
+struct CrateVersionRecord {
+    #[serde(rename = "crate")]
+    crate_name: String,
+    num: String,
+    checksum: String,
+    yanked: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CrateRegistryState {
+    checksum: String,
+    yanked: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CrateVersionLookup {
+    Absent,
+    Present(CrateRegistryState),
+}
+
+fn crate_name_exists(release: &config::Release, name: &str) -> Result<bool> {
+    crate_name_exists_at(release, &HttpEndpoints::production(), name)
+}
+
 fn crate_name_exists_at(
     release: &config::Release,
     endpoints: &HttpEndpoints,
@@ -3372,12 +3508,12 @@ fn crate_name_exists_at(
     }
 }
 
-fn crate_checksum_at(
+fn crate_version_state_at(
     release: &config::Release,
     endpoints: &HttpEndpoints,
     name: &str,
     version: &str,
-) -> Result<Option<String>> {
+) -> Result<CrateVersionLookup> {
     let url = format!("{}/api/v1/crates/{name}/{version}", endpoints.crates_io);
     let result = retry_transient(&release.network_retry, || {
         ureq::get(&url)
@@ -3387,19 +3523,35 @@ fn crate_checksum_at(
     });
     match result {
         Ok(mut response) => {
-            let value: serde_json::Value = response
+            let value: CrateVersionResponse = response
                 .body_mut()
                 .read_json()
                 .map_err(|error| CiError::Http(Box::new(error)))?;
-            Ok(value
-                .get("version")
-                .and_then(|version| version.get("checksum"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned))
+            let record = value.version;
+            if record.crate_name != name || record.num != version {
+                return Err(failure(format!(
+                    "crates.io version response identity differs: expected={name} {version} observed={} {}",
+                    record.crate_name, record.num
+                )));
+            }
+            Ok(CrateVersionLookup::Present(CrateRegistryState {
+                checksum: record.checksum,
+                yanked: record.yanked,
+            }))
         }
-        Err(CiError::Http(error)) if matches!(*error, ureq::Error::StatusCode(404)) => Ok(None),
+        Err(CiError::Http(error)) if matches!(*error, ureq::Error::StatusCode(404)) => {
+            Ok(CrateVersionLookup::Absent)
+        }
         Err(error) => Err(error),
     }
+}
+
+fn crate_version_state(
+    release: &config::Release,
+    name: &str,
+    version: &str,
+) -> Result<CrateVersionLookup> {
+    crate_version_state_at(release, &HttpEndpoints::production(), name, version)
 }
 
 fn public_crate_archive(
@@ -3452,12 +3604,22 @@ fn verify_public_crate(
     release: &config::Release,
     record: &CrateRecord,
 ) -> Result<PublicCrateRecord> {
-    let checksum = crate_checksum(release, &record.name, &record.version)?.ok_or_else(|| {
-        failure(format!(
-            "crate is not public: {} {}",
+    let state = match crate_version_state(release, &record.name, &record.version)? {
+        CrateVersionLookup::Present(state) => state,
+        CrateVersionLookup::Absent => {
+            return Err(failure(format!(
+                "crate is not public: {} {}",
+                record.name, record.version
+            )));
+        }
+    };
+    if state.yanked {
+        return Err(failure(format!(
+            "crate version is yanked: {} {}",
             record.name, record.version
-        ))
-    })?;
+        )));
+    }
+    let checksum = state.checksum;
     let temporary = TempDir::new()?;
     let archive = temporary.path().join("package.crate");
     public_crate_archive(release, &record.name, &record.version, &archive)?;
@@ -3660,18 +3822,18 @@ fn wait_for_public_crate(
     let maximum = Duration::from_millis(wait.maximum_milliseconds);
     let total = Duration::from_secs(wait.total_seconds);
     loop {
-        match crate_checksum(release, &record.name, &record.version) {
-            Ok(None) if started.elapsed() < total => {
+        match crate_version_state(release, &record.name, &record.version) {
+            Ok(CrateVersionLookup::Absent) if started.elapsed() < total => {
                 thread::sleep(delay);
                 delay = delay.saturating_mul(2).min(maximum);
             }
-            Ok(None) => {
+            Ok(CrateVersionLookup::Absent) => {
                 return Err(failure(format!(
                     "crate visibility retry budget expired: {} {}",
                     record.name, record.version
                 )));
             }
-            Ok(Some(_)) => {
+            Ok(CrateVersionLookup::Present(_)) => {
                 let verified = verify_public_crate(release, record)?;
                 verify_crate_consumer(root, record)?;
                 return Ok(verified);
@@ -3685,8 +3847,8 @@ fn wait_for_public_crate(
     }
 }
 
-fn require_registry_token(token: Option<&str>) -> Result<()> {
-    if token.is_none_or(str::is_empty) {
+fn require_registry_token(token: Option<&OsStr>) -> Result<()> {
+    if token.is_none_or(OsStr::is_empty) {
         return Err(failure(format!(
             "{CRATES_IO_TOKEN_VARIABLE} is absent or empty for the selected publication slot"
         )));
@@ -3694,7 +3856,329 @@ fn require_registry_token(token: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cargo_publish_config(root: &Path, record: &CrateRecord) -> Result<PathBuf> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OidcFailureClass {
+    TrustedPublishingNewCrate,
+    Other,
+}
+
+fn classify_oidc_failure(stderr: &str) -> OidcFailureClass {
+    if stderr
+        .lines()
+        .any(|line| line.contains(TRUSTED_PUBLISHING_NEW_CRATE_MARKER))
+    {
+        OidcFailureClass::TrustedPublishingNewCrate
+    } else {
+        OidcFailureClass::Other
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CrateBinding {
+    name: String,
+    version: String,
+    archive_sha256: String,
+}
+
+impl CrateBinding {
+    fn from_record(record: &CrateRecord) -> Self {
+        Self {
+            name: record.name.clone(),
+            version: record.version.clone(),
+            archive_sha256: record.archive_sha256.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseBinding {
+    tag: String,
+    source_commit: String,
+    workflow_commit: String,
+}
+
+impl ReleaseBinding {
+    fn from_manifest(manifest: &ReleaseManifest) -> Self {
+        Self {
+            tag: manifest.tag.clone(),
+            source_commit: manifest.source_commit.clone(),
+            workflow_commit: manifest.workflow_commit.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationRunIdentity {
+    run_id: String,
+    run_attempt: String,
+}
+
+impl PublicationRunIdentity {
+    fn from_environment() -> Result<Self> {
+        Ok(Self {
+            run_id: required_platform_value("GITHUB_RUN_ID")?,
+            run_attempt: required_platform_value("GITHUB_RUN_ATTEMPT")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PublicationOutcome {
+    AlreadyPublic,
+    OidcPubliclyAccepted,
+    OidcRejectedNewCrate,
+    OidcRejectedOther,
+    NewCrateAuthorizationConflict,
+    NewCrateAuthorized,
+    TokenAttemptStarted,
+    TokenPubliclyAccepted,
+    TokenRejected,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PublicNameState {
+    NotChecked,
+    Absent,
+    Present,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CargoDiagnostics {
+    exit_code: Option<i32>,
+    status: String,
+    stdout: String,
+    stderr: String,
+    stdout_sha256: String,
+    stderr_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationAttemptRecord {
+    schema_version: u32,
+    credential_origin: CredentialOrigin,
+    outcome: PublicationOutcome,
+    public_name_state: PublicNameState,
+    cargo: Option<CargoDiagnostics>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationSlotEvidence {
+    schema_version: u32,
+    publication_slot: NonZeroUsize,
+    release: ReleaseBinding,
+    run: PublicationRunIdentity,
+    crate_binding: CrateBinding,
+    records: Vec<PublicationAttemptRecord>,
+}
+
+fn redact_exact(value: &str, credential: &str) -> String {
+    if credential.is_empty() {
+        return value.to_owned();
+    }
+    value
+        .split(credential)
+        .collect::<Vec<_>>()
+        .join("[redacted]")
+}
+
+fn sha256_text(value: &str) -> String {
+    sha256_bytes(value.as_bytes())
+}
+
+fn cargo_diagnostics(
+    output: Option<&ObservedOutput>,
+    process_error: Option<&str>,
+    credential: &str,
+) -> Result<CargoDiagnostics> {
+    let decode = |bytes: &[u8], context: &str| -> Result<String> {
+        if bytes.len() > MAXIMUM_CARGO_DIAGNOSTIC_BYTES {
+            return Err(failure(format!(
+                "{context} exceeds the credential-free diagnostic byte budget"
+            )));
+        }
+        utf8(bytes, context)
+    };
+    let observed = output.map(|observed| {
+        let stdout = redact_exact(&decode(&observed.stdout, "Cargo stdout")?, credential);
+        let stderr = redact_exact(&decode(&observed.stderr, "Cargo stderr")?, credential);
+        let stdout_sha256 = sha256_text(&stdout);
+        let stderr_sha256 = sha256_text(&stderr);
+        Ok(CargoDiagnostics {
+            exit_code: observed.status.code(),
+            status: observed.status.to_string(),
+            stdout,
+            stderr,
+            stdout_sha256,
+            stderr_sha256,
+        })
+    });
+    match (observed, process_error) {
+        (Some(diagnostics), _) => diagnostics,
+        (None, Some(error)) => Ok(CargoDiagnostics {
+            exit_code: None,
+            status: redact_exact(error, credential),
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_sha256: sha256_text(""),
+            stderr_sha256: sha256_text(""),
+        }),
+        (None, None) => Err(failure("Cargo diagnostics are unavailable")),
+    }
+}
+
+fn publication_record(
+    origin: CredentialOrigin,
+    outcome: PublicationOutcome,
+    public_name_state: PublicNameState,
+    cargo: Option<CargoDiagnostics>,
+) -> PublicationAttemptRecord {
+    PublicationAttemptRecord {
+        schema_version: PUBLICATION_EVIDENCE_SCHEMA_VERSION,
+        credential_origin: origin,
+        outcome,
+        public_name_state,
+        cargo,
+    }
+}
+
+fn publication_evidence_directory(root: &Path) -> PathBuf {
+    root.join("target").join("ci").join("publication-evidence")
+}
+
+fn slot_evidence_path(root: &Path, slot: NonZeroUsize) -> PathBuf {
+    publication_evidence_directory(root).join(format!("slot-{slot}.json"))
+}
+
+fn aggregate_evidence_path(root: &Path) -> PathBuf {
+    publication_evidence_directory(root).join("publication-evidence.json")
+}
+
+fn clear_slot_evidence(root: &Path, slot: NonZeroUsize) -> Result<()> {
+    match fs::remove_file(slot_evidence_path(root, slot)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn load_slot_evidence(root: &Path, slot: NonZeroUsize) -> Result<PublicationSlotEvidence> {
+    let path = slot_evidence_path(root, slot);
+    let bytes = fs::read(&path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| failure(format!("publication evidence is malformed: {error}")))
+}
+
+fn write_slot_evidence(root: &Path, evidence: &PublicationSlotEvidence) -> Result<()> {
+    let directory = publication_evidence_directory(root);
+    fs::create_dir_all(&directory)?;
+    write_json(
+        &slot_evidence_path(root, evidence.publication_slot),
+        evidence,
+    )
+}
+
+fn append_publication_record(
+    root: &Path,
+    release: &config::Release,
+    slot: NonZeroUsize,
+    record: PublicationAttemptRecord,
+) -> Result<()> {
+    let mut evidence = load_slot_evidence(root, slot)?;
+    evidence.records.push(record);
+    write_slot_evidence(root, &evidence)?;
+
+    let mut aggregate = Vec::new();
+    for candidate in 1..=release.publish_packages.len() {
+        let candidate = NonZeroUsize::new(candidate).expect("slot index is nonzero");
+        let candidate_path = slot_evidence_path(root, candidate);
+        if candidate_path.exists() {
+            aggregate.push(load_slot_evidence(root, candidate)?);
+        }
+    }
+    write_json(&aggregate_evidence_path(root), &aggregate)
+}
+
+fn establish_slot_evidence(
+    root: &Path,
+    slot: NonZeroUsize,
+    release_binding: &ReleaseBinding,
+    run: &PublicationRunIdentity,
+    crate_binding: &CrateBinding,
+) -> Result<()> {
+    write_slot_evidence(
+        root,
+        &PublicationSlotEvidence {
+            schema_version: PUBLICATION_EVIDENCE_SCHEMA_VERSION,
+            publication_slot: slot,
+            release: release_binding.clone(),
+            run: run.clone(),
+            crate_binding: crate_binding.clone(),
+            records: Vec::new(),
+        },
+    )
+}
+
+fn validate_slot_evidence_identity(
+    evidence: &PublicationSlotEvidence,
+    slot: NonZeroUsize,
+    release_binding: &ReleaseBinding,
+    run: &PublicationRunIdentity,
+    crate_binding: &CrateBinding,
+) -> Result<()> {
+    if evidence.schema_version != PUBLICATION_EVIDENCE_SCHEMA_VERSION
+        || evidence.publication_slot != slot
+        || evidence.release != *release_binding
+        || evidence.run != *run
+        || evidence.crate_binding != *crate_binding
+    {
+        return Err(failure(format!(
+            "publication evidence identity differs for slot {slot}"
+        )));
+    }
+    Ok(())
+}
+
+fn evidence_authorizes_token_provider(evidence: &PublicationSlotEvidence) -> bool {
+    let mut rejection = false;
+    for record in &evidence.records {
+        match record.outcome {
+            PublicationOutcome::OidcRejectedNewCrate => rejection = true,
+            PublicationOutcome::NewCrateAuthorized if rejection => {
+                return !evidence.records.iter().any(|record| {
+                    matches!(
+                        record.outcome,
+                        PublicationOutcome::TokenPubliclyAccepted
+                            | PublicationOutcome::TokenRejected
+                    ) && record.credential_origin == CredentialOrigin::NewCrateToken
+                });
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn evidence_allows_new_token_attempt(evidence: &PublicationSlotEvidence) -> bool {
+    !evidence
+        .records
+        .iter()
+        .any(|record| record.credential_origin == CredentialOrigin::NewCrateToken)
+}
+
+fn cargo_publish_config(
+    root: &Path,
+    record: &CrateRecord,
+    origin: CredentialOrigin,
+    publication_slot: NonZeroUsize,
+) -> Result<PathBuf> {
     let configuration_directory = root.join("target").join("ci").join("cargo-publish-config");
     fs::create_dir_all(&configuration_directory)?;
     let provider = std::env::current_exe()?
@@ -3705,14 +4189,15 @@ fn cargo_publish_config(root: &Path, record: &CrateRecord) -> Result<PathBuf> {
         registry: CargoRegistryConfig {
             credential_provider: vec![
                 provider,
+                origin.value().to_owned(),
+                publication_slot.to_string(),
                 record.name.clone(),
                 record.version.clone(),
                 record.archive_sha256.clone(),
             ],
         },
     };
-    let configuration_path =
-        configuration_directory.join(PathBuf::from(&record.name).with_extension("toml"));
+    let configuration_path = configuration_directory.join(format!("slot-{publication_slot}.toml"));
     fs::write(
         &configuration_path,
         toml::to_string(&configuration)
@@ -3750,7 +4235,12 @@ fn credential_operation_unsupported() -> serde_json::Value {
     })
 }
 
-fn validate_credential_request(root: &Path, request: &CredentialRequest) -> Result<CrateRecord> {
+fn validate_credential_request(
+    root: &Path,
+    request: &CredentialRequest,
+    expected: ProviderBinding<'_>,
+    run: Option<&PublicationRunIdentity>,
+) -> Result<CrateRecord> {
     if request.v != 1
         || request.registry.name.as_deref() != Some("crates-io")
         || !matches!(
@@ -3760,10 +4250,26 @@ fn validate_credential_request(root: &Path, request: &CredentialRequest) -> Resu
     {
         return Err(failure("Cargo credential request identity is invalid"));
     }
-    let [requested_name, requested_version, requested_archive_sha256] = request.args.as_slice()
+    let [
+        requested_origin,
+        requested_publication_slot,
+        requested_name,
+        requested_version,
+        requested_archive_sha256,
+    ] = request.args.as_slice()
     else {
         return Err(failure("Cargo credential request identity is invalid"));
     };
+    if requested_origin != expected.origin.value()
+        || requested_publication_slot != &expected.publication_slot.to_string()
+        || requested_name != expected.name
+        || requested_version != expected.version
+        || requested_archive_sha256 != expected.archive_sha256
+    {
+        return Err(failure(
+            "Cargo credential request differs from the provider argv identity",
+        ));
+    }
     let (_, manifest, _) = bundle_manifest(root)?;
     let record = manifest
         .crates
@@ -3780,7 +4286,13 @@ fn validate_credential_request(root: &Path, request: &CredentialRequest) -> Resu
     match &request.action {
         CredentialAction::Get {
             operation: CredentialOperation::Read,
-        } => {}
+        } => {
+            if expected.origin != CredentialOrigin::Oidc {
+                return Err(failure(
+                    "the new-crate fallback credential does not support registry reads",
+                ));
+            }
+        }
         CredentialAction::Get {
             operation: CredentialOperation::Publish { name, vers, cksum },
         } if name == &record.name && vers == &record.version && cksum == &record.archive_sha256 => {
@@ -3799,13 +4311,47 @@ fn validate_credential_request(root: &Path, request: &CredentialRequest) -> Resu
             return Err(failure("Cargo credential operation is unsupported"));
         }
     }
+    if expected.origin == CredentialOrigin::NewCrateToken {
+        let run = run.ok_or_else(|| {
+            failure("new-crate token authorization requires the GitHub run identity")
+        })?;
+        authorize_token_credential_request(root, &expected, &record, run)?;
+    }
     Ok(record)
+}
+
+fn authorize_token_credential_request(
+    root: &Path,
+    expected: &ProviderBinding<'_>,
+    record: &CrateRecord,
+    run: &PublicationRunIdentity,
+) -> Result<()> {
+    let (_, manifest, _) = bundle_manifest(root)?;
+    let release_binding = ReleaseBinding::from_manifest(&manifest);
+    let crate_binding = CrateBinding::from_record(record);
+    let evidence = load_slot_evidence(root, expected.publication_slot)?;
+    validate_slot_evidence_identity(
+        &evidence,
+        expected.publication_slot,
+        &release_binding,
+        run,
+        &crate_binding,
+    )?;
+    if !evidence_authorizes_token_provider(&evidence) {
+        return Err(failure(format!(
+            "new-crate token evidence lacks a fresh OIDC rejection and authorization for slot {}",
+            expected.publication_slot
+        )));
+    }
+    Ok(())
 }
 
 fn credential_response(
     root: &Path,
     request: serde_json::Result<CredentialRequest>,
-    token: Option<&str>,
+    acquire_token: impl FnOnce() -> Option<String>,
+    expected: ProviderBinding<'_>,
+    run: Option<&PublicationRunIdentity>,
 ) -> serde_json::Value {
     match request {
         Ok(request)
@@ -3818,8 +4364,8 @@ fn credential_response(
         {
             credential_operation_unsupported()
         }
-        Ok(request) => match validate_credential_request(root, &request) {
-            Ok(_) => match token {
+        Ok(request) => match validate_credential_request(root, &request, expected, run) {
+            Ok(_) => match acquire_token() {
                 Some(token) if !token.is_empty() => serde_json::json!({
                     "Ok": {
                         "kind": "get",
@@ -3828,7 +4374,7 @@ fn credential_response(
                         "operation_independent": false,
                     }
                 }),
-                _ => credential_request_error("trusted-publishing capability is absent"),
+                _ => credential_request_error("registry capability is absent"),
             },
             Err(error) => credential_request_error(error.to_string()),
         },
@@ -3840,7 +4386,9 @@ fn cargo_credential_provider_io(
     root: &Path,
     input: impl BufRead,
     mut output: impl Write,
-    token: Option<&str>,
+    acquire_token: impl FnOnce() -> Option<String>,
+    expected: ProviderBinding<'_>,
+    run: Option<&PublicationRunIdentity>,
 ) -> Result<()> {
     serde_json::to_writer(&mut output, &serde_json::json!({ "v": [1] }))?;
     writeln!(output)?;
@@ -3852,96 +4400,684 @@ fn cargo_credential_provider_io(
         return Err(failure("Cargo credential provider received no request"));
     }
     let request = serde_json::from_str::<CredentialRequest>(line.trim_end());
-    let response = credential_response(root, request, token);
+    let response = credential_response(root, request, acquire_token, expected, run);
     serde_json::to_writer(&mut output, &response)?;
     writeln!(output)?;
     output.flush()?;
     Ok(())
 }
 
-pub fn cargo_credential_provider(root: &Path) -> Result<()> {
-    let token = std::env::var(CRATES_IO_TOKEN_VARIABLE).ok();
+pub fn cargo_credential_provider(
+    root: &Path,
+    origin: CredentialOrigin,
+    publication_slot: NonZeroUsize,
+    name: &str,
+    version: &str,
+    archive_sha256: &str,
+) -> Result<()> {
+    let expected = ProviderBinding {
+        origin,
+        publication_slot,
+        name,
+        version,
+        archive_sha256,
+    };
+    let run = match origin {
+        CredentialOrigin::Oidc => None,
+        CredentialOrigin::NewCrateToken => Some(PublicationRunIdentity::from_environment()?),
+    };
     cargo_credential_provider_io(
         root,
         BufReader::new(std::io::stdin().lock()),
         std::io::stdout().lock(),
-        token.as_deref(),
+        || std::env::var(CRATES_IO_TOKEN_VARIABLE).ok(),
+        expected,
+        run.as_ref(),
     )
 }
 
-fn reconcile_publication_result(
-    publication: Result<Vec<u8>>,
-    publicly_visible: bool,
-) -> Result<()> {
-    match publication {
-        Ok(_) => Ok(()),
-        Err(_) if publicly_visible => Ok(()),
-        Err(error) => Err(error),
-    }
+#[derive(Debug)]
+struct RegistryPublicationScan {
+    public_names: Vec<String>,
+    first_absent: Option<String>,
 }
 
-fn publish_next(root: &Path) -> Result<()> {
-    let token = std::env::var(CRATES_IO_TOKEN_VARIABLE).ok();
-    require_registry_token(token.as_deref())?;
-    let (release, manifest, _) = bundle_manifest(root)?;
-    let metadata = metadata(root)?;
-    let order = config::publish_order(&metadata, &release.publish_packages)?;
-    let mut next_absent = None;
-    for package in &order {
+fn scan_registry_publication(
+    release: &config::Release,
+    endpoints: &HttpEndpoints,
+    manifest: &ReleaseManifest,
+    order: &[String],
+) -> Result<RegistryPublicationScan> {
+    let mut scan = RegistryPublicationScan {
+        public_names: Vec::new(),
+        first_absent: None,
+    };
+    for package in order {
         let record = manifest
             .crates
             .iter()
             .find(|record| record.name == *package)
             .ok_or_else(|| failure(format!("release manifest lacks crate {package}")))?;
-        if crate_checksum(&release, &record.name, &record.version)?.is_some() {
-            wait_for_public_crate(root, &release, record, &release.registry_wait)?;
-        } else if next_absent.is_none() {
-            next_absent = Some(package.as_str());
-        }
-    }
-    if let Some(package) = next_absent {
-        let record = manifest
-            .crates
-            .iter()
-            .find(|record| record.name == package)
-            .ok_or_else(|| failure(format!("release manifest lacks crate {package}")))?;
-        let toolchains = config::toolchains(root)?;
-        let cargo_config = cargo_publish_config(root, record)?;
-        let cargo_home = workflow_cargo_home()?;
-        let publication = rustup_cargo(
-            root,
-            &toolchains.stable,
-            [
-                OsStr::new("--config"),
-                cargo_config.as_os_str(),
-                OsStr::new("publish"),
-                OsStr::new("--locked"),
-                OsStr::new("--no-verify"),
-                OsStr::new("--registry"),
-                OsStr::new("crates-io"),
-                OsStr::new("--package"),
-                OsStr::new(package),
-            ],
-            RELEASE_DEADLINE,
-        )
-        .inherit_workflow_registry_credentials()
-        .run();
-        for credentials in ["credentials", "credentials.toml"] {
-            if cargo_home.join(credentials).exists() {
+        match crate_version_state_at(release, endpoints, &record.name, &record.version)? {
+            CrateVersionLookup::Absent => {
+                if scan.first_absent.is_none() {
+                    scan.first_absent = Some(package.clone());
+                }
+            }
+            CrateVersionLookup::Present(state) if state.yanked => {
                 return Err(failure(format!(
-                    "Cargo publication persisted forbidden {credentials}"
+                    "crate version is yanked and cannot be reconciled: {} {}",
+                    record.name, record.version
                 )));
             }
+            CrateVersionLookup::Present(_) => {
+                scan.public_names.push(package.clone());
+            }
         }
-        let publicly_visible = if publication.is_err() {
-            crate_checksum(&release, &record.name, &record.version)?.is_some()
-        } else {
-            false
-        };
-        reconcile_publication_result(publication, publicly_visible)?;
-        wait_for_public_crate(root, &release, record, &release.registry_wait)?;
+    }
+    Ok(scan)
+}
+
+fn manifest_record<'a>(manifest: &'a ReleaseManifest, package: &str) -> Result<&'a CrateRecord> {
+    manifest
+        .crates
+        .iter()
+        .find(|record| record.name == package)
+        .ok_or_else(|| failure(format!("release manifest lacks crate {package}")))
+}
+
+struct CargoPublicationAttempt {
+    observed: Option<ObservedOutput>,
+    process_error: Option<String>,
+}
+
+fn redacted_console_output(observed: &ObservedOutput, credential: &str) -> (String, String) {
+    (
+        redact_exact(&String::from_utf8_lossy(&observed.stdout), credential),
+        redact_exact(&String::from_utf8_lossy(&observed.stderr), credential),
+    )
+}
+
+fn relay_observed_output(observed: &ObservedOutput, credential: &str) {
+    let (stdout, stderr) = redacted_console_output(observed, credential);
+    if !stdout.is_empty() {
+        print!("{stdout}");
+    }
+    if !stderr.is_empty() {
+        eprint!("{stderr}");
+    }
+}
+
+fn run_cargo_publication(
+    root: &Path,
+    record: &CrateRecord,
+    origin: CredentialOrigin,
+    publication_slot: NonZeroUsize,
+    credential: &str,
+) -> Result<CargoPublicationAttempt> {
+    let token = std::env::var_os(CRATES_IO_TOKEN_VARIABLE);
+    require_registry_token(token.as_deref())?;
+    let toolchains = config::toolchains(root)?;
+    let cargo_config = cargo_publish_config(root, record, origin, publication_slot)?;
+    let cargo_home = workflow_cargo_home()?;
+    let publication = rustup_cargo(
+        root,
+        &toolchains.stable,
+        [
+            OsStr::new("--config"),
+            cargo_config.as_os_str(),
+            OsStr::new("publish"),
+            OsStr::new("--locked"),
+            OsStr::new("--no-verify"),
+            OsStr::new("--registry"),
+            OsStr::new("crates-io"),
+            OsStr::new("--package"),
+            OsStr::new(&record.name),
+        ],
+        RELEASE_DEADLINE,
+    )
+    .inherit_crates_io_registry_token()
+    .output();
+    for credentials in ["credentials", "credentials.toml"] {
+        if cargo_home.join(credentials).exists() {
+            return Err(failure(format!(
+                "Cargo publication persisted forbidden {credentials}"
+            )));
+        }
+    }
+    match publication {
+        Ok(observed) => {
+            relay_observed_output(&observed, credential);
+            Ok(CargoPublicationAttempt {
+                observed: Some(observed),
+                process_error: None,
+            })
+        }
+        Err(error) => Ok(CargoPublicationAttempt {
+            observed: None,
+            process_error: Some(error.to_string()),
+        }),
+    }
+}
+
+fn publication_failure(attempt: &CargoPublicationAttempt, credential: &str) -> CiError {
+    match (&attempt.observed, attempt.process_error.as_deref()) {
+        (Some(observed), _) => {
+            let stdout = String::from_utf8_lossy(&observed.stdout);
+            let stderr = String::from_utf8_lossy(&observed.stderr);
+            failure(format!(
+                "cargo publish failed with {}; stdout={:?}; stderr={:?}",
+                observed.status,
+                redact_exact(&stdout, credential),
+                redact_exact(&stderr, credential),
+            ))
+        }
+        (None, Some(error)) => failure(redact_exact(error, credential)),
+        (None, None) => failure("cargo publication attempt is unavailable"),
+    }
+}
+
+fn attempt_stderr(attempt: &CargoPublicationAttempt) -> String {
+    attempt
+        .observed
+        .as_ref()
+        .map(|observed| String::from_utf8_lossy(&observed.stderr).into_owned())
+        .or_else(|| attempt.process_error.as_deref().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn publication_context(root: &Path) -> Result<(config::Release, ReleaseManifest)> {
+    let (release, manifest, _) = bundle_manifest(root)?;
+    validate_release_event_context(&manifest.tag)?;
+    Ok((release, manifest))
+}
+
+fn configured_publication_order(root: &Path, release: &config::Release) -> Result<Vec<String>> {
+    let metadata = metadata(root)?;
+    config::publish_order(&metadata, &release.publish_packages)
+}
+
+fn configured_slot_record(
+    manifest: &ReleaseManifest,
+    order: &[String],
+    slot: NonZeroUsize,
+) -> Result<CrateRecord> {
+    let index = slot
+        .get()
+        .checked_sub(1)
+        .filter(|index| *index < order.len())
+        .ok_or_else(|| {
+            failure(format!(
+                "publication slot {slot} is outside the configured set"
+            ))
+        })?;
+    Ok(manifest_record(manifest, &order[index])?.clone())
+}
+
+fn resolve_first_absent_slot(
+    order: &[String],
+    first_absent: Option<&str>,
+    requested_slot: NonZeroUsize,
+) -> Result<Option<usize>> {
+    let Some(package) = first_absent else {
+        return Ok(None);
+    };
+    let position = order
+        .iter()
+        .position(|name| name == package)
+        .ok_or_else(|| failure(format!("release manifest lacks crate {package}")))?;
+    let registry_slot = position + 1;
+    if requested_slot.get() != registry_slot {
+        return Err(failure(format!(
+            "publication slot {requested_slot} does not select the first absent crate {package}; the registry selected slot {registry_slot}"
+        )));
+    }
+    Ok(Some(position))
+}
+
+fn select_publication_slot(
+    root: &Path,
+    release: &config::Release,
+    manifest: &ReleaseManifest,
+    order: &[String],
+    requested_slot: NonZeroUsize,
+) -> Result<Option<CrateRecord>> {
+    let scan = scan_registry_publication(release, &HttpEndpoints::production(), manifest, order)?;
+    for package in &scan.public_names {
+        let record = manifest_record(manifest, package)?;
+        wait_for_public_crate(root, release, record, &release.registry_wait)?;
+    }
+    match resolve_first_absent_slot(order, scan.first_absent.as_deref(), requested_slot)? {
+        None => Ok(None),
+        Some(position) => Ok(Some(manifest_record(manifest, &order[position])?.clone())),
+    }
+}
+
+fn require_fallback_profile(release: &config::Release, manifest: &ReleaseManifest) -> Result<()> {
+    if release.registry_credentials.policy
+        != config::RegistryCredentialPolicy::OidcFirstNewCrateFallback
+    {
+        return Err(failure(
+            "new-crate fallback is unavailable under the current credential policy",
+        ));
+    }
+    let fallback_version = release
+        .registry_credentials
+        .fallback_version
+        .as_ref()
+        .ok_or_else(|| failure("new-crate fallback version is absent"))?;
+    if manifest.tag != fallback_version.to_string()
+        || manifest.version != fallback_version.to_string()
+    {
+        return Err(failure(
+            "release manifest differs from the bounded new-crate fallback version",
+        ));
     }
     Ok(())
+}
+
+fn slot_publication_identity(
+    manifest: &ReleaseManifest,
+    record: &CrateRecord,
+) -> Result<(ReleaseBinding, PublicationRunIdentity, CrateBinding)> {
+    Ok((
+        ReleaseBinding::from_manifest(manifest),
+        PublicationRunIdentity::from_environment()?,
+        CrateBinding::from_record(record),
+    ))
+}
+
+fn append_slot_record(
+    root: &Path,
+    release: &config::Release,
+    slot: NonZeroUsize,
+    record: PublicationAttemptRecord,
+) -> Result<()> {
+    append_publication_record(root, release, slot, record)
+}
+
+fn attempt_oidc_publication_at(root: &Path, publication_slot: NonZeroUsize) -> Result<()> {
+    clear_slot_evidence(root, publication_slot)?;
+    let (release, manifest) = publication_context(root)?;
+    let order = configured_publication_order(root, &release)?;
+    let record = configured_slot_record(&manifest, &order, publication_slot)?;
+    let (release_binding, run, crate_binding) = slot_publication_identity(&manifest, &record)?;
+    establish_slot_evidence(
+        root,
+        publication_slot,
+        &release_binding,
+        &run,
+        &crate_binding,
+    )?;
+    let selected = select_publication_slot(root, &release, &manifest, &order, publication_slot)?;
+    let Some(record) = selected else {
+        append_slot_record(
+            root,
+            &release,
+            publication_slot,
+            publication_record(
+                CredentialOrigin::Oidc,
+                PublicationOutcome::AlreadyPublic,
+                PublicNameState::NotChecked,
+                None,
+            ),
+        )?;
+        return Ok(());
+    };
+
+    let token = std::env::var_os(CRATES_IO_TOKEN_VARIABLE);
+    require_registry_token(token.as_deref())?;
+    let credential = token
+        .clone()
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| failure("registry capability is not valid Unicode"))?;
+    let attempt = run_cargo_publication(
+        root,
+        &record,
+        CredentialOrigin::Oidc,
+        publication_slot,
+        &credential,
+    )?;
+    let diagnostics = cargo_diagnostics(
+        attempt.observed.as_ref(),
+        attempt.process_error.as_deref(),
+        &credential,
+    )?;
+
+    if attempt
+        .observed
+        .as_ref()
+        .is_some_and(|observed| observed.status.success())
+    {
+        wait_for_public_crate(root, &release, &record, &release.registry_wait)?;
+        append_slot_record(
+            root,
+            &release,
+            publication_slot,
+            publication_record(
+                CredentialOrigin::Oidc,
+                PublicationOutcome::OidcPubliclyAccepted,
+                PublicNameState::NotChecked,
+                Some(diagnostics),
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let state = crate_version_state(&release, &record.name, &record.version)?;
+    match &state {
+        CrateVersionLookup::Present(state)
+            if !state.yanked && state.checksum == record.archive_sha256 =>
+        {
+            wait_for_public_crate(root, &release, &record, &release.registry_wait)?;
+            append_slot_record(
+                root,
+                &release,
+                publication_slot,
+                publication_record(
+                    CredentialOrigin::Oidc,
+                    PublicationOutcome::OidcPubliclyAccepted,
+                    PublicNameState::NotChecked,
+                    Some(diagnostics),
+                ),
+            )?;
+            return Ok(());
+        }
+        CrateVersionLookup::Present(state) => {
+            append_slot_record(
+                root,
+                &release,
+                publication_slot,
+                publication_record(
+                    CredentialOrigin::Oidc,
+                    PublicationOutcome::OidcRejectedOther,
+                    PublicNameState::NotChecked,
+                    Some(diagnostics),
+                ),
+            )?;
+            return Err(failure(format!(
+                "public registry state conflicts with the failed OIDC publication: {} {} yanked={} checksum={}",
+                record.name, record.version, state.yanked, state.checksum
+            )));
+        }
+        CrateVersionLookup::Absent => {}
+    }
+
+    match classify_oidc_failure(&attempt_stderr(&attempt)) {
+        OidcFailureClass::Other => {
+            append_slot_record(
+                root,
+                &release,
+                publication_slot,
+                publication_record(
+                    CredentialOrigin::Oidc,
+                    PublicationOutcome::OidcRejectedOther,
+                    PublicNameState::NotChecked,
+                    Some(diagnostics),
+                ),
+            )?;
+            Err(publication_failure(&attempt, &credential))
+        }
+        OidcFailureClass::TrustedPublishingNewCrate => {
+            let name_present = crate_name_exists(&release, &record.name)?;
+            let (outcome, public_name_state) = if name_present {
+                (
+                    PublicationOutcome::NewCrateAuthorizationConflict,
+                    PublicNameState::Present,
+                )
+            } else {
+                (
+                    PublicationOutcome::OidcRejectedNewCrate,
+                    PublicNameState::Absent,
+                )
+            };
+            append_slot_record(
+                root,
+                &release,
+                publication_slot,
+                publication_record(
+                    CredentialOrigin::Oidc,
+                    outcome,
+                    public_name_state,
+                    Some(diagnostics),
+                ),
+            )?;
+            Err(publication_failure(&attempt, &credential))
+        }
+    }
+}
+
+fn authorize_new_crate_fallback_at(
+    root: &Path,
+    publication_slot: NonZeroUsize,
+    github_output: Option<&Path>,
+) -> Result<()> {
+    let (release, manifest) = publication_context(root)?;
+    require_fallback_profile(&release, &manifest)?;
+    let order = configured_publication_order(root, &release)?;
+    let record = configured_slot_record(&manifest, &order, publication_slot)?;
+    let (release_binding, run, crate_binding) = slot_publication_identity(&manifest, &record)?;
+    let evidence = load_slot_evidence(root, publication_slot)?;
+    validate_slot_evidence_identity(
+        &evidence,
+        publication_slot,
+        &release_binding,
+        &run,
+        &crate_binding,
+    )?;
+    if !evidence.records.iter().any(|record| {
+        record.outcome == PublicationOutcome::OidcRejectedNewCrate
+            && record.public_name_state == PublicNameState::Absent
+    }) {
+        return Err(failure(format!(
+            "publication slot {publication_slot} lacks a new-crate-eligible OIDC rejection"
+        )));
+    }
+
+    let conflict = |public_name_state| {
+        publication_record(
+            CredentialOrigin::Oidc,
+            PublicationOutcome::NewCrateAuthorizationConflict,
+            public_name_state,
+            None,
+        )
+    };
+    if crate_name_exists(&release, &record.name)? {
+        append_slot_record(
+            root,
+            &release,
+            publication_slot,
+            conflict(PublicNameState::Present),
+        )?;
+        return Err(failure(format!(
+            "crate name already exists, so slot {publication_slot} is not eligible for new-crate fallback: {}",
+            record.name
+        )));
+    }
+    if !matches!(
+        crate_version_state(&release, &record.name, &record.version)?,
+        CrateVersionLookup::Absent
+    ) {
+        append_slot_record(
+            root,
+            &release,
+            publication_slot,
+            conflict(PublicNameState::Absent),
+        )?;
+        return Err(failure(format!(
+            "exact crate version appeared before fallback authorization: {} {}",
+            record.name, record.version
+        )));
+    }
+
+    append_slot_record(
+        root,
+        &release,
+        publication_slot,
+        publication_record(
+            CredentialOrigin::Oidc,
+            PublicationOutcome::NewCrateAuthorized,
+            PublicNameState::Absent,
+            None,
+        ),
+    )?;
+    if let Some(output) = github_output {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(output)?;
+        writeln!(file, "authorized=true")?;
+    }
+    Ok(())
+}
+
+fn authorize_new_crate_fallback(root: &Path, publication_slot: NonZeroUsize) -> Result<()> {
+    let output = std::env::var_os("GITHUB_OUTPUT")
+        .map(PathBuf::from)
+        .ok_or_else(|| failure("GITHUB_OUTPUT is absent for fallback authorization"))?;
+    authorize_new_crate_fallback_at(root, publication_slot, Some(&output))
+}
+
+fn publish_token_fallback(root: &Path, publication_slot: NonZeroUsize) -> Result<()> {
+    let (release, manifest) = publication_context(root)?;
+    require_fallback_profile(&release, &manifest)?;
+    let order = configured_publication_order(root, &release)?;
+    let record = configured_slot_record(&manifest, &order, publication_slot)?;
+    let (release_binding, run, crate_binding) = slot_publication_identity(&manifest, &record)?;
+    let evidence = load_slot_evidence(root, publication_slot)?;
+    validate_slot_evidence_identity(
+        &evidence,
+        publication_slot,
+        &release_binding,
+        &run,
+        &crate_binding,
+    )?;
+    if !evidence_authorizes_token_provider(&evidence) {
+        return Err(failure(format!(
+            "publication slot {publication_slot} lacks fresh new-crate fallback authorization"
+        )));
+    }
+    if !evidence_allows_new_token_attempt(&evidence) {
+        return Err(failure(format!(
+            "publication slot {publication_slot} already used its one new-crate token attempt"
+        )));
+    }
+
+    let selected = select_publication_slot(root, &release, &manifest, &order, publication_slot)?;
+    if selected.is_none() {
+        append_slot_record(
+            root,
+            &release,
+            publication_slot,
+            publication_record(
+                CredentialOrigin::NewCrateToken,
+                PublicationOutcome::AlreadyPublic,
+                PublicNameState::Absent,
+                None,
+            ),
+        )?;
+        return Ok(());
+    }
+    if crate_name_exists(&release, &record.name)? {
+        append_slot_record(
+            root,
+            &release,
+            publication_slot,
+            publication_record(
+                CredentialOrigin::NewCrateToken,
+                PublicationOutcome::NewCrateAuthorizationConflict,
+                PublicNameState::Present,
+                None,
+            ),
+        )?;
+        return Err(failure(format!(
+            "crate name exists, so slot {publication_slot} can no longer create crate {}",
+            record.name
+        )));
+    }
+
+    append_slot_record(
+        root,
+        &release,
+        publication_slot,
+        publication_record(
+            CredentialOrigin::NewCrateToken,
+            PublicationOutcome::TokenAttemptStarted,
+            PublicNameState::Absent,
+            None,
+        ),
+    )?;
+    let token = std::env::var_os(CRATES_IO_TOKEN_VARIABLE);
+    require_registry_token(token.as_deref())?;
+    let credential = token
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| failure("registry capability is not valid Unicode"))?;
+    let attempt = run_cargo_publication(
+        root,
+        &record,
+        CredentialOrigin::NewCrateToken,
+        publication_slot,
+        &credential,
+    )?;
+    let diagnostics = cargo_diagnostics(
+        attempt.observed.as_ref(),
+        attempt.process_error.as_deref(),
+        &credential,
+    );
+    let diagnostics = match diagnostics {
+        Ok(diagnostics) => Some(diagnostics),
+        Err(error) => {
+            append_slot_record(
+                root,
+                &release,
+                publication_slot,
+                publication_record(
+                    CredentialOrigin::NewCrateToken,
+                    PublicationOutcome::TokenRejected,
+                    PublicNameState::Absent,
+                    None,
+                ),
+            )?;
+            return Err(error);
+        }
+    };
+
+    let accepted = attempt
+        .observed
+        .as_ref()
+        .is_some_and(|observed| observed.status.success())
+        || matches!(
+            crate_version_state(&release, &record.name, &record.version)?,
+            CrateVersionLookup::Present(state)
+                if !state.yanked && state.checksum == record.archive_sha256
+        );
+    if accepted {
+        wait_for_public_crate(root, &release, &record, &release.registry_wait)?;
+        append_slot_record(
+            root,
+            &release,
+            publication_slot,
+            publication_record(
+                CredentialOrigin::NewCrateToken,
+                PublicationOutcome::TokenPubliclyAccepted,
+                PublicNameState::Absent,
+                diagnostics,
+            ),
+        )?;
+        return Ok(());
+    }
+    append_slot_record(
+        root,
+        &release,
+        publication_slot,
+        publication_record(
+            CredentialOrigin::NewCrateToken,
+            PublicationOutcome::TokenRejected,
+            PublicNameState::Absent,
+            diagnostics,
+        ),
+    )?;
+    Err(publication_failure(&attempt, &credential))
 }
 
 fn verify_crates(root: &Path) -> Result<Vec<PublicCrateRecord>> {
@@ -4270,14 +5406,22 @@ fn verify_public(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run(root: &Path, phase: ReleasePhase) -> Result<()> {
-    match phase {
-        ReleasePhase::Assemble => assemble(root),
-        ReleasePhase::StageGithub => stage_github(root),
-        ReleasePhase::PublishNext => publish_next(root),
-        ReleasePhase::VerifyCrates => verify_crates(root).map(|_| ()),
-        ReleasePhase::FinalizeGithub => finalize_github(root),
-        ReleasePhase::VerifyPublic => verify_public(root),
+pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
+    match command {
+        ReleaseCommand::Assemble => assemble(root),
+        ReleaseCommand::StageGithub => stage_github(root),
+        ReleaseCommand::AttemptOidc { publication_slot } => {
+            attempt_oidc_publication_at(root, publication_slot)
+        }
+        ReleaseCommand::AuthorizeNewCrateFallback { publication_slot } => {
+            authorize_new_crate_fallback(root, publication_slot)
+        }
+        ReleaseCommand::PublishTokenFallback { publication_slot } => {
+            publish_token_fallback(root, publication_slot)
+        }
+        ReleaseCommand::VerifyCrates => verify_crates(root).map(|_| ()),
+        ReleaseCommand::FinalizeGithub => finalize_github(root),
+        ReleaseCommand::VerifyPublic => verify_public(root),
     }
 }
 
@@ -5074,7 +6218,18 @@ mod tests {
             prerelease: false,
             rust_toolchain: "1.85.0".to_owned(),
             assets: Vec::new(),
-            crates: Vec::new(),
+            crates: release
+                .publish_packages
+                .iter()
+                .map(|name| CrateRecord {
+                    name: name.clone(),
+                    version: "1.2.3".to_owned(),
+                    archive_sha256: "ab".repeat(32),
+                    canonical_tree_sha256: "cd".repeat(32),
+                    canonical_identity_sha256: "ef".repeat(32),
+                    vcs_commit: "0123456789abcdef".to_owned(),
+                })
+                .collect(),
             certification: BTreeMap::new(),
             source_date: "2025-01-01T00:00:00Z".to_owned(),
         };
@@ -5115,54 +6270,282 @@ mod tests {
     }
 
     #[test]
-    fn workflow_event_deserialization_rejects_retired_dispatch_inputs() {
-        let steady: WorkflowEvent =
+    fn release_event_payloads_stay_credential_neutral_and_closed() {
+        let dispatch: WorkflowEvent =
             serde_json::from_str(r#"{"inputs":{"tag":"0.2.0"},"repository":{"private":false}}"#)
                 .expect("steady-state dispatch payload should parse");
-        assert_eq!(steady.inputs.expect("dispatch inputs").tag, "0.2.0");
-        assert!(
-            serde_json::from_str::<WorkflowEvent>(
-                r#"{"inputs":{"tag":"0.1.0","registry_auth":"unknown"}}"#
-            )
-            .is_err()
+        assert_eq!(
+            dispatch.inputs.as_ref().expect("dispatch inputs").tag,
+            "0.2.0"
         );
-        assert!(
-            serde_json::from_str::<WorkflowEvent>(
-                r#"{"inputs":{"tag":"0.1.0","registry_auth":"stored-token","extra":"forbidden"}}"#
-            )
-            .is_err()
-        );
+        for payload in [
+            r#"{"inputs":{"tag":"0.1.0","registry_auth":"stored-token"}}"#,
+            r#"{"inputs":{"tag":"0.1.0","registry_auth":"oidc-fallback"}}"#,
+            r#"{"inputs":{"tag":"0.1.0","registry_auth":"unknown"}}"#,
+            r#"{"inputs":{"tag":"0.1.0","extra":"forbidden"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<WorkflowEvent>(payload).is_err(),
+                "credential-choice payloads must no longer parse: {payload}"
+            );
+        }
     }
 
     #[test]
     fn publication_slot_requires_a_nonempty_source_agnostic_token() {
         assert!(require_registry_token(None).is_err());
-        assert!(require_registry_token(Some("")).is_err());
-        require_registry_token(Some("opaque-test-capability"))
+        assert!(require_registry_token(Some(OsStr::new(""))).is_err());
+        require_registry_token(Some(OsStr::new("opaque-test-capability")))
             .expect("any nonempty credential source is accepted");
     }
 
     #[test]
-    fn credential_provider_accepts_bound_read_and_publish_requests() {
+    fn only_the_exact_trusted_publishing_new_crate_rejection_is_recoverable() {
+        let exact = format!(
+            "error: failed to publish to registry\n\ncaused by:\n  the remote server responded with an error (status 403 Forbidden): {TRUSTED_PUBLISHING_NEW_CRATE_MARKER}\n"
+        );
+        assert_eq!(
+            classify_oidc_failure(&exact),
+            OidcFailureClass::TrustedPublishingNewCrate
+        );
+        for near_miss in [
+            "",
+            "error: failed to publish to registry",
+            "the remote server responded with an error (status 403 Forbidden)",
+            "Trusted Publishing tokens do not support creating new crates",
+            "trusted publishing tokens do not support creating new crates. publish the crate manually, first",
+            "error: unauthorized (status 401 Unauthorized)",
+        ] {
+            assert_eq!(
+                classify_oidc_failure(near_miss),
+                OidcFailureClass::Other,
+                "near-miss diagnostics must fail closed: {near_miss}"
+            );
+        }
+    }
+
+    #[test]
+    fn publication_evidence_redacts_and_binds_cargo_diagnostics() {
+        let credential = "opaque-test-capability";
+        let stderr = format!("publishing failed for token {credential} exactly once");
+        let observed = ObservedOutput {
+            status: std::process::ExitStatus::default(),
+            stdout: b"    Packaged memcordon-core".to_vec(),
+            stderr: stderr.into_bytes(),
+            elapsed: Duration::from_millis(1),
+        };
+        let diagnostics =
+            cargo_diagnostics(Some(&observed), None, credential).expect("diagnostics");
+        assert!(!diagnostics.stderr.contains(credential));
+        assert!(diagnostics.stderr.contains("[redacted]"));
+        assert_eq!(diagnostics.stderr_sha256, sha256_text(&diagnostics.stderr));
+        assert_eq!(diagnostics.stdout_sha256, sha256_text(&diagnostics.stdout));
+
+        let oversized = ObservedOutput {
+            stdout: vec![0_u8; MAXIMUM_CARGO_DIAGNOSTIC_BYTES + 1],
+            ..observed
+        };
+        assert!(cargo_diagnostics(Some(&oversized), None, credential).is_err());
+
+        let invalid_utf8 = ObservedOutput {
+            stderr: vec![0xff],
+            ..diagnostics_placeholder()
+        };
+        assert!(cargo_diagnostics(Some(&invalid_utf8), None, credential).is_err());
+    }
+
+    fn diagnostics_placeholder() -> ObservedOutput {
+        ObservedOutput {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            elapsed: Duration::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn live_cargo_output_is_redacted_before_relay_and_failure_reporting() {
+        let credential = "opaque-test-capability";
+        let observed = ObservedOutput {
+            status: std::process::ExitStatus::default(),
+            stdout: format!("publishing with {credential}\n").into_bytes(),
+            stderr: format!("registry rejected token {credential}\n").into_bytes(),
+            elapsed: Duration::from_millis(1),
+        };
+        let (relay_stdout, relay_stderr) = redacted_console_output(&observed, credential);
+        assert!(!relay_stdout.contains(credential));
+        assert!(!relay_stderr.contains(credential));
+        assert_eq!(relay_stdout.matches("[redacted]").count(), 1);
+        assert_eq!(relay_stderr.matches("[redacted]").count(), 1);
+
+        let observed_failure = CargoPublicationAttempt {
+            observed: Some(observed),
+            process_error: None,
+        };
+        let failure_text = publication_failure(&observed_failure, credential).to_string();
+        assert!(!failure_text.contains(credential));
+
+        let process_failure = CargoPublicationAttempt {
+            observed: None,
+            process_error: Some(format!("spawn failed after using {credential}")),
+        };
+        let failure_text = publication_failure(&process_failure, credential).to_string();
+        assert!(!failure_text.contains(credential));
+    }
+
+    #[test]
+    fn one_new_crate_token_attempt_is_evidence_bounded() {
+        let base = PublicationSlotEvidence {
+            schema_version: PUBLICATION_EVIDENCE_SCHEMA_VERSION,
+            publication_slot: NonZeroUsize::new(3).expect("slot is nonzero"),
+            release: ReleaseBinding {
+                tag: "0.5.2".to_owned(),
+                source_commit: "source".to_owned(),
+                workflow_commit: "workflow".to_owned(),
+            },
+            run: PublicationRunIdentity {
+                run_id: "123".to_owned(),
+                run_attempt: "1".to_owned(),
+            },
+            crate_binding: CrateBinding {
+                name: "example".to_owned(),
+                version: "0.5.2".to_owned(),
+                archive_sha256: "ab".repeat(32),
+            },
+            records: vec![
+                publication_record(
+                    CredentialOrigin::Oidc,
+                    PublicationOutcome::OidcRejectedNewCrate,
+                    PublicNameState::Absent,
+                    None,
+                ),
+                publication_record(
+                    CredentialOrigin::Oidc,
+                    PublicationOutcome::NewCrateAuthorized,
+                    PublicNameState::Absent,
+                    None,
+                ),
+            ],
+        };
+        assert!(evidence_authorizes_token_provider(&base));
+        assert!(evidence_allows_new_token_attempt(&base));
+
+        let with_token_record = |outcome: PublicationOutcome| PublicationSlotEvidence {
+            records: base
+                .records
+                .iter()
+                .cloned()
+                .chain(std::iter::once(publication_record(
+                    CredentialOrigin::NewCrateToken,
+                    outcome,
+                    PublicNameState::Absent,
+                    None,
+                )))
+                .collect(),
+            ..base.clone()
+        };
+        let in_flight = with_token_record(PublicationOutcome::TokenAttemptStarted);
+        assert!(evidence_authorizes_token_provider(&in_flight));
+        assert!(!evidence_allows_new_token_attempt(&in_flight));
+        for terminal in [
+            PublicationOutcome::TokenPubliclyAccepted,
+            PublicationOutcome::TokenRejected,
+        ] {
+            let terminal = with_token_record(terminal);
+            assert!(!evidence_authorizes_token_provider(&terminal));
+            assert!(!evidence_allows_new_token_attempt(&terminal));
+        }
+    }
+
+    #[test]
+    fn slot_evidence_serialization_is_credential_free_and_closed() {
+        let evidence = PublicationSlotEvidence {
+            schema_version: PUBLICATION_EVIDENCE_SCHEMA_VERSION,
+            publication_slot: NonZeroUsize::new(3).expect("slot is nonzero"),
+            release: ReleaseBinding {
+                tag: "0.5.2".to_owned(),
+                source_commit: "source".to_owned(),
+                workflow_commit: "workflow".to_owned(),
+            },
+            run: PublicationRunIdentity {
+                run_id: "123".to_owned(),
+                run_attempt: "1".to_owned(),
+            },
+            crate_binding: CrateBinding {
+                name: "example".to_owned(),
+                version: "0.5.2".to_owned(),
+                archive_sha256: "ab".repeat(32),
+            },
+            records: vec![publication_record(
+                CredentialOrigin::Oidc,
+                PublicationOutcome::OidcRejectedNewCrate,
+                PublicNameState::Absent,
+                None,
+            )],
+        };
+        let bytes = serde_json::to_vec(&evidence).expect("evidence should serialize");
+        let text = std::str::from_utf8(&bytes).expect("evidence should be UTF-8");
+        for forbidden in ["token", "credential_value", "CARGO_REGISTRIES"] {
+            assert!(!text.contains(forbidden), "evidence leaked {forbidden}");
+        }
+        assert!(
+            serde_json::from_str::<PublicationSlotEvidence>(
+                r#"{
+                "schema_version": 1,
+                "publication_slot": 3,
+                "release": {"tag":"0.5.2","source_commit":"s","workflow_commit":"w"},
+                "run": {"run_id":"1","run_attempt":"1"},
+                "crate_binding": {"name":"n","version":"1","archive_sha256":"a"},
+                "records": [],
+                "extra": true
+            }"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fallback_policy_rejects_later_remote_tags_without_reusing_rc11() {
+        let fallback = Version::parse("0.5.2").expect("fallback version should parse");
+        let inventory = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\trefs/tags/0.5.2-rc.11\n\
+            0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\trefs/tags/0.5.2\n";
+        validate_fallback_remote_tags(inventory, &fallback)
+            .expect("the immutable earlier RC and exact fallback version are eligible");
+        let later =
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\trefs/tags/0.5.3\n";
+        assert!(validate_fallback_remote_tags(later, &fallback).is_err());
+    }
+
+    #[test]
+    fn credential_provider_binds_origin_slot_and_artifact_identity() {
         let (temporary, release) = release_fixture();
         let manifest_path = temporary
             .path()
             .join(&release.assets.output_directory)
             .join(&release.assets.manifest);
-        let mut manifest: ReleaseManifest =
+        let manifest: ReleaseManifest =
             serde_json::from_slice(&fs::read(&manifest_path).expect("manifest should read"))
                 .expect("manifest should parse");
-        let record = CrateRecord {
-            name: "memcordon-core".to_owned(),
-            version: "1.2.3".to_owned(),
-            archive_sha256: "ab".repeat(32),
-            canonical_tree_sha256: "cd".repeat(32),
-            canonical_identity_sha256: "ef".repeat(32),
-            vcs_commit: manifest.source_commit.clone(),
+        let record = manifest
+            .crates
+            .first()
+            .expect("release fixture should contain the core crate")
+            .clone();
+        let slot = NonZeroUsize::new(1).expect("slot is nonzero");
+        let run = PublicationRunIdentity {
+            run_id: "1234567890".to_owned(),
+            run_attempt: "1".to_owned(),
         };
-        manifest.crates.push(record.clone());
-        write_json(&manifest_path, &manifest).expect("manifest should update");
+        let expected = ProviderBinding {
+            origin: CredentialOrigin::Oidc,
+            publication_slot: slot,
+            name: &record.name,
+            version: &record.version,
+            archive_sha256: &record.archive_sha256,
+        };
         let arguments = serde_json::json!([
+            "oidc",
+            "1",
             record.name.clone(),
             record.version.clone(),
             record.archive_sha256.clone(),
@@ -5180,7 +6563,7 @@ mod tests {
         });
         let read_request: CredentialRequest = serde_json::from_value(read_message.clone())
             .expect("Cargo read request without publish fields should parse");
-        validate_credential_request(temporary.path(), &read_request)
+        validate_credential_request(temporary.path(), &read_request, expected, Some(&run))
             .expect("bound read request should pass");
 
         let mut read_output = Vec::new();
@@ -5190,7 +6573,9 @@ mod tests {
             temporary.path(),
             Cursor::new(read_wire),
             &mut read_output,
-            Some("opaque-test-capability"),
+            || Some("opaque-test-capability".to_owned()),
+            expected,
+            Some(&run),
         )
         .expect("Cargo read transcript should complete");
         let read_lines: Vec<serde_json::Value> = read_output
@@ -5217,23 +6602,31 @@ mod tests {
             "cksum": record.archive_sha256.clone(),
             "args": arguments.clone(),
         });
-        let publish_request: CredentialRequest =
-            serde_json::from_value(publish_message).expect("Cargo publish request should parse");
-        validate_credential_request(temporary.path(), &publish_request)
+        let publish_request: CredentialRequest = serde_json::from_value(publish_message.clone())
+            .expect("Cargo publish request should parse");
+        validate_credential_request(temporary.path(), &publish_request, expected, Some(&run))
             .expect("exact publish request should pass");
         let accepted = credential_response(
             temporary.path(),
             Ok(publish_request.clone()),
-            Some("opaque-test-capability"),
+            || Some("opaque-test-capability".to_owned()),
+            expected,
+            Some(&run),
         );
         assert_eq!(accepted["Ok"]["kind"], "get");
         assert_eq!(accepted["Ok"]["cache"], "never");
         assert_eq!(accepted["Ok"]["operation_independent"], false);
         assert_eq!(accepted["Ok"]["token"], "opaque-test-capability");
-        let missing = credential_response(temporary.path(), Ok(publish_request.clone()), None);
+        let missing = credential_response(
+            temporary.path(),
+            Ok(publish_request.clone()),
+            || None,
+            expected,
+            Some(&run),
+        );
         assert_eq!(missing["Err"]["kind"], "other");
 
-        let mut missing_args = read_message;
+        let mut missing_args = read_message.clone();
         missing_args
             .as_object_mut()
             .expect("request should be an object")
@@ -5243,7 +6636,9 @@ mod tests {
         let missing_args = credential_response(
             temporary.path(),
             Ok(missing_args),
-            Some("opaque-test-capability"),
+            || Some("opaque-test-capability".to_owned()),
+            expected,
+            Some(&run),
         );
         assert_eq!(missing_args["Err"]["kind"], "other");
         assert_eq!(
@@ -5265,14 +6660,18 @@ mod tests {
         let unsupported = credential_response(
             temporary.path(),
             Ok(unsupported),
-            Some("opaque-test-capability"),
+            || Some("opaque-test-capability".to_owned()),
+            expected,
+            Some(&run),
         );
         assert_eq!(unsupported["Err"]["kind"], "operation-not-supported");
 
         let malformed = credential_response(
             temporary.path(),
             serde_json::from_str::<CredentialRequest>("not JSON"),
-            Some("opaque-test-capability"),
+            || Some("opaque-test-capability".to_owned()),
+            expected,
+            Some(&run),
         );
         assert_eq!(malformed["Err"]["kind"], "other");
         assert_eq!(
@@ -5280,8 +6679,9 @@ mod tests {
             "Cargo credential request is malformed"
         );
 
-        let cargo_config = cargo_publish_config(temporary.path(), &record)
-            .expect("isolated Cargo configuration should be prepared");
+        let cargo_config =
+            cargo_publish_config(temporary.path(), &record, CredentialOrigin::Oidc, slot)
+                .expect("isolated Cargo configuration should be prepared");
         let provider_config = fs::read_to_string(cargo_config).expect("config should read");
         assert!(!provider_config.contains("opaque-test-capability"));
         let provider_config: toml::Value =
@@ -5289,12 +6689,14 @@ mod tests {
         let provider = provider_config["registry"]["credential-provider"]
             .as_array()
             .expect("provider should be an argv array");
-        assert_eq!(provider.len(), 4);
-        assert_eq!(provider[1].as_str(), Some(record.name.as_str()));
-        assert_eq!(provider[2].as_str(), Some(record.version.as_str()));
-        assert_eq!(provider[3].as_str(), Some(record.archive_sha256.as_str()));
+        assert_eq!(provider.len(), 6);
+        assert_eq!(provider[1].as_str(), Some("oidc"));
+        assert_eq!(provider[2].as_str(), Some("1"));
+        assert_eq!(provider[3].as_str(), Some(record.name.as_str()));
+        assert_eq!(provider[4].as_str(), Some(record.version.as_str()));
+        assert_eq!(provider[5].as_str(), Some(record.archive_sha256.as_str()));
 
-        let mut wrong_checksum = publish_request;
+        let mut wrong_checksum = publish_request.clone();
         let CredentialAction::Get {
             operation: CredentialOperation::Publish { cksum, .. },
         } = &mut wrong_checksum.action
@@ -5302,18 +6704,201 @@ mod tests {
             panic!("publish request should retain its operation");
         };
         *cksum = "00".repeat(32);
-        assert!(validate_credential_request(temporary.path(), &wrong_checksum).is_err());
+        assert!(
+            validate_credential_request(temporary.path(), &wrong_checksum, expected, Some(&run))
+                .is_err()
+        );
+        let mut wrong_argv = publish_request;
+        wrong_argv.args = vec![
+            "oidc".to_owned(),
+            "2".to_owned(),
+            record.name.clone(),
+            record.version.clone(),
+            record.archive_sha256.clone(),
+        ];
+        let error =
+            validate_credential_request(temporary.path(), &wrong_argv, expected, Some(&run))
+                .expect_err("Cargo request arguments must match provider argv");
+        assert!(error.to_string().contains("provider argv"));
+
+        let token_expected = ProviderBinding {
+            origin: CredentialOrigin::NewCrateToken,
+            publication_slot: slot,
+            name: &record.name,
+            version: &record.version,
+            archive_sha256: &record.archive_sha256,
+        };
+        let token_arguments = serde_json::json!([
+            "new-crate-token",
+            "1",
+            record.name.clone(),
+            record.version.clone(),
+            record.archive_sha256.clone(),
+        ]);
+        let mut token_read_message = read_message.clone();
+        token_read_message
+            .as_object_mut()
+            .expect("request should be an object")
+            .insert("args".to_owned(), token_arguments.clone());
+        let token_read: CredentialRequest = serde_json::from_value(token_read_message)
+            .expect("token-origin read request should parse");
+        let read_invoked = Cell::new(false);
+        let denied_read = credential_response(
+            temporary.path(),
+            Ok(token_read),
+            || {
+                read_invoked.set(true);
+                Some("new-crate-capability".to_owned())
+            },
+            token_expected,
+            Some(&run),
+        );
+        assert_eq!(denied_read["Err"]["kind"], "other");
+        assert!(!read_invoked.get());
+
+        let mut token_publish_message = publish_message.clone();
+        token_publish_message
+            .as_object_mut()
+            .expect("request should be an object")
+            .insert("args".to_owned(), token_arguments);
+        let token_publish: CredentialRequest = serde_json::from_value(token_publish_message)
+            .expect("token-origin publish request should parse");
+        let publish_invoked = Cell::new(false);
+        let unauthorized = credential_response(
+            temporary.path(),
+            Ok(token_publish.clone()),
+            || {
+                publish_invoked.set(true);
+                Some("new-crate-capability".to_owned())
+            },
+            token_expected,
+            Some(&run),
+        );
+        assert_eq!(unauthorized["Err"]["kind"], "other");
+        assert!(!publish_invoked.get());
+
+        let release_binding = ReleaseBinding::from_manifest(&manifest);
+        let crate_binding = CrateBinding::from_record(&record);
+        establish_slot_evidence(
+            temporary.path(),
+            slot,
+            &release_binding,
+            &run,
+            &crate_binding,
+        )
+        .expect("evidence should be established");
+        append_publication_record(
+            temporary.path(),
+            &release,
+            slot,
+            publication_record(
+                CredentialOrigin::Oidc,
+                PublicationOutcome::OidcRejectedNewCrate,
+                PublicNameState::Absent,
+                None,
+            ),
+        )
+        .expect("rejection evidence should append");
+        let still_unauthorized = credential_response(
+            temporary.path(),
+            Ok(token_publish.clone()),
+            || {
+                publish_invoked.set(true);
+                Some("new-crate-capability".to_owned())
+            },
+            token_expected,
+            Some(&run),
+        );
+        assert_eq!(still_unauthorized["Err"]["kind"], "other");
+        assert!(!publish_invoked.get());
+
+        append_publication_record(
+            temporary.path(),
+            &release,
+            slot,
+            publication_record(
+                CredentialOrigin::Oidc,
+                PublicationOutcome::NewCrateAuthorized,
+                PublicNameState::Absent,
+                None,
+            ),
+        )
+        .expect("authorization evidence should append");
+        let authorized = credential_response(
+            temporary.path(),
+            Ok(token_publish.clone()),
+            || {
+                publish_invoked.set(true);
+                Some("new-crate-capability".to_owned())
+            },
+            token_expected,
+            Some(&run),
+        );
+        assert_eq!(authorized["Ok"]["token"], "new-crate-capability");
+        assert!(publish_invoked.get());
+
+        append_publication_record(
+            temporary.path(),
+            &release,
+            slot,
+            publication_record(
+                CredentialOrigin::NewCrateToken,
+                PublicationOutcome::TokenRejected,
+                PublicNameState::Absent,
+                None,
+            ),
+        )
+        .expect("terminal token evidence should append");
+        let retry_invoked = Cell::new(false);
+        let forbidden_retry = credential_response(
+            temporary.path(),
+            Ok(token_publish),
+            || {
+                retry_invoked.set(true);
+                Some("new-crate-capability".to_owned())
+            },
+            token_expected,
+            Some(&run),
+        );
+        assert_eq!(forbidden_retry["Err"]["kind"], "other");
+        assert!(
+            !retry_invoked.get(),
+            "a prior terminal token attempt must forbid every further token read"
+        );
+
+        let evidence_text = fs::read_to_string(slot_evidence_path(temporary.path(), slot))
+            .expect("slot evidence should read");
+        assert!(!evidence_text.contains("new-crate-capability"));
+        assert!(!evidence_text.contains("opaque-test-capability"));
+        let aggregate_text = fs::read_to_string(aggregate_evidence_path(temporary.path()))
+            .expect("aggregate evidence should read");
+        assert!(!aggregate_text.contains("new-crate-capability"));
     }
 
     #[test]
-    fn ambiguous_publish_response_reconciles_public_acceptance_before_retry() {
-        let lost_response = Err(failure("connection lost after acceptance"));
-        reconcile_publication_result(lost_response, true)
-            .expect("public acceptance should reconcile an ambiguous client failure");
-        let rejected = Err(failure("publication rejected"));
-        assert!(reconcile_publication_result(rejected, false).is_err());
-        reconcile_publication_result(Ok(Vec::new()), false)
-            .expect("acknowledged publication should succeed");
+    fn publication_cursor_selects_only_the_first_absent_configured_crate() {
+        let packages: Vec<String> = [
+            "memcordon-core",
+            "memcordon-platform",
+            "memcordon-windows-launch-core",
+            "memcordon",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let slot = |value: usize| NonZeroUsize::new(value).expect("slot is nonzero");
+        assert_eq!(
+            resolve_first_absent_slot(&packages, None, slot(1))
+                .expect("a complete registry is idempotent"),
+            None
+        );
+        assert_eq!(
+            resolve_first_absent_slot(&packages, Some("memcordon-platform"), slot(2))
+                .expect("the exact first-absent slot is selected"),
+            Some(1)
+        );
+        assert!(resolve_first_absent_slot(&packages, Some("memcordon-platform"), slot(1)).is_err());
+        assert!(resolve_first_absent_slot(&packages, Some("memcordon-platform"), slot(3)).is_err());
+        assert!(resolve_first_absent_slot(&packages, Some("memcordon"), slot(5)).is_err());
     }
 
     #[test]
@@ -6028,7 +7613,12 @@ mod tests {
             MockResponse::Json(503, serde_json::json!({"message": "retry"})),
             MockResponse::Json(
                 200,
-                serde_json::json!({"version": {"checksum": "registry-digest"}}),
+                serde_json::json!({"version": {
+                    "crate": "example",
+                    "num": "1.2.3",
+                    "checksum": "registry-digest",
+                    "yanked": false
+                }}),
             ),
             MockResponse::Bytes(503, b"retry".to_vec()),
             MockResponse::Truncated(b"partial".to_vec(), 20),
@@ -6043,9 +7633,12 @@ mod tests {
             .expect("idempotent GitHub GET should retry");
         assert_eq!(github["id"], 41);
         assert_eq!(
-            crate_checksum_at(&release, &endpoints, "example", "1.2.3")
+            crate_version_state_at(&release, &endpoints, "example", "1.2.3")
                 .expect("registry checksum should retry"),
-            Some("registry-digest".to_owned())
+            CrateVersionLookup::Present(CrateRegistryState {
+                checksum: "registry-digest".to_owned(),
+                yanked: false,
+            })
         );
         let archive = temporary.path().join("download.crate");
         public_crate_archive_at(&release, &endpoints, "example", "1.2.3", &archive)
@@ -6070,7 +7663,12 @@ mod tests {
         let server = MockServer::scripted(vec![
             MockResponse::Json(
                 200,
-                serde_json::json!({"version": {"checksum": "published"}}),
+                serde_json::json!({"version": {
+                    "crate": "memcordon-core",
+                    "num": "1.2.3",
+                    "checksum": "published",
+                    "yanked": false
+                }}),
             ),
             MockResponse::Json(404, serde_json::json!({"message": "missing"})),
         ]);
@@ -6078,13 +7676,83 @@ mod tests {
         let states = ["memcordon-core", "memcordon-platform"]
             .into_iter()
             .map(|name| {
-                crate_checksum_at(&release, &endpoints, name, "1.2.3")
-                    .map(|checksum| (name, checksum))
+                crate_version_state_at(&release, &endpoints, name, "1.2.3")
+                    .map(|state| (name, state))
             })
             .collect::<Result<Vec<_>>>()
             .expect("partial registry state should reconcile");
-        assert_eq!(states[0].1.as_deref(), Some("published"));
-        assert_eq!(states[1].1, None);
+        assert_eq!(
+            states[0].1,
+            CrateVersionLookup::Present(CrateRegistryState {
+                checksum: "published".to_owned(),
+                yanked: false,
+            })
+        );
+        assert_eq!(states[1].1, CrateVersionLookup::Absent);
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn http_mock_scan_selects_the_first_absent_crate_and_rejects_yanks() {
+        let (temporary, mut release) = release_fixture();
+        release.network_retry = config::RegistryWait {
+            initial_milliseconds: 1,
+            maximum_milliseconds: 1,
+            total_seconds: 1,
+        };
+        let manifest: ReleaseManifest = serde_json::from_slice(
+            &fs::read(
+                temporary
+                    .path()
+                    .join(&release.assets.output_directory)
+                    .join(&release.assets.manifest),
+            )
+            .expect("fixture manifest should read"),
+        )
+        .expect("fixture manifest should parse");
+        let public = |name: &str| {
+            MockResponse::Json(
+                200,
+                serde_json::json!({"version": {
+                    "crate": name,
+                    "num": "1.2.3",
+                    "checksum": "published",
+                    "yanked": false
+                }}),
+            )
+        };
+        let server = MockServer::scripted(vec![
+            public("memcordon-core"),
+            public("memcordon-platform"),
+            MockResponse::Json(404, serde_json::json!({"message": "missing"})),
+            MockResponse::Json(404, serde_json::json!({"message": "missing"})),
+        ]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let scan =
+            scan_registry_publication(&release, &endpoints, &manifest, &release.publish_packages)
+                .expect("the first absent exact version should be selected generically");
+        assert_eq!(
+            scan.first_absent.as_deref(),
+            Some("memcordon-windows-launch-core")
+        );
+        assert_eq!(scan.public_names, ["memcordon-core", "memcordon-platform"]);
+        assert_eq!(server.finish().len(), 4);
+
+        let yanked = serde_json::json!({"version": {
+            "crate": "memcordon-platform",
+            "num": "1.2.3",
+            "checksum": "published",
+            "yanked": true
+        }});
+        let server = MockServer::scripted(vec![
+            public("memcordon-core"),
+            MockResponse::Json(200, yanked),
+        ]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let error =
+            scan_registry_publication(&release, &endpoints, &manifest, &release.publish_packages)
+                .expect_err("a yanked target version must not reconcile");
+        assert!(error.to_string().contains("yanked"));
         assert_eq!(server.finish().len(), 2);
     }
 
@@ -6106,9 +7774,9 @@ mod tests {
                 .expect("existing name should be recognized")
         );
         assert_eq!(
-            crate_checksum_at(&release, &endpoints, "memcordon-core", "0.1.0")
+            crate_version_state_at(&release, &endpoints, "memcordon-core", "0.1.0")
                 .expect("absent target version should be recognized"),
-            None
+            CrateVersionLookup::Absent
         );
         assert_eq!(server.finish().len(), 2);
     }
@@ -6123,6 +7791,38 @@ mod tests {
             let server = MockServer::scripted(vec![MockResponse::Json(200, response)]);
             let endpoints = HttpEndpoints::fixed_test_server(&server.root);
             assert!(crate_name_exists_at(&release, &endpoints, "memcordon-core").is_err());
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn http_mock_version_state_fails_closed_on_malformed_or_wrong_identity() {
+        let (_, release) = release_fixture();
+        for response in [
+            serde_json::json!({"version": {
+                "crate": "memcordon-core",
+                "num": "1.2.3",
+                "checksum": "published"
+            }}),
+            serde_json::json!({"version": {
+                "crate": "different-name",
+                "num": "1.2.3",
+                "checksum": "published",
+                "yanked": false
+            }}),
+            serde_json::json!({"version": {
+                "crate": "memcordon-core",
+                "num": "0.1.0",
+                "checksum": "published",
+                "yanked": false
+            }}),
+        ] {
+            let server = MockServer::scripted(vec![MockResponse::Json(200, response)]);
+            let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+            assert!(
+                crate_version_state_at(&release, &endpoints, "memcordon-core", "1.2.3").is_err(),
+                "malformed or mismatched version state must fail closed"
+            );
             assert_eq!(server.finish().len(), 1);
         }
     }

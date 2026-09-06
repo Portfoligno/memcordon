@@ -1,4 +1,4 @@
-use memcordon_ci::config::{self, Release, SealedAssetPolicy};
+use memcordon_ci::config::{self, RegistryCredentials, Release, SealedAssetPolicy};
 
 type ReleaseMutation = (&'static str, fn(&mut Release));
 
@@ -39,6 +39,110 @@ fn workspace_publication_order_matches_the_dependency_graph() {
 fn canonical_release() -> Release {
     toml::from_str(include_str!("../../../ci/release.toml"))
         .expect("canonical release configuration should parse")
+}
+
+#[test]
+fn canonical_fallback_configuration_is_bounded_to_the_exact_release() {
+    let release = canonical_release();
+    let development = semver::Version::parse("0.5.2-dev").unwrap();
+    config::validate_registry_credentials(&release, &development)
+        .expect("the current development version should match fallback 0.5.2");
+    let stable = semver::Version::parse("0.5.2").unwrap();
+    config::validate_registry_credentials(&release, &stable)
+        .expect("the release commit should match fallback 0.5.2");
+    assert_eq!(release.schema_version, 3);
+    assert_eq!(
+        release.registry_credentials.policy,
+        config::RegistryCredentialPolicy::OidcFirstNewCrateFallback
+    );
+    assert_eq!(
+        release.publish_packages,
+        [
+            "memcordon-core",
+            "memcordon-platform",
+            "memcordon-windows-launch-core",
+            "memcordon"
+        ]
+    );
+
+    let mutations: [ReleaseMutation; 8] = [
+        ("missing fallback version", |release| {
+            release.registry_credentials.fallback_version = None;
+        }),
+        ("development fallback version", |release| {
+            release.registry_credentials.fallback_version =
+                Some(semver::Version::parse("0.5.2-dev").unwrap());
+        }),
+        ("build-metadata fallback version", |release| {
+            release.registry_credentials.fallback_version =
+                Some(semver::Version::parse("0.5.2+build").unwrap());
+        }),
+        ("missing fallback secret", |release| {
+            release.registry_credentials.fallback_token_secret = None;
+        }),
+        ("wrong fallback secret", |release| {
+            release.registry_credentials.fallback_token_secret =
+                Some("BROAD_REGISTRY_TOKEN".to_owned());
+        }),
+        ("empty publication list", |release| {
+            release.publish_packages.clear();
+        }),
+        ("duplicate publication names", |release| {
+            let last = release.publish_packages.last().cloned().unwrap();
+            release.publish_packages.push(last);
+        }),
+        ("wrong numeric workspace version", |release| {
+            release.registry_credentials.fallback_version =
+                Some(semver::Version::parse("0.5.3").unwrap());
+        }),
+    ];
+    for (case, mutate) in mutations {
+        let mut invalid = release.clone();
+        mutate(&mut invalid);
+        assert!(
+            config::validate_registry_credentials(&invalid, &development).is_err(),
+            "{case} must fail before tagging"
+        );
+    }
+}
+
+#[test]
+fn registry_credential_profiles_parse_only_their_exact_fields() {
+    let fallback = "policy = \"oidc-first-new-crate-fallback\"\nfallback_version = \"0.5.2\"\nfallback_token_secret = \"MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK\"\n";
+    toml::from_str::<RegistryCredentials>(fallback)
+        .expect("the exact fallback profile should parse");
+    toml::from_str::<RegistryCredentials>("policy = \"oidc-only\"\n")
+        .expect("the exact OIDC-only profile should parse");
+    for invalid in [
+        "policy = \"arbitrary-provider\"\n",
+        "policy = \"new-crate-token-bridge\"\nbridge_version = \"0.5.2\"\nbridge_package = \"memcordon-windows-launch-core\"\nstored_token_secret = \"MEMCORDON_WINDOWS_LAUNCH_FIRST_PUBLISH\"\n",
+    ] {
+        assert!(
+            toml::from_str::<RegistryCredentials>(invalid).is_err(),
+            "credential profile should remain closed: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn normal_prerelease_fallback_versions_are_bounded_but_acceptable() {
+    let mut release = canonical_release();
+    release.registry_credentials.fallback_version =
+        Some(semver::Version::parse("0.5.2-dev").unwrap());
+    let development = semver::Version::parse("0.5.2-dev").unwrap();
+    config::validate_registry_credentials(&release, &development)
+        .expect_err("the dev pre-release identifier remains forbidden in the fallback version");
+    release.registry_credentials.fallback_version =
+        Some(semver::Version::parse("0.5.2-rc.12").unwrap());
+    let candidate = semver::Version::parse("0.5.2-rc.12").unwrap();
+    release.registry_credentials.fallback_version = Some(candidate.clone());
+    config::validate_registry_credentials(&release, &candidate)
+        .expect("a normal prerelease may bound one immutable recovery release");
+    let mismatched = semver::Version::parse("0.5.3").unwrap();
+    assert!(
+        config::validate_registry_credentials(&release, &mismatched).is_err(),
+        "a numerically different workspace version must fail before tagging"
+    );
 }
 
 #[test]

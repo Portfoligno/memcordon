@@ -1,13 +1,15 @@
 # Releasing MemCordon
 
 Use this runbook to publish the four MemCordon crates and their matching GitHub
-Release through the OIDC-only workflow. The release is complete only when the
-public crates, assets, checksums, publication report, and credential-free
-verification all agree.
+Release through the temporary OIDC-first new-crate fallback. The release is
+complete only when the public crates, assets, checksums, publication report,
+and credential-free verification all agree.
 
 The published crates, in publication order, are `memcordon-core`,
-`memcordon-platform`, `memcordon-windows-launch-core`, and `memcordon`, each with
-its own trusted publisher.
+`memcordon-platform`, `memcordon-windows-launch-core`, and `memcordon`. Every
+publication slot always attempts crates.io Trusted Publishing first; only the
+exact crates.io new-crate rejection, rechecked against public registry
+topology, can select the narrowly scoped fallback token for that one attempt.
 The `memcordon` crate installs four default binaries: `memcordon`,
 `memcordon-sealed-agent`, `memcordon-target-desktop-bootstrap`, and
 `memcordon-session-broker`. Linux native archives contain the CLI and sealed
@@ -22,9 +24,16 @@ described in [MAINTAINERS.md](MAINTAINERS.md). Record user-visible changes in
 
 ## Prerequisites
 
-- Use an authorized release-maintainer account and confirm each crates.io
-  trusted publisher names owner `Portfoligno`, repository `memcordon`, and
-  workflow `release.yml`.
+- Use an authorized release-maintainer account and confirm the trusted
+  publishers for `memcordon-core`, `memcordon-platform`, and `memcordon` name
+  owner `Portfoligno`, repository `memcordon`, and workflow `release.yml`.
+- The bounded fallback targets stable `0.5.2`. Immediately before tagging,
+  determine which configured crate names are still absent from crates.io and
+  create the narrowest shortest-lived token with only `publish-new` authority
+  scoped to exactly those names. Store it only as repository Actions secret
+  `MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK`. Do not use an organization secret,
+  GitHub Environment, wildcard or all-crate authority, `publish-update`,
+  yank, or owner-management authority.
 - Start from a clean checkout of the intended release commit after every public
   CI check has passed.
 - Confirm the fixed `ubuntu-24.04`, `windows-2025`, and Windows ARM64 native
@@ -32,6 +41,9 @@ described in [MAINTAINERS.md](MAINTAINERS.md). Record user-visible changes in
   blocks release.
 - Confirm the intended version has not been published and its tag does not
   exist. Never move or reuse a published tag or version.
+- Never reuse or move `0.5.2-rc.11`. Its yanked core and platform versions are
+  immutable registry state; this transition uses the new stable `0.5.2`
+  version.
 
 ## 1. Create the release commit
 
@@ -144,15 +156,18 @@ Never replace the tag or publish a crate or asset manually.
 ## 5. Reconcile a partial release
 
 Rerun partial publication by manually dispatching the workflow from the same
-existing protected tag and supplying the exact tag. Public registry and release
-state are authoritative. Identical public crates/assets are accepted;
-conflicting same-version content fails permanently. Never move or reuse a
-published tag or version. Yanking is an explicit incident-response decision.
+existing protected tag and supplying the exact tag. Public registry and
+release state are authoritative. Identical public
+crates/assets are accepted; conflicting same-version content fails permanently.
+A yanked target version is rejected rather than unyanked automatically. Never
+move or reuse a published tag or version. Yanking is an explicit
+incident-response decision.
 
 Dispatch and watch reconciliation with:
 
 ```console
-gh workflow run release.yml --ref "$release_version" --field tag="$release_version"
+gh workflow run release.yml --ref "$release_version" \
+  --field tag="$release_version"
 gh run list --workflow release.yml --branch "$release_version" --event workflow_dispatch
 gh run watch RUN_ID --exit-status
 ```
@@ -172,16 +187,28 @@ asset. For transient service failures or an interrupted run, preserve the tag
 and rerun the same dispatch; the workflow reconciles identical public state and
 continues from the first missing publication step.
 
+Every publication slot begins with a fresh OIDC attempt. If crates.io rejects
+that attempt with the exact Trusted Publishing new-crate diagnostic, a
+credential-free authorizer rechecks that the exact target version and the
+crate name are both absent before the narrowly scoped token is mapped into the
+standard Cargo variable for exactly one retry of the same artifact. A crate
+whose name already exists never receives the fallback token; later slots reset
+to OIDC.
+
 ## Publication security invariants
 
-- The publish job must retain `id-token: write`. Each of the four
-  dependency-ordered publication slots acquires its own short-lived capability
-  from the pinned crates.io action.
-- The paired publication step passes that capability in memory through the
-  typed Cargo credential provider. The provider accepts only Cargo protocol
-  version 1 `get` requests for a crates.io publish operation whose crate name,
-  version, and checksum match the selected preassembled artifact. Its response
-  is non-cacheable and operation-dependent.
+- The publish job must retain `id-token: write`. Existing crate identities use
+  short-lived capabilities from the pinned crates.io action. The generic
+  fallback policy keeps exactly four publication positions, each of which
+  attempts OIDC first; no crate name or slot is mapped to a credential source.
+- The typed Cargo credential provider accepts only Cargo protocol version 1
+  `get` requests for a crates.io publish operation whose provider argv, Cargo
+  request arguments, credential origin, publication slot, crate name, version,
+  and checksum match the selected preassembled artifact. Its response is
+  non-cacheable and operation-dependent. The fallback origin additionally
+  requires fresh same-run evidence of the exact OIDC rejection, absent crate
+  name, absent exact version, and authorization before it reads its
+  capability, and it never answers registry reads.
 - The isolated Cargo configuration contains only the provider executable and
   artifact identity. The capability must never be passed as an argument,
   written by `cargo login`, persisted, cached, uploaded, or logged. A missing
@@ -190,12 +217,19 @@ continues from the first missing publication step.
   release tooling neither defines nor reinjects it or the registry capability.
   The non-secret provider configuration is supplied as a typed `--config PATH`
   argument. Publication homes and credentials are never cached.
-- No repository, organization, or GitHub Environment secret may replace
-  trusted publishing. Release tags must use the closed `oidc-only` policy.
+- The only stored credential permitted during fallback `0.5.2` is the exact
+  repository Actions secret named above, mapped only to the standard
+  `CARGO_REGISTRIES_CRATES_IO_TOKEN` variable in the token-fallback step. The
+  legacy `CARGO_REGISTRY_TOKEN` interface, organization secrets, GitHub
+  Environments, credential-bearing caches/artifacts, command arguments, and
+  logs remain forbidden.
+- Publication attempts write credential-free slot evidence under
+  `target/ci/publication-evidence/`; the aggregate file is uploaded as a
+  diagnostic artifact and never enters the immutable publication report. It
+  contains no capability value or credential-origin secret.
 - No workflow job uses a named GitHub Environment. Tag controls, exact
   provenance checks, and serialized publication remain the authorization
-  boundary; there is no environment approval, secret, or environment-bound
-  OIDC claim.
+  boundary; there is no environment approval or environment-bound OIDC claim.
 
 ## Completion
 
@@ -211,5 +245,15 @@ qualification and required certification scenario with zero skips.
 
 Start the next development version with the `-dev` suffix, update exact internal
 requirements and both lockfiles, and leave future user-visible changes outside
-dated release sections until the next release. No credential cleanup is needed:
-OIDC capabilities are short-lived, isolated per slot, and never persisted.
+dated release sections until the next release.
+
+Before creating any later release tag, complete the fallback cleanup in order:
+confirm all four crate names and exact `0.5.2` versions are publicly unyanked;
+configure and audit the trusted publisher for every configured crate,
+especially each name that was created through fallback; run one successful
+same-tag dispatch after deleting the secret so every OIDC acquisition step
+succeeds against already-public state; revoke the crates.io fallback token;
+delete `MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK`; and merge reviewed policy that
+returns to `oidc-only`, removes the fallback profile and token-fallback steps,
+and restores four unconditional OIDC pairs. Only after that cleanup passes
+repository policy may tag creation resume.

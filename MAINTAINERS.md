@@ -170,10 +170,16 @@ The actionable release procedure and credential invariants live in
 [CHANGELOG.md](CHANGELOG.md), which is parsed by release tooling.
 
 Release source identity is derived from Git and GitHub event metadata. The
-OIDC-only path uses a fresh short-lived crates.io capability for each
-dependency-ordered publication slot. Stored registry tokens, named GitHub
-Environments, credential-bearing caches or artifacts, and force-moving a
-published tag are outside the release policy.
+temporary OIDC-first new-crate fallback keeps the four-slot dependency order
+and typed Cargo credential provider: every slot attempts crates.io Trusted
+Publishing first, and only the exact crates.io new-crate rejection, rechecked
+against absent crate name and absent exact version, can select the narrowly
+scoped repository token for one retry of the same artifact. Later slots reset
+to OIDC. After complete reconciliation and trusted-publisher configuration,
+cleanup must revoke and delete that token and return to four unconditional
+OIDC-only slots. Stored registry tokens, named GitHub Environments,
+credential-bearing caches or artifacts, and force-moving a published tag remain
+outside steady-state policy.
 
 When changing release configuration, update its tests and policy identities in
 the same change. The workflow and typed driver must agree on the tag, commit,

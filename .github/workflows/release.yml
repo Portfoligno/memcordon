@@ -626,35 +626,92 @@ jobs:
       - name: Acquire crates.io token for publication slot 1
         id: crates_auth_1
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Publish next crate in slot 1
+      - name: Attempt crates.io OIDC publication in slot 1
+        id: publish_oidc_1
+        continue-on-error: true
         env:
           CARGO_HOME: target/ci/cargo-publish-home/slot-1
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_1.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 1
+      - name: Authorize new-crate token fallback in slot 1
+        id: authorize_fallback_1
+        if: steps.publish_oidc_1.outcome == 'failure'
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 1
+      - name: Publish new crate with fallback credential in slot 1
+        if: steps.authorize_fallback_1.outcome == 'success' && steps.authorize_fallback_1.outputs.authorized == 'true'
+        env:
+          CARGO_HOME: target/ci/cargo-publish-home/slot-1
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 1
       - name: Acquire crates.io token for publication slot 2
         id: crates_auth_2
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Publish next crate in slot 2
+      - name: Attempt crates.io OIDC publication in slot 2
+        id: publish_oidc_2
+        continue-on-error: true
         env:
           CARGO_HOME: target/ci/cargo-publish-home/slot-2
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_2.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 2
+      - name: Authorize new-crate token fallback in slot 2
+        id: authorize_fallback_2
+        if: steps.publish_oidc_2.outcome == 'failure'
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 2
+      - name: Publish new crate with fallback credential in slot 2
+        if: steps.authorize_fallback_2.outcome == 'success' && steps.authorize_fallback_2.outputs.authorized == 'true'
+        env:
+          CARGO_HOME: target/ci/cargo-publish-home/slot-2
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 2
       - name: Acquire crates.io token for publication slot 3
         id: crates_auth_3
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Publish next crate in slot 3
+      - name: Attempt crates.io OIDC publication in slot 3
+        id: publish_oidc_3
+        continue-on-error: true
         env:
           CARGO_HOME: target/ci/cargo-publish-home/slot-3
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_3.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 3
+      - name: Authorize new-crate token fallback in slot 3
+        id: authorize_fallback_3
+        if: steps.publish_oidc_3.outcome == 'failure'
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 3
+      - name: Publish new crate with fallback credential in slot 3
+        if: steps.authorize_fallback_3.outcome == 'success' && steps.authorize_fallback_3.outputs.authorized == 'true'
+        env:
+          CARGO_HOME: target/ci/cargo-publish-home/slot-3
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 3
       - name: Acquire crates.io token for publication slot 4
         id: crates_auth_4
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Publish next crate in slot 4
+      - name: Attempt crates.io OIDC publication in slot 4
+        id: publish_oidc_4
+        continue-on-error: true
         env:
           CARGO_HOME: target/ci/cargo-publish-home/slot-4
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_4.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 4
+      - name: Authorize new-crate token fallback in slot 4
+        id: authorize_fallback_4
+        if: steps.publish_oidc_4.outcome == 'failure'
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 4
+      - name: Publish new crate with fallback credential in slot 4
+        if: steps.authorize_fallback_4.outcome == 'success' && steps.authorize_fallback_4.outputs.authorized == 'true'
+        env:
+          CARGO_HOME: target/ci/cargo-publish-home/slot-4
+          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 4
+      - name: Upload publication evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-publication-evidence
+          path: target/ci/publication-evidence/publication-evidence.json
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 0
       - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release verify-crates
       - name: Finalize GitHub release
         env:

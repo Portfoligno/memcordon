@@ -19,7 +19,7 @@ pub struct CommandSpec {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CredentialPolicy {
     RemoveInherited,
-    InheritWorkflow,
+    InheritCratesIoToken,
 }
 
 impl CommandSpec {
@@ -47,9 +47,16 @@ impl CommandSpec {
         self
     }
 
-    pub fn inherit_workflow_registry_credentials(mut self) -> Self {
-        self.credential_policy = CredentialPolicy::InheritWorkflow;
+    pub fn inherit_crates_io_registry_token(mut self) -> Self {
+        self.credential_policy = CredentialPolicy::InheritCratesIoToken;
         self
+    }
+
+    pub fn apply_environment(&self, command: &mut Command) {
+        command.env_remove("CARGO_REGISTRY_TOKEN");
+        if self.credential_policy == CredentialPolicy::RemoveInherited {
+            command.env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
+        }
     }
 
     pub fn run(&self) -> Result<Vec<u8>> {
@@ -80,11 +87,7 @@ impl CommandSpec {
         eprintln!("ci subprocess deadline: {:?}", self.deadline);
         let mut command = Command::new(&self.program);
         command.args(&self.arguments).current_dir(&self.current_dir);
-        if self.credential_policy == CredentialPolicy::RemoveInherited {
-            command
-                .env_remove("CARGO_REGISTRY_TOKEN")
-                .env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
-        }
+        self.apply_environment(&mut command);
         run_with_deadline(&mut command, self.deadline).map_err(Into::into)
     }
 }

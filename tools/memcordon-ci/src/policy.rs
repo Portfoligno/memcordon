@@ -100,8 +100,13 @@ fn key(name: &str) -> Value {
     Value::String(name.to_owned())
 }
 
-fn stored_token_source() -> String {
-    ["${{ secrets.", "CARGO_REGISTRY_TOKEN", " }}"].concat()
+fn token_fallback_source(release: &config::Release) -> String {
+    let secret = release
+        .registry_credentials
+        .fallback_token_secret
+        .as_deref()
+        .unwrap_or("MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK");
+    ["${{ secrets.", secret, " }}"].concat()
 }
 
 fn mapping<'a>(value: &'a Value, context: &str) -> Result<&'a Mapping> {
@@ -1160,26 +1165,47 @@ fn named_steps<'a>(jobs: &'a Mapping, job_name: &str) -> Result<BTreeMap<&'a str
     Ok(named)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn require_publication_step(
     steps: &BTreeMap<&str, &Mapping>,
     name: &str,
     condition: Option<&str>,
     source: &str,
     cargo_home: &str,
+    command: &str,
+    continue_on_error: bool,
+    id: Option<&str>,
 ) -> Result<()> {
     let step = steps
         .get(name)
         .ok_or_else(|| failure(format!("release publication step is absent: {name}")))?;
-    let expected_keys = if condition.is_some() {
-        &["name", "if", "env", "run"][..]
+    let expected_keys: Vec<&str> = if condition.is_some() {
+        let mut keys = vec!["name", "if"];
+        if id.is_some() {
+            keys.push("id");
+        }
+        if continue_on_error {
+            keys.push("continue-on-error");
+        }
+        keys.extend(["env", "run"]);
+        keys
     } else {
-        &["name", "env", "run"][..]
+        let mut keys = vec!["name"];
+        if id.is_some() {
+            keys.push("id");
+        }
+        if continue_on_error {
+            keys.push("continue-on-error");
+        }
+        keys.extend(["env", "run"]);
+        keys
     };
-    exact_mapping_keys(step, expected_keys, name)?;
+    exact_mapping_keys(step, &expected_keys, name)?;
     if scalar(step, "if") != condition
-        || step.contains_key(key("continue-on-error"))
-        || scalar(step, "run")
-            != Some("target/ci/publish-bootstrap/debug/memcordon-ci release publish-next")
+        || scalar(step, "id") != id
+        || (continue_on_error
+            && step.get(key("continue-on-error")).and_then(Value::as_bool) != Some(true))
+        || scalar(step, "run") != Some(command)
     {
         return Err(failure(format!(
             "release publication step shape differs: {name}"
@@ -1203,6 +1229,81 @@ fn require_publication_step(
         )));
     }
     Ok(())
+}
+
+fn attempt_oidc_run_command(slot: usize) -> String {
+    format!(
+        "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot {slot}"
+    )
+}
+
+fn require_oidc_attempt_step(
+    steps: &BTreeMap<&str, &Mapping>,
+    slot: usize,
+    action_id: &str,
+    continue_on_error: bool,
+) -> Result<()> {
+    let expected_id = format!("publish_oidc_{slot}");
+    require_publication_step(
+        steps,
+        &format!("Attempt crates.io OIDC publication in slot {slot}"),
+        None,
+        &format!("${{{{ steps.{action_id}.outputs.token }}}}"),
+        &format!("target/ci/cargo-publish-home/slot-{slot}"),
+        &attempt_oidc_run_command(slot),
+        continue_on_error,
+        Some(expected_id.as_str()),
+    )
+}
+
+fn require_fallback_authorization_step(
+    steps: &BTreeMap<&str, &Mapping>,
+    slot: usize,
+) -> Result<()> {
+    let name = format!("Authorize new-crate token fallback in slot {slot}");
+    let step = steps
+        .get(name.as_str())
+        .ok_or_else(|| failure(format!("release fallback step is absent: {name}")))?;
+    exact_mapping_keys(step, &["name", "id", "if", "run"], &name)?;
+    let expected_id = format!("authorize_fallback_{slot}");
+    let expected_condition = format!("steps.publish_oidc_{slot}.outcome == 'failure'");
+    let expected_run = format!(
+        "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot {slot}"
+    );
+    if scalar(step, "id") != Some(expected_id.as_str())
+        || scalar(step, "if") != Some(expected_condition.as_str())
+        || scalar(step, "run") != Some(expected_run.as_str())
+        || step.contains_key(key("continue-on-error"))
+        || step.contains_key(key("env"))
+    {
+        return Err(failure(format!(
+            "release fallback authorization step shape differs: {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_token_fallback_step(
+    steps: &BTreeMap<&str, &Mapping>,
+    slot: usize,
+    fallback_source: &str,
+) -> Result<()> {
+    let condition = format!(
+        "steps.authorize_fallback_{slot}.outcome == 'success' && steps.authorize_fallback_{slot}.outputs.authorized == 'true'"
+    );
+    let command = format!(
+        "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot {slot}"
+    );
+    require_publication_step(
+        steps,
+        &format!("Publish new crate with fallback credential in slot {slot}"),
+        Some(condition.as_str()),
+        fallback_source,
+        &format!("target/ci/cargo-publish-home/slot-{slot}"),
+        &command,
+        false,
+        None,
+    )
 }
 
 fn require_oidc_step(
@@ -1281,32 +1382,49 @@ fn check_release_credentials(
         "Finalize GitHub release",
         "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github",
     )?;
-    let mut previous_publish_position = None;
+    let fallback_profile = release.registry_credentials.policy
+        == config::RegistryCredentialPolicy::OidcFirstNewCrateFallback;
+    let fallback_source = token_fallback_source(release);
+    let mut previous_group_end = None;
     for slot in 1..=release.publish_packages.len() {
         let acquire_name = format!("Acquire crates.io token for publication slot {slot}");
-        let publish_name = format!("Publish next crate in slot {slot}");
+        let attempt_name = format!("Attempt crates.io OIDC publication in slot {slot}");
+        let authorize_name = format!("Authorize new-crate token fallback in slot {slot}");
+        let token_name = format!("Publish new crate with fallback credential in slot {slot}");
+        let mut group: Vec<&str> = vec![acquire_name.as_str(), attempt_name.as_str()];
+        if fallback_profile {
+            group.push(authorize_name.as_str());
+            group.push(token_name.as_str());
+        }
         let acquire_position = ordered_names
             .iter()
             .position(|name| *name == Some(acquire_name.as_str()))
             .ok_or_else(|| failure(format!("crates.io OIDC step is absent: {acquire_name}")))?;
-        if ordered_names.get(acquire_position + 1).copied() != Some(Some(publish_name.as_str())) {
+        let observed_group: Vec<Option<&str>> = (0..group.len())
+            .map(|offset| {
+                ordered_names
+                    .get(acquire_position + offset)
+                    .copied()
+                    .flatten()
+            })
+            .collect();
+        let expected_group: Vec<Option<&str>> = group.iter().map(|name| Some(*name)).collect();
+        if observed_group != expected_group {
             return Err(failure(format!(
-                "crates.io publication slot {slot} is not an adjacent acquire/publish pair"
+                "crates.io publication slot {slot} is not an adjacent credential group"
             )));
         }
-        if previous_publish_position.is_some_and(|position| acquire_position <= position) {
+        if previous_group_end.is_some_and(|position| acquire_position <= position) {
             return Err(failure("crates.io publication slots are out of order"));
         }
-        previous_publish_position = Some(acquire_position + 1);
+        previous_group_end = Some(acquire_position + group.len() - 1);
         let action_id = format!("crates_auth_{slot}");
         require_oidc_step(&steps, &acquire_name, None, &action_id, auth_action)?;
-        require_publication_step(
-            &steps,
-            &publish_name,
-            None,
-            &format!("${{{{ steps.{action_id}.outputs.token }}}}"),
-            &format!("target/ci/cargo-publish-home/slot-{slot}"),
-        )?;
+        require_oidc_attempt_step(&steps, slot, &action_id, fallback_profile)?;
+        if fallback_profile {
+            require_fallback_authorization_step(&steps, slot)?;
+            require_token_fallback_step(&steps, slot, &fallback_source)?;
+        }
     }
     let oidc_count = steps
         .values()
@@ -1316,11 +1434,14 @@ fn check_release_credentials(
         return Err(failure("crates.io OIDC action slot count differs"));
     }
     let github_credential_steps = ["Stage GitHub draft and assets", "Finalize GitHub release"];
+    let expected_environment_steps = github_credential_steps.len()
+        + release.publish_packages.len()
+        + usize::from(fallback_profile) * release.publish_packages.len();
     if steps
         .values()
         .filter(|step| step.contains_key(key("env")))
         .count()
-        != release.publish_packages.len() + github_credential_steps.len()
+        != expected_environment_steps
     {
         return Err(failure(
             "publish job credential mapping count differs from profile",
@@ -1368,7 +1489,8 @@ fn check_release_structure(
             .ok_or_else(|| failure("release dispatch lacks inputs"))?,
         "release inputs",
     )?;
-    exact_mapping_keys(inputs, &["tag"], "release inputs")?;
+    let input_names: Vec<&str> = vec!["tag"];
+    exact_mapping_keys(inputs, &input_names, "release inputs")?;
     let tag = mapping(
         inputs
             .get(key("tag"))
@@ -1914,7 +2036,7 @@ fn validate_workflow_bytes_into(
                 serde_yaml::to_string(with).is_ok_and(|text| {
                     text.contains("CARGO_REGISTRY_TOKEN")
                         || text.contains("CARGO_REGISTRIES_CRATES_IO_TOKEN")
-                        || text.contains(&stored_token_source())
+                        || text.contains("secrets.")
                 })
             }) {
                 return Err(failure(
@@ -2053,27 +2175,43 @@ fn validate_workflow_bytes_into(
         if text.contains("release-bootstrap") || text.contains("bootstrap-crates") {
             return Err(failure("obsolete crates.io bootstrap path is forbidden"));
         }
-        let publication_slots = release.publish_packages.len();
-        if text.matches("CARGO_REGISTRIES_CRATES_IO_TOKEN").count() != publication_slots {
-            return Err(failure(
-                "release credential text occurs outside exact step-local mappings",
-            ));
-        }
-        if text.contains("CARGO_REGISTRY_TOKEN")
-            || text.contains(&stored_token_source())
-            || text.matches("release publish-next").count() != publication_slots
-            || text.matches("outputs.token").count() != publication_slots
-            || text.contains("secrets.")
-        {
-            return Err(failure(
-                "release publication or credential source occurs outside canonical slots",
-            ));
-        }
-        if text.contains("stored-token") || text.contains("oidc-fallback") {
-            return Err(failure(
-                "steady-state workflow retains transition credential literals",
-            ));
-        }
+        check_release_workflow_text(text, &release)?;
+    }
+    Ok(())
+}
+
+fn check_release_workflow_text(text: &str, release: &config::Release) -> Result<()> {
+    let publication_slots = release.publish_packages.len();
+    let fallback_profile = release.registry_credentials.policy
+        == config::RegistryCredentialPolicy::OidcFirstNewCrateFallback;
+    let expected_credential_variables =
+        publication_slots + usize::from(fallback_profile) * publication_slots;
+    if text.matches("CARGO_REGISTRIES_CRATES_IO_TOKEN").count() != expected_credential_variables {
+        return Err(failure(
+            "release credential text occurs outside exact step-local mappings",
+        ));
+    }
+    if text.contains("CARGO_REGISTRY_TOKEN")
+        || text.matches("release attempt-oidc").count() != publication_slots
+        || text.matches("outputs.token").count() != publication_slots
+        || text.contains("publish-next")
+        || text.contains("publish-bridge")
+        || text.contains("registry_auth")
+        || text.matches("release authorize-new-crate-fallback").count()
+            != usize::from(fallback_profile) * publication_slots
+        || text.matches("release publish-token-fallback").count()
+            != usize::from(fallback_profile) * publication_slots
+        || text.matches("secrets.").count() != usize::from(fallback_profile) * publication_slots
+        || text.contains(&token_fallback_source(release)) != fallback_profile
+    {
+        return Err(failure(
+            "release publication or credential source occurs outside canonical slots",
+        ));
+    }
+    if !fallback_profile && (text.contains("stored-token") || text.contains("oidc-fallback")) {
+        return Err(failure(
+            "steady-state workflow retains transition credential literals",
+        ));
     }
     Ok(())
 }
@@ -2386,6 +2524,13 @@ fn check_manifests(root: &Path, policy: &config::Policy) -> Result<()> {
             "release and workspace publish package orders differ",
         ));
     }
+    let workspace_version = metadata
+        .packages
+        .iter()
+        .find(|package| package.name.as_str() == "memcordon")
+        .map(|package| package.version.clone())
+        .ok_or_else(|| failure("workspace version is unavailable"))?;
+    config::validate_registry_credentials(&release, &workspace_version)?;
     config::publish_order(&metadata, &release.publish_packages)?;
     let packages: BTreeMap<&str, &cargo_metadata::Package> = metadata
         .packages
@@ -2844,6 +2989,7 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
 
 pub fn run(root: &Path) -> Result<()> {
     let policy = config::policy(root)?;
+    let release = config::release(root)?;
     for command in &policy.workflow.allowed_run_commands {
         if !static_run_command(command) {
             return Err(failure(format!(
@@ -2866,19 +3012,32 @@ pub fn run(root: &Path) -> Result<()> {
             "temporary release bootstrap workflow must be removed in steady state",
         ));
     }
-    let stored_secret_source = ["secrets.", "CARGO_REGISTRY_TOKEN"].concat();
+    let legacy_secret_source = ["${{ secrets.", "CARGO_REGISTRY_TOKEN", " }}"].concat();
+    let fallback_secret_source = token_fallback_source(&release);
     for relative in &files {
         let bytes = fs::read(root.join(relative))?;
         if let Ok(text) = std::str::from_utf8(&bytes) {
-            if text.contains(&stored_secret_source) {
+            if text.contains(legacy_secret_source.as_str()) {
                 return Err(failure(format!(
-                    "stored crates.io token source remains: {relative:?}"
+                    "legacy broad crates.io token source remains: {relative:?}"
+                )));
+            }
+            let fallback_source_permitted = release.registry_credentials.policy
+                == config::RegistryCredentialPolicy::OidcFirstNewCrateFallback
+                && (relative == Path::new(".github/workflows/release.yml")
+                    || relative == Path::new("ci/policy.toml"));
+            if text.contains(&fallback_secret_source) && !fallback_source_permitted {
+                return Err(failure(format!(
+                    "new-crate fallback token source appears outside its exact policy: {relative:?}"
                 )));
             }
             if text.contains("CARGO_REGISTRY_TOKEN")
                 && relative != Path::new("tools/memcordon-ci/src/command.rs")
                 && relative != Path::new("tools/memcordon-ci/src/policy.rs")
                 && relative != Path::new("tools/memcordon-ci/src/release.rs")
+                && relative != Path::new("tools/memcordon-ci/tests/command.rs")
+                && relative != Path::new("RELEASING.md")
+                && relative != Path::new("MAINTAINERS.md")
             {
                 return Err(failure(format!(
                     "legacy crates.io token interface remains outside negative policy assertions: {relative:?}"
@@ -2927,7 +3086,12 @@ pub fn run(root: &Path) -> Result<()> {
         .iter()
         .filter(|definition| definition.file == ".github/workflows/release.yml")
         .collect();
-    let expected_release_environment_count = 3 + policy.workspace.publish_packages.len() * 2;
+    let fallback_environment_slots = usize::from(
+        release.registry_credentials.policy
+            == config::RegistryCredentialPolicy::OidcFirstNewCrateFallback,
+    ) * policy.workspace.publish_packages.len();
+    let expected_release_environment_count =
+        3 + policy.workspace.publish_packages.len() * 2 + fallback_environment_slots * 2;
     if release_environment.len() != expected_release_environment_count {
         return Err(failure(
             "release workflow step-local environment mapping count does not match the publish package set",
@@ -3018,35 +3182,39 @@ jobs:
       - name: Acquire crates.io token for publication slot 1
         id: crates_auth_1
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Publish next crate in slot 1
+      - name: Attempt crates.io OIDC publication in slot 1
+        id: publish_oidc_1
         env:
           CARGO_HOME: target/ci/cargo-publish-home/slot-1
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_1.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 1
       - name: Acquire crates.io token for publication slot 2
         id: crates_auth_2
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Publish next crate in slot 2
+      - name: Attempt crates.io OIDC publication in slot 2
+        id: publish_oidc_2
         env:
           CARGO_HOME: target/ci/cargo-publish-home/slot-2
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_2.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 2
       - name: Acquire crates.io token for publication slot 3
         id: crates_auth_3
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Publish next crate in slot 3
+      - name: Attempt crates.io OIDC publication in slot 3
+        id: publish_oidc_3
         env:
           CARGO_HOME: target/ci/cargo-publish-home/slot-3
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_3.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 3
       - name: Acquire crates.io token for publication slot 4
         id: crates_auth_4
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
-      - name: Publish next crate in slot 4
+      - name: Attempt crates.io OIDC publication in slot 4
+        id: publish_oidc_4
         env:
           CARGO_HOME: target/ci/cargo-publish-home/slot-4
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_4.outputs.token }}
-        run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-next
+        run: target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 4
       - name: Finalize GitHub release
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -3083,10 +3251,6 @@ jobs:
                 .get_mut(key("jobs"))
                 .and_then(Value::as_mapping_mut)
                 .ok_or_else(|| failure("release jobs are absent"))?;
-            // The steady-state fixture exercises publication authentication.
-            // Keep the production public-verification matrix intact so its
-            // independently strict Windows x64/ARM64 structure is still
-            // checked by check_release_structure.
             let job_name = "publish";
             jobs.insert(
                 key(job_name),
@@ -3103,13 +3267,70 @@ jobs:
                 .ok_or_else(|| failure("release jobs are absent"))?,
             "release jobs",
         )?;
-        let release = config::release(&root)?;
+        let mut release = config::release(&root)?;
+        release.registry_credentials.policy = config::RegistryCredentialPolicy::OidcOnly;
+        release.registry_credentials.fallback_version = None;
+        release.registry_credentials.fallback_token_secret = None;
         let toolchains = config::toolchains(&root)?;
         check_release_structure(workflow, jobs, &release, &toolchains, AUTH_ACTION)
     }
 
+    fn steady_cleanup_configuration() -> Result<(String, config::Release)> {
+        let root = repository_root();
+        let fixture: Value = serde_yaml::from_str(steady_workflow_fixture())?;
+        let fixture_workflow = mapping(&fixture, "steady workflow")?;
+        let fixture_jobs = mapping(
+            fixture_workflow
+                .get(key("jobs"))
+                .ok_or_else(|| failure("steady fixture jobs are absent"))?,
+            "steady jobs",
+        )?;
+        let mut document: Value =
+            serde_yaml::from_slice(include_bytes!("../../../.github/workflows/release.yml"))?;
+        let workflow = document
+            .as_mapping_mut()
+            .ok_or_else(|| failure("release workflow must be a mapping"))?;
+        workflow.insert(
+            key("on"),
+            fixture_workflow
+                .get(key("on"))
+                .ok_or_else(|| failure("steady fixture events are absent"))?
+                .clone(),
+        );
+        let jobs = workflow
+            .get_mut(key("jobs"))
+            .and_then(Value::as_mapping_mut)
+            .ok_or_else(|| failure("release jobs are absent"))?;
+        jobs.insert(
+            key("publish"),
+            fixture_jobs
+                .get(key("publish"))
+                .ok_or_else(|| failure("steady publish job is absent"))?
+                .clone(),
+        );
+        let text = serde_yaml::to_string(&document)?;
+        let mut release = config::release(&root)?;
+        release.registry_credentials.policy = config::RegistryCredentialPolicy::OidcOnly;
+        release.registry_credentials.fallback_version = None;
+        release.registry_credentials.fallback_token_secret = None;
+        Ok((text, release))
+    }
+
+    fn legacy_token_source() -> String {
+        ["${{ secrets.", "CARGO_REGISTRY_TOKEN", " }}"].concat()
+    }
+
+    fn fallback_token_source() -> String {
+        [
+            "${{ secrets.",
+            "MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK",
+            " }}",
+        ]
+        .concat()
+    }
+
     #[test]
-    fn exact_oidc_only_workflow_profile_is_accepted() {
+    fn exact_fallback_and_cleanup_workflow_profiles_are_accepted() {
         let root = repository_root();
         let policy = config::policy(&root).expect("repository policy should parse");
         validate_workflow_bytes(
@@ -3118,7 +3339,7 @@ jobs:
             include_bytes!("../../../.github/workflows/release.yml"),
             &policy,
         )
-        .expect("OIDC-only workflow should satisfy production policy");
+        .expect("generic OIDC-first fallback workflow should satisfy production policy");
         check_steady_fixture(steady_workflow_fixture())
             .expect("cleanup steady-state workflow should satisfy structure policy");
     }
@@ -3126,8 +3347,12 @@ jobs:
     #[test]
     fn steady_profile_rejects_noncanonical_oidc_slots_and_token_reintroduction() {
         let with_input = steady_workflow_fixture().replacen(
-            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18\n",
-            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18\n        with:\n          url: https://example.invalid\n",
+            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+",
+            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+        with:
+          url: https://example.invalid
+",
             1,
         );
         assert!(check_steady_fixture(&with_input).is_err());
@@ -3140,58 +3365,105 @@ jobs:
         assert!(check_steady_fixture(&wrong_output).is_err());
 
         let separated_pair = steady_workflow_fixture().replacen(
-            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18\n      - name: Publish next crate in slot 1\n",
-            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18\n      - run: rustup toolchain install 1.97.1 --profile minimal\n      - name: Publish next crate in slot 1\n",
+            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+      - name: Attempt crates.io OIDC publication in slot 1
+",
+            "        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Attempt crates.io OIDC publication in slot 1
+",
             1,
         );
         assert!(check_steady_fixture(&separated_pair).is_err());
 
         let stored = steady_workflow_fixture().replacen(
             "${{ steps.crates_auth_1.outputs.token }}",
-            &stored_token_source(),
+            &fallback_token_source(),
             1,
         );
         assert!(check_steady_fixture(&stored).is_err());
 
         let missing_github_mapping = steady_workflow_fixture().replacen(
-            "      - name: Stage GitHub draft and assets\n",
-            "      - name: Stage mapping removed\n",
+            "      - name: Stage GitHub draft and assets
+",
+            "      - name: Stage mapping removed
+",
             1,
         );
         assert!(check_steady_fixture(&missing_github_mapping).is_err());
     }
 
     #[test]
-    fn oidc_only_profile_rejects_legacy_token_and_transition_input() {
+    fn fallback_profile_rejects_unbounded_or_cross_wired_credentials() {
         let root = repository_root();
         let policy = config::policy(&root).expect("repository policy should parse");
         let exact = std::str::from_utf8(include_bytes!("../../../.github/workflows/release.yml"))
             .expect("workflow should be UTF-8")
             .replace("\r\n", "\n");
-        let legacy_environment = format!(
-            "        env:\n          CARGO_REGISTRY_TOKEN: {}\n",
-            stored_token_source()
+        let without_continue = exact.replacen("        continue-on-error: true\n", "", 1);
+        let authorizer_step = "      - name: Authorize new-crate token fallback in slot 3\n";
+        let continued_authorizer = exact.replacen(
+            authorizer_step,
+            format!("{authorizer_step}        continue-on-error: true\n").as_str(),
+            1,
         );
-        let transition_input =
-            "      registry_auth:\n        required: true\n        type: choice\n";
-        for (case, invalid) in [
-            (
-                "legacy stored credential",
-                exact.replacen(
-                    "        env:\n          CARGO_HOME: target/ci/cargo-publish-home/slot-1\n          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_1.outputs.token }}\n",
-                    &legacy_environment,
-                    1,
-                ),
-            ),
-            (
-                "retired transition input",
-                exact.replacen(
-                    "  workflow_dispatch:\n    inputs:\n",
-                    &format!("  workflow_dispatch:\n    inputs:\n{transition_input}"),
-                    1,
-                ),
-            ),
-        ] {
+        let token_step = "      - name: Publish new crate with fallback credential in slot 3\n";
+        let continued_token = exact.replacen(
+            token_step,
+            format!("{token_step}        continue-on-error: true\n").as_str(),
+            1,
+        );
+        let broadened_condition = exact.replacen(
+            "steps.authorize_fallback_3.outcome == 'success' && steps.authorize_fallback_3.outputs.authorized == 'true'",
+            "steps.authorize_fallback_3.outcome == 'success'",
+            1,
+        );
+        let cross_wired_source = exact.replacen(
+            fallback_token_source().as_str(),
+            "${{ steps.crates_auth_3.outputs.token }}",
+            1,
+        );
+        let package_named_step = exact.replacen(
+            "Publish new crate with fallback credential in slot 3",
+            "Publish new memcordon-windows-launch-core in slot 3",
+            1,
+        );
+        let authorizer_environment = exact.replacen(
+            "      - name: Authorize new-crate token fallback in slot 3\n        id: authorize_fallback_3\n",
+            "      - name: Authorize new-crate token fallback in slot 3\n        id: authorize_fallback_3\n        env:\n          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates_auth_3.outputs.token }}\n",
+            1,
+        );
+        let transition_input = "      registry_auth:\n        required: true\n        type: choice\n        options:\n          - stored-token\n";
+        let with_transition_input = exact.replacen(
+            "  workflow_dispatch:\n    inputs:\n",
+            format!("  workflow_dispatch:\n    inputs:\n{transition_input}").as_str(),
+            1,
+        );
+        let legacy_variable = exact.replacen(
+            format!(
+                "          CARGO_HOME: target/ci/cargo-publish-home/slot-3\n          CARGO_REGISTRIES_CRATES_IO_TOKEN: {}",
+                fallback_token_source()
+            )
+            .as_str(),
+            format!(
+                "          CARGO_HOME: target/ci/cargo-publish-home/slot-3\n          CARGO_REGISTRIES_CRATES_IO_TOKEN: {}",
+                legacy_token_source()
+            )
+            .as_str(),
+            1,
+        );
+        let cases = [
+            ("OIDC attempt loses continue-on-error", without_continue),
+            ("continued authorizer", continued_authorizer),
+            ("continued token publication", continued_token),
+            ("broadened token condition", broadened_condition),
+            ("cross-wired token source", cross_wired_source),
+            ("package-named credential step", package_named_step),
+            ("authorizer gains credentials", authorizer_environment),
+            ("transition dispatch input", with_transition_input),
+            ("legacy singular-token variable", legacy_variable),
+        ];
+        for (case, invalid) in cases {
             assert_ne!(invalid, exact, "{case} fixture mutation must apply");
             assert!(
                 validate_workflow_bytes(
@@ -3202,6 +3474,58 @@ jobs:
                 )
                 .is_err(),
                 "{case} fixture must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_profile_rejects_transition_inputs_and_stored_tokens() {
+        let transition_input = "      registry_auth:\n        required: true\n        type: choice\n        options:\n          - stored-token\n          - oidc-fallback\n";
+        let with_transition_input = steady_workflow_fixture().replacen(
+            "  workflow_dispatch:\n    inputs:\n",
+            format!("  workflow_dispatch:\n    inputs:\n{transition_input}").as_str(),
+            1,
+        );
+        assert!(check_steady_fixture(&with_transition_input).is_err());
+
+        let with_stored_token = steady_workflow_fixture().replacen(
+            "${{ steps.crates_auth_1.outputs.token }}",
+            fallback_token_source().as_str(),
+            1,
+        );
+        assert!(check_steady_fixture(&with_stored_token).is_err());
+    }
+
+    #[test]
+    fn cleanup_policy_text_rejects_stale_transition_commands_and_sources() {
+        let (clean_text, release) = steady_cleanup_configuration()
+            .expect("steady cleanup configuration should be constructible");
+        check_release_workflow_text(&clean_text, &release)
+            .expect("the cleaned workflow should satisfy the OIDC-only text policy");
+
+        let stale_command = format!(
+            "{clean_text}# stale target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 1 command\n"
+        );
+        let stale_authorizer = format!(
+            "{clean_text}# stale target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 1 command\n"
+        );
+        let stale_secret = format!(
+            "{clean_text}# stale ${{{{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}}} mapping\n"
+        );
+        let stale_variable =
+            format!("{clean_text}# stale CARGO_REGISTRIES_CRATES_IO_TOKEN mapping\n");
+        let stale_literal = format!("{clean_text}# stale stored-token literal\n");
+        for (case, invalid) in [
+            ("token-fallback command", stale_command),
+            ("fallback authorizer command", stale_authorizer),
+            ("fallback secret source", stale_secret),
+            ("extra credential variable", stale_variable),
+            ("transition literal", stale_literal),
+        ] {
+            assert_ne!(invalid, clean_text, "{case} mutation must apply");
+            assert!(
+                check_release_workflow_text(&invalid, &release).is_err(),
+                "{case} must be rejected under the OIDC-only cleanup policy"
             );
         }
     }

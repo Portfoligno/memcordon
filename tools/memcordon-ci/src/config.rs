@@ -181,6 +181,7 @@ pub struct Release {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RegistryCredentialPolicy {
+    OidcFirstNewCrateFallback,
     OidcOnly,
 }
 
@@ -188,6 +189,95 @@ pub enum RegistryCredentialPolicy {
 #[serde(deny_unknown_fields)]
 pub struct RegistryCredentials {
     pub policy: RegistryCredentialPolicy,
+    pub fallback_version: Option<semver::Version>,
+    pub fallback_token_secret: Option<String>,
+}
+
+pub fn validate_registry_credentials(
+    release: &Release,
+    workspace_version: &semver::Version,
+) -> Result<()> {
+    let credentials = &release.registry_credentials;
+    if release.publish_packages.is_empty() {
+        return Err(crate::CiError::Message(
+            "release publish package list must not be empty".to_owned(),
+        ));
+    }
+    let mut configured_set = BTreeSet::new();
+    if !release
+        .publish_packages
+        .iter()
+        .all(|package| configured_set.insert(package.as_str()))
+    {
+        return Err(crate::CiError::Message(
+            "release publish package list contains duplicates".to_owned(),
+        ));
+    }
+    if release.registry != "crates-io" {
+        return Err(crate::CiError::Message(
+            "registry credentials apply only to crates.io".to_owned(),
+        ));
+    }
+    match credentials.policy {
+        RegistryCredentialPolicy::OidcFirstNewCrateFallback => {
+            let fallback_version = credentials.fallback_version.as_ref().ok_or_else(|| {
+                crate::CiError::Message(
+                    "OIDC-first new-crate fallback requires an exact fallback version".to_owned(),
+                )
+            })?;
+            let fallback_token_secret =
+                credentials
+                    .fallback_token_secret
+                    .as_deref()
+                    .ok_or_else(|| {
+                        crate::CiError::Message(
+                        "OIDC-first new-crate fallback requires an exact repository secret name"
+                            .to_owned(),
+                    )
+                    })?;
+            if !fallback_version.build.is_empty() {
+                return Err(crate::CiError::Message(
+                    "new-crate fallback version must be build-free".to_owned(),
+                ));
+            }
+            if fallback_version
+                .pre
+                .as_str()
+                .split('.')
+                .any(|identifier| identifier == "dev")
+            {
+                return Err(crate::CiError::Message(
+                    "new-crate fallback version may not use the development pre-release".to_owned(),
+                ));
+            }
+            if fallback_token_secret != "MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK" {
+                return Err(crate::CiError::Message(
+                    "new-crate fallback repository secret differs".to_owned(),
+                ));
+            }
+            let matching_development = workspace_version.pre.as_str() == "dev"
+                && workspace_version.major == fallback_version.major
+                && workspace_version.minor == fallback_version.minor
+                && workspace_version.patch == fallback_version.patch;
+            if (workspace_version != fallback_version && !matching_development)
+                || !workspace_version.build.is_empty()
+            {
+                return Err(crate::CiError::Message(
+                    "workspace version differs from the bounded new-crate fallback release"
+                        .to_owned(),
+                ));
+            }
+        }
+        RegistryCredentialPolicy::OidcOnly => {
+            if credentials.fallback_version.is_some() || credentials.fallback_token_secret.is_some()
+            {
+                return Err(crate::CiError::Message(
+                    "OIDC-only credentials must not retain fallback fields".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -426,22 +516,6 @@ fn validate_target_executables(target: &AssetTarget, sealed: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn credential_configuration_is_closed_to_oidc_only() {
-        toml::from_str::<RegistryCredentials>("policy = \"oidc-only\"\n")
-            .expect("OIDC-only credentials should parse");
-        for legacy in [
-            "policy = \"arbitrary-provider\"\n",
-            "policy = \"first-release-token-primary\"\nfirst_release_version = \"0.1.3\"\n",
-            "policy = \"oidc-only\"\nfirst_release_version = \"0.1.3\"\n",
-        ] {
-            assert!(
-                toml::from_str::<RegistryCredentials>(legacy).is_err(),
-                "legacy credential configuration unexpectedly parsed"
-            );
-        }
-    }
 
     #[test]
     fn release_configuration_rejects_removed_eligibility_fields() {

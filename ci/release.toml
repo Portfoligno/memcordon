@@ -8,7 +8,9 @@ maximum_package_bytes = 10485760
 maximum_asset_bytes = 134217728
 
 [registry_credentials]
-policy = "oidc-only"
+policy = "oidc-first-new-crate-fallback"
+fallback_version = "0.5.2"
+fallback_token_secret = "MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK"
 
 [assets]
 output_directory = "target/ci/release-bundle"

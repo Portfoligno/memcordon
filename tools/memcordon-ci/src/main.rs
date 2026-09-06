@@ -5,10 +5,34 @@ mod sealed_linux;
 mod sealed_windows;
 mod suites;
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use memcordon_ci::{CiError, Result, command, config, policy};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProviderOrigin {
+    Oidc,
+    NewCrateToken,
+}
+
+impl ProviderOrigin {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "oidc" => Some(Self::Oidc),
+            "new-crate-token" => Some(Self::NewCrateToken),
+            _ => None,
+        }
+    }
+
+    fn release_origin(self) -> release::CredentialOrigin {
+        match self {
+            Self::Oidc => release::CredentialOrigin::Oidc,
+            Self::NewCrateToken => release::CredentialOrigin::NewCrateToken,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -16,8 +40,13 @@ use memcordon_ci::{CiError, Result, command, config, policy};
     about = "Typed MemCordon CI and release orchestrator"
 )]
 struct Cli {
-    #[arg(long, hide = true)]
-    cargo_plugin: bool,
+    #[arg(
+        long,
+        hide = true,
+        num_args = 5,
+        value_names = ["ORIGIN", "PUBLICATION_SLOT", "CRATE", "VERSION", "ARCHIVE_SHA256"]
+    )]
+    cargo_plugin: Option<Vec<String>>,
     #[command(subcommand)]
     command: Option<TopLevel>,
 }
@@ -29,8 +58,8 @@ enum TopLevel {
         suite: Suite,
     },
     Release {
-        #[arg(value_enum)]
-        phase: ReleasePhase,
+        #[command(subcommand)]
+        command: ReleaseCommand,
     },
     #[command(hide = true)]
     DelegatedLinuxCertification {
@@ -67,11 +96,22 @@ enum Suite {
     ReleaseMacos,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ReleasePhase {
+#[derive(Debug, Subcommand)]
+enum ReleaseCommand {
     Assemble,
     StageGithub,
-    PublishNext,
+    AttemptOidc {
+        #[arg(long)]
+        publication_slot: NonZeroUsize,
+    },
+    AuthorizeNewCrateFallback {
+        #[arg(long)]
+        publication_slot: NonZeroUsize,
+    },
+    PublishTokenFallback {
+        #[arg(long)]
+        publication_slot: NonZeroUsize,
+    },
     VerifyCrates,
     FinalizeGithub,
     VerifyPublic,
@@ -94,10 +134,31 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let root = workspace_root(&std::env::current_dir()?)?;
     match (cli.cargo_plugin, cli.command) {
-        (true, None) => release::cargo_credential_provider(&root),
-        (false, Some(TopLevel::Suite { suite })) => suites::run(&root, suite),
-        (false, Some(TopLevel::Release { phase })) => release::run(&root, phase),
-        (false, Some(TopLevel::DelegatedLinuxCertification { rustup, uid })) => {
+        (Some(binding), None) => {
+            let [origin, publication_slot, name, version, archive_sha256] = binding.as_slice()
+            else {
+                return Err(CiError::Message(
+                    "Cargo credential provider requires exactly five identity values".to_owned(),
+                ));
+            };
+            let origin = ProviderOrigin::parse(origin).ok_or_else(|| {
+                CiError::Message(format!("unknown credential-provider origin: {origin}"))
+            })?;
+            let publication_slot = publication_slot
+                .parse::<NonZeroUsize>()
+                .map_err(|error| CiError::Message(format!("invalid publication slot: {error}")))?;
+            release::cargo_credential_provider(
+                &root,
+                origin.release_origin(),
+                publication_slot,
+                name,
+                version,
+                archive_sha256,
+            )
+        }
+        (None, Some(TopLevel::Suite { suite })) => suites::run(&root, suite),
+        (None, Some(TopLevel::Release { command })) => release::run(&root, command),
+        (None, Some(TopLevel::DelegatedLinuxCertification { rustup, uid })) => {
             suites::delegated_linux_certification(&root, &rustup, &uid)
         }
         _ => Err(CiError::Message(
