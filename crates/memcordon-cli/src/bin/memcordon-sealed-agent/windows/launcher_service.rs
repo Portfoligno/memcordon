@@ -9,11 +9,16 @@ use memcordon_core::{
     RestartSafetyProof, RunOutcome, WINDOWS_CONTROL_SERVICE_NAME, WINDOWS_LAUNCHER_PIPE,
     WINDOWS_LAUNCHER_SERVICE_NAME, WINDOWS_PRIVATE_PROTOCOL_VERSION,
     WindowsCleanupProcessCreationEvidenceV1, WindowsLaunchBrokerRequestV1,
-    WindowsLauncherRequestV1, WindowsLauncherResponseV1, WindowsSealedEvidenceV2,
-    WindowsSealedFault, WindowsTerminalReceiptV1,
+    WindowsLauncherRequestV1, WindowsLauncherResponseV1, WindowsProviderReplacementQuiescenceV1,
+    WindowsSealedEvidenceV2, WindowsSealedFault, WindowsTerminalReceiptV1,
+    windows_provider_replacement_quiescence,
 };
 use windows_sys::Win32::Foundation::{
     GetLastError, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::System::JobObjects::{
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+    QueryInformationJobObject,
 };
 use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
@@ -399,6 +404,37 @@ impl JobView {
             Ok(())
         }
     }
+
+    fn active_processes(&self) -> Result<u32, String> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: the active registry owns a live Job handle and the output
+        // structure matches JobObjectBasicAccountingInformation.
+        if unsafe {
+            QueryInformationJobObject(
+                self.0.raw(),
+                JobObjectBasicAccountingInformation,
+                (&raw mut accounting).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        Ok(accounting.ActiveProcesses)
+    }
+
+    fn wait_empty(&self, deadline: Instant) -> Result<bool, String> {
+        loop {
+            if self.active_processes()? == 0 {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 static ACTIVE_JOBS: LazyLock<Mutex<Vec<ActiveJob>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -574,7 +610,7 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
             // may not have reached Membership yet, so wait for those as well as
             // workers whose Job handles have closed but terminal writes continue.
             let settlement = SETTLEMENT.settle_until(deadline, || {
-                terminate_active_jobs()?;
+                terminate_active_jobs(deadline)?;
                 super::record::admissions_empty()
             });
             let result = match &settlement {
@@ -953,7 +989,7 @@ pub(crate) fn bound_launcher_replay_failure_response_for_test(
     bound_launcher_replay_failure_response(attempt_id, nonce, request_sha256, relay_phase, error)
 }
 
-fn terminate_active_jobs() -> Result<(), String> {
+fn terminate_active_jobs(deadline: Instant) -> Result<(), String> {
     let jobs = ACTIVE_JOBS
         .lock()
         .map_err(|_| "active Job registry is poisoned".to_owned())?;
@@ -964,18 +1000,27 @@ fn terminate_active_jobs() -> Result<(), String> {
                 active.attempt_id
             )
         })?;
+        if !active.job.wait_empty(deadline)? {
+            return Err(format!(
+                "phase=wait-job-empty attempt_id={} active_processes_nonzero",
+                active.attempt_id
+            ));
+        }
     }
     Ok(())
 }
 
 fn converge_package_cleanup(deadline: Instant) -> Result<(), super::record::PackageCleanupError> {
     super::record::converge_package_cleanup(deadline)?;
-    if super::record::attempts_empty()? {
+    let attempts_empty = super::record::attempts_empty()?;
+    let quiescence = windows_provider_replacement_quiescence(true, true, attempts_empty);
+    if quiescence == WindowsProviderReplacementQuiescenceV1::ReadyForReplacement {
         Ok(())
     } else {
-        Err(super::record::PackageCleanupError::Active(
-            "phase=durable-recovery attempts_empty=false".to_owned(),
-        ))
+        Err(super::record::PackageCleanupError::Active(format!(
+            "phase={} attempts_empty={attempts_empty}",
+            quiescence.phase()
+        )))
     }
 }
 

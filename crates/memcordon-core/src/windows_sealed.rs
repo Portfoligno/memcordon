@@ -2031,6 +2031,42 @@ impl WindowsPackageCleanupOutcomeV1 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsProviderReplacementQuiescenceV1 {
+    ProviderJobsNotTerminated,
+    ProviderJobStillActive,
+    DurableRecoveryStillActive,
+    ReadyForReplacement,
+}
+
+pub fn windows_provider_replacement_quiescence(
+    provider_jobs_terminated: bool,
+    provider_jobs_observed_empty: bool,
+    durable_recovery_empty: bool,
+) -> WindowsProviderReplacementQuiescenceV1 {
+    match (
+        provider_jobs_terminated,
+        provider_jobs_observed_empty,
+        durable_recovery_empty,
+    ) {
+        (false, _, _) => WindowsProviderReplacementQuiescenceV1::ProviderJobsNotTerminated,
+        (true, false, _) => WindowsProviderReplacementQuiescenceV1::ProviderJobStillActive,
+        (true, true, false) => WindowsProviderReplacementQuiescenceV1::DurableRecoveryStillActive,
+        (true, true, true) => WindowsProviderReplacementQuiescenceV1::ReadyForReplacement,
+    }
+}
+
+impl WindowsProviderReplacementQuiescenceV1 {
+    pub fn phase(self) -> &'static str {
+        match self {
+            Self::ProviderJobsNotTerminated => "provider-jobs-not-terminated",
+            Self::ProviderJobStillActive => "provider-job-still-active",
+            Self::DurableRecoveryStillActive => "durable-recovery-still-active",
+            Self::ReadyForReplacement => "ready-for-replacement",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsAttemptRetainedV1 {

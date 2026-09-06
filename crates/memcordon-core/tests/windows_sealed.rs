@@ -6,17 +6,17 @@ use memcordon_core::{
     WindowsAttemptTerminalDispositionV1, WindowsCleanupProcessCreationEvidenceV1,
     WindowsDurableAttemptRecordV1, WindowsDurableCleanupStateV1, WindowsEnvironmentEntryV1,
     WindowsLaunchBrokerRequestV1, WindowsLauncherResponseV1, WindowsProcessIdentityV1,
-    WindowsProviderRequestV1, WindowsPublicFrameFailureV1, WindowsPublicFramePhaseV1,
-    WindowsPublicTerminalRecoveryV1, WindowsQualificationReceiptV1, WindowsRelayEventV1,
-    WindowsRelayPhaseV1, WindowsRemoteStreamV1, WindowsReplayOutboxStageV1, WindowsReplayPendingV1,
-    WindowsSealedEvidenceV2, WindowsServiceSelfAttestationV1, WindowsStreamRoleV1,
-    WindowsTerminalReceiptV1, WindowsTerminalReplayDecisionV1, WindowsTerminalRetiredV1,
-    WindowsTerminalizationCheckpointV1, WindowsTerminalizationOwnerV1,
+    WindowsProviderReplacementQuiescenceV1, WindowsProviderRequestV1, WindowsPublicFrameFailureV1,
+    WindowsPublicFramePhaseV1, WindowsPublicTerminalRecoveryV1, WindowsQualificationReceiptV1,
+    WindowsRelayEventV1, WindowsRelayPhaseV1, WindowsRemoteStreamV1, WindowsReplayOutboxStageV1,
+    WindowsReplayPendingV1, WindowsSealedEvidenceV2, WindowsServiceSelfAttestationV1,
+    WindowsStreamRoleV1, WindowsTerminalReceiptV1, WindowsTerminalReplayDecisionV1,
+    WindowsTerminalRetiredV1, WindowsTerminalizationCheckpointV1, WindowsTerminalizationOwnerV1,
     WindowsTerminalizationStatusV1, decode_windows_command_line, encode_windows_command_line,
     encode_windows_environment_block, parse_and_authenticate_windows_attempt_record,
     parse_windows_certification_frontend_handle_values, validate_windows_security_descriptor_text,
     validate_windows_stream_manifest, windows_attempt_transition_allowed,
-    windows_certification_argument_prelude_len,
+    windows_certification_argument_prelude_len, windows_provider_replacement_quiescence,
 };
 use sha2::{Digest, Sha256};
 
@@ -121,6 +121,33 @@ fn launcher_self_attestation() -> WindowsServiceSelfAttestationV1 {
             "SeTcbPrivilege".to_owned(),
         ],
     }
+}
+
+#[test]
+fn provider_replacement_requires_live_and_durable_provider_quiescence() {
+    use WindowsProviderReplacementQuiescenceV1::{
+        DurableRecoveryStillActive, ProviderJobStillActive, ProviderJobsNotTerminated,
+        ReadyForReplacement,
+    };
+
+    assert_eq!(
+        windows_provider_replacement_quiescence(false, false, false),
+        ProviderJobsNotTerminated
+    );
+    assert_eq!(
+        windows_provider_replacement_quiescence(true, false, false),
+        ProviderJobStillActive
+    );
+    assert_eq!(
+        windows_provider_replacement_quiescence(true, true, false),
+        DurableRecoveryStillActive
+    );
+    assert_eq!(
+        windows_provider_replacement_quiescence(true, true, true),
+        ReadyForReplacement
+    );
+    assert_eq!(ReadyForReplacement.phase(), "ready-for-replacement");
+    assert_eq!(ProviderJobStillActive.phase(), "provider-job-still-active");
 }
 
 #[test]

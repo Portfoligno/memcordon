@@ -12,7 +12,7 @@ use windows_sys::Win32::System::Services::{
     SERVICE_WIN32_OWN_PROCESS,
 };
 
-use crate::windows::package::remove_installed_binary_with_convergence;
+use crate::windows::package::{copy_atomically_bytes, remove_installed_binary_with_convergence};
 use crate::windows::pipe::OwnedHandle;
 use crate::windows::service_manager::{
     DependencyIntent, PinnedServiceProcess, ServiceBaseSnapshot, ServiceConfig, ServiceSidType,
@@ -389,6 +389,26 @@ fn installed_image_delete_converges_after_transient_native_sharing() {
         assert!(!image.exists());
         release.join().unwrap();
     }
+}
+
+#[test]
+fn image_replacement_waits_for_the_retired_native_image_to_become_deletable() {
+    let directory = tempfile::tempdir().unwrap();
+    let image = directory.path().join("memcordon-sealed-agent.exe");
+    std::fs::write(&image, b"previous provider image\n").unwrap();
+    let image_owner = open_without_delete_share(&image);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        drop(image_owner);
+    });
+    let started = Instant::now();
+    copy_atomically_bytes(b"replacement provider image\n", &image).unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(2));
+    assert_eq!(
+        std::fs::read(&image).unwrap(),
+        b"replacement provider image\n"
+    );
+    release.join().unwrap();
 }
 
 #[test]

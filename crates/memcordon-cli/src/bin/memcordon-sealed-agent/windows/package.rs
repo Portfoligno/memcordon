@@ -1963,11 +1963,12 @@ pub fn ephemeral_ci_enabled() -> bool {
     std::fs::read(marker).is_ok_and(|contents| contents == EPHEMERAL_CI_MARKER_CONTENTS)
 }
 
-fn copy_atomically_bytes(bytes: &[u8], destination: &Path) -> Result<(), String> {
+pub(crate) fn copy_atomically_bytes(bytes: &[u8], destination: &Path) -> Result<(), String> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 
     reject_reparse_components(destination)?;
+    remove_replaced_image_with_convergence(destination)?;
     let staged = destination.with_extension("exe.new");
     reject_reparse_components(&staged)?;
     if !path_absent_no_follow(&staged, "prepare-staged-artifact")? {
@@ -1993,6 +1994,25 @@ fn copy_atomically_bytes(bytes: &[u8], destination: &Path) -> Result<(), String>
     reject_reparse_components(&staged)?;
     super::record::replace_atomically(&staged, destination)?;
     reject_reparse_components(destination)
+}
+
+fn remove_replaced_image_with_convergence(destination: &Path) -> Result<(), String> {
+    if path_absent_no_follow(destination, "retire-replaced-image")? {
+        return Ok(());
+    }
+    let metadata = std::fs::symlink_metadata(destination).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "MCSEALED-WINDOWS-ARTIFACT: phase=retire-replaced-image path={} expected=regular-file actual={}",
+            destination.display(),
+            file_kind(&metadata)
+        ));
+    }
+    remove_installed_binary_with_convergence(
+        destination,
+        IMAGE_DELETE_DEADLINE,
+        IMAGE_DELETE_RETRY_INTERVAL,
+    )
 }
 
 fn create_secure_directory(
