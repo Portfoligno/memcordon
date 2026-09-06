@@ -3597,10 +3597,11 @@ fn sparse_index_path(name: &str) -> Result<String> {
         return Err(failure("crate name is invalid for sparse-index lookup"));
     }
     let length = name.len();
-    Ok(if length < 4 {
-        format!("{length}/{name}")
-    } else {
-        format!("{}/{}/{}", &name[..2], &name[2..4], name)
+    Ok(match length {
+        1 => format!("1/{name}"),
+        2 => format!("2/{name}"),
+        3 => format!("3/{}/{}", &name[..1], name),
+        _ => format!("{}/{}/{}", &name[..2], &name[2..4], name),
     })
 }
 
@@ -3673,21 +3674,6 @@ fn crate_version_state(
     crate_version_state_at(release, &HttpEndpoints::production(), name, version)
 }
 
-fn public_crate_archive(
-    release: &config::Release,
-    name: &str,
-    version: &str,
-    destination: &Path,
-) -> Result<()> {
-    public_crate_archive_at(
-        release,
-        &HttpEndpoints::production(),
-        name,
-        version,
-        destination,
-    )
-}
-
 fn public_crate_archive_at(
     release: &config::Release,
     endpoints: &HttpEndpoints,
@@ -3721,7 +3707,15 @@ fn verify_public_crate(
     release: &config::Release,
     record: &CrateRecord,
 ) -> Result<PublicCrateRecord> {
-    let state = match crate_version_state(release, &record.name, &record.version)? {
+    verify_public_crate_at(release, &HttpEndpoints::production(), record)
+}
+
+fn verify_public_crate_at(
+    release: &config::Release,
+    endpoints: &HttpEndpoints,
+    record: &CrateRecord,
+) -> Result<PublicCrateRecord> {
+    let state = match crate_version_state_at(release, endpoints, &record.name, &record.version)? {
         CrateVersionLookup::Present(state) => state,
         CrateVersionLookup::Absent => {
             return Err(failure(format!(
@@ -3736,10 +3730,16 @@ fn verify_public_crate(
             record.name, record.version
         )));
     }
+    if state.checksum != record.archive_sha256 {
+        return Err(failure(format!(
+            "published crate archive checksum conflict for {}: expected={} observed={}",
+            record.name, record.archive_sha256, state.checksum
+        )));
+    }
     let checksum = state.checksum;
     let temporary = TempDir::new()?;
     let archive = temporary.path().join("package.crate");
-    public_crate_archive(release, &record.name, &record.version, &archive)?;
+    public_crate_archive_at(release, endpoints, &record.name, &record.version, &archive)?;
     if sha256_file(&archive)? != checksum {
         return Err(failure(format!(
             "registry checksum mismatch for {}",
@@ -7351,6 +7351,17 @@ mod tests {
         })
     }
 
+    fn verifier_crate_record(archive_sha256: &str) -> CrateRecord {
+        CrateRecord {
+            name: "example".to_owned(),
+            version: "1.2.3".to_owned(),
+            archive_sha256: archive_sha256.to_owned(),
+            canonical_tree_sha256: "tree-digest".to_owned(),
+            canonical_identity_sha256: "identity-digest".to_owned(),
+            vcs_commit: "0123456789abcdef".to_owned(),
+        }
+    }
+
     fn remote_asset(path: &Path, id: u64) -> serde_json::Value {
         serde_json::json!({
             "id": id,
@@ -8167,7 +8178,7 @@ mod tests {
         );
         assert_eq!(
             sparse_index_path("abc").expect("three-character crate path should shard"),
-            "3/abc"
+            "3/a/abc"
         );
         assert_eq!(
             sparse_index_path("abcd").expect("four-character crate path should shard"),
@@ -8205,6 +8216,73 @@ mod tests {
         let requests = server.finish();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("GET /ex/am/example "));
+    }
+
+    #[test]
+    fn public_verifier_binds_sparse_checksum_to_manifest_archive_digest() {
+        let (_, mut release) = release_fixture();
+        release.network_retry = config::RegistryWait {
+            initial_milliseconds: 1,
+            maximum_milliseconds: 1,
+            total_seconds: 1,
+        };
+        let mut sparse_state = sparse_record("example", "1.2.3", false);
+        sparse_state["cksum"] = serde_json::json!("sparse-index-digest");
+        let server = MockServer::scripted(vec![MockResponse::Json(200, sparse_state)]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let result = verify_public_crate_at(
+            &release,
+            &endpoints,
+            &verifier_crate_record("manifest-archive-digest"),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(record) => panic!("checksum conflict must not return {record:?}"),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("published crate archive checksum conflict for example")
+                && message.contains("expected=manifest-archive-digest")
+                && message.contains("observed=sparse-index-digest"),
+            "checksum diagnostics should bind sparse and manifest digests: {message}"
+        );
+        let requests = server.finish();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the archive must not download on conflict"
+        );
+        assert!(requests[0].starts_with("GET /ex/am/example "));
+    }
+
+    #[test]
+    fn public_verifier_rejects_yanked_input_before_archive_download() {
+        let (_, mut release) = release_fixture();
+        release.network_retry = config::RegistryWait {
+            initial_milliseconds: 1,
+            maximum_milliseconds: 1,
+            total_seconds: 1,
+        };
+        let server = MockServer::scripted(vec![MockResponse::Json(
+            200,
+            sparse_record("example", "1.2.3", true),
+        )]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let result =
+            verify_public_crate_at(&release, &endpoints, &verifier_crate_record("published"));
+        let error = match result {
+            Err(error) => error,
+            Ok(record) => panic!("yanked input must not return {record:?}"),
+        };
+        assert_eq!(error.to_string(), "crate version is yanked: example 1.2.3");
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1, "a yanked archive must not download");
+        assert!(requests[0].starts_with("GET /ex/am/example "));
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with("GET /crates/"))
+        );
     }
 
     #[test]
