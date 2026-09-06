@@ -40,6 +40,9 @@ const RELEASE_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const GITHUB_API_ROOT: &str = "https://api.github.com";
 const GITHUB_UPLOADS_ROOT: &str = "https://uploads.github.com";
 const CRATES_IO_API_ROOT: &str = "https://crates.io";
+const CRATES_IO_INDEX_ROOT: &str = "https://index.crates.io";
+const CRATES_IO_DOWNLOAD_ROOT: &str = "https://static.crates.io";
+const REGISTRY_USER_AGENT: &str = "memcordon-ci (https://github.com/Portfoligno/memcordon)";
 const GITHUB_RELEASES_PER_PAGE: usize = 100;
 const CRATES_IO_TOKEN_VARIABLE: &str = "CARGO_REGISTRIES_CRATES_IO_TOKEN";
 pub(crate) const TRUSTED_PUBLISHING_NEW_CRATE_MARKER: &str = "Trusted Publishing tokens do not support creating new crates. Publish the crate manually, first";
@@ -146,6 +149,8 @@ struct HttpEndpoints {
     github_api: String,
     github_uploads: String,
     crates_io: String,
+    crates_io_index: String,
+    crates_io_download: String,
 }
 
 impl HttpEndpoints {
@@ -154,6 +159,8 @@ impl HttpEndpoints {
             github_api: GITHUB_API_ROOT.to_owned(),
             github_uploads: GITHUB_UPLOADS_ROOT.to_owned(),
             crates_io: CRATES_IO_API_ROOT.to_owned(),
+            crates_io_index: CRATES_IO_INDEX_ROOT.to_owned(),
+            crates_io_download: CRATES_IO_DOWNLOAD_ROOT.to_owned(),
         }
     }
 
@@ -163,6 +170,8 @@ impl HttpEndpoints {
             github_api: root.to_owned(),
             github_uploads: root.to_owned(),
             crates_io: root.to_owned(),
+            crates_io_index: root.to_owned(),
+            crates_io_download: root.to_owned(),
         }
     }
 }
@@ -751,6 +760,46 @@ fn normalized_member_path(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+fn archive_component(component: Component<'_>) -> Result<&str> {
+    match component {
+        Component::Normal(value) => value
+            .to_str()
+            .ok_or_else(|| failure("crate archive member path is not UTF-8")),
+        _ => Err(failure(
+            "crate archive member contains a forbidden path component",
+        )),
+    }
+}
+
+fn validated_archive_relative_path(path: &Path) -> Result<String> {
+    let mut normalized = String::new();
+    for component in path.components() {
+        let component = archive_component(component)?;
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(component);
+    }
+    Ok(normalized)
+}
+
+fn archive_member_path(path: &Path) -> Result<String> {
+    let mut components = path.components();
+    let package_root = components
+        .next()
+        .ok_or_else(|| failure("package archive contains an empty path"))?;
+    archive_component(package_root)?;
+    let mut normalized = String::new();
+    for component in components {
+        let component = archive_component(component)?;
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(component);
+    }
+    Ok(normalized)
+}
+
 fn validate_crate_readme(path: &Path, package: &str) -> Result<()> {
     let decoder = GzDecoder::new(File::open(path)?);
     let mut archive = tar::Archive::new(decoder);
@@ -794,13 +843,13 @@ fn canonical_crate_tree(path: &Path) -> Result<String> {
         if !kind.is_file() && !kind.is_dir() {
             return Err(failure("package archive contains a non-file member"));
         }
-        let normalized = normalized_member_path(&entry.path()?)?;
-        if normalized.as_os_str().is_empty() {
+        let normalized = archive_member_path(&entry.path()?)?;
+        if normalized.is_empty() {
             continue;
         }
         if matches!(
-            normalized.to_str(),
-            Some("Cargo.toml" | "Cargo.lock" | ".cargo_vcs_info.json")
+            normalized.as_str(),
+            "Cargo.toml" | "Cargo.lock" | ".cargo_vcs_info.json"
         ) {
             continue;
         }
@@ -813,7 +862,7 @@ fn canonical_crate_tree(path: &Path) -> Result<String> {
     }
     let mut hash = Sha256::new();
     for (path, (mode, bytes)) in members {
-        hash.update(path.to_string_lossy().as_bytes());
+        hash.update(path.as_bytes());
         hash.update([0]);
         hash.update(mode.to_le_bytes());
         hash.update((bytes.len() as u64).to_le_bytes());
@@ -836,8 +885,8 @@ fn canonical_crate_identity(path: &Path) -> Result<CrateArchiveIdentity> {
         if !kind.is_file() && !kind.is_dir() {
             return Err(failure("package archive contains a non-file member"));
         }
-        let normalized = normalized_member_path(&entry.path()?)?;
-        if normalized.as_os_str().is_empty() {
+        let normalized = archive_member_path(&entry.path()?)?;
+        if normalized.is_empty() {
             continue;
         }
         let mode = entry.header().mode()?;
@@ -845,7 +894,7 @@ fn canonical_crate_identity(path: &Path) -> Result<CrateArchiveIdentity> {
         if kind.is_file() {
             entry.read_to_end(&mut bytes)?;
         }
-        if normalized == Path::new("Cargo.toml") {
+        if normalized == "Cargo.toml" {
             let manifest: toml::Value = toml::from_str(
                 std::str::from_utf8(&bytes)
                     .map_err(|_| failure("normalized Cargo.toml is not UTF-8"))?,
@@ -865,7 +914,7 @@ fn canonical_crate_identity(path: &Path) -> Result<CrateArchiveIdentity> {
             bytes = toml::to_string(&manifest)
                 .map_err(|error| failure(format!("normalized Cargo.toml is invalid: {error}")))?
                 .into_bytes();
-        } else if normalized == Path::new(".cargo_vcs_info.json") {
+        } else if normalized == ".cargo_vcs_info.json" {
             let value: serde_json::Value = serde_json::from_slice(&bytes)?;
             vcs_commit = value
                 .get("git")
@@ -888,7 +937,7 @@ fn canonical_crate_identity(path: &Path) -> Result<CrateArchiveIdentity> {
     }
     let mut hash = Sha256::new();
     for (path, (mode, bytes)) in members {
-        hash.update(path.to_string_lossy().as_bytes());
+        hash.update(path.as_bytes());
         hash.update([0]);
         hash.update(mode.to_le_bytes());
         hash.update((bytes.len() as u64).to_le_bytes());
@@ -923,21 +972,16 @@ fn canonical_source_tree(root: &Path, package: &str, inventory: &str) -> Result<
         if matches!(item, "Cargo.toml" | "Cargo.lock" | ".cargo_vcs_info.json") {
             continue;
         }
-        let relative = PathBuf::from(item);
-        if relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Err(failure("Cargo package inventory contains an unsafe path"));
-        }
-        let package_path = package_root.as_std_path().join(&relative);
-        let source = if relative == Path::new("Cargo.toml.orig") {
+        let relative_path = PathBuf::from(item);
+        let relative = validated_archive_relative_path(&relative_path)?;
+        let package_path = package_root.as_std_path().join(&relative_path);
+        let source = if relative == "Cargo.toml.orig" {
             package.manifest_path.as_std_path().to_path_buf()
         } else if package_path.is_file() {
             package_path
         } else if let Some(source) = relocated_manifest_source(
             package_root.as_std_path(),
-            &relative,
+            &relative_path,
             [
                 (
                     "README",
@@ -964,7 +1008,7 @@ fn canonical_source_tree(root: &Path, package: &str, inventory: &str) -> Result<
     }
     let mut hash = Sha256::new();
     for (path, bytes) in members {
-        hash.update(path.to_string_lossy().as_bytes());
+        hash.update(path.as_bytes());
         hash.update([0]);
         hash.update(0o644_u32.to_le_bytes());
         hash.update((bytes.len() as u64).to_le_bytes());
@@ -3480,16 +3524,10 @@ fn stage_github_at(root: &Path, token: &str, endpoints: &HttpEndpoints) -> Resul
 }
 
 #[derive(Debug, Deserialize)]
-struct CrateVersionResponse {
-    version: CrateVersionRecord,
-}
-
-#[derive(Debug, Deserialize)]
-struct CrateVersionRecord {
-    #[serde(rename = "crate")]
-    crate_name: String,
-    num: String,
-    checksum: String,
+struct SparseCrateVersionRecord {
+    name: String,
+    vers: String,
+    cksum: String,
     yanked: bool,
 }
 
@@ -3517,7 +3555,7 @@ fn crate_name_exists_at(
     let url = format!("{}/api/v1/crates/{name}", endpoints.crates_io);
     let result = retry_transient(&release.network_retry, || {
         ureq::get(&url)
-            .header("User-Agent", "memcordon-ci")
+            .header("User-Agent", REGISTRY_USER_AGENT)
             .call()
             .map_err(|error| CiError::Http(Box::new(error)))
     });
@@ -3544,36 +3582,81 @@ fn crate_name_exists_at(
     }
 }
 
+fn registry_http_error(operation: &str, url: &str, error: ureq::Error) -> CiError {
+    if matches!(error, ureq::Error::StatusCode(403)) {
+        return failure(format!(
+            "{operation} was rejected with HTTP 403 at {url}: \
+             crates.io 403 responses are endpoint-specific and are not treated as transient: {error}"
+        ));
+    }
+    CiError::Http(Box::new(error))
+}
+
+fn sparse_index_path(name: &str) -> Result<String> {
+    if name.is_empty() || !name.is_ascii() || name.contains('/') {
+        return Err(failure("crate name is invalid for sparse-index lookup"));
+    }
+    let length = name.len();
+    Ok(if length < 4 {
+        format!("{length}/{name}")
+    } else {
+        format!("{}/{}/{}", &name[..2], &name[2..4], name)
+    })
+}
+
+fn sparse_crate_version_state(
+    response: &str,
+    name: &str,
+    version: &str,
+) -> Result<CrateVersionLookup> {
+    let mut state = None;
+    for line in response.lines().filter(|line| !line.is_empty()) {
+        let record: SparseCrateVersionRecord = serde_json::from_str(line)
+            .map_err(|error| failure(format!("sparse-index record is invalid: {error}")))?;
+        if record.name != name {
+            return Err(failure(format!(
+                "sparse-index crate identity differs: expected={name} observed={}",
+                record.name
+            )));
+        }
+        if record.vers != version {
+            continue;
+        }
+        let observed = CrateRegistryState {
+            checksum: record.cksum,
+            yanked: record.yanked,
+        };
+        if state.replace(observed).is_some() {
+            return Err(failure("sparse-index contains duplicate target versions"));
+        }
+    }
+    Ok(match state {
+        Some(state) => CrateVersionLookup::Present(state),
+        None => CrateVersionLookup::Absent,
+    })
+}
+
 fn crate_version_state_at(
     release: &config::Release,
     endpoints: &HttpEndpoints,
     name: &str,
     version: &str,
 ) -> Result<CrateVersionLookup> {
-    let url = format!("{}/api/v1/crates/{name}/{version}", endpoints.crates_io);
+    let record_path = sparse_index_path(name)?;
+    let url = format!("{}/{record_path}", endpoints.crates_io_index);
     let result = retry_transient(&release.network_retry, || {
         ureq::get(&url)
-            .header("User-Agent", "memcordon-ci")
+            .header("User-Agent", REGISTRY_USER_AGENT)
             .call()
-            .map_err(|error| CiError::Http(Box::new(error)))
+            .map_err(|error| registry_http_error("sparse-index version lookup", &url, error))
     });
     match result {
         Ok(mut response) => {
-            let value: CrateVersionResponse = response
+            let body = response
                 .body_mut()
-                .read_json()
+                .read_to_string()
                 .map_err(|error| CiError::Http(Box::new(error)))?;
-            let record = value.version;
-            if record.crate_name != name || record.num != version {
-                return Err(failure(format!(
-                    "crates.io version response identity differs: expected={name} {version} observed={} {}",
-                    record.crate_name, record.num
-                )));
-            }
-            Ok(CrateVersionLookup::Present(CrateRegistryState {
-                checksum: record.checksum,
-                yanked: record.yanked,
-            }))
+            sparse_crate_version_state(&body, name, version)
         }
         Err(CiError::Http(error)) if matches!(*error, ureq::Error::StatusCode(404)) => {
             Ok(CrateVersionLookup::Absent)
@@ -3612,15 +3695,13 @@ fn public_crate_archive_at(
     version: &str,
     destination: &Path,
 ) -> Result<()> {
-    let url = format!(
-        "{}/api/v1/crates/{name}/{version}/download",
-        endpoints.crates_io
-    );
+    let download_root = endpoints.crates_io_download.clone();
+    let url = format!("{download_root}/crates/{name}/{name}-{version}.crate");
     let bytes = retry_transient(&release.network_retry, || {
         let mut response = ureq::get(&url)
-            .header("User-Agent", "memcordon-ci")
+            .header("User-Agent", REGISTRY_USER_AGENT)
             .call()
-            .map_err(|error| CiError::Http(Box::new(error)))?;
+            .map_err(|error| registry_http_error("public crate archive download", &url, error))?;
         let mut bytes = Vec::new();
         response
             .body_mut()
@@ -6144,13 +6225,13 @@ mod tests {
         let actual = canonical_source_tree(root, "example", inventory)
             .expect("relocated package README should resolve to its manifest source");
         let expected_members = BTreeMap::from([
-            (PathBuf::from("Cargo.toml.orig"), manifest.as_slice()),
-            (PathBuf::from("package-readme.md"), readme.as_slice()),
-            (PathBuf::from("src/lib.rs"), source.as_slice()),
+            ("Cargo.toml.orig".to_owned(), manifest.as_slice()),
+            ("package-readme.md".to_owned(), readme.as_slice()),
+            ("src/lib.rs".to_owned(), source.as_slice()),
         ]);
         let mut expected = Sha256::new();
         for (path, bytes) in expected_members {
-            expected.update(path.to_string_lossy().as_bytes());
+            expected.update(path.as_bytes());
             expected.update([0]);
             expected.update(0o644_u32.to_le_bytes());
             expected.update((bytes.len() as u64).to_le_bytes());
@@ -6181,6 +6262,7 @@ mod tests {
 
     enum MockResponse {
         Json(u16, serde_json::Value),
+        Ndjson(u16, Vec<serde_json::Value>),
         Bytes(u16, Vec<u8>),
         Truncated(Vec<u8>, usize),
         LoseResponse,
@@ -6216,6 +6298,17 @@ mod tests {
                                 "application/json",
                                 &serde_json::to_vec(&value).expect("mock JSON should serialize"),
                             );
+                        }
+                        MockResponse::Ndjson(status, values) => {
+                            let mut body = Vec::new();
+                            for value in values {
+                                body.extend(
+                                    serde_json::to_vec(&value)
+                                        .expect("mock NDJSON record should serialize"),
+                                );
+                                body.push(b'\n');
+                            }
+                            write_response(&mut stream, status, "application/x-ndjson", &body);
                         }
                         MockResponse::Bytes(status, bytes) => {
                             write_response(&mut stream, status, "application/octet-stream", &bytes);
@@ -7249,6 +7342,15 @@ mod tests {
         })
     }
 
+    fn sparse_record(name: &str, version: &str, yanked: bool) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "vers": version,
+            "cksum": "published",
+            "yanked": yanked,
+        })
+    }
+
     fn remote_asset(path: &Path, id: u64) -> serde_json::Value {
         serde_json::json!({
             "id": id,
@@ -7381,6 +7483,88 @@ mod tests {
         assert_eq!(
             canonical_crate_identity(&first).expect("first identity"),
             canonical_crate_identity(&second).expect("second identity")
+        );
+    }
+
+    #[test]
+    fn crate_archive_hashes_render_nested_host_paths_with_archive_separators() {
+        let nested = PathBuf::from("src").join("lib.rs");
+        let archive_path = PathBuf::from("example-1.2.3").join(nested);
+        assert_eq!(
+            archive_member_path(&archive_path).expect("nested member path should normalize"),
+            "src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn crate_archive_tree_and_identity_use_archive_member_bytes() {
+        let temporary = TempDir::new().expect("temporary directory should exist");
+        let archive = temporary.path().join("example.crate");
+        let manifest =
+            "[package]\nname = \"example\"\nversion = \"1.2.3\"\n\n[dependencies]\nserde = \"1\"\n";
+        let source = b"pub fn value() -> u8 { 1 }\n";
+        write_crate(&archive, manifest, "0123456789abcdef", false);
+
+        let mut tree = Sha256::new();
+        tree.update(b"src/lib.rs");
+        tree.update([0]);
+        tree.update(0o644_u32.to_le_bytes());
+        tree.update((source.len() as u64).to_le_bytes());
+        tree.update(source);
+        assert_eq!(
+            canonical_crate_tree(&archive).expect("archive tree should canonicalize"),
+            hex::encode(tree.finalize())
+        );
+
+        let manifest_value: toml::Value = toml::from_str(manifest).expect("manifest should parse");
+        let normalized_manifest =
+            toml::to_string(&manifest_value).expect("normalized manifest should serialize");
+        let vcs = serde_json::json!({
+            "git": {"sha1": "0123456789abcdef"},
+            "path_in_vcs": "crates/example",
+            "dirty": false,
+        });
+        let normalized_vcs =
+            serde_json::to_vec(&vcs).expect("normalized provenance should serialize");
+        let identity_members = BTreeMap::from([
+            (
+                ".cargo_vcs_info.json".to_owned(),
+                (0o644_u32, normalized_vcs),
+            ),
+            (
+                "Cargo.toml".to_owned(),
+                (0o644_u32, normalized_manifest.into_bytes()),
+            ),
+            ("src/lib.rs".to_owned(), (0o644_u32, source.to_vec())),
+        ]);
+        let mut identity = Sha256::new();
+        for (path, (mode, bytes)) in identity_members {
+            identity.update(path.as_bytes());
+            identity.update([0]);
+            identity.update(mode.to_le_bytes());
+            identity.update((bytes.len() as u64).to_le_bytes());
+            identity.update(bytes);
+        }
+        assert_eq!(
+            canonical_crate_identity(&archive)
+                .expect("archive identity should canonicalize")
+                .sha256,
+            hex::encode(identity.finalize())
+        );
+    }
+
+    #[test]
+    fn crate_archive_hashing_cannot_render_host_dependent_paths() {
+        let source = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("release.rs"),
+        )
+        .expect("release source should be readable from the test");
+        let forbidden = ["path.to_string_lossy()", "as_bytes()"].join("");
+        assert!(
+            !source.contains(&forbidden),
+            "crate member paths must be encoded as archive-format strings before hashing"
         );
     }
 
@@ -7929,15 +8113,11 @@ mod tests {
             MockResponse::Json(500, serde_json::json!({"message": "retry"})),
             MockResponse::Json(200, remote(true)),
             MockResponse::Json(503, serde_json::json!({"message": "retry"})),
-            MockResponse::Json(
-                200,
-                serde_json::json!({"version": {
-                    "crate": "example",
-                    "num": "1.2.3",
-                    "checksum": "registry-digest",
-                    "yanked": false
-                }}),
-            ),
+            MockResponse::Json(200, {
+                let mut record = sparse_record("example", "1.2.3", false);
+                record["cksum"] = serde_json::json!("registry-digest");
+                record
+            }),
             MockResponse::Bytes(503, b"retry".to_vec()),
             MockResponse::Truncated(b"partial".to_vec(), 20),
             MockResponse::Bytes(200, b"crate bytes".to_vec()),
@@ -7968,6 +8148,99 @@ mod tests {
         let requests = server.finish();
         assert_eq!(requests.len(), 7);
         assert!(requests.iter().all(|request| request.starts_with("GET ")));
+        assert!(requests[2].starts_with("GET /ex/am/example "));
+        assert!(requests[3].starts_with("GET /ex/am/example "));
+        assert!(requests[4].starts_with("GET /crates/example/example-1.2.3.crate "));
+        assert!(requests[5].starts_with("GET /crates/example/example-1.2.3.crate "));
+        assert!(requests[6].starts_with("GET /crates/example/example-1.2.3.crate "));
+    }
+
+    #[test]
+    fn sparse_index_paths_follow_cargo_shard_rules() {
+        assert_eq!(
+            sparse_index_path("a").expect("one-character crate path should shard"),
+            "1/a"
+        );
+        assert_eq!(
+            sparse_index_path("ab").expect("two-character crate path should shard"),
+            "2/ab"
+        );
+        assert_eq!(
+            sparse_index_path("abc").expect("three-character crate path should shard"),
+            "3/abc"
+        );
+        assert_eq!(
+            sparse_index_path("abcd").expect("four-character crate path should shard"),
+            "ab/cd/abcd"
+        );
+    }
+
+    #[test]
+    fn sparse_index_lookup_selects_the_exact_public_version() {
+        let (_, mut release) = release_fixture();
+        release.network_retry = config::RegistryWait {
+            initial_milliseconds: 1,
+            maximum_milliseconds: 1,
+            total_seconds: 1,
+        };
+        let mut target = sparse_record("example", "1.2.3", false);
+        target["cksum"] = serde_json::json!("target-digest");
+        let server = MockServer::scripted(vec![MockResponse::Ndjson(
+            200,
+            vec![
+                sparse_record("example", "1.2.2", false),
+                target,
+                sparse_record("example", "1.2.4", true),
+            ],
+        )]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        assert_eq!(
+            crate_version_state_at(&release, &endpoints, "example", "1.2.3")
+                .expect("exact sparse-index version should be selected"),
+            CrateVersionLookup::Present(CrateRegistryState {
+                checksum: "target-digest".to_owned(),
+                yanked: false,
+            })
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /ex/am/example "));
+    }
+
+    #[test]
+    fn registry_http_403_is_diagnosed_without_retry() {
+        let (temporary, mut release) = release_fixture();
+        release.network_retry = config::RegistryWait {
+            initial_milliseconds: 1,
+            maximum_milliseconds: 1,
+            total_seconds: 2,
+        };
+        let server = MockServer::scripted(vec![
+            MockResponse::Json(403, serde_json::json!({"message": "denied"})),
+            MockResponse::Bytes(403, b"denied".to_vec()),
+        ]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let index_error = crate_version_state_at(&release, &endpoints, "example", "1.2.3")
+            .expect_err("sparse-index 403 must fail immediately");
+        let archive = temporary.path().join("download.crate");
+        let archive_error =
+            public_crate_archive_at(&release, &endpoints, "example", "1.2.3", &archive)
+                .expect_err("archive 403 must fail immediately");
+        let index_message = index_error.to_string();
+        let archive_message = archive_error.to_string();
+        assert!(
+            index_message.contains("sparse-index version lookup")
+                && index_message.contains("/ex/am/example")
+                && index_message.contains("not treated as transient"),
+            "sparse-index diagnostics should identify the exact endpoint: {index_message}"
+        );
+        assert!(
+            archive_message.contains("public crate archive download")
+                && archive_message.contains("/crates/example/example-1.2.3.crate")
+                && archive_message.contains("not treated as transient"),
+            "archive diagnostics should identify the exact endpoint: {archive_message}"
+        );
+        assert_eq!(server.finish().len(), 2);
     }
 
     #[test]
@@ -7979,15 +8252,7 @@ mod tests {
             total_seconds: 1,
         };
         let server = MockServer::scripted(vec![
-            MockResponse::Json(
-                200,
-                serde_json::json!({"version": {
-                    "crate": "memcordon-core",
-                    "num": "1.2.3",
-                    "checksum": "published",
-                    "yanked": false
-                }}),
-            ),
+            MockResponse::Json(200, sparse_record("memcordon-core", "1.2.3", false)),
             MockResponse::Json(404, serde_json::json!({"message": "missing"})),
         ]);
         let endpoints = HttpEndpoints::fixed_test_server(&server.root);
@@ -8028,17 +8293,7 @@ mod tests {
             .expect("fixture manifest should read"),
         )
         .expect("fixture manifest should parse");
-        let public = |name: &str| {
-            MockResponse::Json(
-                200,
-                serde_json::json!({"version": {
-                    "crate": name,
-                    "num": "1.2.3",
-                    "checksum": "published",
-                    "yanked": false
-                }}),
-            )
-        };
+        let public = |name: &str| MockResponse::Json(200, sparse_record(name, "1.2.3", false));
         let server = MockServer::scripted(vec![
             public("memcordon-core"),
             public("memcordon-platform"),
@@ -8056,12 +8311,7 @@ mod tests {
         assert_eq!(scan.public_names, ["memcordon-core", "memcordon-platform"]);
         assert_eq!(server.finish().len(), 4);
 
-        let yanked = serde_json::json!({"version": {
-            "crate": "memcordon-platform",
-            "num": "1.2.3",
-            "checksum": "published",
-            "yanked": true
-        }});
+        let yanked = sparse_record("memcordon-platform", "1.2.3", true);
         let server = MockServer::scripted(vec![
             public("memcordon-core"),
             MockResponse::Json(200, yanked),
@@ -8117,23 +8367,8 @@ mod tests {
     fn http_mock_version_state_fails_closed_on_malformed_or_wrong_identity() {
         let (_, release) = release_fixture();
         for response in [
-            serde_json::json!({"version": {
-                "crate": "memcordon-core",
-                "num": "1.2.3",
-                "checksum": "published"
-            }}),
-            serde_json::json!({"version": {
-                "crate": "different-name",
-                "num": "1.2.3",
-                "checksum": "published",
-                "yanked": false
-            }}),
-            serde_json::json!({"version": {
-                "crate": "memcordon-core",
-                "num": "0.1.0",
-                "checksum": "published",
-                "yanked": false
-            }}),
+            serde_json::json!({"name": "memcordon-core", "vers": "1.2.3", "cksum": "published"}),
+            sparse_record("different-name", "1.2.3", false),
         ] {
             let server = MockServer::scripted(vec![MockResponse::Json(200, response)]);
             let endpoints = HttpEndpoints::fixed_test_server(&server.root);
