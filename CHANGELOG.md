@@ -6,10 +6,6 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## [0.5.2-rc.23] - 2026-09-08
 
-No user-visible CLI, API, or runtime changes from `0.5.2-rc.22`.
-
-## [0.5.2-rc.22] - 2026-09-08
-
 ### Added
 
 - Added `--sealed` support on Windows x64 and ARM64. After provider setup,
