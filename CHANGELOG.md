@@ -4,11 +4,14 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+## [0.5.2-rc.22] - 2026-09-08
+
 ### Added
 
 - Added `--sealed` support on Windows x64 and ARM64. After provider setup,
   MemCordon contains the command and its descendants and verifies that they
-  have all stopped before reporting completion.
+  have all stopped before reporting completion. Package upgrades wait for
+  retired provider Jobs and native images to become fully replaceable.
 - Cargo installations and Linux and Windows release archives now include the
   matching `memcordon-sealed-agent` companion. Setting up sealed supervision
   no longer requires a source checkout or a separate provider download.
@@ -22,15 +25,6 @@ All notable user-visible changes to MemCordon are documented here.
 - When backend capabilities change between preflight and execution, failure
   reports now retain the affected attempt, identify what changed, and report
   whether cleanup completed.
-
-### Fixed
-
-- Corrected the new-crate publication fallback for Cargo’s authenticated
-  crates.io index-read while retaining exact artifact, run, registry, and
-  one-shot publication binding.
-- Windows package upgrades now wait for retired provider Jobs and native images
-  to become fully replaceable, preventing architecture-dependent access-denied
-  rollbacks.
 
 ## [0.5.1-rc.2] - 2026-08-25
 
