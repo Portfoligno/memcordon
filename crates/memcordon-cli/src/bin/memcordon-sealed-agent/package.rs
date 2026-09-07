@@ -675,6 +675,11 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         }
         systemctl(["daemon-reload"])?;
         remove_uninstalled_file(LEGACY_PACKAGE_LEASE)?;
+        // A failed startup may have durably recorded its diagnostics in the
+        // provider runtime directory. Uninstall is an explicit ownership transfer
+        // back to the caller, so remove that owned evidence after collecting the
+        // stopped/recovery proofs above and before proving the directory empty.
+        crate::linux::startup::clear()?;
         for path in [
             crate::linux::CGROUP_ROOT,
             crate::linux::STATE_ROOT,

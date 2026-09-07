@@ -65,15 +65,19 @@ fn load_legacy_runtime_directory_units() {
         .status()
         .unwrap();
     assert!(reload.success());
+    // Restarting would run package verification against the deliberately legacy
+    // on-disk units and turn both services into delayed startup failures. The
+    // reload alone installs those definitions in the running manager, while the
+    // still-active processes keep the currently verified executable running.
     for service in [
         "memcordon-sealed-launcher.service",
         "memcordon-sealed-agent.service",
     ] {
-        let restart = Command::new("/usr/bin/systemctl")
-            .args(["restart", service])
+        let active = Command::new("/usr/bin/systemctl")
+            .args(["is-active", service])
             .status()
             .unwrap();
-        assert!(restart.success());
+        assert!(active.success());
     }
 }
 
