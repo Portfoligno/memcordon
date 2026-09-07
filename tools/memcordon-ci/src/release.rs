@@ -5119,7 +5119,7 @@ fn authorize_new_crate_fallback_for_run(
     run: &PublicationRunIdentity,
     github_output: Option<&Path>,
 ) -> Result<()> {
-    let record = configured_slot_record(&manifest, &order, publication_slot)?;
+    let record = configured_slot_record(manifest, order, publication_slot)?;
     let release_binding = ReleaseBinding::from_manifest(manifest);
     let crate_binding = CrateBinding::from_record(&record);
     let evidence = load_slot_evidence(root, publication_slot)?;
@@ -5157,10 +5157,10 @@ fn authorize_new_crate_fallback_for_run(
             None,
         )
     };
-    if crate_name_exists(&release, &record.name)? {
+    if crate_name_exists(release, &record.name)? {
         append_slot_record(
             root,
-            &release,
+            release,
             publication_slot,
             conflict(PublicNameState::Present),
         )?;
@@ -5170,12 +5170,12 @@ fn authorize_new_crate_fallback_for_run(
         )));
     }
     if !matches!(
-        crate_version_state(&release, &record.name, &record.version)?,
+        crate_version_state(release, &record.name, &record.version)?,
         CrateVersionLookup::Absent
     ) {
         append_slot_record(
             root,
-            &release,
+            release,
             publication_slot,
             conflict(PublicNameState::Absent),
         )?;
@@ -5187,7 +5187,7 @@ fn authorize_new_crate_fallback_for_run(
 
     append_slot_record(
         root,
-        &release,
+        release,
         publication_slot,
         publication_record(
             CredentialOrigin::Oidc,
