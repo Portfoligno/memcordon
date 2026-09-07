@@ -2,7 +2,7 @@
 
 All notable user-visible changes to MemCordon are documented here.
 
-## Unreleased
+## [0.5.2-rc.18] - 2026-09-07
 
 ### Added
 
@@ -28,6 +28,8 @@ All notable user-visible changes to MemCordon are documented here.
 - Corrected the new-crate publication fallback for Cargo’s authenticated
   crates.io index-read while retaining exact artifact, run, registry, and
   one-shot publication binding.
+- Classified existing-crate Trusted Publishing rejections separately so they
+  fail closed without selecting the new-crate publication fallback.
 - Windows package upgrades now wait for retired provider Jobs and native images
   to become fully replaceable, preventing architecture-dependent access-denied
   rollbacks.
