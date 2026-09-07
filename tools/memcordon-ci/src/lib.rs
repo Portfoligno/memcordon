@@ -36,6 +36,14 @@ pub enum CiError {
     Semver(#[from] semver::Error),
     #[error("HTTP operation failed: {0}")]
     Http(#[from] Box<ureq::Error>),
+    #[error("GitHub {method} {endpoint} failed: {source}{details}")]
+    GithubHttp {
+        method: String,
+        endpoint: String,
+        source: Box<CiError>,
+        details: String,
+        retry_after: Option<std::time::Duration>,
+    },
     #[error("process operation failed: {0}")]
     Process(#[from] memcordon_testkit::ProcessTestError),
     #[error("ZIP operation failed: {0}")]

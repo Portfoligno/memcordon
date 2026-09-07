@@ -175,7 +175,7 @@ fn canonical_release_identity_accepts_only_supported_values() {
     config::validate_release_configuration_identity(&canonical)
         .expect("canonical release configuration identity should be valid");
 
-    let mutations: [ReleaseMutation; 11] = [
+    let mutations: [ReleaseMutation; 12] = [
         ("stale schema", |release| release.schema_version = 1),
         ("wrong registry", |release| {
             release.registry = "other".to_owned();
@@ -185,6 +185,9 @@ fn canonical_release_identity_accepts_only_supported_values() {
         }),
         ("empty GitHub API version", |release| {
             release.github_api_version.clear();
+        }),
+        ("zero GitHub throttle budget", |release| {
+            release.github_rate_limit_wait_seconds = 0;
         }),
         ("zero package limit", |release| {
             release.maximum_package_bytes = 0;

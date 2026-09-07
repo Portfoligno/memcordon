@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cargo_metadata::{Metadata, MetadataCommand};
 use flate2::Compression;
@@ -148,6 +148,7 @@ struct CargoRegistryConfig {
 
 #[derive(Clone, Debug)]
 struct HttpEndpoints {
+    github_started: Instant,
     github_api: String,
     github_uploads: String,
     crates_io: String,
@@ -158,6 +159,7 @@ struct HttpEndpoints {
 impl HttpEndpoints {
     fn production() -> Self {
         Self {
+            github_started: Instant::now(),
             github_api: GITHUB_API_ROOT.to_owned(),
             github_uploads: GITHUB_UPLOADS_ROOT.to_owned(),
             crates_io: CRATES_IO_API_ROOT.to_owned(),
@@ -169,6 +171,7 @@ impl HttpEndpoints {
     #[cfg(test)]
     fn fixed_test_server(root: &str) -> Self {
         Self {
+            github_started: Instant::now(),
             github_api: root.to_owned(),
             github_uploads: root.to_owned(),
             crates_io: root.to_owned(),
@@ -2958,6 +2961,169 @@ fn classify_remote_release(
     }
 }
 
+fn github_http_error(method: &str, url: &str, error: ureq::Error) -> CiError {
+    CiError::GithubHttp {
+        method: method.to_owned(),
+        endpoint: url.to_owned(),
+        source: Box::new(CiError::Http(Box::new(error))),
+        details: String::new(),
+        retry_after: None,
+    }
+}
+
+fn http_status(error: &CiError) -> Option<u16> {
+    match error {
+        CiError::Http(error) => match error.as_ref() {
+            ureq::Error::StatusCode(status) => Some(*status),
+            _ => None,
+        },
+        CiError::GithubHttp { source, .. } => http_status(source),
+        _ => None,
+    }
+}
+
+fn github_rate_limit_delay(
+    status: u16,
+    retry_after: Option<&str>,
+    remaining: Option<&str>,
+    reset: Option<&str>,
+    now: SystemTime,
+) -> Option<Duration> {
+    if !matches!(status, 403 | 429) {
+        return None;
+    }
+    // GitHub documents Retry-After as seconds. An unsupported or malformed value
+    // fails closed; never replace a server minimum with a shorter backoff.
+    let retry = match retry_after {
+        Some(value) => Some(Duration::from_secs(value.parse::<u64>().ok()?)),
+        None => None,
+    };
+    let reset_delay = if remaining == Some("0") {
+        let reset = UNIX_EPOCH.checked_add(Duration::from_secs(reset?.parse().ok()?))?;
+        Some(
+            reset
+                .duration_since(now)
+                .unwrap_or_default()
+                .saturating_add(Duration::from_secs(1)),
+        )
+    } else {
+        None
+    };
+    retry
+        .max(reset_delay)
+        .map(|delay| delay.max(Duration::from_secs(1)))
+        .or_else(|| {
+            // A 429 explicitly identifies throttling; an unqualified 403 does not.
+            (status == 429).then_some(Duration::from_secs(60))
+        })
+}
+
+fn github_response(
+    method: &str,
+    url: &str,
+    response: std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let response = response.map_err(|error| github_http_error(method, url, error))?;
+    let status = response.status().as_u16();
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let header = |name| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    };
+    let retry_after = github_rate_limit_delay(
+        status,
+        header("retry-after"),
+        header("x-ratelimit-remaining"),
+        header("x-ratelimit-reset"),
+        SystemTime::now(),
+    );
+    let mut details = String::new();
+    // Do not print response bodies, arbitrary headers, redirect URLs or credentials.
+    for name in [
+        "x-github-request-id",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "retry-after",
+    ] {
+        if let Some(value) = header(name) {
+            details.push_str(&format!("; {name}={value:?}"));
+        }
+    }
+    Err(CiError::GithubHttp {
+        method: method.to_owned(),
+        endpoint: url.to_owned(),
+        source: Box::new(CiError::Http(Box::new(ureq::Error::StatusCode(status)))),
+        details,
+        retry_after,
+    })
+}
+
+fn github_retry_delay(
+    release: &config::Release,
+    error: &CiError,
+    backoff: Duration,
+    request_elapsed: Duration,
+    operation_elapsed: Duration,
+) -> Option<Duration> {
+    let throttle = match error {
+        CiError::GithubHttp { retry_after, .. } => *retry_after,
+        _ => None,
+    };
+    let delay = if let Some(delay) = throttle {
+        delay
+    } else if transient_network_error(error)
+        && request_elapsed.saturating_add(backoff)
+            <= Duration::from_secs(release.network_retry.total_seconds)
+    {
+        backoff
+    } else {
+        return None;
+    };
+    (operation_elapsed.saturating_add(delay)
+        <= Duration::from_secs(release.github_rate_limit_wait_seconds))
+    .then_some(delay)
+}
+
+fn retry_github_read<T>(
+    release: &config::Release,
+    endpoints: &HttpEndpoints,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let started = Instant::now();
+    let mut backoff = Duration::from_millis(release.network_retry.initial_milliseconds);
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let Some(delay) = github_retry_delay(
+                    release,
+                    &error,
+                    backoff,
+                    started.elapsed(),
+                    endpoints.github_started.elapsed(),
+                ) else {
+                    if transient_network_error(&error) {
+                        eprintln!(
+                            "GitHub read retry budget exhausted or server delay exceeds remaining operation budget"
+                        );
+                    }
+                    return Err(error);
+                };
+                eprintln!("{error}; retrying GitHub read after {delay:?}");
+                thread::sleep(delay);
+                backoff = backoff.saturating_mul(2).min(Duration::from_millis(
+                    release.network_retry.maximum_milliseconds,
+                ));
+            }
+        }
+    }
+}
+
 fn github_json_request(
     release: &config::Release,
     endpoints: &HttpEndpoints,
@@ -2971,6 +3137,7 @@ fn github_json_request(
     }
     let send = || {
         let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(15)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
             .timeout_recv_body(Some(Duration::from_secs(60)))
@@ -3012,12 +3179,11 @@ fn github_json_request(
                 request.send_json(value)
             }
             _ => return Err(failure("unsupported GitHub API request shape")),
-        }
-        .map_err(|error| CiError::Http(Box::new(error)))?;
-        Ok(response)
+        };
+        github_response(method, url, response)
     };
     let mut response = if method == "GET" {
-        retry_transient(&release.network_retry, send)?
+        retry_github_read(release, endpoints, send)?
     } else {
         // Mutations are attempted exactly once. A transport failure or transient response can
         // mean the server committed the operation before the response was lost; callers must
@@ -3027,7 +3193,7 @@ fn github_json_request(
     response
         .body_mut()
         .read_json()
-        .map_err(|error| CiError::Http(Box::new(error)))
+        .map_err(|error| github_http_error(method, url, error))
 }
 
 fn github_raw_get(
@@ -3041,32 +3207,35 @@ fn github_raw_get(
     if !url.starts_with(&format!("{}/", endpoints.github_api)) {
         return Err(failure("GitHub API destination is not allowlisted"));
     }
-    retry_transient(&release.network_retry, || {
-        let mut request = ureq::get(url)
+    retry_github_read(release, endpoints, || {
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_recv_body(Some(Duration::from_secs(60)))
+            .build()
+            .new_agent();
+        let mut request = agent
+            .get(url)
             .header("Accept", accept)
             .header("X-GitHub-Api-Version", &release.github_api_version)
             .header("User-Agent", "memcordon-ci");
         if let Some(token) = token {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
-        let mut response = request
-            .call()
-            .map_err(|error| CiError::Http(Box::new(error)))?;
+        let mut response = github_response("GET", url, request.call())?;
         let mut bytes = Vec::new();
         response
             .body_mut()
             .as_reader()
             .take(maximum_bytes.saturating_add(1))
-            .read_to_end(&mut bytes)?;
+            .read_to_end(&mut bytes)
+            .map_err(|error| github_http_error("GET", url, ureq::Error::Io(error)))?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum_bytes {
             return Err(failure("GitHub response exceeds configured size policy"));
         }
         Ok(bytes)
     })
-}
-
-fn github_release(root: &Path, token: Option<&str>) -> Result<Option<serde_json::Value>> {
-    github_release_at(root, token, &HttpEndpoints::production())
 }
 
 fn github_release_at(
@@ -3111,7 +3280,7 @@ fn github_release_at(
     );
     match github_json_request(&release, endpoints, "GET", &url, token, None) {
         Ok(value) => Ok(Some(value)),
-        Err(CiError::Http(error)) if matches!(*error, ureq::Error::StatusCode(404)) => Ok(None),
+        Err(error) if http_status(&error) == Some(404) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -3280,23 +3449,30 @@ fn download_github_asset_at(
         return Err(failure("GitHub asset API URL is not allowlisted"));
     }
     let authorization = token.map(|token| format!("Bearer {token}"));
-    let bytes = retry_transient(&release.network_retry, || {
-        let mut request = ureq::get(url)
+    let bytes = retry_github_read(release, endpoints, || {
+        let agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .timeout_recv_response(Some(Duration::from_secs(60)))
+            .timeout_recv_body(Some(Duration::from_secs(60)))
+            .build()
+            .new_agent();
+        let mut request = agent
+            .get(url)
             .header("Accept", "application/octet-stream")
             .header("X-GitHub-Api-Version", &release.github_api_version)
             .header("User-Agent", "memcordon-ci");
         if let Some(authorization) = &authorization {
             request = request.header("Authorization", authorization);
         }
-        let mut response = request
-            .call()
-            .map_err(|error| CiError::Http(Box::new(error)))?;
+        let mut response = github_response("GET", url, request.call())?;
         let mut bytes = Vec::new();
         response
             .body_mut()
             .as_reader()
             .take(release.maximum_asset_bytes.saturating_add(1))
-            .read_to_end(&mut bytes)?;
+            .read_to_end(&mut bytes)
+            .map_err(|error| github_http_error("GET", url, ureq::Error::Io(error)))?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > release.maximum_asset_bytes {
             return Err(failure("GitHub asset exceeds configured size policy"));
         }
@@ -3332,12 +3508,13 @@ fn upload_github_asset_at(
     let bytes = fs::read(path)?;
     // Upload is non-idempotent and therefore deliberately receives one network attempt.
     let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(120)))
         .timeout_recv_body(Some(Duration::from_secs(120)))
         .build()
         .new_agent();
-    let mut response = agent
+    let response = agent
         .post(&url)
         .query("name", name)
         .header("Accept", "application/vnd.github+json")
@@ -3345,22 +3522,23 @@ fn upload_github_asset_at(
         .header("User-Agent", "memcordon-ci")
         .header("Authorization", format!("Bearer {token}"))
         .header("Content-Type", "application/octet-stream")
-        .send(bytes.as_slice())
-        .map_err(|error| CiError::Http(Box::new(error)))?;
+        .send(bytes.as_slice());
+    let mut response = github_response("POST", &url, response)?;
     response
         .body_mut()
         .read_json()
-        .map_err(|error| CiError::Http(Box::new(error)))
+        .map_err(|error| github_http_error("POST", &url, error))
 }
 
 fn ambiguous_mutation_error(error: &CiError) -> bool {
+    // A rejected mutation stays rejected even when the same response would
+    // permit a later GET retry. Preserve the existing reconciliation boundary.
+    if http_status(error) == Some(403) {
+        return false;
+    }
     transient_network_error(error)
         || matches!(error, CiError::Io(_))
-        || matches!(
-            error,
-            CiError::Http(inner)
-                if matches!(inner.as_ref(), ureq::Error::StatusCode(409 | 422))
-        )
+        || matches!(http_status(error), Some(409 | 422))
 }
 
 fn create_or_reconcile_github_draft_at(
@@ -3775,6 +3953,17 @@ fn verify_public_crate_at(
 
 fn transient_network_error(error: &CiError) -> bool {
     match error {
+        CiError::GithubHttp {
+            source,
+            retry_after,
+            ..
+        } => {
+            if matches!(http_status(source), Some(403 | 429)) {
+                retry_after.is_some()
+            } else {
+                transient_network_error(source)
+            }
+        }
         CiError::Http(error) => match error.as_ref() {
             ureq::Error::StatusCode(status) => {
                 matches!(*status, 408 | 425 | 429) || (500..=599).contains(status)
@@ -5545,9 +5734,12 @@ fn verify_public_workflow_provenance(
 }
 
 fn verify_public(root: &Path) -> Result<()> {
+    // Every GitHub read shares this deadline, so sequential throttles cannot
+    // each consume a fresh wait budget inside the 90-minute verification job.
+    let endpoints = HttpEndpoints::production();
     let (release, manifest, output) = bundle_manifest(root)?;
-    let remote =
-        github_release(root, None)?.ok_or_else(|| failure("public GitHub release is absent"))?;
+    let remote = github_release_at(root, None, &endpoints)?
+        .ok_or_else(|| failure("public GitHub release is absent"))?;
     if remote.get("draft").and_then(serde_json::Value::as_bool) != Some(false)
         || remote
             .get("target_commitish")
@@ -5577,7 +5769,7 @@ fn verify_public(root: &Path) -> Result<()> {
     let report_path = public_downloads
         .path()
         .join(&release.assets.publication_report);
-    download_github_asset(&release, report_asset, None, &report_path)?;
+    download_github_asset_at(&release, &endpoints, report_asset, None, &report_path)?;
     if !asset_matches(report_asset, &report_path)? {
         return Err(failure("public publication report digest differs"));
     }
@@ -5598,7 +5790,7 @@ fn verify_public(root: &Path) -> Result<()> {
             .find(|asset| asset.get("name").and_then(serde_json::Value::as_str) == Some(name))
             .ok_or_else(|| failure(format!("public asset is missing: {name}")))?;
         let destination = public_downloads.path().join(name);
-        download_github_asset(&release, asset, None, &destination)?;
+        download_github_asset_at(&release, &endpoints, asset, None, &destination)?;
         if !asset_matches(asset, &destination)? {
             return Err(failure(format!("public asset digest differs: {name}")));
         }
@@ -5670,13 +5862,7 @@ fn verify_public(root: &Path) -> Result<()> {
             return Err(failure(format!("public asset digest differs: {name}")));
         }
     }
-    verify_public_workflow_provenance(
-        root,
-        &release,
-        &manifest,
-        &identity,
-        &HttpEndpoints::production(),
-    )?;
+    verify_public_workflow_provenance(root, &release, &manifest, &identity, &endpoints)?;
     let report_digest = sha256_file(&report_path)?;
     if !remote
         .get("body")

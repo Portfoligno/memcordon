@@ -667,6 +667,7 @@ enum MockResponse {
     Json(u16, serde_json::Value),
     Ndjson(u16, Vec<serde_json::Value>),
     Bytes(u16, Vec<u8>),
+    Headers(u16, Vec<(&'static str, String)>, Vec<u8>),
     Truncated(Vec<u8>, usize),
     LoseResponse,
 }
@@ -715,6 +716,20 @@ impl MockServer {
                     }
                     MockResponse::Bytes(status, bytes) => {
                         write_response(&mut stream, status, "application/octet-stream", &bytes);
+                    }
+                    MockResponse::Headers(status, headers, bytes) => {
+                        write!(
+                            stream,
+                            "HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nConnection: close\r\n",
+                            bytes.len()
+                        )
+                        .expect("mock headers should write");
+                        for (name, value) in headers {
+                            write!(stream, "{name}: {value}\r\n")
+                                .expect("mock header should write");
+                        }
+                        stream.write_all(b"\r\n").expect("mock header terminator");
+                        stream.write_all(&bytes).expect("mock body should write");
                     }
                     MockResponse::Truncated(bytes, declared_length) => {
                         write!(
@@ -2180,6 +2195,265 @@ fn workflow_provenance_fetches_public_bytes_without_a_token() {
         !requests[0].to_ascii_lowercase().contains("authorization:"),
         "public workflow provenance must not send an authorization credential"
     );
+}
+
+#[test]
+fn github_throttle_delays_respect_server_minima_and_fail_closed() {
+    let now = UNIX_EPOCH + Duration::from_secs(100);
+    assert_eq!(
+        github_rate_limit_delay(403, Some("7"), Some("0"), Some("110"), now),
+        Some(Duration::from_secs(11))
+    );
+    assert_eq!(
+        github_rate_limit_delay(403, Some("20"), Some("0"), Some("110"), now),
+        Some(Duration::from_secs(20))
+    );
+    assert_eq!(
+        github_rate_limit_delay(403, None, Some("0"), Some("90"), now),
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        github_rate_limit_delay(429, None, None, None, now),
+        Some(Duration::from_secs(60))
+    );
+    for status in [403, 429] {
+        for retry_after in [
+            "invalid",
+            "Wed, 21 Oct 2015 07:28:00 GMT",
+            "18446744073709551616",
+        ] {
+            assert_eq!(
+                github_rate_limit_delay(status, Some(retry_after), Some("0"), Some("110"), now),
+                None
+            );
+        }
+        for reset in [None, Some("invalid")] {
+            assert_eq!(
+                github_rate_limit_delay(status, None, Some("0"), reset, now),
+                None
+            );
+        }
+    }
+    assert_eq!(github_rate_limit_delay(403, None, None, None, now), None);
+    assert_eq!(
+        github_rate_limit_delay(401, Some("1"), Some("0"), Some("110"), now),
+        None
+    );
+}
+
+#[test]
+fn github_read_retries_recognized_throttling_without_credentials() {
+    for operation in ["metadata", "workflow", "asset"] {
+        let (_, release) = release_fixture();
+        let headers = if operation == "workflow" {
+            vec![
+                ("x-ratelimit-remaining", "0".to_owned()),
+                ("x-ratelimit-reset", "0".to_owned()),
+            ]
+        } else {
+            vec![("retry-after", "0".to_owned())]
+        };
+        let server = MockServer::scripted(vec![
+            MockResponse::Headers(
+                if operation == "asset" { 429 } else { 403 },
+                headers,
+                b"throttled".to_vec(),
+            ),
+            MockResponse::Bytes(200, b"{}".to_vec()),
+        ]);
+        let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+        let url = format!("{}/resource", server.root);
+        match operation {
+            "metadata" => {
+                github_json_request(&release, &endpoints, "GET", &url, None, None)
+                    .expect("metadata throttle should recover");
+            }
+            "workflow" => {
+                assert_eq!(
+                    github_raw_get(
+                        &release,
+                        &endpoints,
+                        &url,
+                        None,
+                        "application/vnd.github.raw+json",
+                        100
+                    )
+                    .expect("workflow throttle should recover"),
+                    b"{}"
+                );
+            }
+            "asset" => {
+                let temporary = TempDir::new().unwrap();
+                let destination = temporary.path().join("asset");
+                download_github_asset_at(
+                    &release,
+                    &endpoints,
+                    &serde_json::json!({"url": url}),
+                    None,
+                    &destination,
+                )
+                .expect("asset throttle should recover");
+                assert_eq!(fs::read(destination).unwrap(), b"{}");
+            }
+            _ => unreachable!(),
+        }
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2, "{operation}");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.to_ascii_lowercase().contains("authorization:"))
+        );
+    }
+}
+
+#[test]
+fn github_forbidden_diagnostics_identify_endpoint_without_leaking_credentials() {
+    let (_, release) = release_fixture();
+    let server = MockServer::scripted(vec![MockResponse::Headers(
+        403,
+        vec![
+            ("x-github-request-id", "fixture-request".to_owned()),
+            ("x-ratelimit-remaining", "42".to_owned()),
+            ("set-cookie", "private-cookie".to_owned()),
+        ],
+        b"private-response-body".to_vec(),
+    )]);
+    let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+    let url = format!(
+        "{}/repos/Portfoligno/memcordon/releases/tags/1.2.3",
+        server.root
+    );
+    let error = github_json_request(
+        &release,
+        &endpoints,
+        "GET",
+        &url,
+        Some("private-token"),
+        None,
+    )
+    .expect_err("ordinary forbidden is permanent");
+    let message = error.to_string();
+    for expected in [
+        &url,
+        "GET",
+        "403",
+        "fixture-request",
+        "x-ratelimit-remaining=\"42\"",
+    ] {
+        assert!(message.contains(expected), "{message}");
+    }
+    for secret in [
+        "private-token",
+        "private-cookie",
+        "private-response-body",
+        "Authorization",
+    ] {
+        assert!(!message.contains(secret), "{message}");
+    }
+    assert!(!transient_network_error(&error));
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn github_throttle_budget_is_shared_across_sequential_reads() {
+    let (_, mut release) = release_fixture();
+    release.github_rate_limit_wait_seconds = 2;
+    let throttle = || MockResponse::Headers(403, vec![("retry-after", "1".to_owned())], Vec::new());
+    let server = MockServer::scripted(vec![
+        throttle(),
+        MockResponse::Json(200, serde_json::json!({})),
+        throttle(),
+    ]);
+    let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+    let first = format!("{}/first", server.root);
+    let second = format!("{}/second", server.root);
+    github_json_request(&release, &endpoints, "GET", &first, None, None)
+        .expect("first throttle fits operation budget");
+    let error = github_raw_get(
+        &release,
+        &endpoints,
+        &second,
+        None,
+        "application/octet-stream",
+        100,
+    )
+    .expect_err("second throttle must not receive a fresh budget");
+    assert_eq!(http_status(&error), Some(403));
+    assert!(error.to_string().contains(&second));
+    assert_eq!(server.finish().len(), 3);
+}
+
+#[test]
+fn github_server_delay_is_never_shortened_to_fit_retry_budget() {
+    let (_, mut release) = release_fixture();
+    release.github_rate_limit_wait_seconds = 10;
+    let error = CiError::GithubHttp {
+        method: "GET".to_owned(),
+        endpoint: "https://api.github.com/resource".to_owned(),
+        source: Box::new(CiError::Http(Box::new(ureq::Error::StatusCode(403)))),
+        details: String::new(),
+        retry_after: Some(Duration::from_secs(9)),
+    };
+    assert_eq!(
+        github_retry_delay(
+            &release,
+            &error,
+            Duration::from_millis(1),
+            Duration::ZERO,
+            Duration::ZERO
+        ),
+        Some(Duration::from_secs(9))
+    );
+    assert_eq!(
+        github_retry_delay(
+            &release,
+            &error,
+            Duration::from_millis(1),
+            Duration::ZERO,
+            Duration::from_secs(2)
+        ),
+        None
+    );
+}
+
+#[test]
+fn github_throttled_mutations_are_attempted_once_and_public_404_stays_absent() {
+    let (temporary, release) = release_fixture();
+    let server = MockServer::scripted(vec![
+        MockResponse::Headers(403, vec![("retry-after", "0".to_owned())], Vec::new()),
+        MockResponse::Headers(403, vec![("retry-after", "0".to_owned())], Vec::new()),
+        MockResponse::Bytes(404, Vec::new()),
+    ]);
+    let endpoints = HttpEndpoints::fixed_test_server(&server.root);
+    let url = format!("{}/repos/example/releases", server.root);
+    let error = github_json_request(
+        &release,
+        &endpoints,
+        "POST",
+        &url,
+        Some("token"),
+        Some(serde_json::json!({})),
+    )
+    .expect_err("POST cannot retry");
+    assert_eq!(http_status(&error), Some(403));
+    assert!(!ambiguous_mutation_error(&error));
+    let path = temporary.path().join("asset.txt");
+    fs::write(&path, b"asset\n").unwrap();
+    let error = upload_github_asset_at(&release, &endpoints, 1, "token", &path)
+        .expect_err("upload cannot retry");
+    assert_eq!(http_status(&error), Some(403));
+    assert!(!ambiguous_mutation_error(&error));
+    assert!(
+        github_release_at(temporary.path(), None, &endpoints)
+            .expect("404 means absent")
+            .is_none()
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("POST "));
+    assert!(requests[1].starts_with("POST "));
+    assert!(requests[2].starts_with("GET "));
 }
 
 fn public_provenance_fixture() -> (

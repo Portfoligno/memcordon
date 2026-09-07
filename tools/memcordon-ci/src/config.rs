@@ -170,6 +170,7 @@ pub struct Release {
     pub registry: String,
     pub publish_packages: Vec<String>,
     pub github_api_version: String,
+    pub github_rate_limit_wait_seconds: u64,
     pub maximum_package_bytes: u64,
     pub maximum_asset_bytes: u64,
     pub registry_credentials: RegistryCredentials,
@@ -385,6 +386,7 @@ pub fn validate_release_configuration_identity(release: &Release) -> Result<()> 
         || release.registry != "crates-io"
         || release.workflow != "release.yml"
         || release.github_api_version.is_empty()
+        || release.github_rate_limit_wait_seconds == 0
         || release.maximum_package_bytes == 0
         || release.maximum_asset_bytes == 0
         || release.registry_wait.initial_milliseconds == 0
