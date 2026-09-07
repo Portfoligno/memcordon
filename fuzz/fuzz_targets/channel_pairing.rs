@@ -12,4 +12,10 @@ fuzz_target!(|data: &[u8]| {
         let _ = cli_channel.version == provider_channel.version
             && cli_channel.source_commit == provider_channel.source_commit;
     }
+    if let Ok([cli_channel, provider_channel]) =
+        serde_json::from_slice::<[inspection_schema::AgentPackageInspectionV4; 2]>(data)
+    {
+        let _ = cli_channel.version == provider_channel.version
+            && cli_channel.source_commit == provider_channel.source_commit;
+    }
 });

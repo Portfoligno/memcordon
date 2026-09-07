@@ -71,7 +71,7 @@ fn package_inspection_is_credential_free_and_machine_readable() {
     );
     let inspection: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("inspection should be JSON");
-    assert_eq!(inspection["schema_version"], 3);
+    assert_eq!(inspection["schema_version"], 4);
     assert_eq!(inspection["version"], env!("CARGO_PKG_VERSION"));
     #[cfg(target_os = "windows")]
     {

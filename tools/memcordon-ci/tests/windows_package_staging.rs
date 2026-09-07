@@ -68,15 +68,10 @@ fn configuration_and_install_arguments_bind_the_isolated_layout() {
             destination.to_string_lossy()
         );
     }
-    for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
-        assert_eq!(
-            configuration["target"][target]["rustflags"],
-            toml::Value::Array(vec![
-                toml::Value::String("-C".to_owned()),
-                toml::Value::String("target-feature=+crt-static".to_owned()),
-            ])
-        );
-    }
+    assert!(
+        configuration.get("target").is_none(),
+        "packaged-source configuration must not inject a runtime unavailable to public Cargo installation"
+    );
 
     let install_root = staging.path().join("durable-install");
     let target_root = staging.path().join("durable-target");

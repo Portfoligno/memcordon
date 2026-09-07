@@ -150,19 +150,27 @@ fn import_gate_rejects_ui_dependency_in_normal_and_delay_tables() {
 }
 
 #[test]
-fn import_gate_rejects_dynamic_crt_dependency_in_normal_and_delay_tables() {
+fn import_gate_rejects_redistributable_crt_dependency_in_normal_and_delay_tables() {
     for dll in [
         "VCRUNTIME140.dll",
         "VCRUNTIME140_1.dll",
         "MSVCP140.dll",
         "MSVCRT.dll",
-        "UCRTBASE.dll",
-        "api-ms-win-crt-runtime-l1-1-0.dll",
     ] {
         for delayed in [false, true] {
             let error = verify_target_desktop_bootstrap_pe(&synthetic_pe(dll, delayed))
-                .expect_err("dynamic CRT imports must fail the loader-safe contract");
+                .expect_err("redistributable CRT imports must fail the loader-safe contract");
             assert!(error.contains(&dll.to_ascii_uppercase()));
+        }
+    }
+}
+
+#[test]
+fn import_gate_accepts_os_provided_ucrt_in_normal_and_delay_tables() {
+    for dll in ["UCRTBASE.dll", "api-ms-win-crt-runtime-l1-1-0.dll"] {
+        for delayed in [false, true] {
+            verify_target_desktop_bootstrap_pe(&synthetic_pe(dll, delayed))
+                .expect("OS-provided UCRT imports are recursively validated by the loader");
         }
     }
 }

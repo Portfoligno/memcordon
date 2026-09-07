@@ -841,6 +841,17 @@ fn windows_package_inspection() -> Value {
     })
 }
 
+fn windows_package_inspection_v4() -> Value {
+    let mut package = windows_package_inspection();
+    package["schema_version"] = json!(4);
+    package["target_desktop_bootstrap_runtime"] = json!("static-vc-runtime-os-ucrt");
+    package["target_desktop_bootstrap_normal_imports"] =
+        json!(["API-MS-WIN-CRT-RUNTIME-L1-1-0.dll"]);
+    package["target_desktop_bootstrap_delayed_imports"] = json!([]);
+    package["target_desktop_bootstrap_loader_contract_sha256"] = json!("61".repeat(32));
+    package
+}
+
 fn macos_report() -> Value {
     json!({
         "schema": 1,
@@ -862,7 +873,13 @@ fn write_report(path: &Path, value: &Value) {
     fs::write(path, bytes).expect("report should write");
 }
 
-fn write_windows_artifact(input: &Path, id: &str, architecture: &str, runner_label: &str) {
+fn write_windows_artifact(
+    input: &Path,
+    id: &str,
+    architecture: &str,
+    runner_label: &str,
+    package_schema_v4: bool,
+) {
     let directory = input.join(format!("release-windows-package-channel-{id}"));
     let evidence = directory.join("release-evidence");
     fs::create_dir_all(&evidence).expect("split Windows evidence directory should exist");
@@ -909,21 +926,32 @@ fn write_windows_artifact(input: &Path, id: &str, architecture: &str, runner_lab
             "evidence_bindings": bindings,
         }),
     );
-    write_legacy_windows_artifact(input, id, architecture, runner_label);
+    write_legacy_windows_artifact(input, id, architecture, runner_label, package_schema_v4);
 }
 
 #[allow(dead_code)]
-fn write_legacy_windows_artifact(input: &Path, id: &str, architecture: &str, runner_label: &str) {
+fn write_legacy_windows_artifact(
+    input: &Path,
+    id: &str,
+    architecture: &str,
+    runner_label: &str,
+    package_schema_v4: bool,
+) {
     let directory = input.join(format!("release-certification-windows-{id}"));
     let qualification = windows_qualification();
     let qualification_value =
         serde_json::to_value(&qualification).expect("Windows qualification should serialize");
-    let package = windows_package_inspection();
+    let package = if package_schema_v4 {
+        windows_package_inspection_v4()
+    } else {
+        windows_package_inspection()
+    };
+    let installed_schema_version = package["schema_version"].clone();
     write_report(&directory.join("windows-package-inspection.json"), &package);
     write_report(
         &directory.join("windows-installed-provider.json"),
         &json!({
-            "schema_version": 3,
+            "schema_version": installed_schema_version,
             "agent": package,
             "installed_executable_sha256": "56".repeat(32),
             "installed_artifacts_valid": true,
@@ -1408,8 +1436,8 @@ fn fixture() -> (TempDir, Value, Value, Value) {
             "caller_mount_namespace_reproduction_verified": true
         }),
     );
-    write_windows_artifact(&input, "x64", "x86_64", "windows-2025");
-    write_windows_artifact(&input, "arm64", "aarch64", "windows-11-arm");
+    write_windows_artifact(&input, "x64", "x86_64", "windows-2025", true);
+    write_windows_artifact(&input, "arm64", "aarch64", "windows-11-arm", false);
     write_report(
         &input
             .join("release-acceptance-macos-arm64")

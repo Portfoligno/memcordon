@@ -625,7 +625,7 @@ struct WindowsStatusMatrixEvidence {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct WindowsPackageInspection {
+struct WindowsPackageInspectionV3 {
     schema_version: u32,
     version: String,
     source_commit: String,
@@ -672,11 +672,35 @@ struct WindowsPackageInspection {
     compiled_metadata_valid: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum TargetDesktopBootstrapRuntimeV4 {
+    StaticVcRuntimeOsUcrt,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
-struct WindowsInstalledProviderInspection {
+struct WindowsPackageInspectionV4 {
+    #[serde(flatten)]
+    base: WindowsPackageInspectionV3,
+    target_desktop_bootstrap_runtime: TargetDesktopBootstrapRuntimeV4,
+    target_desktop_bootstrap_normal_imports: Vec<String>,
+    target_desktop_bootstrap_delayed_imports: Vec<String>,
+    target_desktop_bootstrap_loader_contract_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(untagged)]
+enum WindowsPackageInspection {
+    V3(WindowsPackageInspectionV3),
+    V4(WindowsPackageInspectionV4),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsInstalledProviderInspectionV3 {
     schema_version: u32,
-    agent: WindowsPackageInspection,
+    agent: WindowsPackageInspectionV3,
     installed_executable_sha256: String,
     installed_artifacts_valid: bool,
     provider_identity: Option<String>,
@@ -684,9 +708,32 @@ struct WindowsInstalledProviderInspection {
     qualification_complete: bool,
 }
 
-impl WindowsPackageInspection {
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsInstalledProviderInspectionV4 {
+    schema_version: u32,
+    agent: WindowsPackageInspectionV4,
+    installed_executable_sha256: String,
+    installed_artifacts_valid: bool,
+    provider_identity: Option<String>,
+    provider_reachable: bool,
+    qualification_complete: bool,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(untagged)]
+enum WindowsInstalledProviderInspection {
+    V3(WindowsInstalledProviderInspectionV3),
+    V4(WindowsInstalledProviderInspectionV4),
+}
+
+impl WindowsPackageInspectionV3 {
     fn valid(&self, expected_commit: &str) -> bool {
-        self.schema_version == 3
+        self.semantic_valid(expected_commit, 3)
+    }
+
+    fn semantic_valid(&self, expected_commit: &str, schema_version: u32) -> bool {
+        self.schema_version == schema_version
             && self.version == env!("CARGO_PKG_VERSION")
             && self.source_commit == expected_commit
             && valid_sha256(&self.executable_sha256)
@@ -744,6 +791,33 @@ impl WindowsPackageInspection {
             .iter()
             .all(|value| valid_sha256(value))
             && self.compiled_metadata_valid
+    }
+}
+
+impl WindowsPackageInspectionV4 {
+    fn valid(&self, expected_commit: &str) -> bool {
+        let imports = memcordon_core::WindowsPeImports {
+            machine: 0,
+            normal: self.target_desktop_bootstrap_normal_imports.clone(),
+            delayed: self.target_desktop_bootstrap_delayed_imports.clone(),
+        };
+        self.base.semantic_valid(expected_commit, 4)
+            && self.target_desktop_bootstrap_runtime
+                == TargetDesktopBootstrapRuntimeV4::StaticVcRuntimeOsUcrt
+            && !self.target_desktop_bootstrap_normal_imports.is_empty()
+            && self.target_desktop_bootstrap_normal_imports.is_sorted()
+            && self.target_desktop_bootstrap_delayed_imports.is_sorted()
+            && memcordon_core::verify_target_desktop_bootstrap_imports(&imports).is_ok()
+            && valid_sha256(&self.target_desktop_bootstrap_loader_contract_sha256)
+    }
+}
+
+impl WindowsPackageInspection {
+    fn valid(&self, expected_commit: &str) -> bool {
+        match self {
+            Self::V3(inspection) => inspection.valid(expected_commit),
+            Self::V4(inspection) => inspection.valid(expected_commit),
+        }
     }
 }
 
@@ -887,14 +961,29 @@ fn validate_windows_auxiliary(
         }
         "windows-installed-provider.json" => {
             let inspection: WindowsInstalledProviderInspection = serde_json::from_slice(bytes)?;
-            if inspection.schema_version != 3
-                || !inspection.agent.valid(expected_commit)
-                || inspection.installed_executable_sha256 != inspection.agent.executable_sha256
-                || !inspection.installed_artifacts_valid
-                || inspection.provider_identity.is_none()
-                || !inspection.provider_reachable
-                || !inspection.qualification_complete
-            {
+            let complete = match &inspection {
+                WindowsInstalledProviderInspection::V3(inspection) => {
+                    inspection.schema_version == 3
+                        && inspection.agent.valid(expected_commit)
+                        && inspection.installed_executable_sha256
+                            == inspection.agent.executable_sha256
+                        && inspection.installed_artifacts_valid
+                        && inspection.provider_identity.is_some()
+                        && inspection.provider_reachable
+                        && inspection.qualification_complete
+                }
+                WindowsInstalledProviderInspection::V4(inspection) => {
+                    inspection.schema_version == 4
+                        && inspection.agent.valid(expected_commit)
+                        && inspection.installed_executable_sha256
+                            == inspection.agent.base.executable_sha256
+                        && inspection.installed_artifacts_valid
+                        && inspection.provider_identity.is_some()
+                        && inspection.provider_reachable
+                        && inspection.qualification_complete
+                }
+            };
+            if !complete {
                 return Err(failure(
                     "Windows installed-provider inspection is incomplete",
                 ));
@@ -1059,10 +1148,28 @@ fn validate_windows_cross_report_bindings(directory: &Path, cleanup: &[u8]) -> R
     )?)?;
     let qualification: WindowsQualificationReceiptV1 =
         serde_json::from_slice(&read_report(&directory.join("windows-qualification.json"))?)?;
-    if package != installed.agent
+    let package_matches_installation = match (&package, &installed) {
+        (
+            WindowsPackageInspection::V3(package),
+            WindowsInstalledProviderInspection::V3(installed),
+        ) => package == &installed.agent,
+        (
+            WindowsPackageInspection::V4(package),
+            WindowsInstalledProviderInspection::V4(installed),
+        ) => package == &installed.agent,
+        _ => false,
+    };
+    let provider_identity = match &installed {
+        WindowsInstalledProviderInspection::V3(inspection) => {
+            inspection.provider_identity.as_deref()
+        }
+        WindowsInstalledProviderInspection::V4(inspection) => {
+            inspection.provider_identity.as_deref()
+        }
+    };
+    if !package_matches_installation
         || qualification != cleanup.runtime.qualification
-        || installed.provider_identity.as_deref()
-            != Some(cleanup.runtime.qualification.provider_identity.as_str())
+        || provider_identity != Some(cleanup.runtime.qualification.provider_identity.as_str())
         || !validate_windows_public_launch(
             &cleanup.runtime.public_launch,
             &cleanup.runtime.qualification,

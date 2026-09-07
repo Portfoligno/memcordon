@@ -434,7 +434,7 @@ fn sealed_package_uninstall_refuses_live_authenticated_attempt() {
     assert!(retained.stderr.is_empty());
     let inspection: serde_json::Value = serde_json::from_slice(&retained.stdout)
         .expect("retained installed-provider inspection should be JSON");
-    assert_eq!(inspection["schema_version"], 3);
+    assert_eq!(inspection["schema_version"], 4);
     assert_eq!(inspection["installed_artifacts_valid"], true);
     assert_eq!(inspection["provider_reachable"], true);
     assert_eq!(inspection["qualification_complete"], true);

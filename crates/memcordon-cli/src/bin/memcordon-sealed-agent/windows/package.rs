@@ -14,7 +14,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
 use crate::inspection_schema::{
-    AgentPackageInspectionV3, InstalledProviderInspectionV3, ProviderPackageMetadataV3,
+    AgentPackageInspectionV4, InstalledProviderInspectionV4, ProviderPackageMetadataV4,
+    TargetDesktopBootstrapRuntimeV4,
 };
 
 use super::security::{
@@ -301,7 +302,7 @@ pub(crate) fn validate_installed_session_broker() -> Result<String, String> {
     Ok(crate::package::sha256_bytes(&bytes))
 }
 
-pub fn compiled_metadata() -> Result<ProviderPackageMetadataV3, String> {
+pub fn compiled_metadata() -> Result<ProviderPackageMetadataV4, String> {
     let executable = installed_binary().to_string_lossy().into_owned();
     let source = std::env::current_exe().map_err(|error| error.to_string())?;
     let source_bootstrap = packaged_target_desktop_bootstrap(&source)?;
@@ -349,7 +350,7 @@ pub fn compiled_metadata() -> Result<ProviderPackageMetadataV3, String> {
         })
         .collect::<Result<Vec<_>, String>>()?
         .join("\u{1e}");
-    Ok(ProviderPackageMetadataV3::WindowsService {
+    Ok(ProviderPackageMetadataV4::WindowsService {
         control_service_name: WINDOWS_CONTROL_SERVICE_NAME.to_owned(),
         launcher_service_name: WINDOWS_LAUNCHER_SERVICE_NAME.to_owned(),
         session_broker_service_name: WINDOWS_SESSION_BROKER_SERVICE_NAME.to_owned(),
@@ -371,10 +372,10 @@ pub fn compiled_metadata() -> Result<ProviderPackageMetadataV3, String> {
         target_desktop_bootstrap_sha256: crate::package::sha256_regular_no_follow(
             &source_bootstrap,
         )?,
-        target_desktop_bootstrap_crt_static: cfg!(target_feature = "crt-static"),
+        target_desktop_bootstrap_runtime: TargetDesktopBootstrapRuntimeV4::StaticVcRuntimeOsUcrt,
         target_desktop_bootstrap_loader_contract_sha256: crate::package::sha256_bytes(
             format!(
-                "memcordon-target-desktop-loader-contract-v1\0crt-static=true\0normal={}\0delayed={}",
+                "memcordon-target-desktop-loader-contract-v2\0vc-runtime=static\0ucrt=os\0normal={}\0delayed={}",
                 target_desktop_bootstrap_imports.normal.join(","),
                 target_desktop_bootstrap_imports.delayed.join(","),
             )
@@ -3251,8 +3252,8 @@ fn verify_service_process_protection(manager: &service_manager::ScHandle) -> Res
 }
 
 pub fn installed_inspection(
-    agent: AgentPackageInspectionV3,
-) -> Result<InstalledProviderInspectionV3, String> {
+    agent: AgentPackageInspectionV4,
+) -> Result<InstalledProviderInspectionV4, String> {
     verify_installed()?;
     let installed_executable_sha256 =
         crate::package::sha256_regular_no_follow(&installed_binary())?;
@@ -3260,8 +3261,8 @@ pub fn installed_inspection(
     let qualification_complete = qualification
         .as_ref()
         .is_some_and(|receipt| receipt.qualified && receipt.is_consistent());
-    Ok(InstalledProviderInspectionV3 {
-        schema_version: 3,
+    Ok(InstalledProviderInspectionV4 {
+        schema_version: 4,
         agent,
         installed_executable_sha256,
         installed_artifacts_valid: true,

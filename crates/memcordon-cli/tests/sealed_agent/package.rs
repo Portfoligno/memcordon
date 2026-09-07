@@ -25,7 +25,9 @@ fn installed_verification_uses_captured_source_digest_after_source_removal() {
     std::fs::write(&installed, captured_bytes).expect("captured executable should be installed");
     std::fs::remove_file(&source).expect("source pathname should be removable");
 
-    crate::package::verify_installed_executable_against(&installed, &captured_digest)
+    let installed_digest = crate::package::sha256_regular_no_follow(&installed)
+        .expect("installed verification must not reopen the removed source pathname");
+    crate::package::verify_installed_executable_digest(&captured_digest, &installed_digest)
         .expect("installed verification must not reopen the removed source pathname");
 }
 

@@ -11,7 +11,7 @@ fn package(digest: &str) -> Value {
         "control_pipe_security_sha256": "ab".repeat(32),
         "target_desktop_bootstrap_loader_contract_sha256": "cd".repeat(32),
         "target_desktop_bootstrap_normal_imports": ["KERNEL32.DLL"],
-        "target_desktop_bootstrap_crt_static": true,
+        "target_desktop_bootstrap_runtime": "static-vc-runtime-os-ucrt",
         "mechanism": "windows-job-object-v2"
     })
 }
@@ -40,7 +40,7 @@ fn projection_retains_every_security_loader_and_source_contract() {
             "target_desktop_bootstrap_normal_imports",
             json!(["USER32.DLL"]),
         ),
-        ("target_desktop_bootstrap_crt_static", json!(false)),
+        ("target_desktop_bootstrap_runtime", json!("full-crt-static")),
         ("mechanism", json!("other-mechanism")),
     ] {
         let mut changed = original.clone();

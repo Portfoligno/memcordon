@@ -262,7 +262,7 @@ enum AgentPackagePlatform {
         binary_install_path: String,
         target_desktop_bootstrap_install_path: String,
         target_desktop_bootstrap_sha256: String,
-        target_desktop_bootstrap_crt_static: bool,
+        target_desktop_bootstrap_runtime: TargetDesktopBootstrapRuntime,
         target_desktop_bootstrap_normal_imports: Vec<String>,
         target_desktop_bootstrap_delayed_imports: Vec<String>,
         target_desktop_bootstrap_loader_contract_sha256: String,
@@ -285,6 +285,12 @@ enum AgentPackagePlatform {
         install_directory_security_sha256: String,
         state_directory_security_sha256: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum TargetDesktopBootstrapRuntime {
+    StaticVcRuntimeOsUcrt,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1214,7 +1220,7 @@ fn validate_agent_package_inspection(
             binary_install_path,
             target_desktop_bootstrap_install_path,
             target_desktop_bootstrap_sha256,
-            target_desktop_bootstrap_crt_static,
+            target_desktop_bootstrap_runtime,
             target_desktop_bootstrap_normal_imports,
             target_desktop_bootstrap_delayed_imports,
             target_desktop_bootstrap_loader_contract_sha256,
@@ -1237,6 +1243,11 @@ fn validate_agent_package_inspection(
             install_directory_security_sha256,
             state_directory_security_sha256,
         } => {
+            let loader_imports = memcordon_core::WindowsPeImports {
+                machine: 0,
+                normal: target_desktop_bootstrap_normal_imports.clone(),
+                delayed: target_desktop_bootstrap_delayed_imports.clone(),
+            };
             inspection.provider_protocol == 1
                 && inspection.mechanism == "windows-job-object-v2"
                 && control_service_name == "MemCordonSealedControl"
@@ -1253,10 +1264,12 @@ fn validate_agent_package_inspection(
                 && target_desktop_bootstrap_sha256
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
-                && *target_desktop_bootstrap_crt_static
+                && *target_desktop_bootstrap_runtime
+                    == TargetDesktopBootstrapRuntime::StaticVcRuntimeOsUcrt
                 && !target_desktop_bootstrap_normal_imports.is_empty()
                 && target_desktop_bootstrap_normal_imports.is_sorted()
                 && target_desktop_bootstrap_delayed_imports.is_sorted()
+                && memcordon_core::verify_target_desktop_bootstrap_imports(&loader_imports).is_ok()
                 && valid_digest(target_desktop_bootstrap_loader_contract_sha256)
                 && !session_broker_install_path.is_empty()
                 && valid_digest(session_broker_sha256)
@@ -1289,7 +1302,7 @@ fn validate_agent_package_inspection(
                 .all(valid_digest)
         }
     };
-    if inspection.schema_version != 3
+    if inspection.schema_version != 4
         || inspection.version != expected_version
         || inspection.source_commit != expected_source_commit
         || inspection.execution_report_schema != memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION
@@ -1388,10 +1401,6 @@ fn smoke_packaged_memcordon_install(
     patch_table.insert("crates-io".to_owned(), toml::Value::Table(crates_io));
     let mut configuration = toml::Table::new();
     configuration.insert("patch".to_owned(), toml::Value::Table(patch_table));
-    configuration.insert(
-        "target".to_owned(),
-        windows_static_crt_target_configuration(),
-    );
     fs::write(
         cargo_configuration.join("config.toml"),
         toml::to_string(&toml::Value::Table(configuration)).map_err(|error| {
@@ -1488,22 +1497,6 @@ fn smoke_packaged_memcordon_install(
         smoke_windows_provider(&installed_cli, &installed_agent, root, &mut smoke)?;
     }
     Ok(())
-}
-
-fn windows_static_crt_target_configuration() -> toml::Value {
-    let rustflags = || {
-        toml::Value::Array(vec![
-            toml::Value::String("-C".to_owned()),
-            toml::Value::String("target-feature=+crt-static".to_owned()),
-        ])
-    };
-    let mut targets = toml::Table::new();
-    for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
-        let mut specification = toml::Table::new();
-        specification.insert("rustflags".to_owned(), rustflags());
-        targets.insert(target.to_owned(), toml::Value::Table(specification));
-    }
-    toml::Value::Table(targets)
 }
 
 fn host_target(targets: &[AssetTarget]) -> Result<&AssetTarget> {
@@ -5720,7 +5713,7 @@ mod tests {
     fn package_inspection_fixture() -> serde_json::Value {
         let digest = sha256_bytes(b"package-inspection-fixture");
         serde_json::json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "version": "1.2.3",
             "source_commit": "source-commit",
             "executable_sha256": digest,
@@ -5763,7 +5756,7 @@ mod tests {
             inspection.insert(field.to_owned(), serde_json::json!(digest));
         }
         for (field, value) in [
-            ("schema_version", serde_json::json!(3)),
+            ("schema_version", serde_json::json!(4)),
             ("version", serde_json::json!("1.2.3")),
             ("source_commit", serde_json::json!("source-commit")),
             ("provider_protocol", serde_json::json!(1)),
@@ -5824,8 +5817,8 @@ mod tests {
                 ),
             ),
             (
-                "target_desktop_bootstrap_crt_static",
-                serde_json::json!(true),
+                "target_desktop_bootstrap_runtime",
+                serde_json::json!("static-vc-runtime-os-ucrt"),
             ),
             (
                 "target_desktop_bootstrap_normal_imports",
@@ -6141,6 +6134,42 @@ mod tests {
             error
                 .to_string()
                 .contains("sealed agent package inspection differs from the release identity")
+        );
+    }
+
+    #[test]
+    fn windows_package_inspection_binds_bootstrap_runtime_contract() {
+        let mut canonical = windows_package_inspection_fixture();
+        canonical["target_desktop_bootstrap_normal_imports"] =
+            serde_json::json!(["API-MS-WIN-CRT-RUNTIME-L1-1-0.dll"]);
+        validate_agent_package_inspection(
+            &serde_json::to_vec(&canonical).unwrap(),
+            "1.2.3",
+            "source-commit",
+        )
+        .expect("OS-provided UCRT API sets must remain valid bootstrap imports");
+
+        let mut redistributable = canonical;
+        redistributable["target_desktop_bootstrap_normal_imports"] =
+            serde_json::json!(["VCRUNTIME140.dll"]);
+        assert!(
+            validate_agent_package_inspection(
+                &serde_json::to_vec(&redistributable).unwrap(),
+                "1.2.3",
+                "source-commit",
+            )
+            .is_err()
+        );
+
+        let mut runtime = windows_package_inspection_fixture();
+        runtime["target_desktop_bootstrap_runtime"] = serde_json::json!("full-crt-static");
+        assert!(
+            validate_agent_package_inspection(
+                &serde_json::to_vec(&runtime).unwrap(),
+                "1.2.3",
+                "source-commit",
+            )
+            .is_err()
         );
     }
 

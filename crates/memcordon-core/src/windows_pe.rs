@@ -616,6 +616,11 @@ pub fn parse_windows_pe_imports(bytes: &[u8]) -> Result<WindowsPeImports, String
 
 pub fn verify_target_desktop_bootstrap_pe(bytes: &[u8]) -> Result<WindowsPeImports, String> {
     let imports = parse_windows_pe_imports(bytes)?;
+    verify_target_desktop_bootstrap_imports(&imports)?;
+    Ok(imports)
+}
+
+pub fn verify_target_desktop_bootstrap_imports(imports: &WindowsPeImports) -> Result<(), String> {
     const DENIED: &[&str] = &[
         "USER32.DLL",
         "GDI32.DLL",
@@ -629,17 +634,15 @@ pub fn verify_target_desktop_bootstrap_pe(bytes: &[u8]) -> Result<WindowsPeImpor
     ];
     if let Some(name) = imports.normal.iter().chain(&imports.delayed).find(|name| {
         DENIED.contains(&name.as_str())
-            || name.as_str() == "UCRTBASE.DLL"
             || name.as_str() == "MSVCRT.DLL"
             || name.starts_with("VCRUNTIME")
             || name.starts_with("MSVCP")
-            || name.starts_with("API-MS-WIN-CRT-")
     }) {
         return Err(format!(
-            "target desktop bootstrap PE imports forbidden dynamic loader dependency {name}"
+            "target desktop bootstrap PE imports forbidden redistributable or UI loader dependency {name}"
         ));
     }
-    Ok(imports)
+    Ok(())
 }
 
 pub fn verify_session_broker_pe(bytes: &[u8]) -> Result<WindowsPeImports, String> {

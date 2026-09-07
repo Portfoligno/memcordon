@@ -1,7 +1,7 @@
 #![cfg_attr(feature = "test-support", allow(dead_code))]
 
-#[cfg(all(target_os = "windows", not(target_feature = "crt-static")))]
-compile_error!("the target desktop bootstrap requires a statically linked CRT");
+#[cfg(all(target_os = "windows", not(memcordon_static_vcruntime)))]
+compile_error!("the target desktop bootstrap requires package-owned static VC runtime linking");
 
 use std::ffi::{OsStr, OsString};
 

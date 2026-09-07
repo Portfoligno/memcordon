@@ -73,6 +73,11 @@ fn watch_git_identity(manifest: &Path) {
 }
 
 fn main() {
+    static_vcruntime::metabuild();
+    println!("cargo::rustc-check-cfg=cfg(memcordon_static_vcruntime)");
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo::rustc-cfg=memcordon_static_vcruntime");
+    }
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let output = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("source_commit.rs");
     let commit = packaged_commit(&manifest)

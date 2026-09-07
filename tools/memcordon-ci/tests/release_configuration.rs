@@ -3,6 +3,29 @@ use memcordon_ci::config::{self, RegistryCredentials, Release, SealedAssetPolicy
 type ReleaseMutation = (&'static str, fn(&mut Release));
 
 #[test]
+fn windows_bootstrap_runtime_linking_is_package_owned() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest: toml::Value = toml::from_str(
+        &std::fs::read_to_string(root.join("crates/memcordon-cli/Cargo.toml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["build-dependencies"]["static_vcruntime"],
+        toml::Value::Table(toml::map::Map::from_iter([(
+            "workspace".to_owned(),
+            toml::Value::Boolean(true),
+        )]))
+    );
+    let build_script = std::fs::read_to_string(root.join("crates/memcordon-cli/build.rs")).unwrap();
+    assert!(build_script.contains("static_vcruntime::metabuild();"));
+    assert!(build_script.contains("cargo::rustc-cfg=memcordon_static_vcruntime"));
+    assert!(
+        !root.join(".cargo/config.toml").exists(),
+        "public Cargo installation cannot depend on repository-local target RUSTFLAGS"
+    );
+}
+
+#[test]
 fn workspace_publication_order_matches_the_dependency_graph() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let metadata = cargo_metadata::MetadataCommand::new()

@@ -70,7 +70,7 @@ pub use windows_pe::{
     WindowsPeImportDescriptor, WindowsPeImportSymbol, WindowsPeImports, WindowsPeLoaderContract,
     parse_windows_pe_imports, parse_windows_pe_loader_contract,
     parse_windows_pe_mapped_loader_contract, verify_session_broker_pe,
-    verify_target_desktop_bootstrap_pe,
+    verify_target_desktop_bootstrap_imports, verify_target_desktop_bootstrap_pe,
 };
 pub use windows_sealed::{
     NativeWindowsCommandV1, WINDOWS_CERTIFICATION_FRONTEND_CANARY_COUNT, WINDOWS_CONTROL_PIPE,

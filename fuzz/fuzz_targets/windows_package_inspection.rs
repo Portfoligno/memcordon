@@ -7,4 +7,5 @@ mod inspection_schema;
 
 fuzz_target!(|data: &[u8]| {
     let _ = serde_json::from_slice::<inspection_schema::AgentPackageInspectionV3>(data);
+    let _ = serde_json::from_slice::<inspection_schema::AgentPackageInspectionV4>(data);
 });

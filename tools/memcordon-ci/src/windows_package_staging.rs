@@ -80,10 +80,6 @@ impl WindowsPackageSourceLayout {
         patch_table.insert("crates-io".to_owned(), toml::Value::Table(crates_io));
         let mut configuration = toml::Table::new();
         configuration.insert("patch".to_owned(), toml::Value::Table(patch_table));
-        configuration.insert(
-            "target".to_owned(),
-            windows_static_crt_target_configuration(),
-        );
         let encoded = toml::to_string(&toml::Value::Table(configuration)).map_err(|error| {
             CiError::Message(format!(
                 "packaged-source Cargo configuration serialization failed: {error}"
@@ -153,20 +149,4 @@ pub fn validate_staging_outside_repository(
         )));
     }
     Ok(())
-}
-
-fn windows_static_crt_target_configuration() -> toml::Value {
-    let rustflags = || {
-        toml::Value::Array(vec![
-            toml::Value::String("-C".to_owned()),
-            toml::Value::String("target-feature=+crt-static".to_owned()),
-        ])
-    };
-    let mut targets = toml::Table::new();
-    for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
-        let mut specification = toml::Table::new();
-        specification.insert("rustflags".to_owned(), rustflags());
-        targets.insert(target.to_owned(), toml::Value::Table(specification));
-    }
-    toml::Value::Table(targets)
 }
