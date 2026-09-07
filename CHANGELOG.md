@@ -2,7 +2,7 @@
 
 All notable user-visible changes to MemCordon are documented here.
 
-## Unreleased
+## [0.5.2-rc.21] - 2026-09-07
 
 ### Added
 
@@ -31,6 +31,9 @@ All notable user-visible changes to MemCordon are documented here.
 - Windows package upgrades now wait for retired provider Jobs and native images
   to become fully replaceable, preventing architecture-dependent access-denied
   rollbacks.
+- Windows packages now own static Visual C++ runtime linking while using the
+  operating-system Universal C Runtime, avoiding machine-local VC runtime
+  dependencies.
 
 ## [0.5.1-rc.2] - 2026-08-25
 
