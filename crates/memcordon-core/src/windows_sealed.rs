@@ -12,8 +12,8 @@ use crate::{
     WindowsSealedEvidenceV2,
 };
 
-pub const WINDOWS_PUBLIC_PROTOCOL_VERSION: u32 = 1;
-pub const WINDOWS_PRIVATE_PROTOCOL_VERSION: u32 = 1;
+pub const WINDOWS_PUBLIC_PROTOCOL_VERSION: u32 = 2;
+pub const WINDOWS_PRIVATE_PROTOCOL_VERSION: u32 = 2;
 pub const WINDOWS_QUALIFICATION_SCHEMA_VERSION: u32 = 2;
 pub const WINDOWS_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const WINDOWS_MAX_JOB_PROCESS_IDENTITIES: usize = 256;
@@ -1217,7 +1217,9 @@ pub enum WindowsTerminalizationErrorStageV1 {
 #[serde(deny_unknown_fields)]
 pub struct WindowsTerminalizationErrorV1 {
     pub stage: WindowsTerminalizationErrorStageV1,
+    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 128>")]
     pub error_code: String,
+    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 2048>")]
     pub detail: String,
     pub native_code: Option<i32>,
     pub observed_unix_millis: Option<u64>,
@@ -1250,8 +1252,19 @@ pub struct WindowsTerminalizationStatusV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<WindowsTerminalizationErrorV1>,
     /// Later bounded observer/transport failures in durable causal order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_terminalization_errors"
+    )]
     pub secondary_errors: Vec<WindowsTerminalizationErrorV1>,
+}
+
+fn deserialize_terminalization_errors<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Vec<WindowsTerminalizationErrorV1>, D::Error> {
+    crate::BoundedVec::<WindowsTerminalizationErrorV1, WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS>::deserialize(decoder)
+        .map(|errors| errors.as_slice().to_vec())
 }
 
 impl WindowsTerminalizationStatusV1 {
@@ -1281,12 +1294,18 @@ impl WindowsTerminalizationStatusV1 {
 #[serde(deny_unknown_fields)]
 pub struct WindowsDurableAttemptRecordV1 {
     pub schema_version: u32,
+    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
     pub attempt_id: String,
+    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
     pub provider_generation: String,
+    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
     pub boot_identity: String,
+    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
     pub request_sha256: String,
     pub caller_process_identity: WindowsProcessIdentityV1,
+    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
     pub caller_token_sha256: String,
+    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
     pub job_identity_sha256: String,
     pub guardian_identity: Option<WindowsProcessIdentityV1>,
     pub target_identity: Option<WindowsProcessIdentityV1>,
@@ -1295,11 +1314,26 @@ pub struct WindowsDurableAttemptRecordV1 {
     pub resume_attempted: bool,
     pub target_released: bool,
     pub cleanup_state: WindowsDurableCleanupStateV1,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::deserialize_record_outbox"
+    )]
     pub terminal_response_json: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_disposition: Option<WindowsAttemptTerminalDispositionV1>,
     pub terminalization: WindowsTerminalizationStatusV1,
+    pub causal_diagnostics: crate::WindowsCausalDiagnosticsV1,
+    pub diagnostic_retention: crate::DiagnosticRetentionV1,
+    pub workload_admission: Option<crate::workload_registry::ProviderAdmissionSnapshotV1>,
+    pub workload_checkpoint: Option<(
+        crate::workload_evidence::AttemptBindingV1,
+        crate::workload_evidence::VerifiedCheckpointV1,
+    )>,
+    pub record_revision: u64,
+    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
+    pub provider_incarnation: String,
+    #[serde(deserialize_with = "crate::deserialize_bounded_record_text::<_, 256>")]
     pub integrity_sha256: String,
 }
 
@@ -1311,6 +1345,8 @@ pub fn parse_and_authenticate_windows_attempt_record(
     if bytes.len() > WINDOWS_MAX_FRAME_BYTES {
         return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=frame-too-large");
     }
+    crate::validate_record_json_structure(bytes)
+        .map_err(|_| "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=structural-budget")?;
     if !windows_sha256_text_is_valid(expected_attempt_id) {
         return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=expected-attempt-id-shape");
     }
@@ -1319,15 +1355,84 @@ pub fn parse_and_authenticate_windows_attempt_record(
             "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=expected-provider-generation-empty",
         );
     }
-    let record: WindowsDurableAttemptRecordV1 = serde_json::from_slice(bytes)
+    let mut record: WindowsDurableAttemptRecordV1 = serde_json::from_slice(bytes)
         .map_err(|_| "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=json-invalid")?;
-    let mut canonical = record.clone();
-    canonical.integrity_sha256.clear();
-    let canonical = serde_json::to_vec(&canonical)
+    authenticate_decoded_windows_attempt_record(
+        &mut record,
+        expected_attempt_id,
+        expected_provider_generation,
+    )?;
+    Ok(record)
+}
+
+pub fn authenticate_decoded_windows_attempt_record(
+    record: &mut WindowsDurableAttemptRecordV1,
+    expected_attempt_id: &str,
+    expected_provider_generation: &str,
+) -> Result<(), &'static str> {
+    if !windows_sha256_text_is_valid(expected_attempt_id) || expected_provider_generation.is_empty()
+    {
+        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=expected-binding-shape");
+    }
+    let integrity = std::mem::take(&mut record.integrity_sha256);
+    struct CanonicalHash {
+        digest: Sha256,
+        remaining: usize,
+    }
+    impl std::io::Write for CanonicalHash {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.remaining {
+                return Err(std::io::Error::other("canonical record exceeds bound"));
+            }
+            self.remaining -= bytes.len();
+            self.digest.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut canonical = CanonicalHash {
+        digest: Sha256::new(),
+        remaining: WINDOWS_MAX_FRAME_BYTES,
+    };
+    serde_json::to_writer(&mut canonical, &record)
         .map_err(|_| "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=canonicalization-failed")?;
-    let expected_integrity = windows_sha256(&canonical);
-    if record.schema_version != 2 {
+    let expected_integrity = canonical
+        .digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    record.integrity_sha256 = integrity;
+    if record.schema_version != 3 {
         return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=schema-version");
+    }
+    if !record.causal_diagnostics.is_consistent()
+        || !record.diagnostic_retention.is_consistent()
+        || record.workload_admission.as_ref().is_some_and(|snapshot| {
+            snapshot.validate().is_err()
+                || String::from(snapshot.private_invocation_digest.clone()) != record.request_sha256
+                || !matches!(
+                    snapshot.caller,
+                    crate::workload_registry::CallerSelector::Windows { .. }
+                )
+        })
+        || record
+            .workload_checkpoint
+            .as_ref()
+            .is_some_and(|(binding, checkpoint)| {
+                !record
+                    .workload_admission
+                    .as_ref()
+                    .is_some_and(|snapshot| binding.matches_snapshot(snapshot))
+                    || binding.attempt_id.as_str() != record.attempt_id
+                    || !checkpoint.matches_binding(binding)
+            })
+        || !windows_sha256_text_is_valid(&record.provider_incarnation)
+        || record.record_revision == 0
+    {
+        return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=diagnostic-state");
     }
     if record.attempt_id != expected_attempt_id {
         return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=attempt-id-binding");
@@ -1370,7 +1475,7 @@ pub fn parse_and_authenticate_windows_attempt_record(
     if let Some(error) = windows_durable_attempt_state_error(&record) {
         return Err(error);
     }
-    Ok(record)
+    Ok(())
 }
 
 fn windows_sha256_text_is_valid(value: &str) -> bool {
@@ -1505,6 +1610,9 @@ fn windows_durable_attempt_state_error(
         if json.len() > WINDOWS_MAX_FRAME_BYTES / 2 {
             return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminal-outbox-size");
         }
+        if crate::validate_record_json_structure(json.as_bytes()).is_err() {
+            return Some("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminal-structural-budget");
+        }
         if record.state != WindowsAttemptStateV1::Empty {
             return Some(
                 "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=terminal-outbox-before-empty",
@@ -1516,7 +1624,7 @@ fn windows_durable_attempt_state_error(
             );
         }
         if !serde_json::from_str::<WindowsLauncherResponseV1>(json).is_ok_and(|response| {
-            windows_terminal_outbox_is_bound(
+            !matches!(&response, WindowsLauncherResponseV1::Reject { rejection, .. } if rejection.provider_failure.is_some()) && windows_terminal_outbox_is_bound(
                 &record.attempt_id,
                 &record.request_sha256,
                 record.terminal_disposition,
@@ -1844,12 +1952,27 @@ pub struct WindowsCallerTokenEnvelopeV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsLaunchRequestV1 {
+    pub restart_attempt: u64,
     pub schema_version: u32,
+    pub expected_provider_binding: crate::PublicProviderBindingV1,
+    #[serde(default, deserialize_with = "deserialize_workload_contract")]
+    pub workload_contract: Option<crate::workload_contract::WorkloadContractV1>,
     pub nonce: String,
     pub command: NativeWindowsCommandV1,
     pub environment: Vec<WindowsEnvironmentEntryV1>,
     pub current_directory: Vec<u16>,
     pub policy: WindowsLaunchPolicyV1,
+}
+
+fn deserialize_workload_contract<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::workload_contract::WorkloadContractV1>, D::Error> {
+    let contract =
+        Option::<crate::workload_contract::WorkloadContractV1>::deserialize(deserializer)?;
+    if let Some(contract) = &contract {
+        contract.validate().map_err(serde::de::Error::custom)?;
+    }
+    Ok(contract)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1916,6 +2039,15 @@ pub fn validate_windows_stream_manifest(
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "message", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WindowsProviderRequestV1 {
+    WorkloadDiscovery {
+        schema_version: u32,
+        challenge: crate::workload_contract::Nonce128,
+    },
+    WorkloadPlan {
+        schema_version: u32,
+        challenge: crate::workload_contract::Nonce128,
+        contract: crate::workload_contract::WorkloadContractV1,
+    },
     Probe {
         schema_version: u32,
     },
@@ -2082,6 +2214,9 @@ pub struct WindowsAttemptRetainedV1 {
     pub authority_retained: bool,
     pub primary_detail: String,
     pub secondary_failures: Vec<String>,
+    pub causal_diagnostics: crate::WindowsCausalDiagnosticsV1,
+    pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
+    pub diagnostic_availability: crate::DiagnosticProjectionAvailabilityV1,
 }
 
 impl WindowsAttemptRetainedV1 {
@@ -2092,7 +2227,20 @@ impl WindowsAttemptRetainedV1 {
         request_sha256: &str,
         relay_phase: WindowsRelayPhaseV1,
     ) -> bool {
-        self.schema_version == 1
+        self.schema_version == 2
+            && self.provider_failure.is_some()
+                == (self.diagnostic_availability
+                    == crate::DiagnosticProjectionAvailabilityV1::Available)
+            && self.causal_diagnostics.is_consistent()
+            && self.provider_failure.as_ref().is_none_or(|failure| {
+                failure.is_consistent()
+                    && failure.projection_sha256 == failure.canonical_digest()
+                    && failure.matches_journal(
+                        &self.attempt_id,
+                        &self.request_sha256,
+                        &self.causal_diagnostics,
+                    )
+            })
             && self.attempt_id == attempt_id
             && self.nonce == nonce
             && !self.nonce.is_empty()
@@ -2139,6 +2287,9 @@ pub struct WindowsReplayPendingV1 {
     pub outbox_stage: WindowsReplayOutboxStageV1,
     pub terminalization: WindowsTerminalizationStatusV1,
     pub detail: String,
+    pub causal_diagnostics: crate::WindowsCausalDiagnosticsV1,
+    pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
+    pub diagnostic_availability: crate::DiagnosticProjectionAvailabilityV1,
 }
 
 impl WindowsReplayPendingV1 {
@@ -2149,7 +2300,20 @@ impl WindowsReplayPendingV1 {
         request_sha256: &str,
         relay_phase: WindowsRelayPhaseV1,
     ) -> bool {
-        self.schema_version == 2
+        self.schema_version == 3
+            && self.provider_failure.is_some()
+                == (self.diagnostic_availability
+                    == crate::DiagnosticProjectionAvailabilityV1::Available)
+            && self.causal_diagnostics.is_consistent()
+            && self.provider_failure.as_ref().is_none_or(|failure| {
+                failure.is_consistent()
+                    && failure.projection_sha256 == failure.canonical_digest()
+                    && failure.matches_journal(
+                        &self.attempt_id,
+                        &self.request_sha256,
+                        &self.causal_diagnostics,
+                    )
+            })
             && self.attempt_id == attempt_id
             && self.nonce == nonce
             && self.request_sha256 == request_sha256
@@ -2202,9 +2366,20 @@ impl WindowsTerminalRetiredV1 {
 #[allow(clippy::large_enum_variant)] // Preserve the direct, typed wire payload variants.
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WindowsProviderResponseV1 {
+    WorkloadDiscovery {
+        schema_version: u32,
+        challenge: crate::workload_contract::Nonce128,
+        discovery: crate::workload_discovery::WorkloadDiscoveryV1,
+    },
+    WorkloadPlan {
+        schema_version: u32,
+        challenge: crate::workload_contract::Nonce128,
+        resolution: crate::workload_evidence::WorkloadResolutionReportV1,
+    },
     Probe {
         schema_version: u32,
         qualification: WindowsQualificationReceiptV1,
+        provider_binding: crate::PublicProviderBindingV1,
     },
     StreamsPrepared {
         schema_version: u32,
@@ -2350,6 +2525,7 @@ pub enum WindowsLauncherResponseV1 {
     Probe {
         schema_version: u32,
         attestation: WindowsServiceSelfAttestationV1,
+        provider_binding: crate::PublicProviderBindingV1,
     },
     CertificationMachineRestart {
         schema_version: u32,
@@ -2411,9 +2587,33 @@ pub enum WindowsLauncherResponseV1 {
     TerminalRetired(WindowsTerminalRetiredV1),
 }
 
+macro_rules! terminal_authority_encoding {
+    ($response:ty) => {
+        impl $response {
+            /// Expirable diagnostics are not immutable outbox or ACK authority.
+            pub fn terminal_authority_json(&self) -> Result<String, serde_json::Error> {
+                let mut authority = self.clone();
+                if let Self::Reject { rejection, .. } = &mut authority {
+                    rejection.provider_failure = None;
+                }
+                let mut bytes = crate::bounded_json_bytes(
+                    &authority,
+                    crate::WINDOWS_MAX_TERMINAL_FRAME_BYTES,
+                    false,
+                )?;
+                bytes.pop();
+                Ok(String::from_utf8(bytes).expect("JSON serialization emits UTF-8"))
+            }
+        }
+    };
+}
+terminal_authority_encoding!(WindowsProviderResponseV1);
+terminal_authority_encoding!(WindowsLauncherResponseV1);
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsTerminalReceiptV1 {
+    pub policy_enforcement: crate::workload_evidence::AttemptPolicyEnforcementV1,
     pub schema_version: u32,
     pub attempt_id: String,
     pub nonce: String,

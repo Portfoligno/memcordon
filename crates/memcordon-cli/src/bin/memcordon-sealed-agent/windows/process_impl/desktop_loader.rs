@@ -1770,7 +1770,18 @@ impl TargetDesktopLease {
         {
             return Err("retained session-broker source evidence is invalid".to_owned());
         }
-        if unsafe { WaitForSingleObject(self.bootstrap_process.raw(), 0) } != WAIT_TIMEOUT {
+        let wait = unsafe { WaitForSingleObject(self.bootstrap_process.raw(), 0) };
+        if wait != WAIT_TIMEOUT {
+            let native_code = if wait == windows_sys::Win32::Foundation::WAIT_FAILED {
+                std::io::Error::last_os_error().raw_os_error()
+            } else {
+                None
+            };
+            super::super::diagnostics::capture_native(
+                memcordon_core::FailureOperationV1::CheckDesktopAuthority,
+                native_code,
+                memcordon_core::FailureCodeV1::GuardianLoss,
+            );
             return Err(
                 "target desktop bootstrap exited while its desktop lease was live".to_owned(),
             );

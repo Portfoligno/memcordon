@@ -36,6 +36,7 @@ fuzz_target!(|count: u16| {
                     }),
                     restart_decision: memcordon_core::RestartDecisionRecord::default(),
                     launch: memcordon_core::LaunchEvidence::default(),
+                    policy_enforcement: memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::LegacyUnspecified,
                     restart_safety: memcordon_core::RestartSafetyProof::default(),
                     boundary_detail: memcordon_core::BoundaryMechanismEvidence::Standard {
                         backend: "fuzz-fixture".to_owned(),

@@ -7,9 +7,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::{CGROUP_ROOT, STATE_ROOT};
-use sha2::{Digest, Sha256};
 
-const MAX_RECORD_BYTES: u64 = 16 * 1024;
+const MAX_RECORD_BYTES: u64 = 16 * 1024
+    + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64
+    + memcordon_core::workload_limits::CONTRACT_BYTES as u64;
 
 pub fn recover() -> Result<Vec<String>, String> {
     recover_roots(Path::new(STATE_ROOT), Path::new(CGROUP_ROOT))
@@ -256,7 +257,7 @@ fn inspect_cgroup_root(
     Ok(())
 }
 
-fn read_record_no_follow(path: &Path) -> Result<String, String> {
+pub(crate) fn read_record_no_follow(path: &Path) -> Result<String, String> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -280,13 +281,6 @@ fn read_record_no_follow(path: &Path) -> Result<String, String> {
     Ok(record)
 }
 
-fn integrity_valid(record: &str) -> bool {
-    let Some((body, digest)) = record.rsplit_once("digest=") else {
-        return false;
-    };
-    let expected: String = Sha256::digest(body.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    digest.trim() == expected
+pub(crate) fn integrity_valid(record: &str) -> bool {
+    super::attempt::parse_durable_policy(record).is_ok()
 }

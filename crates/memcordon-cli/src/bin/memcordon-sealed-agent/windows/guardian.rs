@@ -1024,40 +1024,16 @@ pub fn run(arguments: &[OsString]) -> Result<(), GuardianFailure> {
                 "ready-set-event",
             ));
         }
-        let mut watched = vec![frontend.raw(), worker.raw(), disarm.raw()];
-        if let Some(service_stop) = service_stop.as_ref() {
-            watched.push(service_stop.raw());
-        }
-        // SAFETY: all three handles are live and the array remains valid throughout
-        // the non-alertable wait.
-        let result =
-            unsafe { WaitForMultipleObjects(watched.len() as u32, watched.as_ptr(), 0, INFINITE) };
-        if result == WAIT_OBJECT_0 + 2 {
+        if !wait_authority_and_cleanup(
+            &job,
+            &frontend,
+            &worker,
+            &disarm,
+            service_stop.as_ref(),
+            Duration::from_millis(cleanup_deadline),
+        )? {
             return Ok(());
         }
-        if result != WAIT_OBJECT_0
-            && result != WAIT_OBJECT_0 + 1
-            && !(watched.len() == 4 && result == WAIT_OBJECT_0 + 3)
-        {
-            return Err(GuardianFailure::native(
-                GuardianStartupSubphase::Runtime,
-                None,
-                "authority-wait",
-            ));
-        }
-        // SAFETY: frontend or launcher died before disarm, and guardian owns a live
-        // Job handle specifically for terminal cleanup authority.
-        if unsafe { TerminateJobObject(job.raw(), 0xC000_013A) } == 0 {
-            return Err(GuardianFailure::native(
-                GuardianStartupSubphase::Runtime,
-                Some(GuardianHandleRole::Job),
-                "job-terminate",
-            ));
-        }
-        wait_job_empty(
-            job.raw(),
-            Instant::now() + Duration::from_millis(cleanup_deadline),
-        )?;
         super::record::write_guardian_receipt(&attempt_id).map_err(|_| {
             GuardianFailure::new(GuardianStartupSubphase::Runtime, None, "terminal-receipt")
         })
@@ -1074,6 +1050,51 @@ pub fn run(arguments: &[OsString]) -> Result<(), GuardianFailure> {
             Err(error)
         }
     }
+}
+
+/// The authenticated bootstrap owns these handles before entering this loop.
+/// No diagnostic writer or filesystem operation participates in retirement.
+pub(super) fn wait_authority_and_cleanup(
+    job: &OwnedHandle,
+    frontend: &OwnedHandle,
+    worker: &OwnedHandle,
+    disarm: &OwnedHandle,
+    service_stop: Option<&OwnedHandle>,
+    cleanup_timeout: Duration,
+) -> Result<bool, GuardianFailure> {
+    let watched = [
+        frontend.raw(),
+        worker.raw(),
+        disarm.raw(),
+        service_stop.map_or(std::ptr::null_mut(), OwnedHandle::raw),
+    ];
+    let count = if service_stop.is_some() { 4 } else { 3 };
+    // SAFETY: every selected handle is borrowed from a live owner for the wait.
+    let result = unsafe { WaitForMultipleObjects(count, watched.as_ptr(), 0, INFINITE) };
+    if result == WAIT_OBJECT_0 + 2 {
+        return Ok(false);
+    }
+    if result != WAIT_OBJECT_0
+        && result != WAIT_OBJECT_0 + 1
+        && !(count == 4 && result == WAIT_OBJECT_0 + 3)
+    {
+        return Err(GuardianFailure::native(
+            GuardianStartupSubphase::Runtime,
+            None,
+            "authority-wait",
+        ));
+    }
+    // SAFETY: an authenticated authority died before disarm; the owned Job
+    // capability grants precisely the existing guardian cleanup authority.
+    if unsafe { TerminateJobObject(job.raw(), 0xC000_013A) } == 0 {
+        return Err(GuardianFailure::native(
+            GuardianStartupSubphase::Runtime,
+            Some(GuardianHandleRole::Job),
+            "job-terminate",
+        ));
+    }
+    wait_job_empty(job.raw(), Instant::now() + cleanup_timeout)?;
+    Ok(true)
 }
 
 fn read_bootstrap_frame(pipe: HANDLE) -> Result<GuardianBootstrapMessageV1, GuardianFailure> {

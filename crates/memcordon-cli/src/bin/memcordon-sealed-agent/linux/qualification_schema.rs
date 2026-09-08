@@ -6,6 +6,8 @@ use sha2::digest::OutputSizeUser;
 #[serde(deny_unknown_fields)]
 pub struct QualificationReceipt {
     pub schema_version: u32,
+    pub workload_profile: memcordon_core::workload_contract::ProfileRef,
+    pub workload_profile_probe_verified: bool,
     pub version: String,
     pub mechanism: String,
     pub provider_identity: String,
@@ -49,7 +51,10 @@ pub struct QualificationReceipt {
 
 impl QualificationReceipt {
     pub fn complete(&self) -> bool {
-        self.schema_version == 2
+        self.schema_version == 3
+            && self.workload_profile
+                == memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference()
+            && self.workload_profile_probe_verified
             && self.version == env!("CARGO_PKG_VERSION")
             && self.mechanism == "linux-pid-namespace-cgroup-v2"
             && self.provider_identity == "memcordon-sealed-agent-v2"

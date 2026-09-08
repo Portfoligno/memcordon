@@ -6,9 +6,12 @@ use sha2::{Digest, Sha256};
 
 #[cfg(not(target_os = "windows"))]
 use crate::inspection_schema::ProviderPackageMetadataV4;
-use crate::inspection_schema::{AgentPackageInspectionV4, InstalledProviderInspectionV4};
+use crate::inspection_schema::{
+    AgentPackageInspectionV5 as AgentPackageInspectionV4,
+    InstalledProviderInspectionV5 as InstalledProviderInspectionV4,
+};
 
-const SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision control provider\nRequires=memcordon-sealed-agent.socket memcordon-sealed-launcher.socket\nAfter=local-fs.target systemd-tmpfiles-setup.service memcordon-sealed-launcher.socket\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent serve\nUser=root\nGroup=memcordon\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/run/memcordon /var/lib/memcordon/sealed\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
+const SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision control provider\nRequires=memcordon-sealed-agent.socket memcordon-sealed-launcher.socket\nAfter=local-fs.target systemd-tmpfiles-setup.service memcordon-sealed-launcher.socket\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent serve\nUser=root\nGroup=memcordon\nKillMode=process\nStateDirectory=memcordon/sealed memcordon/policy\nStateDirectoryMode=0700\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/run/memcordon /var/lib/memcordon/sealed /var/lib/memcordon/policy\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
 const SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision control socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-agent.sock\nDirectoryMode=0755\nSocketMode=0660\nSocketUser=root\nSocketGroup=memcordon\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
 const LAUNCHER_SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker\nRequires=memcordon-sealed-launcher.socket\nAfter=local-fs.target\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent launch-broker\nUser=root\nGroup=root\nDelegate=yes\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=no\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
 const LAUNCHER_SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-launcher.sock\nDirectoryMode=0750\nSocketMode=0600\nSocketUser=root\nSocketGroup=root\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
@@ -151,7 +154,24 @@ pub(crate) fn inspect() -> Result<AgentPackageInspectionV4, String> {
         crate::windows::package::compiled_metadata()?,
     );
     Ok(AgentPackageInspectionV4 {
-        schema_version: 4,
+        schema_version: 5,
+        native_protocols: if cfg!(target_os = "windows") {
+            memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
+                provider_contract: 3,
+                public_wire: 2,
+                private_wire: 2,
+            }
+        } else {
+            memcordon_core::runtime_manifest::NativeProviderProtocols::Linux {
+                provider_contract: 3,
+                launch_wire: 3,
+            }
+        },
+        runtime_manifest_schema: 2,
+        workload_contract_schema: 1,
+        profile_catalog_sha256: memcordon_core::runtime_manifest::baseline_catalog_digest(cfg!(
+            target_os = "windows"
+        )),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         source_commit: crate::SOURCE_COMMIT.to_owned(),
         executable_sha256,
@@ -179,14 +199,29 @@ fn installed_inspection() -> Result<InstalledProviderInspectionV4, String> {
         let provider_reachable = qualification.is_some();
         let qualification_complete = qualification.as_ref().is_some_and(|value| value.complete());
         let provider_identity = qualification.map(|value| value.provider_identity);
+        let policy = match crate::policy_registry::native::Lease::acquire()
+            .and_then(|lease| lease.read())
+        {
+            Ok(Some(activation)) => activation.inspection()?,
+            Ok(None) => {
+                memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unconfigured
+            }
+            Err(_) => memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unavailable,
+        };
         Ok(InstalledProviderInspectionV4 {
-            schema_version: 4,
+            schema_version: 5,
             agent,
             installed_executable_sha256,
             installed_artifacts_valid: true,
             provider_identity,
             provider_reachable,
             qualification_complete,
+            policy,
+            profile_qualification:
+                memcordon_core::runtime_manifest::profile_qualification_reference(
+                    crate::linux::runtime_manifest::target()?,
+                ),
+            diagnostic_qualification: None,
         })
     }
     #[cfg(target_os = "windows")]
@@ -196,13 +231,17 @@ fn installed_inspection() -> Result<InstalledProviderInspectionV4, String> {
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         Ok(InstalledProviderInspectionV4 {
-            schema_version: 4,
+            schema_version: 5,
             agent,
             installed_executable_sha256: String::new(),
             installed_artifacts_valid: false,
             provider_identity: None,
             provider_reachable: false,
             qualification_complete: false,
+            policy: memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unavailable,
+            profile_qualification:
+                memcordon_core::runtime_manifest::profile_qualification_reference("unsupported"),
+            diagnostic_qualification: None,
         })
     }
 }
@@ -276,7 +315,7 @@ fn verify_compiled_metadata() -> Result<(), String> {
     const CONTROL_CAPABILITY_BOUNDING_SET: &str =
         "CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE";
     const CONTROL_READ_WRITE_PATHS: &str =
-        "ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed";
+        "ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed /var/lib/memcordon/policy";
     let control_capabilities = SERVICE
         .lines()
         .filter(|line| line.starts_with("CapabilityBoundingSet="))
@@ -629,6 +668,14 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     if operation != "install" && operation != "upgrade" && operation != "uninstall" {
         return Err("unknown package operation".to_owned());
     }
+    let source_snapshot = if operation == "uninstall" {
+        None
+    } else {
+        let source = std::env::current_exe().map_err(|error| error.to_string())?;
+        let source_bytes = fs::read(&source).map_err(|error| error.to_string())?;
+        let runtime_manifest = crate::linux::runtime_manifest::source(&source, &source_bytes)?;
+        Some((source_bytes, runtime_manifest))
+    };
     let _package_lease = crate::linux::service::acquire_package_lease().map_err(|error| {
         format!("refusing package mutation while a sealed provider attempt is active: {error}")
     })?;
@@ -658,6 +705,7 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
             LAUNCHER_UNIT,
             TMPFILES_FILE,
             BINARY,
+            crate::linux::runtime_manifest::INSTALLED,
         ] {
             match fs::remove_file(path) {
                 Ok(()) => {}
@@ -713,11 +761,16 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         ));
     }
     verify_runtime_directory_owner(service_gid)?;
-    let source = std::env::current_exe().map_err(|error| error.to_string())?;
-    let source_bytes = fs::read(&source).map_err(|error| error.to_string())?;
+    let (source_bytes, runtime_manifest) =
+        source_snapshot.expect("uninstall returned before installation");
     let source_digest = sha256_bytes(&source_bytes);
     let installations = [
         (Path::new(BINARY), source_bytes, 0o755),
+        (
+            Path::new(crate::linux::runtime_manifest::INSTALLED),
+            runtime_manifest,
+            0o644,
+        ),
         (Path::new(UNIT), SERVICE.as_bytes().to_vec(), 0o644),
         (Path::new(SOCKET_UNIT), SOCKET.as_bytes().to_vec(), 0o644),
         (

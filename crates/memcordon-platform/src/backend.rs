@@ -60,6 +60,7 @@ pub struct UnavailableBackend {
 
 #[derive(Clone, Debug)]
 pub struct Execution {
+    pub policy_enforcement: memcordon_core::workload_evidence::AttemptPolicyEnforcementV1,
     pub outcome: RunOutcome,
     pub backend: BackendInfo,
     pub child_pid: u32,
@@ -137,8 +138,51 @@ pub(crate) fn standard_boundary_support(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StandardLaunchFacts {
+    target_released: bool,
+    containment_verified_before_authorization: bool,
+    guardian_started_before_authorization: bool,
+}
+
+impl StandardLaunchFacts {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn gated_target() -> Self {
+        Self {
+            target_released: false,
+            containment_verified_before_authorization: false,
+            guardian_started_before_authorization: false,
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub(crate) fn contained_spawn_completed() -> Self {
+        Self {
+            target_released: true,
+            containment_verified_before_authorization: true,
+            guardian_started_before_authorization: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn record_containment_before_authorization(&mut self) {
+        self.containment_verified_before_authorization = true;
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn record_guardian_spawn_completed(&mut self) {
+        self.guardian_started_before_authorization = !self.target_released;
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn record_authorization_released(&mut self) {
+        self.target_released = true;
+    }
+}
+
 pub(crate) fn standard_execution_evidence(
     backend: &BackendInfo,
+    launch: StandardLaunchFacts,
     facts: BackendCleanupFacts,
 ) -> (
     LaunchEvidence,
@@ -148,12 +192,10 @@ pub(crate) fn standard_execution_evidence(
     (
         LaunchEvidence {
             mechanism: backend.boundary_support.standard.mechanism.clone(),
-            target_released: true,
-            containment_verified_before_authorization: backend
-                .boundary_support
-                .standard
-                .boundary_verified_before_authorization,
-            guardian_started_before_authorization: false,
+            target_released: launch.target_released,
+            containment_verified_before_authorization: launch
+                .containment_verified_before_authorization,
+            guardian_started_before_authorization: launch.guardian_started_before_authorization,
             target_spawn_error_reported: false,
             boundary_requested: memcordon_core::BoundaryRequirement::Standard,
             boundary_effective: memcordon_core::BoundaryClass::Standard,
@@ -243,6 +285,7 @@ pub fn run(
         memcordon_executable,
         &signal,
         crate::supervisor::AttemptContext {
+            restart_attempt: 0,
             supervision_offset: Duration::ZERO,
             supervision_deadline_remaining: None,
         },
@@ -272,6 +315,7 @@ pub fn run(
         memcordon_executable,
         &signal,
         crate::supervisor::AttemptContext {
+            restart_attempt: 0,
             supervision_offset: Duration::ZERO,
             supervision_deadline_remaining: None,
         },
@@ -284,6 +328,15 @@ pub fn run(
     reason = "the backend boundary preserves the public categorized Error contract"
 )]
 pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
+    if policy.workload_contract().is_some()
+        && policy.boundary() != memcordon_core::BoundaryRequirement::Sealed
+    {
+        return Err(Error::new(
+            memcordon_core::ErrorCategory::Unsupported,
+            "MCUNSUPPORTED-WORKLOAD-CONTRACT",
+            "strict workload admission requires a sealed provider",
+        ));
+    }
     if policy.poll_interval < Duration::from_millis(10) {
         return Err(Error::new(
             ErrorCategory::Usage,
@@ -299,6 +352,7 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
                 .with_os_error(&error)
         })?;
         let context = crate::supervisor::AttemptContext {
+            restart_attempt: 0,
             supervision_offset: Duration::ZERO,
             supervision_deadline_remaining: None,
         };

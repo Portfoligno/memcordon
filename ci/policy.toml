@@ -22,6 +22,8 @@ required_public_matrix = [
 ]
 self_extracting_shell_allowlist = []
 allowed_run_commands = [
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job",
   "rustup toolchain install 1.97.1 --profile minimal",
   "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",
   "rustup toolchain install 1.85.0 --profile minimal",

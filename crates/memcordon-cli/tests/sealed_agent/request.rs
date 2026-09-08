@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 
 fn request() -> LaunchRequestV2 {
     LaunchRequestV2 {
+        restart_attempt: 0,
+        workload_contract: None,
         program: b"/usr/bin/printf".to_vec(),
         arguments: vec![b"%s".to_vec(), b"native argument".to_vec()],
         environment: vec![(b"LANG".to_vec(), b"C".to_vec())],

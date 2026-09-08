@@ -160,6 +160,7 @@ fn finish_error(
             .map(|value| value.report.clone())
             .unwrap_or_else(|| unresolved_report(&args.policy, &args.budgets));
         let error_report = ExecutionErrorReport {
+            policy_enforcement: error.policy_enforcement.clone(),
             category: category_name(error.category).to_owned(),
             code: error.code.to_owned(),
             message: error.message.clone(),
@@ -171,6 +172,7 @@ fn finish_error(
             workload_may_be_alive: error.workload_may_be_alive,
             boundary_setup_failure: error.boundary_setup_failure.clone(),
             provider_rejection: error.provider_rejection.clone(),
+            provider_failure: error.provider_failure.clone(),
         };
         match report(
             args,
@@ -218,7 +220,22 @@ fn report(
             .iter()
             .map(|value| memcordon_core::NativeArgument::from_os(value)),
     );
-    MemcordonReport::schema8(
+    let mut policy = policy.clone();
+    let enforcement = error
+        .as_ref()
+        .and_then(|error| error.policy_enforcement.as_ref())
+        .or_else(|| {
+            supervision
+                .as_ref()
+                .and_then(|execution| execution.attempts().records().last())
+                .map(|attempt| &attempt.policy_enforcement)
+        });
+    if let Some(resolution) = enforcement
+        .and_then(memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::resolution)
+    {
+        policy.effective.workload = resolution;
+    }
+    MemcordonReport::schema9(
         tool_report(),
         InvocationReport {
             syntax: "plus-budgets-v1".to_owned(),
@@ -227,7 +244,7 @@ fn report(
             deadline_token: deadline_token(&args.budgets).map(str::to_owned),
             argv,
         },
-        policy.clone(),
+        policy,
         backend,
         supervision,
         error,
@@ -304,6 +321,13 @@ fn execution_summary(execution: &SupervisionExecution) -> ExecutionSummary<'_> {
 
 fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, Box<Error>> {
     let policy = policy_args.policy(budgets);
+    if policy.workload_contract().is_some() && policy.boundary() != BoundaryRequirement::Sealed {
+        return Err(Box::new(Error::new(
+            ErrorCategory::Usage,
+            "MCUSAGE-WORKLOAD-BOUNDARY",
+            "a strict workload contract requires --boundary sealed",
+        )));
+    }
     let probe = probe();
     let backend = probe
         .selected_for(policy.boundary())
@@ -405,7 +429,7 @@ fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, 
         )
     };
     let restart = memcordon::resolve_restart_policy(&policy, restart).map_err(Box::new)?;
-    let report = policy_report(
+    let mut report = policy_report(
         policy_args,
         budgets,
         &policy,
@@ -414,6 +438,15 @@ fn resolve(policy_args: &PolicyArgs, budgets: &BudgetSet) -> Result<Resolution, 
         effective,
         dormant,
     );
+    if let Some(contract) = policy.workload_contract() {
+        report.effective.workload = memcordon_platform::workload_plan(contract).unwrap_or_else(|_| {
+            memcordon_core::workload_evidence::WorkloadResolutionReportV1::Unavailable {
+                request: Some(memcordon_core::workload_evidence::RequestBindingV1::from_contract(contract).expect("policy contains validated contract")),
+                reason: memcordon_core::workload_evidence::AdmissionAvailabilityFailure::ProviderUnavailable,
+                authorization: memcordon_core::workload_evidence::AuthorizationKnowledge::NotAuthorized,
+            }
+        });
+    }
     Ok(Resolution {
         backend: capability,
         policy,
@@ -565,6 +598,10 @@ fn policy_report(
     PolicyEnvelopeReport {
         requested,
         effective: EffectivePolicyReport {
+            workload: memcordon_core::workload_evidence::WorkloadResolutionReportV1::unresolved(
+                policy.workload_contract(),
+                workload_restriction(backend.name, policy.boundary()),
+            ),
             boundary: match policy.boundary() {
                 memcordon_core::BoundaryRequirement::Sealed
                     if boundary_capability.class != memcordon_core::BoundaryClass::Sealed =>
@@ -601,12 +638,31 @@ fn policy_report(
     }
 }
 
+fn workload_restriction(
+    backend: &str,
+    boundary: BoundaryRequirement,
+) -> memcordon_core::workload_evidence::BaselineRestrictionObservationV1 {
+    use memcordon_core::workload_evidence::BaselineRestrictionObservationV1 as Observation;
+    match (boundary, backend) {
+        (BoundaryRequirement::Sealed, "linux-sealed-provider") => {
+            Observation::LinuxUnixOnlySocketSyscallFilterAlternatePathsUnknown
+        }
+        (BoundaryRequirement::Sealed, "windows-sealed-provider") => {
+            Observation::WindowsNetworkExternallyGoverned
+        }
+        _ => Observation::UnmanagedStandardBackend,
+    }
+}
+
 fn requested_report(
     args: &PolicyArgs,
     budgets: &BudgetSet,
     configured: RestartConditions,
 ) -> RequestedPolicyReport {
     RequestedPolicyReport {
+        workload: memcordon_core::workload_evidence::WorkloadRequestReport::from_contract(
+            args.workload_contract.as_ref(),
+        ),
         boundary: args.boundary,
         memory: budgets.memory.map(|memory| RequestedMemoryPolicyReport {
             limit_bytes: memory.bytes(),
@@ -673,6 +729,9 @@ fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeRe
     PolicyEnvelopeReport {
         requested: requested_report(args, budgets, configured),
         effective: EffectivePolicyReport {
+            workload: memcordon_core::workload_evidence::WorkloadResolutionReportV1::unresolved(
+                args.workload_contract.as_ref(), memcordon_core::workload_evidence::BaselineRestrictionObservationV1::UnmanagedStandardBackend,
+            ),
             boundary: memcordon_core::BoundaryClass::Unavailable,
             memory: budgets.memory.map(|memory| EffectiveMemoryPolicyReport {
                 limit_bytes: memory.bytes(),
@@ -775,6 +834,34 @@ fn unavailable_backend_capability() -> BackendCapabilityReport {
 
 pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
     let probe = probe();
+    use memcordon_core::workload_discovery::DiscoveryReportV1;
+    use memcordon_core::workload_evidence::{
+        AdmissionAvailabilityFailure, AuthorizationKnowledge, RequestBindingV1,
+        WorkloadResolutionReportV1,
+    };
+    let workload_discovery = if cfg!(any(target_os = "linux", target_os = "windows")) {
+        memcordon_platform::workload_discovery()
+            .map(|discovery| DiscoveryReportV1::Authenticated { discovery })
+            .unwrap_or_else(|_| DiscoveryReportV1::Unavailable {
+                reason: memcordon_core::BoundedText::new(
+                    "authenticated provider discovery unavailable",
+                )
+                .expect("fixed reason fits"),
+            })
+    } else {
+        DiscoveryReportV1::Unsupported
+    };
+    let workload = args.workload_contract.as_ref().map(|contract| {
+        memcordon_platform::workload_plan(contract).unwrap_or_else(|_| {
+            WorkloadResolutionReportV1::Unavailable {
+                request: Some(
+                    RequestBindingV1::from_contract(contract).expect("CLI validated contract"),
+                ),
+                reason: AdmissionAvailabilityFailure::BindingUnavailable,
+                authorization: AuthorizationKnowledge::NotAuthorized,
+            }
+        })
+    });
     let capability = |backend: &memcordon_platform::BackendInfo| match args.requirement {
         Some(Requirement::Sealed) => {
             memcordon_platform::capabilities_for(backend, BoundaryRequirement::Sealed)
@@ -787,19 +874,24 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
     };
     let selected = selected_backend.map(capability);
     let available = probe.available.iter().map(capability).collect::<Vec<_>>();
-    let met = args.requirement.is_none_or(|required| {
-        selected.as_ref().is_some_and(|backend| match required {
-            Requirement::Hard => backend
-                .memory
-                .as_ref()
-                .is_some_and(|memory| memory.class == "hard"),
-            Requirement::Watchdog => backend
-                .memory
-                .as_ref()
-                .is_some_and(|memory| memory.class == "watchdog"),
-            Requirement::Sealed => backend.boundary.class == memcordon_core::BoundaryClass::Sealed,
-        })
-    });
+    let met = workload
+        .as_ref()
+        .is_none_or(|resolution| matches!(resolution, WorkloadResolutionReportV1::Planned { .. }))
+        && args.requirement.is_none_or(|required| {
+            selected.as_ref().is_some_and(|backend| match required {
+                Requirement::Hard => backend
+                    .memory
+                    .as_ref()
+                    .is_some_and(|memory| memory.class == "hard"),
+                Requirement::Watchdog => backend
+                    .memory
+                    .as_ref()
+                    .is_some_and(|memory| memory.class == "watchdog"),
+                Requirement::Sealed => {
+                    backend.boundary.class == memcordon_core::BoundaryClass::Sealed
+                }
+            })
+        });
     let report = DoctorReport {
         schema_version: DOCTOR_REPORT_SCHEMA_VERSION,
         tool: tool_report(),
@@ -818,6 +910,7 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
             })
             .collect(),
         requirement: RequirementReport {
+            workload,
             kind: args.requirement.map(|value| match value {
                 Requirement::Hard => "hard".to_owned(),
                 Requirement::Watchdog => "watchdog".to_owned(),
@@ -827,6 +920,7 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
             reason: (!met)
                 .then(|| "selected backend does not satisfy the requested enforcement".to_owned()),
         },
+        workload_discovery,
     };
     if args.json {
         let code = print_json(&report, "doctor", presentation);
@@ -1048,20 +1142,5 @@ fn render_effect_warnings(
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn clean_failure_json_uses_current_schema_and_is_machine_readable() {
-        let error = memcordon_core::Error::new(
-            memcordon_core::ErrorCategory::Cleanup,
-            "MCCLEANUP-TEST",
-            "fixture failure",
-        );
-        let value = super::clean_failure_report(true, &error);
-        assert_eq!(
-            value["schema_version"],
-            memcordon_core::CLEAN_REPORT_SCHEMA_VERSION
-        );
-        assert_eq!(value["dry_run"], true);
-        assert_eq!(value["errors"][0]["code"], "MCCLEANUP-TEST");
-    }
-}
+#[path = "../../tests/application/clean.rs"]
+mod tests;

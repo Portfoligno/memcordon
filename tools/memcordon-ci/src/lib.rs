@@ -1,20 +1,25 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod certification_context;
 pub mod command;
 pub mod config;
 pub mod line_evidence;
 pub mod policy;
+pub mod producer_metadata;
 pub mod release_archive;
 pub mod release_evidence;
 pub mod runtime_manifest;
 pub mod scenario_diagnostic;
 pub mod sealed_identity;
 pub mod sealed_selector;
+pub mod standard_contract;
+pub mod standard_runner;
 pub mod windows_channel_identity;
 pub mod windows_package_cleanup;
 pub mod windows_package_staging;
 pub mod windows_qualification_artifacts;
+pub mod workload_qualification;
 
 use thiserror::Error;
 

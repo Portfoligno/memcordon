@@ -40,6 +40,8 @@ enum TopLevel {
         rustup: PathBuf,
         #[arg(long)]
         uid: String,
+        #[arg(long)]
+        context_file: PathBuf,
     },
 }
 
@@ -110,9 +112,14 @@ fn run() -> Result<()> {
         (true, None) => release::cargo_credential_provider(&root),
         (false, Some(TopLevel::Suite { suite })) => suites::run(&root, suite),
         (false, Some(TopLevel::Release { command })) => release::run(&root, command),
-        (false, Some(TopLevel::DelegatedLinuxCertification { rustup, uid })) => {
-            suites::delegated_linux_certification(&root, &rustup, &uid)
-        }
+        (
+            false,
+            Some(TopLevel::DelegatedLinuxCertification {
+                rustup,
+                uid,
+                context_file,
+            }),
+        ) => suites::delegated_linux_certification(&root, &rustup, &uid, &context_file),
         _ => Err(CiError::Message(
             "exactly one CI command or --cargo-plugin is required".to_owned(),
         )),

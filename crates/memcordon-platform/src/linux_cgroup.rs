@@ -375,6 +375,7 @@ pub fn run_attempt(
         record_failure_cleanup(&mut failure, abort.cleanup, true, false);
         return Err(failure);
     }
+    let mut launch_facts = crate::backend::StandardLaunchFacts::gated_target();
     if let Err(error) = cgroup
         .assign(child_pid)
         .and_then(|()| cgroup.verify(child_pid))
@@ -393,6 +394,7 @@ pub fn run_attempt(
         record_failure_cleanup(&mut failure, abort.cleanup, true, false);
         return Err(failure);
     }
+    launch_facts.record_containment_before_authorization();
     let guardian = match Guardian::spawn(child_pid, memcordon_executable) {
         Ok(guardian) => guardian,
         Err(error) => {
@@ -413,6 +415,7 @@ pub fn run_attempt(
             return Err(failure);
         }
     };
+    launch_facts.record_guardian_spawn_completed();
     let authorized = Instant::now();
     if let Err(error) = release_launcher(release_fd) {
         let cleanup_deadline = context.clamp_deadline(started, CLEANUP_DEADLINE);
@@ -444,6 +447,7 @@ pub fn run_attempt(
         );
         return Err(failure);
     }
+    launch_facts.record_authorization_released();
     let exec_status_deadline = context.clamp_deadline(started, LAUNCHER_STATUS_DEADLINE);
     let mut launcher_deadline_outcome = None;
     match receive_exec_result(exec_status_fd, exec_status_deadline) {
@@ -882,8 +886,9 @@ pub fn run_attempt(
     };
     let backend = info();
     let (launch, restart_safety, boundary_detail) =
-        crate::backend::standard_execution_evidence(&backend, cleanup_facts);
+        crate::backend::standard_execution_evidence(&backend, launch_facts, cleanup_facts);
     Ok(Execution {
+        policy_enforcement: Default::default(),
         outcome,
         backend,
         child_pid: u32::try_from(child_pid).unwrap_or_default(),

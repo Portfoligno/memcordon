@@ -14,7 +14,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
 use crate::inspection_schema::{
-    AgentPackageInspectionV4, InstalledProviderInspectionV4, ProviderPackageMetadataV4,
+    AgentPackageInspectionV5 as AgentPackageInspectionV4,
+    InstalledProviderInspectionV5 as InstalledProviderInspectionV4, ProviderPackageMetadataV4,
     TargetDesktopBootstrapRuntimeV4,
 };
 
@@ -68,6 +69,197 @@ pub fn installed_target_desktop_bootstrap() -> PathBuf {
 
 pub fn installed_session_broker() -> PathBuf {
     install_root().join("memcordon-session-broker.exe")
+}
+
+pub(crate) fn installed_public_provider_binding()
+-> Result<memcordon_core::PublicProviderBindingV1, String> {
+    let path = install_root().join("runtime-manifest.json");
+    SecurityDescriptor::from_sddl(INSTALL_SDDL)?.verify_path(&install_root())?;
+    let bytes = read_regular_no_follow_bounded(&path, "runtime-manifest", 128 * 1024)?;
+    let manifest = memcordon_core::runtime_manifest::RuntimeManifestV2::parse(&bytes)?;
+    if manifest.version != env!("CARGO_PKG_VERSION")
+        || manifest.source_commit != crate::SOURCE_COMMIT
+    {
+        return Err("installed runtime generation differs from provider executable".into());
+    }
+    validate_runtime_components(
+        &manifest,
+        &installed_binary(),
+        &installed_target_desktop_bootstrap(),
+        &installed_session_broker(),
+    )?;
+    manifest.public_binding(&bytes)
+}
+
+fn validate_runtime_components(
+    manifest: &memcordon_core::runtime_manifest::RuntimeManifestV2,
+    agent: &Path,
+    bootstrap: &Path,
+    broker: &Path,
+) -> Result<(), String> {
+    let artifacts = capture_package_artifacts(agent, bootstrap, broker)?;
+    validate_runtime_snapshot(manifest, &artifacts)
+}
+
+fn validate_runtime_snapshot(
+    manifest: &memcordon_core::runtime_manifest::RuntimeManifestV2,
+    artifacts: &CapturedPackageArtifacts,
+) -> Result<(), String> {
+    use memcordon_core::runtime_manifest::{RuntimeComponentRole, RuntimeManifestV2};
+    if manifest.components.len() != 4
+        || *manifest
+            != RuntimeManifestV2::windows(
+                manifest.version.clone(),
+                manifest.source_commit.clone(),
+                native_runtime_target().into(),
+                manifest.components.clone(),
+            )
+    {
+        return Err(
+            "installed runtime manifest schema, platform, profile or protocol differs".into(),
+        );
+    }
+    for (role, id, bytes, name) in [
+        (
+            RuntimeComponentRole::SealedAgent,
+            "sealed-agent",
+            artifacts.agent_bytes.as_slice(),
+            "memcordon-sealed-agent.exe",
+        ),
+        (
+            RuntimeComponentRole::DesktopBootstrap,
+            "target-desktop-bootstrap",
+            artifacts.target_desktop_bootstrap_bytes.as_slice(),
+            "memcordon-target-desktop-bootstrap.exe",
+        ),
+        (
+            RuntimeComponentRole::SessionBroker,
+            "session-broker",
+            artifacts.session_broker_bytes.as_slice(),
+            "memcordon-session-broker.exe",
+        ),
+    ] {
+        let records: Vec<_> = manifest
+            .components
+            .iter()
+            .filter(|record| record.role == role)
+            .collect();
+        if records.len() != 1 {
+            return Err("runtime component role inventory differs".into());
+        }
+        let record = records[0];
+        if record.id != id
+            || record.path != name
+            || record.mode != 0o755
+            || record.size != bytes.len() as u64
+            || record.sha256 != crate::package::sha256_bytes(bytes)
+        {
+            return Err("installed runtime component digest differs".into());
+        }
+    }
+    let public: Vec<_> = manifest
+        .components
+        .iter()
+        .filter(|record| record.role == RuntimeComponentRole::PublicCli)
+        .collect();
+    if public.len() != 1
+        || public[0].id != "public-cli"
+        || public[0].path != "memcordon.exe"
+        || public[0].mode != 0o755
+    {
+        return Err("runtime public CLI inventory differs".into());
+    }
+    Ok(())
+}
+
+fn native_runtime_target() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64-pc-windows-msvc",
+        "aarch64" => "aarch64-pc-windows-msvc",
+        _ => panic!("unsupported Windows runtime architecture"),
+    }
+}
+
+fn source_runtime_manifest(
+    agent: &Path,
+    bootstrap: &Path,
+    broker: &Path,
+) -> Result<Vec<u8>, String> {
+    use memcordon_core::runtime_manifest::{
+        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifestV2,
+    };
+    let directory = agent.parent().ok_or("provider source has no parent")?;
+    let manifest_path = directory.join("runtime-manifest.json");
+    let bytes = if manifest_path.exists() {
+        read_regular_no_follow_bounded(&manifest_path, "source-runtime-manifest", 128 * 1024)?
+    } else {
+        let public = directory.join("memcordon.exe");
+        let mut components = Vec::new();
+        for (role, id, path, name) in [
+            (
+                RuntimeComponentRole::PublicCli,
+                "public-cli",
+                public.as_path(),
+                "memcordon.exe",
+            ),
+            (
+                RuntimeComponentRole::SealedAgent,
+                "sealed-agent",
+                agent,
+                "memcordon-sealed-agent.exe",
+            ),
+            (
+                RuntimeComponentRole::DesktopBootstrap,
+                "target-desktop-bootstrap",
+                bootstrap,
+                "memcordon-target-desktop-bootstrap.exe",
+            ),
+            (
+                RuntimeComponentRole::SessionBroker,
+                "session-broker",
+                broker,
+                "memcordon-session-broker.exe",
+            ),
+        ] {
+            let content = read_regular_no_follow(path, id)?;
+            components.push(RuntimeComponentRecord {
+                id: id.into(),
+                path: name.into(),
+                role,
+                size: content.len() as u64,
+                mode: 0o755,
+                sha256: crate::package::sha256_bytes(&content),
+            });
+        }
+        let manifest = RuntimeManifestV2::windows(
+            env!("CARGO_PKG_VERSION").into(),
+            crate::SOURCE_COMMIT.into(),
+            native_runtime_target().into(),
+            components,
+        );
+        let mut bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
+        bytes.push(b'\n');
+        bytes
+    };
+    let manifest = RuntimeManifestV2::parse(&bytes)?;
+    validate_runtime_components(&manifest, agent, bootstrap, broker)?;
+    if manifest.version != env!("CARGO_PKG_VERSION")
+        || manifest.source_commit != crate::SOURCE_COMMIT
+    {
+        return Err("source runtime manifest belongs to another provider generation".into());
+    }
+    let public_bytes = read_regular_no_follow(&directory.join("memcordon.exe"), "public-cli")?;
+    let public = manifest
+        .components
+        .iter()
+        .find(|component| component.role == RuntimeComponentRole::PublicCli)
+        .ok_or("source runtime manifest lacks public CLI")?;
+    if public.size != public_bytes.len() as u64
+        || public.sha256 != crate::package::sha256_bytes(&public_bytes)
+    {
+        return Err("source public CLI differs from runtime manifest".into());
+    }
+    Ok(bytes)
 }
 
 fn packaged_target_desktop_bootstrap(agent: &Path) -> Result<PathBuf, String> {
@@ -175,6 +367,14 @@ struct CapturedPackageArtifacts {
 }
 
 fn read_regular_no_follow(path: &Path, role: &str) -> Result<Vec<u8>, String> {
+    read_regular_no_follow_bounded(path, role, u64::MAX)
+}
+
+fn read_regular_no_follow_bounded(
+    path: &Path,
+    role: &str,
+    maximum: u64,
+) -> Result<Vec<u8>, String> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -204,13 +404,19 @@ fn read_regular_no_follow(path: &Path, role: &str) -> Result<Vec<u8>, String> {
             file_kind(&metadata),
         ));
     }
+    if metadata.len() > maximum {
+        return Err("package artifact exceeds byte bound".into());
+    }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|error| {
+    (&mut file).take(maximum.saturating_add(1)).read_to_end(&mut bytes).map_err(|error| {
         format!(
             "MCSEALED-WINDOWS-ARTIFACT: role={role} path={} expected=readable-regular-file actual=read-failed error={error}",
             path.display()
         )
     })?;
+    if u64::try_from(bytes.len()).map_or(true, |length| length > maximum) {
+        return Err("package artifact grew beyond byte bound".into());
+    }
     Ok(bytes)
 }
 
@@ -655,7 +861,13 @@ fn install_with_intent(intent: InstallIntent) -> Result<InstallTransition, Strin
     let source_bootstrap = packaged_target_desktop_bootstrap(&source)?;
     let source_broker = packaged_session_broker(&source)?;
     let mut transition = InstallTransition::new(intent);
-    let result = install_transaction(&source, &source_bootstrap, &source_broker, &mut transition);
+    let result = install_transaction(
+        &source,
+        &source_bootstrap,
+        &source_broker,
+        &mut transition,
+        RuntimeManifestInput::Source,
+    );
     if let Err(install_error) = result {
         return match rollback_fresh_install(FreshRollback::Transition(transition)) {
             Ok(()) => Err(install_error),
@@ -1058,6 +1270,7 @@ impl InstallTransition {
 }
 
 struct UpgradeRollback {
+    runtime_manifest: Option<Vec<u8>>,
     binary: PathBuf,
     target_desktop_bootstrap: PathBuf,
     session_broker: PathBuf,
@@ -1098,9 +1311,15 @@ impl ProviderRemovalContext {
 }
 
 fn upgrade(ephemeral_ci: bool) -> Result<UpgradeInstallation, String> {
+    let source = std::env::current_exe().map_err(|error| error.to_string())?;
+    upgrade_from(ephemeral_ci, &source)
+}
+
+fn upgrade_from(ephemeral_ci: bool, source: &Path) -> Result<UpgradeInstallation, String> {
     let scm_connect_ace_owned = scm_ownership_marker_present()?;
     let installed = installed_binary();
     let captured = validate_existing_installed_artifacts()?;
+    let runtime_manifest = captured_installed_manifest(&captured)?;
     let backup = installed.with_extension("exe.rollback");
     copy_atomically_bytes(&captured.agent_bytes, &backup).map_err(|error| {
         format!("cannot preserve the working Windows provider for rollback: {error}")
@@ -1134,6 +1353,7 @@ fn upgrade(ephemeral_ci: bool) -> Result<UpgradeInstallation, String> {
         None
     };
     let rollback = UpgradeRollback {
+        runtime_manifest,
         binary: backup,
         target_desktop_bootstrap: bootstrap_backup,
         session_broker: broker_backup,
@@ -1142,7 +1362,6 @@ fn upgrade(ephemeral_ci: bool) -> Result<UpgradeInstallation, String> {
         ephemeral_ci,
         scm_connect_ace_owned,
     };
-    let source = std::env::current_exe().map_err(|error| error.to_string())?;
     let source_broker = packaged_session_broker(&source)?;
     if let Err(cleanup_error) = service_owned_cleanup_barrier() {
         cleanup_upgrade_rollback(&rollback);
@@ -1182,7 +1401,13 @@ fn upgrade(ephemeral_ci: bool) -> Result<UpgradeInstallation, String> {
     }
     let mut transition = InstallTransition::new(InstallIntent::from_ephemeral_ci(ephemeral_ci));
     let source_bootstrap = packaged_target_desktop_bootstrap(&source)?;
-    match install_transaction(&source, &source_bootstrap, &source_broker, &mut transition) {
+    match install_transaction(
+        &source,
+        &source_bootstrap,
+        &source_broker,
+        &mut transition,
+        RuntimeManifestInput::Source,
+    ) {
         Ok(()) => {
             if rollback.scm_connect_ace_owned {
                 std::fs::write(
@@ -1514,6 +1739,7 @@ fn restore_upgrade(
         &rollback.target_desktop_bootstrap,
         &rollback.session_broker,
         &mut restored_transition,
+        RuntimeManifestInput::Rollback(rollback.runtime_manifest.as_deref()),
     )?;
     if rollback.scm_connect_ace_owned {
         std::fs::write(
@@ -1549,13 +1775,58 @@ fn cleanup_upgrade_rollback(rollback: &UpgradeRollback) {
     }
 }
 
+enum RuntimeManifestInput<'a> {
+    Source,
+    // Absence preserves a drained historical package's real inventory. It is
+    // never synthesized into evidence of support for current admission schemas.
+    Rollback(Option<&'a [u8]>),
+}
+
+fn captured_installed_manifest(
+    artifacts: &CapturedPackageArtifacts,
+) -> Result<Option<Vec<u8>>, String> {
+    let path = install_root().join("runtime-manifest.json");
+    if path_absent_no_follow(&path, "capture-installed-runtime-manifest")? {
+        return Ok(None);
+    }
+    let bytes = read_regular_no_follow_bounded(
+        &path,
+        "capture-installed-runtime-manifest",
+        memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+    )?;
+    let manifest = memcordon_core::runtime_manifest::RuntimeManifestV2::parse(&bytes)?;
+    validate_runtime_snapshot(&manifest, artifacts)?;
+    Ok(Some(bytes))
+}
+
 fn install_transaction(
     source: &Path,
     source_bootstrap: &Path,
     source_broker: &Path,
     transition: &mut InstallTransition,
+    runtime_manifest: RuntimeManifestInput<'_>,
 ) -> Result<(), String> {
     let source_artifacts = capture_package_artifacts(source, source_bootstrap, source_broker)?;
+    let manifest_bytes = match runtime_manifest {
+        RuntimeManifestInput::Rollback(bytes) => bytes.map(<[u8]>::to_vec),
+        RuntimeManifestInput::Source => Some(source_runtime_manifest(
+            source,
+            source_bootstrap,
+            source_broker,
+        )?),
+    };
+    install_captured_transaction(&source_artifacts, manifest_bytes.as_deref(), transition)
+}
+
+fn install_captured_transaction(
+    source_artifacts: &CapturedPackageArtifacts,
+    manifest_bytes: Option<&[u8]>,
+    transition: &mut InstallTransition,
+) -> Result<(), String> {
+    if let Some(bytes) = manifest_bytes {
+        let manifest = memcordon_core::runtime_manifest::RuntimeManifestV2::parse(bytes)?;
+        validate_runtime_snapshot(&manifest, source_artifacts)?;
+    }
     let install_root = install_root();
     let state_root = state_root();
     reject_reparse_components(&install_root)?;
@@ -1577,6 +1848,14 @@ fn install_transaction(
         &source_artifacts.session_broker_bytes,
         &installed_session_broker(),
     )?;
+    if let Some(bytes) = manifest_bytes {
+        copy_atomically_bytes(bytes, &install_root.join("runtime-manifest.json"))?;
+    } else {
+        let path = install_root.join("runtime-manifest.json");
+        if !path_absent_no_follow(&path, "restore-legacy-manifest-absence")? {
+            std::fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
+    }
     let bootstrap_security = SecurityDescriptor::from_sddl(&state_bootstrap_sddl()?)?;
     let state_parent = state_root
         .parent()
@@ -1587,6 +1866,7 @@ fn install_transaction(
         "create package state parent",
     )?;
     transition.retain(state_parent, &state_parent_sddl()?)?;
+    super::policy_registry::install()?;
     create_secure_directory(
         &state_root,
         &bootstrap_security,
@@ -2016,7 +2296,7 @@ fn remove_replaced_image_with_convergence(destination: &Path) -> Result<(), Stri
     )
 }
 
-fn create_secure_directory(
+pub(crate) fn create_secure_directory(
     path: &Path,
     security: &SecurityDescriptor,
     phase: &str,
@@ -2221,11 +2501,24 @@ pub(crate) fn reconcile_certification_marker_security(path: &Path) -> Result<(),
 }
 
 fn uninstall(ephemeral_ci: bool) -> Result<(), String> {
+    uninstall_with_removal(ephemeral_ci, remove_provider_files)
+}
+
+fn uninstall_with_removal(
+    ephemeral_ci: bool,
+    remove: impl FnOnce(ProviderRemovalContext) -> Result<(), String>,
+) -> Result<(), String> {
     service_owned_cleanup_barrier()?;
-    let source = std::env::current_exe().map_err(|error| error.to_string())?;
+    let captured = validate_existing_installed_artifacts()?;
+    let runtime_manifest = captured_installed_manifest(&captured)?;
+    let policy_snapshot = super::policy_registry::capture_retired()?;
     let qualification_path = state_root().join("package").join("qualification.json");
     let qualification = if qualification_path.is_file() {
-        Some(std::fs::read(&qualification_path).map_err(|error| error.to_string())?)
+        Some(read_regular_no_follow_bounded(
+            &qualification_path,
+            "uninstall-qualification-snapshot",
+            memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+        )?)
     } else {
         None
     };
@@ -2247,22 +2540,32 @@ fn uninstall(ephemeral_ci: bool) -> Result<(), String> {
     } else {
         ScmAceDisposition::NotOwned
     };
-    if let Err(remove_error) = remove_provider_files(ProviderRemovalContext { scm_ace }) {
+    if let Err(remove_error) = remove(ProviderRemovalContext { scm_ace }) {
         let mut transition = InstallTransition::new(InstallIntent::from_ephemeral_ci(ephemeral_ci));
-        let source_bootstrap = packaged_target_desktop_bootstrap(&source)?;
-        let source_broker = packaged_session_broker(&source)?;
-        let rollback =
-            install_transaction(&source, &source_bootstrap, &source_broker, &mut transition)
-                .and_then(|()| {
-                    if let Some(qualification) = qualification {
-                        let destination = state_root().join("package").join("qualification.json");
-                        let staged = destination.with_extension("json.new");
-                        std::fs::write(&staged, qualification)
-                            .map_err(|error| error.to_string())?;
-                        super::record::replace_atomically(&staged, &destination)?;
-                    }
-                    Ok(())
-                });
+        let rollback = (|| {
+            if let Some(snapshot) = policy_snapshot.as_ref() {
+                let parent = state_root()
+                    .parent()
+                    .expect("sealed state has parent")
+                    .to_path_buf();
+                create_secure_directory(
+                    &parent,
+                    &SecurityDescriptor::from_sddl(&state_parent_sddl()?)?,
+                    "restore package policy parent",
+                )?;
+                super::policy_registry::restore_retired(snapshot)?;
+            }
+            install_captured_transaction(&captured, runtime_manifest.as_deref(), &mut transition)
+        })()
+        .and_then(|()| {
+            if let Some(qualification) = qualification {
+                let destination = state_root().join("package").join("qualification.json");
+                let staged = destination.with_extension("json.new");
+                std::fs::write(&staged, qualification).map_err(|error| error.to_string())?;
+                super::record::replace_atomically(&staged, &destination)?;
+            }
+            Ok(())
+        });
         return match rollback {
             Ok(()) => Err(format!(
                 "MCSEALED-WINDOWS-UNINSTALL-ROLLED-BACK: filesystem removal failed and the installed pair was restored: {remove_error}"
@@ -2274,6 +2577,10 @@ fn uninstall(ephemeral_ci: bool) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/sealed_agent/windows_package_policy_rollback.rs"]
+mod policy_rollback_tests;
 
 fn scm_ownership_marker_present() -> Result<bool, String> {
     use std::os::windows::fs::MetadataExt;
@@ -2307,6 +2614,11 @@ fn remove_provider_files(context: ProviderRemovalContext) -> Result<(), String> 
     let broker = installed_session_broker();
     remove_provider_state(context)?;
     remove_installed_binary_with_convergence(
+        &install_root().join("runtime-manifest.json"),
+        IMAGE_DELETE_DEADLINE,
+        IMAGE_DELETE_RETRY_INTERVAL,
+    )?;
+    remove_installed_binary_with_convergence(
         &binary,
         IMAGE_DELETE_DEADLINE,
         IMAGE_DELETE_RETRY_INTERVAL,
@@ -2331,6 +2643,12 @@ fn remove_provider_files(context: ProviderRemovalContext) -> Result<(), String> 
             )
         })?;
     }
+    super::policy_registry::remove_retired()?;
+    let parent = state_root()
+        .parent()
+        .expect("sealed state has parent")
+        .to_path_buf();
+    remove_directory_if_present(&parent, StateDirectory::StateParent, context)?;
     Ok(())
 }
 
@@ -2525,7 +2843,12 @@ fn remove_provider_state(context: ProviderRemovalContext) -> Result<(), String> 
     let parent = state
         .parent()
         .ok_or_else(|| "Windows sealed state root has no parent".to_owned())?;
-    remove_directory_if_present(parent, StateDirectory::StateParent, context)?;
+    if path_absent_no_follow(
+        &super::policy_registry::root(),
+        "preserve-policy-during-runtime-replacement",
+    )? {
+        remove_directory_if_present(parent, StateDirectory::StateParent, context)?;
+    }
     Ok(())
 }
 
@@ -3261,13 +3584,29 @@ pub fn installed_inspection(
     let qualification_complete = qualification
         .as_ref()
         .is_some_and(|receipt| receipt.qualified && receipt.is_consistent());
+    let policy = match super::policy_registry::Lease::acquire().and_then(|lease| lease.read()) {
+        Ok(Some(activation)) => activation.inspection()?,
+        Ok(None) => memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unconfigured,
+        Err(_) => memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unavailable,
+    };
+    let target = match std::env::consts::ARCH {
+        "aarch64" => "aarch64-pc-windows-msvc",
+        "x86_64" => "x86_64-pc-windows-msvc",
+        _ => return Err("unsupported installed inspection architecture".into()),
+    };
     Ok(InstalledProviderInspectionV4 {
-        schema_version: 4,
+        schema_version: 5,
         agent,
         installed_executable_sha256,
         installed_artifacts_valid: true,
         provider_identity: qualification.map(|receipt| receipt.provider_identity),
         provider_reachable: qualification_complete,
         qualification_complete,
+        policy,
+        profile_qualification: memcordon_core::runtime_manifest::profile_qualification_reference(
+            target,
+        ),
+        diagnostic_qualification:
+            memcordon_core::runtime_manifest::diagnostic_qualification_reference(target),
     })
 }

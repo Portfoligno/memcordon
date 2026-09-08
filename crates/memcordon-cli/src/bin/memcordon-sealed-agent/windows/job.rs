@@ -19,6 +19,10 @@ use windows_sys::Win32::System::JobObjects::{
 use super::pipe::OwnedHandle;
 use memcordon_core::{WindowsSealedFault, WindowsSealedMutant};
 
+#[cfg(test)]
+#[path = "../../../../tests/sealed_agent/windows_native_diagnostic_codes.rs"]
+mod native_diagnostic_codes;
+
 // The windows-sys release used by this workspace does not expose the Job
 // completion message constants. These are the stable values from WinNT.h.
 const JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO: u32 = 4;
@@ -38,6 +42,49 @@ pub enum JobNotification {
     Other(u32),
 }
 
+#[derive(Debug)]
+pub(crate) struct JobObservationError {
+    pub operation: memcordon_core::FailureOperationV1,
+    pub source: io::Error,
+}
+impl JobObservationError {
+    fn last(operation: memcordon_core::FailureOperationV1) -> Self {
+        let source = io::Error::last_os_error();
+        Self { operation, source }
+    }
+    fn semantic(operation: memcordon_core::FailureOperationV1, message: &'static str) -> Self {
+        Self {
+            operation,
+            source: io::Error::new(io::ErrorKind::InvalidData, message),
+        }
+    }
+}
+impl std::fmt::Display for JobObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+impl From<JobObservationError> for String {
+    fn from(error: JobObservationError) -> Self {
+        super::diagnostics::capture_native(
+            error.operation,
+            error.source.raw_os_error(),
+            memcordon_core::FailureCodeV1::JobQuery,
+        );
+        error.to_string()
+    }
+}
+
+fn captured_native_message(operation: memcordon_core::FailureOperationV1) -> String {
+    let source = io::Error::last_os_error();
+    super::diagnostics::capture_native(
+        operation,
+        source.raw_os_error(),
+        memcordon_core::FailureCodeV1::PolicyReadback,
+    );
+    source.to_string()
+}
+
 enum JobObjectSecurity {
     LauncherService,
     NestedCanaryCreator,
@@ -49,7 +96,9 @@ impl Job {
         let mut inside = 0_i32;
         // SAFETY: process is live; a null Job asks whether it belongs to any Job.
         if unsafe { IsProcessInJob(process, ptr::null_mut(), &raw mut inside) } == 0 {
-            Err(io::Error::last_os_error().to_string())
+            Err(captured_native_message(
+                memcordon_core::FailureOperationV1::VerifyPolicy,
+            ))
         } else {
             Ok(inside != 0)
         }
@@ -104,14 +153,23 @@ impl Job {
         // SAFETY: attributes holds the exact role-appropriate descriptor and
         // remains live for the call. The unnamed Job handle is transferred
         // into OwnedHandle.
-        let handle =
-            OwnedHandle::new(unsafe { CreateJobObjectW(&raw const attributes, ptr::null()) })?;
+        let raw = unsafe { CreateJobObjectW(&raw const attributes, ptr::null()) };
+        if raw.is_null() {
+            return Err(captured_native_message(
+                memcordon_core::FailureOperationV1::InstallPolicy,
+            ));
+        }
+        let handle = OwnedHandle::new(raw)?;
         security.verify_kernel_object(handle.raw(), super::security::SecurityObjectKind::Job)?;
         // SAFETY: INVALID_HANDLE_VALUE requests a new completion port; the
         // returned handle is independently owned.
-        let completion_port = OwnedHandle::new(unsafe {
-            CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 1)
-        })?;
+        let raw = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 1) };
+        if raw.is_null() {
+            return Err(captured_native_message(
+                memcordon_core::FailureOperationV1::InstallPolicy,
+            ));
+        }
+        let completion_port = OwnedHandle::new(raw)?;
         let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
             CompletionKey: handle.raw(),
             CompletionPort: completion_port.raw(),
@@ -127,7 +185,9 @@ impl Job {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error().to_string());
+            return Err(captured_native_message(
+                memcordon_core::FailureOperationV1::InstallPolicy,
+            ));
         }
         let job = Self {
             handle,
@@ -177,13 +237,21 @@ impl Job {
             )
         } == 0
         {
-            Err(io::Error::last_os_error().to_string())
+            Err(captured_native_message(
+                memcordon_core::FailureOperationV1::InstallPolicy,
+            ))
         } else {
             Ok(())
         }
     }
 
     fn query_limits(&self) -> Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION, String> {
+        self.query_limits_observed().map_err(String::from)
+    }
+
+    fn query_limits_observed(
+        &self,
+    ) -> Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObservationError> {
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         // SAFETY: output structure and size match the requested Job information class.
         if unsafe {
@@ -196,7 +264,9 @@ impl Job {
             )
         } == 0
         {
-            Err(io::Error::last_os_error().to_string())
+            Err(JobObservationError::last(
+                memcordon_core::FailureOperationV1::QueryPeakMemory,
+            ))
         } else {
             Ok(limits)
         }
@@ -218,7 +288,9 @@ impl Job {
             )
         } == 0
         {
-            Err(io::Error::last_os_error().to_string())
+            Err(captured_native_message(
+                memcordon_core::FailureOperationV1::InstallPolicy,
+            ))
         } else {
             Ok(())
         }
@@ -241,7 +313,9 @@ impl Job {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error().to_string());
+            return Err(captured_native_message(
+                memcordon_core::FailureOperationV1::VerifyPolicy,
+            ));
         }
         let expected = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
@@ -267,7 +341,9 @@ impl Job {
             )
         } == 0
         {
-            return Err(io::Error::last_os_error().to_string());
+            return Err(captured_native_message(
+                memcordon_core::FailureOperationV1::VerifyPolicy,
+            ));
         }
         if accounting.ActiveProcesses != 0 || accounting.TotalProcesses != 0 {
             return Err("session-holder Job is not empty at broker adoption".to_owned());
@@ -303,7 +379,9 @@ impl Job {
         let mut inside = 0;
         // SAFETY: both handles are live and output storage is initialized.
         if unsafe { IsProcessInJob(process, self.handle(), &raw mut inside) } == 0 {
-            Err(io::Error::last_os_error().to_string())
+            Err(captured_native_message(
+                memcordon_core::FailureOperationV1::VerifySuspendedTarget,
+            ))
         } else {
             Ok(inside != 0)
         }
@@ -313,13 +391,27 @@ impl Job {
         Ok(self.accounting()?.ActiveProcesses)
     }
 
+    pub(crate) fn active_processes_observed(&self) -> Result<u32, JobObservationError> {
+        Ok(self.accounting_observed()?.ActiveProcesses)
+    }
+
     pub fn total_processes(&self) -> Result<u32, String> {
         Ok(self.accounting()?.TotalProcesses)
     }
 
     pub fn process_ids(&self) -> Result<Vec<u32>, String> {
-        let mut capacity = usize::try_from(self.active_processes()?)
-            .map_err(|error| error.to_string())?
+        self.process_ids_observed().map_err(String::from)
+    }
+
+    pub(super) fn process_ids_observed(&self) -> Result<Vec<u32>, JobObservationError> {
+        use memcordon_core::FailureOperationV1::QueryJobProcessIds;
+        let mut capacity = usize::try_from(self.accounting_observed()?.ActiveProcesses)
+            .map_err(|_| {
+                JobObservationError::semantic(
+                    QueryJobProcessIds,
+                    "Job process count exceeds address width",
+                )
+            })?
             .saturating_add(16);
         loop {
             // One pointer-sized word holds the two u32 header fields on every
@@ -331,7 +423,12 @@ impl Job {
                 .len()
                 .checked_mul(size_of::<usize>())
                 .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| "Job process-list buffer exceeds the native limit".to_owned())?;
+                .ok_or_else(|| {
+                    JobObservationError::semantic(
+                        QueryJobProcessIds,
+                        "Job process-list buffer exceeds the native limit",
+                    )
+                })?;
             let mut returned = 0_u32;
             // SAFETY: storage is native-aligned and byte_len describes its
             // complete writable allocation for JobObjectBasicProcessIdList.
@@ -344,6 +441,8 @@ impl Job {
                     &raw mut returned,
                 )
             };
+            let native_failure =
+                (success == 0).then(|| JobObservationError::last(QueryJobProcessIds));
             // SAFETY: the fixed two-u32 header fits in the first usize word on
             // x86_64 and ARM64, the only supported Windows provider targets.
             let header = storage.as_ptr().cast::<u32>();
@@ -354,22 +453,35 @@ impl Job {
                 continue;
             }
             if success == 0 {
-                return Err(io::Error::last_os_error().to_string());
+                return Err(native_failure.expect("failed native query captured immediately"));
             }
             if listed > capacity || listed > assigned {
-                return Err("Job process-list readback is inconsistent".to_owned());
+                return Err(JobObservationError::semantic(
+                    QueryJobProcessIds,
+                    "Job process-list readback is inconsistent",
+                ));
             }
             return storage[1..1 + listed]
                 .iter()
                 .map(|value| {
-                    u32::try_from(*value)
-                        .map_err(|_| "Job process id exceeds the Windows PID width".to_owned())
+                    u32::try_from(*value).map_err(|_| {
+                        JobObservationError::semantic(
+                            QueryJobProcessIds,
+                            "Job process id exceeds the Windows PID width",
+                        )
+                    })
                 })
                 .collect();
         }
     }
 
     fn accounting(&self) -> Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, String> {
+        self.accounting_observed().map_err(String::from)
+    }
+
+    fn accounting_observed(
+        &self,
+    ) -> Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObservationError> {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: output structure and size match the requested accounting class.
         if unsafe {
@@ -382,7 +494,9 @@ impl Job {
             )
         } == 0
         {
-            Err(io::Error::last_os_error().to_string())
+            Err(JobObservationError::last(
+                memcordon_core::FailureOperationV1::QueryJobAccounting,
+            ))
         } else {
             Ok(accounting)
         }
@@ -392,17 +506,33 @@ impl Job {
         Ok(self.query_limits()?.PeakJobMemoryUsed as u64)
     }
 
+    pub(super) fn peak_memory_observed(&self) -> Result<u64, JobObservationError> {
+        Ok(self.query_limits_observed()?.PeakJobMemoryUsed as u64)
+    }
+
     pub fn terminate(&self, status: u32) -> Result<(), String> {
+        self.terminate_observed(status).map_err(String::from)
+    }
+
+    pub(super) fn terminate_observed(&self, status: u32) -> Result<(), JobObservationError> {
         // SAFETY: the Job handle remains live and the status is an intentional
         // terminal NT status for every active member.
         if unsafe { TerminateJobObject(self.handle(), status) } == 0 {
-            Err(io::Error::last_os_error().to_string())
+            Err(JobObservationError::last(
+                memcordon_core::FailureOperationV1::TerminateJob,
+            ))
         } else {
             Ok(())
         }
     }
 
     pub fn take_notification(&self) -> Result<Option<JobNotification>, String> {
+        self.take_notification_observed().map_err(String::from)
+    }
+
+    pub(super) fn take_notification_observed(
+        &self,
+    ) -> Result<Option<JobNotification>, JobObservationError> {
         let mut message = 0_u32;
         let mut key = 0_usize;
         let mut overlapped = ptr::null_mut();
@@ -426,11 +556,17 @@ impl Job {
             {
                 Ok(None)
             } else {
-                Err(error.to_string())
+                Err(JobObservationError {
+                    operation: memcordon_core::FailureOperationV1::ReadJobNotification,
+                    source: error,
+                })
             };
         }
         if key != self.handle() as usize {
-            return Err("Job completion packet has an unexpected completion key".to_owned());
+            return Err(JobObservationError::semantic(
+                memcordon_core::FailureOperationV1::ReadJobNotification,
+                "Job completion packet has an unexpected completion key",
+            ));
         }
         Ok(Some(match message {
             JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO => JobNotification::ActiveProcessesZero,
@@ -442,8 +578,15 @@ impl Job {
     }
 
     pub fn wait_empty(&self, deadline: Instant) -> Result<bool, String> {
+        self.wait_empty_observed(deadline).map_err(String::from)
+    }
+
+    pub(super) fn wait_empty_observed(
+        &self,
+        deadline: Instant,
+    ) -> Result<bool, JobObservationError> {
         while Instant::now() < deadline {
-            if self.active_processes()? == 0 {
+            if self.accounting_observed()?.ActiveProcesses == 0 {
                 return Ok(true);
             }
             let mut message = 0_u32;
@@ -461,7 +604,7 @@ impl Job {
             };
             std::thread::sleep(Duration::from_millis(1));
         }
-        Ok(self.active_processes()? == 0)
+        Ok(self.accounting_observed()?.ActiveProcesses == 0)
     }
 }
 

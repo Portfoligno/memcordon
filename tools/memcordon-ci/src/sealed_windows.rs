@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use memcordon_ci::command::{CommandSpec, git, rustup_cargo};
-use memcordon_ci::runtime_manifest::{RuntimeManifestV1, SealedRuntimeV1};
+use memcordon_ci::runtime_manifest::{RuntimeManifestV2, SealedRuntimeV2};
 use memcordon_ci::scenario_diagnostic::BoundedStream;
 use memcordon_ci::windows_package_cleanup::{
     ActivePackageMutation, certify_active_package_mutation, complete_optional_install_cleanup,
@@ -690,6 +690,7 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
     require_windows()?;
     require_native_architecture()?;
     certify_qualification_preflight_regressions(root, stable)?;
+    certify_causal_diagnostics(root, stable)?;
     let native = native_channel_binaries(root, stable)?;
     let reports = report_directory(root);
     if reports.exists() {
@@ -866,6 +867,34 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
     };
     write_json(&reports.join("windows-cleanup.json"), &summary)?;
     fs::remove_file(public_report_path)?;
+    Ok(())
+}
+
+fn certify_causal_diagnostics(root: &Path, stable: &str) -> Result<()> {
+    for name in memcordon_ci::workload_qualification::DIAGNOSTIC_TESTS {
+        let output = rustup_cargo(
+            root,
+            stable,
+            [
+                "test",
+                "--locked",
+                "--target-dir",
+                "target/ci/windows-sealed",
+                "--package",
+                "memcordon",
+                "--features",
+                "test-support",
+                "--test",
+                "sealed_agent",
+                name,
+                "--",
+                "--exact",
+            ],
+            DEADLINE,
+        )
+        .run()?;
+        memcordon_ci::capability::require_single_test_success(&output, name)?;
+    }
     Ok(())
 }
 
@@ -1509,9 +1538,15 @@ impl StatusScenarioRunner<'_> {
 pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
     require_windows()?;
     require_native_architecture()?;
+    certify_causal_diagnostics(root, stable)?;
     let native = native_channel_binaries(root, stable)?;
     let channel = root.join("target").join("ci").join("windows-sealed-cargo");
     fs::create_dir_all(&channel)?;
+    write_native_qualification(
+        root,
+        &channel,
+        memcordon_ci::workload_qualification::QualificationKind::CausalDiagnostics,
+    )?;
     let install_root = channel.join("install");
     if install_root.exists() {
         fs::remove_dir_all(&install_root)?;
@@ -1611,6 +1646,36 @@ fn certify_rollback_with_cleanup(root: &Path, agent: &Path) -> Result<bool> {
     )
 }
 
+fn write_native_qualification(
+    root: &Path,
+    directory: &Path,
+    kind: memcordon_ci::workload_qualification::QualificationKind,
+) -> Result<()> {
+    let target = match std::env::consts::ARCH {
+        "x86_64" => "x86_64-pc-windows-msvc",
+        "aarch64" => "aarch64-pc-windows-msvc",
+        _ => {
+            return Err(CiError::Message(
+                "unsupported native qualification architecture".into(),
+            ));
+        }
+    };
+    let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
+        .map_err(|error| CiError::Message(error.to_string()))?;
+    let (_, name, _, _) = memcordon_ci::workload_qualification::ARTIFACTS
+        .into_iter()
+        .find(|(_, _, entry_target, entry_kind)| *entry_target == target && *entry_kind == kind)
+        .expect("closed native qualification inventory");
+    write_json(
+        &directory.join(name),
+        &memcordon_ci::workload_qualification::QualificationArtifactV1::after_observed_tests(
+            kind,
+            target,
+            commit.trim(),
+        ),
+    )
+}
+
 fn write_split_windows_release_certification(
     root: &Path,
     channel: &Path,
@@ -1653,6 +1718,13 @@ fn write_split_windows_release_certification(
         ),
     ];
     let mut bindings = serde_json::Map::new();
+    for (_, name, target, _) in memcordon_ci::workload_qualification::ARTIFACTS {
+        if Some(target) == native.target.as_deref() {
+            let destination = evidence.join(name);
+            fs::copy(channel.join(name), &destination)?;
+            bindings.insert(name.into(), Value::String(sha256_file(&destination)?));
+        }
+    }
     for (name, path) in required {
         let destination = evidence.join(name);
         fs::copy(&path, &destination)?;
@@ -1767,7 +1839,8 @@ fn native_channel_binaries(root: &Path, stable: &str) -> Result<NativeChannel> {
     let extracted = roots.remove(0);
     let manifest_path = extracted.join("runtime-manifest.json");
     let runtime_manifest_sha256 = sha256_file(&manifest_path)?;
-    let manifest: RuntimeManifestV1 = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let manifest =
+        RuntimeManifestV2::parse(&fs::read(&manifest_path)?).map_err(CiError::Message)?;
     let expected_target = match std::env::consts::ARCH {
         "x86_64" => "x86_64-pc-windows-msvc",
         "aarch64" => "aarch64-pc-windows-msvc",
@@ -1779,15 +1852,15 @@ fn native_channel_binaries(root: &Path, stable: &str) -> Result<NativeChannel> {
     };
     let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
         .map_err(|error| CiError::Message(format!("git commit identity was not UTF-8: {error}")))?;
-    if manifest.schema_version != 1
+    if manifest.schema_version != 2
         || manifest.project != "memcordon"
         || manifest.version != env!("CARGO_PKG_VERSION")
         || manifest.source_commit != commit.trim_end_matches(['\r', '\n'])
         || manifest.target != expected_target
         || !matches!(
             manifest.sealed,
-            SealedRuntimeV1::Included {
-                provider_protocol: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            SealedRuntimeV2::Included {
+                native_protocols: memcordon_core::runtime_manifest::NativeProviderProtocols::Windows { provider_contract: 3, public_wire: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION, private_wire: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION },
                 mechanism: ref value,
                 execution_report_schema: memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
                 qualification_schema: memcordon_core::WINDOWS_QUALIFICATION_SCHEMA_VERSION,
@@ -2043,6 +2116,40 @@ fn channel_smoke_installed(
     channel: &Path,
     package: Value,
 ) -> Result<ChannelFingerprint> {
+    let stable = memcordon_ci::config::toolchains(root)?.stable;
+    for name in memcordon_ci::workload_qualification::PROFILE_TESTS
+        .into_iter()
+        .chain(memcordon_ci::workload_qualification::WINDOWS_PACKAGE_POLICY_TESTS)
+    {
+        let output = rustup_cargo(
+            root,
+            &stable,
+            [
+                "test",
+                "--locked",
+                "--target-dir",
+                "target/ci/windows-sealed",
+                "--package",
+                "memcordon",
+                "--features",
+                "test-support",
+                "--test",
+                "sealed_agent",
+                name,
+                "--",
+                "--exact",
+                "--ignored",
+            ],
+            DEADLINE,
+        )
+        .run()?;
+        memcordon_ci::capability::require_single_test_success(&output, name)?;
+    }
+    write_native_qualification(
+        root,
+        channel,
+        memcordon_ci::workload_qualification::QualificationKind::Profile,
+    )?;
     let artifacts = read_ready_windows_qualification_artifacts(channel)?;
     let qualification = artifacts.receipt;
     let launch_plan = artifacts.plan;

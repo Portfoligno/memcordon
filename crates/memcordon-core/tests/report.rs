@@ -83,6 +83,8 @@ fn sealed_setup_failure_preserves_truthful_incomplete_retirement() {
 #[test]
 fn typed_provider_rejection_round_trips_with_cleanup_proof() {
     let rejection = memcordon_core::ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-TARGET-DESCRIPTORS-READBACK".to_owned(),
         phase: memcordon_core::BoundarySetupPhase::ResourceVerification,
@@ -105,6 +107,7 @@ fn typed_provider_rejection_round_trips_with_cleanup_proof() {
         terminal_receipt: None,
     };
     let error = ExecutionErrorReport {
+        policy_enforcement: None,
         category: "setup".to_owned(),
         code: "MCSEALED-PROVIDER-REJECTION".to_owned(),
         message: "provider rejected launch".to_owned(),
@@ -116,6 +119,7 @@ fn typed_provider_rejection_round_trips_with_cleanup_proof() {
         workload_may_be_alive: false,
         boundary_setup_failure: None,
         provider_rejection: Some(rejection.clone()),
+        provider_failure: None,
     };
 
     let value = serde_json::to_value(&error).expect("error must serialize");
@@ -133,7 +137,7 @@ fn typed_provider_rejection_round_trips_with_cleanup_proof() {
 }
 
 fn report() -> MemcordonReport {
-    MemcordonReport::schema8(
+    MemcordonReport::schema9(
         ToolReport {
             name: "memcordon".to_owned(),
             version: "test".to_owned(),
@@ -150,6 +154,7 @@ fn report() -> MemcordonReport {
         },
         PolicyEnvelopeReport {
             requested: RequestedPolicyReport {
+                workload: Default::default(),
                 boundary: memcordon_core::BoundaryRequirement::Standard,
                 memory: None,
                 deadline: Some(DeadlinePolicyReport {
@@ -172,6 +177,7 @@ fn report() -> MemcordonReport {
                 },
             },
             effective: EffectivePolicyReport {
+                workload: memcordon_core::workload_evidence::WorkloadResolutionReportV1::unresolved(None, memcordon_core::workload_evidence::BaselineRestrictionObservationV1::UnmanagedStandardBackend),
                 boundary: memcordon_core::BoundaryClass::Standard,
                 memory: None,
                 deadline: Some(DeadlinePolicyReport {
@@ -196,6 +202,7 @@ fn report() -> MemcordonReport {
         None,
         None,
         Some(ExecutionErrorReport {
+            policy_enforcement: None,
             category: "spawn".to_owned(),
             code: "MCSPAWN".to_owned(),
             message: "fixture".to_owned(),
@@ -207,9 +214,43 @@ fn report() -> MemcordonReport {
             workload_may_be_alive: false,
             boundary_setup_failure: None,
             provider_rejection: None,
+            provider_failure: None,
         }),
     )
     .expect("valid report")
+}
+
+#[test]
+fn execution_report_rejects_corrupt_or_future_provider_diagnostics() {
+    let projection = memcordon_core::ProviderFailureDiagnosticV1::from_journal(
+        memcordon_core::PublicProviderBindingV1 {
+            generation: memcordon_core::BoundedText::new("1.0:test").unwrap(),
+            source_commit: memcordon_core::BoundedText::new(
+                "0123456789012345678901234567890123456789",
+            )
+            .unwrap(),
+            runtime_manifest_sha256: memcordon_core::DiagnosticSha256::from_bytes([1; 32]),
+        },
+        &"02".repeat(32),
+        &"03".repeat(32),
+        &memcordon_core::WindowsCausalDiagnosticsV1::default(),
+    )
+    .unwrap();
+    let mut value = serde_json::to_value(report()).unwrap();
+    value["error"]["provider_failure"] = serde_json::to_value(projection).unwrap();
+    assert!(serde_json::from_value::<MemcordonReport>(value.clone()).is_ok());
+    for (field, invalid) in [
+        ("schema_version", serde_json::json!(2)),
+        ("diagnostic_sequence", serde_json::json!(20)),
+        ("projection_sha256", serde_json::json!("00".repeat(32))),
+    ] {
+        let mut corrupt = value.clone();
+        corrupt["error"]["provider_failure"][field] = invalid;
+        assert!(
+            serde_json::from_value::<MemcordonReport>(corrupt).is_err(),
+            "accepted corrupt diagnostic field {field}"
+        );
+    }
 }
 
 #[test]
@@ -616,6 +657,7 @@ fn attempt_record(
     error: Option<SupervisionErrorRecord>,
 ) -> AttemptRecord {
     AttemptRecord {
+        policy_enforcement: Default::default(),
         number,
         kind: if number == 1 {
             AttemptKind::Initial
@@ -738,7 +780,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         RestartConditions::NONE
     };
     base.policy.effective.restart.dormant_conditions.clear();
-    MemcordonReport::schema8(
+    MemcordonReport::schema9(
         base.tool,
         base.invocation,
         base.policy,
@@ -746,7 +788,7 @@ fn report_from_execution(execution: SupervisionExecution) -> MemcordonReport {
         Some(execution),
         None,
     )
-    .expect("schema8")
+    .expect("schema9")
 }
 
 fn coordinator() -> RestartCoordinator {
@@ -1095,6 +1137,8 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
         errors: Vec::new(),
     };
     let provider_rejection = memcordon_core::ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: "MCSPAWN-NOT-FOUND".to_owned(),
         phase: memcordon_core::BoundarySetupPhase::TargetCreation,
@@ -1156,6 +1200,8 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
 #[test]
 fn request_validation_provider_rejection_round_trips_in_schema_eight() {
     let provider_rejection = memcordon_core::ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-PACKAGE-LEASE".to_owned(),
         phase: memcordon_core::BoundarySetupPhase::RequestValidation,

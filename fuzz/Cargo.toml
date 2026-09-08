@@ -334,4 +334,53 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "windows-causal-diagnostics"
+path = "fuzz_targets/windows_causal_diagnostics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "workload-request"
+path = "fuzz_targets/workload_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "workload-registry"
+path = "fuzz_targets/workload_registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "workload-discovery"
+path = "fuzz_targets/workload_discovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "workload-receipt"
+path = "fuzz_targets/workload_receipt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "workload-canonical"
+path = "fuzz_targets/workload_canonical.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "workload-transitions"
+path = "fuzz_targets/workload_transitions.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

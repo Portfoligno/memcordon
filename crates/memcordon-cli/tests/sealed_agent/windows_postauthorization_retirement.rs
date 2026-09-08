@@ -55,6 +55,7 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
         errors: Vec::new(),
     };
     let terminal = WindowsTerminalReceiptV1 {
+        policy_enforcement: Default::default(),
         schema_version: 1,
         attempt_id: record.attempt_id.clone(),
         nonce: nonce.to_owned(),
@@ -88,6 +89,8 @@ fn suspended_postauthorization_rejection_stages_replays_and_retires_bound_outbox
         }),
     };
     let rejection = ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-WINDOWS-CERTIFICATION-FAULT".to_owned(),
         phase: BoundarySetupPhase::Authorization,
@@ -145,6 +148,21 @@ fn receiptless_posttarget_rejection_cannot_bypass_terminal_binding() {
         digest,
     )
     .unwrap();
+    let original = memcordon_core::CausalEventV1 {
+        sequence: 0,
+        origin: memcordon_core::DiagnosticOriginV1::Launcher,
+        category: memcordon_core::FailureCategoryV1::Monitor,
+        operation: memcordon_core::FailureOperationV1::ObserveProcessIdentity,
+        code: memcordon_core::FailureCodeV1::ProcessInventoryObservation,
+        native_code: Some(memcordon_core::NativeFailureCodeV1::Win32(1234)),
+        observed_phase: memcordon_core::AttemptObservationPhaseV1::Monitoring,
+        safe_detail: memcordon_core::SafeDiagnosticDetailV1::NoAdditionalDetail,
+        detail_redacted: true,
+        detail_truncated: false,
+        terminalization_reference: None,
+    };
+    record.causal_diagnostics.observe(original).unwrap();
+    let retained_original = record.causal_diagnostics.original.clone();
     record.guardian_identity = Some(identity.clone());
     record.target_identity = Some(identity);
     record.state = crate::windows::record::WindowsAttemptStateV1::Authorized;
@@ -158,6 +176,8 @@ fn receiptless_posttarget_rejection_cannot_bypass_terminal_binding() {
     record.complete_rejection_cleanup_for_test().unwrap();
 
     let rejection = ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-WINDOWS-CERTIFICATION-FAULT".to_owned(),
         phase: BoundarySetupPhase::Retirement,
@@ -193,6 +213,25 @@ fn receiptless_posttarget_rejection_cannot_bypass_terminal_binding() {
             .stage_terminal_response_for_test(&response)
             .unwrap_err(),
         "terminal outbox response is not bound and consistent for the attempt"
+    );
+    assert!(record.terminal_response_json.is_none());
+    assert_eq!(record.causal_diagnostics.original, retained_original);
+    assert!(
+        record
+            .stage_terminal_response_with_store_for_test(&response, |record| record
+                .validate_for_store_for_test())
+            .is_err()
+    );
+    assert_eq!(record.causal_diagnostics.original, retained_original);
+    let secondary = record.causal_diagnostics.secondary.as_slice();
+    assert_eq!(secondary.len(), 1);
+    assert_eq!(
+        secondary[0].operation,
+        memcordon_core::FailureOperationV1::ValidateTerminalResponse
+    );
+    assert_eq!(
+        secondary[0].terminalization_reference,
+        Some(memcordon_core::TerminalizationReferenceV1::FirstError)
     );
     assert!(record.terminal_response_json.is_none());
 }

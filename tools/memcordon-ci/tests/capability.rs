@@ -60,7 +60,8 @@ fn certification_consumes_typed_doctor_schema() {
         "selected": backend_capability("linux-cgroup-v2", true, "hard"),
         "available": [backend_capability("linux-cgroup-v2", true, "hard")],
         "unavailable": [],
-        "requirement": { "kind": null, "met": true, "reason": null }
+        "requirement": { "kind": null, "met": true, "reason": null },
+        "workload_discovery": { "state": "unsupported" }
     });
     assert!(capability::require_certified_hard_backend(&probe, "linux-cgroup-v2").is_ok());
 

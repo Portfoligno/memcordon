@@ -226,6 +226,7 @@ pub fn run_attempt(
     let mut process =
         SuspendedProcess::create(command).map_err(|error| spawn_error(error, command))?;
     let authorized = assign_then_resume(&job, &mut process).map_err(setup_error)?;
+    let launch_facts = crate::backend::StandardLaunchFacts::contained_spawn_completed();
 
     let child_pid = process.id;
     let mut peak = 0_u64;
@@ -531,8 +532,9 @@ pub fn run_attempt(
     };
     let backend = info();
     let (launch, restart_safety, boundary_detail) =
-        crate::backend::standard_execution_evidence(&backend, cleanup_facts);
+        crate::backend::standard_execution_evidence(&backend, launch_facts, cleanup_facts);
     Ok(Execution {
+        policy_enforcement: Default::default(),
         outcome,
         backend,
         child_pid,

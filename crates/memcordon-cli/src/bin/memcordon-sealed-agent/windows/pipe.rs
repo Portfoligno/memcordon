@@ -1120,6 +1120,15 @@ pub fn finish_server_response(handle: HANDLE) -> Result<(), String> {
 
 pub fn write_frame<T: Serialize>(handle: HANDLE, value: &T) -> Result<(), String> {
     let payload = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    if let Ok(limit) = memcordon_core::windows_response_frame_limit(
+        &payload[..payload
+            .len()
+            .min(memcordon_core::WINDOWS_RESPONSE_PREFIX_BYTES)],
+    ) {
+        if payload.len() > limit {
+            return Err("diagnostic control frame exceeds its reserved bound".to_owned());
+        }
+    }
     if payload.len() > WINDOWS_MAX_FRAME_BYTES {
         return Err("Windows provider frame exceeds the protocol bound".to_owned());
     }
@@ -1176,6 +1185,23 @@ pub fn read_frame<T: DeserializeOwned>(handle: HANDLE) -> Result<T, String> {
 }
 
 pub fn read_frame_detailed<T: DeserializeOwned>(handle: HANDLE) -> Result<T, FrameReadError> {
+    read_frame_with_kind_limit(handle, false)
+}
+
+pub fn read_response_frame<T: DeserializeOwned>(handle: HANDLE) -> Result<T, String> {
+    read_response_frame_detailed(handle).map_err(|error| error.to_string())
+}
+
+pub fn read_response_frame_detailed<T: DeserializeOwned>(
+    handle: HANDLE,
+) -> Result<T, FrameReadError> {
+    read_frame_with_kind_limit(handle, true)
+}
+
+fn read_frame_with_kind_limit<T: DeserializeOwned>(
+    handle: HANDLE,
+    response: bool,
+) -> Result<T, FrameReadError> {
     let mut length = [0_u8; 4];
     read_exact_detailed(handle, &mut length, FrameReadPhase::Length)?;
     let length = u32::from_le_bytes(length) as usize;
@@ -1189,8 +1215,55 @@ pub fn read_frame_detailed<T: DeserializeOwned>(handle: HANDLE) -> Result<T, Fra
             detail: "Windows provider frame exceeds the protocol bound".to_owned(),
         });
     }
+    let mut prefix = [0_u8; memcordon_core::WINDOWS_RESPONSE_PREFIX_BYTES];
+    let prefix_length = if response {
+        length.min(prefix.len())
+    } else {
+        0
+    };
+    if response {
+        read_exact_detailed(
+            handle,
+            &mut prefix[..prefix_length],
+            FrameReadPhase::Payload,
+        )?;
+        let limit = memcordon_core::windows_response_frame_limit(&prefix[..prefix_length])
+            .map_err(|detail| FrameReadError {
+                phase: FrameReadPhase::Decode,
+                expected_bytes: length,
+                transferred_bytes: prefix_length,
+                native_code: None,
+                peer_closed: false,
+                detail: detail.to_owned(),
+            })?;
+        if length > limit {
+            return Err(FrameReadError {
+                phase: FrameReadPhase::Length,
+                expected_bytes: limit,
+                transferred_bytes: length,
+                native_code: None,
+                peer_closed: false,
+                detail: "diagnostic control frame exceeds its reserved bound".to_owned(),
+            });
+        }
+    }
     let mut payload = vec![0_u8; length];
-    read_exact_detailed(handle, &mut payload, FrameReadPhase::Payload)?;
+    payload[..prefix_length].copy_from_slice(&prefix[..prefix_length]);
+    read_exact_detailed(
+        handle,
+        &mut payload[prefix_length..],
+        FrameReadPhase::Payload,
+    )?;
+    memcordon_core::workload_contract::reject_duplicate_json_keys(&payload).map_err(|detail| {
+        FrameReadError {
+            phase: FrameReadPhase::Decode,
+            expected_bytes: length,
+            transferred_bytes: length,
+            native_code: None,
+            peer_closed: false,
+            detail,
+        }
+    })?;
     serde_json::from_slice(&payload).map_err(|error| FrameReadError {
         phase: FrameReadPhase::Decode,
         expected_bytes: length,

@@ -88,6 +88,8 @@ fn bound_preauthorization_rejection(
         nonce,
         request_sha256: record.request_sha256.clone(),
         rejection: ProviderRejectionEvidence {
+            workload_admission: None,
+            provider_failure: None,
             schema_version: 1,
             code: "MCSEALED-WINDOWS-PREAUTHORIZATION-ABORT".to_owned(),
             phase: BoundarySetupPhase::TargetCreation,
@@ -421,7 +423,13 @@ fn authenticated_record_roundtrip_preserves_terminalization_and_cleanup_facts() 
         creation_time_100ns: 7_171,
     };
     let mut record = WindowsDurableAttemptRecordV1 {
-        schema_version: 2,
+        schema_version: 3,
+        causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
+        diagnostic_retention: memcordon_core::DiagnosticRetentionV1::admitted_at(0).unwrap(),
+        record_revision: 1,
+        workload_admission: None,
+        workload_checkpoint: None,
+        provider_incarnation: crate::windows::record::digest(b"incarnation"),
         attempt_id: attempt_id.clone(),
         provider_generation: provider_generation.clone(),
         boot_identity: "cycle-7-boot".to_owned(),
@@ -475,7 +483,11 @@ fn authenticated_record_roundtrip_preserves_terminalization_and_cleanup_facts() 
 fn replay_pending_roundtrip_preserves_terminalization_disposition_and_binding() {
     let (attempt_id, nonce, request_sha256) = binding();
     let pending = WindowsReplayPendingV1 {
-        schema_version: 2,
+        schema_version: 3,
+        causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
+        provider_failure: None,
+        diagnostic_availability:
+            memcordon_core::DiagnosticProjectionAvailabilityV1::RecordUnavailable,
         attempt_id: attempt_id.clone(),
         nonce: nonce.clone(),
         request_sha256: request_sha256.clone(),

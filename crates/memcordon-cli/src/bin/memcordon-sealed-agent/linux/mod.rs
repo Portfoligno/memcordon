@@ -10,6 +10,7 @@ pub mod namespace;
 pub mod qualification;
 mod qualification_schema;
 pub mod recovery;
+pub mod runtime_manifest;
 pub mod service;
 pub mod startup;
 pub mod transport;

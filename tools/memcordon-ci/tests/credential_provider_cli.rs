@@ -7,9 +7,14 @@ use std::time::Duration;
 use memcordon_ci::command::CommandSpec;
 use memcordon_ci::config;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[path = "support/standard.rs"]
+mod standard_fixture;
+
 const PROVIDER_DEADLINE: Duration = Duration::from_secs(30);
+const FIXTURE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 fn provider_fixture() -> (TempDir, config::Release, Value) {
     let temporary = TempDir::new().expect("provider fixture directory should exist");
@@ -36,17 +41,25 @@ fn provider_fixture() -> (TempDir, config::Release, Value) {
                 "archive_sha256": checksum,
                 "canonical_tree_sha256": "cd".repeat(32),
                 "canonical_identity_sha256": "ef".repeat(32),
-                "vcs_commit": "0123456789abcdef",
+                "vcs_commit": FIXTURE_COMMIT,
             })
         })
         .collect();
-    let manifest = json!({
+    let mut manifest = json!({
         "schema_version": config::RELEASE_SCHEMA_VERSION,
+        "certification_contract": "standard-and-sealed-v1",
+        "certification_origin": {
+            "source_commit": FIXTURE_COMMIT,
+            "repository": "Portfoligno/memcordon",
+            "run_id": 123,
+            "workflow_commit": FIXTURE_COMMIT,
+            "workflow_ref": "Portfoligno/memcordon/.github/workflows/release.yml@refs/tags/0.5.2"
+        },
         "project": "memcordon",
         "tag": "0.5.2",
         "version": "0.5.2",
-        "source_commit": "0123456789abcdef",
-        "workflow_commit": "0123456789abcdef",
+        "source_commit": FIXTURE_COMMIT,
+        "workflow_commit": FIXTURE_COMMIT,
         "workflow_ref": "Portfoligno/memcordon/.github/workflows/release.yml@refs/tags/0.5.2",
         "workflow_sha256": "00".repeat(32),
         "action_revisions": {},
@@ -57,12 +70,122 @@ fn provider_fixture() -> (TempDir, config::Release, Value) {
         "certification": {},
         "source_date": "2026-01-01T00:00:00Z",
     });
+    write_certification_fixture(&output, &mut manifest);
     fs::write(
         output.join(&release.assets.manifest),
         serde_json::to_vec(&manifest).expect("manifest should encode"),
     )
     .expect("release manifest should write");
     (temporary, release, manifest)
+}
+
+// Synthetic transport evidence reaches the credential boundary without claiming
+// that this portable test executed native certification.
+fn write_certification_fixture(output: &Path, manifest: &mut Value) {
+    let origin = serde_json::from_value(manifest["certification_origin"].clone()).unwrap();
+    let mut records = serde_json::Map::new();
+    let mut write = |key: &str, path: &str, value: Value| {
+        let destination = output.join(path);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        let sha256: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        fs::write(destination, bytes).unwrap();
+        records.insert(
+            key.into(),
+            json!({ "evidence_path": path, "sha256": sha256 }),
+        );
+    };
+    for (key, path) in [
+        (
+            "linux-pid-namespace-cgroup-v2",
+            "certification/cleanup-leak-check.json",
+        ),
+        (
+            "windows-job-object-v2/x86_64-pc-windows-msvc",
+            "certification/windows-sealed-v2/x64-windows-release-certification.json",
+        ),
+        (
+            "windows-job-object-v2/aarch64-pc-windows-msvc",
+            "certification/windows-sealed-v2/arm64-windows-release-certification.json",
+        ),
+        (
+            "macos-watchdog",
+            "certification/backend-macos-watchdog.json",
+        ),
+    ] {
+        write(key, path, json!({}));
+    }
+    for name in [
+        "provider-package-verification.json",
+        "provider-qualification-v2.json",
+        "setid-transition.json",
+        "sudo-transition.json",
+        "file-capability-transition.json",
+        "caller-envelope.json",
+        "mount-context.json",
+        "fault-injection.json",
+    ] {
+        write(
+            &format!("linux-pid-namespace-cgroup-v2/{name}"),
+            &format!("certification/linux-sealed-v2/{name}"),
+            json!({}),
+        );
+    }
+    for contract in [
+        memcordon_ci::standard_contract::LINUX,
+        memcordon_ci::standard_contract::WINDOWS,
+    ] {
+        write(
+            contract.manifest_key,
+            contract.bundle_path,
+            serde_json::to_value(standard_fixture::report(contract, &origin)).unwrap(),
+        );
+    }
+    use memcordon_ci::workload_qualification::{QualificationArtifactV1, QualificationKind};
+    for (name, target, kind) in [
+        (
+            "linux-profile-qualification.json",
+            "x86_64-unknown-linux-gnu",
+            QualificationKind::Profile,
+        ),
+        (
+            "windows-x64-profile-qualification.json",
+            "x86_64-pc-windows-msvc",
+            QualificationKind::Profile,
+        ),
+        (
+            "windows-x64-causal-diagnostics.json",
+            "x86_64-pc-windows-msvc",
+            QualificationKind::CausalDiagnostics,
+        ),
+        (
+            "windows-arm64-profile-qualification.json",
+            "aarch64-pc-windows-msvc",
+            QualificationKind::Profile,
+        ),
+        (
+            "windows-arm64-causal-diagnostics.json",
+            "aarch64-pc-windows-msvc",
+            QualificationKind::CausalDiagnostics,
+        ),
+    ] {
+        write(
+            &format!("workload/{name}"),
+            &format!("certification/workload/{name}"),
+            serde_json::to_value(QualificationArtifactV1::after_observed_tests(
+                kind,
+                target,
+                &origin.source_commit,
+            ))
+            .unwrap(),
+        );
+    }
+    assert_eq!(records.len(), 19);
+    manifest["certification"] = Value::Object(records);
 }
 
 fn write_canonical_publication_fixture(root: &Path) {

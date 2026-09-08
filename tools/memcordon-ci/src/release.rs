@@ -25,7 +25,7 @@ use memcordon_ci::release_archive::{
     validate_memcordon_crate_distribution as validate_reviewed_memcordon_distribution,
 };
 use memcordon_ci::release_evidence::{CertificationRecord, collect_certification};
-use memcordon_ci::runtime_manifest::{RuntimeComponentRecord, RuntimeManifestV1, SealedRuntimeV1};
+use memcordon_ci::runtime_manifest::{RuntimeComponentRecord, RuntimeManifestV2, SealedRuntimeV2};
 #[cfg(target_os = "linux")]
 use memcordon_ci::sealed_identity::frontend_identity;
 #[cfg(any(target_os = "linux", test))]
@@ -229,6 +229,10 @@ struct AgentPackageInspection {
     source_commit: String,
     executable_sha256: String,
     provider_protocol: u32,
+    native_protocols: memcordon_core::runtime_manifest::NativeProviderProtocols,
+    runtime_manifest_schema: u32,
+    workload_contract_schema: u32,
+    profile_catalog_sha256: String,
     mechanism: String,
     execution_report_schema: u32,
     plan_report_schema: u32,
@@ -322,6 +326,8 @@ struct ReleaseManifest {
     assets: Vec<AssetRecord>,
     crates: Vec<CrateRecord>,
     certification: BTreeMap<String, CertificationRecord>,
+    certification_contract: String,
+    certification_origin: memcordon_ci::certification_context::ExpectedCertificationOrigin,
     source_date: String,
 }
 
@@ -1305,7 +1311,28 @@ fn validate_agent_package_inspection(
                 .all(valid_digest)
         }
     };
-    if inspection.schema_version != 4
+    let windows = matches!(
+        &inspection.platform,
+        AgentPackagePlatform::WindowsService { .. }
+    );
+    let expected_protocols = if windows {
+        memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
+            provider_contract: 3,
+            public_wire: 2,
+            private_wire: 2,
+        }
+    } else {
+        memcordon_core::runtime_manifest::NativeProviderProtocols::Linux {
+            provider_contract: 3,
+            launch_wire: 3,
+        }
+    };
+    if inspection.schema_version != 5
+        || inspection.native_protocols != expected_protocols
+        || inspection.runtime_manifest_schema != 2
+        || inspection.workload_contract_schema != 1
+        || inspection.profile_catalog_sha256
+            != memcordon_core::runtime_manifest::baseline_catalog_digest(windows)
         || inspection.version != expected_version
         || inspection.source_commit != expected_source_commit
         || inspection.execution_report_schema != memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION
@@ -1645,32 +1672,60 @@ fn runtime_manifest(
     identity: &ReleaseIdentity,
     target: &AssetTarget,
     components: Vec<RuntimeComponentRecord>,
-) -> RuntimeManifestV1 {
+) -> RuntimeManifestV2 {
     let sealed = match (target.sealed, target.rust_target.contains("windows")) {
-        (SealedAssetPolicy::Included, true) => SealedRuntimeV1::Included {
+        (SealedAssetPolicy::Included, true) => SealedRuntimeV2::Included {
+            diagnostic_qualification:
+                memcordon_core::runtime_manifest::diagnostic_qualification_reference(
+                    &target.rust_target,
+                ),
+            profile_qualification:
+                memcordon_core::runtime_manifest::profile_qualification_reference(
+                    &target.rust_target,
+                ),
             agent_component: "sealed-agent".to_owned(),
-            provider_protocol: 1,
+            native_protocols: memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
+                provider_contract: 3,
+                public_wire: 2,
+                private_wire: 2,
+            },
+            workload_contract_schema: 1,
+            profile_catalog_sha256: memcordon_core::runtime_manifest::baseline_catalog_digest(true),
+            profiles: vec!["windows-host-network-external-v1".into()],
             mechanism: "windows-job-object-v2".to_owned(),
             execution_report_schema: memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
             plan_report_schema: memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
             doctor_report_schema: memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
             qualification_schema: memcordon_core::WINDOWS_QUALIFICATION_SCHEMA_VERSION,
         },
-        (SealedAssetPolicy::Included, false) => SealedRuntimeV1::Included {
+        (SealedAssetPolicy::Included, false) => SealedRuntimeV2::Included {
+            diagnostic_qualification: None,
+            profile_qualification:
+                memcordon_core::runtime_manifest::profile_qualification_reference(
+                    &target.rust_target,
+                ),
             agent_component: "sealed-agent".to_owned(),
-            provider_protocol: 2,
+            native_protocols: memcordon_core::runtime_manifest::NativeProviderProtocols::Linux {
+                provider_contract: 3,
+                launch_wire: 3,
+            },
+            workload_contract_schema: 1,
+            profile_catalog_sha256: memcordon_core::runtime_manifest::baseline_catalog_digest(
+                false,
+            ),
+            profiles: vec!["linux-unix-create-v1".into()],
             mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
             execution_report_schema: memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
             plan_report_schema: memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
             doctor_report_schema: memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
-            qualification_schema: 2,
+            qualification_schema: 3,
         },
-        (SealedAssetPolicy::NotApplicable, _) => SealedRuntimeV1::NotApplicable {
+        (SealedAssetPolicy::NotApplicable, _) => SealedRuntimeV2::NotApplicable {
             reason: "the platform has no qualified packaged sealed provider".to_owned(),
         },
     };
-    RuntimeManifestV1 {
-        schema_version: 1,
+    RuntimeManifestV2 {
+        schema_version: 2,
         project: "memcordon".to_owned(),
         version: identity.version.to_string(),
         source_commit: identity.commit.clone(),
@@ -1900,7 +1955,7 @@ fn inspect_extract_and_smoke(
     if !manifest_bytes.ends_with(b"\n") {
         return Err(failure("runtime manifest is not newline terminated"));
     }
-    let manifest: RuntimeManifestV1 = serde_json::from_slice(&manifest_bytes)?;
+    let manifest = RuntimeManifestV2::parse(&manifest_bytes).map_err(failure)?;
     let mut components = Vec::new();
     for configured in &target.executable {
         let path = temporary.path().join(&top).join(&configured.archive_path);
@@ -2801,10 +2856,25 @@ fn assemble(root: &Path) -> Result<()> {
     fs::write(output.join(&release.assets.notes), notes)?;
     let (workflow_commit, workflow_ref, workflow_sha256, action_revisions) =
         workflow_provenance(root, &identity, &release)?;
+    let certification_origin = memcordon_ci::certification_context::ExpectedCertificationOrigin {
+        source_commit: identity.commit.clone(),
+        repository: required_platform_value("GITHUB_REPOSITORY")?,
+        run_id: required_platform_value("GITHUB_RUN_ID")?
+            .parse()
+            .map_err(|_| failure("invalid producer run id"))?,
+        workflow_ref: workflow_ref.clone(),
+        workflow_commit: workflow_commit.clone(),
+    };
     let certification = collect_certification(
         &root.join("target").join("ci").join("release-inputs"),
         &output,
-        &identity.commit,
+        &certification_origin,
+    )?;
+    verify_standard_producers(
+        &release,
+        &HttpEndpoints::production(),
+        &certification_origin,
+        |contract| memcordon_ci::release_evidence::read_report(&output.join(contract.bundle_path)),
     )?;
     let manifest = ReleaseManifest {
         schema_version: config::RELEASE_SCHEMA_VERSION,
@@ -2821,6 +2891,8 @@ fn assemble(root: &Path) -> Result<()> {
         assets,
         crates,
         certification,
+        certification_contract: "standard-and-sealed-v1".into(),
+        certification_origin,
         source_date: identity.source_date,
     };
     write_json(&output.join(&release.assets.manifest), &manifest)?;
@@ -2837,6 +2909,18 @@ fn bundle_manifest(root: &Path) -> Result<(config::Release, ReleaseManifest, Pat
         return Err(failure("release manifest schema identity is invalid"));
     }
     validate_manifest_crates(&release, &manifest)?;
+    if manifest.certification_contract != "standard-and-sealed-v1"
+        || manifest.certification_origin.source_commit != manifest.source_commit
+        || manifest.certification_origin.workflow_commit != manifest.workflow_commit
+        || manifest.certification_origin.workflow_ref != manifest.workflow_ref
+    {
+        return Err(failure("release certification contract or origin mismatch"));
+    }
+    memcordon_ci::release_evidence::validate_required_certification_records(
+        &manifest.certification,
+        &manifest.certification_origin,
+        |path| memcordon_ci::release_evidence::read_report(&output.join(path)),
+    )?;
     Ok((release, manifest, output))
 }
 
@@ -3122,6 +3206,54 @@ fn retry_github_read<T>(
             }
         }
     }
+}
+
+fn verify_standard_producers(
+    release: &config::Release,
+    endpoints: &HttpEndpoints,
+    origin: &memcordon_ci::certification_context::ExpectedCertificationOrigin,
+    mut read: impl FnMut(memcordon_ci::standard_contract::StandardContract) -> Result<Vec<u8>>,
+) -> Result<()> {
+    for contract in [
+        memcordon_ci::standard_contract::LINUX,
+        memcordon_ci::standard_contract::WINDOWS,
+    ] {
+        let report: memcordon_ci::standard_contract::StandardCertificationReportV3 =
+            serde_json::from_slice(&read(contract)?)?;
+        memcordon_ci::standard_contract::validate_report(
+            &report,
+            contract,
+            &origin.source_commit,
+            Some(origin),
+        )?;
+        let provenance = report
+            .provenance
+            .as_ref()
+            .ok_or_else(|| failure("hosted producer provenance absent"))?;
+        let url = format!(
+            "{}/repos/{}/actions/runs/{}/attempts/{}",
+            endpoints.github_api, origin.repository, origin.run_id, provenance.run_attempt
+        );
+        let run = github_json_request(release, endpoints, "GET", &url, None, None)?;
+        let jobs_url = format!("{url}/jobs?per_page=100");
+        let jobs = github_json_request(release, endpoints, "GET", &jobs_url, None, None)?;
+        let count = jobs
+            .get("total_count")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| failure("producer job count absent"))?;
+        if count > 100
+            || jobs
+                .get("jobs")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|jobs| jobs.len() as u64 != count)
+        {
+            return Err(failure(
+                "producer job metadata exceeds complete bounded inventory",
+            ));
+        }
+        memcordon_ci::producer_metadata::validate(origin, provenance, contract, &run, &jobs)?;
+    }
+    Ok(())
 }
 
 fn github_json_request(
@@ -5796,6 +5928,26 @@ fn verify_public(root: &Path) -> Result<()> {
         }
         static_paths.push(destination);
     }
+    memcordon_ci::release_evidence::validate_required_certification_records(
+        &manifest.certification,
+        &manifest.certification_origin,
+        |path| {
+            let name = Path::new(path)
+                .file_name()
+                .ok_or_else(|| failure("public certification has no filename"))?;
+            memcordon_ci::release_evidence::read_report(&public_downloads.path().join(name))
+        },
+    )?;
+    verify_standard_producers(
+        &release,
+        &endpoints,
+        &manifest.certification_origin,
+        |contract| {
+            memcordon_ci::release_evidence::read_report(
+                &public_downloads.path().join(contract.report_name),
+            )
+        },
+    )?;
     let public_assets = public_asset_records(&release, &remote, &static_paths, &manifest.assets)?;
     let identity = ReleaseIdentity {
         tag: manifest.tag.clone(),

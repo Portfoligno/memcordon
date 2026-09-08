@@ -7,6 +7,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod diagnostics;
+pub mod runtime_manifest;
+pub mod workload_codec;
+pub mod workload_contract;
+pub mod workload_discovery;
+pub mod workload_evidence;
+pub mod workload_limits;
+pub mod workload_registry;
+pub use diagnostics::*;
 mod error;
 mod outcome;
 mod policy;
@@ -101,7 +110,8 @@ pub use windows_sealed::{
     WindowsTerminalReceiptV1, WindowsTerminalReplayDecisionV1, WindowsTerminalRetiredV1,
     WindowsTerminalizationCheckpointV1, WindowsTerminalizationErrorStageV1,
     WindowsTerminalizationErrorV1, WindowsTerminalizationOwnerV1, WindowsTerminalizationStatusV1,
-    WindowsTokenMatrixEvidenceV1, WindowsTokenScenarioEvidenceV1, decode_windows_command_line,
+    WindowsTokenMatrixEvidenceV1, WindowsTokenScenarioEvidenceV1,
+    authenticate_decoded_windows_attempt_record, decode_windows_command_line,
     encode_windows_command_line, encode_windows_environment_block,
     parse_and_authenticate_windows_attempt_record,
     parse_windows_certification_frontend_handle_values, validate_windows_security_descriptor_text,

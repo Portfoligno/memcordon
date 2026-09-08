@@ -203,6 +203,7 @@ impl CommandSpec {
 
 #[derive(Clone, Debug)]
 pub struct Policy {
+    workload_contract: Option<crate::workload_contract::WorkloadContractV1>,
     pub memory: Option<ByteSize>,
     pub deadline: Option<DeadlinePolicy>,
     pub enforcement: Enforcement,
@@ -224,6 +225,7 @@ pub struct Policy {
 impl Policy {
     pub fn new(memory: ByteSize) -> Self {
         Self {
+            workload_contract: None,
             memory: Some(memory),
             deadline: None,
             enforcement: Enforcement::Auto,
@@ -240,6 +242,7 @@ impl Policy {
 
     pub fn unbounded() -> Self {
         Self {
+            workload_contract: None,
             memory: None,
             deadline: None,
             enforcement: Enforcement::Auto,
@@ -252,6 +255,19 @@ impl Policy {
             limit_grace: Duration::ZERO,
             swap: SwapPolicy::Bytes(ByteSize::from_bytes(0)),
         }
+    }
+
+    pub fn workload_contract(&self) -> Option<&crate::workload_contract::WorkloadContractV1> {
+        self.workload_contract.as_ref()
+    }
+
+    pub fn with_workload_contract(
+        mut self,
+        request: crate::workload_contract::WorkloadContractV1,
+    ) -> Result<Self, String> {
+        request.validate()?;
+        self.workload_contract = Some(request);
+        Ok(self)
     }
 
     pub fn with_deadline(mut self, duration: Duration) -> Result<Self, DeadlinePolicyError> {

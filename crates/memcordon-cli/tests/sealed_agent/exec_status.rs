@@ -9,6 +9,7 @@ use crate::linux::launch::{
 
 fn terminal(exec_status: TargetExecStatus, child_status: i32) -> TerminalFacts {
     TerminalFacts {
+        policy_enforcement: Default::default(),
         child_status,
         exec_status,
         spawn_error_reported: true,

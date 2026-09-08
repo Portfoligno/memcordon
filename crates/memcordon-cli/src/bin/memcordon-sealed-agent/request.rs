@@ -5,8 +5,8 @@ pub const MAX_ARGUMENTS: usize = 4096;
 pub const MAX_ENVIRONMENT_ENTRIES: usize = 8192;
 use sha2::{Digest, Sha256};
 
-pub const LAUNCH_REQUEST_VERSION: u16 = 2;
-pub const LAUNCH_BROKER_REQUEST_VERSION: u16 = 2;
+pub const LAUNCH_REQUEST_VERSION: u16 = 3;
+pub const LAUNCH_BROKER_REQUEST_VERSION: u16 = 3;
 const MAX_SUPPLEMENTARY_GROUPS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +45,8 @@ pub struct LaunchPolicyV2 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchRequestV2 {
+    pub restart_attempt: u64,
+    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContractV1>,
     pub program: Vec<u8>,
     pub arguments: Vec<Vec<u8>>,
     pub environment: Vec<(Vec<u8>, Vec<u8>)>,
@@ -197,6 +199,7 @@ pub fn encode_launch_request(request: &LaunchRequestV2) -> Result<Vec<u8>, Reque
     validate_request(request)?;
     let mut encoded = Vec::new();
     encoded.extend_from_slice(&LAUNCH_REQUEST_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&request.restart_attempt.to_be_bytes());
     put_bytes(&mut encoded, &request.program)?;
     put_count(&mut encoded, request.arguments.len())?;
     for argument in &request.arguments {
@@ -225,6 +228,18 @@ pub fn encode_launch_request(request: &LaunchRequestV2) -> Result<Vec<u8>, Reque
     encoded.extend_from_slice(&request.policy.limit_grace_millis.to_be_bytes());
     put_count(&mut encoded, request.descriptors.len())?;
     encoded.extend(request.descriptors.iter().map(|purpose| *purpose as u8));
+    match &request.workload_contract {
+        None => encoded.push(0),
+        Some(contract) => {
+            contract
+                .validate()
+                .map_err(|_| RequestCodecError::InvalidValue)?;
+            encoded.push(1);
+            let bytes =
+                serde_json::to_vec(contract).map_err(|_| RequestCodecError::InvalidValue)?;
+            put_bytes(&mut encoded, &bytes)?;
+        }
+    }
     Ok(encoded)
 }
 
@@ -234,6 +249,7 @@ pub fn decode_launch_request(payload: &[u8]) -> Result<LaunchRequestV2, RequestC
     if version != LAUNCH_REQUEST_VERSION {
         return Err(RequestCodecError::UnsupportedVersion(version));
     }
+    let restart_attempt = cursor.u64()?;
     let program = cursor.bytes()?;
     let argument_count = cursor.count()?;
     if argument_count > MAX_ARGUMENTS {
@@ -288,10 +304,20 @@ pub fn decode_launch_request(payload: &[u8]) -> Result<LaunchRequestV2, RequestC
             _ => return Err(RequestCodecError::InvalidValue),
         });
     }
+    let workload_contract = match cursor.u8()? {
+        0 => None,
+        1 => Some(
+            memcordon_core::workload_contract::WorkloadContractV1::parse(&cursor.bytes()?)
+                .map_err(|_| RequestCodecError::InvalidValue)?,
+        ),
+        _ => return Err(RequestCodecError::InvalidValue),
+    };
     if !cursor.is_empty() {
         return Err(RequestCodecError::TrailingBytes);
     }
     let request = LaunchRequestV2 {
+        restart_attempt,
+        workload_contract,
         program,
         arguments,
         environment,

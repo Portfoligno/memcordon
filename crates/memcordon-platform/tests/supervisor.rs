@@ -397,6 +397,8 @@ fn only_exact_retired_sealed_retry_deadline_rejection_is_outside_attempt() {
         errors: Vec::new(),
     };
     let rejection = ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-AUTHORIZATION".to_owned(),
         phase: BoundarySetupPhase::Authorization,
@@ -431,6 +433,7 @@ fn only_exact_retired_sealed_retry_deadline_rejection_is_outside_attempt() {
     supervision_policy.deadline =
         Some(DeadlinePolicy::new(Duration::from_secs(30), DeadlineScope::Supervision).unwrap());
     let retry = AttemptContext {
+        restart_attempt: 1,
         supervision_offset: Duration::from_secs(25),
         supervision_deadline_remaining: Some(Duration::from_secs(5)),
     };
@@ -443,6 +446,7 @@ fn only_exact_retired_sealed_retry_deadline_rejection_is_outside_attempt() {
     );
 
     let initial = AttemptContext {
+        restart_attempt: 0,
         supervision_offset: Duration::ZERO,
         supervision_deadline_remaining: None,
     };

@@ -4,7 +4,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 
-use memcordon_ci::release_evidence::{LINUX_SEALED_TESTS as LINUX_TESTS, collect_certification};
+use memcordon_ci::release_evidence::LINUX_SEALED_TESTS as LINUX_TESTS;
 use memcordon_core::{
     AttemptHistory, AttemptKind, AttemptPhase, AttemptRecord, BackendCapabilityReport,
     BoundaryCapability, BoundaryClass, BoundaryMechanismEvidence, BoundaryQualificationReport,
@@ -22,6 +22,82 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+fn origin(commit: &str) -> memcordon_ci::certification_context::ExpectedCertificationOrigin {
+    memcordon_ci::certification_context::ExpectedCertificationOrigin {
+        source_commit: commit.into(),
+        repository: "Portfoligno/memcordon".into(),
+        run_id: 123.try_into().unwrap(),
+        workflow_ref: "Portfoligno/memcordon/.github/workflows/release.yml@refs/heads/main".into(),
+        workflow_commit: COMMIT.into(),
+    }
+}
+
+fn collect_certification(
+    input: &Path,
+    output: &Path,
+    commit: &str,
+) -> memcordon_ci::Result<
+    std::collections::BTreeMap<String, memcordon_ci::release_evidence::CertificationRecord>,
+> {
+    memcordon_ci::release_evidence::collect_certification(input, output, &origin(commit))
+}
+
+fn standard_report(contract: memcordon_ci::standard_contract::StandardContract) -> Value {
+    use memcordon_ci::standard_contract::{
+        StandardCertificationReportV3, StandardRuntimeEvidence, StandardTarget,
+    };
+    let linux = contract.target == StandardTarget::LinuxX64;
+    let expected = origin(COMMIT);
+    let report = StandardCertificationReportV3 {
+        schema: 3,
+        contract_id: contract.contract_id.into(),
+        contract_sha256: contract.digest().unwrap(),
+        boundary: BoundaryRequirement::Standard,
+        backend: contract.backend_name.into(),
+        target: contract.rust_target.into(),
+        certified: true,
+        commit: COMMIT.into(),
+        runner_class: "ephemeral-certified".into(),
+        runner_provider: "github-hosted".into(),
+        runner_label: contract.runner_label.into(),
+        provenance: Some(
+            memcordon_ci::certification_context::CertificationProvenance {
+                repository: expected.repository,
+                run_id: expected.run_id,
+                run_attempt: 1.try_into().unwrap(),
+                job: contract.release_job.into(),
+                workflow_ref: expected.workflow_ref,
+                workflow_commit: expected.workflow_commit,
+                runner_environment: "github-hosted".into(),
+                runner_os: if linux { "Linux" } else { "Windows" }.into(),
+                runner_arch: "X64".into(),
+            },
+        ),
+        runtime: if linux {
+            StandardRuntimeEvidence::Linux {
+                unified_cgroup_v2: true,
+                delegated_boundary: true,
+                memory_controller: true,
+                memory_max_round_trip: true,
+                memory_swap_max: true,
+                cgroup_kill: true,
+            }
+        } else {
+            StandardRuntimeEvidence::Windows {
+                job_memory_limit: true,
+                kill_on_close: true,
+                suspended_assignment: true,
+                nested_job: true,
+                completion_port: true,
+            }
+        },
+        tests: contract.results(),
+        tests_run: if linux { 23 } else { 17 },
+        tests_skipped: 0,
+    };
+    serde_json::to_value(report).unwrap()
+}
 
 type ReportMutation = fn(&mut Value);
 
@@ -156,6 +232,7 @@ fn public_launch_report() -> Value {
         cleanup,
     };
     let attempt = AttemptRecord {
+        policy_enforcement: Default::default(),
         number: 1,
         kind: AttemptKind::Initial,
         phase: AttemptPhase::Completed,
@@ -248,7 +325,7 @@ fn public_launch_report() -> Value {
         1,
     )
     .expect("public launch execution should be valid");
-    let report = MemcordonReport::schema8(
+    let report = MemcordonReport::schema9(
         ToolReport {
             name: "memcordon".to_owned(),
             version: "test".to_owned(),
@@ -265,6 +342,7 @@ fn public_launch_report() -> Value {
         },
         PolicyEnvelopeReport {
             requested: RequestedPolicyReport {
+                workload: Default::default(),
                 boundary: BoundaryRequirement::Sealed,
                 memory: None,
                 deadline: Some(DeadlinePolicyReport {
@@ -287,6 +365,7 @@ fn public_launch_report() -> Value {
                 },
             },
             effective: EffectivePolicyReport {
+                workload: memcordon_core::workload_evidence::WorkloadResolutionReportV1::unresolved(None, memcordon_core::workload_evidence::BaselineRestrictionObservationV1::UnmanagedStandardBackend),
                 boundary: BoundaryClass::Sealed,
                 memory: None,
                 deadline: Some(DeadlinePolicyReport {
@@ -843,7 +922,14 @@ fn windows_package_inspection() -> Value {
 
 fn windows_package_inspection_v4() -> Value {
     let mut package = windows_package_inspection();
-    package["schema_version"] = json!(4);
+    package["schema_version"] = json!(5);
+    package["native_protocols"] =
+        json!({"platform":"windows","provider_contract":3,"public_wire":2,"private_wire":2});
+    package["runtime_manifest_schema"] = json!(2);
+    package["workload_contract_schema"] = json!(1);
+    package["profile_catalog_sha256"] = json!(
+        memcordon_core::runtime_manifest::baseline_catalog_digest(true)
+    );
     package["target_desktop_bootstrap_runtime"] = json!("static-vc-runtime-os-ucrt");
     package["target_desktop_bootstrap_normal_imports"] =
         json!(["API-MS-WIN-CRT-RUNTIME-L1-1-0.dll"]);
@@ -909,6 +995,16 @@ fn write_windows_artifact(
         "aarch64" => "aarch64-pc-windows-msvc",
         _ => panic!("unsupported Windows fixture architecture"),
     };
+    for (_, name, target, kind) in memcordon_ci::workload_qualification::ARTIFACTS {
+        if target == native_target {
+            let path = evidence.join(name);
+            write_report(&path,&serde_json::to_value(memcordon_ci::workload_qualification::QualificationArtifactV1::after_observed_tests(kind,target,COMMIT)).unwrap());
+            bindings.insert(
+                name.into(),
+                Value::String(hex::encode(Sha256::digest(fs::read(path).unwrap()))),
+            );
+        }
+    }
     write_report(
         &directory.join("windows-release-certification.json"),
         &json!({
@@ -941,11 +1037,8 @@ fn write_legacy_windows_artifact(
     let qualification = windows_qualification();
     let qualification_value =
         serde_json::to_value(&qualification).expect("Windows qualification should serialize");
-    let package = if package_schema_v4 {
-        windows_package_inspection_v4()
-    } else {
-        windows_package_inspection()
-    };
+    let _ = package_schema_v4;
+    let package = windows_package_inspection_v4();
     let installed_schema_version = package["schema_version"].clone();
     write_report(&directory.join("windows-package-inspection.json"), &package);
     write_report(
@@ -957,7 +1050,10 @@ fn write_legacy_windows_artifact(
             "installed_artifacts_valid": true,
             "provider_identity": format!("memcordon-sealed-agent-windows-v1:{}", env!("CARGO_PKG_VERSION")),
             "provider_reachable": true,
-            "qualification_complete": true
+            "qualification_complete": true,
+            "policy": {"state":"unconfigured"},
+            "profile_qualification": memcordon_core::runtime_manifest::profile_qualification_reference(if architecture == "aarch64" {"aarch64-pc-windows-msvc"} else {"x86_64-pc-windows-msvc"}),
+            "diagnostic_qualification": memcordon_core::runtime_manifest::diagnostic_qualification_reference(if architecture == "aarch64" {"aarch64-pc-windows-msvc"} else {"x86_64-pc-windows-msvc"})
         }),
     );
     write_report(
@@ -1104,6 +1200,17 @@ fn fixture() -> (TempDir, Value, Value, Value) {
     let temporary = TempDir::new().expect("temporary directory should exist");
     let input = temporary.path().join("input");
     fs::create_dir_all(&input).expect("input directory should exist");
+    for contract in [
+        memcordon_ci::standard_contract::LINUX,
+        memcordon_ci::standard_contract::WINDOWS,
+    ] {
+        write_report(
+            &input
+                .join(contract.release_artifact)
+                .join(contract.report_name),
+            &standard_report(contract),
+        );
+    }
     let linux = linux_report();
     let windows = windows_report("x86_64", "windows-2025", &windows_qualification());
     let macos = macos_report();
@@ -1164,7 +1271,26 @@ fn fixture() -> (TempDir, Value, Value, Value) {
     }
     write_report(
         &input.join("release-certification-linux/provider-qualification-v2.json"),
-        &qualification,
+        &{
+            qualification["schema_version"] = json!(3);
+            qualification["workload_profile"] = serde_json::to_value(
+                memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference(),
+            )
+            .unwrap();
+            qualification["workload_profile_probe_verified"] = json!(true);
+            qualification
+        },
+    );
+    write_report(
+        &input.join("release-certification-linux/linux-profile-qualification.json"),
+        &serde_json::to_value(
+            memcordon_ci::workload_qualification::QualificationArtifactV1::after_observed_tests(
+                memcordon_ci::workload_qualification::QualificationKind::Profile,
+                "x86_64-unknown-linux-gnu",
+                COMMIT,
+            ),
+        )
+        .unwrap(),
     );
     let fault_selectors = [
         (
@@ -1455,7 +1581,7 @@ fn valid_reports_are_copied_and_digest_bound() {
     let records = collect_certification(&input, &output, COMMIT)
         .expect("valid certification reports should collect");
 
-    assert_eq!(records.len(), 12);
+    assert_eq!(records.len(), 19);
     for (backend, report_name) in [
         ("linux-pid-namespace-cgroup-v2", "cleanup-leak-check.json"),
         ("macos-watchdog", "backend-macos-watchdog.json"),
@@ -2588,8 +2714,8 @@ fn promoted_linux_inventory_is_exact_and_failure_inventory_is_not_releasable() {
         fs::read_dir(&successful_linux)
             .expect("successful Linux inventory should be readable")
             .count(),
-        9,
-        "successful Linux release inventory must contain exactly nine files"
+        10,
+        "successful Linux release inventory must contain exactly ten files"
     );
 
     for name in ["provider-package-verification.json", "caller-envelope.json"] {

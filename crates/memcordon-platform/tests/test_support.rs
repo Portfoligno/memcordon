@@ -44,6 +44,7 @@ fn sealed_attempt_deadline_uses_the_full_budget_for_each_attempt() {
     policy.deadline =
         Some(DeadlinePolicy::new(Duration::from_secs(30), DeadlineScope::Attempt).unwrap());
     let context = AttemptContext {
+        restart_attempt: 0,
         supervision_offset: Duration::from_secs(25),
         supervision_deadline_remaining: Some(Duration::from_secs(5)),
     };
@@ -65,14 +66,17 @@ fn sealed_supervision_retry_uses_only_the_remaining_budget() {
     policy.deadline =
         Some(DeadlinePolicy::new(Duration::from_secs(30), DeadlineScope::Supervision).unwrap());
     let initial = AttemptContext {
+        restart_attempt: 0,
         supervision_offset: Duration::ZERO,
         supervision_deadline_remaining: None,
     };
     let retry = AttemptContext {
+        restart_attempt: 1,
         supervision_offset: Duration::from_secs(25),
         supervision_deadline_remaining: Some(Duration::from_secs(5)),
     };
     let expired_retry = AttemptContext {
+        restart_attempt: 2,
         supervision_offset: Duration::from_secs(30),
         supervision_deadline_remaining: Some(Duration::ZERO),
     };

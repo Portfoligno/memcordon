@@ -572,7 +572,7 @@ fn acknowledge_and_confirm_terminal_retirement(
             terminal_response_sha256: terminal_response_sha256.to_owned(),
         },
     )?;
-    match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe)? {
+    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe)? {
         WindowsProviderResponseV1::TerminalRetired(retired)
             if retired.is_consistent_for(
                 attempt_id,
@@ -881,7 +881,7 @@ impl QualificationAdmission {
                 "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-admission-begin-write endpoint={WINDOWS_CONTROL_PIPE} detail={detail}"
             )
         })?;
-        match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw()).map_err(|detail| {
+        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw()).map_err(|detail| {
             format!(
                 "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-admission-begin-read endpoint={WINDOWS_CONTROL_PIPE} detail={detail}"
             )
@@ -932,7 +932,7 @@ impl QualificationAdmission {
                 "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-admission-acquire-write endpoint={WINDOWS_CONTROL_PIPE} detail={detail}"
             )
         })?;
-        match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw()).map_err(|detail| {
+        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw()).map_err(|detail| {
             format!(
                 "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-admission-acquire-read endpoint={WINDOWS_CONTROL_PIPE} detail={detail}"
             )
@@ -966,7 +966,7 @@ impl QualificationAdmission {
                 child_process_identity: super::process::process_identity(child_process)?,
             },
         )?;
-        match super::pipe::read_frame::<WindowsProviderResponseV1>(self.pipe.raw())? {
+        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(self.pipe.raw())? {
             WindowsProviderResponseV1::QualificationChildAuthorized { schema_version }
                 if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
             {
@@ -983,7 +983,7 @@ impl QualificationAdmission {
                 schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
             },
         )?;
-        match super::pipe::read_frame::<WindowsProviderResponseV1>(self.pipe.raw())? {
+        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(self.pipe.raw())? {
             WindowsProviderResponseV1::QualificationEnded { schema_version }
                 if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
             {
@@ -1070,7 +1070,8 @@ pub fn probe() -> Result<WindowsQualificationReceiptV1, String> {
             schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
         },
     )?;
-    match super::pipe::read_frame::<memcordon_core::WindowsProviderResponseV1>(pipe.raw())? {
+    match super::pipe::read_response_frame::<memcordon_core::WindowsProviderResponseV1>(pipe.raw())?
+    {
         memcordon_core::WindowsProviderResponseV1::Probe { qualification, .. }
             if qualification.qualified && qualification.is_consistent() =>
         {
@@ -1414,6 +1415,9 @@ fn preauthorization_fault_matrix() -> Result<(), String> {
         let _marker_cleanup = RemoveFileGuard(marker.clone());
         let request = WindowsLaunchRequestV1 {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            expected_provider_binding: super::package::installed_public_provider_binding()?,
+            workload_contract: None,
+            restart_attempt: 0,
             nonce: format!(
                 "qualification-fault-{}-{}-{}",
                 std::process::id(),
@@ -1508,7 +1512,8 @@ fn terminal_frame_truncation_canary() -> Result<bool, String> {
         }
         Ok(())
     });
-    let rejected = super::pipe::read_frame::<WindowsProviderResponseV1>(reader.raw()).is_err();
+    let rejected =
+        super::pipe::read_response_frame::<WindowsProviderResponseV1>(reader.raw()).is_err();
     writer_thread
         .join()
         .map_err(|_| "terminal-frame writer panicked".to_owned())??;
@@ -1535,6 +1540,9 @@ fn retirement_fault_matrix() -> Result<(), String> {
         let _marker_cleanup = RemoveFileGuard(marker.clone());
         let request = WindowsLaunchRequestV1 {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            expected_provider_binding: super::package::installed_public_provider_binding()?,
+            workload_contract: None,
+            restart_attempt: 0,
             nonce: format!(
                 "qualification-retirement-fault-{}-{}-{}",
                 std::process::id(),
@@ -1652,7 +1660,7 @@ fn run_certification_fault(
     let mut relay_retired_event = None;
     let mut authorized = false;
     loop {
-        match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw())? {
+        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
             WindowsProviderResponseV1::StreamsPrepared {
                 schema_version,
                 attempt_id: received,
@@ -1884,6 +1892,9 @@ pub fn frontend_loss_client(release_marker: &std::ffi::OsStr) -> Result<(), Stri
     let executable = crate::windows::package::installed_binary();
     let request = WindowsLaunchRequestV1 {
         schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        expected_provider_binding: super::package::installed_public_provider_binding()?,
+        workload_contract: None,
+        restart_attempt: 0,
         nonce: format!("frontend-loss-{}", std::process::id()),
         command: NativeWindowsCommandV1 {
             program: executable.as_os_str().encode_wide().collect(),
@@ -1912,7 +1923,7 @@ pub fn frontend_loss_client(release_marker: &std::ffi::OsStr) -> Result<(), Stri
     let mut relay_retired_event = None;
     let mut active_attempt_id = None;
     loop {
-        match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw())? {
+        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
             WindowsProviderResponseV1::StreamsPrepared {
                 attempt_id,
                 schema_version,
@@ -2009,6 +2020,9 @@ pub fn authority_loss_client(
     let executable = crate::windows::package::installed_binary();
     let request = WindowsLaunchRequestV1 {
         schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        expected_provider_binding: super::package::installed_public_provider_binding()?,
+        workload_contract: None,
+        restart_attempt: 0,
         nonce: format!(
             "authority-{}-{}",
             std::process::id(),
@@ -2065,31 +2079,31 @@ pub fn authority_loss_client(
     let mut stream_handles = Vec::new();
     let mut relay_event = None;
     loop {
-        let response = match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw()) {
-            Ok(response) => response,
-            Err(_)
-                if fault == WindowsSealedFault::ControlWorkerKilledAfterAuthorization
-                    && std::path::Path::new(marker).is_file() =>
-            {
-                let worker_lost =
-                    std::path::Path::new(marker).with_extension("control-worker-lost");
-                let release = std::path::Path::new(marker).with_extension("frontend-release");
-                std::fs::write(&worker_lost, b"control worker retired\n")
-                    .map_err(|error| error.to_string())?;
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                while !release.is_file() {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(
-                            "control-worker fixture did not receive frontend release".to_owned()
-                        );
+        let response =
+            match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw()) {
+                Ok(response) => response,
+                Err(_)
+                    if fault == WindowsSealedFault::ControlWorkerKilledAfterAuthorization
+                        && std::path::Path::new(marker).is_file() =>
+                {
+                    let worker_lost =
+                        std::path::Path::new(marker).with_extension("control-worker-lost");
+                    let release = std::path::Path::new(marker).with_extension("frontend-release");
+                    std::fs::write(&worker_lost, b"control worker retired\n")
+                        .map_err(|error| error.to_string())?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while !release.is_file() {
+                        if std::time::Instant::now() >= deadline {
+                            return Err("control-worker fixture did not receive frontend release"
+                                .to_owned());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            Err(_) if std::path::Path::new(marker).is_file() => return Ok(()),
-            Err(error) => return Err(error),
-        };
+                Err(_) if std::path::Path::new(marker).is_file() => return Ok(()),
+                Err(error) => return Err(error),
+            };
         match response {
             WindowsProviderResponseV1::StreamsPrepared {
                 schema_version,
@@ -2465,6 +2479,9 @@ fn run_provider_mutant(
     };
     let request = WindowsLaunchRequestV1 {
         schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        expected_provider_binding: super::package::installed_public_provider_binding()?,
+        workload_contract: None,
+        restart_attempt: 0,
         nonce: format!("mutant-{}-{}", std::process::id(), now.as_nanos()),
         command: NativeWindowsCommandV1 {
             program: executable.as_os_str().encode_wide().collect(),
@@ -2522,7 +2539,7 @@ fn run_provider_mutant(
     let mut hook_observation = None;
     let mut hook_process = None;
     loop {
-        match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw())? {
+        match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
             WindowsProviderResponseV1::CertificationMutantHookObserved(receipt) => {
                 let remote = receipt.remote_observation_handle.ok_or_else(|| {
                     "mutant hook omitted its query-only process handle".to_owned()
@@ -2938,6 +2955,9 @@ pub fn recursive_mutant_target(marker: &std::ffi::OsStr) -> Result<(), String> {
     let executable = crate::windows::package::installed_binary();
     let request = WindowsLaunchRequestV1 {
         schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        expected_provider_binding: super::package::installed_public_provider_binding()?,
+        workload_contract: None,
+        restart_attempt: 0,
         nonce: format!("recursive-mutant-{}", std::process::id()),
         command: NativeWindowsCommandV1 {
             program: executable.as_os_str().encode_wide().collect(),
@@ -2981,7 +3001,7 @@ pub fn recursive_mutant_target(marker: &std::ffi::OsStr) -> Result<(), String> {
             launch: request,
         },
     )?;
-    match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw())? {
+    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
         WindowsProviderResponseV1::StreamsPrepared {
             schema_version,
             attempt_id: returned_attempt,
@@ -3078,7 +3098,7 @@ fn certify_machine_restart_through_provider() -> Result<bool, String> {
             schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
         },
     )?;
-    match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw())? {
+    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
         WindowsProviderResponseV1::CertificationMachineRestart {
             schema_version,
             recovered,
@@ -3175,6 +3195,9 @@ pub fn appcontainer_rejection_client() -> Result<(), String> {
     let executable = crate::windows::package::installed_binary();
     let request = WindowsLaunchRequestV1 {
         schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        expected_provider_binding: super::package::installed_public_provider_binding()?,
+        workload_contract: None,
+        restart_attempt: 0,
         nonce: format!("appcontainer-rejection-{}", std::process::id()),
         command: NativeWindowsCommandV1 {
             program: executable.as_os_str().encode_wide().collect(),
@@ -3196,7 +3219,7 @@ pub fn appcontainer_rejection_client() -> Result<(), String> {
         },
     };
     super::pipe::write_frame(pipe.raw(), &WindowsProviderRequestV1::Launch(request))?;
-    match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw())? {
+    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
         WindowsProviderResponseV1::Reject { rejection, .. }
             if rejection.code == "MCSEALED-WINDOWS-APPCONTAINER-UNSUPPORTED"
                 && !rejection.target_created
@@ -3385,6 +3408,9 @@ fn native_public_canary(
     }));
     let request = WindowsLaunchRequestV1 {
         schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        expected_provider_binding: super::package::installed_public_provider_binding()?,
+        workload_contract: None,
+        restart_attempt: 0,
         nonce,
         command: NativeWindowsCommandV1 {
             program: executable.as_os_str().encode_wide().collect(),
@@ -3434,7 +3460,8 @@ fn native_public_canary(
                     .expect("active replay retains its original trigger"),
             )?
         } else {
-            match super::pipe::read_frame_detailed::<WindowsProviderResponseV1>(pipe.raw()) {
+            match super::pipe::read_response_frame_detailed::<WindowsProviderResponseV1>(pipe.raw())
+            {
                 Ok(response) => response,
                 Err(error) => {
                     let failure = qualification_public_frame_failure(&error);
@@ -3908,7 +3935,7 @@ fn read_qualification_replay_response(
         }
         match super::pipe::frame_available_detailed(pipe) {
             Ok(true) => {
-                return super::pipe::read_frame_detailed(pipe).map_err(|secondary| {
+                return super::pipe::read_response_frame_detailed(pipe).map_err(|secondary| {
                     format!(
                         "{primary}; secondary qualification terminal replay read failure: {secondary}"
                     )
@@ -4033,6 +4060,8 @@ fn invalid_native_response(
 fn provider_response_variant(response: &WindowsProviderResponseV1) -> &'static str {
     match response {
         WindowsProviderResponseV1::Probe { .. } => "probe",
+        WindowsProviderResponseV1::WorkloadPlan { .. } => "workload-plan",
+        WindowsProviderResponseV1::WorkloadDiscovery { .. } => "workload-discovery",
         WindowsProviderResponseV1::StreamsPrepared { .. } => "streams-prepared",
         WindowsProviderResponseV1::RecoveryStatus { .. } => "recovery-status",
         WindowsProviderResponseV1::PackageCleanupResult { .. } => "package-cleanup-result",
@@ -5673,6 +5702,9 @@ fn recursive_provider_canary() -> Result<(), String> {
     let executable = crate::windows::package::installed_binary();
     let request = WindowsLaunchRequestV1 {
         schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        expected_provider_binding: super::package::installed_public_provider_binding()?,
+        workload_contract: None,
+        restart_attempt: 0,
         nonce: format!("recursive-{}", std::process::id()),
         command: NativeWindowsCommandV1 {
             program: executable.as_os_str().encode_wide().collect(),
@@ -5697,7 +5729,7 @@ fn recursive_provider_canary() -> Result<(), String> {
     let request_sha256 =
         super::record::digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
     super::pipe::write_frame(pipe.raw(), &WindowsProviderRequestV1::Launch(request))?;
-    match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw())? {
+    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
         WindowsProviderResponseV1::Reject {
             schema_version,
             attempt_id,
@@ -6446,7 +6478,7 @@ pub fn recovery_status() -> Result<bool, String> {
             challenge: challenge.clone(),
         },
     )?;
-    match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw())? {
+    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
         WindowsProviderResponseV1::RecoveryStatus {
             schema_version,
             challenge: returned_challenge,
@@ -6485,7 +6517,7 @@ pub fn prepare_package_cleanup(
             deadline_millis,
         },
     )?;
-    match super::pipe::read_frame::<WindowsProviderResponseV1>(pipe.raw())? {
+    match super::pipe::read_response_frame::<WindowsProviderResponseV1>(pipe.raw())? {
         WindowsProviderResponseV1::PackageCleanupResult {
             schema_version,
             challenge: returned_challenge,

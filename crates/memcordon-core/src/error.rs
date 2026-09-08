@@ -43,6 +43,10 @@ pub struct BoundarySetupFailure {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderRejectionEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_admission: Option<crate::workload_evidence::WorkloadAdmissionRejectionV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
     pub schema_version: u32,
     pub code: String,
     pub phase: BoundarySetupPhase,
@@ -71,6 +75,15 @@ impl ProviderRejectionEvidence {
         const MAX_CLEANUP_ERRORS: usize = 16;
         const MAX_CLEANUP_ERROR_BYTES: usize = 1024;
         self.schema_version == 1
+            && self.workload_admission.as_ref().is_none_or(|admission| {
+                !self.target_released
+                    && admission.request.authorization.approved_plan_digest
+                        == admission.request.workload_plan_digest
+            })
+            && self.provider_failure.as_ref().is_none_or(|projection| {
+                projection.is_consistent()
+                    && projection.canonical_digest() == projection.projection_sha256
+            })
             && !self.code.is_empty()
             && self.code.len() <= MAX_CODE_BYTES
             && self
@@ -147,6 +160,7 @@ pub enum ErrorCategory {
 #[derive(Clone, Debug, Error)]
 #[error("{message} ({code})")]
 pub struct Error {
+    pub policy_enforcement: Option<crate::workload_evidence::AttemptPolicyEnforcementV1>,
     pub category: ErrorCategory,
     pub code: &'static str,
     pub message: String,
@@ -164,6 +178,7 @@ pub struct Error {
     pub initial_spawn_failure: Option<InitialSpawnFailure>,
     pub boundary_setup_failure: Option<BoundarySetupFailure>,
     pub provider_rejection: Option<ProviderRejectionEvidence>,
+    pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
 }
 
 impl Error {
@@ -186,11 +201,22 @@ impl Error {
             initial_spawn_failure: None,
             boundary_setup_failure: None,
             provider_rejection: None,
+            provider_failure: None,
+            policy_enforcement: None,
         }
     }
 
     pub fn with_os_error(mut self, error: &std::io::Error) -> Self {
         self.os_code = error.raw_os_error();
+        self
+    }
+
+    /// The caller must establish the provider transport and exact attempt binding first.
+    pub fn with_provider_failure(
+        mut self,
+        failure: crate::ValidatedProviderFailureDiagnosticV1,
+    ) -> Self {
+        self.provider_failure = Some(failure.into_projection());
         self
     }
 
@@ -216,6 +242,18 @@ impl Error {
     }
 
     pub fn with_provider_rejection(mut self, rejection: ProviderRejectionEvidence) -> Self {
+        if let Some(admission) = rejection
+            .workload_admission
+            .as_ref()
+            .filter(|_| rejection.is_consistent())
+        {
+            self.policy_enforcement = Some(
+                crate::workload_evidence::AttemptPolicyEnforcementV1::NotAuthorized {
+                    request: admission.request.clone(),
+                    rejection: admission.rejection.clone(),
+                },
+            );
+        }
         self.os_code = rejection.os_code;
         self.target_released = rejection.target_released;
         self.restart_safety = Some(rejection.restart_safety.clone());

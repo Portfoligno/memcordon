@@ -38,6 +38,7 @@ const DEADLINE_STATUS: u32 = 0xC000_0102;
 const GUARDIAN_STARTUP_TIMEOUT_MILLIS: u32 = 10_000;
 
 struct LaunchAttemptError {
+    workload_admission: Option<memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1>,
     code: &'static str,
     detail: String,
     os_code: Option<i32>,
@@ -59,11 +60,150 @@ impl From<String> for LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            workload_admission: None,
         }
+        .captured()
+    }
+}
+
+impl From<super::job::JobObservationError> for LaunchAttemptError {
+    fn from(error: super::job::JobObservationError) -> Self {
+        use memcordon_core::FailureOperationV1;
+        let code = match error.operation {
+            FailureOperationV1::QueryJobProcessIds => "MCSEALED-WINDOWS-JOB-PROCESS-IDS",
+            FailureOperationV1::QueryPeakMemory => "MCSEALED-WINDOWS-JOB-PEAK-MEMORY",
+            FailureOperationV1::ReadJobNotification => "MCSEALED-WINDOWS-JOB-NOTIFICATION",
+            FailureOperationV1::ResumeTarget => "MCSEALED-WINDOWS-TARGET-RESUME",
+            FailureOperationV1::PollTarget => "MCSEALED-WINDOWS-TARGET-POLL",
+            FailureOperationV1::ReadTargetExit => "MCSEALED-WINDOWS-TARGET-EXIT",
+            _ => "MCSEALED-WINDOWS-JOB-QUERY",
+        };
+        let os_code = error.source.raw_os_error();
+        let failure = Self {
+            code,
+            detail: error.to_string(),
+            os_code,
+            phase: Some(memcordon_core::BoundarySetupPhase::Monitoring),
+            connection_must_close: false,
+            mutant_observation: None,
+            loader_qualification: None,
+            terminal_candidate: None,
+            workload_admission: None,
+        };
+        let mut observation = failure.observation();
+        observation.operation = error.operation;
+        observation.native_code = os_code.map(|code| {
+            memcordon_core::NativeFailureCodeV1::Win32(u32::from_ne_bytes(code.to_ne_bytes()))
+        });
+        super::diagnostics::capture(observation);
+        failure
     }
 }
 
 impl LaunchAttemptError {
+    fn captured(self) -> Self {
+        super::diagnostics::capture(self.observation());
+        self
+    }
+    fn observation(&self) -> memcordon_core::CausalEventV1 {
+        use memcordon_core::{
+            AttemptObservationPhaseV1 as Phase, FailureCategoryV1 as Category,
+            FailureCodeV1 as Code, FailureOperationV1 as Operation,
+        };
+        let (category, operation, code, phase, native_known) = match self.code {
+            "MCSEALED-WINDOWS-TARGET-RESUME" => (
+                Category::Launch,
+                Operation::ResumeTarget,
+                Code::TargetResume,
+                Phase::ResumeAttempted,
+                true,
+            ),
+            "MCSEALED-WINDOWS-TARGET-POLL" => (
+                Category::Monitor,
+                Operation::PollTarget,
+                Code::TargetQuery,
+                Phase::Monitoring,
+                true,
+            ),
+            "MCSEALED-WINDOWS-TARGET-EXIT" => (
+                Category::Monitor,
+                Operation::ReadTargetExit,
+                Code::TargetQuery,
+                Phase::Monitoring,
+                true,
+            ),
+            "MCSEALED-WINDOWS-GUARDIAN-BOOTSTRAP" | "MCSEALED-WINDOWS-GUARDIAN-STARTUP" => (
+                Category::Launch,
+                Operation::StartGuardian,
+                Code::GuardianLoss,
+                Phase::BeforeAuthorization,
+                true,
+            ),
+            "MCSEALED-WINDOWS-JOB-PROCESS-IDS" => (
+                Category::Monitor,
+                Operation::QueryJobProcessIds,
+                Code::JobQuery,
+                Phase::Monitoring,
+                true,
+            ),
+            "MCSEALED-WINDOWS-JOB-PEAK-MEMORY" => (
+                Category::Monitor,
+                Operation::QueryPeakMemory,
+                Code::JobQuery,
+                Phase::Monitoring,
+                true,
+            ),
+            "MCSEALED-WINDOWS-JOB-NOTIFICATION" => (
+                Category::Monitor,
+                Operation::ReadJobNotification,
+                Code::JobQuery,
+                Phase::Monitoring,
+                true,
+            ),
+            "MCSEALED-WINDOWS-PROCESS-INVENTORY" => (
+                Category::Monitor,
+                Operation::ObserveProcessIdentity,
+                Code::ProcessInventoryObservation,
+                Phase::Monitoring,
+                true,
+            ),
+            "MCSPAWN-NOT-FOUND" | "MCSPAWN-NOT-EXECUTABLE" | "MCSPAWN-FAILED" => (
+                Category::Launch,
+                Operation::CreateTarget,
+                Code::TargetCreate,
+                Phase::BeforeAuthorization,
+                true,
+            ),
+            _ => (
+                Category::Launch,
+                Operation::UnclassifiedProviderOperation,
+                Code::UnexpectedProviderFailure,
+                Phase::BeforeAuthorization,
+                false,
+            ),
+        };
+        memcordon_core::CausalEventV1 {
+            sequence: 0,
+            origin: memcordon_core::DiagnosticOriginV1::Launcher,
+            category,
+            operation,
+            code,
+            native_code: if native_known {
+                self.os_code.map(|code| {
+                    memcordon_core::NativeFailureCodeV1::Win32(u32::from_ne_bytes(
+                        code.to_ne_bytes(),
+                    ))
+                })
+            } else {
+                None
+            },
+            observed_phase: phase,
+            safe_detail: memcordon_core::SafeDiagnosticDetailV1::NoAdditionalDetail,
+            detail_redacted: true,
+            detail_truncated: false,
+            terminalization_reference: None,
+        }
+    }
     fn guardian_bootstrap(error: super::process::GuardianBootstrapError) -> Self {
         let role = error
             .role
@@ -93,7 +233,8 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
-        }
+            workload_admission: None,
+        }.captured()
     }
 
     fn guardian_startup(diagnostic: GuardianStartupDiagnostic) -> Self {
@@ -119,7 +260,8 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
-        }
+            workload_admission: None,
+        }.captured()
     }
 
     fn target_create(error: super::process::TargetCreateError) -> Self {
@@ -137,7 +279,9 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: error.loader_qualification,
             terminal_candidate: None,
+            workload_admission: None,
         }
+        .captured()
     }
 
     fn process_inventory(error: super::process::ProcessIdentityObservationError) -> Self {
@@ -150,7 +294,9 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            workload_admission: None,
         }
+        .captured()
     }
 
     fn cleanup_marker(
@@ -167,7 +313,9 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            workload_admission: None,
         }
+        .captured()
     }
 
     fn cleanup_producer_failure(
@@ -195,7 +343,8 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
-        }
+            workload_admission: None,
+        }.captured()
     }
 
     fn cleanup_child_spawn(
@@ -217,7 +366,9 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            workload_admission: None,
         }
+        .captured()
     }
 
     fn cleanup_producer_abrupt(detail: String) -> Self {
@@ -230,7 +381,9 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            workload_admission: None,
         }
+        .captured()
     }
 
     fn cleanup_producer_timeout(detail: String) -> Self {
@@ -243,7 +396,9 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            workload_admission: None,
         }
+        .captured()
     }
 
     fn certification_fault(
@@ -261,7 +416,9 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            workload_admission: None,
         }
+        .captured()
     }
 
     fn mutant_observed(
@@ -277,7 +434,9 @@ impl LaunchAttemptError {
             mutant_observation: Some(Box::new(observation)),
             loader_qualification: None,
             terminal_candidate: None,
+            workload_admission: None,
         }
+        .captured()
     }
 
     fn mutant_candidate(
@@ -303,7 +462,9 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            workload_admission: None,
         }
+        .captured()
     }
 
     fn authority_loss(detail: String) -> Self {
@@ -316,7 +477,9 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            workload_admission: None,
         }
+        .captured()
     }
 }
 
@@ -582,6 +745,7 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                 &WindowsLauncherResponseV1::Probe {
                     schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
                     attestation,
+                    provider_binding: super::package::installed_public_provider_binding()?,
                 },
             )
         }
@@ -704,7 +868,7 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                 &caller_process_identity,
                 &caller_token_sha256,
             );
-            let Some(response) = (match pending_terminal {
+            let Some(mut response) = (match pending_terminal {
                 Ok(response) => response,
                 Err(error) => {
                     return pipe::write_frame(
@@ -780,11 +944,13 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                 );
             };
             let terminal_response_sha256 = super::record::digest(
-                serde_json::to_string(&response)
+                response
+                    .terminal_authority_json()
                     .map_err(|error| error.to_string())?
                     .as_bytes(),
             );
             pipe::write_frame(connection, &response)?;
+            response.release_payload();
             wait_for_terminal_acknowledgment(
                 connection,
                 &attempt_id,
@@ -792,8 +958,7 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                 &request_sha256,
                 &terminal_response_sha256,
             )?;
-            let retired =
-                super::record::acknowledge_terminal_response(&attempt_id, &nonce, &request_sha256)?;
+            let retired = response.acknowledge(&attempt_id, &nonce, &request_sha256)?;
             pipe::write_frame(
                 connection,
                 &WindowsLauncherResponseV1::TerminalRetired(retired),
@@ -841,6 +1006,7 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
             let launch: WindowsLauncherRequestV1 = pipe::read_frame(connection)?;
             match launch {
                 WindowsLauncherRequestV1::Launch(request) => {
+                    let _diagnostic_scope = super::diagnostics::AttemptDiagnosticScope::enter();
                     let certification_mutant = request.certification_mutant;
                     match launch_attempt(connection, request, &attempt_id, &nonce, &request_sha256)
                     {
@@ -882,7 +1048,8 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                                 );
                             }
                             let primary_detail = failure.detail.clone();
-                            let rejection = super::record::rejection_evidence(
+                            let workload_admission = failure.workload_admission;
+                            let mut rejection = super::record::rejection_evidence(
                                 &attempt_id,
                                 failure.code,
                                 failure.detail,
@@ -891,6 +1058,24 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                                 failure.loader_qualification,
                                 failure.terminal_candidate,
                             )?;
+                            rejection.workload_admission = workload_admission;
+                            if rejection.provider_failure.is_none() {
+                                let mut journal =
+                                    memcordon_core::WindowsCausalDiagnosticsV1::default();
+                                super::diagnostics::merge_into(&mut journal);
+                                if let Ok(binding) =
+                                    super::package::installed_public_provider_binding()
+                                {
+                                    rejection.provider_failure =
+                                        memcordon_core::ProviderFailureDiagnosticV1::from_journal(
+                                            binding,
+                                            &attempt_id,
+                                            &request_sha256,
+                                            &journal,
+                                        )
+                                        .ok();
+                                }
+                            }
                             let response = WindowsLauncherResponseV1::Reject {
                                 schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
                                 attempt_id: attempt_id.clone(),
@@ -908,7 +1093,8 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
                                 )
                             })?;
                             let terminal_response_sha256 = super::record::digest(
-                                serde_json::to_string(&response)
+                                response
+                                    .terminal_authority_json()
                                     .map_err(|error| error.to_string())?
                                     .as_bytes(),
                             );
@@ -1410,6 +1596,8 @@ fn launch_attempt(
     }
     let digest_length = super::record::digest(&[]).len();
     if request.schema_version != WINDOWS_PRIVATE_PROTOCOL_VERSION
+        || request.launch.expected_provider_binding
+            != super::package::installed_public_provider_binding()?
         || request.attempt_id.len() != digest_length
         || request.request_sha256.len() != digest_length
     {
@@ -1473,6 +1661,36 @@ fn launch_attempt(
         )
         .into());
     }
+    let workload_admission = request
+        .launch
+        .workload_contract
+        .as_ref()
+        .map(|contract| {
+            crate::admission::plan_windows(
+                contract,
+                &duplicated_primary_envelope.user_sid,
+                memcordon_core::workload_codec::hash_bytes(&launch_bytes),
+            )
+            .map_err(|rejection| {
+                let mut failure = LaunchAttemptError::from(
+                    "exact caller workload admission was rejected before target allocation"
+                        .to_owned(),
+                );
+                failure.code = "MCSEALED-POLICY-ADMISSION";
+                failure.workload_admission = Some(
+                    memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1 {
+                        request:
+                            memcordon_core::workload_evidence::RequestBindingV1::from_contract(
+                                contract,
+                            )
+                            .expect("native launch contract was validated"),
+                        rejection,
+                    },
+                );
+                failure
+            })
+        })
+        .transpose()?;
     super::record::reserve_attempt(&request.attempt_id, &request.request_sha256)?;
     // Keep the durable admission until the first authenticated attempt record
     // has been stored. Package mutation therefore sees either the admission or
@@ -1576,6 +1794,16 @@ fn launch_attempt(
     // starting. Recovery must never infer readiness merely from process creation.
     record.store()?;
     let mut cleanup_guard = AttemptCleanup::new(&job, disarm.raw(), guardian.raw(), record);
+    let workload_admission = if let Some((snapshot, lease)) = workload_admission {
+        cleanup_guard
+            .record
+            .bind_workload_admission(snapshot.clone())?;
+        lease.register_reference(&request.attempt_id, &snapshot)?;
+        drop(lease);
+        Some(snapshot)
+    } else {
+        None
+    };
     if request.certification_mutant
         != Some(memcordon_core::WindowsSealedMutant::ResumeBeforeGuardian)
     {
@@ -1626,6 +1854,8 @@ fn launch_attempt(
     streams.accept_remote_handles();
     macro_rules! retire_preauthorization_without_target {
         ($failure:expr) => {{
+            let failure = $failure;
+            cleanup_guard.observe_failure(&failure);
             pipe::write_frame(
                 connection,
                 &WindowsLauncherResponseV1::RelaysAbort {
@@ -1673,7 +1903,7 @@ fn launch_attempt(
             drop(registration);
             drop(job);
             record.complete_preauthorization_abort()?;
-            return Err($failure);
+            return Err(failure);
         }};
     }
     if request.certification_mutant != Some(memcordon_core::WindowsSealedMutant::ResumeBeforeRelays)
@@ -1763,6 +1993,8 @@ fn launch_attempt(
     let target_cleanup_barrier = TargetCleanupBarrier::new(&job, &target);
     macro_rules! retire_preauthorization_with_target {
         ($failure:expr) => {{
+            let failure = $failure;
+            cleanup_guard.observe_failure(&failure);
             pipe::write_frame(
                 connection,
                 &WindowsLauncherResponseV1::RelaysAbort {
@@ -1819,7 +2051,7 @@ fn launch_attempt(
             drop(registration);
             drop(job);
             record.complete_preauthorization_abort()?;
-            return Err($failure);
+            return Err(failure);
         }};
     }
     let creation = target.creation_observation.clone();
@@ -2002,6 +2234,7 @@ fn launch_attempt(
     macro_rules! retire_postauthorization_before_resume {
         ($failure:expr) => {{
             let mut failure = $failure;
+            cleanup_guard.observe_failure(&failure);
             let authorization_offset = started.elapsed();
             let mut job_process_identities = Vec::new();
             for process_id in job.process_ids()? {
@@ -2111,12 +2344,12 @@ fn launch_attempt(
                 record_retired,
                 loader_qualification: creation.loader_qualification.clone(),
             };
-            failure.terminal_candidate = Some(Box::new(build_terminal_receipt(
-                &request,
-                started,
-                authorization_offset,
-                completed,
-            )));
+            let mut receipt =
+                build_terminal_receipt(&request, started, authorization_offset, completed);
+            if let Some((binding, checkpoint)) = record.workload_checkpoint.clone() {
+                bind_terminal_policy(&mut receipt, binding, checkpoint)?;
+            }
+            failure.terminal_candidate = Some(Box::new(receipt));
             return Err(failure);
         }};
     }
@@ -2180,9 +2413,58 @@ fn launch_attempt(
     ) {
         retire_preauthorization_with_target!(failure);
     }
+    let policy_lease = match workload_admission
+        .as_ref()
+        .map(crate::admission::revalidate_windows)
+        .transpose()
+    {
+        Ok(lease) => lease,
+        Err(detail) => retire_preauthorization_with_target!(LaunchAttemptError::from(detail)),
+    };
+    let workload_checkpoint = if let Some(snapshot) = workload_admission.as_ref() {
+        let observed = (|| -> Result<_, String> {
+            use memcordon_core::workload_evidence::{
+                AttemptBindingV1, BaselineRestrictionObservationV1, VerifiedCheckpointV1,
+            };
+            require_guardian_live(guardian.raw())?;
+            let binding = AttemptBindingV1::from_snapshot(
+                snapshot,
+                super::package::installed_public_provider_binding()?,
+                memcordon_core::BoundedText::new(&cleanup_guard.record.boot_identity)
+                    .map_err(str::to_owned)?,
+                memcordon_core::BoundedText::new(&request.attempt_id).map_err(str::to_owned)?,
+                request.launch.restart_attempt,
+            )?;
+            // All target token, handle-list, Job membership and suspension checks
+            // above succeeded while this exact target remained behind the resume gate.
+            let checkpoint = VerifiedCheckpointV1::observed(
+                &binding,
+                BaselineRestrictionObservationV1::WindowsNetworkExternallyGoverned,
+                true,
+                true,
+                true,
+                true,
+                policy_lease.is_some(),
+                true,
+            )?;
+            cleanup_guard
+                .record
+                .bind_workload_checkpoint(binding.clone(), checkpoint.clone())?;
+            Ok((binding, checkpoint))
+        })();
+        match observed {
+            Ok(value) => Some(value),
+            Err(detail) => retire_preauthorization_with_target!(LaunchAttemptError::from(detail)),
+        }
+    } else {
+        None
+    };
     if let Err(detail) = cleanup_guard.record.authorize() {
         retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
     }
+    super::diagnostics::set_phase(
+        memcordon_core::AttemptObservationPhaseV1::AuthorizedBeforeResume,
+    );
     if let Err(detail) = require_guardian_live(guardian.raw()) {
         retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
     }
@@ -2198,12 +2480,15 @@ fn launch_attempt(
     if let Err(detail) = cleanup_guard.record.mark_resume_attempted() {
         retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
     }
-    if let Err(detail) = target.resume(None) {
-        retire_preauthorization_with_target!(LaunchAttemptError::from(detail));
+    super::diagnostics::set_phase(memcordon_core::AttemptObservationPhaseV1::ResumeAttempted);
+    if let Err(failure) = target.resume_observed(None) {
+        retire_preauthorization_with_target!(LaunchAttemptError::from(failure));
     }
+    super::diagnostics::set_phase(memcordon_core::AttemptObservationPhaseV1::Monitoring);
     drop(streams);
     let authorization_offset = started.elapsed();
     cleanup_guard.record.mark_released()?;
+    drop(policy_lease);
     if let Some(hook_observation) = match request.certification_mutant {
         Some(memcordon_core::WindowsSealedMutant::SkipTargetTokenReadback) => Some(
             memcordon_core::WindowsMutantHookObservationV1::TargetTokenReadbackSkipped {
@@ -2259,6 +2544,7 @@ fn launch_attempt(
     }
 
     let monitored = monitor(
+        workload_admission.as_ref(),
         connection,
         &request,
         &job,
@@ -2277,6 +2563,7 @@ fn launch_attempt(
             if request.certification_fault
                 == Some(WindowsSealedFault::LauncherWorkerKilledAfterAuthorization) =>
         {
+            cleanup_guard.observe_failure(&error);
             cleanup_guard.abandon_to_guardian();
             target_cleanup_barrier.abandon_to_guardian();
             drop(relay_retired_event);
@@ -2290,7 +2577,12 @@ fn launch_attempt(
             pipe::disconnect(connection);
             return Err(LaunchAttemptError::authority_loss(error.detail));
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            // Capture while the cleanup owner and source error are both live.
+            // The journal mutation performs no native or filesystem operation.
+            cleanup_guard.observe_failure(&error);
+            return Err(error);
+        }
     };
     let mut mutant_candidate = None;
     let mut mutant_observation = None;
@@ -2527,7 +2819,10 @@ fn launch_attempt(
         record_retired,
         loader_qualification: creation.loader_qualification,
     };
-    let receipt = build_terminal_receipt(&request, started, authorization_offset, completed);
+    let mut receipt = build_terminal_receipt(&request, started, authorization_offset, completed);
+    if let Some((binding, checkpoint)) = workload_checkpoint {
+        bind_terminal_policy(&mut receipt, binding, checkpoint)?;
+    }
     if let Some(
         fault @ (WindowsSealedFault::RecordRetire
         | WindowsSealedFault::GuardianKilledAfterAuthorization),
@@ -2585,7 +2880,8 @@ fn launch_attempt(
             .with_terminal_candidate(receipt.clone())
         })?;
         let terminal_response_sha256 = super::record::digest(
-            serde_json::to_string(&response)
+            response
+                .terminal_authority_json()
                 .map_err(|error| {
                     LaunchAttemptError::from(format!(
                         "durable terminal outbox digest serialization failed: {error}"
@@ -2680,6 +2976,25 @@ struct CompletedRetirement {
     loader_qualification: Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
 }
 
+fn bind_terminal_policy(
+    receipt: &mut WindowsTerminalReceiptV1,
+    binding: memcordon_core::workload_evidence::AttemptBindingV1,
+    checkpoint: memcordon_core::workload_evidence::VerifiedCheckpointV1,
+) -> Result<(), String> {
+    let controls_preserved = matches!(&receipt.boundary_detail, memcordon_core::BoundaryMechanismEvidence::WindowsJobObjectV2(native)
+        if native.job_limits_verified && native.breakaway_denied && native.job_membership_independent_of_token && native.final_job_handles_closed);
+    receipt.policy_enforcement =
+        memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::retired(
+            binding,
+            checkpoint,
+            controls_preserved,
+            receipt
+                .restart_safety
+                .is_safe_for(memcordon_core::BoundaryRequirement::Sealed),
+        )?;
+    Ok(())
+}
+
 fn build_terminal_receipt(
     request: &WindowsLaunchBrokerRequestV1,
     started: Instant,
@@ -2695,6 +3010,7 @@ fn build_terminal_receipt(
         .collect();
     let boundary_detail = complete_windows_boundary_evidence(&completed);
     WindowsTerminalReceiptV1 {
+        policy_enforcement: Default::default(),
         schema_version: 1,
         attempt_id: request.attempt_id.clone(),
         nonce: request.launch.nonce.clone(),
@@ -2741,6 +3057,7 @@ fn build_terminal_candidate(
     evidence.guardian_reaped = guardian_reaped;
     evidence.final_job_handles_closed = final_job_handles_closed;
     WindowsTerminalReceiptV1 {
+        policy_enforcement: Default::default(),
         schema_version: 1,
         attempt_id: request.attempt_id.clone(),
         nonce: request.launch.nonce.clone(),
@@ -3490,6 +3807,7 @@ struct MonitorObservation {
 }
 
 fn monitor(
+    workload_admission: Option<&crate::admission::FrozenAdmission>,
     connection: HANDLE,
     request: &WindowsLaunchBrokerRequestV1,
     job: &Job,
@@ -3504,6 +3822,15 @@ fn monitor(
     let mut job_process_identities = Vec::new();
     let mut guardian_loss_injected = false;
     let reason = loop {
+        if workload_admission
+            .map(crate::admission::revoked_windows)
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Err(LaunchAttemptError::from(
+                "MCSEALED-POLICY-DRIFT: active policy revoked".to_owned(),
+            ));
+        }
         if matches!(
             request.certification_fault,
             Some(
@@ -3570,12 +3897,22 @@ fn monitor(
             guardian_loss_injected = true;
         }
         if !guardian_is_live(guardian)? {
+            super::diagnostics::capture_native(
+                memcordon_core::FailureOperationV1::CheckGuardian,
+                None,
+                memcordon_core::FailureCodeV1::GuardianLoss,
+            );
             break TerminalReason::Interrupted(15);
         }
         if !target.desktop_authority_live()? {
+            super::diagnostics::capture_native(
+                memcordon_core::FailureOperationV1::CheckDesktopAuthority,
+                None,
+                memcordon_core::FailureCodeV1::GuardianLoss,
+            );
             break TerminalReason::Interrupted(15);
         }
-        for process_id in job.process_ids()? {
+        for process_id in job.process_ids_observed()? {
             if let Some(identity) =
                 super::process::process_identity_for_pid_as_authenticated_caller(
                     process_id,
@@ -3588,12 +3925,12 @@ fn monitor(
                     .map_err(LaunchAttemptError::from)?;
             }
         }
-        while let Some(notification) = job.take_notification()? {
+        while let Some(notification) = job.take_notification_observed()? {
             if notification == JobNotification::MemoryLimit {
                 memory_limit_notified = true;
             }
         }
-        let peak = job.peak_memory()?;
+        let peak = job.peak_memory_observed()?;
         if memory_limit_notified
             || request
                 .launch
@@ -3603,8 +3940,8 @@ fn monitor(
         {
             break TerminalReason::Memory(peak);
         }
-        if direct_status.is_none() && target.wait(Duration::ZERO)? {
-            let status = target.exit_status()?;
+        if direct_status.is_none() && target.wait_observed(Duration::ZERO)? {
+            let status = target.exit_status_observed()?;
             direct_status = Some(status);
             command_exit = Some(Instant::now());
             if request.launch.policy.lifetime == memcordon_core::WindowsLifetimeV1::Command
@@ -3623,7 +3960,7 @@ fn monitor(
         }
         if request.launch.policy.lifetime == memcordon_core::WindowsLifetimeV1::Workload {
             if let Some(status) = direct_status {
-                if job.active_processes()? == 0 {
+                if job.active_processes_observed()? == 0 {
                     break TerminalReason::Direct(status);
                 }
             }
@@ -3638,16 +3975,34 @@ fn monitor(
             break TerminalReason::Deadline;
         }
         if control_connected {
-            let available = match pipe::frame_available(connection) {
+            let available = match pipe::frame_available_detailed(connection) {
                 Ok(available) => available,
-                Err(_) => {
+                Err(error) => {
+                    let code = match error {
+                        pipe::FrameAvailabilityError::Native { code, .. } => code,
+                        pipe::FrameAvailabilityError::PeerClosed => None,
+                    };
+                    super::diagnostics::capture_native(
+                        memcordon_core::FailureOperationV1::ReadControlFrame,
+                        code,
+                        memcordon_core::FailureCodeV1::ControlTransport,
+                    );
                     control_connected = false;
                     false
                 }
             };
             if available {
-                match pipe::read_frame::<WindowsLauncherRequestV1>(connection) {
-                    Err(_) => control_connected = false,
+                match pipe::read_frame_detailed::<WindowsLauncherRequestV1>(connection) {
+                    Err(error) => {
+                        super::diagnostics::capture_native(
+                            memcordon_core::FailureOperationV1::ReadControlFrame,
+                            error
+                                .native_code
+                                .map(|code| i32::from_ne_bytes(code.to_ne_bytes())),
+                            memcordon_core::FailureCodeV1::ControlTransport,
+                        );
+                        control_connected = false;
+                    }
                     Ok(WindowsLauncherRequestV1::Cancel {
                         schema_version,
                         attempt_id,
@@ -3684,7 +4039,7 @@ fn monitor(
         reason,
         control_connected,
         job_process_identities,
-        peak_memory_bytes: job.peak_memory()?,
+        peak_memory_bytes: job.peak_memory_observed()?,
     })
 }
 
@@ -3776,6 +4131,23 @@ pub(crate) fn record_job_process_identity(
         return Ok(());
     }
     if inventory.len() == memcordon_core::WINDOWS_MAX_JOB_PROCESS_IDENTITIES {
+        super::diagnostics::capture(memcordon_core::CausalEventV1 {
+            sequence: 0,
+            origin: memcordon_core::DiagnosticOriginV1::Launcher,
+            category: memcordon_core::FailureCategoryV1::Monitor,
+            operation: memcordon_core::FailureOperationV1::AccumulateProcessInventory,
+            code: memcordon_core::FailureCodeV1::ProcessInventoryCapacity,
+            native_code: None,
+            observed_phase: memcordon_core::AttemptObservationPhaseV1::Monitoring,
+            safe_detail: memcordon_core::SafeDiagnosticDetailV1::CountAndLimit {
+                observed: u32::try_from(inventory.len() + 1).expect("bounded inventory count"),
+                limit: u32::try_from(memcordon_core::WINDOWS_MAX_JOB_PROCESS_IDENTITIES)
+                    .expect("bounded inventory limit"),
+            },
+            detail_redacted: false,
+            detail_truncated: false,
+            terminalization_reference: None,
+        });
         return Err("Job process-identity observation limit was exceeded".to_owned());
     }
     inventory.push(identity);
@@ -3808,13 +4180,19 @@ fn require_guardian_live(guardian: HANDLE) -> Result<(), String> {
     }
 }
 
-fn guardian_is_live(guardian: HANDLE) -> Result<bool, String> {
+fn guardian_is_live(guardian: HANDLE) -> Result<bool, super::job::JobObservationError> {
     // SAFETY: guardian is an owned synchronization handle for this attempt.
     match unsafe { WaitForSingleObject(guardian, 0) } {
         WAIT_TIMEOUT => Ok(true),
         WAIT_OBJECT_0 => Ok(false),
-        WAIT_FAILED => Err(io::Error::last_os_error().to_string()),
-        status => Err(format!("unexpected guardian wait status: {status}")),
+        WAIT_FAILED => Err(super::job::JobObservationError {
+            operation: memcordon_core::FailureOperationV1::CheckGuardian,
+            source: io::Error::last_os_error(),
+        }),
+        status => Err(super::job::JobObservationError {
+            operation: memcordon_core::FailureOperationV1::CheckGuardian,
+            source: io::Error::other(format!("unexpected guardian wait status: {status}")),
+        }),
     }
 }
 
@@ -3883,6 +4261,51 @@ impl Drop for TargetCleanupBarrier<'_> {
 }
 
 impl<'a> AttemptCleanup<'a> {
+    fn observe_cleanup(
+        &mut self,
+        operation: memcordon_core::FailureOperationV1,
+        native_code: Option<i32>,
+    ) {
+        let event = memcordon_core::CausalEventV1 {
+            sequence: 0,
+            origin: memcordon_core::DiagnosticOriginV1::Launcher,
+            category: memcordon_core::FailureCategoryV1::Cleanup,
+            operation,
+            code: memcordon_core::FailureCodeV1::UnexpectedProviderFailure,
+            native_code: native_code.map(|value| {
+                memcordon_core::NativeFailureCodeV1::Win32(u32::from_ne_bytes(value.to_ne_bytes()))
+            }),
+            observed_phase: memcordon_core::AttemptObservationPhaseV1::Cleaning,
+            safe_detail: memcordon_core::SafeDiagnosticDetailV1::NoAdditionalDetail,
+            detail_redacted: true,
+            detail_truncated: false,
+            terminalization_reference: None,
+        };
+        super::diagnostics::observe_record(&mut self.record.causal_diagnostics, event, true);
+    }
+    fn observe_failure(&mut self, failure: &LaunchAttemptError) {
+        super::diagnostics::merge_into(&mut self.record.causal_diagnostics);
+        let mut observation = failure.observation();
+        observation.observed_phase = if self.record.target_released {
+            memcordon_core::AttemptObservationPhaseV1::Monitoring
+        } else if self.record.resume_attempted {
+            memcordon_core::AttemptObservationPhaseV1::ResumeAttempted
+        } else if self.record.authorization_unix_millis.is_some() {
+            memcordon_core::AttemptObservationPhaseV1::AuthorizedBeforeResume
+        } else {
+            memcordon_core::AttemptObservationPhaseV1::BeforeAuthorization
+        };
+        if self.record.causal_diagnostics.sequence == 0
+            && self.record.causal_diagnostics.observe(observation).is_err()
+        {
+            self.record.causal_diagnostics.loss.writer_unavailable = true;
+        }
+        // Initiate containment before submitting any diagnostic disk work.
+        let _ = self.job.terminate(CANCEL_STATUS);
+        if super::attempt_store::try_commit_diagnostics(&mut self.record).is_err() {
+            self.record.causal_diagnostics.loss.writer_unavailable = true;
+        }
+    }
     fn new(
         job: &'a Job,
         disarm: HANDLE,
@@ -3917,20 +4340,58 @@ impl Drop for AttemptCleanup<'_> {
             return;
         }
         let mut failures = Vec::new();
+        super::diagnostics::set_phase(memcordon_core::AttemptObservationPhaseV1::Cleaning);
+        super::diagnostics::merge_into(&mut self.record.causal_diagnostics);
+        if std::thread::panicking() {
+            super::diagnostics::observe_record(
+                &mut self.record.causal_diagnostics,
+                memcordon_core::CausalEventV1 {
+                    sequence: 0,
+                    origin: memcordon_core::DiagnosticOriginV1::Launcher,
+                    category: memcordon_core::FailureCategoryV1::Recovery,
+                    operation: memcordon_core::FailureOperationV1::UnexpectedUnwind,
+                    code: memcordon_core::FailureCodeV1::UnexpectedProviderFailure,
+                    native_code: None,
+                    observed_phase: memcordon_core::AttemptObservationPhaseV1::Cleaning,
+                    safe_detail: memcordon_core::SafeDiagnosticDetailV1::ProviderMessage {
+                        id: memcordon_core::SafeMessageIdV1::ObservationUnavailableAfterOwnerLoss,
+                    },
+                    detail_redacted: true,
+                    detail_truncated: false,
+                    terminalization_reference: None,
+                },
+                false,
+            );
+        }
         if self.record.authorization_unix_millis.is_none() && !self.record.resume_attempted {
-            if let Err(error) = self.record.begin_preauthorization_abort() {
+            if let Err(error) = self.record.prepare_preauthorization_abort() {
                 failures.push(format!("record-preauthorization-abort: {error}"));
             }
         }
-        if let Err(error) = self.job.terminate(CANCEL_STATUS) {
+        // Termination must precede any diagnostic or lifecycle persistence.
+        super::diagnostics::merge_into(&mut self.record.causal_diagnostics);
+        if let Err(error) = self.job.terminate_observed(CANCEL_STATUS) {
+            self.observe_cleanup(
+                memcordon_core::FailureOperationV1::TerminateJob,
+                error.source.raw_os_error(),
+            );
             failures.push(format!("terminate-job: {error}"));
         }
         let empty = match self
             .job
-            .wait_empty(Instant::now() + Duration::from_secs(30))
+            .wait_empty_observed(Instant::now() + Duration::from_secs(30))
         {
-            Ok(empty) => empty,
+            Ok(empty) => {
+                if !empty {
+                    self.observe_cleanup(memcordon_core::FailureOperationV1::WaitJobEmpty, None);
+                }
+                empty
+            }
             Err(error) => {
+                self.observe_cleanup(
+                    memcordon_core::FailureOperationV1::WaitJobEmpty,
+                    error.source.raw_os_error(),
+                );
                 failures.push(format!("wait-empty: {error}"));
                 false
             }
@@ -3939,11 +4400,28 @@ impl Drop for AttemptCleanup<'_> {
         // guard has run, including every early-return path.
         let disarmed = unsafe { SetEvent(self.disarm) } != 0;
         if !disarmed {
-            failures.push(format!("guardian-disarm: {}", io::Error::last_os_error()));
+            let error = io::Error::last_os_error();
+            self.observe_cleanup(
+                memcordon_core::FailureOperationV1::RetireGuardian,
+                error.raw_os_error(),
+            );
+            failures.push(format!("guardian-disarm: {error}"));
         }
-        let guardian_reaped =
-            disarmed && unsafe { WaitForSingleObject(self.guardian, 10_000) } == WAIT_OBJECT_0;
+        let guardian_wait = if disarmed {
+            Some(unsafe { WaitForSingleObject(self.guardian, 10_000) })
+        } else {
+            None
+        };
+        let guardian_wait_error =
+            (guardian_wait == Some(WAIT_FAILED)).then(io::Error::last_os_error);
+        let guardian_reaped = guardian_wait == Some(WAIT_OBJECT_0);
         if disarmed && !guardian_reaped {
+            self.observe_cleanup(
+                memcordon_core::FailureOperationV1::RetireGuardian,
+                guardian_wait_error
+                    .as_ref()
+                    .and_then(io::Error::raw_os_error),
+            );
             failures.push("guardian-reap: guardian did not become signaled".to_owned());
         }
         self.record.cleanup_state.termination_requested = true;
@@ -3964,7 +4442,7 @@ impl Drop for AttemptCleanup<'_> {
                 failures.push(format!("record-transition: {error}"));
             }
         }
-        if let Err(error) = self.record.store() {
+        if let Err(error) = super::attempt_store::try_commit_diagnostics(&mut self.record) {
             failures.push(format!("record-store: {error}"));
         }
         if !failures.is_empty() {
@@ -3973,6 +4451,16 @@ impl Drop for AttemptCleanup<'_> {
             }
         }
     }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn drop_attempt_cleanup_for_test(
+    job: &Job,
+    disarm: HANDLE,
+    guardian: HANDLE,
+    record: super::record::WindowsAttemptRecordV1,
+) {
+    drop(AttemptCleanup::new(job, disarm, guardian, record));
 }
 
 fn take_fallback_cleanup_failures(attempt_id: &str) -> Option<Vec<String>> {

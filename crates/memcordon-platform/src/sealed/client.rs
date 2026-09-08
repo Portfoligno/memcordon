@@ -12,7 +12,7 @@ use sha2::digest::OutputSizeUser;
 use sha2::{Digest, Sha256};
 
 const ENDPOINT: &str = "/run/memcordon/sealed-agent.sock";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const HEADER_LENGTH: usize = 72;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_NATIVE_VALUE: usize = 64 * 1024;
@@ -34,6 +34,8 @@ pub struct ProbeReceipt {
 #[serde(deny_unknown_fields)]
 pub(crate) struct QualificationReceipt {
     schema_version: u32,
+    workload_profile: memcordon_core::workload_contract::ProfileRef,
+    workload_profile_probe_verified: bool,
     version: String,
     mechanism: String,
     provider_identity: String,
@@ -77,7 +79,10 @@ pub(crate) struct QualificationReceipt {
 
 impl QualificationReceipt {
     fn is_complete(&self) -> bool {
-        self.schema_version == 2
+        self.schema_version == 3
+            && self.workload_profile
+                == memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference()
+            && self.workload_profile_probe_verified
             && self.mechanism == "linux-pid-namespace-cgroup-v2"
             && self.provider_identity == "memcordon-sealed-agent-v2"
             && self.control_service_identity == "memcordon-sealed-agent.service:v2"
@@ -138,6 +143,7 @@ pub(crate) fn parse_qualification(payload: &[u8]) -> Result<QualificationReceipt
 
 #[allow(dead_code)]
 pub struct TerminalReceipt {
+    pub policy_enforcement: memcordon_core::workload_evidence::AttemptPolicyEnforcementV1,
     pub schema_version: u32,
     pub mechanism: String,
     pub status: i32,
@@ -210,6 +216,8 @@ struct RejectionCleanupV1 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RejectionV1 {
+    #[serde(default)]
+    workload_admission: Option<memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1>,
     schema_version: u32,
     code: String,
     phase: memcordon_core::BoundarySetupPhase,
@@ -245,6 +253,23 @@ pub fn run(
         ),
         LaunchError::Rejected(rejection) => {
             let rejection = *rejection;
+            if rejection
+                .workload_admission
+                .as_ref()
+                .is_some_and(|admission| {
+                    policy.workload_contract().is_none_or(|contract| {
+                        memcordon_core::workload_evidence::RequestBindingV1::from_contract(contract)
+                            .as_ref()
+                            != Ok(&admission.request)
+                    })
+                })
+            {
+                return memcordon_core::Error::new(
+                    memcordon_core::ErrorCategory::Monitor,
+                    "MCSEALED-WORKLOAD-REJECTION",
+                    "provider admission rejection belongs to another request",
+                );
+            }
             let restart_safety = rejection.restart_safety.clone();
             let mut error = memcordon_core::Error::new(
                 memcordon_core::ErrorCategory::Setup,
@@ -280,6 +305,29 @@ pub fn run(
             error
         }
     })?;
+    if !terminal
+        .policy_enforcement
+        .matches_terminal_request(policy.workload_contract())
+    {
+        return Err(memcordon_core::Error::new(
+            memcordon_core::ErrorCategory::Monitor,
+            "MCSEALED-WORKLOAD-TERMINAL",
+            "terminal workload binding differs from the exact request",
+        ));
+    }
+    if let memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::Authorized {
+        admission,
+        ..
+    } = &terminal.policy_enforcement
+    {
+        super::linux_runtime::verify(&admission.plan.provider).map_err(|detail| {
+            memcordon_core::Error::new(
+                memcordon_core::ErrorCategory::Monitor,
+                "MCSEALED-WORKLOAD-TERMINAL",
+                detail,
+            )
+        })?;
+    }
     let cleanup = memcordon_core::CleanupSummary {
         direct_child_reaped: terminal.init_reaped,
         workload_empty: Some(terminal.cgroup_empty),
@@ -395,6 +443,7 @@ pub fn run(
         cgroup_removed: terminal.boundary_retired,
     };
     Ok(crate::backend::Execution {
+        policy_enforcement: terminal.policy_enforcement.clone(),
         outcome,
         backend: crate::linux_cgroup::sealed_info(qualification),
         child_pid: terminal.target_pid,
@@ -457,6 +506,8 @@ pub(crate) fn terminal_spawn_error(
         "sealed provider reported a verified target exec failure with native OS code {os_code}"
     );
     let provider_rejection = memcordon_core::ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: code.to_owned(),
         phase: memcordon_core::BoundarySetupPhase::TargetCreation,
@@ -519,8 +570,8 @@ pub(crate) fn launch(
     let attempt = nonce().map_err(LaunchError::Transport)?;
     let nonce = nonce().map_err(LaunchError::Transport)?;
     let deadline_budget = effective_deadline_duration(policy, context, started.elapsed());
-    let payload =
-        encode_launch(policy, command, deadline_budget).map_err(LaunchError::Transport)?;
+    let payload = encode_launch(policy, command, deadline_budget, context.restart_attempt)
+        .map_err(LaunchError::Transport)?;
     let frame = encoded_frame(2, nonce, attempt, &payload).map_err(LaunchError::Transport)?;
     let cwd = fs::File::open(".").map_err(|error| LaunchError::Transport(error.to_string()))?;
     let frontend_pidfd = pidfd_self().map_err(LaunchError::Transport)?;
@@ -549,7 +600,25 @@ pub(crate) fn launch(
             "provider omitted terminal receipt".to_owned(),
         ));
     }
-    parse_terminal(&payload).map_err(LaunchError::Transport)
+    let terminal = parse_terminal(&payload).map_err(LaunchError::Transport)?;
+    let attempt_identity = attempt
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| LaunchError::Transport(error.to_string()))?;
+    if !terminal.policy_enforcement.valid_native_terminal(
+        policy.workload_contract(),
+        memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate,
+        &attempt_identity,
+        context.restart_attempt,
+        boot.trim(),
+    ) {
+        return Err(LaunchError::Transport(
+            "terminal workload native attempt binding differs".into(),
+        ));
+    }
+    Ok(terminal)
 }
 
 pub(crate) fn parse_rejection(
@@ -600,6 +669,8 @@ pub(crate) fn parse_rejection(
         return Err("typed rejection retirement evidence is incomplete".to_owned());
     }
     Ok(memcordon_core::ProviderRejectionEvidence {
+        workload_admission: receipt.workload_admission,
+        provider_failure: None,
         schema_version: receipt.schema_version,
         code: receipt.code,
         phase: receipt.phase,
@@ -650,6 +721,95 @@ fn boundary_phase_name(phase: memcordon_core::BoundarySetupPhase) -> &'static st
         memcordon_core::BoundarySetupPhase::Monitoring => "monitoring",
         memcordon_core::BoundarySetupPhase::Retirement => "retirement",
     }
+}
+
+pub fn workload_discovery()
+-> Result<memcordon_core::workload_discovery::WorkloadDiscoveryV1, String> {
+    verify_endpoint()?;
+    let mut stream = UnixStream::connect(Path::new(ENDPOINT)).map_err(|error| error.to_string())?;
+    verify_peer(&stream)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| error.to_string())?;
+    let nonce = nonce()?;
+    write_frame(&mut stream, 9, nonce, [0; 16], &[])?;
+    let frame = read_frame(&mut stream)?;
+    if frame.kind != 109
+        || frame.nonce != nonce
+        || frame.attempt != [0; 16]
+        || frame.payload.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES
+    {
+        return Err("discovery receipt identity or size differs".into());
+    }
+    memcordon_core::workload_contract::reject_duplicate_json_keys(&frame.payload)?;
+    let discovery: memcordon_core::workload_discovery::WorkloadDiscoveryV1 =
+        serde_json::from_slice(&frame.payload).map_err(|error| error.to_string())?;
+    if !discovery.validate(memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate) {
+        return Err("discovery profile differs".into());
+    }
+    super::linux_runtime::verify(&discovery.provider)?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| error.to_string())?;
+    if boot.trim() != discovery.boot_identity.as_str() {
+        return Err("discovery boot differs".into());
+    }
+    Ok(discovery)
+}
+
+pub fn workload_plan(
+    contract: &memcordon_core::workload_contract::WorkloadContractV1,
+) -> Result<memcordon_core::workload_evidence::WorkloadResolutionReportV1, String> {
+    use memcordon_core::workload_evidence::WorkloadResolutionReportV1;
+    contract.validate()?;
+    verify_endpoint()?;
+    let mut stream = UnixStream::connect(Path::new(ENDPOINT)).map_err(|error| error.to_string())?;
+    verify_peer(&stream)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| error.to_string())?;
+    let nonce = nonce()?;
+    let payload = serde_json::to_vec(contract).map_err(|error| error.to_string())?;
+    if payload.len() > memcordon_core::workload_limits::CONTRACT_BYTES {
+        return Err("encoded workload request exceeds limit".into());
+    }
+    write_frame(&mut stream, 8, nonce, [0; 16], &payload)?;
+    let frame = read_frame(&mut stream)?;
+    if frame.kind != 108
+        || frame.nonce != nonce
+        || frame.attempt != [0; 16]
+        || frame.payload.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES
+    {
+        return Err("workload plan receipt identity or size differs".into());
+    }
+    memcordon_core::workload_contract::reject_duplicate_json_keys(&frame.payload)?;
+    let response: WorkloadResolutionReportV1 =
+        serde_json::from_slice(&frame.payload).map_err(|error| error.to_string())?;
+    if !response.valid_plan_response(
+        contract,
+        memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate,
+    ) {
+        return Err("workload plan request or effective binding differs".into());
+    }
+    match &response {
+        WorkloadResolutionReportV1::Planned { binding, .. } => {
+            super::linux_runtime::verify(&binding.provider)?;
+            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .map_err(|error| error.to_string())?;
+            if boot.trim() != binding.boot_identity.as_str() {
+                return Err("workload plan boot binding differs".into());
+            }
+        }
+        WorkloadResolutionReportV1::Rejected { .. }
+        | WorkloadResolutionReportV1::Unavailable { .. } => {}
+        _ => return Err("workload plan returned an execution state".into()),
+    }
+    Ok(response)
 }
 
 pub fn probe() -> Result<ProbeReceipt, String> {
@@ -782,12 +942,14 @@ fn encode_launch(
     policy: &memcordon_core::Policy,
     command: &memcordon_core::CommandSpec,
     deadline_budget: Option<Duration>,
+    restart_attempt: u64,
 ) -> Result<Vec<u8>, String> {
     if command.arguments().len() > MAX_ARGUMENTS {
         return Err("launch argument count exceeds protocol limit".to_owned());
     }
     let mut output = Vec::new();
-    output.extend_from_slice(&2_u16.to_be_bytes());
+    output.extend_from_slice(&3_u16.to_be_bytes());
+    output.extend_from_slice(&restart_attempt.to_be_bytes());
     put_bytes(&mut output, command.program().as_bytes())?;
     put_count(&mut output, command.arguments().len())?;
     for argument in command.arguments() {
@@ -848,6 +1010,17 @@ fn encode_launch(
     }
     put_count(&mut output, 5)?;
     output.extend_from_slice(&[1, 2, 3, 4, 5]);
+    match policy.workload_contract() {
+        None => output.push(0),
+        Some(contract) => {
+            contract.validate()?;
+            output.push(1);
+            put_bytes(
+                &mut output,
+                &serde_json::to_vec(contract).map_err(|error| error.to_string())?,
+            )?;
+        }
+    }
     Ok(output)
 }
 
@@ -991,6 +1164,9 @@ fn send_with_descriptors(
 }
 
 pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> {
+    if payload.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES {
+        return Err("terminal receipt exceeds limit".into());
+    }
     let text = std::str::from_utf8(payload).map_err(|_| "terminal receipt encoding".to_owned())?;
     if !payload.ends_with(b"\n") {
         return Err("terminal receipt is not newline terminated".to_owned());
@@ -1008,6 +1184,13 @@ pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> 
         .parse::<u32>()
         .map_err(|_| "terminal schema version invalid".to_owned())?;
     let mechanism = take_terminal_field(&mut fields, "mechanism")?.to_owned();
+    let policy_bytes = take_terminal_field(&mut fields, "policy-enforcement")?.as_bytes();
+    memcordon_core::workload_contract::reject_duplicate_json_keys(policy_bytes)?;
+    let policy_enforcement: memcordon_core::workload_evidence::AttemptPolicyEnforcementV1 =
+        serde_json::from_slice(policy_bytes).map_err(|error| error.to_string())?;
+    if !policy_enforcement.is_consistent() {
+        return Err("terminal policy enforcement differs".into());
+    }
     if schema_version != 2 || mechanism != "linux-pid-namespace-cgroup-v2" {
         return Err("terminal receipt schema or mechanism is incompatible".to_owned());
     }
@@ -1082,6 +1265,7 @@ pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> 
             _ => return Err("terminal credential-transition disposition is invalid".to_owned()),
         };
     let receipt = TerminalReceipt {
+        policy_enforcement,
         schema_version,
         mechanism,
         status,

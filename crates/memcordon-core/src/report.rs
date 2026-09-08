@@ -14,9 +14,9 @@ use crate::{
     SupervisionAggregates, SupervisionExecution, SupervisionPhase, SupervisionTerminal,
 };
 
-pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 8;
-pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 7;
-pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 5;
+pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 9;
+pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 8;
+pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 6;
 pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize)]
@@ -32,7 +32,7 @@ pub struct MemcordonReport {
 }
 
 impl MemcordonReport {
-    pub fn schema8(
+    pub fn schema9(
         tool: ToolReport,
         invocation: InvocationReport,
         policy: PolicyEnvelopeReport,
@@ -43,6 +43,7 @@ impl MemcordonReport {
         if supervision.is_some() == error.is_some() {
             return Err(ReportModelError::TerminalEnvelope);
         }
+        validate_provider_failure(error.as_ref())?;
         invocation.validate()?;
         policy.validate(&invocation)?;
         validate_boundary_envelope(&policy, backend.as_ref())?;
@@ -56,6 +57,7 @@ impl MemcordonReport {
         if let Some(summary) = &supervision {
             validate_attempt_history(summary, &attempts)?;
         }
+        validate_workload_history(&policy, &attempts, error.as_ref())?;
         Ok(Self {
             schema_version: EXECUTION_REPORT_SCHEMA_VERSION,
             tool,
@@ -76,6 +78,7 @@ pub enum ReportModelError {
     AttemptHistory,
     InvocationBudgets,
     PolicyEnvelope,
+    ProviderFailure,
 }
 
 impl std::fmt::Display for ReportModelError {
@@ -86,6 +89,7 @@ impl std::fmt::Display for ReportModelError {
             Self::AttemptHistory => "report attempt history is inconsistent",
             Self::InvocationBudgets => "report budget tokens and normalized tokens disagree",
             Self::PolicyEnvelope => "requested and effective report policies disagree",
+            Self::ProviderFailure => "provider diagnostic projection is inconsistent",
         })
     }
 }
@@ -114,6 +118,7 @@ impl<'de> Deserialize<'de> for MemcordonReport {
         if wire.supervision.is_some() == wire.error.is_some() {
             return Err(serde::de::Error::custom(ReportModelError::TerminalEnvelope));
         }
+        validate_provider_failure(wire.error.as_ref()).map_err(serde::de::Error::custom)?;
         if let Some(summary) = &wire.supervision {
             validate_attempt_history(summary, &wire.attempts).map_err(serde::de::Error::custom)?;
         } else if !wire.attempts.is_empty() {
@@ -127,6 +132,8 @@ impl<'de> Deserialize<'de> for MemcordonReport {
             .map_err(serde::de::Error::custom)?;
         validate_boundary_envelope(&wire.policy, wire.backend.as_ref())
             .map_err(serde::de::Error::custom)?;
+        validate_workload_history(&wire.policy, &wire.attempts, wire.error.as_ref())
+            .map_err(serde::de::Error::custom)?;
         Ok(Self {
             schema_version: wire.schema_version,
             tool: wire.tool,
@@ -138,6 +145,108 @@ impl<'de> Deserialize<'de> for MemcordonReport {
             error: wire.error,
         })
     }
+}
+
+fn validate_workload_history(
+    policy: &PolicyEnvelopeReport,
+    attempts: &[AttemptRecord],
+    error: Option<&ExecutionErrorReport>,
+) -> Result<(), ReportModelError> {
+    use crate::workload_evidence::{
+        AttemptPolicyEnforcementV1, RequestBindingV1, WorkloadRequestReport,
+    };
+    let contract = match &policy.requested.workload {
+        WorkloadRequestReport::LegacyUnspecified => None,
+        WorkloadRequestReport::StrictV1 { contract } => Some(contract),
+    };
+    let expected = contract
+        .map(RequestBindingV1::from_contract)
+        .transpose()
+        .map_err(|_| ReportModelError::PolicyEnvelope)?;
+    let mut bytes = 0usize;
+    for (enforcement, number) in attempts
+        .iter()
+        .map(|attempt| (&attempt.policy_enforcement, Some(attempt.number)))
+        .chain(
+            error
+                .and_then(|error| error.policy_enforcement.as_ref())
+                .map(|enforcement| (enforcement, None)),
+        )
+    {
+        bytes = bytes
+            .checked_add(
+                serde_json::to_vec(enforcement)
+                    .map_err(|_| ReportModelError::PolicyEnvelope)?
+                    .len(),
+            )
+            .ok_or(ReportModelError::PolicyEnvelope)?;
+        if !enforcement.is_consistent() {
+            return Err(ReportModelError::PolicyEnvelope);
+        }
+        let matches = match (enforcement, &expected) {
+            (AttemptPolicyEnforcementV1::LegacyUnspecified, None) => true,
+            (AttemptPolicyEnforcementV1::NotAuthorized { request, .. }, Some(expected)) => {
+                request == expected
+            }
+            (
+                AttemptPolicyEnforcementV1::AuthorizationUncertain {
+                    request: Some(request),
+                    ..
+                },
+                Some(expected),
+            ) => request == expected,
+            (AttemptPolicyEnforcementV1::Authorized { admission, .. }, Some(expected)) => {
+                &admission.plan.request == expected
+                    && admission
+                        .plan
+                        .matches_contract(contract.expect("strict expected binding"))
+                    && number.is_none_or(|number| {
+                        admission.restart_attempt.checked_add(1) == Some(number)
+                    })
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(ReportModelError::PolicyEnvelope);
+        }
+    }
+    if bytes > crate::workload_limits::REPORT_CONTRIBUTION_BYTES {
+        return Err(ReportModelError::PolicyEnvelope);
+    }
+    if let Some(enforcement) = error
+        .and_then(|error| error.policy_enforcement.as_ref())
+        .or_else(|| attempts.last().map(|attempt| &attempt.policy_enforcement))
+    {
+        if let Some(resolution) = enforcement.resolution() {
+            if policy.effective.workload != resolution {
+                return Err(ReportModelError::PolicyEnvelope);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_failure(error: Option<&ExecutionErrorReport>) -> Result<(), ReportModelError> {
+    for failure in error
+        .and_then(|error| error.provider_failure.as_ref())
+        .into_iter()
+        .chain(
+            error
+                .and_then(|error| error.provider_rejection.as_ref())
+                .and_then(|rejection| rejection.provider_failure.as_ref()),
+        )
+    {
+        if !failure.is_consistent()
+            || failure.projection_sha256 != failure.canonical_digest()
+            || serde_json::to_vec(failure)
+                .map_err(|_| ReportModelError::ProviderFailure)?
+                .len()
+                > crate::MAX_DIAGNOSTIC_PROJECTION_BYTES
+        {
+            return Err(ReportModelError::ProviderFailure);
+        }
+    }
+    Ok(())
 }
 
 fn validate_boundary_envelope(
@@ -369,6 +478,13 @@ impl InvocationReport {
 
 impl PolicyEnvelopeReport {
     fn validate(&self, invocation: &InvocationReport) -> Result<(), ReportModelError> {
+        if !self
+            .effective
+            .workload
+            .matches_request(&self.requested.workload)
+        {
+            return Err(ReportModelError::PolicyEnvelope);
+        }
         if self.requested.memory.is_some() != invocation.memory_token.is_some()
             || self.requested.deadline.is_some() != invocation.deadline_token.is_some()
             || self.requested.restart.enabled != self.effective.restart.enabled
@@ -492,6 +608,7 @@ pub struct PolicyEnvelopeReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestedPolicyReport {
+    pub workload: crate::workload_evidence::WorkloadRequestReport,
     pub boundary: crate::BoundaryRequirement,
     pub memory: Option<RequestedMemoryPolicyReport>,
     pub deadline: Option<DeadlinePolicyReport>,
@@ -549,6 +666,7 @@ pub struct CircuitBreakerPolicyReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EffectivePolicyReport {
+    pub workload: crate::workload_evidence::WorkloadResolutionReportV1,
     pub boundary: crate::BoundaryClass,
     pub memory: Option<EffectiveMemoryPolicyReport>,
     pub deadline: Option<DeadlinePolicyReport>,
@@ -605,6 +723,8 @@ pub enum OptionEffectReport {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionErrorReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_enforcement: Option<crate::workload_evidence::AttemptPolicyEnforcementV1>,
     pub category: String,
     pub code: String,
     pub message: String,
@@ -616,6 +736,7 @@ pub struct ExecutionErrorReport {
     pub workload_may_be_alive: bool,
     pub boundary_setup_failure: Option<crate::BoundarySetupFailure>,
     pub provider_rejection: Option<crate::ProviderRejectionEvidence>,
+    pub provider_failure: Option<crate::ProviderFailureDiagnosticV1>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -646,6 +767,7 @@ pub struct DoctorReport {
     pub available: Vec<BackendCapabilityReport>,
     pub unavailable: Vec<UnavailableCapabilityReport>,
     pub requirement: RequirementReport,
+    pub workload_discovery: crate::workload_discovery::DiscoveryReportV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -665,6 +787,7 @@ pub struct RequirementReport {
     pub kind: Option<String>,
     pub met: bool,
     pub reason: Option<String>,
+    pub workload: Option<crate::workload_evidence::WorkloadResolutionReportV1>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

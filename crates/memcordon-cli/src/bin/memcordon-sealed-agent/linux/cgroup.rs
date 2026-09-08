@@ -49,7 +49,7 @@ pub(super) fn classify_attempt_root_entry(entry: &fs::DirEntry) -> io::Result<At
     Ok(AttemptRootEntry::Unsafe(name))
 }
 
-pub(super) fn valid_attempt_identity(identity: &str) -> bool {
+pub(crate) fn valid_attempt_identity(identity: &str) -> bool {
     identity.len() == 32
         && identity
             .bytes()

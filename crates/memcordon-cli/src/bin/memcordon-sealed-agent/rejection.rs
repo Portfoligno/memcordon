@@ -39,6 +39,8 @@ pub struct RejectionCleanupV1 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RejectionV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_admission: Option<memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1>,
     pub schema_version: u32,
     pub code: String,
     pub phase: RejectionPhaseV1,
@@ -59,6 +61,7 @@ impl RejectionV1 {
         cleanup: RejectionCleanupV1,
     ) -> Result<Self, String> {
         let rejection = Self {
+            workload_admission: None,
             schema_version: 1,
             code: if valid_code(code) {
                 code.to_owned()
@@ -90,6 +93,7 @@ impl RejectionV1 {
             );
         let cleanup = cleanup_evidence(attempt_id, phase);
         Self {
+            workload_admission: None,
             schema_version: 1,
             code,
             phase,
@@ -103,6 +107,7 @@ impl RejectionV1 {
 
     pub fn request_error(code: &str, detail: &str) -> Self {
         Self {
+            workload_admission: None,
             schema_version: 1,
             code: if valid_code(code) {
                 code.to_owned()
@@ -268,7 +273,11 @@ fn phase_for_code(code: &str) -> RejectionPhaseV1 {
         || code.contains("RECOVERY")
     {
         RejectionPhaseV1::BoundaryCreation
-    } else if code.contains("MONITOR") || code.contains("DEADLINE") || code.contains("MEMORY") {
+    } else if code.contains("MONITOR")
+        || code.contains("DEADLINE")
+        || code.contains("MEMORY")
+        || code == "MCSEALED-POLICY-DRIFT"
+    {
         RejectionPhaseV1::Monitoring
     } else if code.contains("TARGET") || code.contains("RECORD-TARGET") {
         RejectionPhaseV1::TargetCreation

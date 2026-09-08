@@ -1,9 +1,15 @@
 #[cfg(target_os = "windows")]
+#[path = "memcordon-sealed-agent/admission.rs"]
+mod admission;
+#[cfg(target_os = "windows")]
 #[path = "memcordon-sealed-agent/inspection_schema.rs"]
 mod inspection_schema;
 #[cfg(target_os = "windows")]
 #[path = "memcordon-sealed-agent/package.rs"]
 mod package;
+#[cfg(target_os = "windows")]
+#[path = "memcordon-sealed-agent/policy_registry.rs"]
+mod policy_registry;
 #[cfg(target_os = "windows")]
 #[path = "memcordon-sealed-agent/protocol.rs"]
 mod protocol;

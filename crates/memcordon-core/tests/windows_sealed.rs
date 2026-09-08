@@ -475,7 +475,11 @@ fn windows_retained_and_retired_outcomes_require_exact_typed_bindings() {
     let request_sha256 = "b".repeat(64);
     let terminal_response_sha256 = "c".repeat(64);
     let retained = WindowsAttemptRetainedV1 {
-        schema_version: 1,
+        schema_version: 2,
+        causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
+        provider_failure: None,
+        diagnostic_availability:
+            memcordon_core::DiagnosticProjectionAvailabilityV1::RecordUnavailable,
         attempt_id: attempt_id.clone(),
         nonce: "nonce".to_owned(),
         request_sha256: request_sha256.clone(),
@@ -583,7 +587,13 @@ fn windows_attempt_state_machine_rejects_authorization_shortcuts() {
 fn windows_durable_attempt_parser_authenticates_and_bounds_real_records() {
     let digest = sha256(&[]);
     let mut record = WindowsDurableAttemptRecordV1 {
-        schema_version: 2,
+        schema_version: 3,
+        causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
+        diagnostic_retention: memcordon_core::DiagnosticRetentionV1::admitted_at(0).unwrap(),
+        record_revision: 1,
+        workload_admission: None,
+        workload_checkpoint: None,
+        provider_incarnation: digest.clone(),
         attempt_id: digest.clone(),
         provider_generation: "windows-provider-generation".to_owned(),
         boot_identity: "boot-identity".to_owned(),
@@ -707,7 +717,13 @@ fn windows_attempt_record_authenticates_only_typed_preauthorization_abort_releas
         creation_time_100ns: 23,
     };
     let mut record = WindowsDurableAttemptRecordV1 {
-        schema_version: 2,
+        schema_version: 3,
+        causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
+        diagnostic_retention: memcordon_core::DiagnosticRetentionV1::admitted_at(0).unwrap(),
+        record_revision: 1,
+        workload_admission: None,
+        workload_checkpoint: None,
+        provider_incarnation: digest.clone(),
         attempt_id: digest.clone(),
         provider_generation: "windows-provider-generation".to_owned(),
         boot_identity: "boot-identity".to_owned(),
@@ -809,6 +825,8 @@ fn windows_security_descriptor_text_rejects_malformed_ace_shapes() {
 #[test]
 fn windows_nonspawn_provider_rejection_has_consistent_public_provenance() {
     let rejection = ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-WINDOWS-JOB".to_owned(),
         phase: BoundarySetupPhase::BoundaryCreation,
@@ -847,6 +865,8 @@ fn windows_nonspawn_provider_rejection_has_consistent_public_provenance() {
 fn windows_posttarget_rejection_retains_truthful_terminal_receipt() {
     let terminal = complete_windows_certification_terminal();
     let rejection = ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-WINDOWS-CLEANUP-PRODUCER-IO".to_owned(),
         phase: BoundarySetupPhase::Retirement,
@@ -886,6 +906,8 @@ fn windows_posttarget_rejection_retains_truthful_terminal_receipt() {
 #[test]
 fn windows_preauthorization_abort_can_require_ack_without_target_receipt() {
     let rejection = ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-WINDOWS-LAUNCH".to_owned(),
         phase: BoundarySetupPhase::TargetCreation,
@@ -919,6 +941,7 @@ fn windows_preauthorization_abort_can_require_ack_without_target_receipt() {
 #[test]
 fn windows_terminal_process_identity_inventory_is_bounded_and_unique() {
     let mut receipt = WindowsTerminalReceiptV1 {
+        policy_enforcement: Default::default(),
         schema_version: 1,
         attempt_id: "a".repeat(64),
         nonce: "nonce".to_owned(),
@@ -1023,6 +1046,7 @@ fn windows_relay_phase_rejects_skipped_duplicate_reversed_and_late_abort_events(
 fn complete_windows_certification_terminal() -> WindowsTerminalReceiptV1 {
     let attempt_binding = format!("attempt-{}", "a".repeat(64));
     WindowsTerminalReceiptV1 {
+        policy_enforcement: Default::default(),
         schema_version: 1,
         attempt_id: "b".repeat(64),
         nonce: "nonce".to_owned(),
@@ -1093,6 +1117,25 @@ fn complete_windows_certification_terminal() -> WindowsTerminalReceiptV1 {
             loader_qualification: None,
         }),
     }
+}
+
+#[test]
+fn maximum_native_process_inventory_fits_terminal_transport_reservation() {
+    let mut terminal = complete_windows_certification_terminal();
+    terminal.job_process_identities = (1..=WINDOWS_MAX_JOB_PROCESS_IDENTITIES)
+        .map(|index| WindowsProcessIdentityV1 {
+            process_id: u32::try_from(index).unwrap(),
+            creation_time_100ns: u64::MAX,
+        })
+        .collect();
+    terminal.job_total_processes = u32::MAX;
+    terminal.duration_millis = u64::MAX;
+    terminal.authorization_offset_millis = u64::MAX;
+    assert!(terminal.process_identity_inventory_shape_is_bounded());
+    let response = WindowsLauncherResponseV1::Terminal(terminal);
+    let encoded = response.terminal_authority_json().unwrap();
+    assert!(encoded.len() < memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES);
+    memcordon_core::validate_record_json_structure(encoded.as_bytes()).unwrap();
 }
 
 #[test]
@@ -1205,7 +1248,11 @@ fn windows_public_terminal_pending_is_exactly_bound() {
     let digest = sha256(b"request");
     let attempt = sha256(b"attempt");
     let pending = WindowsReplayPendingV1 {
-        schema_version: 2,
+        schema_version: 3,
+        causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
+        provider_failure: None,
+        diagnostic_availability:
+            memcordon_core::DiagnosticProjectionAvailabilityV1::RecordUnavailable,
         attempt_id: attempt.clone(),
         nonce: "nonce".to_owned(),
         request_sha256: digest.clone(),

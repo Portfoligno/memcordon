@@ -48,6 +48,7 @@ fn require_backend() {
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("probe output should be JSON");
     assert_eq!(value["selected"]["name"], expected_backend());
+    assert_eq!(value["selected"]["boundary"]["class"], "standard");
     assert_eq!(value["selected"]["memory"]["supported"], true);
     assert_eq!(value["selected"]["memory"]["class"], "hard");
 }
@@ -249,6 +250,52 @@ fn certified_backend_preserves_ordinary_status_and_reaps() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_stdout_empty(&output);
+    #[cfg(target_os = "windows")]
+    {
+        let (output, report) = reported_run("+8GiB", &["exit", "--code", "0"]);
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            report["attempts"][0]["launch"]["guardian_started_before_authorization"],
+            false
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires the protected certified backend runner"]
+fn linux_standard_success_reports_guardian_started_before_authorization() {
+    require_backend();
+    let (output, value) = reported_run("+8GiB", &["exit", "--code", "0"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: memcordon_core::MemcordonReport =
+        serde_json::from_value(value).expect("typed ordinary report");
+    assert_eq!(report.backend.as_ref().unwrap().name, "linux-cgroup-v2");
+    assert_eq!(report.attempts.len(), 1);
+    let attempt = &report.attempts[0];
+    assert!(attempt.target_pid.is_some());
+    assert!(attempt.authorized_offset_ms.is_some());
+    assert_eq!(
+        attempt.launch.boundary_requested,
+        memcordon_core::BoundaryRequirement::Standard
+    );
+    assert_eq!(
+        attempt.launch.boundary_effective,
+        memcordon_core::BoundaryClass::Standard
+    );
+    assert!(attempt.launch.target_released);
+    assert!(attempt.launch.containment_verified_before_authorization);
+    assert!(attempt.launch.guardian_started_before_authorization);
+    assert!(!attempt.launch.boundary_assignment_verified);
+    assert!(!attempt.launch.boundary_reconfiguration_denied);
+    assert!(!attempt.launch.inherited_resources_restricted);
+    assert!(!attempt.launch.frontend_loss_cleanup_authority_verified);
+    assert!(!attempt.restart_safety.sealed_boundary_retired);
+    assert!(
+        attempt
+            .restart_safety
+            .is_safe_for(memcordon_core::BoundaryRequirement::Standard)
+    );
 }
 
 #[test]

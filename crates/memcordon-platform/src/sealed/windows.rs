@@ -53,11 +53,134 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::backend::{BackendInfo, BoundaryQualification, Execution, SealedAvailability};
 
+#[path = "windows_runtime.rs"]
+mod runtime;
+
 const PIPE_CLIENT_READ_WRITE: u32 = 0x0012_019b;
 const TOKEN_GROUP_ENABLED: u32 = 0x0000_0004;
 const TOKEN_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
 
+pub fn workload_discovery()
+-> Result<memcordon_core::workload_discovery::WorkloadDiscoveryV1, String> {
+    prepare_current_process_for_restricted_broker()?;
+    let pipe = connect()?;
+    authenticate_peer(pipe.raw())?;
+    let mut random = [0; 16];
+    // SAFETY: system RNG writes only the fixed output buffer.
+    if unsafe {
+        windows_sys::Win32::Security::Cryptography::BCryptGenRandom(
+            std::ptr::null_mut(),
+            random.as_mut_ptr(),
+            u32::try_from(random.len()).expect("nonce length fits"),
+            windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    } < 0
+    {
+        return Err("discovery challenge generation failed".into());
+    }
+    let challenge = memcordon_core::workload_contract::Nonce128(random);
+    write_frame(
+        pipe.raw(),
+        &WindowsProviderRequestV1::WorkloadDiscovery {
+            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            challenge,
+        },
+    )?;
+    let WindowsProviderResponseV1::WorkloadDiscovery {
+        schema_version,
+        challenge: returned,
+        discovery,
+    } = read_frame(pipe.raw())?
+    else {
+        return Err("invalid discovery response".into());
+    };
+    if schema_version != WINDOWS_PUBLIC_PROTOCOL_VERSION
+        || returned != challenge
+        || !discovery.validate(
+            memcordon_core::workload_registry::BaselineProfile::WindowsHostNetworkExternal,
+        )
+    {
+        return Err("discovery identity differs".into());
+    }
+    runtime::verify_binding(&discovery.provider)?;
+    if discovery.boot_identity.as_str() != runtime::boot_identity()? {
+        return Err("discovery boot differs".into());
+    }
+    Ok(discovery)
+}
+
+pub fn workload_plan(
+    contract: &memcordon_core::workload_contract::WorkloadContractV1,
+) -> Result<memcordon_core::workload_evidence::WorkloadResolutionReportV1, String> {
+    use memcordon_core::workload_evidence::WorkloadResolutionReportV1;
+    contract.validate()?;
+    prepare_current_process_for_restricted_broker()?;
+    let pipe = connect()?;
+    authenticate_peer(pipe.raw())?;
+    let mut random = [0; 16];
+    // SAFETY: the system-preferred RNG writes only the provided fixed buffer.
+    let status = unsafe {
+        windows_sys::Win32::Security::Cryptography::BCryptGenRandom(
+            std::ptr::null_mut(),
+            random.as_mut_ptr(),
+            u32::try_from(random.len()).expect("nonce fits Win32 length"),
+            windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err("workload plan challenge generation failed".into());
+    }
+    let challenge = memcordon_core::workload_contract::Nonce128(random);
+    write_frame(
+        pipe.raw(),
+        &WindowsProviderRequestV1::WorkloadPlan {
+            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            challenge,
+            contract: contract.clone(),
+        },
+    )?;
+    let WindowsProviderResponseV1::WorkloadPlan {
+        schema_version,
+        challenge: returned,
+        resolution,
+    } = read_frame(pipe.raw())?
+    else {
+        return Err("invalid workload plan response".into());
+    };
+    if schema_version != WINDOWS_PUBLIC_PROTOCOL_VERSION
+        || returned != challenge
+        || !resolution.valid_plan_response(
+            contract,
+            memcordon_core::workload_registry::BaselineProfile::WindowsHostNetworkExternal,
+        )
+    {
+        return Err("workload plan binding differs".into());
+    }
+    match &resolution {
+        WorkloadResolutionReportV1::Planned { binding, .. } => {
+            runtime::verify_binding(&binding.provider)?;
+            if binding.boot_identity.as_str() != runtime::boot_identity()? {
+                return Err("workload plan boot identity differs".into());
+            }
+        }
+        WorkloadResolutionReportV1::Rejected { .. }
+        | WorkloadResolutionReportV1::Unavailable { .. } => {}
+        _ => return Err("workload plan returned execution authority".into()),
+    }
+    Ok(resolution)
+}
+
 pub fn probe() -> Result<WindowsQualificationReceiptV1, String> {
+    probe_with_binding().map(|(qualification, _)| qualification)
+}
+
+fn probe_with_binding() -> Result<
+    (
+        WindowsQualificationReceiptV1,
+        memcordon_core::PublicProviderBindingV1,
+    ),
+    String,
+> {
     prepare_current_process_for_restricted_broker()?;
     let pipe = connect()?;
     authenticate_peer(pipe.raw())?;
@@ -71,7 +194,9 @@ pub fn probe() -> Result<WindowsQualificationReceiptV1, String> {
         WindowsProviderResponseV1::Probe {
             schema_version,
             qualification,
+            provider_binding,
         } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+            && provider_binding.is_consistent()
             && qualification_is_advertisable(&qualification, None)
             && qualification.provider_identity
                 == format!(
@@ -79,7 +204,8 @@ pub fn probe() -> Result<WindowsQualificationReceiptV1, String> {
                     env!("CARGO_PKG_VERSION")
                 ) =>
         {
-            Ok(qualification)
+            runtime::verify_binding(&provider_binding)?;
+            Ok((qualification, provider_binding))
         }
         WindowsProviderResponseV1::Reject { rejection, .. } => {
             Err(format!("{}: {}", rejection.code, rejection.detail))
@@ -232,7 +358,7 @@ pub fn run(
     console: &crate::windows_job::ConsoleControl,
     context: crate::supervisor::AttemptContext,
 ) -> Result<Execution, Error> {
-    let qualification = probe().map_err(|detail| {
+    let (qualification, provider_binding) = probe_with_binding().map_err(|detail| {
         Error::new(
             ErrorCategory::Setup,
             "MCSEALED-WINDOWS-QUALIFICATION",
@@ -243,7 +369,10 @@ pub fn run(
     authenticate_peer(pipe.raw()).map_err(transport_error)?;
     let nonce = launch_nonce(command);
     let request = WindowsLaunchRequestV1 {
+        restart_attempt: context.restart_attempt,
         schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        expected_provider_binding: provider_binding.clone(),
+        workload_contract: policy.workload_contract().cloned(),
         nonce: nonce.clone(),
         command: encode_command(command).map_err(usage_error)?,
         environment: encode_environment().map_err(usage_error)?,
@@ -283,7 +412,13 @@ pub fn run(
             && returned_nonce == nonce
             && returned_digest == request_sha256 =>
         {
-            return Err(rejection_error(rejection));
+            return Err(bound_rejection_error(
+                rejection,
+                policy.workload_contract(),
+                &provider_binding,
+                &attempt_id,
+                &request_sha256,
+            ));
         }
         _ => {
             return Err(transport_error(
@@ -367,8 +502,10 @@ pub fn run(
         };
         if let Some(response) = response {
             let response_sha256 = digest_bytes(
-                &serde_json::to_vec(&response)
-                    .map_err(|error| transport_error(error.to_string()))?,
+                response
+                    .terminal_authority_json()
+                    .map_err(|error| transport_error(error.to_string()))?
+                    .as_bytes(),
             );
             match response {
                 WindowsProviderResponseV1::ReplayPending(pending)
@@ -535,8 +672,8 @@ pub fn run(
                         &nonce,
                         &request_sha256,
                         &response_sha256,
-                    )
-                    .map_err(transport_error)?;
+                        &provider_binding,
+                    )?;
                     break receipt;
                 }
                 WindowsProviderResponseV1::Reject {
@@ -560,7 +697,13 @@ pub fn run(
                         .advance(WindowsRelayEventV1::Reject)
                         .map_err(|error| transport_error(error.to_owned()))?;
                     let terminal_ack_required = rejection.terminal_ack_required;
-                    let mut primary = rejection_error(rejection);
+                    let mut primary = bound_rejection_error(
+                        rejection,
+                        policy.workload_contract(),
+                        &provider_binding,
+                        &attempt_id,
+                        &request_sha256,
+                    );
                     if terminal_ack_required {
                         if let Err(acknowledgment) = acknowledge_terminal_retirement(
                             pipe.raw(),
@@ -568,7 +711,11 @@ pub fn run(
                             &nonce,
                             &request_sha256,
                             &response_sha256,
+                            &provider_binding,
                         ) {
+                            if primary.provider_failure.is_none() {
+                                primary.provider_failure = acknowledgment.provider_failure.clone();
+                            }
                             primary.message = format!(
                                 "{}; secondary terminal acknowledgment failure: {}",
                                 primary.message, acknowledgment
@@ -585,14 +732,7 @@ pub fn run(
                         relay_phase,
                     ) =>
                 {
-                    return Err(transport_error(format!(
-                        "MCSEALED-WINDOWS-ATTEMPT-RETAINED: relay_phase={:?} cleanup_complete={} terminal_replay_available={} primary={} secondary={}",
-                        retained.relay_phase,
-                        retained.cleanup_complete,
-                        retained.terminal_replay_available,
-                        retained.primary_detail,
-                        retained.secondary_failures.join(" | "),
-                    )));
+                    return Err(retained_attempt_error(retained, &provider_binding));
                 }
                 _ => {
                     return Err(transport_error(
@@ -624,6 +764,26 @@ pub fn run(
         }
     };
     relays.retire().map_err(transport_error)?;
+    if !terminal.policy_enforcement.valid_native_terminal(
+        policy.workload_contract(),
+        memcordon_core::workload_registry::BaselineProfile::WindowsHostNetworkExternal,
+        &attempt_id,
+        context.restart_attempt,
+        &runtime::boot_identity().map_err(transport_error)?,
+    ) {
+        return Err(Error::new(
+            ErrorCategory::Monitor,
+            "MCSEALED-WORKLOAD-TERMINAL",
+            "terminal workload binding differs from the exact request",
+        ));
+    }
+    if let memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::Authorized {
+        admission,
+        ..
+    } = &terminal.policy_enforcement
+    {
+        runtime::verify_binding(&admission.plan.provider).map_err(transport_error)?;
+    }
     if terminal.schema_version != 1
         || !terminal
             .restart_safety
@@ -660,6 +820,7 @@ pub fn run(
         ));
     }
     Ok(Execution {
+        policy_enforcement: terminal.policy_enforcement,
         outcome: terminal.outcome,
         backend: info(qualification),
         child_pid: terminal.child_pid,
@@ -1339,8 +1500,38 @@ fn read_frame_detailed<T: DeserializeOwned>(handle: HANDLE) -> Result<T, PublicF
             detail: "provider frame exceeds bound".to_owned(),
         });
     }
+    let mut prefix = [0_u8; memcordon_core::WINDOWS_RESPONSE_PREFIX_BYTES];
+    let prefix_length = length.min(prefix.len());
+    read_exact_detailed(
+        handle,
+        &mut prefix[..prefix_length],
+        memcordon_core::WindowsPublicFramePhaseV1::Payload,
+    )?;
+    let limit = memcordon_core::windows_response_frame_limit(&prefix[..prefix_length]).map_err(
+        |detail| PublicFrameError {
+            failure: WindowsPublicFrameFailureV1::Protocol(WindowsPublicFramePhaseV1::Decode),
+            detail: detail.to_owned(),
+        },
+    )?;
+    if length > limit {
+        return Err(PublicFrameError {
+            failure: WindowsPublicFrameFailureV1::Protocol(WindowsPublicFramePhaseV1::Length),
+            detail: "diagnostic control frame exceeds its reserved bound".to_owned(),
+        });
+    }
     let mut payload = vec![0_u8; length];
-    read_exact_detailed(handle, &mut payload, WindowsPublicFramePhaseV1::Payload)?;
+    payload[..prefix_length].copy_from_slice(&prefix[..prefix_length]);
+    read_exact_detailed(
+        handle,
+        &mut payload[prefix_length..],
+        WindowsPublicFramePhaseV1::Payload,
+    )?;
+    memcordon_core::workload_contract::reject_duplicate_json_keys(&payload).map_err(|detail| {
+        PublicFrameError {
+            failure: WindowsPublicFrameFailureV1::Protocol(WindowsPublicFramePhaseV1::Decode),
+            detail,
+        }
+    })?;
     serde_json::from_slice(&payload).map_err(|error| PublicFrameError {
         failure: WindowsPublicFrameFailureV1::Protocol(WindowsPublicFramePhaseV1::Decode),
         detail: error.to_string(),
@@ -1675,7 +1866,8 @@ fn acknowledge_terminal_retirement(
     nonce: &str,
     request_sha256: &str,
     terminal_response_sha256: &str,
-) -> Result<(), String> {
+    provider_binding: &memcordon_core::PublicProviderBindingV1,
+) -> Result<(), Error> {
     write_frame(
         pipe,
         &WindowsProviderRequestV1::TerminalAcknowledged {
@@ -1685,8 +1877,9 @@ fn acknowledge_terminal_retirement(
             request_sha256: request_sha256.to_owned(),
             terminal_response_sha256: terminal_response_sha256.to_owned(),
         },
-    )?;
-    match read_frame::<WindowsProviderResponseV1>(pipe)? {
+    )
+    .map_err(transport_error)?;
+    match read_frame::<WindowsProviderResponseV1>(pipe).map_err(transport_error)? {
         WindowsProviderResponseV1::TerminalRetired(retired)
             if retired.is_consistent_for(
                 attempt_id,
@@ -1705,13 +1898,109 @@ fn acknowledge_terminal_retirement(
                 WindowsRelayPhaseV1::Terminal,
             ) =>
         {
-            Err(format!(
-                "terminal ACK retained attempt authority: primary={} secondary={}",
-                retained.primary_detail,
-                retained.secondary_failures.join(" | ")
-            ))
+            Err(retained_attempt_error(retained, provider_binding))
         }
-        _ => Err("provider did not confirm exact terminal retirement".to_owned()),
+        _ => Err(transport_error(
+            "provider did not confirm exact terminal retirement".to_owned(),
+        )),
+    }
+}
+
+fn retained_attempt_error(
+    retained: memcordon_core::WindowsAttemptRetainedV1,
+    provider_binding: &memcordon_core::PublicProviderBindingV1,
+) -> Error {
+    let mut error = transport_error(format!(
+        "MCSEALED-WINDOWS-ATTEMPT-RETAINED: relay_phase={:?} cleanup_complete={} terminal_replay_available={} diagnostic_availability={:?} primary={} secondary={}",
+        retained.relay_phase,
+        retained.cleanup_complete,
+        retained.terminal_replay_available,
+        retained.diagnostic_availability,
+        retained.primary_detail,
+        retained.secondary_failures.join(" | "),
+    ));
+    if let Some(projection) = retained.provider_failure {
+        let validated = serde_json::to_vec(&projection)
+            .map_err(|_| "diagnostic projection serialization failed")
+            .and_then(|bytes| {
+                memcordon_core::ProviderFailureDiagnosticV1::parse_bound(
+                    &bytes,
+                    provider_binding,
+                    &projection.attempt_id,
+                    &projection.request_sha256,
+                )
+            });
+        match validated {
+            Ok(validated) => {
+                error.message = format!(
+                    "{}; {}",
+                    validated.projection().safe_summary(),
+                    error.message
+                );
+                error = error.with_provider_failure(validated);
+            }
+            Err(detail) => {
+                error.message.push_str("; ");
+                error.message.push_str(detail);
+            }
+        }
+    }
+    error
+}
+
+fn bound_rejection_error(
+    rejection: memcordon_core::ProviderRejectionEvidence,
+    contract: Option<&memcordon_core::workload_contract::WorkloadContractV1>,
+    binding: &memcordon_core::PublicProviderBindingV1,
+    attempt_id: &str,
+    request_sha256: &str,
+) -> Error {
+    if !rejection.is_consistent() {
+        return transport_error("provider rejection is inconsistent".to_owned());
+    }
+    if rejection
+        .workload_admission
+        .as_ref()
+        .is_some_and(|admission| {
+            contract.is_none_or(|contract| {
+                memcordon_core::workload_evidence::RequestBindingV1::from_contract(contract)
+                    .as_ref()
+                    != Ok(&admission.request)
+            })
+        })
+    {
+        return transport_error("provider admission rejection belongs to another request".into());
+    }
+    let validated = rejection
+        .provider_failure
+        .as_ref()
+        .map(|projection| {
+            if String::from(projection.attempt_id.clone()) != attempt_id
+                || String::from(projection.request_sha256.clone()) != request_sha256
+            {
+                return Err("provider rejection diagnostic attempt binding differs".to_owned());
+            }
+            let bytes = serde_json::to_vec(projection).map_err(|error| error.to_string())?;
+            memcordon_core::ProviderFailureDiagnosticV1::parse_bound(
+                &bytes,
+                binding,
+                &projection.attempt_id,
+                &projection.request_sha256,
+            )
+            .map_err(str::to_owned)
+        })
+        .transpose();
+    match validated {
+        Err(error) => transport_error(format!(
+            "provider rejection diagnostic binding failed: {error}"
+        )),
+        Ok(Some(projection)) => {
+            let summary = projection.projection().safe_summary();
+            let mut error = rejection_error(rejection).with_provider_failure(projection);
+            error.message = format!("{summary}; {}", error.message);
+            error
+        }
+        Ok(None) => rejection_error(rejection),
     }
 }
 

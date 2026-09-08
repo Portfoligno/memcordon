@@ -48,6 +48,40 @@ fn plan() -> ProductionLoaderPlanV1 {
     build_package_loader_plan(plan_input()).expect("fixture plan must be valid")
 }
 
+#[test]
+fn two_maximum_valid_loader_plan_copies_fit_terminal_diagnostic_budget() {
+    let plan = plan();
+    let mut plan_json = serde_json::to_string(&plan).unwrap();
+    assert!(plan_json.len() < 64 * 1024);
+    // JSON whitespace preserves the exact typed production plan and digest
+    // while exercising the admitted evidence byte ceiling independently.
+    plan_json.extend(std::iter::repeat_n(' ', 64 * 1024 - plan_json.len()));
+    let parsed: ProductionLoaderPlanV1 = serde_json::from_str(&plan_json).unwrap();
+    assert_eq!(parsed, plan);
+    let outcome = memcordon_core::WindowsLoaderQualificationOutcomeV2::Ready(
+        memcordon_core::WindowsLoaderReadyEvidenceV1 {
+            schema_version: 1,
+            launch_plan_sha256: plan.launch_plan_sha256().to_owned(),
+            launch_plan_json: Some(plan_json),
+            elapsed_millis: u64::MAX,
+        },
+    );
+    assert!(outcome.is_consistent());
+    // Rejection evidence may repeat loader qualification inside its retained
+    // terminal receipt. Neither copy can be omitted from the text reservation.
+    let envelope = serde_json::json!({
+        "message": "reject",
+        "rejection": {
+            "loader_qualification": outcome,
+            "terminal_receipt": {"boundary_detail": {"loader_qualification": outcome}},
+        },
+    });
+    let encoded = serde_json::to_vec(&envelope).unwrap();
+    assert!(encoded.len() > 128 * 1024);
+    memcordon_core::validate_record_json_structure(&encoded).unwrap();
+    assert!(encoded.len() < memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES);
+}
+
 struct CountingFactory {
     creates: Cell<usize>,
     cleanup: CleanupOutcomeV1,

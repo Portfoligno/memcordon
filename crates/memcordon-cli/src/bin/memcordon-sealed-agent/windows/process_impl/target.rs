@@ -563,47 +563,89 @@ impl SuspendedTarget {
     }
 
     pub fn resume(&self, certification_fault: Option<WindowsSealedFault>) -> Result<(), String> {
-        reject_fault(certification_fault, WindowsSealedFault::Resume)?;
+        self.resume_observed(certification_fault)
+            .map_err(String::from)
+    }
+
+    pub(crate) fn resume_observed(
+        &self,
+        certification_fault: Option<WindowsSealedFault>,
+    ) -> Result<(), crate::windows::job::JobObservationError> {
+        let semantic = |detail: String| crate::windows::job::JobObservationError {
+            operation: memcordon_core::FailureOperationV1::VerifySuspendedTarget,
+            source: io::Error::other(detail),
+        };
+        reject_fault(certification_fault, WindowsSealedFault::Resume).map_err(semantic)?;
         if let Some(expected) = self.process_snapshot.as_ref() {
-            let observed = super::token::process_token_query_attestation(self.process.raw())?;
+            let observed = super::token::process_token_query_attestation(self.process.raw())
+                .map_err(semantic)?;
             super::token::require_same_process_token_query(
                 "real-target-process-before-resume",
                 expected,
                 &observed,
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| semantic(error.to_string()))?;
         }
-        if !self.desktop_authority_live()? {
-            return Err("target desktop bootstrap exited before workload resume".to_owned());
+        if !self.desktop_authority_live().map_err(semantic)? {
+            return Err(semantic(
+                "target desktop bootstrap exited before workload resume".to_owned(),
+            ));
         }
         // SAFETY: the primary thread is live and has not previously been resumed.
         let previous = unsafe { ResumeThread(self.thread.raw()) };
         if previous == u32::MAX {
-            Err(io::Error::last_os_error().to_string())
+            let source = io::Error::last_os_error();
+            Err(crate::windows::job::JobObservationError {
+                operation: memcordon_core::FailureOperationV1::ResumeTarget,
+                source,
+            })
         } else if previous != 1 {
-            Err(format!(
+            Err(semantic(format!(
                 "target primary thread suspend count was {previous}, expected 1"
-            ))
+            )))
         } else {
             Ok(())
         }
     }
 
     pub fn wait(&self, duration: Duration) -> Result<bool, String> {
+        self.wait_observed(duration).map_err(String::from)
+    }
+
+    pub(crate) fn wait_observed(
+        &self,
+        duration: Duration,
+    ) -> Result<bool, crate::windows::job::JobObservationError> {
         let timeout = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX - 1);
         // SAFETY: process handle remains live for the wait.
         match unsafe { WaitForSingleObject(self.process.raw(), timeout) } {
             WAIT_OBJECT_0 => Ok(true),
             WAIT_TIMEOUT => Ok(false),
-            _ => Err(io::Error::last_os_error().to_string()),
+            _ => {
+                let source = io::Error::last_os_error();
+                Err(crate::windows::job::JobObservationError {
+                    operation: memcordon_core::FailureOperationV1::PollTarget,
+                    source,
+                })
+            }
         }
     }
 
     pub fn exit_status(&self) -> Result<u32, String> {
+        self.exit_status_observed().map_err(String::from)
+    }
+
+    pub(crate) fn exit_status_observed(
+        &self,
+    ) -> Result<u32, crate::windows::job::JobObservationError> {
         let mut status = 0_u32;
         // SAFETY: process is signaled before this query and output is writable.
         if unsafe { GetExitCodeProcess(self.process.raw(), &raw mut status) } == 0 {
-            Err(io::Error::last_os_error().to_string())
+            let source = io::Error::last_os_error();
+            Err(crate::windows::job::JobObservationError {
+                operation: memcordon_core::FailureOperationV1::ReadTargetExit,
+                source,
+            })
         } else {
             Ok(status)
         }

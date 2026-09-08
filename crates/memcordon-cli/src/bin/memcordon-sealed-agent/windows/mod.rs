@@ -1,4 +1,6 @@
+mod attempt_store;
 pub mod control_service;
+mod diagnostics;
 pub mod guardian;
 pub mod guardian_service;
 pub mod job;
@@ -6,6 +8,7 @@ pub mod launcher_service;
 pub(crate) mod loader_access;
 pub mod package;
 pub mod pipe;
+pub mod policy_registry;
 pub mod process;
 mod process_impl;
 pub mod qualification;

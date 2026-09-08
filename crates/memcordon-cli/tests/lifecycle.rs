@@ -172,6 +172,23 @@ fn macos_system_success_and_failure_smoke_tests_are_bounded() {
     let failure = completed(&mut wrapped("/usr/bin/false", &[]), Duration::from_secs(2));
     assert_eq!(failure.status.code(), Some(1));
     assert_stdout_empty(&failure);
+    let report_file = temporary_pid_file().with_extension("json");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    command
+        .args(["--enforcement", "watchdog", "--report"])
+        .arg(&report_file)
+        .args(["+8GiB", "--", "/usr/bin/true"]);
+    let output = completed(&mut command, Duration::from_secs(5));
+    assert_eq!(output.status.code(), Some(0));
+    let report: memcordon_core::MemcordonReport =
+        serde_json::from_slice(&fs::read(&report_file).unwrap()).unwrap();
+    assert_eq!(report.attempts.len(), 1);
+    assert!(
+        !report.attempts[0]
+            .launch
+            .guardian_started_before_authorization
+    );
+    fs::remove_file(report_file).unwrap();
 }
 
 #[test]

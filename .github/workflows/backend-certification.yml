@@ -12,6 +12,120 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  standard-linux:
+    name: Linux standard cgroup v2 / x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - id: source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: standard-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+      - id: standard-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/standard-backend
+          key: cargo-target-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ steps.source.outputs.commit }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: backend-standard-linux-cgroup-v2-x64
+          path: target/ci/reports/standard/linux-x64/backend-linux-cgroup-v2.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-standard-linux-x64
+          path: target/ci/standard-diagnostics/linux-x64
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
+      - if: always() && steps.standard-target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/standard-backend
+          key: ${{ steps.standard-target.outputs.cache-primary-key }}
+      - if: always() && steps.standard-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.standard-deps.outputs.cache-primary-key }}
+
+  standard-windows:
+    name: Windows standard Job Object / x64
+    runs-on: windows-2025
+    timeout-minutes: 75
+    steps:
+      - id: source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: standard-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+      - id: standard-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/standard-backend
+          key: cargo-target-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ steps.source.outputs.commit }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: backend-standard-windows-job-object-x64
+          path: target/ci/reports/standard/windows-x64/backend-windows-job-object.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-standard-windows-x64
+          path: target/ci/standard-diagnostics/windows-x64
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
+      - if: always() && steps.standard-target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/standard-backend
+          key: ${{ steps.standard-target.outputs.cache-primary-key }}
+      - if: always() && steps.standard-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.standard-deps.outputs.cache-primary-key }}
+
   linux:
     name: Linux sealed provider v2
     runs-on: ubuntu-24.04

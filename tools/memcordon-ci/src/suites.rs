@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use memcordon_ci::capability;
+use memcordon_ci::standard_contract::{CargoTestTarget, HardBackendScenario};
 
 use crate::command::{CommandSpec, git, rustup_cargo};
 use crate::config;
@@ -13,8 +14,6 @@ use crate::{CiError, Result, Suite, policy, release};
 
 const CARGO_DEADLINE: Duration = Duration::from_secs(15 * 60);
 const CERTIFICATION_DEADLINE: Duration = Duration::from_secs(60 * 60);
-const HARD_CERTIFICATION_RUNNER_CLASS: &str = "ephemeral-certified";
-const HARD_CERTIFICATION_RUNNER_PROVIDER: &str = "github-hosted";
 
 fn cargo(
     root: &Path,
@@ -204,6 +203,22 @@ fn miri(root: &Path, nightly: &str) -> Result<()> {
 }
 
 fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
+    cargo(
+        root,
+        stable,
+        "test",
+        [
+            "--locked",
+            "--package",
+            "memcordon-core",
+            "--test",
+            "workload_independent_vectors",
+            "--",
+            "--ignored",
+            "--exact",
+            "write_portable_fuzz_seed_corpora",
+        ],
+    )?;
     let tools = config::tools(root)?;
     install_tool(root, stable, "cargo-fuzz", &tools.cargo_fuzz)?;
     CommandSpec::new("rustup", root, Duration::from_secs(10 * 60))
@@ -259,6 +274,13 @@ fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
         "windows-qualification",
         "windows-terminal-receipt",
         "windows-attempt-record",
+        "windows-causal-diagnostics",
+        "workload-request",
+        "workload-registry",
+        "workload-discovery",
+        "workload-receipt",
+        "workload-canonical",
+        "workload-transitions",
         "windows-package-inspection",
     ];
     for target in targets {
@@ -284,7 +306,11 @@ fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
                 OsString::from(target),
                 OsString::from("--"),
                 OsString::from("-max_total_time=30"),
-                OsString::from("-max_len=4096"),
+                OsString::from(if target.starts_with("workload-") {
+                    "-max_len=1048576"
+                } else {
+                    "-max_len=4096"
+                }),
             ])
             .run()?;
     }
@@ -392,193 +418,13 @@ struct CertificationReport<'a> {
     runner_class: &'a str,
 }
 
-#[derive(Serialize)]
-struct HardCertificationReport<'a> {
-    schema: u32,
-    backend: &'a str,
-    certified: bool,
-    tests_run: u32,
-    tests_skipped: u32,
-    commit: String,
-    tests: Vec<CertificationTest>,
-    runner_class: &'a str,
-    runner_provider: &'a str,
-    runner_label: &'a str,
-    runtime: CertificationRuntime,
-}
-
-#[derive(Serialize)]
-struct CertificationTest {
-    name: &'static str,
-    result: &'static str,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum CertificationRuntime {
-    Linux {
-        unified_cgroup_v2: bool,
-        delegated_boundary: bool,
-        memory_controller: bool,
-        memory_max_round_trip: bool,
-        memory_swap_max: bool,
-        cgroup_kill: bool,
-    },
-    Windows {
-        job_memory_limit: bool,
-        kill_on_close: bool,
-        suspended_assignment: bool,
-        nested_job: bool,
-        completion_port: bool,
-    },
-}
-
-#[derive(Clone, Copy)]
-enum CargoTestTarget {
-    BackendContract,
-    PlatformTest(&'static str),
-}
-
-#[derive(Clone, Copy)]
-struct HardBackendScenario {
-    public_name: &'static str,
-    exact_name: &'static str,
-    target: CargoTestTarget,
-    ignored: bool,
-}
-
-impl HardBackendScenario {
-    const fn integration(name: &'static str) -> Self {
-        Self {
-            public_name: name,
-            exact_name: name,
-            target: CargoTestTarget::BackendContract,
-            ignored: true,
-        }
-    }
-
-    const fn platform(
-        test_binary: &'static str,
-        public_name: &'static str,
-        exact_name: &'static str,
-    ) -> Self {
-        Self {
-            public_name,
-            exact_name,
-            target: CargoTestTarget::PlatformTest(test_binary),
-            ignored: false,
-        }
-    }
-}
-
-const COMMON_HARD_SCENARIOS: [HardBackendScenario; 4] = [
-    HardBackendScenario::integration("certified_backend_preserves_ordinary_status_and_reaps"),
-    HardBackendScenario::integration("certified_backend_reports_limit_and_removes_workload"),
-    HardBackendScenario::integration(
-        "certified_backend_cleans_background_descendant_by_birth_identity",
-    ),
-    HardBackendScenario::integration("certified_backend_allows_bounded_transient_burst"),
-];
-
-const LINUX_HARD_SCENARIOS: [HardBackendScenario; 18] = [
-    HardBackendScenario::integration("linux_cgroup_v2_contains_aggregate_tree"),
-    HardBackendScenario::integration("linux_cgroup_v2_handles_rapid_process_churn"),
-    HardBackendScenario::integration("linux_cgroup_controls_are_applied_before_target_observation"),
-    HardBackendScenario::integration(
-        "linux_embedding_limiter_blocks_target_until_containment_is_verified",
-    ),
-    HardBackendScenario::integration("linux_embedding_limiter_preserves_non_utf8_target_argv"),
-    HardBackendScenario::integration("linux_target_spawn_failures_preserve_native_provenance"),
-    HardBackendScenario::integration("linux_memory_events_produce_limit_evidence"),
-    HardBackendScenario::integration("linux_cleanup_evidence_confirms_empty_reaped_cgroup"),
-    HardBackendScenario::integration("linux_cgroup_identity_is_verified_before_exec"),
-    HardBackendScenario::integration("linux_report_pid_is_the_actual_target_pid"),
-    HardBackendScenario::integration(
-        "linux_gate_failures_kill_the_blocked_target_before_fixture_code",
-    ),
-    HardBackendScenario::integration("linux_guardian_kills_process_group_after_wrapper_crash"),
-    HardBackendScenario::integration("linux_cgroup_kill_reaps_continually_forking_workload"),
-    HardBackendScenario::integration("linux_supervisor_monitor_error_fails_closed_end_to_end"),
-    HardBackendScenario::platform(
-        "linux_cgroup",
-        "limit_evidence_requires_counter_delta",
-        "limit_evidence_requires_counter_delta",
-    ),
-    HardBackendScenario::platform(
-        "linux_cgroup",
-        "cgroup_controls_are_written_exactly",
-        "cgroup_controls_are_written_exactly",
-    ),
-    HardBackendScenario::platform(
-        "linux_cgroup",
-        "monitor_file_errors_are_reported_instead_of_treated_as_success",
-        "monitor_file_errors_are_reported_instead_of_treated_as_success",
-    ),
-    HardBackendScenario::platform(
-        "linux_cgroup",
-        "cgroup_identity_verification_rejects_the_wrong_process",
-        "cgroup_identity_verification_rejects_the_wrong_process",
-    ),
-];
-
-const WINDOWS_HARD_SCENARIOS: [HardBackendScenario; 13] = [
-    HardBackendScenario::integration("windows_job_object_contains_aggregate_tree"),
-    HardBackendScenario::integration("windows_job_object_handles_rapid_process_churn"),
-    HardBackendScenario::integration("windows_target_is_suspended_until_job_assignment"),
-    HardBackendScenario::integration("windows_descendants_remain_in_job_and_are_cleaned"),
-    HardBackendScenario::integration("windows_breakaway_descendant_is_not_left_alive"),
-    HardBackendScenario::integration("windows_job_notification_produces_limit_evidence"),
-    HardBackendScenario::integration("windows_kill_on_close_cleans_workload"),
-    HardBackendScenario::integration("windows_wrapper_crash_closes_job_and_reaps_descendants"),
-    HardBackendScenario::platform(
-        "windows_job",
-        "windows_quoting_preserves_spaces_and_quotes",
-        "windows_native_encoder_quotes_without_shell_interpretation",
-    ),
-    HardBackendScenario::platform(
-        "windows_job",
-        "target_remains_suspended_until_successful_job_assignment",
-        "target_remains_suspended_until_successful_job_assignment",
-    ),
-    HardBackendScenario::platform(
-        "windows_job",
-        "kill_on_job_close_terminates_a_running_member",
-        "kill_on_job_close_terminates_a_running_member",
-    ),
-    HardBackendScenario::platform(
-        "windows_job",
-        "nested_assignment_is_accounted_by_the_memcordon_job",
-        "nested_assignment_is_accounted_by_the_memcordon_job",
-    ),
-    HardBackendScenario::platform(
-        "windows_job",
-        "assignment_failure_terminates_suspended_target_before_execution",
-        "assignment_failure_terminates_suspended_target_before_execution",
-    ),
-];
-
-fn hard_backend_scenarios(backend: &str) -> Result<Vec<HardBackendScenario>> {
-    let specific = match backend {
-        "linux-cgroup-v2" => LINUX_HARD_SCENARIOS.as_slice(),
-        "windows-job-object" => WINDOWS_HARD_SCENARIOS.as_slice(),
-        _ => {
-            return Err(CiError::Message(format!(
-                "unknown hard backend certification: {backend}"
-            )));
-        }
-    };
-    Ok(COMMON_HARD_SCENARIOS
-        .into_iter()
-        .chain(specific.iter().copied())
-        .collect())
-}
-
 fn certification_cargo(
     root: &Path,
     rustup: &Path,
     toolchain: &str,
     subcommand: &str,
     arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    deadline: Duration,
 ) -> Result<Vec<u8>> {
     let mut command_arguments = vec![
         OsString::from("run"),
@@ -591,7 +437,7 @@ fn certification_cargo(
             .into_iter()
             .map(|argument| argument.as_ref().to_os_string()),
     );
-    CommandSpec::new(rustup, root, CARGO_DEADLINE)
+    CommandSpec::new(rustup, root, deadline)
         .args(command_arguments)
         .run()
 }
@@ -601,11 +447,12 @@ fn run_hard_scenario(
     rustup: &Path,
     stable: &str,
     scenario: HardBackendScenario,
+    deadline: Duration,
 ) -> Result<()> {
     let mut arguments = match scenario.target {
         CargoTestTarget::BackendContract => vec![
             OsString::from("--target-dir"),
-            OsString::from("target/ci/backend"),
+            OsString::from("target/ci/standard-backend"),
             OsString::from("--locked"),
             OsString::from("--package"),
             OsString::from("memcordon"),
@@ -616,7 +463,7 @@ fn run_hard_scenario(
         ],
         CargoTestTarget::PlatformTest(test_binary) => vec![
             OsString::from("--target-dir"),
-            OsString::from("target/ci/backend"),
+            OsString::from("target/ci/standard-backend"),
             OsString::from("--locked"),
             OsString::from("--package"),
             OsString::from("memcordon-platform"),
@@ -633,11 +480,15 @@ fn run_hard_scenario(
         arguments.push(OsString::from("--ignored"));
     }
     arguments.extend([
-        OsString::from("--nocapture"),
-        OsString::from("--test-threads=1"),
+        OsString::from("--format"),
+        OsString::from("pretty"),
+        OsString::from("--color"),
+        OsString::from("never"),
+        OsString::from("--test-threads"),
+        OsString::from("1"),
     ]);
-    let output = certification_cargo(root, rustup, stable, "test", arguments)?;
-    capability::require_single_test_success(&output, scenario.exact_name)
+    let output = certification_cargo(root, rustup, stable, "test", arguments, deadline)?;
+    capability::require_exact_standard_test_success(&output, scenario.exact_name)
 }
 
 fn certification(
@@ -646,12 +497,46 @@ fn certification(
     stable: &str,
     backend: &str,
     platform_matches: bool,
+    inherited_context: Option<memcordon_ci::certification_context::CertificationContext>,
 ) -> Result<()> {
-    if !platform_matches {
-        return Err(CiError::Message(format!(
-            "{backend} certification was invoked on the wrong platform"
-        )));
+    use memcordon_ci::certification_context::CertificationContext;
+    use memcordon_ci::standard_contract::{
+        StandardCertificationReportV3, StandardContract, StandardRuntimeEvidence, validate_report,
+    };
+    let contract = StandardContract::for_backend(backend)?;
+    let reports = contract.report_directory(root);
+    fs::create_dir_all(&reports)?;
+    let final_path = reports.join(contract.report_name);
+    if final_path.exists() {
+        fs::remove_file(&final_path)?;
     }
+    let candidate = reports.join("candidate.json");
+    if candidate.exists() {
+        fs::remove_file(&candidate)?;
+    }
+    contract.require_native()?;
+    if !platform_matches {
+        return Err(CiError::Message(
+            "wrong standard certification platform".into(),
+        ));
+    }
+    let context = match inherited_context {
+        Some(context) => context,
+        None => CertificationContext::capture(root, contract.contract_id)?,
+    };
+    context.validate(contract.contract_id)?;
+    let source = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
+        .map_err(|error| CiError::Message(error.to_string()))?;
+    if source.trim() != context.source_commit {
+        return Err(CiError::Message("delegated checkout changed".into()));
+    }
+    let started = std::time::Instant::now();
+    let remaining = || {
+        CERTIFICATION_DEADLINE
+            .checked_sub(started.elapsed())
+            .filter(|time| !time.is_zero())
+            .ok_or_else(|| CiError::Message("standard suite deadline exhausted".into()))
+    };
     let output = certification_cargo(
         root,
         rustup,
@@ -659,7 +544,7 @@ fn certification(
         "run",
         [
             "--target-dir",
-            "target/ci/backend",
+            "target/ci/standard-backend",
             "--locked",
             "--package",
             "memcordon",
@@ -669,66 +554,82 @@ fn certification(
             "doctor",
             "--json",
         ],
+        remaining()?.min(CARGO_DEADLINE),
     )?;
-    let probe: serde_json::Value = serde_json::from_slice(&output)?;
-    capability::require_certified_hard_backend(&probe, backend)?;
-    let scenarios = hard_backend_scenarios(backend)?;
-    let mut tests = Vec::with_capacity(scenarios.len());
-    for scenario in scenarios {
-        run_hard_scenario(root, rustup, stable, scenario)?;
-        tests.push(CertificationTest {
-            name: scenario.public_name,
-            result: "passed",
-        });
+    let probe = serde_json::from_slice(&output)?;
+    capability::require_certified_standard_backend(&probe, backend)?;
+    for scenario in contract.scenarios() {
+        run_hard_scenario(
+            root,
+            rustup,
+            stable,
+            scenario,
+            remaining()?.min(CARGO_DEADLINE),
+        )?;
     }
-    let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
-        .map_err(|error| CiError::Message(error.to_string()))?
-        .trim()
-        .to_owned();
-    let tests_run = u32::try_from(tests.len())
-        .map_err(|_| CiError::Message("too many certification tests".to_owned()))?;
-    let (runner_label, runtime) = match backend {
-        "linux-cgroup-v2" => (
-            "ubuntu-24.04",
-            CertificationRuntime::Linux {
+    // Each fact is justified jointly by the ordinary probe and the exact mandatory scenarios.
+    let runtime = match contract.target {
+        memcordon_ci::standard_contract::StandardTarget::LinuxX64 => {
+            StandardRuntimeEvidence::Linux {
                 unified_cgroup_v2: true,
                 delegated_boundary: true,
                 memory_controller: true,
                 memory_max_round_trip: true,
                 memory_swap_max: true,
                 cgroup_kill: true,
-            },
-        ),
-        "windows-job-object" => (
-            "windows-2025",
-            CertificationRuntime::Windows {
+            }
+        }
+        memcordon_ci::standard_contract::StandardTarget::WindowsX64 => {
+            StandardRuntimeEvidence::Windows {
                 job_memory_limit: true,
                 kill_on_close: true,
                 suspended_assignment: true,
                 nested_job: true,
                 completion_port: true,
-            },
-        ),
-        _ => unreachable!("hard backend was validated before report construction"),
+            }
+        }
     };
-    let report = HardCertificationReport {
-        schema: 2,
-        backend,
+    let hosted = context.provenance.is_some();
+    let tests = contract.results();
+    let report = StandardCertificationReportV3 {
+        schema: 3,
+        contract_id: contract.contract_id.into(),
+        contract_sha256: contract.digest()?,
+        boundary: memcordon_core::BoundaryRequirement::Standard,
+        backend: backend.into(),
+        target: contract.rust_target.into(),
         certified: true,
-        tests_run,
-        tests_skipped: 0,
-        commit,
-        tests,
-        runner_class: HARD_CERTIFICATION_RUNNER_CLASS,
-        runner_provider: HARD_CERTIFICATION_RUNNER_PROVIDER,
-        runner_label,
+        commit: context.source_commit.clone(),
+        runner_class: if hosted {
+            "ephemeral-certified"
+        } else {
+            "local"
+        }
+        .into(),
+        runner_provider: if hosted { "github-hosted" } else { "local" }.into(),
+        runner_label: if hosted { contract.runner_label } else { "" }.into(),
+        provenance: context.provenance,
         runtime,
+        tests_run: u32::try_from(tests.len())
+            .map_err(|_| CiError::Message("too many standard tests".into()))?,
+        tests_skipped: 0,
+        tests,
     };
-    let reports = root.join("target").join("ci").join("reports");
-    fs::create_dir_all(&reports)?;
+    validate_report(&report, contract, &context.source_commit, None)?;
+    remaining()?;
     let mut bytes = serde_json::to_vec_pretty(&report)?;
     bytes.push(b'\n');
-    fs::write(reports.join(format!("backend-{backend}.json")), bytes)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&reports)?;
+    std::io::Write::write_all(&mut temporary, &bytes)?;
+    temporary.as_file().sync_all()?;
+    let destination = if backend == "linux-cgroup-v2" {
+        candidate
+    } else {
+        final_path
+    };
+    temporary
+        .persist_noclobber(destination)
+        .map_err(|error| CiError::Io(error.error))?;
     Ok(())
 }
 
@@ -758,64 +659,161 @@ fn resolve_rustup() -> Result<PathBuf> {
 }
 
 fn launch_delegated_linux_certification(root: &Path) -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        return Err(CiError::Message(
-            "linux-cgroup-v2 certification was invoked on the wrong platform".to_owned(),
-        ));
+    use memcordon_ci::certification_context::CertificationContext;
+    use memcordon_ci::standard_contract::LINUX;
+    let reports = LINUX.report_directory(root);
+    fs::create_dir_all(&reports)?;
+    for name in [LINUX.report_name, "candidate.json"] {
+        let path = reports.join(name);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
     }
+    LINUX.require_native()?;
     let uid = current_uid(root)?;
     if uid == "0" {
         return Err(CiError::Message(
-            "linux certification must start as the unprivileged runner user".to_owned(),
+            "Linux certification must start unprivileged".into(),
         ));
     }
+    let context = CertificationContext::capture(root, LINUX.contract_id)?;
+    let directory = tempfile::Builder::new()
+        .prefix("memcordon-standard-")
+        .suffix(".service")
+        .tempdir()?;
+    let unit = directory
+        .path()
+        .file_name()
+        .ok_or_else(|| CiError::Message("missing unit basename".into()))?
+        .to_os_string();
+    let unit_text = unit
+        .to_str()
+        .ok_or_else(|| CiError::Message("invalid unit encoding".into()))?;
+    if !unit_text.ends_with(".service")
+        || !unit_text
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+    {
+        return Err(CiError::Message("invalid owned delegation unit".into()));
+    }
+    let context_path = directory.path().join("context.json");
+    let mut context_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&context_path)?;
+    let mut bytes = serde_json::to_vec(&context)?;
+    bytes.push(b'\n');
+    std::io::Write::write_all(&mut context_file, &bytes)?;
     let rustup = resolve_rustup()?;
     let executable = std::env::current_exe()?;
-    let arguments = vec![
-        OsString::from("--non-interactive"),
-        OsString::from("--"),
-        OsString::from("/usr/bin/systemd-run"),
-        OsString::from("--wait"),
-        OsString::from("--pipe"),
-        OsString::from("--collect"),
-        OsString::from("--service-type"),
-        OsString::from("exec"),
-        OsString::from("--uid"),
-        OsString::from(&uid),
-        OsString::from("--property"),
-        OsString::from("Delegate=memory"),
-        OsString::from("--property"),
-        OsString::from("DelegateSubgroup=memcordon-ci"),
-        OsString::from("--working-directory"),
-        root.as_os_str().to_os_string(),
-        OsString::from("--"),
-        executable.into_os_string(),
-        OsString::from("delegated-linux-certification"),
-        OsString::from("--rustup"),
-        rustup.into_os_string(),
-        OsString::from("--uid"),
-        OsString::from(uid),
-    ];
-    CommandSpec::new("/usr/bin/sudo", root, CERTIFICATION_DEADLINE)
+    let mut arguments: Vec<OsString> = [
+        "--non-interactive",
+        "--",
+        "/usr/bin/systemd-run",
+        "--wait",
+        "--pipe",
+        "--collect",
+        "--service-type",
+        "exec",
+        "--expand-environment=no",
+        "--unit",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    arguments.push(unit.clone());
+    arguments.extend(["--uid"].map(OsString::from));
+    arguments.push(OsString::from(&uid));
+    arguments.extend(
+        [
+            "--property",
+            "Delegate=memory",
+            "--property",
+            "DelegateSubgroup=memcordon-ci",
+            "--property",
+            "RuntimeMaxSec=60min",
+            "--property",
+            "TimeoutStartSec=2min",
+            "--property",
+            "TimeoutStopSec=30s",
+            "--property",
+            "KillMode=control-group",
+            "--property",
+            "Restart=no",
+            "--working-directory",
+        ]
+        .map(OsString::from),
+    );
+    arguments.push(root.as_os_str().to_os_string());
+    arguments.push("--".into());
+    arguments.push(executable.into_os_string());
+    arguments.extend(["delegated-linux-certification", "--rustup"].map(OsString::from));
+    arguments.push(rustup.into_os_string());
+    arguments.push("--uid".into());
+    arguments.push(uid.into());
+    arguments.push("--context-file".into());
+    arguments.push(context_path.into_os_string());
+    let mut lease = memcordon_ci::standard_runner::DelegatedUnitLease::new(root, unit)?;
+    let execution = CommandSpec::new("/usr/bin/sudo", root, Duration::from_secs(65 * 60))
         .args(arguments)
-        .run()?;
+        .run();
+    let retirement = lease.retire();
+    drop(context_file);
+    let context_cleanup = directory.close();
+    memcordon_ci::standard_runner::finish_delegation(execution, retirement, context_cleanup)?;
+    let candidate = reports.join("candidate.json");
+    let bytes = memcordon_ci::standard_runner::read_bounded_regular(&candidate)?;
+    let report = serde_json::from_slice(&bytes)?;
+    memcordon_ci::standard_contract::validate_report(&report, LINUX, &context.source_commit, None)?;
+    if report.provenance != context.provenance {
+        return Err(CiError::Message(
+            "candidate provenance differs from originating context".into(),
+        ));
+    }
+    memcordon_ci::standard_runner::publish_candidate(
+        &candidate,
+        &reports.join(LINUX.report_name),
+        &bytes,
+    )?;
     Ok(())
 }
 
-pub fn delegated_linux_certification(root: &Path, rustup: &Path, expected_uid: &str) -> Result<()> {
+pub fn delegated_linux_certification(
+    root: &Path,
+    rustup: &Path,
+    expected_uid: &str,
+    context_file: &Path,
+) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Err(CiError::Message(
-            "delegated Linux certification was invoked on the wrong platform".to_owned(),
+            "delegated Linux certification invoked on wrong platform".into(),
         ));
     }
     let uid = current_uid(root)?;
     if uid == "0" || uid != expected_uid {
-        return Err(CiError::Message(format!(
-            "systemd delegation did not preserve the unprivileged runner uid: expected {expected_uid}, observed {uid}"
-        )));
+        return Err(CiError::Message(
+            "delegation did not preserve unprivileged uid".into(),
+        ));
     }
+    let expected_uid = uid
+        .parse()
+        .map_err(|_| CiError::Message("invalid context owner uid".into()))?;
+    let bytes = memcordon_ci::standard_runner::read_bounded_regular_owned(
+        context_file,
+        Some(expected_uid),
+    )?;
+    let context: memcordon_ci::certification_context::CertificationContext =
+        serde_json::from_slice(&bytes)?;
+    context.validate(memcordon_ci::standard_contract::LINUX.contract_id)?;
     let toolchains = config::toolchains(root)?;
-    certification(root, rustup, &toolchains.stable, "linux-cgroup-v2", true)
+    certification(
+        root,
+        rustup,
+        &toolchains.stable,
+        "linux-cgroup-v2",
+        true,
+        Some(context),
+    )
 }
 
 fn macos_acceptance(root: &Path, stable: &str) -> Result<()> {
@@ -893,6 +891,7 @@ pub fn run(root: &Path, suite: Suite) -> Result<()> {
             &toolchains.stable,
             "windows-job-object",
             cfg!(target_os = "windows"),
+            None,
         ),
         Suite::BackendWindowsSealedV2 => crate::sealed_windows::certify(root, &toolchains.stable),
         Suite::WindowsLoaderProduction => {

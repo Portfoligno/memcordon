@@ -9,7 +9,8 @@ Boundary capability is reported separately from memory enforcement. Sealed
 requests never fall back to standard backends. Linux and Windows report sealed
 capability only when their matching mechanism-v2 providers are installed and
 qualified; missing, stale, or mismatched providers reject the request before
-target authorization. Execution reports use schema 8.
+target authorization. Execution reports use schema 9, including observed
+standard launch facts and optional exact-grant sealed workload admission.
 
 ## Install
 

@@ -7,11 +7,15 @@ use std::sync::{Arc, Mutex};
 fn package_inspection_fixture() -> serde_json::Value {
     let digest = sha256_bytes(b"package-inspection-fixture");
     serde_json::json!({
-        "schema_version": 4,
+        "schema_version": 5,
         "version": "1.2.3",
         "source_commit": "source-commit",
         "executable_sha256": digest,
         "provider_protocol": 2,
+        "native_protocols": memcordon_core::runtime_manifest::NativeProviderProtocols::Linux { provider_contract: 3, launch_wire: 3 },
+        "runtime_manifest_schema": 2,
+        "workload_contract_schema": 1,
+        "profile_catalog_sha256": memcordon_core::runtime_manifest::baseline_catalog_digest(false),
         "mechanism": "linux-pid-namespace-cgroup-v2",
         "platform": "linux-systemd",
         "execution_report_schema": memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
@@ -50,10 +54,28 @@ fn windows_package_inspection_fixture() -> serde_json::Value {
         inspection.insert(field.to_owned(), serde_json::json!(digest));
     }
     for (field, value) in [
-        ("schema_version", serde_json::json!(4)),
+        ("schema_version", serde_json::json!(5)),
         ("version", serde_json::json!("1.2.3")),
         ("source_commit", serde_json::json!("source-commit")),
         ("provider_protocol", serde_json::json!(1)),
+        (
+            "native_protocols",
+            serde_json::json!(
+                memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
+                    provider_contract: 3,
+                    public_wire: 2,
+                    private_wire: 2
+                }
+            ),
+        ),
+        ("runtime_manifest_schema", serde_json::json!(2)),
+        ("workload_contract_schema", serde_json::json!(1)),
+        (
+            "profile_catalog_sha256",
+            serde_json::json!(memcordon_core::runtime_manifest::baseline_catalog_digest(
+                true
+            )),
+        ),
         ("mechanism", serde_json::json!("windows-job-object-v2")),
         ("platform", serde_json::json!("windows-service")),
         (
@@ -332,7 +354,7 @@ fn windows_runtime_manifest_uses_shared_qualification_schema() {
         source_date: "2025-01-01T00:00:00Z".to_owned(),
     };
     let manifest = runtime_manifest(&identity, target, Vec::new());
-    let SealedRuntimeV1::Included {
+    let SealedRuntimeV2::Included {
         qualification_schema,
         ..
     } = manifest.sealed
@@ -821,6 +843,9 @@ fn request_json_body(request: &str) -> serde_json::Value {
     serde_json::from_str(&request[start..]).expect("request JSON should parse")
 }
 
+#[path = "../support/standard.rs"]
+mod standard_fixture;
+
 fn release_fixture() -> (TempDir, config::Release) {
     let temporary = TempDir::new().expect("temporary repository should exist");
     let root = temporary.path();
@@ -834,13 +859,13 @@ fn release_fixture() -> (TempDir, config::Release) {
     let release = config::release(root).expect("release config should parse");
     let output = root.join(&release.assets.output_directory);
     fs::create_dir_all(&output).expect("release output should exist");
-    let manifest = ReleaseManifest {
+    let mut manifest = ReleaseManifest {
         schema_version: config::RELEASE_SCHEMA_VERSION,
         project: "memcordon".to_owned(),
         tag: "1.2.3".to_owned(),
         version: "1.2.3".to_owned(),
-        source_commit: "0123456789abcdef".to_owned(),
-        workflow_commit: "0123456789abcdef".to_owned(),
+        source_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        workflow_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
         workflow_ref: "Portfoligno/memcordon/.github/workflows/release.yml@refs/tags/1.2.3"
             .to_owned(),
         workflow_sha256: "00".repeat(32),
@@ -857,12 +882,152 @@ fn release_fixture() -> (TempDir, config::Release) {
                 archive_sha256: "ab".repeat(32),
                 canonical_tree_sha256: "cd".repeat(32),
                 canonical_identity_sha256: "ef".repeat(32),
-                vcs_commit: "0123456789abcdef".to_owned(),
+                vcs_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             })
             .collect(),
         certification: BTreeMap::new(),
+        certification_contract: "standard-and-sealed-v1".into(),
+        certification_origin: memcordon_ci::certification_context::ExpectedCertificationOrigin {
+            source_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            repository: "Portfoligno/memcordon".into(),
+            run_id: 123.try_into().unwrap(),
+            workflow_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            workflow_ref: "Portfoligno/memcordon/.github/workflows/release.yml@refs/tags/1.2.3"
+                .into(),
+        },
         source_date: "2025-01-01T00:00:00Z".to_owned(),
     };
+    for (key, path) in [
+        (
+            "linux-pid-namespace-cgroup-v2",
+            "certification/cleanup-leak-check.json",
+        ),
+        (
+            "windows-job-object-v2/x86_64-pc-windows-msvc",
+            "certification/windows-sealed-v2/x64-windows-release-certification.json",
+        ),
+        (
+            "windows-job-object-v2/aarch64-pc-windows-msvc",
+            "certification/windows-sealed-v2/arm64-windows-release-certification.json",
+        ),
+        (
+            "macos-watchdog",
+            "certification/backend-macos-watchdog.json",
+        ),
+        (
+            "linux-pid-namespace-cgroup-v2/provider-package-verification.json",
+            "certification/linux-sealed-v2/provider-package-verification.json",
+        ),
+        (
+            "linux-pid-namespace-cgroup-v2/provider-qualification-v2.json",
+            "certification/linux-sealed-v2/provider-qualification-v2.json",
+        ),
+        (
+            "linux-pid-namespace-cgroup-v2/setid-transition.json",
+            "certification/linux-sealed-v2/setid-transition.json",
+        ),
+        (
+            "linux-pid-namespace-cgroup-v2/sudo-transition.json",
+            "certification/linux-sealed-v2/sudo-transition.json",
+        ),
+        (
+            "linux-pid-namespace-cgroup-v2/file-capability-transition.json",
+            "certification/linux-sealed-v2/file-capability-transition.json",
+        ),
+        (
+            "linux-pid-namespace-cgroup-v2/caller-envelope.json",
+            "certification/linux-sealed-v2/caller-envelope.json",
+        ),
+        (
+            "linux-pid-namespace-cgroup-v2/mount-context.json",
+            "certification/linux-sealed-v2/mount-context.json",
+        ),
+        (
+            "linux-pid-namespace-cgroup-v2/fault-injection.json",
+            "certification/linux-sealed-v2/fault-injection.json",
+        ),
+    ] {
+        let destination = output.join(path);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"{}\n").unwrap();
+        manifest.certification.insert(
+            key.into(),
+            CertificationRecord {
+                evidence_path: path.into(),
+                sha256: sha256_file(&destination).unwrap(),
+            },
+        );
+    }
+    for contract in [
+        memcordon_ci::standard_contract::LINUX,
+        memcordon_ci::standard_contract::WINDOWS,
+    ] {
+        let destination = output.join(contract.bundle_path);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        write_json(
+            &destination,
+            &standard_fixture::report(contract, &manifest.certification_origin),
+        )
+        .unwrap();
+        manifest.certification.insert(
+            contract.manifest_key.into(),
+            CertificationRecord {
+                evidence_path: contract.bundle_path.into(),
+                sha256: sha256_file(&destination).unwrap(),
+            },
+        );
+    }
+    // Synthetic, complete native-qualification records for release transport
+    // tests. Their presence is not a claim that native qualification ran here.
+    use memcordon_ci::workload_qualification::{QualificationArtifactV1, QualificationKind};
+    for (name, target, kind) in [
+        (
+            "linux-profile-qualification.json",
+            "x86_64-unknown-linux-gnu",
+            QualificationKind::Profile,
+        ),
+        (
+            "windows-x64-profile-qualification.json",
+            "x86_64-pc-windows-msvc",
+            QualificationKind::Profile,
+        ),
+        (
+            "windows-x64-causal-diagnostics.json",
+            "x86_64-pc-windows-msvc",
+            QualificationKind::CausalDiagnostics,
+        ),
+        (
+            "windows-arm64-profile-qualification.json",
+            "aarch64-pc-windows-msvc",
+            QualificationKind::Profile,
+        ),
+        (
+            "windows-arm64-causal-diagnostics.json",
+            "aarch64-pc-windows-msvc",
+            QualificationKind::CausalDiagnostics,
+        ),
+    ] {
+        let relative = Path::new("certification").join("workload").join(name);
+        let destination = output.join(&relative);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        write_json(
+            &destination,
+            &QualificationArtifactV1::after_observed_tests(kind, target, &manifest.source_commit),
+        )
+        .unwrap();
+        manifest.certification.insert(
+            format!("workload/{name}"),
+            CertificationRecord {
+                evidence_path: format!("certification/workload/{name}"),
+                sha256: sha256_file(&destination).unwrap(),
+            },
+        );
+    }
+    assert_eq!(
+        manifest.certification.len(),
+        19,
+        "fixture retains every current certification obligation"
+    );
     write_json(&output.join(&release.assets.manifest), &manifest).expect("manifest should write");
     fs::write(output.join(&release.assets.notes), "notes\n").expect("notes should write");
     (temporary, release)
@@ -1782,7 +1947,7 @@ fn remote(draft: bool) -> serde_json::Value {
     serde_json::json!({
         "id": 41,
         "tag_name": "1.2.3",
-        "target_commitish": "0123456789abcdef",
+        "target_commitish": "0123456789abcdef0123456789abcdef01234567",
         "prerelease": false,
         "draft": draft,
         "assets": [],
@@ -1873,8 +2038,13 @@ fn mock_github_fresh_release_creates_one_draft() {
     .expect("fresh release should create");
     assert_eq!(calls.get(), 1);
     assert_eq!(
-        classify_remote_release(&created, "1.2.3", "0123456789abcdef", false)
-            .expect("created draft should classify"),
+        classify_remote_release(
+            &created,
+            "1.2.3",
+            "0123456789abcdef0123456789abcdef01234567",
+            false
+        )
+        .expect("created draft should classify"),
         RemoteReleaseState::Draft(41)
     );
 }
@@ -1889,8 +2059,13 @@ fn mock_github_exact_existing_draft_is_not_created_again() {
     .expect("existing draft should reconcile");
     assert_eq!(calls.get(), 0);
     assert_eq!(
-        classify_remote_release(&existing, "1.2.3", "0123456789abcdef", false)
-            .expect("draft should classify"),
+        classify_remote_release(
+            &existing,
+            "1.2.3",
+            "0123456789abcdef0123456789abcdef01234567",
+            false
+        )
+        .expect("draft should classify"),
         RemoteReleaseState::Draft(41)
     );
 }
@@ -1905,8 +2080,13 @@ fn mock_github_exact_published_release_is_immutable_and_reconciled() {
     .expect("published release should reconcile");
     assert_eq!(calls.get(), 0);
     assert_eq!(
-        classify_remote_release(&existing, "1.2.3", "0123456789abcdef", false)
-            .expect("published release should classify"),
+        classify_remote_release(
+            &existing,
+            "1.2.3",
+            "0123456789abcdef0123456789abcdef01234567",
+            false
+        )
+        .expect("published release should classify"),
         RemoteReleaseState::Published(41)
     );
 }
@@ -1926,7 +2106,15 @@ fn mock_github_partial_rerun_reuses_existing_state() {
 fn mock_github_identity_conflict_hard_fails() {
     let mut conflicting = remote(true);
     conflicting["target_commitish"] = serde_json::json!("different");
-    assert!(classify_remote_release(&conflicting, "1.2.3", "0123456789abcdef", false).is_err());
+    assert!(
+        classify_remote_release(
+            &conflicting,
+            "1.2.3",
+            "0123456789abcdef0123456789abcdef01234567",
+            false
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -2463,12 +2651,13 @@ fn public_provenance_fixture() -> (
     ReleaseManifest,
     Vec<u8>,
 ) {
-    let (temporary, release, identity) = provenance_fixture();
+    let (temporary, release, mut identity) = provenance_fixture();
     // Construct canonical LF independently of the test host's checkout settings.
     let workflow = include_str!("../../../../.github/workflows/release.yml")
         .replace("\r\n", "\n")
         .into_bytes();
     let (_, mut manifest, _) = bundle_manifest(temporary.path()).expect("fixture manifest");
+    identity.commit = manifest.source_commit.clone();
     manifest.workflow_sha256 = sha256_bytes(&workflow);
     manifest.action_revisions = config::action_pins(temporary.path())
         .expect("fixture pins")
@@ -2804,24 +2993,6 @@ fn http_mock_upload_conflict_reconciles_canonical_remote_asset_once() {
 fn http_mock_stage_uploads_complete_static_inventory_including_certification() {
     let (temporary, release) = release_fixture();
     let output = temporary.path().join(&release.assets.output_directory);
-    let certification = [
-        (
-            "linux-cgroup-v2",
-            "certification/backend-linux-cgroup-v2.json",
-        ),
-        (
-            "windows-job-object-v2/x86_64-pc-windows-msvc",
-            "certification/windows-sealed-v2/x64-windows-cleanup.json",
-        ),
-        (
-            "windows-job-object-v2/aarch64-pc-windows-msvc",
-            "certification/windows-sealed-v2/arm64-windows-cleanup.json",
-        ),
-        (
-            "macos-watchdog",
-            "certification/backend-macos-watchdog.json",
-        ),
-    ];
     fs::create_dir_all(output.join("certification")).expect("certification directory should exist");
     fs::write(output.join(&release.assets.checksums), b"checksums\n")
         .expect("checksums should write");
@@ -2841,24 +3012,6 @@ fn http_mock_stage_uploads_complete_static_inventory_including_certification() {
         runtime_manifest_sha256: "runtime-manifest-digest".to_owned(),
         components: Vec::new(),
     });
-    for (backend, relative) in certification {
-        let evidence_path = output.join(relative);
-        fs::create_dir_all(
-            evidence_path
-                .parent()
-                .expect("certification evidence should have a parent"),
-        )
-        .expect("certification evidence directory should exist");
-        fs::write(&evidence_path, format!("{backend} certified\n"))
-            .expect("certification evidence should write");
-        manifest.certification.insert(
-            backend.to_owned(),
-            CertificationRecord {
-                evidence_path: relative.to_owned(),
-                sha256: sha256_file(&evidence_path).expect("evidence digest"),
-            },
-        );
-    }
     write_json(&manifest_path, &manifest).expect("manifest should update");
     let static_paths = static_asset_paths(&release, &manifest, &output)
         .expect("static asset inventory should be valid");
@@ -2889,7 +3042,10 @@ fn http_mock_stage_uploads_complete_static_inventory_including_certification() {
     let create_body = request_json_body(&requests[1]);
     assert_eq!(create_body["draft"], true);
     assert_eq!(create_body["tag_name"], "1.2.3");
-    assert_eq!(create_body["target_commitish"], "0123456789abcdef");
+    assert_eq!(
+        create_body["target_commitish"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
     assert!(
         requests
             .last()

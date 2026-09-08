@@ -60,10 +60,9 @@ fn compiled_package_metadata_uses_split_control_and_launcher_identities() {
     assert!(semantic_lines(control_service).contains(
         &"After=local-fs.target systemd-tmpfiles-setup.service memcordon-sealed-launcher.socket"
     ));
-    assert!(
-        semantic_lines(control_service)
-            .contains(&"ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed")
-    );
+    assert!(semantic_lines(control_service).contains(
+        &"ReadWritePaths=/run/memcordon /var/lib/memcordon/sealed /var/lib/memcordon/policy"
+    ));
     assert!(!control_service.contains("ReadWritePaths=/run/memcordon-sealed-package.lock"));
     assert!(!control_service.contains("RuntimeDirectory="));
     assert!(!control_service.contains("RuntimeDirectoryMode="));

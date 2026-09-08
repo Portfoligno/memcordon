@@ -1,5 +1,14 @@
 #![allow(dead_code)]
 
+#[path = "../src/bin/memcordon-sealed-agent/admission.rs"]
+mod admission;
+#[path = "sealed_agent/native_workload_admission.rs"]
+mod native_workload_admission;
+#[path = "../src/bin/memcordon-sealed-agent/policy_registry.rs"]
+mod policy_registry;
+#[path = "sealed_agent/policy_revocation.rs"]
+mod policy_revocation;
+
 #[path = "../src/bin/memcordon-sealed-agent/inspection_schema.rs"]
 mod inspection_schema;
 #[path = "../src/bin/memcordon-sealed-agent/package.rs"]

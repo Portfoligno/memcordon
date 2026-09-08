@@ -52,6 +52,9 @@ fn recursive_inventory(proc_root: &Path, cgroup_root: &Path) -> Result<bool, Str
 
 fn qualification() -> QualificationReceipt {
     QualificationReceipt {
+        workload_profile: memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate
+            .reference(),
+        workload_profile_probe_verified: true,
         schema_version: 2,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),

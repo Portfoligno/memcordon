@@ -532,6 +532,325 @@ fn step_with_id<'a>(steps: &'a [Value], id: &str, context: &str) -> Result<&'a M
     Ok(matches[0])
 }
 
+fn check_standard_certification_job(
+    job: &Mapping,
+    contract: crate::standard_contract::StandardContract,
+    release: bool,
+) -> Result<()> {
+    let context = "standard certification job";
+    let keys = if release {
+        vec!["name", "needs", "runs-on", "timeout-minutes", "steps"]
+    } else {
+        vec!["name", "runs-on", "timeout-minutes", "steps"]
+    };
+    exact_mapping_keys(job, &keys, context)?;
+    if scalar(job, "runs-on") != Some(contract.runner_label)
+        || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(75)
+        || (release && scalar(job, "needs") != Some("preflight"))
+    {
+        return Err(failure("standard certification runner/dependency differs"));
+    }
+    let steps = job
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("standard job lacks steps"))?;
+    let expected_length = if release { 10 } else { 9 };
+    if steps.len() != expected_length {
+        return Err(failure("standard job step inventory differs"));
+    }
+    let checkout_count = if release { 2 } else { 1 };
+    let ordered = [
+        (
+            "uses",
+            "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        ),
+        (
+            "uses",
+            "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        ),
+        ("run", "rustup toolchain install 1.97.1 --profile minimal"),
+        ("run", ""),
+        (
+            "uses",
+            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        ),
+        (
+            "uses",
+            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        ),
+        (
+            "uses",
+            "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        ),
+        (
+            "uses",
+            "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        ),
+    ];
+    for step in &steps[..checkout_count] {
+        if step.as_mapping().and_then(|step| scalar(step, "uses"))
+            != Some("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
+        {
+            return Err(failure(
+                "standard checkout must precede cache restoration and execution",
+            ));
+        }
+    }
+    for (step, (field, value)) in steps[checkout_count..].iter().zip(ordered) {
+        let actual = step.as_mapping().and_then(|step| scalar(step, field));
+        if actual.is_none() || (!value.is_empty() && actual != Some(value)) {
+            return Err(failure(
+                "standard checkout/cache/command/evidence step order differs",
+            ));
+        }
+    }
+    for (offset, id) in ["standard-deps", "standard-target"].into_iter().enumerate() {
+        if steps[checkout_count + offset]
+            .as_mapping()
+            .and_then(|step| scalar(step, "id"))
+            != Some(id)
+        {
+            return Err(failure("standard cache restore order differs"));
+        }
+    }
+    let expected_suite = match contract.target {
+        crate::standard_contract::StandardTarget::LinuxX64 => {
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup"
+        }
+        crate::standard_contract::StandardTarget::WindowsX64 => {
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job"
+        }
+    };
+    let commands: Vec<_> = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter(|step| step.contains_key(key("run")))
+        .collect();
+    if commands.len() != 2 {
+        return Err(failure("standard suite invocation inventory differs"));
+    }
+    for (step, expected) in commands.into_iter().zip([
+        "rustup toolchain install 1.97.1 --profile minimal",
+        expected_suite,
+    ]) {
+        exact_mapping_keys(step, &["run"], context)?;
+        if scalar(step, "run").map(|run| run.split_whitespace().collect::<Vec<_>>())
+            != Some(expected.split_whitespace().collect())
+        {
+            return Err(failure("required standard invocation differs"));
+        }
+    }
+    const CHECKOUT: &str = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
+    let checkouts = action_steps(steps, CHECKOUT)?;
+    if checkouts.len() != if release { 2 } else { 1 } {
+        return Err(failure("standard checkout inventory differs"));
+    }
+    for (index, step) in checkouts.into_iter().enumerate() {
+        exact_mapping_keys(
+            step,
+            if release {
+                &["name", "id", "if", "uses", "with"]
+            } else {
+                &["id", "uses", "with"]
+            },
+            context,
+        )?;
+        let input = mapping(
+            step.get(key("with"))
+                .ok_or_else(|| failure("missing checkout inputs"))?,
+            context,
+        )?;
+        exact_mapping_keys(
+            input,
+            if release {
+                &["ref", "fetch-depth", "persist-credentials"]
+            } else {
+                &["persist-credentials"]
+            },
+            context,
+        )?;
+        if input
+            .get(key("persist-credentials"))
+            .and_then(Value::as_bool)
+            != Some(false)
+        {
+            return Err(failure("standard checkout persists credentials"));
+        }
+        if release {
+            let (id, condition, reference) = if index == 0 {
+                (
+                    "source-push",
+                    "github.event_name == 'push'",
+                    "${{ github.ref }}",
+                )
+            } else {
+                (
+                    "source-dispatch",
+                    "github.event_name == 'workflow_dispatch'",
+                    "${{ inputs.tag }}",
+                )
+            };
+            if scalar(step, "id") != Some(id)
+                || scalar(step, "if") != Some(condition)
+                || scalar(input, "ref") != Some(reference)
+                || input.get(key("fetch-depth")).and_then(Value::as_u64) != Some(0)
+            {
+                return Err(failure("standard release checkout provenance differs"));
+            }
+        } else if scalar(step, "id") != Some("source") {
+            return Err(failure("standard checkout identity differs"));
+        }
+    }
+    let domain = if release {
+        "release-standard-v1"
+    } else {
+        "backend-standard-v1"
+    };
+    let source = if release {
+        "push-${{ steps.source-push.outputs.commit }}-dispatch-${{ steps.source-dispatch.outputs.commit }}"
+    } else {
+        "${{ steps.source.outputs.commit }}"
+    };
+    let dependency_key = format!(
+        "cargo-deps-{domain}-${{{{ runner.os }}}}-${{{{ runner.arch }}}}-1.97.1-${{{{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}}}"
+    );
+    let target_key = format!(
+        "cargo-target-{domain}-${{{{ runner.os }}}}-${{{{ runner.arch }}}}-1.97.1-{source}-${{{{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}}}"
+    );
+    let restores = action_steps(
+        steps,
+        "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+    )?;
+    let saves = action_steps(
+        steps,
+        "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+    )?;
+    if restores.len() != 2 || saves.len() != 2 {
+        return Err(failure("standard split cache inventory differs"));
+    }
+    for (id, path, cache_key) in [
+        (
+            "standard-deps",
+            "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n",
+            dependency_key,
+        ),
+        (
+            "standard-target",
+            "target/ci/bootstrap\ntarget/ci/standard-backend\n",
+            target_key,
+        ),
+    ] {
+        let restore = step_with_id(steps, id, context)?;
+        exact_mapping_keys(restore, &["id", "uses", "with"], context)?;
+        if !restores.contains(&restore) {
+            return Err(failure("standard cache restore action differs"));
+        }
+        let input = mapping(
+            restore
+                .get(key("with"))
+                .ok_or_else(|| failure("missing cache inputs"))?,
+            context,
+        )?;
+        exact_mapping_keys(input, &["path", "key"], context)?;
+        if scalar(input, "path") != Some(path) || scalar(input, "key") != Some(cache_key.as_str()) {
+            return Err(failure("standard cache identity differs"));
+        }
+        let condition = format!("always() && steps.{id}.outputs.cache-hit != 'true'");
+        let matching: Vec<_> = saves
+            .iter()
+            .filter(|step| scalar(step, "if") == Some(condition.as_str()))
+            .collect();
+        if matching.len() != 1 {
+            return Err(failure("standard cache save condition differs"));
+        }
+        exact_mapping_keys(matching[0], &["if", "uses", "with"], context)?;
+        let input = mapping(
+            matching[0]
+                .get(key("with"))
+                .ok_or_else(|| failure("missing save inputs"))?,
+            context,
+        )?;
+        exact_mapping_keys(input, &["path", "key"], context)?;
+        let primary = format!("${{{{ steps.{id}.outputs.cache-primary-key }}}}");
+        if scalar(input, "path") != Some(path) || scalar(input, "key") != Some(primary.as_str()) {
+            return Err(failure("standard cache save identity differs"));
+        }
+    }
+    let uploads = action_steps(
+        steps,
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    )?;
+    if uploads.len() != 2 {
+        return Err(failure("standard evidence upload inventory differs"));
+    }
+    let backend_artifact = match contract.target {
+        crate::standard_contract::StandardTarget::LinuxX64 => {
+            "backend-standard-linux-cgroup-v2-x64"
+        }
+        crate::standard_contract::StandardTarget::WindowsX64 => {
+            "backend-standard-windows-job-object-x64"
+        }
+    };
+    for (index, step) in uploads.into_iter().enumerate() {
+        exact_mapping_keys(
+            step,
+            if index == 0 {
+                &["uses", "with"]
+            } else {
+                &["if", "uses", "with"]
+            },
+            context,
+        )?;
+        let input = mapping(
+            step.get(key("with"))
+                .ok_or_else(|| failure("missing evidence upload inputs"))?,
+            context,
+        )?;
+        exact_mapping_keys(
+            input,
+            &[
+                "name",
+                "path",
+                "if-no-files-found",
+                "retention-days",
+                "compression-level",
+            ],
+            context,
+        )?;
+        let (name, path, missing) = if index == 0 {
+            (
+                if release {
+                    contract.release_artifact
+                } else {
+                    backend_artifact
+                }
+                .to_owned(),
+                format!(
+                    "target/ci/reports/standard/{}/{}",
+                    contract.directory, contract.report_name
+                ),
+                "error",
+            )
+        } else {
+            (
+                format!("diagnostics-standard-{}", contract.directory),
+                format!("target/ci/standard-diagnostics/{}", contract.directory),
+                "warn",
+            )
+        };
+        if scalar(input, "name") != Some(name.as_str())
+            || scalar(input, "path") != Some(path.as_str())
+            || scalar(input, "if-no-files-found") != Some(missing)
+            || input.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
+            || input.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
+            || (index == 1 && scalar(step, "if") != Some("always()"))
+        {
+            return Err(failure("standard evidence upload identity differs"));
+        }
+    }
+    Ok(())
+}
+
 fn check_certification_cache(
     steps: &[Value],
     restore_action: &str,
@@ -804,9 +1123,25 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
             "windows-provider-lifecycle",
             "windows-package-channel",
             "windows-loader-lab",
+            "standard-linux",
+            "standard-windows",
         ],
         "backend certification jobs",
     )?;
+    for (name, contract) in [
+        ("standard-linux", crate::standard_contract::LINUX),
+        ("standard-windows", crate::standard_contract::WINDOWS),
+    ] {
+        check_standard_certification_job(
+            mapping(
+                jobs.get(key(name))
+                    .ok_or_else(|| failure("missing standard certification job"))?,
+                name,
+            )?,
+            contract,
+            false,
+        )?;
+    }
 
     let linux_dependency_key = "cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}";
     let linux_target_key = "cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}";
@@ -1707,9 +2042,88 @@ fn check_release_structure(
             "linux-certification",
             "windows-package-channel",
             "macos-acceptance",
+            "linux-standard-certification",
+            "windows-standard-certification",
         ],
         "release assemble dependencies",
     )?;
+    let assemble_steps = certification_steps(assemble, "release assemble")?;
+    let expected_steps = [
+        (
+            "uses",
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        ),
+        (
+            "uses",
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        ),
+        (
+            "uses",
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        ),
+        ("run", "rustup toolchain install 1.97.1 --profile minimal"),
+        (
+            "run",
+            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- release assemble",
+        ),
+        (
+            "uses",
+            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        ),
+    ];
+    if assemble_steps.len() != expected_steps.len() {
+        return Err(failure("release assemble step inventory differs"));
+    }
+    for (step, (field, expected)) in assemble_steps.iter().zip(expected_steps) {
+        let step = mapping(step, "release assemble step")?;
+        if scalar(step, field) != Some(expected) {
+            return Err(failure("release assemble step order differs"));
+        }
+        if expected.starts_with("actions/download-artifact@") {
+            let inputs = mapping(
+                step.get(key("with"))
+                    .ok_or_else(|| failure("assemble download inputs absent"))?,
+                "assemble download inputs",
+            )?;
+            if scalar(inputs, "pattern") != Some("release-*")
+                || scalar(inputs, "path") != Some("target/ci/release-inputs")
+                || inputs.get(key("merge-multiple")) != Some(&Value::Bool(false))
+                || step.contains_key(key("if"))
+            {
+                return Err(failure(
+                    "release assemble must download every separately named producer artifact",
+                ));
+            }
+        }
+        if expected.starts_with("actions/upload-artifact@") {
+            let inputs = mapping(
+                step.get(key("with"))
+                    .ok_or_else(|| failure("assemble upload inputs absent"))?,
+                "assemble upload inputs",
+            )?;
+            if scalar(inputs, "name") != Some("release-bundle")
+                || scalar(inputs, "path") != Some("target/ci/release-bundle")
+                || scalar(inputs, "if-no-files-found") != Some("error")
+                || step.contains_key(key("if"))
+            {
+                return Err(failure("release assemble bundle upload differs"));
+            }
+        }
+    }
+    for contract in [
+        crate::standard_contract::LINUX,
+        crate::standard_contract::WINDOWS,
+    ] {
+        check_standard_certification_job(
+            mapping(
+                jobs.get(key(contract.release_job))
+                    .ok_or_else(|| failure("missing release standard certification job"))?,
+                contract.release_job,
+            )?,
+            contract,
+            true,
+        )?;
+    }
     let publish = mapping(
         jobs.get(key("publish"))
             .ok_or_else(|| failure("release publish job is absent"))?,
@@ -2797,9 +3211,9 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
         root,
         "crates/memcordon-core/src/report.rs",
         &[
-            "pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 8;",
-            "pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 7;",
-            "pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 5;",
+            "pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 9;",
+            "pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 8;",
+            "pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 6;",
             "pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 2;",
         ],
         &[],
@@ -2820,15 +3234,15 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
     require_credential_transition_fragments(
         root,
         "crates/memcordon-cli/src/bin/memcordon-sealed-agent/protocol.rs",
-        &["pub const PROTOCOL_VERSION: u16 = 2;"],
+        &["pub const PROTOCOL_VERSION: u16 = 3;"],
         &["linux-pid-namespace-cgroup-v1"],
     )?;
     require_credential_transition_fragments(
         root,
         "crates/memcordon-cli/src/bin/memcordon-sealed-agent/request.rs",
         &[
-            "pub const LAUNCH_REQUEST_VERSION: u16 = 2;",
-            "pub const LAUNCH_BROKER_REQUEST_VERSION: u16 = 2;",
+            "pub const LAUNCH_REQUEST_VERSION: u16 = 3;",
+            "pub const LAUNCH_BROKER_REQUEST_VERSION: u16 = 3;",
             "CallerExecutionEnvelopeV2",
             "LaunchBrokerRequestV2",
             "request_digest",
@@ -2842,7 +3256,7 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
         root,
         "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/qualification.rs",
         &[
-            "schema_version: 2",
+            "schema_version: 3",
             "linux-pid-namespace-cgroup-v2",
             "preserve-caller-envelope",
             "setid_transition_certification_digest",

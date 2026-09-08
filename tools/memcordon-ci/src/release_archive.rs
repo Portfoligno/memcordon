@@ -19,12 +19,14 @@ pub const NATIVE_ARCHIVE_STATIC_PATHS: &[&str] = &[
     "docs/reference.md",
     "docs/sealed-provider.md",
     "docs/sealed-supervision.md",
+    "docs/spec-workload-contract-v1.md",
     "docs/assets/banner.png",
     "docs/assets/key-guarantees.png",
     "spec/sealed-linux-v2.md",
     "spec/sealed-provider-protocol-v2.md",
     "spec/sealed-windows-provider-v1.md",
     "spec/sealed-windows-v2.md",
+    "spec/windows-causal-diagnostics-v1.md",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

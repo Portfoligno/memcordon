@@ -13,6 +13,8 @@ use memcordon_core::{
     WindowsMutantKillEvidenceV1, WindowsQualificationReceiptV1, WindowsTokenMatrixEvidenceV1,
 };
 
+use crate::certification_context::ExpectedCertificationOrigin;
+use crate::standard_contract::{self, LINUX, WINDOWS};
 use crate::{CiError, Result};
 
 const MAXIMUM_CERTIFICATION_REPORT_BYTES: u64 = 64 * 1024;
@@ -31,6 +33,8 @@ const LINUX_SEALED_FILES: &[&str] = &[
     "cleanup-leak-check.json",
 ];
 pub const LINUX_SEALED_TESTS: &[&str] = &[
+    "native_exact_grant_epoch_and_terminal_checkpoint_are_enforced",
+    "native_tcp_requirement_preserves_baseline_authority",
     "qualification_fails_closed_without_root_provider",
     "qualification_receipt_requires_complete_retirement",
     "sealed_direct_exit_retires_fresh_boundary",
@@ -140,6 +144,8 @@ pub struct CertificationRecord {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ReportKind {
+    StandardLinux,
+    StandardWindows,
     LinuxSealed,
     WindowsSplit,
     Macos,
@@ -175,6 +181,26 @@ struct SplitWindowsCertificationV1 {
 }
 
 const REPORTS: &[ReportSpec] = &[
+    ReportSpec {
+        record_key: LINUX.manifest_key,
+        backend: LINUX.backend_name,
+        artifact_directory: LINUX.release_artifact,
+        report_name: LINUX.report_name,
+        evidence_path: LINUX.bundle_path,
+        kind: ReportKind::StandardLinux,
+        architecture: Some("x86_64"),
+        runner_label: Some(LINUX.runner_label),
+    },
+    ReportSpec {
+        record_key: WINDOWS.manifest_key,
+        backend: WINDOWS.backend_name,
+        artifact_directory: WINDOWS.release_artifact,
+        report_name: WINDOWS.report_name,
+        evidence_path: WINDOWS.bundle_path,
+        kind: ReportKind::StandardWindows,
+        architecture: Some("x86_64"),
+        runner_label: Some(WINDOWS.runner_label),
+    },
     ReportSpec {
         record_key: "linux-pid-namespace-cgroup-v2",
         backend: "linux-pid-namespace-cgroup-v2",
@@ -280,6 +306,8 @@ struct LinuxSealedScenarioReport {
 #[serde(deny_unknown_fields)]
 struct LinuxQualificationReceipt {
     schema_version: u32,
+    workload_profile: memcordon_core::workload_contract::ProfileRef,
+    workload_profile_probe_verified: bool,
     version: String,
     mechanism: String,
     provider_identity: String,
@@ -624,7 +652,6 @@ struct WindowsStatusMatrixEvidence {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
 struct WindowsPackageInspectionV3 {
     schema_version: u32,
     version: String,
@@ -689,9 +716,52 @@ struct WindowsPackageInspectionV4 {
     target_desktop_bootstrap_loader_contract_sha256: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WindowsPackageInspectionV5 {
+    base: WindowsPackageInspectionV4,
+    native_protocols: memcordon_core::runtime_manifest::NativeProviderProtocols,
+    runtime_manifest_schema: u32,
+    workload_contract_schema: u32,
+    profile_catalog_sha256: String,
+}
+
+impl<'de> Deserialize<'de> for WindowsPackageInspectionV5 {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| D::Error::custom("inspection must be an object"))?;
+        fn take<T: serde::de::DeserializeOwned, E: serde::de::Error>(
+            object: &mut serde_json::Map<String, serde_json::Value>,
+            key: &str,
+        ) -> std::result::Result<T, E> {
+            let value = object
+                .remove(key)
+                .ok_or_else(|| E::custom(format!("missing inspection field: {key}")))?;
+            serde_json::from_value(value).map_err(E::custom)
+        }
+        let native_protocols = take::<_, D::Error>(object, "native_protocols")?;
+        let runtime_manifest_schema = take::<_, D::Error>(object, "runtime_manifest_schema")?;
+        let workload_contract_schema = take::<_, D::Error>(object, "workload_contract_schema")?;
+        let profile_catalog_sha256 = take::<_, D::Error>(object, "profile_catalog_sha256")?;
+        let base = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Self {
+            base,
+            native_protocols,
+            runtime_manifest_schema,
+            workload_contract_schema,
+            profile_catalog_sha256,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(untagged)]
 enum WindowsPackageInspection {
+    V5(WindowsPackageInspectionV5),
     V3(WindowsPackageInspectionV3),
     V4(WindowsPackageInspectionV4),
 }
@@ -720,9 +790,26 @@ struct WindowsInstalledProviderInspectionV4 {
     qualification_complete: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsInstalledProviderInspectionV5 {
+    schema_version: u32,
+    agent: WindowsPackageInspectionV5,
+    installed_executable_sha256: String,
+    installed_artifacts_valid: bool,
+    provider_identity: Option<String>,
+    provider_reachable: bool,
+    qualification_complete: bool,
+    policy: memcordon_core::runtime_manifest::InstalledPolicyObservationV1,
+    profile_qualification: memcordon_core::runtime_manifest::QualificationArtifactReferenceV1,
+    diagnostic_qualification:
+        Option<memcordon_core::runtime_manifest::QualificationArtifactReferenceV1>,
+}
+
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 #[serde(untagged)]
 enum WindowsInstalledProviderInspection {
+    V5(WindowsInstalledProviderInspectionV5),
     V3(WindowsInstalledProviderInspectionV3),
     V4(WindowsInstalledProviderInspectionV4),
 }
@@ -796,12 +883,15 @@ impl WindowsPackageInspectionV3 {
 
 impl WindowsPackageInspectionV4 {
     fn valid(&self, expected_commit: &str) -> bool {
+        self.semantic_valid(expected_commit, 4)
+    }
+    fn semantic_valid(&self, expected_commit: &str, schema: u32) -> bool {
         let imports = memcordon_core::WindowsPeImports {
             machine: 0,
             normal: self.target_desktop_bootstrap_normal_imports.clone(),
             delayed: self.target_desktop_bootstrap_delayed_imports.clone(),
         };
-        self.base.semantic_valid(expected_commit, 4)
+        self.base.semantic_valid(expected_commit, schema)
             && self.target_desktop_bootstrap_runtime
                 == TargetDesktopBootstrapRuntimeV4::StaticVcRuntimeOsUcrt
             && !self.target_desktop_bootstrap_normal_imports.is_empty()
@@ -812,12 +902,19 @@ impl WindowsPackageInspectionV4 {
     }
 }
 
-impl WindowsPackageInspection {
+impl WindowsPackageInspectionV5 {
     fn valid(&self, expected_commit: &str) -> bool {
-        match self {
-            Self::V3(inspection) => inspection.valid(expected_commit),
-            Self::V4(inspection) => inspection.valid(expected_commit),
-        }
+        self.base.semantic_valid(expected_commit, 5)
+            && self.native_protocols
+                == (memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
+                    provider_contract: 3,
+                    public_wire: 2,
+                    private_wire: 2,
+                })
+            && self.runtime_manifest_schema == 2
+            && self.workload_contract_schema == 1
+            && self.profile_catalog_sha256
+                == memcordon_core::runtime_manifest::baseline_catalog_digest(true)
     }
 }
 
@@ -954,14 +1051,33 @@ fn validate_windows_auxiliary(
 ) -> Result<()> {
     match name {
         "windows-package-inspection.json" => {
-            let inspection: WindowsPackageInspection = serde_json::from_slice(bytes)?;
+            let inspection: WindowsPackageInspectionV5 = serde_json::from_slice(bytes)?;
             if !inspection.valid(expected_commit) {
                 return Err(failure("Windows package inspection is incomplete"));
             }
         }
         "windows-installed-provider.json" => {
             let inspection: WindowsInstalledProviderInspection = serde_json::from_slice(bytes)?;
+            if !matches!(&inspection, WindowsInstalledProviderInspection::V5(_)) {
+                return Err(failure(
+                    "current release requires installed package inspection schema 5",
+                ));
+            }
             let complete = match &inspection {
+                WindowsInstalledProviderInspection::V5(inspection) => {
+                    let target = match expected_architecture {
+                        "aarch64" => "aarch64-pc-windows-msvc",
+                        "x86_64" => "x86_64-pc-windows-msvc",
+                        _ => return Err(failure("unsupported Windows inspection architecture")),
+                    };
+                    inspection.schema_version == 5 && inspection.agent.valid(expected_commit)
+                        && inspection.installed_executable_sha256 == inspection.agent.base.base.executable_sha256
+                        && inspection.installed_artifacts_valid && inspection.provider_identity.is_some()
+                        && inspection.provider_reachable && inspection.qualification_complete
+                        && inspection.policy.valid_for(memcordon_core::workload_registry::BaselineProfile::WindowsHostNetworkExternal)
+                        && inspection.profile_qualification == memcordon_core::runtime_manifest::profile_qualification_reference(target)
+                        && inspection.diagnostic_qualification == memcordon_core::runtime_manifest::diagnostic_qualification_reference(target)
+                }
                 WindowsInstalledProviderInspection::V3(inspection) => {
                     inspection.schema_version == 3
                         && inspection.agent.valid(expected_commit)
@@ -1150,6 +1266,10 @@ fn validate_windows_cross_report_bindings(directory: &Path, cleanup: &[u8]) -> R
         serde_json::from_slice(&read_report(&directory.join("windows-qualification.json"))?)?;
     let package_matches_installation = match (&package, &installed) {
         (
+            WindowsPackageInspection::V5(package),
+            WindowsInstalledProviderInspection::V5(installed),
+        ) => package == &installed.agent,
+        (
             WindowsPackageInspection::V3(package),
             WindowsInstalledProviderInspection::V3(installed),
         ) => package == &installed.agent,
@@ -1160,6 +1280,9 @@ fn validate_windows_cross_report_bindings(directory: &Path, cleanup: &[u8]) -> R
         _ => false,
     };
     let provider_identity = match &installed {
+        WindowsInstalledProviderInspection::V5(inspection) => {
+            inspection.provider_identity.as_deref()
+        }
         WindowsInstalledProviderInspection::V3(inspection) => {
             inspection.provider_identity.as_deref()
         }
@@ -1240,7 +1363,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn read_report(path: &Path) -> Result<Vec<u8>> {
+pub fn read_report(path: &Path) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
         return Err(failure(format!(
@@ -1254,7 +1377,12 @@ fn read_report(path: &Path) -> Result<Vec<u8>> {
             path.display()
         )));
     }
-    let bytes = fs::read(path)?;
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, MAXIMUM_CERTIFICATION_REPORT_BYTES + 1),
+        &mut bytes,
+    )?;
     if u64::try_from(bytes.len()).map_or(true, |length| length > MAXIMUM_CERTIFICATION_REPORT_BYTES)
     {
         return Err(failure(format!(
@@ -1354,7 +1482,7 @@ fn validate_split_windows_certification(
         "aarch64" => "aarch64-pc-windows-msvc",
         _ => return Err(failure("unsupported Windows release architecture")),
     };
-    let expected_names: BTreeSet<&str> = [
+    let mut expected_names: BTreeSet<&str> = [
         "production-result.json",
         "production-manifest.json",
         "lifecycle-outcomes.json",
@@ -1367,6 +1495,11 @@ fn validate_split_windows_certification(
     ]
     .into_iter()
     .collect();
+    for (_, name, target, _) in crate::workload_qualification::ARTIFACTS {
+        if target == expected_target {
+            expected_names.insert(name);
+        }
+    }
     if report.schema_version != 1
         || report.backend != spec.backend
         || !report.certified
@@ -1564,7 +1697,10 @@ fn validate_linux_concurrency(report: &LinuxConcurrencyReport, expected_commit: 
 fn linux_provider_binding(directory: &Path) -> Result<LinuxProviderBinding> {
     let qualification_bytes = read_report(&directory.join("provider-qualification-v2.json"))?;
     let qualification: LinuxQualificationReceipt = serde_json::from_slice(&qualification_bytes)?;
-    if qualification.schema_version != 2
+    if qualification.schema_version != 3
+        || !qualification.workload_profile_probe_verified
+        || qualification.workload_profile
+            != memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference()
         || qualification.version != env!("CARGO_PKG_VERSION")
         || qualification.mechanism != "linux-pid-namespace-cgroup-v2"
         || qualification.provider_identity.is_empty()
@@ -1840,7 +1976,10 @@ fn linux_qualification_complete(
     report: &LinuxQualificationReceipt,
     binding: &LinuxProviderBinding,
 ) -> bool {
-    report.schema_version == 2
+    report.schema_version == 3
+        && report.workload_profile_probe_verified
+        && report.workload_profile
+            == memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference()
         && report.mechanism == "linux-pid-namespace-cgroup-v2"
         && report.provider_identity == binding.provider_identity
         && report.control_service_identity == "memcordon-sealed-agent.service:v2"
@@ -1951,7 +2090,7 @@ fn validate_linux_auxiliary(
         "provider-qualification-v2.json" => {
             let report: LinuxQualificationReceipt = serde_json::from_slice(bytes)?;
             if !linux_qualification_complete(&report, binding) {
-                return Err(failure("Linux qualification v2 evidence is incomplete"));
+                return Err(failure("Linux qualification v3 evidence is incomplete"));
             }
         }
         "setid-transition.json" | "sudo-transition.json" | "file-capability-transition.json" => {
@@ -2082,11 +2221,16 @@ fn validate_artifact_inventory(input: &Path) -> Result<()> {
         }
         if !matches!(spec.kind, ReportKind::WindowsSplit) {
             let entries = fs::read_dir(&directory)?.collect::<std::io::Result<Vec<_>>>()?;
-            let expected: BTreeSet<&str> = match spec.kind {
+            let mut expected: BTreeSet<&str> = match spec.kind {
                 ReportKind::LinuxSealed => LINUX_SEALED_FILES.iter().copied().collect(),
-                ReportKind::Macos => [spec.report_name].into_iter().collect(),
+                ReportKind::Macos | ReportKind::StandardLinux | ReportKind::StandardWindows => {
+                    [spec.report_name].into_iter().collect()
+                }
                 ReportKind::WindowsSplit => unreachable!(),
             };
+            if spec.kind == ReportKind::LinuxSealed {
+                expected.insert("linux-profile-qualification.json");
+            }
             let actual: BTreeSet<String> = entries
                 .iter()
                 .map(|entry| {
@@ -2153,6 +2297,48 @@ fn validate_output_inventory(output: &Path) -> Result<()> {
             .file_name()
             .into_string()
             .map_err(|_| failure("release certification evidence name is not UTF-8"))?;
+        if name == "standard" && entry.file_type()?.is_dir() {
+            let actual: BTreeSet<String> = fs::read_dir(entry.path())?
+                .map(|entry| {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
+                        return Err(failure("standard evidence must be a regular file"));
+                    }
+                    entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| failure("standard evidence filename is not UTF-8"))
+                })
+                .collect::<Result<_>>()?;
+            let expected = [LINUX.report_name.to_owned(), WINDOWS.report_name.to_owned()]
+                .into_iter()
+                .collect();
+            if actual != expected {
+                return Err(failure("standard evidence inventory differs"));
+            }
+            continue;
+        }
+        if name == "workload" && entry.file_type()?.is_dir() {
+            let actual: BTreeSet<_> = fs::read_dir(entry.path())?
+                .map(|file| {
+                    let file = file?;
+                    if !file.file_type()?.is_file() {
+                        return Err(failure("workload certification entry must be regular"));
+                    }
+                    file.file_name()
+                        .into_string()
+                        .map_err(|_| failure("workload qualification filename is not UTF-8"))
+                })
+                .collect::<Result<_>>()?;
+            let expected: BTreeSet<String> = crate::workload_qualification::ARTIFACTS
+                .into_iter()
+                .map(|(_, name, _, _)| name.into())
+                .collect();
+            if actual != expected {
+                return Err(failure("workload qualification inventory differs"));
+            }
+            continue;
+        }
         if name == "linux-sealed-v2" && entry.file_type()?.is_dir() {
             let actual: BTreeSet<String> = fs::read_dir(entry.path())?
                 .map(|item| {
@@ -2208,8 +2394,9 @@ fn validate_output_inventory(output: &Path) -> Result<()> {
 pub fn collect_certification(
     input: &Path,
     output: &Path,
-    expected_commit: &str,
+    expected: &ExpectedCertificationOrigin,
 ) -> Result<BTreeMap<String, CertificationRecord>> {
+    let expected_commit = expected.source_commit.as_str();
     validate_artifact_inventory(input)?;
     validate_output_inventory(output)?;
 
@@ -2248,16 +2435,58 @@ pub fn collect_certification(
     }
 
     let mut validated = Vec::new();
+    let mut linux_auxiliary = BTreeMap::new();
+    let mut workload_auxiliary = BTreeMap::new();
     for spec in REPORTS {
         let path = input.join(spec.artifact_directory).join(spec.report_name);
         let bytes = read_report(&path)?;
+        for (directory, name, target, kind) in crate::workload_qualification::ARTIFACTS {
+            if directory != spec.artifact_directory {
+                continue;
+            }
+            let base = input.join(directory);
+            let auxiliary = read_report(&if spec.kind == ReportKind::WindowsSplit {
+                base.join("release-evidence").join(name)
+            } else {
+                base.join(name)
+            })?;
+            let artifact: crate::workload_qualification::QualificationArtifactV1 =
+                serde_json::from_slice(&auxiliary)?;
+            artifact.validate(kind, target, expected_commit)?;
+            if spec.kind == ReportKind::WindowsSplit {
+                let report: SplitWindowsCertificationV1 = serde_json::from_slice(&bytes)?;
+                if report.evidence_bindings.get(name) != Some(&sha256_bytes(&auxiliary)) {
+                    return Err(failure(
+                        "workload qualification differs from split certificate binding",
+                    ));
+                }
+            }
+            workload_auxiliary.insert(name, auxiliary);
+        }
         match spec.kind {
+            ReportKind::StandardLinux | ReportKind::StandardWindows => {
+                let contract = if spec.kind == ReportKind::StandardLinux {
+                    LINUX
+                } else {
+                    WINDOWS
+                };
+                let report = serde_json::from_slice(&bytes)?;
+                standard_contract::validate_report(
+                    &report,
+                    contract,
+                    expected_commit,
+                    Some(expected),
+                )?;
+            }
             ReportKind::LinuxSealed => {
                 let binding = linux_provider_binding(&input.join(spec.artifact_directory))?;
                 validate_linux_sealed_report(&bytes, expected_commit, &binding)?;
                 for name in LINUX_SEALED_FILES {
                     let auxiliary = read_report(&input.join(spec.artifact_directory).join(name))?;
                     validate_linux_auxiliary(name, &auxiliary, expected_commit, &binding)?;
+                    if *name != "cleanup-leak-check.json" {
+                        linux_auxiliary.insert(*name, auxiliary);
+                    }
                 }
             }
             ReportKind::WindowsSplit => validate_split_windows_certification(
@@ -2275,9 +2504,25 @@ pub fn collect_certification(
         });
     }
 
+    fs::create_dir_all(output)?;
+    let staging = tempfile::tempdir_in(output)?;
+    let destination_root = output;
+    let output = staging.path();
     let evidence_directory = output.join("certification");
     fs::create_dir_all(&evidence_directory)?;
     let mut records = BTreeMap::new();
+    fs::create_dir_all(evidence_directory.join("workload"))?;
+    for (name, bytes) in workload_auxiliary {
+        let relative = format!("certification/workload/{name}");
+        fs::write(output.join(&relative), &bytes)?;
+        records.insert(
+            format!("workload/{name}"),
+            CertificationRecord {
+                evidence_path: relative,
+                sha256: sha256_bytes(&bytes),
+            },
+        );
+    }
     for report in validated {
         let destination = output.join(report.spec.evidence_path);
         fs::create_dir_all(
@@ -2286,31 +2531,110 @@ pub fn collect_certification(
                 .ok_or_else(|| failure("certification evidence path has no parent"))?,
         )?;
         fs::write(&destination, report.bytes)?;
-        records.insert(
-            report.spec.record_key.to_owned(),
-            CertificationRecord {
-                evidence_path: report.spec.evidence_path.to_owned(),
-                sha256: report.sha256,
-            },
-        );
+        if records
+            .insert(
+                report.spec.record_key.to_owned(),
+                CertificationRecord {
+                    evidence_path: report.spec.evidence_path.to_owned(),
+                    sha256: report.sha256,
+                },
+            )
+            .is_some()
+        {
+            return Err(failure("duplicate certification record key"));
+        }
     }
-    let linux_input = input.join("release-certification-linux");
     let linux_output = evidence_directory.join("linux-sealed-v2");
     fs::create_dir_all(&linux_output)?;
-    for name in LINUX_SEALED_FILES {
-        if *name == "cleanup-leak-check.json" {
-            continue;
-        }
-        let bytes = read_report(&linux_input.join(name))?;
+    for (name, bytes) in linux_auxiliary {
         let relative = format!("certification/linux-sealed-v2/{name}");
         fs::write(output.join(&relative), &bytes)?;
-        records.insert(
-            format!("linux-pid-namespace-cgroup-v2/{name}"),
-            CertificationRecord {
-                evidence_path: relative,
-                sha256: sha256_bytes(&bytes),
-            },
+        if records
+            .insert(
+                format!("linux-pid-namespace-cgroup-v2/{name}"),
+                CertificationRecord {
+                    evidence_path: relative,
+                    sha256: sha256_bytes(&bytes),
+                },
+            )
+            .is_some()
+        {
+            return Err(failure("duplicate auxiliary certification record key"));
+        }
+    }
+    validate_required_certification_records(&records, expected, |path| {
+        read_report(&output.join(path))
+    })?;
+    let final_directory = destination_root.join("certification");
+    if final_directory.exists() {
+        return Err(failure(
+            "certification publication requires a fresh destination",
+        ));
+    }
+    fs::rename(evidence_directory, final_directory)?;
+    Ok(records)
+}
+
+pub fn validate_required_certification_records(
+    records: &BTreeMap<String, CertificationRecord>,
+    origin: &ExpectedCertificationOrigin,
+    mut resolve: impl FnMut(&str) -> Result<Vec<u8>>,
+) -> Result<()> {
+    let mut expected: BTreeMap<String, String> = REPORTS
+        .iter()
+        .map(|spec| (spec.record_key.into(), spec.evidence_path.into()))
+        .collect();
+    for (_, name, _, _) in crate::workload_qualification::ARTIFACTS {
+        expected.insert(
+            format!("workload/{name}"),
+            format!("certification/workload/{name}"),
         );
     }
-    Ok(records)
+    for name in LINUX_SEALED_FILES
+        .iter()
+        .filter(|name| **name != "cleanup-leak-check.json")
+    {
+        expected.insert(
+            format!("linux-pid-namespace-cgroup-v2/{name}"),
+            format!("certification/linux-sealed-v2/{name}"),
+        );
+    }
+    if records.len() != expected.len() {
+        return Err(failure("release certification obligation count differs"));
+    }
+    for (key, path) in expected {
+        let record = records
+            .get(&key)
+            .ok_or_else(|| failure("required certification record missing"))?;
+        if record.evidence_path != path || !valid_sha256(&record.sha256) {
+            return Err(failure("certification record identity differs"));
+        }
+        let bytes = resolve(&path)?;
+        if !bytes.ends_with(b"\n")
+            || bytes.len()
+                > usize::try_from(MAXIMUM_CERTIFICATION_REPORT_BYTES)
+                    .expect("certificate bound fits usize")
+            || sha256_bytes(&bytes) != record.sha256
+        {
+            return Err(failure("certification evidence bytes differ"));
+        }
+        for contract in [LINUX, WINDOWS] {
+            if key == contract.manifest_key {
+                standard_contract::validate_report(
+                    &serde_json::from_slice(&bytes)?,
+                    contract,
+                    &origin.source_commit,
+                    Some(origin),
+                )?;
+            }
+        }
+        for (_, name, target, kind) in crate::workload_qualification::ARTIFACTS {
+            if key == format!("workload/{name}") {
+                let artifact: crate::workload_qualification::QualificationArtifactV1 =
+                    serde_json::from_slice(&bytes)?;
+                artifact.validate(kind, target, &origin.source_commit)?;
+            }
+        }
+    }
+    Ok(())
 }

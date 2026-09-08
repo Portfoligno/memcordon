@@ -57,6 +57,16 @@ impl Scenario {
 
 const SCENARIOS: &[Scenario] = &[
     Scenario {
+        test_module: "native_workload_admission",
+        name: "native_exact_grant_epoch_and_terminal_checkpoint_are_enforced",
+        class: "workload-admission",
+    },
+    Scenario {
+        test_module: "native_workload_admission",
+        name: "native_tcp_requirement_preserves_baseline_authority",
+        class: "workload-admission",
+    },
+    Scenario {
         test_module: "linux_provider",
         name: "qualification_fails_closed_without_root_provider",
         class: "qualification",
@@ -302,6 +312,8 @@ const SCENARIOS: &[Scenario] = &[
 #[serde(deny_unknown_fields)]
 struct QualificationReceipt {
     schema_version: u32,
+    workload_profile: memcordon_core::workload_contract::ProfileRef,
+    workload_profile_probe_verified: bool,
     version: String,
     mechanism: String,
     provider_identity: String,
@@ -345,7 +357,10 @@ struct QualificationReceipt {
 
 impl QualificationReceipt {
     fn validate(&self) -> Result<()> {
-        let complete = self.schema_version == 2
+        let complete = self.schema_version == 3
+            && self.workload_profile
+                == memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference()
+            && self.workload_profile_probe_verified
             && self.version == env!("CARGO_PKG_VERSION")
             && self.mechanism == MECHANISM
             && self.provider_identity == "memcordon-sealed-agent-v2"
@@ -1781,7 +1796,7 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
         memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
         memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
         memcordon_core::CLEAN_REPORT_SCHEMA_VERSION,
-    ) != (8, 7, 5, 2)
+    ) != (9, 8, 6, 2)
     {
         return Err(CiError::Message(
             "Linux sealed certification has not been updated for the report schemas".to_owned(),
@@ -1807,8 +1822,7 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
             "--locked",
             "--package",
             "memcordon",
-            "--bin",
-            "memcordon-sealed-agent",
+            "--bins",
         ],
     )?;
     privileged_agent(root, ["package", "install", "--ephemeral-ci"])?;
@@ -1905,6 +1919,14 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
         .collect::<String>();
     let tests_run = u32::try_from(results.len())
         .map_err(|_| CiError::Message("too many sealed scenarios".to_owned()))?;
+    write_json(
+        &report_dir.join("linux-profile-qualification.json"),
+        &memcordon_ci::workload_qualification::QualificationArtifactV1::after_observed_tests(
+            memcordon_ci::workload_qualification::QualificationKind::Profile,
+            "x86_64-unknown-linux-gnu",
+            commit,
+        ),
+    )?;
     let transition_report = |file: &str, scenario: &str, digest: Option<&str>| {
         write_json(
             &report_dir.join(file),

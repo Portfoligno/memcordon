@@ -5,6 +5,13 @@ and elapsed-time limits. Use it when builds, tests, workers, or other commands
 can spawn child processes and need one containment boundary with reliable
 cleanup and exit-status reporting.
 
+Sealed providers can additionally enforce an explicitly granted workload
+contract with `--sealed --workload-contract contract.json`. Admission checks the
+authenticated caller, exact grant and policy epoch before releasing the target;
+it does not add network authority to the provider's existing baseline. See the
+[workload contract specification](docs/spec-workload-contract-v1.md) for registry
+administration, supported profiles, discovery, and qualification requirements.
+
 ![MemCordon command containment overview](docs/assets/banner.png)
 
 ## Install

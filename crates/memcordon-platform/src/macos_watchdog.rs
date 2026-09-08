@@ -266,6 +266,7 @@ pub fn run_attempt(
         .map_err(|error| Error::new(ErrorCategory::Setup, "MCSETUP-STATE", error.to_string()))?;
     let authorized = Instant::now();
     let mut child = spawn_contained(command)?;
+    let mut launch_facts = crate::backend::StandardLaunchFacts::contained_spawn_completed();
     state
         .transition(RunState::SpawnedGated)
         .map_err(|error| Error::new(ErrorCategory::Setup, "MCSETUP-STATE", error.to_string()))?;
@@ -326,6 +327,7 @@ pub fn run_attempt(
         }
     };
     let exit_watcher = ExitWatcher::new(root_pid).ok();
+    launch_facts.record_guardian_spawn_completed();
     let mut known = HashSet::new();
     if let Ok(snapshot) = process_snapshot(root_pid) {
         known.insert(snapshot.identity);
@@ -592,8 +594,9 @@ pub fn run_attempt(
             .collect(),
     };
     let (launch, restart_safety, boundary_detail) =
-        crate::backend::standard_execution_evidence(&backend, cleanup_facts);
+        crate::backend::standard_execution_evidence(&backend, launch_facts, cleanup_facts);
     Ok(Execution {
+        policy_enforcement: Default::default(),
         outcome,
         backend,
         child_pid,

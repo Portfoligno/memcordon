@@ -219,6 +219,8 @@ fn request_for_program(
     absolute_deadline_millis: u64,
 ) -> LaunchRequestV2 {
     LaunchRequestV2 {
+        restart_attempt: 0,
+        workload_contract: None,
         program: program.as_os_str().as_encoded_bytes().to_vec(),
         arguments: vec![mode.as_bytes().to_vec()],
         environment: Vec::new(),

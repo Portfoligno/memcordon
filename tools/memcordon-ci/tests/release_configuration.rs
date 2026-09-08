@@ -92,7 +92,7 @@ fn canonical_fallback_configuration_derives_the_release_bound_dynamically() {
     }
     config::validate_registry_credentials(&release, &actual_release)
         .expect("the actual release version should validate dynamically");
-    assert_eq!(release.schema_version, 3);
+    assert_eq!(release.schema_version, 4);
     assert_eq!(
         release.registry_credentials.policy,
         config::RegistryCredentialPolicy::OidcFirstNewCrateFallback

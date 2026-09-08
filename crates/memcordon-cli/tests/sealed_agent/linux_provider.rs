@@ -13,6 +13,9 @@ fn qualification_receipt_requires_complete_retirement() {
     {
         let digest = "0".repeat(64);
         let incomplete = crate::linux::qualification::QualificationReceipt {
+            workload_profile: memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate
+                .reference(),
+            workload_profile_probe_verified: false,
             schema_version: 2,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),

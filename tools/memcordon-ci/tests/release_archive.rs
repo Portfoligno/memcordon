@@ -24,12 +24,14 @@ const EXPECTED_STATIC_PATHS: &[&str] = &[
     "docs/reference.md",
     "docs/sealed-provider.md",
     "docs/sealed-supervision.md",
+    "docs/spec-workload-contract-v1.md",
     "docs/assets/banner.png",
     "docs/assets/key-guarantees.png",
     "spec/sealed-linux-v2.md",
     "spec/sealed-provider-protocol-v2.md",
     "spec/sealed-windows-provider-v1.md",
     "spec/sealed-windows-v2.md",
+    "spec/windows-causal-diagnostics-v1.md",
 ];
 
 fn repository_root() -> PathBuf {
@@ -159,7 +161,29 @@ fn native_archive_markdown_links_resolve_within_member_set() {
 }
 
 #[test]
+fn native_archive_markdown_links_require_the_workload_specification() {
+    let mut documents = archive_documents();
+    assert!(
+        documents
+            .remove(Path::new("docs/spec-workload-contract-v1.md"))
+            .is_some()
+    );
+    let error = validate_markdown_documents(&documents)
+        .expect_err("README workload specification link must resolve inside the archive");
+    assert_eq!(
+        error.to_string(),
+        "Markdown link target is absent from package or archive: \"README.md\" -> \"docs/spec-workload-contract-v1.md\""
+    );
+}
+
+#[test]
 fn native_archive_markdown_links_reject_each_missing_sealed_document() {
+    assert_missing_document_link(
+        Path::new("spec/windows-causal-diagnostics-v1.md"),
+        Path::new("spec/sealed-windows-v2.md"),
+        "windows-causal-diagnostics-v1.md",
+        "sealed Windows link to missing causal diagnostics specification must fail",
+    );
     assert_missing_document_link(
         Path::new("docs/sealed-supervision.md"),
         Path::new("docs/reference.md"),

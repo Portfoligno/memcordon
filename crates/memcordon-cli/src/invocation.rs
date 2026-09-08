@@ -49,6 +49,7 @@ Usage:
 
 Budgets and common options:
   --sealed                       Require certified sealed supervision; off
+  --workload-contract PATH        Require exact workload admission; needs --sealed
   +MEMORY                        Memory ceiling; bytes, KB..EB, or KiB..EiB
   +TIME                          Elapsed-time deadline; decimal ms, s, m, or h
   --wait-for command|workload    Terminate remaining members after command exit
@@ -291,7 +292,7 @@ Rules:
             r#"Configure execution reports and optional wrapper output.
 
 Output options (value; default):
-  --report PATH                          Write schema-8 JSON to PATH; unset
+  --report PATH                          Write schema-9 JSON to PATH; unset
   --summary                              Write one final summary line to stderr; off
   --quiet                                Suppress optional wrapper output; off
 
@@ -301,8 +302,8 @@ Rules:
   with --quiet; quiet never suppresses required diagnostics or child streams.
 
 Utility JSON:
-  doctor --json    schema-5
-  plan --json      schema-7
+  doctor --json    schema-6
+  plan --json      schema-8
   clean --json     schema-2
 
 "#
@@ -322,8 +323,8 @@ Usage:
 
 Utilities:
   help      List topics or show one topic
-  doctor    Print the version and selected backend; JSON uses schema-5
-  plan      Resolve policy with launch proof false; JSON uses schema-7
+  doctor    Print the version and selected backend; JSON uses schema-6
+  plan      Resolve policy with launch proof false; JSON uses schema-8
   clean     Inspect or remove stale owned artifacts; JSON uses schema-2
   --version Print one version line
 
@@ -401,6 +402,7 @@ Options:
 
 Containment:
   --sealed                              Require certified sealed supervision; off
+  --workload-contract PATH               Strict workload declaration; requires --sealed
 
   Sealed mode fails before target authorization when the complete contract is
   unavailable and never falls back to standard supervision.
@@ -469,7 +471,7 @@ Circuit breaker (requires --restart or --restart-on):
   and cannot be set by itself.
 
 Output:
-  --report PATH                          Write a schema-8 JSON report; unset
+  --report PATH                          Write a schema-9 JSON report; unset
   --summary                              Final summary line on stderr; off
   --quiet                                Suppress optional MemCordon output; off
 
@@ -488,9 +490,9 @@ Utilities:
   clean [--dry-run] [--json]          Inspect or remove stale owned state
 
 Utility options:
-  doctor --json                       Write schema-5 JSON to stdout; off
+  doctor --json                       Write schema-6 JSON to stdout; off
   doctor --require hard|watchdog|sealed Require the selected backend class; unset
-  plan --json                         Write schema-7 JSON to stdout; off
+  plan --json                         Write schema-8 JSON to stdout; off
   clean --dry-run                     List without removing artifacts; off
   clean --json                        Write schema-2 JSON to stdout; off
 
@@ -522,7 +524,7 @@ Run memcordon help for topic-specific help.
 ];
 
 pub const DOCTOR_USAGE: &str = with_reference!(
-    "Inspect backend availability without launching a workload.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog|sealed]\n\nText prints the version and selected backend; --json prints full capabilities\nand limitations.\n\nOptions (default):\n  --json                         Write schema-5 JSON to stdout; off\n  --require hard|watchdog|sealed Return 125 unless the backend matches; unset\n  -h, --help                     Print this help\n\n"
+    "Inspect backend availability without launching a workload.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog|sealed] [--workload-contract PATH]\n\nText prints the version and selected backend; --json prints full capabilities,\nlimitations, and authenticated caller-filtered workload discovery.\n\nOptions (default):\n  --json                         Write schema-6 JSON to stdout; off\n  --require hard|watchdog|sealed Return 125 unless the backend matches; unset\n  --workload-contract PATH       Resolve exact workload requirements; requires --require sealed\n  -h, --help                     Print this help\n\n"
 );
 
 pub const PLAN_USAGE: &str = with_reference!(
@@ -542,6 +544,7 @@ Budgets:
   +TIME      Elapsed-time deadline; decimal ms, s, m, or h
 
 Policy options (value; default):
+  --workload-contract PATH               Strict workload declaration; requires --sealed
   --sealed                              Require certified sealed supervision; off
   --enforcement auto|hard|watchdog       Backend requirement; auto
   --wait-for command|workload            Clean on direct-command exit or wait for workload empty; command
@@ -564,7 +567,7 @@ Policy options (value; default):
   --circuit-threshold SCORE              Decayed failure pressure to open; unset
   --circuit-cooldown DURATION            Minimum circuit quarantine; unset
   --circuit-half-life DURATION           Failure-pressure half-life; backoff half-life
-  --json                                 Write schema-7 JSON to stdout; off
+  --json                                 Write schema-8 JSON to stdout; off
   -h, --help                             Print this help
 
 Rules:
@@ -737,6 +740,7 @@ impl LimitToken {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicyArgs {
+    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContractV1>,
     pub boundary: BoundaryRequirement,
     pub enforcement: Enforcement,
     pub wait_for: Lifetime,
@@ -780,6 +784,7 @@ pub struct ExplicitPolicyOptions {
 impl Default for PolicyArgs {
     fn default() -> Self {
         Self {
+            workload_contract: None,
             boundary: BoundaryRequirement::Standard,
             enforcement: Enforcement::Auto,
             wait_for: Lifetime::Command,
@@ -824,6 +829,11 @@ impl PolicyArgs {
         policy.command_exit_grace = self.command_exit_grace;
         policy.limit_grace = self.limit_grace;
         policy.swap = self.swap;
+        if let Some(request) = &self.workload_contract {
+            policy = policy
+                .with_workload_contract(request.clone())
+                .expect("validated CLI workload contract remains valid");
+        }
         policy
     }
 }
@@ -854,6 +864,7 @@ pub enum Requirement {
 pub struct DoctorArgs {
     pub json: bool,
     pub requirement: Option<Requirement>,
+    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContractV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1085,6 +1096,7 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
 fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
     let mut json = false;
     let mut requirement = None;
+    let mut workload_policy = PolicyArgs::default();
     let mut index = 0;
     while index < argv.len() {
         let text = strict_text(&argv[index], "doctor option")?;
@@ -1094,6 +1106,9 @@ fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
         let (name, inline_value) = split_option(text);
         match name {
             "--json" if inline_value.is_none() => json = true,
+            "--workload-contract" => {
+                parse_policy_option(name, inline_value, argv, &mut index, &mut workload_policy)?
+            }
             "--require" => {
                 let value = option_value(argv, &mut index, inline_value, name)?;
                 requirement = Some(match value.to_str() {
@@ -1112,7 +1127,17 @@ fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
         }
         index += 1;
     }
-    Ok(Invocation::Doctor(DoctorArgs { json, requirement }))
+    if workload_policy.workload_contract.is_some() && requirement != Some(Requirement::Sealed) {
+        return Err(CliError::new(
+            "MCCLI-DOCTOR-REQUIRE",
+            "--workload-contract requires --require sealed",
+        ));
+    }
+    Ok(Invocation::Doctor(DoctorArgs {
+        json,
+        requirement,
+        workload_contract: workload_policy.workload_contract,
+    }))
 }
 
 fn parse_plan(argv: &[OsString]) -> Result<Invocation, CliError> {
@@ -1300,6 +1325,32 @@ fn parse_policy_option(
     index: &mut usize,
     policy: &mut PolicyArgs,
 ) -> Result<(), CliError> {
+    if name == "--workload-contract" {
+        use std::io::Read;
+        if policy.workload_contract.is_some() {
+            return Err(CliError::new(
+                "MCUSAGE-WORKLOAD-CONTRACT",
+                "--workload-contract may be supplied once",
+            ));
+        }
+        let path = std::path::PathBuf::from(option_value(argv, index, inline_value, name)?);
+        let read = || -> Result<_, String> {
+            let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            let limit = memcordon_core::workload_limits::CONTRACT_BYTES;
+            if !metadata.is_file() || metadata.len() > limit as u64 {
+                return Err("workload contract must be a bounded regular file".into());
+            }
+            let mut bytes = Vec::new();
+            file.take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|error| error.to_string())?;
+            memcordon_core::workload_contract::WorkloadContractV1::parse(&bytes)
+        };
+        policy.workload_contract =
+            Some(read().map_err(|error| CliError::new("MCUSAGE-WORKLOAD-CONTRACT", error))?);
+        return Ok(());
+    }
     if name == "--sealed" {
         if inline_value.is_some() || policy.explicit.boundary {
             return Err(CliError::new(

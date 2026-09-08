@@ -6,6 +6,33 @@ use tempfile::TempDir;
 const IDENTITY: &str = "abababababababababababababababab";
 
 #[test]
+fn production_allocated_and_transitioned_records_pass_strict_recovery_parser() {
+    let temporary = TempDir::new().unwrap();
+    let record = AttemptRecord::create_for_test(temporary.path(), IDENTITY.to_owned(), 1).unwrap();
+    let path = temporary.path().join(IDENTITY);
+    let allocated = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        crate::linux::attempt::parse_durable_policy(&allocated)
+            .unwrap()
+            .is_none()
+    );
+    record.transition("boundary-created").unwrap();
+    let transitioned = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        crate::linux::attempt::parse_durable_policy(&transitioned)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        crate::linux::attempt::parse_durable_policy(
+            &allocated.replace("frontend-pid=1", "frontend-pid=0")
+        )
+        .is_err()
+    );
+    record.retire().unwrap();
+}
+
+#[test]
 fn transition_failure_before_rename_preserves_committed_record_and_removes_owned_temporary() {
     let temporary = TempDir::new().unwrap();
     let record = AttemptRecord::create_for_test(temporary.path(), IDENTITY.to_owned(), 1).unwrap();

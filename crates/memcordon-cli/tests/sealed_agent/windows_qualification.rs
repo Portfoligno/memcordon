@@ -94,6 +94,8 @@ fn fallback_rejection_finalizes_before_staging_bound_terminal_outbox() {
     );
 
     let rejection = memcordon_core::ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-WINDOWS-LAUNCH".to_owned(),
         phase: memcordon_core::BoundarySetupPhase::Retirement,
@@ -187,6 +189,7 @@ fn completed_posttarget_rejection_skips_duplicate_finalization_and_stages_bound_
         errors: Vec::new(),
     };
     let terminal = memcordon_core::WindowsTerminalReceiptV1 {
+        policy_enforcement: Default::default(),
         schema_version: 1,
         attempt_id: record.attempt_id.clone(),
         nonce: nonce.to_owned(),
@@ -214,6 +217,8 @@ fn completed_posttarget_rejection_skips_duplicate_finalization_and_stages_bound_
         ),
     };
     let rejection = memcordon_core::ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: None,
         schema_version: 1,
         code: "MCSEALED-WINDOWS-LAUNCH".to_owned(),
         phase: memcordon_core::BoundarySetupPhase::Retirement,
@@ -482,7 +487,11 @@ fn qualification_pending_diagnostic_preserves_authenticated_terminalization_snap
     let attempt_id = "a7".repeat(32);
     let request_sha256 = "b7".repeat(32);
     let pending = WindowsReplayPendingV1 {
-        schema_version: 2,
+        schema_version: 3,
+        causal_diagnostics: memcordon_core::WindowsCausalDiagnosticsV1::default(),
+        provider_failure: None,
+        diagnostic_availability:
+            memcordon_core::DiagnosticProjectionAvailabilityV1::RecordUnavailable,
         attempt_id: attempt_id.clone(),
         nonce: "cycle-7-qualification-pending".to_owned(),
         request_sha256,

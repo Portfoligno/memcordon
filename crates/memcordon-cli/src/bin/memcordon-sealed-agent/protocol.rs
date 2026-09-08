@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 
 use sha2::{Digest, Sha256};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_LENGTH: usize = 1024 * 1024;
 const DIGEST_LENGTH: usize = 32;
 const HEADER_LENGTH: usize = 2 + 2 + 4 + 16 + 16 + DIGEST_LENGTH;
@@ -17,6 +17,8 @@ pub enum MessageKind {
     BrokerProbe = 5,
     BrokerLaunch = 6,
     BrokerAuthenticate = 7,
+    WorkloadPlan = 8,
+    WorkloadDiscovery = 9,
     ProbeReceipt = 101,
     LaunchPrepared = 102,
     Authorized = 103,
@@ -24,6 +26,8 @@ pub enum MessageKind {
     Terminal = 105,
     Rejected = 106,
     BrokerAuthenticated = 107,
+    WorkloadPlanReceipt = 108,
+    WorkloadDiscoveryReceipt = 109,
 }
 
 impl TryFrom<u16> for MessageKind {
@@ -38,6 +42,8 @@ impl TryFrom<u16> for MessageKind {
             5 => Ok(Self::BrokerProbe),
             6 => Ok(Self::BrokerLaunch),
             7 => Ok(Self::BrokerAuthenticate),
+            8 => Ok(Self::WorkloadPlan),
+            9 => Ok(Self::WorkloadDiscovery),
             101 => Ok(Self::ProbeReceipt),
             102 => Ok(Self::LaunchPrepared),
             103 => Ok(Self::Authorized),
@@ -45,6 +51,8 @@ impl TryFrom<u16> for MessageKind {
             105 => Ok(Self::Terminal),
             106 => Ok(Self::Rejected),
             107 => Ok(Self::BrokerAuthenticated),
+            108 => Ok(Self::WorkloadPlanReceipt),
+            109 => Ok(Self::WorkloadDiscoveryReceipt),
             _ => Err(ProtocolError::UnknownKind(value)),
         }
     }

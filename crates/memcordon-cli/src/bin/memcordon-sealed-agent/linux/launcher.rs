@@ -168,7 +168,9 @@ fn handle(
                     payload: qualification.render().into_bytes(),
                 }
             }
-            MessageKind::BrokerLaunch => launch_response(&request, descriptors, peer)?,
+            MessageKind::BrokerLaunch => {
+                launch_response(&request, descriptors, peer, qualification)?
+            }
             _ => rejected(
                 &request,
                 &RejectionV1::request_error(
@@ -185,6 +187,7 @@ fn launch_response(
     request: &Frame,
     descriptors: Vec<OwnedFd>,
     peer: AuthenticatedPeer,
+    qualification: &super::qualification::QualificationReceipt,
 ) -> Result<Frame, String> {
     let broker = match decode_launch_broker_request(&request.payload) {
         Ok(broker) => broker,
@@ -274,6 +277,7 @@ fn launch_response(
         mount_namespace,
         root,
         record.take(),
+        &qualification.receipt_digest,
     ) {
         Ok(facts) => Ok(Frame {
             kind: MessageKind::Terminal,

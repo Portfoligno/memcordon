@@ -75,3 +75,85 @@ pub fn require_single_test_success(output: &[u8], test_name: &str) -> Result<()>
         )))
     }
 }
+
+pub fn require_certified_standard_backend(probe: &Value, backend: &str) -> Result<()> {
+    require_certified_hard_backend(probe, backend)?;
+    let report: DoctorReport = serde_json::from_value(probe.clone())?;
+    let selected = report
+        .selected
+        .expect("hard backend validation requires selection");
+    let (mechanism, metric) = match backend {
+        "linux-cgroup-v2" => ("gated-cgroup-v2-v1", "linux-cgroup-memory"),
+        "windows-job-object" => ("suspended-job-assignment-v1", "windows-job-commit"),
+        _ => return Err(CiError::Message("unknown ordinary backend".into())),
+    };
+    if selected.boundary.class != memcordon_core::BoundaryClass::Standard
+        || selected.boundary.mechanism != mechanism
+        || !selected.boundary.target_gated
+        || !selected.boundary.boundary_verified_before_authorization
+        || !selected
+            .memory
+            .is_some_and(|memory| memory.metric == metric)
+    {
+        return Err(CiError::Message(
+            "doctor did not select the required ordinary execution route".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Strict libtest transcript parser. The caller must also require a successful process exit.
+pub fn require_exact_standard_test_success(output: &[u8], test_name: &str) -> Result<()> {
+    let invalid = || {
+        CiError::Message(format!(
+            "exact standard test {test_name} has an invalid libtest transcript"
+        ))
+    };
+    if output.len() > 1024 * 1024 {
+        return Err(invalid());
+    }
+    let output = std::str::from_utf8(output).map_err(|_| invalid())?;
+    let mut lines = output.lines().filter(|line| !line.is_empty());
+    if lines.next() != Some("running 1 test") {
+        return Err(invalid());
+    }
+    let name = lines
+        .next()
+        .and_then(|line| line.strip_prefix("test "))
+        .and_then(|line| line.strip_suffix(" ... ok"));
+    if name != Some(test_name) {
+        return Err(invalid());
+    }
+    let summary = lines
+        .next()
+        .and_then(|line| line.strip_prefix("test result: ok. "))
+        .ok_or_else(invalid)?;
+    let (counts, time) = summary.split_once("; finished in ").ok_or_else(invalid)?;
+    let fields: Vec<_> = counts.split("; ").collect();
+    let expected = [
+        (" passed", Some(1_u64)),
+        (" failed", Some(0)),
+        (" ignored", Some(0)),
+        (" measured", Some(0)),
+        (" filtered out", None),
+    ];
+    if fields.len() != expected.len() {
+        return Err(invalid());
+    }
+    for (field, (suffix, required)) in fields.into_iter().zip(expected) {
+        let number: u64 = field
+            .strip_suffix(suffix)
+            .ok_or_else(invalid)?
+            .parse()
+            .map_err(|_| invalid())?;
+        if required.is_some_and(|required| required != number) {
+            return Err(invalid());
+        }
+    }
+    let time = time.strip_suffix('s').ok_or_else(invalid)?;
+    let seconds: f64 = time.parse().map_err(|_| invalid())?;
+    if !seconds.is_finite() || seconds < 0.0 || lines.next().is_some() {
+        return Err(invalid());
+    }
+    Ok(())
+}

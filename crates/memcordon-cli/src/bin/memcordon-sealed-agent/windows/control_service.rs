@@ -75,6 +75,8 @@ unsafe extern "system" fn service_main(_count: u32, _arguments: *mut *mut u16) {
             })?;
         super::record::reconcile_attempt_state()
             .map_err(|error| (STARTUP_STATE_RECONCILIATION, error))?;
+        super::policy_registry::start_service_instance()
+            .map_err(|error| (STARTUP_STATE_RECONCILIATION, error))?;
         let listener = PipeListener::new(
             WINDOWS_CONTROL_PIPE,
             SecurityDescriptor::from_sddl(
@@ -303,6 +305,50 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
     super::record::reharden_attempt_state()?;
     let request: WindowsProviderRequestV1 = pipe::read_frame(public)?;
     match request {
+        WindowsProviderRequestV1::WorkloadDiscovery {
+            schema_version,
+            challenge,
+        } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION => {
+            let mut client_pid = 0;
+            // SAFETY: public is a connected server pipe and output is writable.
+            if unsafe { GetNamedPipeClientProcessId(public, &raw mut client_pid) } == 0 {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            let (_token, envelope, _frontend, _identity) =
+                super::token::authenticate_pipe_client(public, client_pid, None)?;
+            let discovery = crate::admission::discover_windows(&envelope.user_sid)?;
+            pipe::write_frame(
+                public,
+                &WindowsProviderResponseV1::WorkloadDiscovery {
+                    schema_version,
+                    challenge,
+                    discovery,
+                },
+            )
+        }
+        WindowsProviderRequestV1::WorkloadPlan {
+            schema_version,
+            challenge,
+            contract,
+        } if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION => {
+            contract.validate()?;
+            let mut client_pid = 0;
+            // SAFETY: public is the connected server pipe, and output is writable.
+            if unsafe { GetNamedPipeClientProcessId(public, &raw mut client_pid) } == 0 {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            let (_token, envelope, _frontend, _identity) =
+                super::token::authenticate_pipe_client(public, client_pid, None)?;
+            let resolution = crate::admission::inspect_windows(&contract, &envelope.user_sid)?;
+            pipe::write_frame(
+                public,
+                &WindowsProviderResponseV1::WorkloadPlan {
+                    schema_version,
+                    challenge,
+                    resolution,
+                },
+            )
+        }
         WindowsProviderRequestV1::Probe { schema_version }
             if schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
         {
@@ -323,6 +369,7 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                 &WindowsProviderResponseV1::Probe {
                     schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
                     qualification: super::qualification::local_receipt()?,
+                    provider_binding: super::package::installed_public_provider_binding()?,
                 },
             )
         }
@@ -447,6 +494,13 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
         WindowsProviderRequestV1::Launch(launch)
             if launch.schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION =>
         {
+            if launch.expected_provider_binding
+                != super::package::installed_public_provider_binding()?
+            {
+                return Err(
+                    "Windows provider binding changed after the authenticated probe".to_owned(),
+                );
+            }
             let nonce = launch.nonce.clone();
             let request_sha256 = hex(Sha256::digest(
                 serde_json::to_vec(&launch).map_err(|error| error.to_string())?,
@@ -525,10 +579,14 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                                 "terminal was delivered but durable retirement was not confirmed"
                                     .to_owned()
                             };
-                            let retained = super::record::retained_attempt_evidence(
+                            let caller = authenticate_replay_binding(
+                                public,
                                 &binding.attempt_id,
                                 &binding.nonce,
                                 &binding.request_sha256,
+                            )?;
+                            let retained = super::record::retained_attempt_evidence(
+                                &caller,
                                 failure.progress.relay_phase,
                                 primary,
                                 vec![replay_error],
@@ -631,7 +689,7 @@ fn handle_client(public: HANDLE) -> Result<(), String> {
                     schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
                 },
             )?;
-            match pipe::read_frame::<WindowsLauncherResponseV1>(launcher.raw())? {
+            match pipe::read_response_frame::<WindowsLauncherResponseV1>(launcher.raw())? {
                 WindowsLauncherResponseV1::CertificationMachineRestart {
                     schema_version,
                     recovered,
@@ -879,7 +937,7 @@ fn launch_client_inner(
         return Err(membership_transfer.abort(error));
     }
     membership_transfer.disarm();
-    match pipe::read_frame::<WindowsLauncherResponseV1>(launcher.raw())? {
+    match pipe::read_response_frame::<WindowsLauncherResponseV1>(launcher.raw())? {
         WindowsLauncherResponseV1::Membership {
             schema_version,
             attempt_id: returned_attempt,
@@ -1012,10 +1070,41 @@ fn launch_client_inner(
     )
 }
 
-struct ReplayCallerBinding {
+pub(super) struct AuthenticatedAttemptBinding {
+    attempt_id: String,
+    nonce: String,
+    request_sha256: String,
     process_identity: WindowsProcessIdentityV1,
     token_sha256: String,
 }
+type ReplayCallerBinding = AuthenticatedAttemptBinding;
+impl AuthenticatedAttemptBinding {
+    pub(super) fn matches_record(&self, record: &super::record::WindowsAttemptRecordV1) -> bool {
+        self.attempt_id == record.attempt_id
+            && self.request_sha256 == record.request_sha256
+            && self.process_identity == record.caller_process_identity
+            && self.token_sha256 == record.caller_token_sha256
+    }
+    pub(super) fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+    pub(super) fn nonce(&self) -> &str {
+        &self.nonce
+    }
+    pub(super) fn request_sha256(&self) -> &str {
+        &self.request_sha256
+    }
+    pub(super) fn process_identity(&self) -> &WindowsProcessIdentityV1 {
+        &self.process_identity
+    }
+    pub(super) fn token_sha256(&self) -> &str {
+        &self.token_sha256
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../../tests/sealed_agent/windows_retained_binding.rs"]
+mod retained_binding_tests;
 
 fn bound_public_replay_failure_response(
     attempt_id: &str,
@@ -1072,6 +1161,9 @@ fn authenticate_replay_binding(
     let token_sha256 =
         super::record::digest(&serde_json::to_vec(&envelope).map_err(|error| error.to_string())?);
     Ok(ReplayCallerBinding {
+        attempt_id: attempt_id.to_owned(),
+        nonce: nonce.to_owned(),
+        request_sha256: request_sha256.to_owned(),
         process_identity: identity,
         token_sha256,
     })
@@ -1100,9 +1192,10 @@ fn replay_terminal(
             terminalization_error,
         },
     )?;
-    let response = pipe::read_frame::<WindowsLauncherResponseV1>(launcher.raw())?;
+    let response = pipe::read_response_frame::<WindowsLauncherResponseV1>(launcher.raw())?;
     let response_sha256 = super::record::digest(
-        serde_json::to_string(&response)
+        response
+            .terminal_authority_json()
             .map_err(|error| error.to_string())?
             .as_bytes(),
     );
@@ -1178,7 +1271,7 @@ fn replay_terminal(
             terminal_response_sha256: response_sha256.clone(),
         },
     )?;
-    let retired = match pipe::read_frame::<WindowsLauncherResponseV1>(launcher.raw())? {
+    let retired = match pipe::read_response_frame::<WindowsLauncherResponseV1>(launcher.raw())? {
         WindowsLauncherResponseV1::TerminalRetired(retired)
             if retired.is_consistent_for(attempt_id, nonce, request_sha256, &response_sha256) =>
         {
@@ -1396,7 +1489,7 @@ fn converge_launcher_package_cleanup(
             deadline_millis,
         },
     )?;
-    match pipe::read_frame::<WindowsLauncherResponseV1>(launcher.raw())? {
+    match pipe::read_response_frame::<WindowsLauncherResponseV1>(launcher.raw())? {
         WindowsLauncherResponseV1::PackageCleanup {
             schema_version,
             status,
@@ -1443,8 +1536,8 @@ fn launcher_self_attestation_detailed(
     .map_err(|error| {
         LauncherAuthenticationError::new(STARTUP_LAUNCHER_AUTHENTICATION_PROBE_WRITE, error)
     })?;
-    let response = pipe::read_frame_detailed::<WindowsLauncherResponseV1>(launcher.raw()).map_err(
-        |error| {
+    let response = pipe::read_response_frame_detailed::<WindowsLauncherResponseV1>(launcher.raw())
+        .map_err(|error| {
             LauncherAuthenticationError::new(
                 STARTUP_LAUNCHER_AUTHENTICATION_PROBE_READ,
                 format!(
@@ -1452,14 +1545,23 @@ fn launcher_self_attestation_detailed(
                     launcher_identity.process_id, launcher_identity.creation_time_100ns,
                 ),
             )
-        },
-    )?;
+        })?;
     match response {
         WindowsLauncherResponseV1::Probe {
             schema_version,
             attestation,
+            provider_binding,
         } => {
-            if schema_version != WINDOWS_PRIVATE_PROTOCOL_VERSION {
+            let installed_binding =
+                super::package::installed_public_provider_binding().map_err(|error| {
+                    LauncherAuthenticationError::new(
+                        STARTUP_LAUNCHER_AUTHENTICATION_PROBE_ATTESTATION,
+                        error,
+                    )
+                })?;
+            if schema_version != WINDOWS_PRIVATE_PROTOCOL_VERSION
+                || provider_binding != installed_binding
+            {
                 Err(LauncherAuthenticationError::new(
                     STARTUP_LAUNCHER_AUTHENTICATION_PROBE_SCHEMA,
                     "launcher probe response has the wrong schema version",
@@ -1641,9 +1743,10 @@ fn relay_protocol(
 ) -> Result<(), String> {
     loop {
         if pipe::frame_available(launcher)? {
-            let response: WindowsLauncherResponseV1 = pipe::read_frame(launcher)?;
+            let response: WindowsLauncherResponseV1 = pipe::read_response_frame(launcher)?;
             let response_sha256 = super::record::digest(
-                serde_json::to_string(&response)
+                response
+                    .terminal_authority_json()
                     .map_err(|error| error.to_string())?
                     .as_bytes(),
             );
@@ -1910,23 +2013,24 @@ fn relay_protocol(
                             terminal_response_sha256: response_sha256.clone(),
                         },
                     )?;
-                    let retired = match pipe::read_frame::<WindowsLauncherResponseV1>(launcher)? {
-                        WindowsLauncherResponseV1::TerminalRetired(retired)
-                            if retired.is_consistent_for(
-                                expected_attempt_id,
-                                expected_nonce,
-                                expected_request_sha256,
-                                &response_sha256,
-                            ) =>
-                        {
-                            retired
-                        }
-                        _ => {
-                            return Err(
-                                "launcher did not confirm exact terminal retirement".to_owned()
-                            );
-                        }
-                    };
+                    let retired =
+                        match pipe::read_response_frame::<WindowsLauncherResponseV1>(launcher)? {
+                            WindowsLauncherResponseV1::TerminalRetired(retired)
+                                if retired.is_consistent_for(
+                                    expected_attempt_id,
+                                    expected_nonce,
+                                    expected_request_sha256,
+                                    &response_sha256,
+                                ) =>
+                            {
+                                retired
+                            }
+                            _ => {
+                                return Err(
+                                    "launcher did not confirm exact terminal retirement".to_owned()
+                                );
+                            }
+                        };
                     pipe::write_frame(
                         public,
                         &WindowsProviderResponseV1::TerminalRetired(retired),

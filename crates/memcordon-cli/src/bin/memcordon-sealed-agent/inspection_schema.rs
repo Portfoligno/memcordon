@@ -170,3 +170,40 @@ pub struct InstalledProviderInspectionV4 {
     pub provider_reachable: bool,
     pub qualification_complete: bool,
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPackageInspectionV5 {
+    pub schema_version: u32,
+    pub version: String,
+    pub source_commit: String,
+    pub executable_sha256: String,
+    pub provider_protocol: u32,
+    pub native_protocols: memcordon_core::runtime_manifest::NativeProviderProtocols,
+    pub runtime_manifest_schema: u32,
+    pub workload_contract_schema: u32,
+    pub profile_catalog_sha256: String,
+    pub mechanism: String,
+    pub execution_report_schema: u32,
+    pub plan_report_schema: u32,
+    pub doctor_report_schema: u32,
+    #[serde(flatten)]
+    pub platform: ProviderPackageMetadataV4,
+    pub compiled_metadata_valid: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledProviderInspectionV5 {
+    pub schema_version: u32,
+    pub agent: AgentPackageInspectionV5,
+    pub installed_executable_sha256: String,
+    pub installed_artifacts_valid: bool,
+    pub provider_identity: Option<String>,
+    pub provider_reachable: bool,
+    pub qualification_complete: bool,
+    pub policy: memcordon_core::runtime_manifest::InstalledPolicyObservationV1,
+    pub profile_qualification: memcordon_core::runtime_manifest::QualificationArtifactReferenceV1,
+    pub diagnostic_qualification:
+        Option<memcordon_core::runtime_manifest::QualificationArtifactReferenceV1>,
+}

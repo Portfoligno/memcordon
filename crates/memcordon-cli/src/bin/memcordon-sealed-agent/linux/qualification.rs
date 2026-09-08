@@ -17,6 +17,52 @@ fn certification_digest(scenario: &str, expected: &[&str]) -> String {
         .collect()
 }
 
+/// Executed as a sacrificial native target under the inherited, package-verified
+/// systemd address-family filter. It deliberately makes no stronger claim about
+/// alternate kernel networking interfaces or inherited descriptors.
+pub fn workload_profile_probe() -> Result<(), String> {
+    for kind in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+        // SAFETY: socket has only scalar arguments; a successful descriptor is closed below.
+        let descriptor = unsafe { libc::socket(libc::AF_UNIX, kind | libc::SOCK_CLOEXEC, 0) };
+        if descriptor < 0 {
+            return Err("qualified UNIX socket creation failed".into());
+        }
+        // SAFETY: descriptor belongs exclusively to this probe.
+        unsafe { libc::close(descriptor) };
+        let mut pair = [-1; 2];
+        // SAFETY: pair provides the required two initialized descriptor slots.
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                kind | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err("qualified UNIX socketpair failed".into());
+        }
+        for descriptor in pair {
+            // SAFETY: successful socketpair transfers both descriptors to this probe.
+            unsafe { libc::close(descriptor) };
+        }
+    }
+    for family in [libc::AF_INET, libc::AF_INET6] {
+        // SAFETY: socket has no pointer arguments. Capture errno before cleanup.
+        let descriptor = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        let error = std::io::Error::last_os_error().raw_os_error();
+        if descriptor >= 0 {
+            // SAFETY: unexpected successful descriptor is still owned by the probe.
+            unsafe { libc::close(descriptor) };
+            return Err("qualified INET denial was bypassed".into());
+        }
+        if error != Some(libc::EAFNOSUPPORT) {
+            return Err("qualified INET denial errno changed".into());
+        }
+    }
+    Ok(())
+}
+
 pub fn qualify() -> Result<QualificationReceipt, String> {
     verify_provider_identity()?;
     crate::package::verify()?;
@@ -60,6 +106,20 @@ fn qualify_after_package_verification() -> Result<QualificationReceipt, String> 
     require_unambiguous_recovery(&ambiguous_recovery)?;
     let recovery_complete = true;
     let sacrificial = sacrificial_attempt(b"/usr/bin/true");
+    use std::os::unix::ffi::OsStrExt;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let profile_probe = sacrificial_attempt_with_arguments(
+        executable.as_os_str().as_bytes(),
+        vec![b"workload-profile-probe".to_vec()],
+    );
+    let profile_verified = profile_probe.as_ref().is_ok_and(|facts| {
+        facts.child_status == 0
+            && facts.exec_status == super::launch::TargetExecStatus::Succeeded
+            && facts.cgroup_empty
+            && facts.init_reaped
+            && facts.guardian_reaped
+            && facts.boundary_retired
+    });
     let missing_target = b"/run/memcordon/sealed-qualification-target-must-not-exist";
     let missing_target_path = std::path::Path::new(
         std::str::from_utf8(missing_target).expect("fixed qualification path is UTF-8"),
@@ -109,7 +169,10 @@ fn qualify_after_package_verification() -> Result<QualificationReceipt, String> 
             && facts.guardian_reaped
             && facts.boundary_retired
     });
-    let qualified = success_verified && spawn_error_verified && launcher_no_new_privs_disabled;
+    let qualified = success_verified
+        && spawn_error_verified
+        && launcher_no_new_privs_disabled
+        && profile_verified;
     let setid_transition_certification_digest = certification_digest(
         "sealed_setid_transition_preserves_boundary",
         &[
@@ -144,7 +207,10 @@ fn qualify_after_package_verification() -> Result<QualificationReceipt, String> 
         digest.update(facts.caller_envelope_digest.as_bytes());
     }
     let receipt = QualificationReceipt {
-        schema_version: 2,
+        schema_version: 3,
+        workload_profile: memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate
+            .reference(),
+        workload_profile_probe_verified: profile_verified,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
         provider_identity: "memcordon-sealed-agent-v2".to_owned(),
@@ -238,6 +304,13 @@ pub(crate) fn require_unambiguous_recovery(ambiguous_recovery: &[String]) -> Res
 }
 
 fn sacrificial_attempt(program: &[u8]) -> Result<super::launch::TerminalFacts, String> {
+    sacrificial_attempt_with_arguments(program, Vec::new())
+}
+
+fn sacrificial_attempt_with_arguments(
+    program: &[u8],
+    arguments: Vec<Vec<u8>>,
+) -> Result<super::launch::TerminalFacts, String> {
     use crate::request::{
         DeadlineScope, DescriptorPurpose, LaunchPolicyV2, LaunchRequestV2, SwapLimit,
     };
@@ -264,8 +337,10 @@ fn sacrificial_attempt(program: &[u8]) -> Result<super::launch::TerminalFacts, S
     )
     .map_err(|error| error.to_string())?;
     let request = LaunchRequestV2 {
+        restart_attempt: 0,
+        workload_contract: None,
         program: program.to_vec(),
-        arguments: Vec::new(),
+        arguments,
         environment: Vec::new(),
         policy: LaunchPolicyV2 {
             memory_limit_bytes: None,

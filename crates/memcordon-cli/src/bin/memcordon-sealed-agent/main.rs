@@ -2,10 +2,12 @@
 
 use std::ffi::OsString;
 
+mod admission;
 mod inspection_schema;
 #[cfg(target_os = "linux")]
 mod linux;
 mod package;
+mod policy_registry;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod protocol;
 #[cfg(target_os = "linux")]
@@ -49,6 +51,10 @@ fn main() {
         [command] if command == "launch-broker" => launch_broker(),
         [command] if command == "probe" => probe(),
         [command] if command == "qualify" => qualify(),
+        #[cfg(target_os = "linux")]
+        [command] if command == "workload-profile-probe" => {
+            linux::qualification::workload_profile_probe()
+        }
         #[cfg(target_os = "windows")]
         [command] if command == "windows-control" => windows::control(),
         #[cfg(target_os = "windows")]
@@ -145,6 +151,42 @@ fn main() {
                 [stdin, stdout, stderr],
                 session,
             )
+        }
+        #[cfg(target_os = "linux")]
+        [package, policy, operation, json]
+            if package == "package"
+                && policy == "policy"
+                && operation == "inspect"
+                && json == "--json" =>
+        {
+            policy_registry::inspect()
+        }
+        #[cfg(target_os = "linux")]
+        [package, policy, operation, file, path]
+            if package == "package"
+                && policy == "policy"
+                && operation == "apply"
+                && file == "--file" =>
+        {
+            policy_registry::apply(std::path::Path::new(path))
+        }
+        #[cfg(target_os = "windows")]
+        [package, policy, operation, json]
+            if package == "package"
+                && policy == "policy"
+                && operation == "inspect"
+                && json == "--json" =>
+        {
+            windows::policy_registry::inspect()
+        }
+        #[cfg(target_os = "windows")]
+        [package, policy, operation, file, path]
+            if package == "package"
+                && policy == "policy"
+                && operation == "apply"
+                && file == "--file" =>
+        {
+            windows::policy_registry::apply(std::path::Path::new(path))
         }
         [package, operation] if package == "package" => package::run(operation, false, false, None),
         [package, operation, option] if package == "package" && option == "--json" => {

@@ -120,6 +120,7 @@ pub struct AttemptExecution {
 
 #[derive(Clone, Copy, Debug)]
 pub struct AttemptContext {
+    pub restart_attempt: u64,
     pub supervision_offset: Duration,
     pub supervision_deadline_remaining: Option<Duration>,
 }
@@ -256,6 +257,15 @@ pub fn supervise(request: SupervisorRequest) -> Result<SupervisionExecution, Err
 fn validate_resolved_backend(
     request: &SupervisorRequest,
 ) -> Result<Option<BackendCapabilityReport>, Error> {
+    if request.policy.workload_contract().is_some()
+        && request.policy.boundary() != BoundaryRequirement::Sealed
+    {
+        return Err(Error::new(
+            ErrorCategory::Unsupported,
+            "MCWORKLOAD-SEALED-REQUIRED",
+            "a strict workload contract requires sealed supervision",
+        ));
+    }
     let Some(backend) = request.resolved_backend.clone() else {
         if request.policy.boundary() != BoundaryRequirement::Sealed {
             return Ok(None);
@@ -325,6 +335,7 @@ fn supervise_with<I: InterruptionWait>(
     loop {
         let attempt_started = started.elapsed();
         let context = AttemptContext {
+            restart_attempt: history.total,
             supervision_offset: attempt_started,
             supervision_deadline_remaining: supervision_remaining(
                 &request.policy,
@@ -415,6 +426,13 @@ fn supervise_with<I: InterruptionWait>(
                     .append(
                         AttemptRecord {
                             number,
+                            policy_enforcement: error.policy_enforcement.clone().unwrap_or_else(|| {
+                                request.policy.workload_contract().map_or_else(Default::default, |contract|
+                                    memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::AuthorizationUncertain {
+                                        request: Some(memcordon_core::workload_evidence::RequestBindingV1::from_contract(contract).expect("policy workload is validated")),
+                                        failure: memcordon_core::workload_evidence::AdmissionAvailabilityFailure::TerminalUnavailable,
+                                    })
+                            }),
                             kind,
                             phase: AttemptPhase::Failed,
                             target_pid: error.target_pid,
@@ -595,6 +613,7 @@ fn supervise_with<I: InterruptionWait>(
                             number,
                             kind,
                             phase: AttemptPhase::Completed,
+                            policy_enforcement: attempt.execution.policy_enforcement,
                             target_pid: Some(attempt.execution.child_pid),
                             started_offset_ms: Some(millis(attempt_started)),
                             authorized_offset_ms: attempt
@@ -906,6 +925,7 @@ fn finish_backend_selection_drift(
         .append(
             AttemptRecord {
                 number,
+                policy_enforcement: attempt.execution.policy_enforcement,
                 kind,
                 phase: AttemptPhase::Failed,
                 target_pid: Some(attempt.execution.child_pid),
@@ -1014,6 +1034,7 @@ pub(crate) fn test_backend_selection_drift_execution(
         metric,
         AttemptExecution {
             execution: Execution {
+                policy_enforcement: Default::default(),
                 outcome: RunOutcome::Exited {
                     child: memcordon_core::ChildTermination::ExitCode { code: 0 },
                     peak: None,

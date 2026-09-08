@@ -3,11 +3,11 @@ use std::fs;
 use std::path::Path;
 
 use cargo_metadata::{DependencyKind, Metadata};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::Result;
 
-pub const RELEASE_SCHEMA_VERSION: u32 = 3;
+pub const RELEASE_SCHEMA_VERSION: u32 = 4;
 
 /// Derive and validate the canonical dependency order for public workspace packages.
 pub fn publish_order(metadata: &Metadata, configured: &[String]) -> Result<Vec<String>> {
@@ -282,14 +282,7 @@ pub struct AssetExecutable {
     pub role: RuntimeComponentRole,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RuntimeComponentRole {
-    PublicCli,
-    SealedAgent,
-    DesktopBootstrap,
-    SessionBroker,
-}
+pub use memcordon_core::runtime_manifest::RuntimeComponentRole;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]

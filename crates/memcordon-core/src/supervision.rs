@@ -788,6 +788,7 @@ impl Default for RestartDecisionRecord {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AttemptRecord {
+    pub policy_enforcement: crate::workload_evidence::AttemptPolicyEnforcementV1,
     pub number: u64,
     pub kind: AttemptKind,
     pub phase: AttemptPhase,
@@ -888,7 +889,8 @@ impl AttemptHistory {
 
 impl AttemptRecord {
     fn is_consistent(&self) -> bool {
-        self.number > 0
+        self.policy_enforcement.is_consistent()
+            && self.number > 0
             && self.outcome.is_some() != self.error.is_some()
             && self
                 .error
@@ -929,6 +931,7 @@ impl<'de> Deserialize<'de> for AttemptRecord {
         #[derive(Deserialize)]
         struct Wire {
             number: u64,
+            policy_enforcement: crate::workload_evidence::AttemptPolicyEnforcementV1,
             kind: AttemptKind,
             phase: AttemptPhase,
             target_pid: Option<u32>,
@@ -946,6 +949,7 @@ impl<'de> Deserialize<'de> for AttemptRecord {
         let wire = Wire::deserialize(deserializer)?;
         let record = Self {
             number: wire.number,
+            policy_enforcement: wire.policy_enforcement,
             kind: wire.kind,
             phase: wire.phase,
             target_pid: wire.target_pid,
