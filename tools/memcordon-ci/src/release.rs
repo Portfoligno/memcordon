@@ -2275,6 +2275,7 @@ fn smoke_linux_provider(
         Ok(())
     })();
     let uninstall = privileged_agent(&["package", "uninstall", "--ephemeral-ci"])
+        .map(|_| ())
         .and_then(|()| verify_linux_provider_absent());
     if uninstall.is_ok() {
         smoke.provider_uninstall = Some(true);
