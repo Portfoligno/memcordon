@@ -4,6 +4,7 @@ use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -53,12 +54,47 @@ impl fmt::Display for ProcessTestError {
 
 impl std::error::Error for ProcessTestError {}
 
-fn reader(mut stream: impl Read + Send + 'static) -> thread::JoinHandle<io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stream.read_to_end(&mut bytes)?;
-        Ok(bytes)
-    })
+struct OutputReader {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    worker: thread::JoinHandle<io::Result<()>>,
+}
+
+impl OutputReader {
+    fn snapshot(&self) -> Vec<u8> {
+        self.bytes
+            .lock()
+            .expect("output reader buffer poisoned")
+            .clone()
+    }
+
+    fn join(self) -> thread::Result<io::Result<Vec<u8>>> {
+        self.worker.join().map(|result| {
+            result.map(|()| {
+                std::mem::take(&mut *self.bytes.lock().expect("output reader buffer poisoned"))
+            })
+        })
+    }
+}
+
+fn reader(mut stream: impl Read + Send + 'static) -> OutputReader {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&bytes);
+    let worker = thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let length = match stream.read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(length) => length,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            captured
+                .lock()
+                .expect("output reader buffer poisoned")
+                .extend_from_slice(&chunk[..length]);
+        }
+    });
+    OutputReader { bytes, worker }
 }
 
 pub fn run_with_deadline(
@@ -110,7 +146,7 @@ pub fn run_with_deadline_after(
                 .take()
                 .expect("callback result was present")
                 .expect_err("callback result was checked as an error");
-            let cleanup = boundary.terminate();
+            let cleanup = boundary.terminate_and_reap(&mut child);
             if cleanup.is_err() {
                 let _ = child.kill();
             }
@@ -126,7 +162,7 @@ pub fn run_with_deadline_after(
             match child.try_wait() {
                 Ok(status) => observed_status = status,
                 Err(error) => {
-                    let cleanup = boundary.terminate();
+                    let cleanup = boundary.terminate_and_reap(&mut child);
                     if cleanup.is_err() {
                         let _ = child.kill();
                     }
@@ -144,7 +180,9 @@ pub fn run_with_deadline_after(
             break status;
         }
         if started.elapsed() >= deadline {
-            let cleanup = boundary.terminate().map_err(|error| error.to_string());
+            let cleanup = boundary
+                .terminate_and_reap(&mut child)
+                .map_err(|error| error.to_string());
             if cleanup.is_err() {
                 let _ = child.kill();
             }
@@ -152,8 +190,8 @@ pub fn run_with_deadline_after(
             if let Err(error) = cleanup {
                 return Err(ProcessTestError::Timeout {
                     deadline,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
+                    stdout: stdout_reader.snapshot(),
+                    stderr: stderr_reader.snapshot(),
                     cleanup: Err(error),
                 });
             }

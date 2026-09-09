@@ -255,7 +255,7 @@ fn workload_plan_response(
             restriction: BaselineRestrictionObservationV1::LinuxUnixOnlySocketSyscallFilterAlternatePathsUnknown,
         }, pending })
     })();
-    let response = result.unwrap_or_else(|_| WorkloadResolutionReportV1::Unavailable {
+    let response = result.unwrap_or(WorkloadResolutionReportV1::Unavailable {
         request: Some(binding),
         reason: AdmissionAvailabilityFailure::BindingUnavailable,
         authorization: AuthorizationKnowledge::NotAuthorized,
@@ -389,7 +389,7 @@ pub(crate) fn terminal_payload(facts: &super::launch::TerminalFacts) -> Vec<u8> 
     };
     let mut payload = format!(
         "schema-version=2\nmechanism=linux-pid-namespace-cgroup-v2\nstatus={}\nexec-status={}\nexec-os-code={}\nspawn-error-reported={}\ntarget-pid={}\nauthorization-offset-millis={}\nmemory-limit-exceeded={}\ndeadline-exceeded={}\nassignment-verified={}\nnamespaces-verified={}\ntarget-initial-credentials-verified={}\ninitial-provider-capabilities-absent={}\ncaller-envelope-digest={}\ncaller-no-new-privs={}\ntarget-no-new-privs-matched={}\ncaller-capability-bounding-set-digest={}\ntarget-capability-bounding-set-matched={}\ncaller-mount-namespace-digest={}\ntarget-mount-context-derived-from-caller={}\ncredential-transition-disposition=preserve-caller-envelope\nboundary-independent-of-credentials={}\ndescriptors-verified={}\nwritable-ancestor-cgroup-denied={}\nparent-namespace-handles-denied={}\nrecursive-provider-request-denied={}\nguardian-ready-before-authorization={}\nfrontend-loss-authority-verified={}\ncgroup-kill-invoked={}\ncgroup-empty={}\ninit-reaped={}\nguardian-reaped={}\nboundary-retired={}\n",
-        facts.child_status,
+        facts.child_status.map_or_else(|| "none".to_owned(), |status| status.to_string()),
         exec_status,
         exec_os_code,
         facts.spawn_error_reported,
@@ -422,6 +422,9 @@ pub(crate) fn terminal_payload(facts: &super::launch::TerminalFacts) -> Vec<u8> 
         facts.boundary_retired
     )
     .into_bytes();
+    if facts.policy_revoked {
+        payload.extend_from_slice(b"policy-revoked=true\n");
+    }
     payload.extend_from_slice(b"policy-enforcement=");
     payload.extend_from_slice(
         &serde_json::to_vec(&facts.policy_enforcement)

@@ -1,3 +1,4 @@
+use memcordon_core::WindowsProviderResponseV1;
 use memcordon_core::{
     BoundaryMechanismEvidence, BoundarySetupPhase, ChildTermination, CleanupSummary,
     CredentialTransitionDisposition, ProviderRejectionEvidence, RestartSafetyProof, RunOutcome,
@@ -436,6 +437,69 @@ fn windows_environment_uses_one_case_key_and_native_size_limit() {
 }
 
 #[test]
+fn windows_environment_preserves_native_drive_directories_and_utf16() {
+    let entries = [
+        ("Path", "C:\\Windows"),
+        ("=z:", "Z:\\資料😀=archive"),
+        ("=C:", "C:\\work"),
+    ]
+    .map(|(name, value)| WindowsEnvironmentEntryV1 {
+        name: name.encode_utf16().collect(),
+        value: value.encode_utf16().collect(),
+    });
+    assert_eq!(
+        encode_windows_environment_block(&entries).unwrap(),
+        "=C:=C:\\work\0=z:=Z:\\資料😀=archive\0Path=C:\\Windows\0\0"
+            .encode_utf16()
+            .collect::<Vec<_>>()
+    );
+
+    let native_value = WindowsEnvironmentEntryV1 {
+        name: "=D:".encode_utf16().collect(),
+        value: vec![0xd800],
+    };
+    let mut expected: Vec<_> = "=D:=".encode_utf16().collect();
+    expected.extend([0xd800, 0, 0]);
+    assert_eq!(
+        encode_windows_environment_block(&[native_value]).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn windows_environment_rejects_malformed_and_duplicate_drive_entries() {
+    for name in [
+        "=", "=C", "=C::", "=CC:", "=1:", "=é:", "A=B", "==C:", "=C:\0",
+    ] {
+        let entry = WindowsEnvironmentEntryV1 {
+            name: name.encode_utf16().collect(),
+            value: "C:\\work".encode_utf16().collect(),
+        };
+        assert_eq!(
+            encode_windows_environment_block(&[entry]),
+            Err("invalid Windows environment entry"),
+            "{name:?}"
+        );
+    }
+    let duplicate = ["=C:", "=c:"].map(|name| WindowsEnvironmentEntryV1 {
+        name: name.encode_utf16().collect(),
+        value: "C:\\work".encode_utf16().collect(),
+    });
+    assert_eq!(
+        encode_windows_environment_block(&duplicate),
+        Err("duplicate case-insensitive Windows environment name")
+    );
+    let nul_value = WindowsEnvironmentEntryV1 {
+        name: "=C:".encode_utf16().collect(),
+        value: vec![0],
+    };
+    assert_eq!(
+        encode_windows_environment_block(&[nul_value]),
+        Err("invalid Windows environment entry")
+    );
+}
+
+#[test]
 fn windows_qualification_requires_every_native_predicate() {
     let canonical = qualification();
     assert!(canonical.is_consistent());
@@ -469,6 +533,16 @@ fn windows_launch_broker_protocol_rejects_restricted_diagnostic_token_relay() {
     assert!(error.to_string().contains("unknown field"));
 }
 
+fn serialized_response_limit<T: memcordon_core::WindowsResponseFrame + serde::Serialize>(
+    response: &T,
+) -> usize {
+    let encoded = serde_json::to_vec(response).unwrap();
+    let prefix = &encoded[..encoded
+        .len()
+        .min(memcordon_core::WINDOWS_RESPONSE_PREFIX_BYTES)];
+    T::frame_limit(prefix).unwrap()
+}
+
 #[test]
 fn windows_retained_and_retired_outcomes_require_exact_typed_bindings() {
     let attempt_id = "a".repeat(64);
@@ -499,6 +573,18 @@ fn windows_retained_and_retired_outcomes_require_exact_typed_bindings() {
         WindowsRelayPhaseV1::AwaitAbortRejection,
     ));
     let mut contradictory = retained.clone();
+    assert_eq!(
+        serialized_response_limit(&WindowsProviderResponseV1::AttemptRetained(
+            retained.clone()
+        )),
+        memcordon_core::MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
+    );
+    assert_eq!(
+        serialized_response_limit(&WindowsLauncherResponseV1::AttemptRetained(
+            retained.clone()
+        )),
+        memcordon_core::MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
+    );
     contradictory.cleanup_complete = false;
     assert!(!contradictory.is_consistent_for(
         &attempt_id,
@@ -1132,7 +1218,15 @@ fn maximum_native_process_inventory_fits_terminal_transport_reservation() {
     terminal.duration_millis = u64::MAX;
     terminal.authorization_offset_millis = u64::MAX;
     assert!(terminal.process_identity_inventory_shape_is_bounded());
+    assert_eq!(
+        serialized_response_limit(&WindowsProviderResponseV1::Terminal(terminal.clone())),
+        memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES
+    );
     let response = WindowsLauncherResponseV1::Terminal(terminal);
+    assert_eq!(
+        serialized_response_limit(&response),
+        memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES
+    );
     let encoded = response.terminal_authority_json().unwrap();
     assert!(encoded.len() < memcordon_core::WINDOWS_MAX_TERMINAL_FRAME_BYTES);
     memcordon_core::validate_record_json_structure(encoded.as_bytes()).unwrap();
@@ -1275,6 +1369,14 @@ fn windows_public_terminal_pending_is_exactly_bound() {
         },
         detail: "durable terminal is not staged".to_owned(),
     };
+    assert_eq!(
+        serialized_response_limit(&WindowsProviderResponseV1::ReplayPending(pending.clone())),
+        memcordon_core::MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
+    );
+    assert_eq!(
+        serialized_response_limit(&WindowsLauncherResponseV1::ReplayPending(pending.clone())),
+        memcordon_core::MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
+    );
     assert!(pending.is_consistent_for(
         &attempt,
         "nonce",

@@ -54,6 +54,8 @@ enum Suite {
     SupplyChain,
     Miri,
     Fuzz,
+    FuzzFirst,
+    FuzzSecond,
     Stress,
     BackendLinuxCgroup,
     BackendLinuxSealedV2,

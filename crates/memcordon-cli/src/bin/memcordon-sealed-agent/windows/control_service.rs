@@ -21,6 +21,8 @@ use super::security::{NamedPipeSecurityError, SecurityDescriptor, public_pipe_sd
 
 const STARTUP_PROCESS_PROTECTION: u32 = 0x4d43_0101;
 const STARTUP_STATE_RECONCILIATION: u32 = 0x4d43_0102;
+// Policy startup owns a separate range from pipe/token security subphases.
+pub(crate) const STARTUP_POLICY_REGISTRY: u32 = 0x4d43_0801;
 const STARTUP_PIPE_PREPARATION: u32 = 0x4d43_0103;
 const STARTUP_LAUNCHER_AUTHENTICATION: u32 = 0x4d43_0104;
 const STARTUP_RUNNING_ANNOUNCEMENT: u32 = 0x4d43_0105;
@@ -73,10 +75,13 @@ unsafe extern "system" fn service_main(_count: u32, _arguments: *mut *mut u16) {
             .map_err(|error| {
                 super::security::token_dacl_startup_error(WINDOWS_CONTROL_SERVICE_NAME, error)
             })?;
+        if let Err(error) = super::startup_diagnostics::clear() {
+            eprintln!("startup diagnostic cleanup failed: {error}");
+        }
         super::record::reconcile_attempt_state()
             .map_err(|error| (STARTUP_STATE_RECONCILIATION, error))?;
         super::policy_registry::start_service_instance()
-            .map_err(|error| (STARTUP_STATE_RECONCILIATION, error))?;
+            .map_err(|error| (STARTUP_POLICY_REGISTRY, error))?;
         let listener = PipeListener::new(
             WINDOWS_CONTROL_PIPE,
             SecurityDescriptor::from_sddl(
@@ -85,8 +90,7 @@ unsafe extern "system" fn service_main(_count: u32, _arguments: *mut *mut u16) {
             .map_err(|error| (STARTUP_PIPE_PREPARATION, error))?,
         );
         let first = listener.prepare().map_err(pipe_startup_error)?;
-        probe_authenticated_launcher_detailed()
-            .map_err(|error| (error.phase, error.to_string()))?;
+        attest_launcher_for_startup().map_err(|error| (error.phase, error.to_string()))?;
         super::service::announce_running()
             .map_err(|error| (STARTUP_RUNNING_ANNOUNCEMENT, error))?;
         Ok((listener, first))
@@ -96,6 +100,9 @@ unsafe extern "system" fn service_main(_count: u32, _arguments: *mut *mut u16) {
     });
     if let Err((code, error)) = result {
         eprintln!("{error}");
+        if let Err(diagnostic_error) = super::startup_diagnostics::record(code, &error) {
+            eprintln!("startup diagnostic publication failed: {diagnostic_error}");
+        }
         super::service::announce_startup_failed(code);
     } else {
         super::service::announce_stopped(0);
@@ -726,34 +733,82 @@ fn qualification_session(public: HANDLE, scope: &str, challenge: &str) -> Result
     if !matches!(scope, "direct" | "package") {
         return Err("invalid Windows qualification admission scope".to_owned());
     }
-    let mut client_pid = 0_u32;
-    // SAFETY: public is a connected server pipe and output is writable.
-    if unsafe { GetNamedPipeClientProcessId(public, &raw mut client_pid) } == 0 {
-        return Err(io::Error::last_os_error().to_string());
-    }
-    let (_source_token, envelope, _source_frontend, owner) =
-        super::token::authenticate_pipe_client(public, client_pid, None)?;
-    if !envelope.elevated {
+    // Authenticate diagnostic visibility independently. Full caller authentication
+    // and all qualification checks below still gate admission; this grants none.
+    if !super::token::pipe_client_is_elevated(public)? {
         return Err("MCSEALED-WINDOWS-ELEVATION: qualification requires elevation".to_owned());
     }
-    let control_attestation = super::token::current_service_self_attestation(
-        "control-service",
-        WINDOWS_CONTROL_SERVICE_NAME,
-        super::package::CONTROL_PRIVILEGES,
-        challenge,
-    )
-    .map_err(|error| error.to_string())?;
-    let launcher_attestation =
-        launcher_self_attestation_detailed(challenge).map_err(|error| error.to_string())?;
-    // The authenticated caller still owns the package mutex here. Publish the
-    // service-owned durable admission before acknowledging authentication, so
-    // dropping the caller's mutex cannot expose an unrepresented handoff gap.
-    if !super::record::attempts_empty()? {
-        return Err(
-            "MCSEALED-WINDOWS-QUALIFICATION-ACTIVE: attempt or recovery state is active".to_owned(),
-        );
-    }
-    let admission = super::record::reserve_qualification_admission_for(scope, owner.clone())?;
+    let preparation = (|| -> Result<_, String> {
+        let mut client_pid = 0_u32;
+        // SAFETY: public is a connected server pipe and output is writable.
+        if unsafe { GetNamedPipeClientProcessId(public, &raw mut client_pid) } == 0 {
+            return Err(format!(
+                "stage=client-process-id: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let (source_token, envelope, source_frontend, owner) =
+            super::token::authenticate_pipe_client(public, client_pid, None)
+                .map_err(|error| format!("stage=caller-authentication: {error}"))?;
+        if !envelope.elevated {
+            return Err("MCSEALED-WINDOWS-ELEVATION: qualification requires elevation".to_owned());
+        }
+        let control_attestation = super::token::current_service_self_attestation(
+            "control-service",
+            WINDOWS_CONTROL_SERVICE_NAME,
+            super::package::CONTROL_PRIVILEGES,
+            challenge,
+        )
+        .map_err(|error| format!("stage=control-attestation: {error}"))?;
+        let launcher_attestation = launcher_self_attestation_detailed(challenge)
+            .map_err(|error| format!("stage=launcher-attestation: {error}"))?;
+        // The authenticated caller still owns the package mutex here. Publish the
+        // service-owned durable admission before acknowledging authentication, so
+        // dropping the caller's mutex cannot expose an unrepresented handoff gap.
+        if !super::record::attempts_empty()
+            .map_err(|error| format!("stage=attempts-empty: {error}"))?
+        {
+            return Err(
+                "MCSEALED-WINDOWS-QUALIFICATION-ACTIVE: attempt or recovery state is active"
+                    .to_owned(),
+            );
+        }
+        let admission = super::record::reserve_qualification_admission_for(scope, owner.clone())
+            .map_err(|error| format!("stage=admission-reservation: {error}"))?;
+        Ok((
+            source_token,
+            source_frontend,
+            owner,
+            control_attestation,
+            launcher_attestation,
+            admission,
+        ))
+    })();
+    let (
+        _source_token,
+        _source_frontend,
+        owner,
+        control_attestation,
+        launcher_attestation,
+        admission,
+    ) = match preparation {
+        Ok(prepared) => prepared,
+        Err(original) => {
+            eprintln!("MCSEALED-WINDOWS-QUALIFICATION-PREPARATION: {original}");
+            let rejection =
+                memcordon_core::WindowsQualificationRejectionV1::new(challenge, &original)
+                    .map_err(|secondary| {
+                        format!("{original}; qualification rejection encoding failed: {secondary}")
+                    })?;
+            return pipe::write_frame(
+                public,
+                &WindowsProviderResponseV1::QualificationRejected(rejection),
+            )
+            .map_err(|secondary| {
+                format!("{original}; qualification rejection write failed: {secondary}")
+            });
+        }
+    };
     pipe::write_frame(
         public,
         &WindowsProviderResponseV1::QualificationAuthenticated {
@@ -1525,15 +1580,41 @@ fn probe_authenticated_launcher_detailed() -> Result<(), LauncherAuthenticationE
 fn launcher_self_attestation_detailed(
     challenge: &str,
 ) -> Result<WindowsServiceSelfAttestationV1, LauncherAuthenticationError> {
+    launcher_attestation_detailed(challenge, LauncherAttestationPurpose::ProviderProbe)
+}
+
+enum LauncherAttestationPurpose {
+    Startup,
+    ProviderProbe,
+}
+
+fn attest_launcher_for_startup() -> Result<(), LauncherAuthenticationError> {
+    // Restoring legacy state must retain management service access even when
+    // no runtime manifest exists. Public probes and qualification continue to
+    // require the separate manifest-bound ProviderProbe exchange.
+    let challenge =
+        super::token::service_attestation_challenge("control-service").map_err(|error| {
+            LauncherAuthenticationError::new(STARTUP_LAUNCHER_AUTHENTICATION_PROBE_CHALLENGE, error)
+        })?;
+    launcher_attestation_detailed(&challenge, LauncherAttestationPurpose::Startup).map(|_| ())
+}
+
+fn launcher_attestation_detailed(
+    challenge: &str,
+    purpose: LauncherAttestationPurpose,
+) -> Result<WindowsServiceSelfAttestationV1, LauncherAuthenticationError> {
     let (launcher, _launcher_process, launcher_identity) = authenticated_launcher_detailed()?;
-    pipe::write_frame(
-        launcher.raw(),
-        &WindowsLauncherRequestV1::Probe {
+    let request = match purpose {
+        LauncherAttestationPurpose::Startup => WindowsLauncherRequestV1::StartupAttestation {
             schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
             challenge: challenge.to_owned(),
         },
-    )
-    .map_err(|error| {
+        LauncherAttestationPurpose::ProviderProbe => WindowsLauncherRequestV1::Probe {
+            schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+            challenge: challenge.to_owned(),
+        },
+    };
+    pipe::write_frame(launcher.raw(), &request).map_err(|error| {
         LauncherAuthenticationError::new(STARTUP_LAUNCHER_AUTHENTICATION_PROBE_WRITE, error)
     })?;
     let response = pipe::read_response_frame_detailed::<WindowsLauncherResponseV1>(launcher.raw())
@@ -1546,12 +1627,22 @@ fn launcher_self_attestation_detailed(
                 ),
             )
         })?;
-    match response {
-        WindowsLauncherResponseV1::Probe {
-            schema_version,
-            attestation,
-            provider_binding,
-        } => {
+    let attestation = match (purpose, response) {
+        (
+            LauncherAttestationPurpose::Startup,
+            WindowsLauncherResponseV1::StartupAttestation {
+                schema_version,
+                attestation,
+            },
+        ) if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => attestation,
+        (
+            LauncherAttestationPurpose::ProviderProbe,
+            WindowsLauncherResponseV1::Probe {
+                schema_version,
+                attestation,
+                provider_binding,
+            },
+        ) => {
             let installed_binding =
                 super::package::installed_public_provider_binding().map_err(|error| {
                     LauncherAuthenticationError::new(
@@ -1562,19 +1653,36 @@ fn launcher_self_attestation_detailed(
             if schema_version != WINDOWS_PRIVATE_PROTOCOL_VERSION
                 || provider_binding != installed_binding
             {
-                Err(LauncherAuthenticationError::new(
+                return Err(LauncherAuthenticationError::new(
                     STARTUP_LAUNCHER_AUTHENTICATION_PROBE_SCHEMA,
                     "launcher probe response has the wrong schema version",
-                ))
-            } else {
-                let launcher_sid = super::security::service_sid(WINDOWS_LAUNCHER_SERVICE_NAME)
-                    .map_err(|error| {
-                        LauncherAuthenticationError::new(
-                            STARTUP_LAUNCHER_AUTHENTICATION_ORDINARY_SID,
-                            error,
-                        )
-                    })?;
-                attestation
+                ));
+            }
+            attestation
+        }
+        (_, WindowsLauncherResponseV1::Reject { rejection, .. }) => {
+            let phase = control_authentication_phase_from_rejection_code(&rejection.code)
+                .unwrap_or(STARTUP_LAUNCHER_AUTHENTICATION_PEER_REJECTED);
+            return Err(LauncherAuthenticationError::new(
+                phase,
+                format!(
+                    "launcher rejected the control peer: code={} detail={}",
+                    rejection.code, rejection.detail
+                ),
+            ));
+        }
+        _ => {
+            return Err(LauncherAuthenticationError::new(
+                STARTUP_LAUNCHER_AUTHENTICATION_RESPONSE_KIND,
+                "launcher returned an unexpected attestation response",
+            ));
+        }
+    };
+    let launcher_sid =
+        super::security::service_sid(WINDOWS_LAUNCHER_SERVICE_NAME).map_err(|error| {
+            LauncherAuthenticationError::new(STARTUP_LAUNCHER_AUTHENTICATION_ORDINARY_SID, error)
+        })?;
+    attestation
                     .validate_for(
                         challenge,
                         WINDOWS_LAUNCHER_SERVICE_NAME,
@@ -1590,25 +1698,7 @@ fn launcher_self_attestation_detailed(
                             ),
                         )
                     })?;
-                Ok(attestation)
-            }
-        }
-        WindowsLauncherResponseV1::Reject { rejection, .. } => {
-            let phase = control_authentication_phase_from_rejection_code(&rejection.code)
-                .unwrap_or(STARTUP_LAUNCHER_AUTHENTICATION_PEER_REJECTED);
-            Err(LauncherAuthenticationError::new(
-                phase,
-                format!(
-                    "launcher rejected the control peer: code={} detail={}",
-                    rejection.code, rejection.detail
-                ),
-            ))
-        }
-        _ => Err(LauncherAuthenticationError::new(
-            STARTUP_LAUNCHER_AUTHENTICATION_RESPONSE_KIND,
-            "launcher returned an unexpected probe response",
-        )),
-    }
+    Ok(attestation)
 }
 
 fn probe_authenticated_launcher() -> Result<(), String> {

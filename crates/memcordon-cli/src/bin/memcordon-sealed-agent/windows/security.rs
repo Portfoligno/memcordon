@@ -381,6 +381,21 @@ pub fn package_mutex_sddl() -> Result<String, String> {
     Ok(format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{control})"))
 }
 
+pub(super) const PUBLICATION_MUTEX_ACCESS: u32 = 0x0012_0001;
+
+pub(super) fn publication_mutex_sddl(owner: &str) -> Result<String, String> {
+    if !matches!(owner, "S-1-5-18" | "S-1-5-19") {
+        return Err("publication mutex owner is not a service account".to_owned());
+    }
+    let control = service_sid(memcordon_core::WINDOWS_CONTROL_SERVICE_NAME)?;
+    let launcher = service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME)?;
+    // Either service may create first. Deny implicit owner mutation rights;
+    // only the trusted service identities may inspect, wait and release.
+    Ok(format!(
+        "O:{owner}D:P(D;;WDWO;;;OW)(A;;0x{PUBLICATION_MUTEX_ACCESS:08x};;;SY)(A;;0x{PUBLICATION_MUTEX_ACCESS:08x};;;{control})(A;;0x{PUBLICATION_MUTEX_ACCESS:08x};;;{launcher})"
+    ))
+}
+
 pub(crate) const TARGET_KERNEL_PROCESS_DIAGNOSTIC_ACCESS: u32 = 0x0010_1040;
 pub(crate) const TARGET_KERNEL_THREAD_DIAGNOSTIC_ACCESS: u32 = 0x0012_1800;
 

@@ -841,7 +841,9 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
     };
     let workload_discovery = if cfg!(any(target_os = "linux", target_os = "windows")) {
         memcordon_platform::workload_discovery()
-            .map(|discovery| DiscoveryReportV1::Authenticated { discovery })
+            .map(|discovery| DiscoveryReportV1::Authenticated {
+                discovery: Box::new(discovery),
+            })
             .unwrap_or_else(|_| DiscoveryReportV1::Unavailable {
                 reason: memcordon_core::BoundedText::new(
                     "authenticated provider discovery unavailable",

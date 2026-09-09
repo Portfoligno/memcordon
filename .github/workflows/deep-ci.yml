@@ -50,7 +50,11 @@ jobs:
           key: ${{ steps.miri-deps.outputs.cache-primary-key }}
 
   fuzz:
-    name: fuzz smoke
+    name: fuzz smoke / ${{ matrix.shard }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [first, second]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -71,14 +75,17 @@ jobs:
           path: |
             target/ci
             fuzz/target
-          key: cargo-target-deep-v2-fuzz-nightly-2026-07-31-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'crates/**', 'tools/**', 'ci/tools.toml', 'ci/toolchains.toml') }}
+          key: cargo-target-deep-v3-fuzz-${{ runner.os }}-${{ runner.arch }}-${{ matrix.shard }}-nightly-2026-07-31-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'crates/**', 'tools/**', 'ci/**', '.github/workflows/deep-ci.yml') }}
       - id: fuzz-tools
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: target/ci-tools
           key: cargo-tools-deep-v1-fuzz-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('ci/tools.toml', 'tools/**') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite fuzz
+      - if: matrix.shard == 'first'
+        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite fuzz-first
+      - if: matrix.shard == 'second'
+        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite fuzz-second
       - if: always() && steps.fuzz-target.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:

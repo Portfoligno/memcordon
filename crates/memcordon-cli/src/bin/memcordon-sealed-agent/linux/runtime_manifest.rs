@@ -48,6 +48,44 @@ fn manifest_bytes(path: &Path, protected: bool) -> Result<Vec<u8>, String> {
 }
 
 pub fn source(source: &Path, agent_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if source == Path::new("/usr/libexec/memcordon-sealed-agent") {
+        let mut image = File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(source)
+            .map_err(|error| format!("installed source image unavailable: {error}"))?;
+        let metadata = image.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != 0
+            || metadata.len() != agent_bytes.len() as u64
+            || metadata.mode() & 0o7777 != 0o755
+        {
+            return Err("installed source image is not protected".into());
+        }
+        let mut buffer = [0_u8; 64 * 1024];
+        for expected in agent_bytes.chunks(buffer.len()) {
+            let actual = &mut buffer[..expected.len()];
+            image
+                .read_exact(actual)
+                .map_err(|error| format!("installed source image changed: {error}"))?;
+            if actual != expected {
+                return Err(
+                    "installed source image differs from the snapshotted executable".into(),
+                );
+            }
+        }
+        if image
+            .read(&mut buffer[..1])
+            .map_err(|error| error.to_string())?
+            != 0
+        {
+            return Err("installed source image grew after snapshot".into());
+        }
+        let bytes = manifest_bytes(Path::new(INSTALLED), true)?;
+        validate_installed_source(&bytes, agent_bytes)?;
+        return Ok(bytes);
+    }
     let directory = source.parent().ok_or("provider source has no parent")?;
     let public = std::fs::read(directory.join("memcordon")).map_err(|error| error.to_string())?;
     let components = vec![
@@ -97,7 +135,41 @@ pub fn source(source: &Path, agent_bytes: &[u8]) -> Result<Vec<u8>, String> {
 pub fn installed_binding() -> Result<memcordon_core::PublicProviderBindingV1, String> {
     crate::package::verify()?;
     let bytes = manifest_bytes(Path::new(INSTALLED), true)?;
-    let manifest = RuntimeManifestV2::parse(&bytes)?;
+    let manifest = installed_generation(&bytes)?;
+    let agent = manifest
+        .components
+        .iter()
+        .find(|entry| entry.role == RuntimeComponentRole::SealedAgent)
+        .expect("installed generation validates the agent role");
+    let installed_digest =
+        crate::package::sha256_regular_no_follow(Path::new("/usr/libexec/memcordon-sealed-agent"))?;
+    crate::package::verify_installed_executable_digest(&agent.sha256, &installed_digest)?;
+    manifest.public_binding(&bytes)
+}
+
+fn validate_installed_source(bytes: &[u8], agent_bytes: &[u8]) -> Result<(), String> {
+    let manifest = installed_generation(bytes)?;
+    let agent = manifest
+        .components
+        .iter()
+        .find(|entry| entry.role == RuntimeComponentRole::SealedAgent)
+        .expect("installed generation validates the agent role");
+    if agent.size != agent_bytes.len() as u64 || agent.sha256 != digest(agent_bytes) {
+        return Err("installed runtime manifest differs from exact source image".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn validate_installed_source_for_test(
+    bytes: &[u8],
+    agent_bytes: &[u8],
+) -> Result<(), String> {
+    validate_installed_source(bytes, agent_bytes)
+}
+
+fn installed_generation(bytes: &[u8]) -> Result<RuntimeManifestV2, String> {
+    let manifest = RuntimeManifestV2::parse(bytes)?;
     let expected = RuntimeManifestV2::linux(
         env!("CARGO_PKG_VERSION").into(),
         crate::SOURCE_COMMIT.into(),
@@ -115,9 +187,6 @@ pub fn installed_binding() -> Result<memcordon_core::PublicProviderBindingV1, St
     if agent.id != "sealed-agent" || agent.path != "memcordon-sealed-agent" || agent.mode != 0o755 {
         return Err("runtime agent role differs".into());
     }
-    let installed_digest =
-        crate::package::sha256_regular_no_follow(Path::new("/usr/libexec/memcordon-sealed-agent"))?;
-    crate::package::verify_installed_executable_digest(&agent.sha256, &installed_digest)?;
     let public = manifest
         .components
         .iter()
@@ -126,5 +195,5 @@ pub fn installed_binding() -> Result<memcordon_core::PublicProviderBindingV1, St
     if public.id != "public-cli" || public.path != "memcordon" || public.mode != 0o755 {
         return Err("runtime CLI role differs".into());
     }
-    manifest.public_binding(&bytes)
+    Ok(manifest)
 }

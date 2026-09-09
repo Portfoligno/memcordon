@@ -216,6 +216,36 @@ fn demand_start_stopped_diagnostic_preserves_typed_scm_evidence() {
 }
 
 #[test]
+fn policy_startup_code_has_no_security_decoder_collision() {
+    let code = crate::windows::control_service::STARTUP_POLICY_REGISTRY;
+    assert!(crate::windows::security::pipe_mismatch_diagnostic_from_exit(code).is_none());
+    assert!(crate::windows::security::token_dacl_diagnostic_from_exit(code).is_none());
+    assert!(
+        crate::windows::control_service::control_authentication_diagnostic_from_exit(code)
+            .is_none()
+    );
+    assert!(
+        crate::windows::control_service::launcher_authentication_diagnostic_from_exit(code)
+            .is_none()
+    );
+    assert!(crate::windows::guardian_service::startup_diagnostic_from_exit(code).is_none());
+    assert!(crate::windows::session_broker::startup_diagnostic_from_exit(code).is_none());
+    let status = SERVICE_STATUS_PROCESS {
+        dwCurrentState: SERVICE_STOPPED,
+        dwWin32ExitCode: windows_sys::Win32::Foundation::ERROR_SERVICE_SPECIFIC_ERROR,
+        dwServiceSpecificExitCode: code,
+        ..SERVICE_STATUS_PROCESS::default()
+    };
+    let diagnostic = crate::windows::service_manager::demand_start_stopped_diagnostic_for_test(
+        memcordon_core::WINDOWS_CONTROL_SERVICE_NAME,
+        &status,
+        7,
+    );
+    assert!(diagnostic.contains("role=control operation=startup stage=policy-registry"));
+    assert!(!diagnostic.contains("security-mismatch"));
+}
+
+#[test]
 fn session_broker_protection_failures_preserve_exact_subphases() {
     for (exit, subphase) in [
         (

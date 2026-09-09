@@ -809,9 +809,9 @@ struct WindowsInstalledProviderInspectionV5 {
 #[derive(Debug, Deserialize, Eq, PartialEq)]
 #[serde(untagged)]
 enum WindowsInstalledProviderInspection {
-    V5(WindowsInstalledProviderInspectionV5),
-    V3(WindowsInstalledProviderInspectionV3),
-    V4(WindowsInstalledProviderInspectionV4),
+    V5(Box<WindowsInstalledProviderInspectionV5>),
+    V3(Box<WindowsInstalledProviderInspectionV3>),
+    V4(Box<WindowsInstalledProviderInspectionV4>),
 }
 
 impl WindowsPackageInspectionV3 {

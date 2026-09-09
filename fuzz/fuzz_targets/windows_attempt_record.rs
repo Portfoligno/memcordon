@@ -6,12 +6,7 @@ use memcordon_core::{
     windows_certification_transition_allowed,
 };
 
-fuzz_target!(|data: (
-    Vec<u8>,
-    String,
-    String,
-    Vec<u8>,
-)| {
+fuzz_target!(|data: (Vec<u8>, String, String, Vec<u8>,)| {
     let (bytes, expected_attempt_id, expected_generation, states) = data;
     if let Ok(record) = parse_and_authenticate_windows_attempt_record(
         &bytes,
@@ -21,12 +16,14 @@ fuzz_target!(|data: (
         assert_eq!(record.attempt_id, expected_attempt_id);
         assert_eq!(record.provider_generation, expected_generation);
         let canonical = serde_json::to_vec(&record).expect("authenticated record must serialize");
-        assert!(parse_and_authenticate_windows_attempt_record(
-            &canonical,
-            &record.attempt_id,
-            &record.provider_generation,
-        )
-        .is_ok());
+        assert!(
+            parse_and_authenticate_windows_attempt_record(
+                &canonical,
+                &record.attempt_id,
+                &record.provider_generation,
+            )
+            .is_ok()
+        );
     }
 
     use WindowsCertificationPhaseV1 as Phase;
@@ -78,7 +75,9 @@ fuzz_target!(|data: (
         }
         if current == Phase::Retired {
             let candidate = phases[(selector as usize) % phases.len()];
-            assert!(!windows_certification_transition_allowed(current, candidate));
+            assert!(!windows_certification_transition_allowed(
+                current, candidate
+            ));
         }
     }
 });

@@ -28,7 +28,7 @@ fuzz_target!(|data: &[u8]| {
     for (preserved, closed) in [(false, false), (false, true), (true, false)] {
         assert!(
             AttemptPolicyEnforcementV1::retired(
-                admission.clone(),
+                admission.as_ref().clone(),
                 before_authorization.clone(),
                 preserved,
                 closed
@@ -42,7 +42,7 @@ fuzz_target!(|data: &[u8]| {
     restarted.admission_nonce = Nonce128(nonce);
     assert!(!before_authorization.matches_binding(&restarted));
     assert!(
-        AttemptPolicyEnforcementV1::retired(restarted, before_authorization, true, true).is_err()
+        AttemptPolicyEnforcementV1::retired(*restarted, before_authorization, true, true).is_err()
     );
     let uncertain = AttemptPolicyEnforcementV1::AuthorizationUncertain {
         request: Some(admission.plan.request),

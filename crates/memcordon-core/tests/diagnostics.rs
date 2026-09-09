@@ -1,5 +1,136 @@
 use memcordon_core::diagnostics::*;
 
+fn assert_serialized_response_limit<T: WindowsResponseFrame + serde::Serialize>(
+    response: &T,
+    expected: usize,
+) {
+    let bytes = serde_json::to_vec(response).unwrap();
+    let prefix = &bytes[..bytes.len().min(WINDOWS_RESPONSE_PREFIX_BYTES)];
+    assert_eq!(T::frame_limit(prefix).unwrap(), expected);
+    let decoded: T = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+}
+
+#[test]
+fn response_framing_is_bound_to_the_serialized_protocol() {
+    use memcordon_core::{WindowsLauncherResponseV1, WindowsProviderResponseV1};
+
+    let response = WindowsLauncherResponseV1::Probe {
+        schema_version: memcordon_core::WINDOWS_PRIVATE_PROTOCOL_VERSION,
+        attestation: memcordon_core::WindowsServiceSelfAttestationV1 {
+            schema_version: 1,
+            challenge: "01".repeat(32),
+            service_name: "MemCordonSealedLauncher".to_owned(),
+            process_identity: memcordon_core::WindowsProcessIdentityV1 {
+                process_id: 41,
+                creation_time_100ns: 73,
+            },
+            service_sid: "S-1-5-80-1-2-3-4-5".to_owned(),
+            service_sid_enabled: true,
+            service_sid_restricted: true,
+            token_session_id: 0,
+            required_privileges: vec!["SeAssignPrimaryTokenPrivilege".to_owned()],
+        },
+        provider_binding: PublicProviderBindingV1 {
+            generation: BoundedText::new("test-provider").unwrap(),
+            source_commit: BoundedText::new("0123456789012345678901234567890123456789").unwrap(),
+            runtime_manifest_sha256: DiagnosticSha256::from_bytes([1; 32]),
+        },
+    };
+    let bytes = serde_json::to_vec(&response).unwrap();
+    assert!(bytes.len() > WINDOWS_RESPONSE_PREFIX_BYTES);
+    let prefix = &bytes[..WINDOWS_RESPONSE_PREFIX_BYTES];
+    assert_eq!(
+        WindowsLauncherResponseV1::frame_limit(prefix).unwrap(),
+        memcordon_core::WINDOWS_MAX_FRAME_BYTES
+    );
+    // Both response protocols use kind; their concrete payload schemas still differ.
+    assert!(serde_json::from_slice::<WindowsProviderResponseV1>(&bytes).is_err());
+    let decoded: WindowsLauncherResponseV1 = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+
+    let cleanup = WindowsProviderResponseV1::PackageCleanupResult {
+        schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        challenge: "04".repeat(32),
+        status: memcordon_core::WindowsControlRequestStatusV1::Failed,
+        attempts_empty: None,
+        terminal_outboxes: None,
+        detail: "cleanup did not converge".to_owned(),
+    };
+    assert_serialized_response_limit(&cleanup, memcordon_core::WINDOWS_MAX_FRAME_BYTES);
+    assert_serialized_response_limit(
+        &WindowsProviderResponseV1::QualificationReady {
+            schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+        },
+        memcordon_core::WINDOWS_MAX_FRAME_BYTES,
+    );
+    let discovery = memcordon_core::workload_discovery::WorkloadDiscoveryV1::authenticated(
+        None,
+        &memcordon_core::workload_registry::CallerSelector::Linux { uid: 1000 },
+        memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate,
+        DiagnosticSha256::from_bytes([1; 32]),
+        match &response {
+            WindowsLauncherResponseV1::Probe {
+                provider_binding, ..
+            } => provider_binding.clone(),
+            _ => unreachable!(),
+        },
+        BoundedText::new("boot-a").unwrap(),
+    )
+    .unwrap();
+    assert_serialized_response_limit(
+        &WindowsProviderResponseV1::WorkloadDiscovery {
+            schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            challenge: memcordon_core::workload_contract::Nonce128([3; 16]),
+            discovery,
+        },
+        memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES,
+    );
+
+    for (response, request, limit) in [
+        (
+            br#"{"kind":"attempt-retained"}"#.as_slice(),
+            br#"{"message":"attempt-retained"}"#.as_slice(),
+            MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES,
+        ),
+        (
+            br#"{"kind":"replay-pending"}"#.as_slice(),
+            br#"{"message":"replay-pending"}"#.as_slice(),
+            MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES,
+        ),
+        (
+            br#"{"kind":"terminal"}"#.as_slice(),
+            br#"{"message":"terminal"}"#.as_slice(),
+            WINDOWS_MAX_TERMINAL_FRAME_BYTES,
+        ),
+        (
+            br#"{"kind":"reject"}"#.as_slice(),
+            br#"{"message":"reject"}"#.as_slice(),
+            WINDOWS_MAX_TERMINAL_FRAME_BYTES,
+        ),
+    ] {
+        assert_eq!(
+            WindowsLauncherResponseV1::frame_limit(response).unwrap(),
+            limit
+        );
+        assert_eq!(
+            WindowsProviderResponseV1::frame_limit(response).unwrap(),
+            limit
+        );
+        assert!(WindowsLauncherResponseV1::frame_limit(request).is_err());
+        assert!(WindowsProviderResponseV1::frame_limit(request).is_err());
+    }
+    for invalid in [
+        br#"{"schema_version":2,"kind":"probe"}"#.as_slice(),
+        br#"{"kind":"Probe"}"#.as_slice(),
+        br#"{"kind":"pro\u0062e"}"#.as_slice(),
+        br#"{"kind":"probe"#.as_slice(),
+    ] {
+        assert!(WindowsLauncherResponseV1::frame_limit(invalid).is_err());
+        assert!(WindowsProviderResponseV1::frame_limit(invalid).is_err());
+    }
+}
+
 fn event() -> CausalEventV1 {
     CausalEventV1 {
         sequence: 0,
@@ -148,6 +279,7 @@ fn diagnostic_expiry_does_not_change_terminal_authority_or_ack_bytes() {
             terminal_receipt: None,
         },
     };
+    assert_serialized_response_limit(&response, WINDOWS_MAX_TERMINAL_FRAME_BYTES);
     let authority = response.terminal_authority_json().unwrap();
     assert!(serde_json::to_value(&response).unwrap()["rejection"]["provider_failure"].is_object());
     if let memcordon_core::WindowsProviderResponseV1::Reject { rejection, .. } = &mut response {
@@ -160,8 +292,8 @@ fn diagnostic_expiry_does_not_change_terminal_authority_or_ack_bytes() {
 #[test]
 fn response_prefix_selects_diagnostic_budget_before_payload_allocation() {
     for prefix in [
-        b"{\"message\":\"attempt-retained\",\"schema_version\":".as_slice(),
-        b"{\"message\":\"replay-pending\",\"schema_version\":".as_slice(),
+        b"{\"kind\":\"attempt-retained\",\"schema_version\":".as_slice(),
+        b"{\"kind\":\"replay-pending\",\"schema_version\":".as_slice(),
     ] {
         assert_eq!(
             windows_response_frame_limit(prefix).unwrap(),
@@ -169,13 +301,13 @@ fn response_prefix_selects_diagnostic_budget_before_payload_allocation() {
         );
     }
     assert_eq!(
-        windows_response_frame_limit(b"{\"message\":\"terminal\",\"schema_version\":").unwrap(),
+        windows_response_frame_limit(b"{\"kind\":\"terminal\",\"schema_version\":").unwrap(),
         WINDOWS_MAX_TERMINAL_FRAME_BYTES
     );
     for invalid in [
-        b"{\"schema_version\":2,\"message\":\"attempt-retained\"}".as_slice(),
-        b"{\"message\":\"attempt\\u002dretained\"}".as_slice(),
-        b"{\"message\":\"unterminated".as_slice(),
+        b"{\"schema_version\":2,\"kind\":\"attempt-retained\"}".as_slice(),
+        b"{\"kind\":\"attempt\\u002dretained\"}".as_slice(),
+        b"{\"kind\":\"unterminated".as_slice(),
     ] {
         assert!(windows_response_frame_limit(invalid).is_err());
     }
@@ -313,20 +445,35 @@ fn record_preflight_bounds_decoded_container_and_metadata_expansion() {
 
 #[test]
 fn maximal_terminal_structure_and_escape_expansion_fit_reserved_transport() {
+    let maximal_entries = MAX_RECORD_JSON_NODES - 1;
+    // Miri exercises the first and repeated map-entry paths, including escaping
+    // and deserialization. Native runs materialize the entire capacity stress
+    // case; the exact full-capacity transport bound is checked in both modes.
+    let entries = if cfg!(miri) { 2 } else { maximal_entries };
     let mut fields = serde_json::Map::new();
-    for index in 0..MAX_RECORD_JSON_NODES - 1 {
+    fields.insert(
+        format!("{:064}", 0),
+        serde_json::Value::String("\u{1}".repeat(16)),
+    );
+    let entry_bytes = serde_json::to_vec(&fields).unwrap().len() - b"{}".len();
+    let encoded_size = |entries: usize| {
+        b"{}".len() + entries * entry_bytes + entries.saturating_sub(1) * b",".len()
+    };
+    assert!(encoded_size(maximal_entries) < WINDOWS_MAX_TERMINAL_FRAME_BYTES);
+    for index in 1..entries {
         let key = format!("{index:064}");
         fields.insert(key, serde_json::Value::String("\u{1}".repeat(16)));
     }
     let encoded = serde_json::to_vec(&fields).unwrap();
+    assert_eq!(encoded.len(), encoded_size(entries));
     validate_record_json_structure(&encoded).unwrap();
     assert!(encoded.len() < WINDOWS_MAX_TERMINAL_FRAME_BYTES);
     assert_eq!(
-        windows_response_frame_limit(br#"{"message":"terminal"}"#).unwrap(),
+        windows_response_frame_limit(br#"{"kind":"terminal"}"#).unwrap(),
         WINDOWS_MAX_TERMINAL_FRAME_BYTES
     );
     assert_eq!(
-        windows_response_frame_limit(br#"{"message":"reject"}"#).unwrap(),
+        windows_response_frame_limit(br#"{"kind":"reject"}"#).unwrap(),
         WINDOWS_MAX_TERMINAL_FRAME_BYTES
     );
 }

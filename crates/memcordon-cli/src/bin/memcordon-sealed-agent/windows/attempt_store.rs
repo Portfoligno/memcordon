@@ -325,20 +325,74 @@ fn close_lane(lane: &Lane) -> Result<(), String> {
 pub(super) struct PublicationGuard(super::pipe::OwnedHandle);
 impl PublicationGuard {
     pub(super) fn acquire(attempt_id: &str) -> Result<Self, String> {
+        // SAFETY: GetCurrentProcess returns the current process pseudo-handle.
+        let owner = super::token::process_user_sid(unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentProcess()
+        })?;
+        let security = super::security::SecurityDescriptor::from_sddl(
+            &super::security::publication_mutex_sddl(&owner)?,
+        )?;
+        let alternate_owner = if owner == "S-1-5-19" {
+            "S-1-5-18"
+        } else {
+            "S-1-5-19"
+        };
+        let alternate = super::security::SecurityDescriptor::from_sddl(
+            &super::security::publication_mutex_sddl(alternate_owner)?,
+        )?;
+        Self::acquire_with_security(attempt_id, security, Some(alternate))
+    }
+
+    #[cfg(test)]
+    pub(super) fn acquire_for_test(attempt_id: &str) -> Result<Self, String> {
+        // The native fixture is an ordinary process, not the LocalSystem service.
+        let user = super::token::process_user_sid(unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentProcess()
+        })?;
+        let security = super::security::SecurityDescriptor::from_sddl(&format!(
+            "O:{user}D:P(D;;WDWO;;;OW)(A;;0x{access:08x};;;{user})",
+            access = super::security::PUBLICATION_MUTEX_ACCESS,
+        ))?;
+        Self::acquire_with_security(attempt_id, security, None)
+    }
+
+    fn acquire_with_security(
+        attempt_id: &str,
+        security: super::security::SecurityDescriptor,
+        alternate: Option<super::security::SecurityDescriptor>,
+    ) -> Result<Self, String> {
         use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
-        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        use windows_sys::Win32::System::Threading::{CreateMutexExW, WaitForSingleObject};
         super::record::validate_attempt_id(attempt_id)?;
-        let security =
-            super::security::SecurityDescriptor::from_sddl(&super::security::private_pipe_sddl()?)?;
         let attributes = security.attributes(false);
         let name: Vec<u16> = format!("Global\\MemCordon.Attempt.Writer.{attempt_id}")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
         // SAFETY: attributes and the terminated name outlive this call.
-        let raw = unsafe { CreateMutexW(&raw const attributes, 0, name.as_ptr()) };
+        let raw = unsafe {
+            CreateMutexExW(
+                &raw const attributes,
+                name.as_ptr(),
+                0,
+                super::security::PUBLICATION_MUTEX_ACCESS,
+            )
+        };
         let handle = super::pipe::OwnedHandle::new(raw)?;
-        security.verify_kernel_object(handle.raw(), super::security::SecurityObjectKind::Mutex)?;
+        if let Err(original) =
+            security.verify_kernel_object(handle.raw(), super::security::SecurityObjectKind::Mutex)
+        {
+            // An existing mutex may have been created by the other service.
+            // Both alternatives require the same complete protected DACL.
+            let alternate = alternate.ok_or(original.clone())?;
+            alternate
+                .verify_kernel_object(handle.raw(), super::security::SecurityObjectKind::Mutex)
+                .map_err(|secondary| {
+                    format!(
+                        "publication mutex policy mismatch: creator={original}; peer={secondary}"
+                    )
+                })?;
+        }
         // No waiting on another service or a stalled writer is introduced.
         let wait = unsafe { WaitForSingleObject(handle.raw(), 0) };
         if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {

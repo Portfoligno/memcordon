@@ -64,6 +64,7 @@ fn terminal(status: i32, exec_status: &str, os_code: &str) -> Vec<u8> {
         concat!(
             "schema-version=2\n",
             "mechanism=linux-pid-namespace-cgroup-v2\n",
+            "policy-enforcement={policy_enforcement}\n",
             "status={status}\n",
             "exec-status={exec_status}\n",
             "exec-os-code={os_code}\n",
@@ -100,11 +101,171 @@ fn terminal(status: i32, exec_status: &str, os_code: &str) -> Vec<u8> {
         status = status,
         exec_status = exec_status,
         os_code = os_code,
+        policy_enforcement = serde_json::to_string(
+            &memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::LegacyUnspecified,
+        )
+        .unwrap(),
         caller_envelope_digest = CALLER_ENVELOPE_DIGEST,
         caller_capability_bounding_set_digest = CALLER_CAPABILITY_BOUNDING_SET_DIGEST,
         caller_mount_namespace_digest = CALLER_MOUNT_NAMESPACE_DIGEST,
     )
     .into_bytes()
+}
+
+fn revoked_terminal() -> Vec<u8> {
+    use memcordon_core::workload_contract::*;
+    use memcordon_core::workload_evidence::*;
+    use memcordon_core::workload_registry::*;
+    use memcordon_core::{BoundedText, DiagnosticSha256};
+    use std::num::NonZeroU64;
+    let digest = DiagnosticSha256::from_bytes([7; 32]);
+    let profile = BaselineProfile::LinuxUnixCreate;
+    let request = WorkloadContractV1 {
+        schema_version: Default::default(),
+        workload_plan_digest: digest.clone(),
+        authorized_profile: profile.reference(),
+        authorization: AuthorizationRef {
+            grant_id: LogicalId::new("revocation-grant".to_owned()).unwrap(),
+            grant_revision: NonZeroU64::MIN,
+            approved_plan_digest: digest.clone(),
+        },
+        ceiling: profile.ceiling(),
+        requirements: Default::default(),
+        endpoints: Default::default(),
+        expected_epoch: PolicyEpoch {
+            service_instance: Nonce128([3; 16]),
+            revision: NonZeroU64::MIN,
+        },
+    };
+    let snapshot = ProviderAdmissionSnapshotV1 {
+        request_digest: memcordon_core::workload_codec::contract_digest(&request).unwrap(),
+        request,
+        registry_digest: digest.clone(),
+        qualification_digest: digest.clone(),
+        admission_nonce: Nonce128([4; 16]),
+        caller_invocation_reference: Nonce128([5; 16]),
+        private_invocation_digest: digest.clone(),
+        caller: CallerSelector::Linux { uid: 1000 },
+        native_profile: profile,
+    };
+    let source = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let binding = AttemptBindingV1::from_snapshot(
+        &snapshot,
+        memcordon_core::PublicProviderBindingV1 {
+            generation: BoundedText::new(&format!("0.5.3-dev:{source}")).unwrap(),
+            source_commit: BoundedText::new(source).unwrap(),
+            runtime_manifest_sha256: digest,
+        },
+        BoundedText::new("boot-a").unwrap(),
+        BoundedText::new("attempt-a").unwrap(),
+        1,
+    )
+    .unwrap();
+    let checkpoint = VerifiedCheckpointV1::observed(
+        &binding,
+        baseline_observation(profile),
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
+    .unwrap();
+    let enforcement = AttemptPolicyEnforcementV1::retired(binding, checkpoint, true, true).unwrap();
+    let ordinary = String::from_utf8(terminal(0, "success", "none")).unwrap();
+    let mut payload = String::new();
+    for line in ordinary.lines() {
+        if line.starts_with("policy-enforcement=") {
+            payload.push_str("policy-enforcement=");
+            payload.push_str(&serde_json::to_string(&enforcement).unwrap());
+        } else if line == "status=0" {
+            payload.push_str("status=none\npolicy-revoked=true");
+        } else {
+            payload.push_str(line);
+        }
+        payload.push('\n');
+    }
+    payload.into_bytes()
+}
+
+#[test]
+fn policy_revocation_preserves_authorized_attempt_and_verified_retirement() {
+    let payload = revoked_terminal();
+    let error =
+        memcordon_platform::test_support::sealed_terminal_revocation_error(&payload).unwrap();
+    assert_eq!(error.category, ErrorCategory::Monitor);
+    assert_eq!(error.code, "MCSEALED-POLICY-DRIFT");
+    assert!(error.target_released);
+    assert_eq!(error.target_pid, Some(71));
+    assert_eq!(
+        error.authorization_offset,
+        Some(std::time::Duration::from_millis(9))
+    );
+    let expected_policy = std::str::from_utf8(&payload)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("policy-enforcement="))
+        .unwrap();
+    assert_eq!(
+        error.policy_enforcement,
+        Some(serde_json::from_str(expected_policy).unwrap())
+    );
+    assert!(error.cleanup.direct_child_reaped);
+    assert_eq!(error.cleanup.workload_empty, Some(true));
+    assert!(!error.workload_may_be_alive);
+    assert!(
+        error
+            .restart_safety
+            .unwrap()
+            .is_safe_for(memcordon_core::BoundaryRequirement::Sealed)
+    );
+    let text = String::from_utf8(payload).unwrap();
+    for (from, to) in [
+        ("status=none", "status=0"),
+        ("policy-revoked=true", "policy-revoked=false"),
+        ("policy-revoked=true", "policy-revoked=invalid"),
+        ("deadline-exceeded=false", "deadline-exceeded=true"),
+        ("cgroup-empty=true", "cgroup-empty=false"),
+        ("init-reaped=true", "init-reaped=false"),
+        ("guardian-reaped=true", "guardian-reaped=false"),
+        ("boundary-retired=true", "boundary-retired=false"),
+        (
+            "\"controls_preserved\":true",
+            "\"controls_preserved\":false",
+        ),
+        (
+            "\"provider_resources_closed\":true",
+            "\"provider_resources_closed\":false",
+        ),
+    ] {
+        assert!(text.contains(from), "missing mutation source {from}");
+        assert!(
+            memcordon_platform::test_support::sealed_terminal_revocation_error(
+                text.replace(from, to).as_bytes()
+            )
+            .is_err(),
+            "accepted {to}"
+        );
+    }
+    let legacy = serde_json::to_string(
+        &memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::LegacyUnspecified,
+    )
+    .unwrap();
+    let mut unbound = String::new();
+    for line in text.lines() {
+        if line.starts_with("policy-enforcement=") {
+            unbound.push_str("policy-enforcement=");
+            unbound.push_str(&legacy);
+        } else {
+            unbound.push_str(line);
+        }
+        unbound.push('\n');
+    }
+    assert!(
+        memcordon_platform::test_support::sealed_terminal_revocation_error(unbound.as_bytes())
+            .is_err()
+    );
 }
 
 #[test]

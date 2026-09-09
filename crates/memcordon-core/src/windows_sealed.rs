@@ -1116,9 +1116,16 @@ pub fn encode_windows_environment_block(
     }
     let mut output = Vec::new();
     for entry in entries {
+        // CreateProcessW environment blocks retain the native =C: drive-directory
+        // entries in addition to ordinary names, which cannot contain '='.
+        let drive_directory = matches!(entry.name.as_slice(), [equals, drive, colon]
+            if *equals == u16::from(b'=')
+                && *colon == u16::from(b':')
+                && ((u16::from(b'A')..=u16::from(b'Z')).contains(drive)
+                    || (u16::from(b'a')..=u16::from(b'z')).contains(drive)));
         if entry.name.is_empty()
             || entry.name.contains(&0)
-            || entry.name.contains(&(b'=' as u16))
+            || (entry.name.contains(&(b'=' as u16)) && !drive_directory)
             || entry.value.contains(&0)
         {
             return Err("invalid Windows environment entry");
@@ -1472,7 +1479,7 @@ pub fn authenticate_decoded_windows_attempt_record(
     {
         return Err("MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH: reason=target-process-identity");
     }
-    if let Some(error) = windows_durable_attempt_state_error(&record) {
+    if let Some(error) = windows_durable_attempt_state_error(record) {
         return Err(error);
     }
     Ok(())
@@ -1860,6 +1867,41 @@ pub enum WindowsLifetimeV1 {
 pub struct WindowsProcessIdentityV1 {
     pub process_id: u32,
     pub creation_time_100ns: u64,
+}
+
+/// A diagnostic-only refusal, never a qualification admission or launch authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowsQualificationRejectionV1 {
+    pub schema_version: u32,
+    pub challenge: crate::DiagnosticSha256,
+    pub detail: crate::BoundedText<4096>,
+    pub detail_truncated: bool,
+}
+
+impl WindowsQualificationRejectionV1 {
+    pub const MAX_DETAIL_BYTES: usize = 4096;
+
+    pub fn new(challenge: &str, detail: &str) -> Result<Self, &'static str> {
+        let challenge = crate::DiagnosticSha256::try_from(crate::BoundedText::new(challenge)?)?;
+        let mut end = detail.len().min(Self::MAX_DETAIL_BYTES);
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        Ok(Self {
+            schema_version: WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            challenge,
+            detail: crate::BoundedText::new(&detail[..end])?,
+            detail_truncated: end < detail.len(),
+        })
+    }
+
+    pub fn matches_challenge(&self, expected: &str) -> bool {
+        self.schema_version == WINDOWS_PUBLIC_PROTOCOL_VERSION
+            && crate::BoundedText::new(expected)
+                .and_then(crate::DiagnosticSha256::try_from)
+                .is_ok_and(|challenge| challenge == self.challenge)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2407,6 +2449,7 @@ pub enum WindowsProviderResponseV1 {
     QualificationReady {
         schema_version: u32,
     },
+    QualificationRejected(WindowsQualificationRejectionV1),
     QualificationAuthenticated {
         schema_version: u32,
         control_attestation: WindowsServiceSelfAttestationV1,
@@ -2460,6 +2503,10 @@ pub enum WindowsProviderResponseV1 {
 #[allow(clippy::large_enum_variant)] // Preserve the direct, typed wire payload variants.
 #[serde(tag = "message", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WindowsLauncherRequestV1 {
+    StartupAttestation {
+        schema_version: u32,
+        challenge: String,
+    },
     Probe {
         schema_version: u32,
         challenge: String,
@@ -2522,6 +2569,10 @@ pub enum WindowsLauncherRequestV1 {
 #[allow(clippy::large_enum_variant)] // Preserve the direct, typed wire payload variants.
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WindowsLauncherResponseV1 {
+    StartupAttestation {
+        schema_version: u32,
+        attestation: WindowsServiceSelfAttestationV1,
+    },
     Probe {
         schema_version: u32,
         attestation: WindowsServiceSelfAttestationV1,

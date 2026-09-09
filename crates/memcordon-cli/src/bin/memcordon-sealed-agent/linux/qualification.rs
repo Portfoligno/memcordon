@@ -113,7 +113,7 @@ fn qualify_after_package_verification() -> Result<QualificationReceipt, String> 
         vec![b"workload-profile-probe".to_vec()],
     );
     let profile_verified = profile_probe.as_ref().is_ok_and(|facts| {
-        facts.child_status == 0
+        facts.child_status == Some(0)
             && facts.exec_status == super::launch::TargetExecStatus::Succeeded
             && facts.cgroup_empty
             && facts.init_reaped
@@ -150,12 +150,12 @@ fn qualify_after_package_verification() -> Result<QualificationReceipt, String> 
                 .map(|error| format!("spawn-error-transaction={error}"))
         });
     let success_verified = sacrificial.as_ref().is_ok_and(|facts| {
-        facts.child_status == 0
+        facts.child_status == Some(0)
             && facts.spawn_error_reported
             && facts.exec_status == super::launch::TargetExecStatus::Succeeded
     });
     let spawn_error_verified = missing_sacrificial.as_ref().is_ok_and(|facts| {
-        facts.child_status == 127
+        facts.child_status == Some(127)
             && facts.spawn_error_reported
             && matches!(
                 facts.exec_status,
@@ -199,11 +199,21 @@ fn qualify_after_package_verification() -> Result<QualificationReceipt, String> 
     digest.update(sudo_transition_certification_digest.as_bytes());
     digest.update([u8::from(qualified), u8::from(recovery_complete)]);
     if let Ok(facts) = sacrificial.as_ref() {
-        digest.update(facts.child_status.to_be_bytes());
+        digest.update(
+            facts
+                .child_status
+                .expect("qualification observed child status")
+                .to_be_bytes(),
+        );
         digest.update(facts.caller_envelope_digest.as_bytes());
     }
     if let Ok(facts) = missing_sacrificial.as_ref() {
-        digest.update(facts.child_status.to_be_bytes());
+        digest.update(
+            facts
+                .child_status
+                .expect("qualification observed child status")
+                .to_be_bytes(),
+        );
         digest.update(facts.caller_envelope_digest.as_bytes());
     }
     let receipt = QualificationReceipt {

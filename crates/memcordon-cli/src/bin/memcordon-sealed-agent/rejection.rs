@@ -40,7 +40,8 @@ pub struct RejectionCleanupV1 {
 #[serde(deny_unknown_fields)]
 pub struct RejectionV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workload_admission: Option<memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1>,
+    pub workload_admission:
+        Option<Box<memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1>>,
     pub schema_version: u32,
     pub code: String,
     pub phase: RejectionPhaseV1,

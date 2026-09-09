@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use super::{CGROUP_ROOT, STATE_ROOT};
 
-const MAX_RECORD_BYTES: u64 = 16 * 1024
+pub(crate) const MAX_RECORD_BYTES: u64 = 16 * 1024
     + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64
     + memcordon_core::workload_limits::CONTRACT_BYTES as u64;
 

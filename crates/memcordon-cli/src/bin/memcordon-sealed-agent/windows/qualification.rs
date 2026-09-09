@@ -906,6 +906,15 @@ impl QualificationAdmission {
                     launcher_attestation,
                 )
             }
+            WindowsProviderResponseV1::QualificationRejected(rejection)
+                if rejection.matches_challenge(&challenge) =>
+            {
+                Err(format!(
+                    "MCSEALED-WINDOWS-QUALIFICATION: stage=qualification-admission-rejected detail_truncated={} detail={}",
+                    rejection.detail_truncated,
+                    rejection.detail.as_str()
+                ))
+            }
             WindowsProviderResponseV1::Reject { rejection, .. } => {
                 Err(format!("{}: {}", rejection.code, rejection.detail))
             }
@@ -4066,6 +4075,7 @@ fn provider_response_variant(response: &WindowsProviderResponseV1) -> &'static s
         WindowsProviderResponseV1::RecoveryStatus { .. } => "recovery-status",
         WindowsProviderResponseV1::PackageCleanupResult { .. } => "package-cleanup-result",
         WindowsProviderResponseV1::QualificationReady { .. } => "qualification-ready",
+        WindowsProviderResponseV1::QualificationRejected(_) => "qualification-rejected",
         WindowsProviderResponseV1::QualificationAuthenticated { .. } => {
             "qualification-authenticated"
         }

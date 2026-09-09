@@ -11,9 +11,13 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+
+#[cfg(test)]
+#[path = "../../../../tests/sealed_agent/windows_policy_directory.rs"]
+mod directory_tests;
 
 pub fn root() -> PathBuf {
     super::package::state_root()
@@ -38,6 +42,7 @@ fn owned_policy_name(name: &std::ffi::OsStr) -> bool {
         return false;
     };
     matches!(name, "policy-activation.json" | "policy-activation.pending")
+        || name == super::startup_diagnostics::FILE_NAME
         || name.strip_suffix(".snapshot").is_some_and(|digest| {
             digest.len() == std::mem::size_of::<[u8; 32]>() * 2
                 && digest
@@ -60,7 +65,7 @@ pub fn capture_retired() -> Result<Option<RetiredPolicySnapshot>, String> {
     for entry in std::fs::read_dir(root()).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         if !owned_policy_name(&entry.file_name())
-            || entries.len() >= memcordon_core::workload_limits::SNAPSHOTS + 2
+            || entries.len() >= memcordon_core::workload_limits::SNAPSHOTS + 3
         {
             return Err("policy directory contains unknown or excessive entries".into());
         }
@@ -250,15 +255,7 @@ impl Lease {
         super::package::reject_reparse_components(&root)?;
         SecurityDescriptor::from_sddl(&super::security::state_bootstrap_sddl()?)?
             .verify_path(&root)?;
-        let directory = OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(
-                FILE_FLAG_OPEN_REPARSE_POINT
-                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
-            )
-            .open(&root)
-            .map_err(|error| error.to_string())?;
+        let directory = pin_directory(&root).map_err(|error| error.to_string())?;
         let control = super::security::service_sid(memcordon_core::WINDOWS_CONTROL_SERVICE_NAME)?;
         let launcher = super::security::service_sid(memcordon_core::WINDOWS_LAUNCHER_SERVICE_NAME)?;
         let security = SecurityDescriptor::from_sddl(&format!(
@@ -308,8 +305,11 @@ impl Lease {
         instance: Option<Nonce128>,
     ) -> Result<Activation, String> {
         registry.validate()?;
-        self.retain_snapshot(&registry)?;
-        let previous = self.read()?;
+        self.retain_snapshot(&registry)
+            .map_err(|error| format!("retain snapshot: {error}"))?;
+        let previous = self
+            .read()
+            .map_err(|error| format!("read activation: {error}"))?;
         let revoked_admissions = Activation::next_revocations(
             previous.as_ref(),
             registry.active_attempt_disposition,
@@ -359,7 +359,7 @@ impl Lease {
             .share_mode(0)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&staged)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("open activation staging: {error}"))?;
         let metadata = file.metadata().map_err(|error| error.to_string())?;
         if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err("policy activation staging file is not regular".into());
@@ -367,9 +367,10 @@ impl Lease {
         file.set_len(0)
             .and_then(|()| file.write_all(&bytes))
             .and_then(|()| file.sync_all())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("write and flush activation staging: {error}"))?;
         drop(file);
-        super::record::replace_atomically(&staged, &root().join("policy-activation.json"))?;
+        super::record::replace_atomically(&staged, &root().join("policy-activation.json"))
+            .map_err(|error| format!("publish activation: {error}"))?;
         Ok(activation)
     }
 }
@@ -381,6 +382,24 @@ impl Drop for Lease {
         }
     }
 }
+fn pin_directory(path: &std::path::Path) -> std::io::Result<File> {
+    // Child publications may open the parent for write. Excluding DELETE pins
+    // the directory itself against rename/replacement without blocking them.
+    let directory = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(
+            FILE_FLAG_OPEN_REPARSE_POINT
+                | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+        )
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other("policy directory is not regular"));
+    }
+    Ok(directory)
+}
+
 fn open_regular(path: &std::path::Path) -> std::io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
@@ -414,8 +433,11 @@ pub fn random_nonce() -> Result<Nonce128, String> {
 }
 
 pub fn start_service_instance() -> Result<(), String> {
-    let lease = Lease::acquire()?;
-    let registry = match lease.read()? {
+    let lease = Lease::acquire().map_err(|error| format!("policy startup lease: {error}"))?;
+    let registry = match lease
+        .read()
+        .map_err(|error| format!("policy startup read: {error}"))?
+    {
         Some(previous) => previous.registry,
         None => PolicyRegistryV1 {
             schema_version: ContractVersionOne::default(),
@@ -425,7 +447,10 @@ pub fn start_service_instance() -> Result<(), String> {
                 memcordon_core::workload_registry::GrantChangeDisposition::DrainExisting,
         },
     };
-    lease.activate(registry, Some(random_nonce()?))?;
+    let nonce = random_nonce().map_err(|error| format!("policy startup nonce: {error}"))?;
+    lease
+        .activate(registry, Some(nonce))
+        .map_err(|error| format!("policy startup activation: {error}"))?;
     Ok(())
 }
 

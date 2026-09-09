@@ -41,7 +41,7 @@ fn deep_ci_fuzz_timeout_covers_the_complete_target_set() {
     )
     .expect("the exact deep CI workflow should pass");
 
-    for timeout_minutes in [30, 44] {
+    for timeout_minutes in [30, 44, 60] {
         let invalid = workflow_with_job_timeout(fixture, "fuzz", timeout_minutes);
         let error = policy::validate_workflow_bytes(
             &root,
@@ -49,23 +49,14 @@ fn deep_ci_fuzz_timeout_covers_the_complete_target_set() {
             &invalid,
             &repository_policy,
         )
-        .expect_err("an insufficient fuzz workload budget must fail");
+        .expect_err("a changed fuzz shard deadline must fail");
         assert!(
             error
                 .to_string()
-                .contains("deep CI fuzz timeout is below workload minimum"),
+                .contains("deep CI fuzz timeout differs from workload deadline"),
             "unexpected workflow policy error: {error}"
         );
     }
-
-    let increased = workflow_with_job_timeout(fixture, "fuzz", 60);
-    policy::validate_workflow_bytes(
-        &root,
-        Path::new(".github/workflows/deep-ci.yml"),
-        &increased,
-        &repository_policy,
-    )
-    .expect("a larger fuzz workload budget should remain valid");
 }
 
 #[test]

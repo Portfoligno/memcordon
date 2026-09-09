@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use memcordon_platform::test_support::ProcessIdentity;
-use memcordon_testkit::run_with_deadline;
+use memcordon_testkit::{ProcessTestError, run_with_deadline};
 
 const DESCENDANT_IDENTITY: &str = "descendant.pid";
 const HELPER_TEST: &str = "outer_boundary_helper_leaves_descendant";
@@ -14,12 +14,14 @@ struct TemporaryDirectory(PathBuf);
 
 impl TemporaryDirectory {
     fn new() -> Self {
+        static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should follow the Unix epoch")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "memcordon-testkit-outer-boundary-{}-{nonce}",
+            "memcordon-testkit-outer-boundary-{}-{nonce}-{sequence}",
             std::process::id()
         ));
         std::fs::create_dir(&path).expect("temporary directory should exist");
@@ -105,4 +107,55 @@ fn read_identity(path: &Path) -> ProcessIdentity {
         .expect("descendant birth identity should parse");
     assert!(fields.next().is_none(), "descendant identity was malformed");
     ProcessIdentity { pid, birth }
+}
+
+#[test]
+fn timeout_reaps_direct_child_and_preserves_output() {
+    let temporary = TemporaryDirectory::new();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "outer_boundary_helper_waits_for_timeout",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .current_dir(temporary.path());
+    let error = run_with_deadline(&mut command, Duration::from_millis(500)).unwrap_err();
+    let ProcessTestError::Timeout {
+        stdout,
+        stderr,
+        cleanup,
+        ..
+    } = error
+    else {
+        panic!("expected timeout, got {error}");
+    };
+    assert!(
+        cleanup.is_ok(),
+        "direct child was not reaped during retirement: {cleanup:?}"
+    );
+    assert!(String::from_utf8_lossy(&stdout).contains("timeout stdout marker"));
+    assert!(String::from_utf8_lossy(&stderr).contains("timeout stderr marker"));
+    assert!(
+        !read_identity(&temporary.path().join(DESCENDANT_IDENTITY))
+            .still_exists()
+            .unwrap()
+    );
+}
+
+#[test]
+#[ignore = "subprocess helper for timeout coverage"]
+fn outer_boundary_helper_waits_for_timeout() {
+    use std::io::Write;
+    ProcessIdentity::for_pid(std::process::id())
+        .unwrap()
+        .publish_to(Path::new(DESCENDANT_IDENTITY))
+        .unwrap();
+    println!("timeout stdout marker");
+    eprintln!("timeout stderr marker");
+    std::io::stdout().flush().unwrap();
+    std::io::stderr().flush().unwrap();
+    std::thread::sleep(Duration::from_secs(30));
 }

@@ -163,16 +163,14 @@ fn native_archive_markdown_links_resolve_within_member_set() {
 #[test]
 fn native_archive_markdown_links_require_the_workload_specification() {
     let mut documents = archive_documents();
-    assert!(
-        documents
-            .remove(Path::new("docs/spec-workload-contract-v1.md"))
-            .is_some()
-    );
+    let source = Path::new("README.md");
+    let target = Path::new("docs").join("spec-workload-contract-v1.md");
+    assert!(documents.remove(&target).is_some());
     let error = validate_markdown_documents(&documents)
         .expect_err("README workload specification link must resolve inside the archive");
     assert_eq!(
         error.to_string(),
-        "Markdown link target is absent from package or archive: \"README.md\" -> \"docs/spec-workload-contract-v1.md\""
+        format!("Markdown link target is absent from package or archive: {source:?} -> {target:?}")
     );
 }
 

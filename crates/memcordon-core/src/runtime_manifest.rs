@@ -84,7 +84,7 @@ pub enum SealedRuntimeV2 {
         profile_catalog_sha256: String,
         profiles: Vec<String>,
         diagnostic_qualification: Option<QualificationArtifactReferenceV1>,
-        profile_qualification: QualificationArtifactReferenceV1,
+        profile_qualification: Box<QualificationArtifactReferenceV1>,
     },
     NotApplicable {
         reason: String,
@@ -205,7 +205,7 @@ impl RuntimeManifestV2 {
                 profile_catalog_sha256: baseline_catalog_digest(false),
                 profiles: vec!["linux-unix-create-v1".into()],
                 diagnostic_qualification: None,
-                profile_qualification,
+                profile_qualification: Box::new(profile_qualification),
             },
         }
     }
@@ -241,7 +241,7 @@ impl RuntimeManifestV2 {
                 profile_catalog_sha256: baseline_catalog_digest(true),
                 profiles: vec!["windows-host-network-external-v1".into()],
                 diagnostic_qualification,
-                profile_qualification,
+                profile_qualification: Box::new(profile_qualification),
             },
         }
     }

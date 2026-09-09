@@ -1185,22 +1185,26 @@ pub fn read_frame<T: DeserializeOwned>(handle: HANDLE) -> Result<T, String> {
 }
 
 pub fn read_frame_detailed<T: DeserializeOwned>(handle: HANDLE) -> Result<T, FrameReadError> {
-    read_frame_with_kind_limit(handle, false)
+    read_frame_with_kind_limit(handle, None)
 }
 
-pub fn read_response_frame<T: DeserializeOwned>(handle: HANDLE) -> Result<T, String> {
+pub fn read_response_frame<T: memcordon_core::WindowsResponseFrame>(
+    handle: HANDLE,
+) -> Result<T, String> {
     read_response_frame_detailed(handle).map_err(|error| error.to_string())
 }
 
-pub fn read_response_frame_detailed<T: DeserializeOwned>(
+pub fn read_response_frame_detailed<T: memcordon_core::WindowsResponseFrame>(
     handle: HANDLE,
 ) -> Result<T, FrameReadError> {
-    read_frame_with_kind_limit(handle, true)
+    read_frame_with_kind_limit(handle, Some(T::frame_limit))
 }
+
+type ResponseFrameLimit = fn(&[u8]) -> Result<usize, &'static str>;
 
 fn read_frame_with_kind_limit<T: DeserializeOwned>(
     handle: HANDLE,
-    response: bool,
+    response_limit: Option<ResponseFrameLimit>,
 ) -> Result<T, FrameReadError> {
     let mut length = [0_u8; 4];
     read_exact_detailed(handle, &mut length, FrameReadPhase::Length)?;
@@ -1216,26 +1220,25 @@ fn read_frame_with_kind_limit<T: DeserializeOwned>(
         });
     }
     let mut prefix = [0_u8; memcordon_core::WINDOWS_RESPONSE_PREFIX_BYTES];
-    let prefix_length = if response {
+    let prefix_length = if response_limit.is_some() {
         length.min(prefix.len())
     } else {
         0
     };
-    if response {
+    if let Some(response_limit) = response_limit {
         read_exact_detailed(
             handle,
             &mut prefix[..prefix_length],
             FrameReadPhase::Payload,
         )?;
-        let limit = memcordon_core::windows_response_frame_limit(&prefix[..prefix_length])
-            .map_err(|detail| FrameReadError {
-                phase: FrameReadPhase::Decode,
-                expected_bytes: length,
-                transferred_bytes: prefix_length,
-                native_code: None,
-                peer_closed: false,
-                detail: detail.to_owned(),
-            })?;
+        let limit = response_limit(&prefix[..prefix_length]).map_err(|detail| FrameReadError {
+            phase: FrameReadPhase::Decode,
+            expected_bytes: length,
+            transferred_bytes: prefix_length,
+            native_code: None,
+            peer_closed: false,
+            detail: detail.to_owned(),
+        })?;
         if length > limit {
             return Err(FrameReadError {
                 phase: FrameReadPhase::Length,

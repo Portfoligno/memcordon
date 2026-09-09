@@ -5,6 +5,52 @@ use std::process::{Child, Command, Stdio};
 
 const CHILD_FIXTURE: &str = "windows::record::record_fault_tests::native_lifetime_child";
 
+#[test]
+fn publication_mutex_policy_accepts_service_owners_and_rejects_other_accounts() {
+    use super::super::security::{SecurityDescriptor, publication_mutex_sddl};
+
+    for owner in ["S-1-5-18", "S-1-5-19"] {
+        SecurityDescriptor::from_sddl(&publication_mutex_sddl(owner).unwrap())
+            .expect("native parser must accept each explicit service-owner policy");
+    }
+    for owner in ["S-1-5-32-544", "S-1-5-20", "S-1-1-0", ""] {
+        assert!(publication_mutex_sddl(owner).is_err());
+    }
+}
+
+#[test]
+fn publication_mutex_preserves_exclusivity_without_owner_mutation_rights() {
+    use super::super::attempt_store::PublicationGuard;
+    use windows_sys::Win32::System::Threading::OpenMutexW;
+
+    let attempt = digest(format!("publication-policy-{}", std::process::id()).as_bytes());
+    let guard = PublicationGuard::acquire_for_test(&attempt).unwrap();
+    let contender = attempt.clone();
+    let error = std::thread::spawn(move || {
+        PublicationGuard::acquire_for_test(&contender)
+            .err()
+            .expect("another thread must not acquire the held publication mutex")
+    })
+    .join()
+    .unwrap();
+    assert_eq!(error, "attempt publication owner is unavailable");
+
+    let name: Vec<u16> = format!("Global\\MemCordon.Attempt.Writer.{attempt}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: name is terminated and remains live for the native open call.
+    let mutation = unsafe { OpenMutexW(0x000c_0000, 0, name.as_ptr()) };
+    let error = std::io::Error::last_os_error();
+    assert!(
+        mutation.is_null(),
+        "owner must not receive WRITE_DAC or WRITE_OWNER"
+    );
+    assert_eq!(error.raw_os_error(), Some(5));
+    drop(guard);
+    assert!(PublicationGuard::acquire_for_test(&attempt).is_ok());
+}
+
 struct ChildLifetime(Child);
 
 impl Drop for ChildLifetime {
@@ -301,6 +347,7 @@ fn stale_revision_original_replacement_and_staging_collision_never_publish() {
 
 #[test]
 fn native_rename_sharing_failure_retains_typed_code_and_original() {
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("attempt.json");
@@ -316,7 +363,39 @@ fn native_rename_sharing_failure_retains_typed_code_and_original() {
         .unwrap();
     let mut candidate = committed.clone();
     candidate.record_revision += 1;
-    assert!(candidate.publish_at(&path, 1, |_| Ok(())).is_err());
+    let probe = directory.path().join("native-replacement-probe");
+    fs::write(&probe, b"replacement probe").unwrap();
+    let probe_name: Vec<u16> = probe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination_name: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: both names are live terminated UTF-16 buffers. The retained
+    // destination handle excludes delete sharing throughout both operations.
+    let replaced = unsafe {
+        MoveFileExW(
+            probe_name.as_ptr(),
+            destination_name.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    let expected_code = std::io::Error::last_os_error().raw_os_error().unwrap();
+    assert_eq!(replaced, 0);
+    let mut reached_rename = false;
+    assert!(
+        candidate
+            .publish_at(&path, 1, |phase| {
+                reached_rename |= phase == PublicationPhase::Rename;
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(reached_rename);
     let mut source = memcordon_core::WindowsCausalDiagnosticsV1::default();
     super::super::diagnostics::merge_into(&mut source);
     let memcordon_core::OriginalFailureV1::Observed { event } = source.original else {
@@ -324,7 +403,9 @@ fn native_rename_sharing_failure_retains_typed_code_and_original() {
     };
     assert_eq!(
         event.native_code,
-        Some(memcordon_core::NativeFailureCodeV1::Win32(32))
+        Some(memcordon_core::NativeFailureCodeV1::Win32(
+            u32::try_from(expected_code).unwrap()
+        ))
     );
     assert_eq!(
         event.origin,
@@ -369,11 +450,18 @@ fn frozen_native_publication_does_not_own_workload_job_cleanup() {
         let cleanup_record = record.clone();
         let attempt_id = record.attempt_id.clone();
         let cleanup_path = path.clone();
+        let (attempted, wait_attempted) = std::sync::mpsc::sync_channel(1);
         let lane = super::super::attempt_store::test_publisher_lane(
             &attempt_id,
             move |record, revision| {
-                let _publication_owner =
-                    super::super::attempt_store::PublicationGuard::acquire(&record.attempt_id)?;
+                let publication_owner =
+                    super::super::attempt_store::PublicationGuard::acquire_for_test(
+                        &record.attempt_id,
+                    );
+                attempted
+                    .send(publication_owner.as_ref().err().cloned())
+                    .unwrap();
+                let _publication_owner = publication_owner?;
                 record.publish_at(&cleanup_path, revision, |_| Ok(()))
             },
         )
@@ -382,7 +470,8 @@ fn frozen_native_publication_does_not_own_workload_job_cleanup() {
         let (release, wait_release) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::spawn(move || {
             let _publication_owner =
-                super::super::attempt_store::PublicationGuard::acquire(&record.attempt_id).unwrap();
+                super::super::attempt_store::PublicationGuard::acquire_for_test(&record.attempt_id)
+                    .unwrap();
             record.publish_at(&path, 0, |phase| {
                 if phase == PublicationPhase::Flush {
                     frozen.send(()).unwrap();
@@ -454,8 +543,30 @@ fn frozen_native_publication_does_not_own_workload_job_cleanup() {
             !worker.is_finished(),
             "writer was not still frozen during Job cleanup"
         );
+        if !guardian_cleanup {
+            assert_eq!(
+                wait_attempted
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap(),
+                Some("attempt publication owner is unavailable".to_owned())
+            );
+        }
         release.send(()).unwrap();
         worker.join().unwrap().unwrap();
-        lane.finish().unwrap();
+        let publication = lane.finish();
+        if guardian_cleanup {
+            publication.unwrap();
+        } else {
+            assert_eq!(
+                publication.unwrap_err(),
+                "attempt cleanup publication is unconfirmed"
+            );
+        }
+        let committed: WindowsAttemptRecordV1 = serde_json::from_slice(
+            &read_record_bounded(&directory.path().join("attempt.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(committed.record_revision, 1);
+        assert!(!committed.cleanup_state.termination_requested);
     }
 }

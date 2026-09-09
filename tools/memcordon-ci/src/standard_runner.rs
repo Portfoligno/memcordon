@@ -218,10 +218,10 @@ impl<C: UnitControl> DelegatedUnitLease<C> {
 
 impl<C: UnitControl> Drop for DelegatedUnitLease<C> {
     fn drop(&mut self) {
-        if self.armed {
-            if let Err(error) = self.stop() {
-                eprintln!("owned standard unit emergency cleanup failed: {error}");
-            }
+        if self.armed
+            && let Err(error) = self.stop()
+        {
+            eprintln!("owned standard unit emergency cleanup failed: {error}");
         }
     }
 }

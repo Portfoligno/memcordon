@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 
 mod support;
+pub(crate) use support::StagedFixture;
 
 #[path = "support/retained_streams.rs"]
 mod retained_streams;
@@ -211,7 +212,8 @@ fn staged_frontend_hold_rejects_exit_before_readiness() {
 fn run(mode: &str, lifetime: Lifetime) {
     let facts = support::execute(mode, lifetime).expect("native sealed launch must complete");
     assert_eq!(
-        facts.child_status, 0,
+        facts.child_status,
+        Some(0),
         "fixture mode {mode} did not complete successfully"
     );
     support::assert_retired(&facts);
@@ -232,7 +234,7 @@ fn assert_transition_terminal(
     result: Result<crate::linux::launch::TerminalFacts, String>,
 ) -> crate::linux::launch::TerminalFacts {
     let facts = result.expect("credential transition must finish under the sealed boundary");
-    assert_eq!(facts.child_status, 0);
+    assert_eq!(facts.child_status, Some(0));
     assert!(facts.boundary_independent_of_credentials);
     assert!(facts.target_initial_credentials_verified);
     assert!(facts.initial_provider_capabilities_absent);
@@ -501,7 +503,7 @@ fn sealed_caller_mount_context_is_reproduced() {
             facts.target_mount_context_derived_from_caller
                 && facts.caller_mount_namespace_digest.len() == 64
                 && facts.boundary_retired
-                && facts.child_status == 0
+                && facts.child_status == Some(0)
         });
         unsafe { libc::_exit(i32::from(!success)) };
     }
@@ -556,7 +558,7 @@ fn sealed_fixture_deadline_is_future_monotonic_time() {
 #[ignore = "requires privileged Linux sealed certification"]
 fn sealed_future_deadline_authorizes_and_retires() {
     let facts = support::execute("exit", Lifetime::Command).unwrap();
-    assert_eq!(facts.child_status, 0);
+    assert_eq!(facts.child_status, Some(0));
     assert!(!facts.deadline_exceeded);
     assert!(facts.authorization_offset_millis < 30_000);
     support::assert_retired(&facts);
@@ -642,7 +644,7 @@ fn sealed_staged_fixture_is_isolated_and_removed_after_retirement() {
     assert_eq!(program_metadata.permissions().mode() & 0o777, 0o555);
     let facts = support::execute_request(fixture.request("exit", Lifetime::Command).unwrap())
         .expect("isolated staged fixture must execute as the reduced target identity");
-    assert_eq!(facts.child_status, 0);
+    assert_eq!(facts.child_status, Some(0));
     support::assert_retired(&facts);
     drop(fixture);
     drop(second_fixture);
@@ -700,7 +702,7 @@ fn sealed_retained_streams_do_not_finish_before_retirement() {
         captured.stderr,
         b"retained-stderr-open\nretained-stderr-release\n"
     );
-    assert_eq!(captured.facts.child_status, 0);
+    assert_eq!(captured.facts.child_status, Some(0));
     assert_eq!(captured.facts.exec_status, TargetExecStatus::Succeeded);
     assert!(captured.facts.spawn_error_reported);
     assert!(!captured.facts.deadline_exceeded);
@@ -874,7 +876,7 @@ fn sealed_provider_worker_loss_triggers_guardian() {
         &sealed_faults::CapturedFaultOutcome {
             outcome: crate::linux::launch::FaultExecutionOutcome {
                 attempt_id: attempt,
-                rejection,
+                rejection: Box::new(rejection),
                 retirement_owner: RetirementOwner::Guardian,
             },
             marker_observed: false,
@@ -1020,7 +1022,7 @@ fn sealed_faults_before_authorization_never_create_marker() {
         &sealed_faults::CapturedFaultOutcome {
             outcome: FaultExecutionOutcome {
                 attempt_id: attempt,
-                rejection,
+                rejection: Box::new(rejection),
                 retirement_owner: RetirementOwner::Provider,
             },
             marker_observed: false,
@@ -1088,7 +1090,7 @@ fn sealed_namespace_init_failure_is_typed_prompt_and_retired() {
 #[ignore = "requires privileged Linux sealed certification"]
 fn sealed_native_nonzero_exit_preserves_provenance() {
     let captured = support::execute_captured("exit-17", Lifetime::Command).unwrap();
-    assert_eq!(captured.facts.child_status, 17);
+    assert_eq!(captured.facts.child_status, Some(17));
     assert_eq!(captured.facts.exec_status, TargetExecStatus::Succeeded);
     assert!(captured.facts.spawn_error_reported);
     support::assert_retired(&captured.facts);
@@ -1100,7 +1102,7 @@ fn sealed_native_nonzero_exit_preserves_provenance() {
 fn sealed_native_exit_126_and_127_are_not_exec_failures() {
     for (mode, expected) in [("exit-126", 126), ("exit-127", 127)] {
         let captured = support::execute_captured(mode, Lifetime::Command).unwrap();
-        assert_eq!(captured.facts.child_status, expected);
+        assert_eq!(captured.facts.child_status, Some(expected));
         assert_eq!(captured.facts.exec_status, TargetExecStatus::Succeeded);
         assert!(captured.facts.spawn_error_reported);
         support::assert_retired(&captured.facts);
@@ -1115,7 +1117,7 @@ fn sealed_missing_target_preserves_enoent_exec_provenance() {
     let request = fixture.request("exit", Lifetime::Command).unwrap();
     drop(fixture);
     let captured = support::execute_request_captured(request).unwrap();
-    assert_eq!(captured.facts.child_status, 127);
+    assert_eq!(captured.facts.child_status, Some(127));
     assert_eq!(
         captured.facts.exec_status,
         TargetExecStatus::Failed {
@@ -1137,7 +1139,7 @@ fn sealed_non_executable_target_preserves_eacces_exec_provenance() {
     std::fs::set_permissions(fixture.program(), std::fs::Permissions::from_mode(0o444)).unwrap();
     let request = fixture.request("exit", Lifetime::Command).unwrap();
     let captured = support::execute_request_captured(request).unwrap();
-    assert_eq!(captured.facts.child_status, 126);
+    assert_eq!(captured.facts.child_status, Some(126));
     assert_eq!(
         captured.facts.exec_status,
         TargetExecStatus::Failed {
@@ -1155,8 +1157,8 @@ fn sealed_non_executable_target_preserves_eacces_exec_provenance() {
 fn sealed_restart_uses_fresh_retired_boundary() {
     let first = support::execute_captured("exit", Lifetime::Command).unwrap();
     let second = support::execute_captured("exit", Lifetime::Command).unwrap();
-    assert_eq!(first.facts.child_status, 0);
-    assert_eq!(second.facts.child_status, 0);
+    assert_eq!(first.facts.child_status, Some(0));
+    assert_eq!(second.facts.child_status, Some(0));
     assert_ne!(first.facts.target_pid, second.facts.target_pid);
     assert_ne!(first.attempt, second.attempt);
     assert_ne!(first.identity(), second.identity());

@@ -66,7 +66,8 @@ fn legacy_manifest_absence_survives_failed_upgrade_qualification() {
         policy
     );
     drop(restore);
-    verify_installed().unwrap();
+    validate_installed_artifacts(&before.digests).unwrap();
+    verify_live_installed_state().unwrap();
 }
 
 struct RestoreManifest {
@@ -166,6 +167,7 @@ fn partial_uninstall_restores_captured_images_manifest_and_policy() {
             }
             std::fs::remove_file(installed_target_desktop_bootstrap())
                 .map_err(|error| error.to_string())?;
+            SecurityDescriptor::from_sddl(&state_sddl()?)?.verify_path(&state_root())?;
             Err("fixture: removal interrupted after manifest and bootstrap deletion".into())
         })
         .expect_err("injected partial removal must fail");
@@ -173,6 +175,14 @@ fn partial_uninstall_restores_captured_images_manifest_and_policy() {
             failure.contains("MCSEALED-WINDOWS-UNINSTALL-ROLLED-BACK"),
             "{failure}"
         );
+        assert!(
+            failure.contains("fixture: removal interrupted after manifest and bootstrap deletion"),
+            "{failure}"
+        );
+        SecurityDescriptor::from_sddl(&state_sddl().unwrap())
+            .unwrap()
+            .verify_path(&state_root())
+            .unwrap();
         let restored = validate_existing_installed_artifacts().unwrap();
         assert_eq!(restored.agent_bytes, before.agent_bytes);
         assert_eq!(
@@ -192,9 +202,14 @@ fn partial_uninstall_restores_captured_images_manifest_and_policy() {
         assert_eq!(policy_after.registry_digest, policy_before.registry_digest);
         assert_eq!(policy_after.registry, policy_before.registry);
         if legacy_absence {
+            assert!(
+                installed_public_provider_binding().is_err(),
+                "restored legacy absence must not advertise a current runtime binding"
+            );
             copy_atomically_bytes(&manifest, &manifest_path).unwrap();
         }
-        verify_installed().unwrap();
+        validate_installed_artifacts(&before.digests).unwrap();
+        verify_live_installed_state().unwrap();
     }
     drop(manifest_restore);
 }

@@ -1536,7 +1536,9 @@ pub fn query_status(service: &ScHandle) -> Result<SERVICE_STATUS_PROCESS, String
 }
 
 fn startup_diagnostic(service_exit: u32) -> String {
-    if let Some((role, component)) =
+    if service_exit == super::control_service::STARTUP_POLICY_REGISTRY {
+        "; startup_diagnostic=role=control operation=startup stage=policy-registry".to_owned()
+    } else if let Some((role, component)) =
         super::security::pipe_mismatch_diagnostic_from_exit(service_exit)
     {
         format!(
@@ -1581,8 +1583,17 @@ fn stopped_before_running_diagnostic(
     phase: ServiceStatePhase,
     elapsed_millis: u128,
 ) -> String {
+    let original = if name == memcordon_core::WINDOWS_CONTROL_SERVICE_NAME {
+        match super::startup_diagnostics::read(status.dwServiceSpecificExitCode, elapsed_millis) {
+            Ok(Some(failure)) => format!("; original_startup_failure={failure}"),
+            Ok(None) => String::new(),
+            Err(error) => format!("; startup_diagnostic_read_failure={error}"),
+        }
+    } else {
+        String::new()
+    };
     format!(
-        "role=windows-service operation=state-convergence phase={} service={name} expected_state={SERVICE_RUNNING} last_state={} process_id={} win32_exit={} service_exit={} elapsed_ms={elapsed_millis}{}",
+        "role=windows-service operation=state-convergence phase={} service={name} expected_state={SERVICE_RUNNING} last_state={} process_id={} win32_exit={} service_exit={} elapsed_ms={elapsed_millis}{}{original}",
         phase.label(),
         status.dwCurrentState,
         status.dwProcessId,

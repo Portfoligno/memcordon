@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DiscoveryReportV1 {
-    Authenticated { discovery: WorkloadDiscoveryV1 },
+    Authenticated { discovery: Box<WorkloadDiscoveryV1> },
     Unavailable { reason: BoundedText<256> },
     Unsupported,
 }

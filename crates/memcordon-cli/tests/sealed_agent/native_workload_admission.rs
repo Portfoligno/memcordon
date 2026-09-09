@@ -121,6 +121,28 @@ fn fixture() -> (WorkloadContractV1, Restore) {
     };
     (contract, restore)
 }
+fn frontend_command() -> std::process::Command {
+    #[cfg(target_os = "linux")]
+    {
+        // Registry administration requires root, but execution supports callers
+        // with no active capabilities. Keep the grant's UID while clearing all
+        // capability sources before exec of the actual frontend.
+        let mut command = std::process::Command::new("/usr/bin/setpriv");
+        command.args([
+            "--bounding-set=-all",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--",
+            env!("CARGO_BIN_EXE_memcordon"),
+        ]);
+        command
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new(env!("CARGO_BIN_EXE_memcordon"))
+    }
+}
+
 fn execute(
     contract: &WorkloadContractV1,
     tcp_port: Option<u16>,
@@ -130,11 +152,20 @@ fn execute(
     bool,
 ) {
     let directory = tempfile::TempDir::new().unwrap();
+    #[cfg(target_os = "linux")]
+    let staged = crate::linux_sealed::StagedFixture::from_source(std::path::Path::new(env!(
+        "CARGO_BIN_EXE_memcordon-test-fixture"
+    )))
+    .expect("workload fixture must be reachable without DAC capabilities");
+    #[cfg(target_os = "linux")]
+    let program = staged.program();
+    #[cfg(target_os = "windows")]
+    let program = std::path::Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture"));
     let declaration = directory.path().join("contract.json");
     let report = directory.path().join("report.json");
     let marker = directory.path().join("marker");
     std::fs::write(&declaration, serde_json::to_vec(contract).unwrap()).unwrap();
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    let mut command = frontend_command();
     command
         .arg("--sealed")
         .arg("--workload-contract")
@@ -142,7 +173,7 @@ fn execute(
         .arg("--report")
         .arg(&report)
         .arg("--")
-        .arg(env!("CARGO_BIN_EXE_memcordon-test-fixture"));
+        .arg(program);
     if let Some(port) = tcp_port {
         command.arg("tcp-client").arg(port.to_string());
     } else {
@@ -150,7 +181,20 @@ fn execute(
     }
     command.arg(&marker);
     let status = command.status().unwrap();
-    let report = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    let report_bytes = std::fs::read(&report).unwrap_or_else(|error| {
+        panic!(
+            "frontend report read failed: status={status}; marker={}; path={}; error={error}",
+            marker.exists(),
+            report.display()
+        )
+    });
+    let report = serde_json::from_slice(&report_bytes).unwrap_or_else(|error| {
+        panic!(
+            "frontend report decode failed: status={status}; marker={}; error={error}; report={}",
+            marker.exists(),
+            String::from_utf8_lossy(&report_bytes)
+        )
+    });
     (status, report, marker.exists())
 }
 
@@ -163,7 +207,10 @@ fn native_exact_grant_epoch_and_terminal_checkpoint_are_enforced() {
         WorkloadResolutionReportV1::Planned { .. }
     ));
     let (status, report, marker) = execute(&request, None);
-    assert!(status.success() && marker);
+    assert!(
+        status.success() && marker,
+        "authorized target execution failed: status={status}; marker={marker}; report={report:#?}"
+    );
     let attempt = report.attempts.last().unwrap();
     assert!(attempt.policy_enforcement.terminal_success());
     assert!(matches!(
@@ -175,7 +222,10 @@ fn native_exact_grant_epoch_and_terminal_checkpoint_are_enforced() {
     let next = lease.activate(active.registry, None).unwrap();
     drop(lease);
     let (status, report, marker) = execute(&request, None);
-    assert!(!status.success() && !marker);
+    assert!(
+        !status.success() && !marker,
+        "stale epoch must reject before execution: status={status}; marker={marker}; report={report:#?}"
+    );
     assert!(matches!(
         report.policy.effective.workload,
         WorkloadResolutionReportV1::Rejected {
@@ -242,18 +292,27 @@ fn live_activation_preserves_drain_and_enforces_revoke() {
     for revoke in [false, true] {
         let (request, restore) = fixture();
         let directory = tempfile::TempDir::new().unwrap();
+        #[cfg(target_os = "linux")]
+        let staged = crate::linux_sealed::StagedFixture::from_source(std::path::Path::new(env!(
+            "CARGO_BIN_EXE_memcordon-test-fixture"
+        )))
+        .expect("workload fixture must be reachable without DAC capabilities");
+        #[cfg(target_os = "linux")]
+        let program = staged.program();
+        #[cfg(target_os = "windows")]
+        let program = std::path::Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture"));
         let declaration = directory.path().join("contract.json");
         let report_path = directory.path().join("report.json");
         let ready = directory.path().join("ready");
         let finish = directory.path().join("finish");
         std::fs::write(&declaration, serde_json::to_vec(&request).unwrap()).unwrap();
-        let process = std::process::Command::new(env!("CARGO_BIN_EXE_memcordon"))
+        let process = frontend_command()
             .args(["--sealed", "--workload-contract"])
             .arg(declaration)
             .arg("--report")
             .arg(&report_path)
             .arg("--")
-            .arg(env!("CARGO_BIN_EXE_memcordon-test-fixture"))
+            .arg(program)
             .arg("gate-wait")
             .arg(&ready)
             .arg(&finish)
@@ -373,7 +432,10 @@ fn native_tcp_requirement_preserves_baseline_authority() {
     #[cfg(target_os = "linux")]
     {
         let (status, report, marker) = execute(&request, None);
-        assert!(!status.success() && !marker);
+        assert!(
+            !status.success() && !marker,
+            "strict TCP must reject before execution: status={status}; marker={marker}; report={report:#?}"
+        );
         let WorkloadResolutionReportV1::Rejected {
             binding: observed,
             rejection,
@@ -395,12 +457,41 @@ fn native_tcp_requirement_preserves_baseline_authority() {
             }]
         );
         assert_eq!(rejection.remaining_conflicts, 0);
-        assert!(report.attempts.iter().all(|attempt| {
-            !attempt.launch.target_released
-                && attempt
-                    .restart_safety
-                    .is_safe_for(memcordon_core::BoundaryRequirement::Sealed)
-        }));
+        assert_eq!(report.attempts.len(), 1, "{report:#?}");
+        let attempt = &report.attempts[0];
+        assert!(!attempt.launch.target_released);
+        assert_eq!(attempt.target_pid, None);
+        assert_eq!(attempt.authorized_offset_ms, None);
+        let error = attempt
+            .error
+            .as_ref()
+            .expect("admission rejection retained");
+        assert!(!error.target_released && !error.workload_may_be_alive);
+        let provider = error
+            .provider_rejection
+            .as_ref()
+            .expect("typed provider rejection retained");
+        assert!(provider.is_consistent(), "{provider:#?}");
+        assert_eq!(provider.code, "MCSEALED-POLICY-ADMISSION");
+        assert_eq!(
+            provider.phase,
+            memcordon_core::BoundarySetupPhase::RequestValidation
+        );
+        assert!(!provider.target_created && !provider.target_released);
+        assert!(!provider.cleanup_attempted);
+        let admission = provider
+            .workload_admission
+            .as_ref()
+            .expect("exact admission evidence retained");
+        assert_eq!(&admission.request, observed);
+        assert_eq!(&admission.rejection, rejection);
+        // No workload existed to reap or retire. Preserve that exact evidence
+        // instead of requiring a fabricated post-workload retirement proof.
+        assert_eq!(
+            provider.restart_safety,
+            memcordon_core::RestartSafetyProof::default()
+        );
+        assert_eq!(attempt.restart_safety, provider.restart_safety);
     }
     #[cfg(target_os = "windows")]
     {
@@ -413,7 +504,7 @@ fn native_tcp_requirement_preserves_baseline_authority() {
             let (status, report, marker) = execute(&strict, None);
             assert!(
                 !status.success() && !marker,
-                "Windows baseline must reject stronger network ceilings before execution"
+                "Windows baseline must reject stronger network ceilings before execution: status={status}; marker={marker}; report={report:#?}"
             );
             let WorkloadResolutionReportV1::Rejected {
                 binding, rejection, ..
@@ -454,7 +545,10 @@ fn native_tcp_requirement_preserves_baseline_authority() {
         });
         let (status, report, marker) = execute(&request, Some(port));
         server.join().unwrap();
-        assert!(status.success() && marker);
+        assert!(
+            status.success() && marker,
+            "authorized TCP target execution failed: status={status}; marker={marker}; report={report:#?}"
+        );
         assert!(
             report
                 .attempts

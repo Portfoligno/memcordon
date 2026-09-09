@@ -186,23 +186,39 @@ fn miri(root: &Path, nightly: &str) -> Result<()> {
         ])
         .run()?;
     cargo(root, nightly, "miri", ["setup"])?;
-    cargo(
+    let metadata = cargo(
         root,
         nightly,
-        "miri",
-        [
+        "metadata",
+        ["--format-version", "1", "--no-deps", "--locked"],
+    )?;
+    for target in memcordon_ci::miri_targets::plan(&metadata, "memcordon-core")? {
+        let mut arguments = vec![
             "test",
             "--target-dir",
             "target/ci/miri",
             "--package",
             "memcordon-core",
             "--locked",
-        ],
-    )?;
+        ];
+        arguments.extend(target.arguments());
+        // Each original harness remains intact, including its inter-test races.
+        // The normal 900-second command deadline applies independently to it.
+        cargo(root, nightly, "miri", arguments)?;
+    }
     Ok(())
 }
 
-fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
+fn fuzz(
+    root: &Path,
+    stable: &str,
+    nightly: &str,
+    shard: Option<memcordon_ci::fuzz_targets::FuzzShard>,
+) -> Result<()> {
+    let targets = memcordon_ci::fuzz_targets::targets(
+        &std::fs::read_to_string(root.join("fuzz").join("Cargo.toml"))?,
+        shard,
+    )?;
     cargo(
         root,
         stable,
@@ -229,61 +245,7 @@ fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
         .join("ci-tools")
         .join("bin")
         .join("cargo-fuzz");
-    let targets = [
-        "backoff_multiplier",
-        "bounded_history",
-        "budget_classifier",
-        "byte_size",
-        "caller-envelope-status",
-        "capability-mask",
-        "cleanup_json",
-        "duration",
-        "broker-protocol-v2",
-        "invocation_router",
-        "half_life_logistic_recurrence",
-        "limit_token",
-        "linux-evidence-v2",
-        "mount-context-manifest",
-        "runtime-manifest",
-        "release-asset-components",
-        "agent-package-inspection",
-        "installed-provider-inspection",
-        "cargo-bin-inventory",
-        "channel-pairing",
-        "native_argument",
-        "namespace-identity",
-        "outcome_json",
-        "outcome_sequences",
-        "policy_parser",
-        "provider-recursion-proof",
-        "qualification-receipt-v2",
-        "report_json",
-        "restart_controller",
-        "schema_four",
-        "service-unit-policy",
-        "state_machine",
-        "terminal-receipt-v2",
-        "workflow_parser",
-        "windows-public-provider-protocol",
-        "windows-private-launcher-protocol",
-        "windows-token-envelope",
-        "windows-security-descriptor",
-        "windows-handle-manifest",
-        "windows-environment-block",
-        "windows-argv",
-        "windows-qualification",
-        "windows-terminal-receipt",
-        "windows-attempt-record",
-        "windows-causal-diagnostics",
-        "workload-request",
-        "workload-registry",
-        "workload-discovery",
-        "workload-receipt",
-        "workload-canonical",
-        "workload-transitions",
-        "windows-package-inspection",
-    ];
-    for target in targets {
+    for target in &targets {
         CommandSpec::new("rustup", root, CARGO_DEADLINE)
             .args([
                 OsString::from("run"),
@@ -295,7 +257,7 @@ fn fuzz(root: &Path, stable: &str, nightly: &str) -> Result<()> {
             ])
             .run()?;
     }
-    for target in targets {
+    for target in &targets {
         CommandSpec::new("rustup", root, Duration::from_secs(5 * 60))
             .args([
                 OsString::from("run"),
@@ -881,7 +843,19 @@ pub fn run(root: &Path, suite: Suite) -> Result<()> {
         Suite::Native => native(root, &toolchains.stable, false),
         Suite::SupplyChain => supply_chain(root, &toolchains.stable),
         Suite::Miri => miri(root, &toolchains.miri),
-        Suite::Fuzz => fuzz(root, &toolchains.stable, &toolchains.miri),
+        Suite::Fuzz => fuzz(root, &toolchains.stable, &toolchains.miri, None),
+        Suite::FuzzFirst => fuzz(
+            root,
+            &toolchains.stable,
+            &toolchains.miri,
+            Some(memcordon_ci::fuzz_targets::FuzzShard::First),
+        ),
+        Suite::FuzzSecond => fuzz(
+            root,
+            &toolchains.stable,
+            &toolchains.miri,
+            Some(memcordon_ci::fuzz_targets::FuzzShard::Second),
+        ),
         Suite::Stress => stress(root, &toolchains.stable),
         Suite::BackendLinuxCgroup => launch_delegated_linux_certification(root),
         Suite::BackendLinuxSealedV2 => crate::sealed_linux::certify(root, &toolchains.stable),

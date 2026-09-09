@@ -118,12 +118,41 @@ pub fn validate_record_json_structure(bytes: &[u8]) -> Result<(), serde_json::Er
     decoder.end()
 }
 
-/// Version-two response framing requires the compact message discriminator
+/// Public response framing requires the compact `kind` discriminator
 /// first, allowing diagnostic limits to be checked before allocating payload.
 pub fn windows_response_frame_limit(prefix: &[u8]) -> Result<usize, &'static str> {
     let remainder = prefix
-        .strip_prefix(b"{\"message\":\"")
-        .ok_or("response message discriminator must be first")?;
+        .strip_prefix(b"{\"kind\":\"")
+        .ok_or("response kind discriminator must be first")?;
+    response_kind_frame_limit(remainder, true)
+}
+
+/// Private launcher responses use their own compact, first `kind` discriminator.
+pub fn windows_launcher_response_frame_limit(prefix: &[u8]) -> Result<usize, &'static str> {
+    let remainder = prefix
+        .strip_prefix(b"{\"kind\":\"")
+        .ok_or("launcher response kind discriminator must be first")?;
+    response_kind_frame_limit(remainder, false)
+}
+
+/// Binds response framing to the concrete wire protocol, including inferred reads.
+pub trait WindowsResponseFrame: serde::de::DeserializeOwned {
+    fn frame_limit(prefix: &[u8]) -> Result<usize, &'static str>;
+}
+
+impl WindowsResponseFrame for crate::WindowsProviderResponseV1 {
+    fn frame_limit(prefix: &[u8]) -> Result<usize, &'static str> {
+        windows_response_frame_limit(prefix)
+    }
+}
+
+impl WindowsResponseFrame for crate::WindowsLauncherResponseV1 {
+    fn frame_limit(prefix: &[u8]) -> Result<usize, &'static str> {
+        windows_launcher_response_frame_limit(prefix)
+    }
+}
+
+fn response_kind_frame_limit(remainder: &[u8], public: bool) -> Result<usize, &'static str> {
     let end = remainder
         .iter()
         .position(|byte| *byte == b'"')
@@ -137,7 +166,10 @@ pub fn windows_response_frame_limit(prefix: &[u8]) -> Result<usize, &'static str
     }
     Ok(match kind {
         b"attempt-retained" | b"replay-pending" => MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES,
-        b"workload-plan" | b"workload-discovery" => crate::workload_limits::PUBLIC_OBJECT_BYTES,
+        b"qualification-rejected" if public => MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES,
+        b"workload-plan" | b"workload-discovery" if public => {
+            crate::workload_limits::PUBLIC_OBJECT_BYTES
+        }
         b"terminal" | b"reject" => WINDOWS_MAX_TERMINAL_FRAME_BYTES,
         _ => crate::WINDOWS_MAX_FRAME_BYTES,
     })
@@ -250,6 +282,7 @@ impl FailureCodeV1 {
             Self::ControlTransport => "MCSEALED-WINDOWS-CONTROL-TRANSPORT",
             Self::PolicyAdmission => "MCSEALED-POLICY-ADMISSION",
             Self::PolicyReadback => "MCSEALED-POLICY-READBACK",
+            Self::PolicyRevoked => "MCSEALED-POLICY-DRIFT",
             Self::TerminalBinding => "MCSEALED-WINDOWS-TERMINAL-RESPONSE",
             Self::RecordIo => "MCSEALED-WINDOWS-RECORD-IO",
             Self::RecordAuthentication => "MCSEALED-WINDOWS-ATTEMPT-RECORD-AUTH",
@@ -428,7 +461,7 @@ macro_rules! vocabulary {
 vocabulary!(DiagnosticOriginV1 { Launcher = 0, ControlRelay = 1, GuardianRecovery = 2, StartupRecovery = 3, RecordWriter = 4, ClientTransport = 5 });
 vocabulary!(FailureCategoryV1 { Admission = 0, Launch = 1, Monitor = 2, Cleanup = 3, Terminalization = 4, Transport = 5, Persistence = 6, Recovery = 7 });
 vocabulary!(FailureOperationV1 { AuthenticateCaller = 0, ResolveAdmission = 1, InstallPolicy = 2, VerifyPolicy = 3, StartGuardian = 4, CreateTarget = 5, VerifySuspendedTarget = 6, AuthorizeTarget = 7, ResumeTarget = 8, QueryJobProcessIds = 9, ObserveProcessIdentity = 10, AccumulateProcessInventory = 11, ReadJobNotification = 12, QueryPeakMemory = 13, PollTarget = 14, ReadTargetExit = 15, CheckGuardian = 16, CheckDesktopAuthority = 17, ReadControlFrame = 18, TerminateJob = 19, WaitJobEmpty = 20, RetireGuardian = 21, CloseFinalHandles = 22, BuildRejection = 23, ValidateTerminalResponse = 24, SerializeTerminalResponse = 25, StoreRecord = 26, DeliverResponse = 27, AcknowledgeTerminal = 28, RetireOutbox = 29, InspectRecoveryRecord = 30, UnexpectedUnwind = 31, UnclassifiedProviderOperation = 32, QueryJobAccounting = 33 });
-vocabulary!(FailureCodeV1 { ProcessInventoryObservation = 0, ProcessInventoryCapacity = 1, JobQuery = 2, GuardianLoss = 3, TargetCreate = 4, TargetResume = 5, TargetQuery = 6, ControlTransport = 7, PolicyAdmission = 8, PolicyReadback = 9, TerminalBinding = 10, RecordIo = 11, RecordAuthentication = 12, UnexpectedProviderFailure = 13 });
+vocabulary!(FailureCodeV1 { ProcessInventoryObservation = 0, ProcessInventoryCapacity = 1, JobQuery = 2, GuardianLoss = 3, TargetCreate = 4, TargetResume = 5, TargetQuery = 6, ControlTransport = 7, PolicyAdmission = 8, PolicyReadback = 9, TerminalBinding = 10, RecordIo = 11, RecordAuthentication = 12, UnexpectedProviderFailure = 13, PolicyRevoked = 14 });
 vocabulary!(SafeMessageIdV1 { OriginalFailureCaptured = 0, ReceiptRequiredForPosttarget = 1, PeerDisconnected = 2, CommitNotConfirmed = 3, ObservationUnavailableAfterOwnerLoss = 4 });
 vocabulary!(AttemptObservationPhaseV1 { BeforeAuthorization = 0, AuthorizedBeforeResume = 1, ResumeAttempted = 2, Monitoring = 3, TargetExitObserved = 4, Cleaning = 5, Terminalizing = 6, Recovery = 7 });
 vocabulary!(OriginalUnavailableReasonV1 { NoEarlierErrorObserved = 0, WorkerLostBeforeObservation = 1, ObservationNotDurableBeforeServiceLoss = 2, RecordUnavailable = 3, RecordAuthenticationFailed = 4, LegacyProvider = 5, RetentionExpired = 6 });

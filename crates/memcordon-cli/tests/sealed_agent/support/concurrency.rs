@@ -278,7 +278,7 @@ fn run_worker(directory: &Path) {
     let terminal_monotonic_millis =
         crate::linux::clock::monotonic_millis().expect("worker terminal time must be available");
 
-    assert_eq!(facts.child_status, 0);
+    assert_eq!(facts.child_status, Some(0));
     assert_eq!(facts.exec_status, TargetExecStatus::Succeeded);
     assert!(facts.spawn_error_reported);
     assert!(!facts.deadline_exceeded);
@@ -305,7 +305,9 @@ fn run_worker(directory: &Path) {
         authorized_monotonic_millis: started_monotonic_millis
             .saturating_add(facts.authorization_offset_millis),
         terminal_monotonic_millis,
-        child_status: facts.child_status,
+        child_status: facts
+            .child_status
+            .expect("concurrency fixture observed child status"),
         exec_succeeded: facts.exec_status == TargetExecStatus::Succeeded,
         record_absent,
         cgroup_absent,

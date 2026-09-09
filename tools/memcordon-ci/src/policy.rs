@@ -377,6 +377,204 @@ fn check_runner_matrix(
     Ok(())
 }
 
+pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
+    exact_mapping_keys(
+        fuzz,
+        &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
+        "fuzz job",
+    )?;
+    let strategy = mapping(
+        fuzz.get(key("strategy"))
+            .ok_or_else(|| failure("fuzz strategy absent"))?,
+        "fuzz strategy",
+    )?;
+    exact_mapping_keys(strategy, &["fail-fast", "matrix"], "fuzz strategy")?;
+    let matrix = mapping(
+        strategy
+            .get(key("matrix"))
+            .ok_or_else(|| failure("fuzz matrix absent"))?,
+        "fuzz matrix",
+    )?;
+    exact_mapping_keys(matrix, &["shard"], "fuzz matrix")?;
+    let expected_shards = Value::Sequence(vec![
+        Value::String("first".into()),
+        Value::String("second".into()),
+    ]);
+    if strategy.get(key("fail-fast")).and_then(Value::as_bool) != Some(false)
+        || matrix.get(key("shard")) != Some(&expected_shards)
+        || fuzz.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(45)
+        || scalar(fuzz, "runs-on") != Some("ubuntu-24.04")
+    {
+        return Err(failure("fuzz shard coverage or execution bounds differ"));
+    }
+    let steps = fuzz
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("fuzz steps absent"))?;
+    let mut runs = Vec::new();
+    let mut target_cache = 0;
+    let mut target_save = 0;
+    let identities = [
+        None,
+        Some("fuzz-deps"),
+        Some("fuzz-target"),
+        Some("fuzz-tools"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ];
+    if steps.len() != identities.len() {
+        return Err(failure("fuzz ordered step inventory differs"));
+    }
+    for (index, step) in steps.iter().enumerate() {
+        let step = mapping(step, "fuzz step")?;
+        let keys: &[&str] = match index {
+            0 => &["uses", "with"],
+            1..=3 => &["id", "uses", "with"],
+            4 => &["run"],
+            5..=6 => &["if", "run"],
+            _ => &["if", "uses", "with"],
+        };
+        exact_mapping_keys(step, keys, "fuzz ordered step")?;
+        if index == 0 {
+            let with = mapping(
+                step.get(key("with")).expect("exact step keys"),
+                "fuzz checkout",
+            )?;
+            exact_mapping_keys(with, &["persist-credentials"], "fuzz checkout")?;
+            if scalar(step, "uses")
+                != Some("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
+                || with
+                    .get(key("persist-credentials"))
+                    .and_then(Value::as_bool)
+                    != Some(false)
+            {
+                return Err(failure("fuzz checkout differs"));
+            }
+        }
+        if scalar(step, "id") != identities[index] {
+            return Err(failure("fuzz cache restore ordering differs"));
+        }
+        if matches!(index, 1..=3)
+            && scalar(step, "uses")
+                != Some("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
+        {
+            return Err(failure("fuzz cache restore action differs"));
+        }
+        if index >= 7 {
+            let expected = [
+                (
+                    "always() && steps.fuzz-target.outputs.cache-hit != 'true'",
+                    "${{ steps.fuzz-target.outputs.cache-primary-key }}",
+                    "target/ci\nfuzz/target\n",
+                ),
+                (
+                    "always() && steps.fuzz-tools.outputs.cache-hit != 'true'",
+                    "${{ steps.fuzz-tools.outputs.cache-primary-key }}",
+                    "target/ci-tools",
+                ),
+                (
+                    "always() && steps.fuzz-deps.outputs.cache-hit != 'true'",
+                    "${{ steps.fuzz-deps.outputs.cache-primary-key }}",
+                    "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n",
+                ),
+            ];
+            let (condition, cache_key, path) = expected[index - 7];
+            let with = mapping(
+                step.get(key("with")).expect("exact step keys"),
+                "fuzz cache save",
+            )?;
+            exact_mapping_keys(with, &["path", "key"], "fuzz cache save")?;
+            if scalar(step, "uses")
+                != Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
+                || scalar(step, "if") != Some(condition)
+                || scalar(with, "key") != Some(cache_key)
+                || scalar(with, "path") != Some(path)
+            {
+                return Err(failure("fuzz cache save ordering or inputs differ"));
+            }
+        }
+        if matches!(index, 1 | 3) {
+            let with = mapping(
+                step.get(key("with")).expect("exact step keys"),
+                "fuzz shared cache",
+            )?;
+            exact_mapping_keys(with, &["path", "key"], "fuzz shared cache")?;
+            let (path, cache_key) = if index == 1 {
+                (
+                    "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n",
+                    "cargo-deps-deep-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml') }}",
+                )
+            } else {
+                (
+                    "target/ci-tools",
+                    "cargo-tools-deep-v1-fuzz-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('ci/tools.toml', 'tools/**') }}",
+                )
+            };
+            if scalar(with, "path") != Some(path) || scalar(with, "key") != Some(cache_key) {
+                return Err(failure("fuzz shared cache inputs differ"));
+            }
+        }
+        if let Some(run) = scalar(step, "run") {
+            runs.push((run, scalar(step, "if")));
+        }
+        if scalar(step, "id") == Some("fuzz-target") {
+            let with = mapping(
+                step.get(key("with"))
+                    .ok_or_else(|| failure("fuzz cache inputs absent"))?,
+                "fuzz cache inputs",
+            )?;
+            exact_mapping_keys(with, &["path", "key"], "fuzz target cache")?;
+            if scalar(with, "key")
+                != Some(
+                    "cargo-target-deep-v3-fuzz-${{ runner.os }}-${{ runner.arch }}-${{ matrix.shard }}-nightly-2026-07-31-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'crates/**', 'tools/**', 'ci/**', '.github/workflows/deep-ci.yml') }}",
+                )
+                || scalar(with, "path") != Some("target/ci\nfuzz/target\n")
+                || scalar(step, "if").is_some()
+                || scalar(step, "uses")
+                    != Some("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
+            {
+                return Err(failure("fuzz shard build cache inputs differ"));
+            }
+            target_cache += 1;
+        }
+        if let Some(with) = step.get(key("with")).and_then(Value::as_mapping)
+            && scalar(with, "key") == Some("${{ steps.fuzz-target.outputs.cache-primary-key }}")
+        {
+            if scalar(step, "uses")
+                != Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
+                || scalar(step, "if")
+                    != Some("always() && steps.fuzz-target.outputs.cache-hit != 'true'")
+                || scalar(with, "path") != Some("target/ci\nfuzz/target\n")
+            {
+                return Err(failure("fuzz shard cache save differs"));
+            }
+            target_save += 1;
+        }
+    }
+    if runs
+        != [
+            ("rustup toolchain install 1.97.1 --profile minimal", None),
+            (
+                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite fuzz-first",
+                Some("matrix.shard == 'first'"),
+            ),
+            (
+                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite fuzz-second",
+                Some("matrix.shard == 'second'"),
+            ),
+        ]
+        || target_cache != 1
+        || target_save != 1
+    {
+        return Err(failure("fuzz shard invocations or cache coverage differ"));
+    }
+    Ok(())
+}
+
 fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
     check_push_and_dispatch_events(workflow, "deep CI")?;
     check_top_level_permissions(workflow)?;
@@ -408,9 +606,12 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
         .get(key("timeout-minutes"))
         .and_then(Value::as_u64)
         .ok_or_else(|| failure("deep CI fuzz timeout is absent or nonnumeric"))?;
-    if fuzz_timeout < DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES {
-        return Err(failure("deep CI fuzz timeout is below workload minimum"));
+    if fuzz_timeout != DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES {
+        return Err(failure(
+            "deep CI fuzz timeout differs from workload deadline",
+        ));
     }
+    check_fuzz_shards(fuzz)?;
     check_runner_matrix(jobs, "stress", &STRESS_MATRIX, "deep CI stress")?;
     Ok(())
 }
@@ -3329,12 +3530,14 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
         "mount-context-manifest",
     ];
     require_credential_transition_fragments(root, "fuzz/Cargo.toml", &fuzz_targets, &[])?;
-    require_credential_transition_fragments(
-        root,
-        "tools/memcordon-ci/src/suites.rs",
-        &fuzz_targets,
-        &[],
-    )?;
+    let planned =
+        crate::fuzz_targets::targets(&fs::read_to_string(root.join("fuzz/Cargo.toml"))?, None)?;
+    if fuzz_targets
+        .iter()
+        .any(|required| !planned.iter().any(|target| target == required))
+    {
+        return Err(failure("credential transition fuzz coverage differs"));
+    }
     require_credential_transition_fragments(
         root,
         "docs/sealed-supervision.md",

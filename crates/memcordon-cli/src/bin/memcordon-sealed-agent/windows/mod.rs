@@ -18,6 +18,7 @@ pub mod service;
 pub mod service_manager;
 pub mod session_broker;
 mod settlement;
+mod startup_diagnostics;
 pub mod token;
 pub mod user_api;
 

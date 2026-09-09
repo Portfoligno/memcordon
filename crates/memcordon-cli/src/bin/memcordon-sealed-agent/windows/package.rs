@@ -2543,6 +2543,10 @@ fn uninstall_with_removal(
     if let Err(remove_error) = remove(ProviderRemovalContext { scm_ace }) {
         let mut transition = InstallTransition::new(InstallIntent::from_ephemeral_ci(ephemeral_ci));
         let rollback = (|| {
+            // A partial removal can leave hardened directories that cannot be
+            // reopened with bootstrap authority. Retire that remaining state
+            // before rebuilding through the normal installation transition.
+            remove_provider_state(ProviderRemovalContext { scm_ace })?;
             if let Some(snapshot) = policy_snapshot.as_ref() {
                 let parent = state_root()
                     .parent()

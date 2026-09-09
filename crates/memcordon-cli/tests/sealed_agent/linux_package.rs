@@ -5,6 +5,88 @@ use std::process::Command;
 
 const AGENT: &str = "/usr/libexec/memcordon-sealed-agent";
 
+#[test]
+fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
+    use memcordon_core::runtime_manifest::{
+        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifestV2,
+    };
+    let agent = b"exact installed provider image";
+    let manifest = RuntimeManifestV2::linux(
+        env!("CARGO_PKG_VERSION").into(),
+        crate::SOURCE_COMMIT.into(),
+        crate::linux::runtime_manifest::target().unwrap().into(),
+        vec![
+            RuntimeComponentRecord {
+                id: "public-cli".into(),
+                path: "memcordon".into(),
+                role: RuntimeComponentRole::PublicCli,
+                size: 17,
+                mode: 0o755,
+                sha256: "ab".repeat(32),
+            },
+            RuntimeComponentRecord {
+                id: "sealed-agent".into(),
+                path: "memcordon-sealed-agent".into(),
+                role: RuntimeComponentRole::SealedAgent,
+                size: agent.len() as u64,
+                mode: 0o755,
+                sha256: memcordon_core::workload_codec::hash_bytes(agent).into(),
+            },
+        ],
+    );
+    let validate = |manifest: &RuntimeManifestV2, image: &[u8]| {
+        crate::linux::runtime_manifest::validate_installed_source_for_test(
+            &serde_json::to_vec(manifest).unwrap(),
+            image,
+        )
+    };
+    validate(&manifest, agent).unwrap();
+    assert!(validate(&manifest, b"different installed image").is_err());
+    let mut same_size_image = agent.to_vec();
+    same_size_image[0] ^= 1;
+    assert!(validate(&manifest, &same_size_image).is_err());
+    for mutation in 0..6 {
+        let mut changed = manifest.clone();
+        match mutation {
+            0 => changed.components[1].size += 1,
+            1 => changed.components[1].sha256 = "cd".repeat(32),
+            2 => changed.components[1].path = "other-agent".into(),
+            3 => changed.components[0].role = RuntimeComponentRole::SealedAgent,
+            4 => changed.components[0].mode = 0o777,
+            5 => changed.components.push(changed.components[0].clone()),
+            _ => unreachable!(),
+        }
+        assert!(
+            validate(&changed, agent).is_err(),
+            "accepted mutation {mutation}"
+        );
+    }
+    let mut wrong_generation = serde_json::to_value(&manifest).unwrap();
+    let other_target = if manifest.target == "x86_64-unknown-linux-gnu" {
+        "aarch64-unknown-linux-gnu"
+    } else {
+        "x86_64-unknown-linux-gnu"
+    };
+    for (field, replacement) in [
+        ("version", "9.9.9"),
+        ("source_commit", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ("target", other_target),
+    ] {
+        let original = wrong_generation[field].clone();
+        assert!(!original.is_null(), "missing manifest field {field}");
+        assert_ne!(original, replacement);
+        wrong_generation[field] = serde_json::Value::String(replacement.into());
+        assert!(
+            crate::linux::runtime_manifest::validate_installed_source_for_test(
+                &serde_json::to_vec(&wrong_generation).unwrap(),
+                agent
+            )
+            .is_err()
+        );
+        wrong_generation[field] = original;
+    }
+}
+
 struct PermissionRestore {
     path: &'static str,
     permissions: Option<std::fs::Permissions>,
@@ -303,9 +385,12 @@ fn sealed_package_upgrade_recovers_before_advertising() {
     assert!(launcher_socket.success());
     let qualification = Command::new(AGENT).arg("probe").output().unwrap();
     assert!(qualification.status.success());
+    let typed_receipt: crate::linux::qualification::QualificationReceipt =
+        serde_json::from_slice(&qualification.stdout).expect("strict qualification receipt");
+    assert!(typed_receipt.complete(), "{typed_receipt:#?}");
     let receipt: serde_json::Value = serde_json::from_slice(&qualification.stdout).unwrap();
     assert_eq!(receipt["boundary_retired"], true);
-    assert_eq!(receipt["schema_version"], 2);
+    assert_eq!(receipt["schema_version"], 3);
     assert_eq!(receipt["mechanism"], "linux-pid-namespace-cgroup-v2");
     assert_eq!(receipt["provider_identity"], "memcordon-sealed-agent-v2");
     for field in [
@@ -432,9 +517,19 @@ fn sealed_package_uninstall_refuses_live_authenticated_attempt() {
         String::from_utf8_lossy(&retained.stderr)
     );
     assert!(retained.stderr.is_empty());
+    let typed: crate::inspection_schema::InstalledProviderInspectionV5 =
+        serde_json::from_slice(&retained.stdout).expect("strict current installed inspection");
+    assert_eq!(typed.schema_version, 5);
+    assert_eq!(typed.agent.schema_version, 5);
+    assert_eq!(typed.agent.runtime_manifest_schema, 2);
+    assert_eq!(typed.agent.workload_contract_schema, 1);
+    assert_eq!(
+        typed.agent.profile_catalog_sha256,
+        memcordon_core::runtime_manifest::baseline_catalog_digest(false)
+    );
     let inspection: serde_json::Value = serde_json::from_slice(&retained.stdout)
         .expect("retained installed-provider inspection should be JSON");
-    assert_eq!(inspection["schema_version"], 4);
+    assert_eq!(inspection["schema_version"], 5);
     assert_eq!(inspection["installed_artifacts_valid"], true);
     assert_eq!(inspection["provider_reachable"], true);
     assert_eq!(inspection["qualification_complete"], true);

@@ -828,6 +828,20 @@ struct SuspendedProcess {
 
 impl SuspendedProcess {
     fn create(command: &CommandSpec) -> io::Result<Self> {
+        Self::create_with_flags(command, 0)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn create_test_fixture(command: &CommandSpec) -> io::Result<Self> {
+        // Native children bypass libtest's capture. Give fixtures no console so
+        // their output cannot split an authenticated libtest result line.
+        Self::create_with_flags(
+            command,
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+        )
+    }
+
+    fn create_with_flags(command: &CommandSpec, additional_flags: u32) -> io::Result<Self> {
         let mut command_line = encode_command_line(command);
         // SAFETY: zeroed startup/process structures are the documented initialization form.
         let mut startup = unsafe { MaybeUninit::<STARTUPINFOW>::zeroed().assume_init() };
@@ -842,7 +856,7 @@ impl SuspendedProcess {
                 ptr::null(),
                 ptr::null(),
                 0,
-                CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP,
+                CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | additional_flags,
                 ptr::null(),
                 ptr::null(),
                 &raw const startup,
@@ -995,7 +1009,7 @@ pub(crate) fn test_target_remains_suspended_until_assignment() -> io::Result<boo
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     let command = CommandSpec::new("ping.exe").args(["-n", "1", "127.0.0.1"]);
-    let mut process = SuspendedProcess::create(&command)?;
+    let mut process = SuspendedProcess::create_test_fixture(&command)?;
     // SAFETY: process handle is live and queried without mutation.
     let suspended = unsafe { WaitForSingleObject(process.process, 0) } == WAIT_TIMEOUT;
     let job = Job::create()?;
@@ -1014,7 +1028,7 @@ pub(crate) fn test_kill_on_job_close() -> io::Result<bool> {
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     let command = CommandSpec::new("ping.exe").args(["-n", "30", "127.0.0.1"]);
-    let mut process = SuspendedProcess::create(&command)?;
+    let mut process = SuspendedProcess::create_test_fixture(&command)?;
     let job = Job::create()?;
     job.configure(Some(256 * 1024 * 1024))?;
     job.assign(process.process)?;
@@ -1032,7 +1046,7 @@ pub(crate) fn test_nested_assignment() -> io::Result<bool> {
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     let command = CommandSpec::new("ping.exe").args(["-n", "1", "127.0.0.1"]);
-    let mut process = SuspendedProcess::create(&command)?;
+    let mut process = SuspendedProcess::create_test_fixture(&command)?;
     let outer = Job::create()?;
     outer.configure(Some(512 * 1024 * 1024))?;
     outer.assign(process.process)?;
@@ -1057,7 +1071,7 @@ pub(crate) fn test_assignment_failure() -> io::Result<bool> {
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     let command = CommandSpec::new("ping.exe").args(["-n", "30", "127.0.0.1"]);
-    let mut process = SuspendedProcess::create(&command)?;
+    let mut process = SuspendedProcess::create_test_fixture(&command)?;
     let mut invalid_job = Job::create()?;
     // SAFETY: invalidating the uniquely owned handle exercises the assignment failure path.
     unsafe { CloseHandle(invalid_job.handle) };

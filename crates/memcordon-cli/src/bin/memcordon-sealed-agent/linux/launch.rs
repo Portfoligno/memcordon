@@ -83,7 +83,8 @@ pub enum TargetExecStatus {
 #[derive(Debug)]
 pub struct TerminalFacts {
     pub policy_enforcement: memcordon_core::workload_evidence::AttemptPolicyEnforcementV1,
-    pub child_status: i32,
+    pub child_status: Option<i32>,
+    pub policy_revoked: bool,
     pub exec_status: TargetExecStatus,
     pub spawn_error_reported: bool,
     pub target_pid: u32,
@@ -124,7 +125,7 @@ pub enum RetirementOwner {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FaultExecutionOutcome {
     pub attempt_id: [u8; 16],
-    pub rejection: RejectionV1,
+    pub rejection: Box<RejectionV1>,
     pub retirement_owner: RetirementOwner,
 }
 
@@ -593,7 +594,7 @@ fn fault_outcome(attempt_id: [u8; 16], point: FaultPoint, detail: &str) -> Fault
     ) {
         return FaultExecutionOutcome {
             attempt_id,
-            rejection: rejection_for_launch_error(detail, attempt_id),
+            rejection: Box::new(rejection_for_launch_error(detail, attempt_id)),
             retirement_owner: RetirementOwner::Provider,
         };
     }
@@ -627,21 +628,16 @@ fn fault_outcome(attempt_id: [u8; 16], point: FaultPoint, detail: &str) -> Fault
     if !detail.starts_with(code) {
         return FaultExecutionOutcome {
             attempt_id,
-            rejection: rejection_for_launch_error(detail, attempt_id),
+            rejection: Box::new(rejection_for_launch_error(detail, attempt_id)),
             retirement_owner: RetirementOwner::Provider,
         };
     }
     FaultExecutionOutcome {
         attempt_id,
-        rejection: RejectionV1::from_launch_facts(
-            code,
-            phase,
-            detail,
-            true,
-            released,
-            retired_cleanup(),
-        )
-        .unwrap_or_else(|failure| panic!("invalid internal fault receipt: {failure}")),
+        rejection: Box::new(
+            RejectionV1::from_launch_facts(code, phase, detail, true, released, retired_cleanup())
+                .unwrap_or_else(|failure| panic!("invalid internal fault receipt: {failure}")),
+        ),
         retirement_owner: owner,
     }
 }
@@ -745,6 +741,8 @@ pub fn execute_typed(
     .map_err(|error| rejection_for_launch_error(&error, attempt))
 }
 
+// The broker supplies each authenticated launch capability explicitly.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_brokered_typed(
     request: LaunchRequestV2,
     descriptors: Vec<OwnedFd>,
@@ -764,7 +762,7 @@ pub fn execute_brokered_typed(
                 "MCSEALED-POLICY-ADMISSION",
                 "exact caller workload admission was rejected before target allocation",
             );
-            rejection.workload_admission = Some(
+            rejection.workload_admission = Some(Box::new(
                 memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1 {
                     request: memcordon_core::workload_evidence::RequestBindingV1::from_contract(
                         contract,
@@ -774,7 +772,7 @@ pub fn execute_brokered_typed(
                     })?,
                     rejection: admission,
                 },
-            );
+            ));
             record
                 .transition("retired")
                 .and_then(|()| record.retire())
@@ -1391,17 +1389,18 @@ fn execute_inner(
         let exec_status = receive_exec_status(&mut provider_control, exec_status_deadline)?;
         drop(provider_control);
         let mut deadline_exceeded = false;
+        let mut policy_revoked = false;
         let mut status = [0_u8; 4];
         loop {
-            if admission
-                .as_ref()
-                .map(crate::admission::FrozenAdmission::revoked_linux)
-                .transpose()?
-                .unwrap_or(false)
+            if exec_status == TargetExecStatus::Succeeded
+                && admission
+                    .as_ref()
+                    .map(crate::admission::FrozenAdmission::revoked_linux)
+                    .transpose()?
+                    .unwrap_or(false)
             {
-                return Err(
-                    "MCSEALED-POLICY-DRIFT: active grant revoked; native cleanup required".into(),
-                );
+                policy_revoked = true;
+                break;
             }
             let mut pollfd = libc::pollfd {
                 fd: status_read.as_raw_fd(),
@@ -1435,25 +1434,30 @@ fn execute_inner(
                 }
             }
         }
-        let child_status = if deadline_exceeded {
-            125
+        let child_status = if policy_revoked {
+            // Containment retirement also kills namespace init. No child exit
+            // status was observed; the receipt must not invent one.
+            None
+        } else if deadline_exceeded {
+            Some(125)
         } else {
             status_read
                 .read_exact(&mut status)
                 .map_err(|error| format!("MCSEALED-MONITOR-STATUS: {error}"))?;
-            i32::from_be_bytes(status)
+            Some(i32::from_be_bytes(status))
         };
         let memory_limit_exceeded = cgroup
             .memory_oom_killed()
             .map_err(|error| format!("MCSEALED-MEMORY-READBACK: {error}"))?;
-        if !deadline_exceeded
+        if !policy_revoked
+            && !deadline_exceeded
             && !memory_limit_exceeded
             && monitoring_policy.lifetime == crate::request::Lifetime::Command
             && monitoring_policy.command_exit_grace_millis > 0
         {
             deadline_exceeded = wait_command_exit_grace(&cgroup, &monitoring_policy)?;
         }
-        if deadline_exceeded || memory_limit_exceeded {
+        if !policy_revoked && (deadline_exceeded || memory_limit_exceeded) {
             // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
             let _ = unsafe {
                 libc::syscall(
@@ -1544,6 +1548,7 @@ fn execute_inner(
                 None => Default::default(),
             },
             child_status,
+            policy_revoked,
             exec_status,
             spawn_error_reported: true,
             target_pid: target_pid as u32,

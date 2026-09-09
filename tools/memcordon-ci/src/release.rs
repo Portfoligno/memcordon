@@ -1679,10 +1679,11 @@ fn runtime_manifest(
                 memcordon_core::runtime_manifest::diagnostic_qualification_reference(
                     &target.rust_target,
                 ),
-            profile_qualification:
+            profile_qualification: Box::new(
                 memcordon_core::runtime_manifest::profile_qualification_reference(
                     &target.rust_target,
                 ),
+            ),
             agent_component: "sealed-agent".to_owned(),
             native_protocols: memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
                 provider_contract: 3,
@@ -1700,10 +1701,11 @@ fn runtime_manifest(
         },
         (SealedAssetPolicy::Included, false) => SealedRuntimeV2::Included {
             diagnostic_qualification: None,
-            profile_qualification:
+            profile_qualification: Box::new(
                 memcordon_core::runtime_manifest::profile_qualification_reference(
                     &target.rust_target,
                 ),
+            ),
             agent_component: "sealed-agent".to_owned(),
             native_protocols: memcordon_core::runtime_manifest::NativeProviderProtocols::Linux {
                 provider_contract: 3,

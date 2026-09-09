@@ -4,22 +4,20 @@ use crate::workload_registry::{AdmissionRejectionV1, BaselineProfile};
 use crate::{BoundedText, BoundedVec, DiagnosticSha256, PublicProviderBindingV1};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WorkloadRequestReport {
+    #[default]
     LegacyUnspecified,
-    StrictV1 { contract: WorkloadContractV1 },
-}
-impl Default for WorkloadRequestReport {
-    fn default() -> Self {
-        Self::LegacyUnspecified
-    }
+    StrictV1 {
+        contract: Box<WorkloadContractV1>,
+    },
 }
 impl WorkloadRequestReport {
     pub fn from_contract(contract: Option<&WorkloadContractV1>) -> Self {
         match contract {
             Some(contract) => Self::StrictV1 {
-                contract: contract.clone(),
+                contract: Box::new(contract.clone()),
             },
             None => Self::LegacyUnspecified,
         }
@@ -183,14 +181,9 @@ pub struct EffectiveWorkloadPolicyV1 {
     pub restriction: BaselineRestrictionObservationV1,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct False(bool);
-impl Default for False {
-    fn default() -> Self {
-        Self(false)
-    }
-}
 impl<'de> Deserialize<'de> for False {
     fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
         if bool::deserialize(decoder)? {
@@ -317,16 +310,17 @@ pub enum PolicyTerminalEvidenceV1 {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum AttemptPolicyEnforcementV1 {
+    #[default]
     LegacyUnspecified,
     NotAuthorized {
         request: RequestBindingV1,
         rejection: AdmissionRejectionV1,
     },
     Authorized {
-        admission: AttemptBindingV1,
+        admission: Box<AttemptBindingV1>,
         before_authorization: VerifiedCheckpointV1,
         terminal: PolicyTerminalEvidenceV1,
     },
@@ -334,11 +328,6 @@ pub enum AttemptPolicyEnforcementV1 {
         request: Option<RequestBindingV1>,
         failure: AdmissionAvailabilityFailure,
     },
-}
-impl Default for AttemptPolicyEnforcementV1 {
-    fn default() -> Self {
-        Self::LegacyUnspecified
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -505,6 +494,8 @@ impl VerifiedCheckpointV1 {
                     && checkpoint_digest(&digest, self.controls).as_ref() == Ok(&self.digest)
             })
     }
+    // Each independently observed gate is required; none may default to verified.
+    #[allow(clippy::too_many_arguments)]
     pub fn observed(
         binding: &AttemptBindingV1,
         controls: BaselineRestrictionObservationV1,
@@ -547,7 +538,7 @@ impl AttemptPolicyEnforcementV1 {
             } => {
                 let profile = baseline_for(&admission.plan.request.profile)?;
                 Some(WorkloadResolutionReportV1::Admitted {
-                    binding: admission.clone(),
+                    binding: admission.as_ref().clone(),
                     effective: EffectiveWorkloadPolicyV1 {
                         profile,
                         ceiling: profile.ceiling(),
@@ -632,7 +623,7 @@ impl AttemptPolicyEnforcementV1 {
             return Err("checkpoint belongs to another attempt".into());
         }
         Ok(Self::Authorized {
-            admission: binding,
+            admission: Box::new(binding),
             terminal: PolicyTerminalEvidenceV1::Retired {
                 attempt_binding: digest,
                 checkpoint: checkpoint.digest.clone(),

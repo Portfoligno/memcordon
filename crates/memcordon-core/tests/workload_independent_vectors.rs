@@ -350,27 +350,50 @@ fn discovery_filters_callers_and_rejects_duplicate_or_incompatible_grants() {
 
 #[test]
 fn maximal_valid_registry_errors_instead_of_truncating_complete_discovery() {
+    use memcordon_core::workload_limits::{GRANTS, PLANS_PER_GRANT, PUBLIC_OBJECT_BYTES};
+
     let mut registry = registry();
-    let prototype = registry.grants.as_slice()[0].clone();
-    registry.grants = bounded((0..128).map(|index| {
-        let mut grant = prototype.clone();
-        grant.id = id(&format!("grant-{index}"));
-        grant.callers = bounded([CallerSelector::Linux { uid: 1000 }]);
-        grant.approved_plans = bounded((0..16).map(digest));
-        grant
-    }));
-    assert!(registry.validate().is_ok());
-    let encoded = serde_json::to_vec(&registry).unwrap();
-    assert!(PolicyRegistryV1::parse(&encoded).is_ok());
-    let error = discovery(&registry, 1000).unwrap_err();
-    assert!(
-        error.contains("capacity"),
-        "expected explicit bounded discovery error: {error}"
-    );
-    // The same registry remains usable for callers with no matching grants.
-    let unrelated = discovery(&registry, 2000).unwrap();
-    assert!(unrelated.complete);
-    assert!(unrelated.grants.as_slice().is_empty());
+    let mut prototype = registry.grants.as_slice()[0].clone();
+    let id_width = GRANTS.to_string().len();
+    let grant_id = |index| id(&format!("grant-{index:0id_width$}"));
+    prototype.id = grant_id(0);
+    prototype.callers = bounded([CallerSelector::Linux { uid: 1000 }]);
+    prototype.approved_plans = bounded([digest(0)]);
+    registry.grants = bounded([prototype.clone()]);
+    let single = discovery(&registry, 1000).unwrap();
+    let entry_bytes = serde_json::to_vec(&single.grants.as_slice()[0])
+        .unwrap()
+        .len();
+    let envelope_bytes = serde_json::to_vec(&single).unwrap().len() - entry_bytes;
+    let discovery_bytes = |grants: usize| {
+        let entries = grants * PLANS_PER_GRANT;
+        envelope_bytes + entries * entry_bytes + entries.saturating_sub(1) * b",".len()
+    };
+    // Equal-width ids and fixed-width digests make this serialized size exact.
+    // Miri still crosses the real public byte limit and exercises rejection;
+    // native execution retains the complete registry and plan capacity case.
+    let minimum_overflow_grants = (1..=GRANTS)
+        .find(|grants| discovery_bytes(*grants) > PUBLIC_OBJECT_BYTES)
+        .unwrap();
+    assert!(discovery_bytes(minimum_overflow_grants - 1) <= PUBLIC_OBJECT_BYTES);
+    for grants in std::iter::once(minimum_overflow_grants).chain((!cfg!(miri)).then_some(GRANTS)) {
+        registry.grants = bounded((0..grants).map(|index| {
+            let mut grant = prototype.clone();
+            grant.id = grant_id(index);
+            grant.approved_plans =
+                bounded((0..PLANS_PER_GRANT).map(|plan| digest(u8::try_from(plan).unwrap())));
+            grant
+        }));
+        assert!(registry.validate().is_ok());
+        let encoded = serde_json::to_vec(&registry).unwrap();
+        assert!(PolicyRegistryV1::parse(&encoded).is_ok());
+        let error = discovery(&registry, 1000).unwrap_err();
+        assert_eq!(error, "caller discovery exceeds public object capacity");
+        // The same registry remains usable for callers with no matching grants.
+        let unrelated = discovery(&registry, 2000).unwrap();
+        assert!(unrelated.complete);
+        assert!(unrelated.grants.as_slice().is_empty());
+    }
 }
 
 #[test]
@@ -503,7 +526,9 @@ fn portable_seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     let registry = registry();
     let discovery = discovery(&registry, 1000).unwrap();
     assert!(discovery.validate(BaselineProfile::LinuxUnixCreate));
-    let report = memcordon_core::workload_discovery::DiscoveryReportV1::Authenticated { discovery };
+    let report = memcordon_core::workload_discovery::DiscoveryReportV1::Authenticated {
+        discovery: Box::new(discovery),
+    };
     let binding = attempt();
     let checkpoint = VerifiedCheckpointV1::observed(
         &binding,

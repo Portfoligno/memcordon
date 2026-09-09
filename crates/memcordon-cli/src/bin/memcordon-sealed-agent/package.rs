@@ -953,7 +953,7 @@ pub fn probe_provider() -> Result<crate::linux::qualification::QualificationRece
     let qualification: crate::linux::qualification::QualificationReceipt =
         serde_json::from_slice(&receipt.payload)
             .map_err(|error| readiness_error(&error.to_string()))?;
-    if qualification.schema_version != 2
+    if qualification.schema_version != 3
         || qualification.mechanism != "linux-pid-namespace-cgroup-v2"
         || qualification.provider_identity.is_empty()
         || qualification.receipt_digest.is_empty()

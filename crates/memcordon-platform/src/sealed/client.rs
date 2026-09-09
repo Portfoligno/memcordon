@@ -146,7 +146,8 @@ pub struct TerminalReceipt {
     pub policy_enforcement: memcordon_core::workload_evidence::AttemptPolicyEnforcementV1,
     pub schema_version: u32,
     pub mechanism: String,
-    pub status: i32,
+    pub status: Option<i32>,
+    pub policy_revoked: bool,
     pub exec_status: TerminalExecStatus,
     pub spawn_error_reported: bool,
     pub target_pid: u32,
@@ -335,6 +336,13 @@ pub fn run(
         ..memcordon_core::CleanupSummary::default()
     };
     let restart_safety = terminal_restart_safety(&terminal);
+    if terminal.policy_revoked {
+        return Err(terminal_revocation_error(
+            &terminal,
+            cleanup,
+            restart_safety,
+        ));
+    }
     if let TerminalExecStatus::Failed { class, os_code } = terminal.exec_status {
         return Err(terminal_spawn_error(
             &terminal,
@@ -345,7 +353,9 @@ pub fn run(
         ));
     }
     let child = memcordon_core::ChildTermination::ExitCode {
-        code: terminal.status,
+        code: terminal
+            .status
+            .expect("ordinary terminal status was validated"),
     };
     let outcome = if terminal.memory_limit_exceeded {
         let limit = policy.memory.ok_or_else(|| {
@@ -482,6 +492,47 @@ pub(crate) fn terminal_restart_safety(
         sealed_boundary_retired: terminal.boundary_retired,
         errors: Vec::new(),
     }
+}
+
+pub(crate) fn terminal_revocation_error(
+    terminal: &TerminalReceipt,
+    cleanup: memcordon_core::CleanupSummary,
+    restart_safety: memcordon_core::RestartSafetyProof,
+) -> memcordon_core::Error {
+    let mut error = memcordon_core::Error::new(
+        memcordon_core::ErrorCategory::Monitor,
+        "MCSEALED-POLICY-DRIFT",
+        "active grant revoked; workload retired without an observed child exit status",
+    )
+    .with_boundary_setup_failure(memcordon_core::BoundarySetupFailure {
+        requested: memcordon_core::BoundaryRequirement::Sealed,
+        mechanism: Some("linux-pid-namespace-cgroup-v2".to_owned()),
+        phase: memcordon_core::BoundarySetupPhase::Retirement,
+        target_created: true,
+        target_released: true,
+        cleanup_attempted: true,
+        restart_safety: restart_safety.clone(),
+    });
+    error.target_pid = Some(terminal.target_pid);
+    error.launch_phase = Some("policy-revoked");
+    error.target_released = true;
+    error.authorization_offset = Some(Duration::from_millis(terminal.authorization_offset_millis));
+    error.policy_enforcement = Some(terminal.policy_enforcement.clone());
+    error.cgroup_verified_before_release = terminal.assignment_verified
+        && terminal.namespaces_verified
+        && terminal.target_initial_credentials_verified
+        && terminal.initial_provider_capabilities_absent
+        && terminal.target_no_new_privs_matched
+        && terminal.target_capability_bounding_set_matched
+        && terminal.target_mount_context_derived_from_caller
+        && terminal.descriptors_verified
+        && terminal.writable_ancestor_cgroup_denied;
+    error.guardian_ready_before_release = terminal.guardian_ready;
+    error.workload_may_be_alive =
+        !restart_safety.is_safe_for(memcordon_core::BoundaryRequirement::Sealed);
+    error.cleanup = cleanup;
+    error.restart_safety = Some(restart_safety);
+    error
 }
 
 pub(crate) fn terminal_spawn_error(
@@ -1194,9 +1245,22 @@ pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> 
     if schema_version != 2 || mechanism != "linux-pid-namespace-cgroup-v2" {
         return Err("terminal receipt schema or mechanism is incompatible".to_owned());
     }
-    let status = take_terminal_field(&mut fields, "status")?
-        .parse()
-        .map_err(|_| "terminal status invalid".to_owned())?;
+    let status = match take_terminal_field(&mut fields, "status")? {
+        "none" => None,
+        value => Some(
+            value
+                .parse()
+                .map_err(|_| "terminal status invalid".to_owned())?,
+        ),
+    };
+    let policy_revoked = match fields.remove("policy-revoked") {
+        None | Some("false") => false,
+        Some("true") => true,
+        _ => return Err("terminal revocation flag invalid".to_owned()),
+    };
+    if policy_revoked != status.is_none() {
+        return Err("terminal revocation and observed child status disagree".to_owned());
+    }
     let exec_name = take_terminal_field(&mut fields, "exec-status")?;
     let exec_os_code = match take_terminal_field(&mut fields, "exec-os-code")? {
         "none" => None,
@@ -1234,7 +1298,7 @@ pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> 
             TerminalExecFailureClass::NotFound => 127,
             TerminalExecFailureClass::NotExecutable | TerminalExecFailureClass::Other => 126,
         };
-        if status != expected_status {
+        if status != Some(expected_status) {
             return Err("terminal exec failure and child status are contradictory".to_owned());
         }
     }
@@ -1269,6 +1333,7 @@ pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> 
         schema_version,
         mechanism,
         status,
+        policy_revoked,
         exec_status,
         spawn_error_reported,
         target_pid,
@@ -1330,6 +1395,27 @@ pub(crate) fn parse_terminal(payload: &[u8]) -> Result<TerminalReceipt, String> 
         memory_limit_exceeded: take_terminal_fact(&mut fields, "memory-limit-exceeded")?,
         deadline_exceeded: take_terminal_fact(&mut fields, "deadline-exceeded")?,
     };
+    if receipt.policy_revoked
+        && (receipt.deadline_exceeded
+            || !matches!(
+                &receipt.policy_enforcement,
+                memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::Authorized {
+                    terminal:
+                        memcordon_core::workload_evidence::PolicyTerminalEvidenceV1::Retired {
+                            controls_preserved: true,
+                            provider_resources_closed: true,
+                            ..
+                        },
+                    ..
+                }
+            )
+            || !receipt.cgroup_empty
+            || !receipt.init_reaped
+            || !receipt.guardian_reaped
+            || !receipt.boundary_retired)
+    {
+        return Err("terminal policy revocation lacks verified admission retirement".to_owned());
+    }
     if fields.is_empty() {
         Ok(receipt)
     } else {

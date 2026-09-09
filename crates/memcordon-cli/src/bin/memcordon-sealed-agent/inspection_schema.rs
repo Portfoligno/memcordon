@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[allow(dead_code)] // Preserve the stored historical V3 evidence schema.
-#[serde(deny_unknown_fields)]
 pub struct AgentPackageInspectionV3 {
     pub schema_version: u32,
     pub version: String,
@@ -71,8 +70,7 @@ pub enum ProviderPackageMetadataV3 {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct AgentPackageInspectionV4 {
     pub schema_version: u32,
     pub version: String,
@@ -171,8 +169,7 @@ pub struct InstalledProviderInspectionV4 {
     pub qualification_complete: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct AgentPackageInspectionV5 {
     pub schema_version: u32,
     pub version: String,
@@ -207,3 +204,74 @@ pub struct InstalledProviderInspectionV5 {
     pub diagnostic_qualification:
         Option<memcordon_core::runtime_manifest::QualificationArtifactReferenceV1>,
 }
+
+// Serde's strict outer derive cannot distinguish flattened enum fields from
+// unknown fields. Decode common fields directly (including nested validation),
+// then let the strict platform enum validate the remaining, unique fields.
+macro_rules! deserialize_inspection {
+    ($inspection:ident, $platform:ty, { $($field:ident: $ty:ty),+ $(,)? }) => {
+        impl<'de> Deserialize<'de> for $inspection {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct InspectionVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for InspectionVisitor {
+                    type Value = $inspection;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        formatter.write_str("a strict flattened provider inspection")
+                    }
+
+                    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                        $(let mut $field: Option<$ty> = None;)+
+                        let mut platform_fields = serde_json::Map::new();
+                        while let Some(key) = map.next_key::<String>()? {
+                            match key.as_str() {
+                                $(stringify!($field) => {
+                                    if $field.is_some() {
+                                        return Err(serde::de::Error::duplicate_field(stringify!($field)));
+                                    }
+                                    $field = Some(map.next_value::<$ty>()?);
+                                })+
+                                _ => {
+                                    if platform_fields.contains_key(&key) {
+                                        return Err(serde::de::Error::custom(format!("duplicate field `{key}`")));
+                                    }
+                                    platform_fields.insert(key, map.next_value::<serde_json::Value>()?);
+                                }
+                            }
+                        }
+                        let platform = serde_json::from_value::<$platform>(serde_json::Value::Object(platform_fields))
+                            .map_err(serde::de::Error::custom)?;
+                        Ok($inspection {
+                            $($field: $field.ok_or_else(|| serde::de::Error::missing_field(stringify!($field)))?,)+
+                            platform,
+                        })
+                    }
+                }
+                deserializer.deserialize_map(InspectionVisitor)
+            }
+        }
+    };
+}
+
+deserialize_inspection!(AgentPackageInspectionV3, ProviderPackageMetadataV3, {
+    schema_version: u32, version: String, source_commit: String,
+    executable_sha256: String, provider_protocol: u32, mechanism: String,
+    execution_report_schema: u32, plan_report_schema: u32,
+    doctor_report_schema: u32, compiled_metadata_valid: bool,
+});
+deserialize_inspection!(AgentPackageInspectionV4, ProviderPackageMetadataV4, {
+    schema_version: u32, version: String, source_commit: String,
+    executable_sha256: String, provider_protocol: u32, mechanism: String,
+    execution_report_schema: u32, plan_report_schema: u32,
+    doctor_report_schema: u32, compiled_metadata_valid: bool,
+});
+deserialize_inspection!(AgentPackageInspectionV5, ProviderPackageMetadataV4, {
+    schema_version: u32, version: String, source_commit: String,
+    executable_sha256: String, provider_protocol: u32,
+    native_protocols: memcordon_core::runtime_manifest::NativeProviderProtocols,
+    runtime_manifest_schema: u32, workload_contract_schema: u32,
+    profile_catalog_sha256: String, mechanism: String,
+    execution_report_schema: u32, plan_report_schema: u32,
+    doctor_report_schema: u32, compiled_metadata_valid: bool,
+});

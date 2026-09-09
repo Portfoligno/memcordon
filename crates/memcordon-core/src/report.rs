@@ -157,7 +157,7 @@ fn validate_workload_history(
     };
     let contract = match &policy.requested.workload {
         WorkloadRequestReport::LegacyUnspecified => None,
-        WorkloadRequestReport::StrictV1 { contract } => Some(contract),
+        WorkloadRequestReport::StrictV1 { contract } => Some(contract.as_ref()),
     };
     let expected = contract
         .map(RequestBindingV1::from_contract)

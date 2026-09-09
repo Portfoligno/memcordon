@@ -278,18 +278,17 @@ pub fn validate_report(
                     "standard certificate runner mismatch".into(),
                 ));
             }
-            if let Some(o) = origin {
-                if p.repository != o.repository
+            if let Some(o) = origin
+                && (p.repository != o.repository
                     || p.run_id != o.run_id
                     || p.workflow_ref != o.workflow_ref
                     || p.workflow_commit != o.workflow_commit
                     || p.job != contract.release_job
-                    || report.commit != o.source_commit
-                {
-                    return Err(CiError::Message(
-                        "standard certificate producer origin mismatch".into(),
-                    ));
-                }
+                    || report.commit != o.source_commit)
+            {
+                return Err(CiError::Message(
+                    "standard certificate producer origin mismatch".into(),
+                ));
             }
         }
         None => {

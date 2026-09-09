@@ -10,7 +10,8 @@ use crate::linux::launch::{
 fn terminal(exec_status: TargetExecStatus, child_status: i32) -> TerminalFacts {
     TerminalFacts {
         policy_enforcement: Default::default(),
-        child_status,
+        child_status: Some(child_status),
+        policy_revoked: false,
         exec_status,
         spawn_error_reported: true,
         target_pid: 41,
@@ -40,6 +41,25 @@ fn terminal(exec_status: TargetExecStatus, child_status: i32) -> TerminalFacts {
         cgroup_kill_invoked: true,
         memory_limit_exceeded: false,
         deadline_exceeded: false,
+    }
+}
+
+#[test]
+fn revoked_terminal_preserves_authorization_without_fabricating_child_status() {
+    let mut facts = terminal(TargetExecStatus::Succeeded, 0);
+    facts.child_status = None;
+    facts.policy_revoked = true;
+    let payload = crate::linux::service::terminal_payload_for_test(&facts);
+    let text = std::str::from_utf8(&payload).unwrap();
+    for field in [
+        "status=none",
+        "policy-revoked=true",
+        "authorization-offset-millis=7",
+        "deadline-exceeded=false",
+        "cgroup-empty=true",
+        "boundary-retired=true",
+    ] {
+        assert!(text.lines().any(|line| line == field), "missing {field}");
     }
 }
 

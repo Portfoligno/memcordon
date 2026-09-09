@@ -64,6 +64,23 @@ pub fn sealed_terminal_spawn_error(
 }
 
 #[cfg(target_os = "linux")]
+pub fn sealed_terminal_revocation_error(payload: &[u8]) -> Result<memcordon_core::Error, String> {
+    let terminal = crate::sealed::client::parse_terminal(payload)?;
+    if !terminal.policy_revoked {
+        return Err("terminal is not a policy revocation".to_owned());
+    }
+    let cleanup = memcordon_core::CleanupSummary {
+        direct_child_reaped: terminal.init_reaped,
+        workload_empty: Some(terminal.cgroup_empty),
+        ..Default::default()
+    };
+    let safety = crate::sealed::client::terminal_restart_safety(&terminal);
+    Ok(crate::sealed::client::terminal_revocation_error(
+        &terminal, cleanup, safety,
+    ))
+}
+
+#[cfg(target_os = "linux")]
 pub fn sealed_terminal_v2_is_valid(payload: &[u8]) -> Result<(), String> {
     crate::sealed::client::parse_terminal(payload).map(|_| ())
 }
@@ -632,7 +649,7 @@ impl OuterTestBoundary {
     }
 
     pub fn terminate(&self) -> io::Result<()> {
-        terminate_unix_session(self.session)
+        terminate_unix_session(self.session, || Ok(()))
     }
 }
 
@@ -709,13 +726,17 @@ fn unix_session_members(session: i32) -> io::Result<Vec<i32>> {
 }
 
 #[cfg(unix)]
-fn terminate_unix_session(session: i32) -> io::Result<()> {
+fn terminate_unix_session(
+    session: i32,
+    mut reap: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
     use std::collections::BTreeSet;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut first_error = None;
     let mut signalled = BTreeSet::new();
     loop {
+        reap()?;
         let mut members = Vec::new();
         for pid in unix_session_members(session)? {
             let Ok(pid_value) = u32::try_from(pid) else {
@@ -879,6 +900,24 @@ impl Drop for OuterTestBoundary {
 #[cfg(not(any(unix, windows)))]
 #[derive(Debug)]
 pub struct OuterTestBoundary;
+
+impl OuterTestBoundary {
+    /// Reap the owned direct child while retiring its boundary. A killed Unix
+    /// child remains a session member until its parent consumes the exit status.
+    pub fn terminate_and_reap(&self, child: &mut Child) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            terminate_unix_session(self.session, || child.try_wait().map(|_| ()))
+        }
+        #[cfg(not(unix))]
+        {
+            self.terminate()?;
+            #[cfg(not(windows))]
+            child.kill()?;
+            child.wait().map(|_| ())
+        }
+    }
+}
 
 #[cfg(not(any(unix, windows)))]
 impl OuterTestBoundary {

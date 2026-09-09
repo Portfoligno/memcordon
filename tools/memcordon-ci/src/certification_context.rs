@@ -117,8 +117,8 @@ impl CertificationContext {
         {
             return Err(CiError::Message("invalid certification context".into()));
         }
-        if let Some(p) = &self.provenance {
-            if !valid_commit(&p.workflow_commit)
+        if let Some(p) = &self.provenance
+            && (!valid_commit(&p.workflow_commit)
                 || p.repository.split('/').count() != 2
                 || p.repository.split('/').any(|part| {
                     part.is_empty()
@@ -134,12 +134,11 @@ impl CertificationContext {
                 || !valid_workflow_ref(&p.repository, &p.workflow_ref)
                 || p.runner_environment != "github-hosted"
                 || !matches!(p.runner_os.as_str(), "Linux" | "Windows")
-                || p.runner_arch != "X64"
-            {
-                return Err(CiError::Message(
-                    "invalid hosted certification provenance".into(),
-                ));
-            }
+                || p.runner_arch != "X64")
+        {
+            return Err(CiError::Message(
+                "invalid hosted certification provenance".into(),
+            ));
         }
         Ok(())
     }

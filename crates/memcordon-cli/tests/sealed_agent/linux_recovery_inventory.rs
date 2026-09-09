@@ -206,7 +206,9 @@ fn recovery_preserves_unsafe_interrupted_transition_metadata() {
                     .unwrap();
             }
             "oversized" => {
-                write_transaction(&transaction, &"x".repeat(16 * 1024 + 1));
+                let oversized =
+                    usize::try_from(crate::linux::recovery::MAX_RECORD_BYTES).unwrap() + 1;
+                write_transaction(&transaction, &"x".repeat(oversized));
             }
             "symlink" => {
                 let target = temporary.path().join("outside");
@@ -218,7 +220,7 @@ fn recovery_preserves_unsafe_interrupted_transition_metadata() {
 
         let ambiguous =
             crate::linux::recovery::recover_test_roots(&state_root, &cgroup_root).unwrap();
-        assert!(ambiguous.iter().any(|entry| entry == IDENTITY));
+        assert!(ambiguous.iter().any(|entry| entry == IDENTITY), "{case}");
         assert!(
             ambiguous
                 .iter()

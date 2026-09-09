@@ -111,6 +111,13 @@ impl LaunchAttemptError {
             FailureCodeV1 as Code, FailureOperationV1 as Operation,
         };
         let (category, operation, code, phase, native_known) = match self.code {
+            "MCSEALED-POLICY-DRIFT" => (
+                Category::Monitor,
+                Operation::VerifyPolicy,
+                Code::PolicyRevoked,
+                Phase::Monitoring,
+                false,
+            ),
             "MCSEALED-WINDOWS-TARGET-RESUME" => (
                 Category::Launch,
                 Operation::ResumeTarget,
@@ -729,6 +736,25 @@ fn handle_control(connection: HANDLE) -> Result<(), String> {
     }
     let first: WindowsLauncherRequestV1 = pipe::read_frame(connection)?;
     match first {
+        WindowsLauncherRequestV1::StartupAttestation {
+            schema_version,
+            challenge,
+        } if schema_version == WINDOWS_PRIVATE_PROTOCOL_VERSION => {
+            let attestation = super::token::current_service_self_attestation(
+                "launcher-service",
+                WINDOWS_LAUNCHER_SERVICE_NAME,
+                super::package::LAUNCHER_PRIVILEGES,
+                &challenge,
+            )
+            .map_err(|error| error.to_string())?;
+            pipe::write_frame(
+                connection,
+                &WindowsLauncherResponseV1::StartupAttestation {
+                    schema_version: WINDOWS_PRIVATE_PROTOCOL_VERSION,
+                    attestation,
+                },
+            )
+        }
         WindowsLauncherRequestV1::Probe {
             schema_version,
             challenge,
@@ -2585,6 +2611,11 @@ fn launch_attempt(
         }
     };
     let mut mutant_candidate = None;
+    if matches!(reason, TerminalReason::PolicyRevoked) {
+        // Retain the original reason before fallible cleanup, without starting
+        // a second termination path before the normal accounting snapshot.
+        super::diagnostics::merge_into(&mut cleanup_guard.record.causal_diagnostics);
+    }
     let mut mutant_observation = None;
     let mut success_before_zero_active_processes = None;
     let mut completion_accepted_without_accounting = false;
@@ -3784,6 +3815,7 @@ fn latch_certification_target_result(
 #[derive(Clone, Copy)]
 enum TerminalReason {
     Direct(u32),
+    PolicyRevoked,
     Deadline,
     Memory(u64),
     Interrupted(i32),
@@ -3792,7 +3824,7 @@ enum TerminalReason {
 impl TerminalReason {
     const fn termination_status(self) -> u32 {
         match self {
-            Self::Direct(_) | Self::Interrupted(_) => CANCEL_STATUS,
+            Self::Direct(_) | Self::Interrupted(_) | Self::PolicyRevoked => CANCEL_STATUS,
             Self::Deadline => DEADLINE_STATUS,
             Self::Memory(_) => LIMIT_STATUS,
         }
@@ -3827,9 +3859,8 @@ fn monitor(
             .transpose()?
             .unwrap_or(false)
         {
-            return Err(LaunchAttemptError::from(
-                "MCSEALED-POLICY-DRIFT: active policy revoked".to_owned(),
-            ));
+            let _revocation = policy_revocation_failure().captured();
+            break TerminalReason::PolicyRevoked;
         }
         if matches!(
             request.certification_fault,
@@ -4043,6 +4074,41 @@ fn monitor(
     })
 }
 
+fn policy_revocation_failure() -> LaunchAttemptError {
+    LaunchAttemptError {
+        code: "MCSEALED-POLICY-DRIFT",
+        detail: "active policy revoked".to_owned(),
+        os_code: None,
+        phase: Some(memcordon_core::BoundarySetupPhase::Monitoring),
+        connection_must_close: false,
+        mutant_observation: None,
+        loader_qualification: None,
+        terminal_candidate: None,
+        workload_admission: None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn policy_revocation_observation_for_test() -> memcordon_core::CausalEventV1 {
+    policy_revocation_failure().observation()
+}
+
+fn policy_revocation_outcome(child: ChildTermination, cleanup: CleanupSummary) -> RunOutcome {
+    RunOutcome::MonitorFailed {
+        error: "MCSEALED-POLICY-DRIFT: active policy revoked".to_owned(),
+        child_after_termination: Some(child),
+        cleanup,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn policy_revocation_outcome_for_test(
+    status: u32,
+    cleanup: CleanupSummary,
+) -> RunOutcome {
+    policy_revocation_outcome(child_termination(status), cleanup)
+}
+
 fn build_outcome(
     reason: TerminalReason,
     request: &WindowsLaunchBrokerRequestV1,
@@ -4068,6 +4134,10 @@ fn build_outcome(
             peak,
             cleanup,
         }),
+        TerminalReason::PolicyRevoked => Ok(policy_revocation_outcome(
+            child_after_termination.expect("revocation queries the terminated target status"),
+            cleanup,
+        )),
         TerminalReason::Deadline => {
             let observed = millis(started.elapsed());
             let requested = request

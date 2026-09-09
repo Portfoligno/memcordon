@@ -30,7 +30,10 @@ impl CapturedExecution {
 
 impl StagedFixture {
     pub fn new() -> Result<Self, String> {
-        let source = Path::new(fixture());
+        Self::from_source(Path::new(fixture()))
+    }
+
+    pub fn from_source(source: &Path) -> Result<Self, String> {
         let source_metadata =
             std::fs::symlink_metadata(source).map_err(|error| error.to_string())?;
         if !source_metadata.file_type().is_file() {
