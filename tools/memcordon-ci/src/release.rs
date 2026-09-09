@@ -1193,6 +1193,30 @@ fn validate_agent_package_inspection(
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     };
+    let windows = matches!(
+        &inspection.platform,
+        AgentPackagePlatform::WindowsService { .. }
+    );
+    let expected_protocols = if windows {
+        memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
+            provider_contract: 3,
+            public_wire: 2,
+            private_wire: 2,
+        }
+    } else {
+        memcordon_core::runtime_manifest::NativeProviderProtocols::Linux {
+            provider_contract: 3,
+            launch_wire: 3,
+        }
+    };
+    let expected_provider_protocol = match &expected_protocols {
+        memcordon_core::runtime_manifest::NativeProviderProtocols::Linux {
+            launch_wire, ..
+        } => *launch_wire,
+        memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
+            public_wire, ..
+        } => *public_wire,
+    };
     let platform_valid = match &inspection.platform {
         AgentPackagePlatform::LinuxSystemd {
             control_service_sha256,
@@ -1201,7 +1225,7 @@ fn validate_agent_package_inspection(
             launcher_socket_sha256,
             tmpfiles_sha256,
         } => {
-            inspection.provider_protocol == 2
+            inspection.provider_protocol == expected_provider_protocol
                 && inspection.mechanism == "linux-pid-namespace-cgroup-v2"
                 && [
                     control_service_sha256,
@@ -1257,7 +1281,7 @@ fn validate_agent_package_inspection(
                 normal: target_desktop_bootstrap_normal_imports.clone(),
                 delayed: target_desktop_bootstrap_delayed_imports.clone(),
             };
-            inspection.provider_protocol == 1
+            inspection.provider_protocol == expected_provider_protocol
                 && inspection.mechanism == "windows-job-object-v2"
                 && control_service_name == "MemCordonSealedControl"
                 && launcher_service_name == "MemCordonSealedLauncher"
@@ -1309,22 +1333,6 @@ fn validate_agent_package_inspection(
                 ]
                 .into_iter()
                 .all(valid_digest)
-        }
-    };
-    let windows = matches!(
-        &inspection.platform,
-        AgentPackagePlatform::WindowsService { .. }
-    );
-    let expected_protocols = if windows {
-        memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
-            provider_contract: 3,
-            public_wire: 2,
-            private_wire: 2,
-        }
-    } else {
-        memcordon_core::runtime_manifest::NativeProviderProtocols::Linux {
-            provider_contract: 3,
-            launch_wire: 3,
         }
     };
     if inspection.schema_version != 5

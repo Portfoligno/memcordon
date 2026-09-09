@@ -4,15 +4,32 @@ use std::io::{BufRead, BufReader, Cursor};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+fn provider_wire_protocol(
+    protocols: &memcordon_core::runtime_manifest::NativeProviderProtocols,
+) -> u32 {
+    match protocols {
+        memcordon_core::runtime_manifest::NativeProviderProtocols::Linux {
+            launch_wire, ..
+        } => *launch_wire,
+        memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
+            public_wire, ..
+        } => *public_wire,
+    }
+}
+
 fn package_inspection_fixture() -> serde_json::Value {
     let digest = sha256_bytes(b"package-inspection-fixture");
+    let native_protocols = memcordon_core::runtime_manifest::NativeProviderProtocols::Linux {
+        provider_contract: 3,
+        launch_wire: 3,
+    };
     serde_json::json!({
         "schema_version": 5,
         "version": "1.2.3",
         "source_commit": "source-commit",
         "executable_sha256": digest,
-        "provider_protocol": 2,
-        "native_protocols": memcordon_core::runtime_manifest::NativeProviderProtocols::Linux { provider_contract: 3, launch_wire: 3 },
+        "provider_protocol": provider_wire_protocol(&native_protocols),
+        "native_protocols": native_protocols,
         "runtime_manifest_schema": 2,
         "workload_contract_schema": 1,
         "profile_catalog_sha256": memcordon_core::runtime_manifest::baseline_catalog_digest(false),
@@ -34,6 +51,11 @@ fn windows_package_inspection_fixture() -> serde_json::Value {
     let digest = sha256_bytes(b"windows-package-inspection-fixture");
     let digest = digest.as_str();
     let mut inspection = serde_json::Map::new();
+    let native_protocols = memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
+        provider_contract: 3,
+        public_wire: 2,
+        private_wire: 2,
+    };
     for field in [
         "executable_sha256",
         "control_service_config_sha256",
@@ -57,16 +79,13 @@ fn windows_package_inspection_fixture() -> serde_json::Value {
         ("schema_version", serde_json::json!(5)),
         ("version", serde_json::json!("1.2.3")),
         ("source_commit", serde_json::json!("source-commit")),
-        ("provider_protocol", serde_json::json!(1)),
+        (
+            "provider_protocol",
+            serde_json::json!(provider_wire_protocol(&native_protocols)),
+        ),
         (
             "native_protocols",
-            serde_json::json!(
-                memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
-                    provider_contract: 3,
-                    public_wire: 2,
-                    private_wire: 2
-                }
-            ),
+            serde_json::json!(native_protocols.clone()),
         ),
         ("runtime_manifest_schema", serde_json::json!(2)),
         ("workload_contract_schema", serde_json::json!(1)),
@@ -409,6 +428,33 @@ fn package_inspection_binds_version_source_commit_and_sha256_fields() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn package_inspection_accepts_current_native_provider_wire_identity() {
+    for (canonical, stale_provider_protocol) in [
+        (package_inspection_fixture(), 2),
+        (windows_package_inspection_fixture(), 1),
+    ] {
+        validate_agent_package_inspection(
+            &serde_json::to_vec(&canonical).unwrap(),
+            "1.2.3",
+            "source-commit",
+        )
+        .expect("the package inspection provider protocol should match the native wire identity");
+
+        let mut stale_provider_identity = canonical;
+        stale_provider_identity["provider_protocol"] = serde_json::json!(stale_provider_protocol);
+        assert!(
+            validate_agent_package_inspection(
+                &serde_json::to_vec(&stale_provider_identity).unwrap(),
+                "1.2.3",
+                "source-commit",
+            )
+            .is_err(),
+            "a provider protocol that differs from the native wire identity should fail"
+        );
+    }
 }
 
 #[test]
