@@ -4,6 +4,41 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+### Added
+
+- Added `--sealed --workload-contract PATH` to require an administrator-approved
+  workload policy before a command starts or restarts. Unsupported requirements
+  are rejected before launch. Contracts do not grant additional network access.
+- Added `memcordon-sealed-agent package policy inspect --json` and
+  `package policy apply --file PATH` to manage workload grants. Administrators
+  can let running workloads finish or stop them when changing policy.
+- `doctor --json` now shows workload grants available to the caller. `plan` and
+  `doctor --require sealed` accept `--workload-contract PATH` to check whether
+  the provider supports a workload before running it.
+
+### Changed
+
+- Execution reports now show whether a workload was approved or rejected and
+  which policy applied to each attempt.
+
+### Fixed
+
+- Windows sealed failure reports retain the original cause even when cleanup
+  or recovery encounters additional errors.
+- Failed Windows package removal now restores the previous installation and
+  workload policy, including older installations.
+- Corrected launch reports to reflect when containment and cleanup supervision
+  were established for non-sealed commands.
+
+### Breaking Changes
+
+- Execution reports advance from schema 8 to 9, plan reports from 7 to 8, and
+  doctor reports from 5 to 6. Package inspection JSON advances from schema 4
+  to 5. Consumers of these JSON formats must update for the new schemas.
+- Rust callers must replace `MemcordonReport::schema8` with `schema9`, create
+  `Policy` through its constructors and builder methods, and update struct
+  initializers and exhaustive matches for the new workload and diagnostic data.
+
 ## [0.5.2-rc.23] - 2026-09-08
 
 ### Added
