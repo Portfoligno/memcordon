@@ -13,9 +13,9 @@ clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
 libc.workspace = true
-memcordon-core = { path = "../../crates/memcordon-core", version = "=0.5.3-rc.4" }
-memcordon-testkit = { path = "../../crates/memcordon-testkit", version = "=0.5.3-rc.4" }
-memcordon-windows-launch-core = { path = "../../crates/memcordon-windows-launch-core", version = "=0.5.3-rc.4" }
+memcordon-core = { path = "../../crates/memcordon-core", version = "=0.5.4-dev" }
+memcordon-testkit = { path = "../../crates/memcordon-testkit", version = "=0.5.4-dev" }
+memcordon-windows-launch-core = { path = "../../crates/memcordon-windows-launch-core", version = "=0.5.4-dev" }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

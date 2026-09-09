@@ -10,8 +10,8 @@ publish = false
 [dependencies]
 clap.workspace = true
 hex.workspace = true
-memcordon-core = { path = "../../crates/memcordon-core", version = "=0.5.3-rc.4" }
-memcordon-windows-launch-core = { path = "../../crates/memcordon-windows-launch-core", version = "=0.5.3-rc.4" }
+memcordon-core = { path = "../../crates/memcordon-core", version = "=0.5.4-dev" }
+memcordon-windows-launch-core = { path = "../../crates/memcordon-windows-launch-core", version = "=0.5.4-dev" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
