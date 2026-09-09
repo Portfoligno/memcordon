@@ -34,7 +34,12 @@ use memcordon_testkit::ObservedOutput;
 
 use crate::command::{CommandSpec, git, rustup_cargo};
 use crate::config::{self, AssetTarget, RuntimeComponentRole, SealedAssetPolicy};
+#[cfg(any(target_os = "linux", test))]
+use crate::sealed_linux::QualificationReceipt as LinuxQualificationReceipt;
 use crate::{CiError, ReleaseCommand, Result};
+
+#[cfg(any(target_os = "linux", test))]
+const LINUX_PROVIDER_QUALIFICATION_ARGUMENTS: &[&str] = &["probe"];
 
 const RELEASE_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const GITHUB_API_ROOT: &str = "https://api.github.com";
@@ -2216,6 +2221,17 @@ fn linux_provider_frontend_arguments(
     setpriv_sudo_arguments(identity, cli, &public_arguments)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn validate_linux_provider_qualification(command: &[&str], output: &[u8]) -> Result<()> {
+    if command != LINUX_PROVIDER_QUALIFICATION_ARGUMENTS {
+        return Err(failure(
+            "Linux provider qualification must query the installed provider",
+        ));
+    }
+    let receipt: LinuxQualificationReceipt = serde_json::from_slice(output)?;
+    receipt.validate()
+}
+
 #[cfg(target_os = "linux")]
 fn smoke_linux_provider(
     cli: &Path,
@@ -2229,7 +2245,6 @@ fn smoke_linux_provider(
         CommandSpec::new("sudo", root, RELEASE_DEADLINE)
             .args(command)
             .run()
-            .map(|_| ())
     };
     let authorized_release_cli =
         |identity: &FrontendIdentity, stage: LinuxProviderFrontendStage, cli: &Path| {
@@ -2244,7 +2259,14 @@ fn smoke_linux_provider(
         smoke.provider_install = Some(true);
         privileged_agent(&["package", "verify", "--json"])?;
         smoke.provider_verify = Some(true);
-        privileged_agent(&["qualify"])?;
+        // V3 workload-profile evidence depends on the launcher service's inherited
+        // AF_UNIX filter. Query that installed provider; standalone qualification
+        // runs outside the unit and therefore cannot prove this predicate.
+        let qualification = privileged_agent(LINUX_PROVIDER_QUALIFICATION_ARGUMENTS)?;
+        validate_linux_provider_qualification(
+            LINUX_PROVIDER_QUALIFICATION_ARGUMENTS,
+            &qualification,
+        )?;
         smoke.provider_qualification = Some(true);
         let identity = frontend_identity(root, RELEASE_DEADLINE)?;
         authorized_release_cli(&identity, LinuxProviderFrontendStage::Doctor, cli)?;

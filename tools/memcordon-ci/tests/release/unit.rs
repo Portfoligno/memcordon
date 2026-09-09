@@ -17,6 +17,61 @@ fn provider_wire_protocol(
     }
 }
 
+fn linux_provider_qualification_fixture() -> serde_json::Value {
+    let mut qualification = serde_json::json!({
+        "schema_version": 3,
+        "workload_profile": serde_json::to_value(
+            memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference(),
+        )
+        .expect("Linux workload profile should serialize"),
+        "workload_profile_probe_verified": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "mechanism": "linux-pid-namespace-cgroup-v2",
+        "provider_identity": "memcordon-sealed-agent-v2",
+        "control_service_identity": "memcordon-sealed-agent.service:v2",
+        "launcher_service_identity": "memcordon-sealed-launcher.service:v2",
+        "receipt_digest": "ab".repeat(32),
+        "credential_transition_disposition": "preserve-caller-envelope",
+        "setid_transition_certification_digest": "cd".repeat(32),
+        "sudo_transition_certification_digest": "ef".repeat(32)
+    });
+    for field in [
+        "unified_cgroup_v2",
+        "private_cgroup_subtree",
+        "clone3",
+        "clone3_into_cgroup",
+        "pid_namespace",
+        "mount_namespace",
+        "cgroup_namespace",
+        "pidfd",
+        "close_range",
+        "guardian_outside_boundary",
+        "target_gated",
+        "assignment_verified",
+        "inherited_descriptors_verified",
+        "spawn_error_reporting_verified",
+        "frontend_loss_authority_verified",
+        "cgroup_kill",
+        "workload_empty",
+        "helpers_reaped",
+        "boundary_retired",
+        "recovery_complete",
+        "split_control_and_launcher_services",
+        "launcher_no_new_privs_disabled",
+        "caller_mount_namespace_reproduction_verified",
+        "caller_no_new_privs_reproduction_verified",
+        "caller_capability_bounding_set_reproduction_verified",
+        "initial_provider_capabilities_absent",
+        "post_transition_cgroup_membership_verified",
+        "post_transition_pid_namespace_verified",
+        "post_transition_cleanup_verified",
+        "recursive_provider_request_rejected",
+    ] {
+        qualification[field] = serde_json::json!(true);
+    }
+    qualification
+}
+
 fn package_inspection_fixture() -> serde_json::Value {
     let digest = sha256_bytes(b"package-inspection-fixture");
     let native_protocols = memcordon_core::runtime_manifest::NativeProviderProtocols::Linux {
@@ -455,6 +510,48 @@ fn package_inspection_accepts_current_native_provider_wire_identity() {
             "a provider protocol that differs from the native wire identity should fail"
         );
     }
+}
+
+#[test]
+fn linux_provider_qualification_requires_installed_provider_and_complete_predicates() {
+    let canonical = linux_provider_qualification_fixture();
+    validate_linux_provider_qualification(
+        LINUX_PROVIDER_QUALIFICATION_ARGUMENTS,
+        &serde_json::to_vec(&canonical).unwrap(),
+    )
+    .expect("a complete installed-provider probe should validate");
+
+    let standalone_error = validate_linux_provider_qualification(
+        &["qualify"],
+        &serde_json::to_vec(&canonical).unwrap(),
+    )
+    .expect_err("standalone qualification cannot replace installed-provider evidence");
+    assert!(
+        standalone_error
+            .to_string()
+            .contains("Linux provider qualification must query the installed provider")
+    );
+
+    let mut incomplete = canonical;
+    for field in [
+        "workload_profile_probe_verified",
+        "post_transition_cgroup_membership_verified",
+        "post_transition_pid_namespace_verified",
+        "post_transition_cleanup_verified",
+        "recursive_provider_request_rejected",
+    ] {
+        incomplete[field] = serde_json::json!(false);
+    }
+    let incomplete_error = validate_linux_provider_qualification(
+        LINUX_PROVIDER_QUALIFICATION_ARGUMENTS,
+        &serde_json::to_vec(&incomplete).unwrap(),
+    )
+    .expect_err("false qualification predicates must remain failures");
+    assert!(
+        incomplete_error
+            .to_string()
+            .contains("Linux sealed qualification receipt is incomplete")
+    );
 }
 
 #[test]

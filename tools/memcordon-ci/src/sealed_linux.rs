@@ -310,7 +310,7 @@ const SCENARIOS: &[Scenario] = &[
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct QualificationReceipt {
+pub(crate) struct QualificationReceipt {
     schema_version: u32,
     workload_profile: memcordon_core::workload_contract::ProfileRef,
     workload_profile_probe_verified: bool,
@@ -356,7 +356,7 @@ struct QualificationReceipt {
 }
 
 impl QualificationReceipt {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let complete = self.schema_version == 3
             && self.workload_profile
                 == memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate.reference()
