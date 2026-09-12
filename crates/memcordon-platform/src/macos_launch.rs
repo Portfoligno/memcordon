@@ -1024,6 +1024,8 @@ pub fn rejects_protocol(bytes: &[u8]) -> bool {
 
 #[cfg(feature = "test-support")]
 pub fn inspector_stall(image: &Path) -> Result<(), String> {
+    use crate::macos_watchdog::{InspectionAdmission, inspect_with_admission};
+
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut launch = launch(
         &CommandSpec::new(image).args(["__execution-probe"]),
@@ -1051,15 +1053,29 @@ pub fn inspector_stall(image: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let result = (|| {
         let started = Instant::now();
+        let expired: Result<(), String> = crate::macos_watchdog::inspect_until(started, || {
+            panic!("expired monitoring inspection must not execute")
+        });
+        if !expired.is_err_and(|error| error.contains("deadline expired")) {
+            return Err("expired monitoring inspection was admitted".into());
+        }
         let queued =
             crate::macos_watchdog::inspect_until(started + Duration::from_millis(20), || Ok(()));
         let full =
             crate::macos_watchdog::inspect_until(started + Duration::from_millis(50), || Ok(()));
-        if queued.is_ok()
+        if !queued.is_err_and(|error| error.contains("deadline expired"))
             || !full.is_err_and(|error| error.contains("busy"))
             || started.elapsed() > Duration::from_millis(200)
         {
             return Err("stalled inspector did not preserve timeout and capacity rejection".into());
+        }
+        let expired: Result<(), String> = inspect_with_admission(
+            Instant::now() + Duration::from_millis(20),
+            InspectionAdmission::Cleanup,
+            || panic!("unadmitted cleanup inspection must not execute"),
+        );
+        if !expired.is_err_and(|error| error.contains("deadline expired")) {
+            return Err("cleanup admission did not respect its deadline".into());
         }
         launch
             .child
@@ -1071,17 +1087,31 @@ pub fn inspector_stall(image: &Path) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         Ok(())
     })();
-    let _ = release.send(());
+    let release_worker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        let _ = release.send(());
+    });
+    // Both inspector slots remain occupied until the fixture releases the worker.
+    // Cleanup must recover without resubmitting any native operation.
+    let recovered = inspect_with_admission(
+        Instant::now() + Duration::from_secs(1),
+        InspectionAdmission::Cleanup,
+        || Ok(()),
+    );
+    release_worker
+        .join()
+        .map_err(|_| "inspector release fixture panicked".to_owned())?;
     let _ = done
         .recv_timeout(Duration::from_secs(1))
         .map_err(|error| error.to_string())?;
-    // A timed-out queued request is discarded before subsequent native work.
-    let drain = Instant::now() + Duration::from_secs(1);
-    while crate::macos_watchdog::inspect_until(drain, || Ok(())).is_err() {
-        if Instant::now() >= drain {
-            return Err("inspector did not recover after released fixture stall".into());
-        }
-        std::thread::sleep(Duration::from_millis(1));
+    recovered?;
+    let native_error = inspect_with_admission(
+        Instant::now() + Duration::from_secs(1),
+        InspectionAdmission::Cleanup,
+        || Err::<(), _>("fixture native inspection failure".into()),
+    );
+    if native_error != Err("fixture native inspection failure".into()) {
+        return Err("cleanup admission did not preserve native inspection failure".into());
     }
     result
 }

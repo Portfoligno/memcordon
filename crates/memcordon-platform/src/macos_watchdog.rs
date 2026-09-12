@@ -505,7 +505,12 @@ pub fn run_attempt(
                             .unwrap_or_else(|| deadline.duration()))
                     .min(Instant::now() + Duration::from_millis(250))
                 });
-        match discover(root_pid, &mut known, inspection_deadline) {
+        match discover(
+            root_pid,
+            &mut known,
+            inspection_deadline,
+            InspectionAdmission::Immediate,
+        ) {
             Ok(snapshots) => {
                 workload_empty = snapshots.is_empty();
                 if policy.lifetime == Lifetime::Workload
@@ -874,7 +879,7 @@ fn terminate_and_cleanup(
     let deadline = supervision_deadline.map_or(deadline, |supervision| deadline.min(supervision));
     let mut empty = false;
     while Instant::now() < deadline {
-        match discover(root_pid, known, deadline) {
+        match discover(root_pid, known, deadline, InspectionAdmission::Cleanup) {
             Ok(snapshots) => {
                 if snapshots.is_empty() {
                     empty = true;
@@ -933,7 +938,7 @@ fn cleanup_after_direct_exit(
     let deadline = supervision_deadline.map_or(Instant::now() + CLEANUP_DEADLINE, |deadline| {
         deadline.min(Instant::now() + CLEANUP_DEADLINE)
     });
-    match discover(root_pid, known, deadline) {
+    match discover(root_pid, known, deadline, InspectionAdmission::Cleanup) {
         Ok(snapshots)
             if snapshots
                 .iter()
@@ -991,10 +996,7 @@ fn signal_workload(
             });
         }
     }
-    let deadline = cleanup_deadline
-        .map_or(Instant::now() + Duration::from_millis(100), |deadline| {
-            deadline.min(Instant::now() + Duration::from_millis(100))
-        });
+    let deadline = cleanup_deadline.unwrap_or_else(|| Instant::now() + Duration::from_millis(100));
     for identity in known {
         kill_identity(*identity, signal, summary, deadline);
     }
@@ -1078,7 +1080,7 @@ fn kill_identity(
         }
         return;
     }
-    let result = inspect_until(deadline, move || {
+    let result = inspect_with_admission(deadline, InspectionAdmission::Cleanup, move || {
         let mut summary = CleanupSummary::default();
         if process_snapshot(identity.pid).is_ok_and(|current| current.identity == identity)
             && Instant::now() < deadline
@@ -1114,9 +1116,10 @@ fn discover(
     root_pid: i32,
     known: &mut HashSet<ProcessIdentity>,
     deadline: Instant,
+    admission: InspectionAdmission,
 ) -> Result<Vec<ProcessSnapshot>, String> {
     let captured = known.clone();
-    let (snapshots, updated) = inspect_until(deadline, move || {
+    let (snapshots, updated) = inspect_with_admission(deadline, admission, move || {
         let mut captured = captured;
         let result = discover_native(root_pid, &mut captured)?;
         Ok((result, captured))
@@ -1133,6 +1136,23 @@ pub(crate) fn inspect_until<T: Send + 'static>(
     deadline: Instant,
     operation: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
+    inspect_with_admission(deadline, InspectionAdmission::Immediate, operation)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum InspectionAdmission {
+    Immediate,
+    Cleanup,
+}
+
+pub(crate) fn inspect_with_admission<T: Send + 'static>(
+    deadline: Instant,
+    admission: InspectionAdmission,
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    if Instant::now() >= deadline {
+        return Err("process inspection deadline expired before admission".into());
+    }
     let worker = INSPECTOR
         .get_or_init(|| {
             let (send, receive) = std::sync::mpsc::sync_channel::<Inspection>(1);
@@ -1149,13 +1169,34 @@ pub(crate) fn inspect_until<T: Send + 'static>(
         .as_ref()
         .map_err(Clone::clone)?;
     let (send, receive) = std::sync::mpsc::sync_channel(1);
-    worker
-        .try_send(Box::new(move || {
-            if Instant::now() < deadline {
-                let _ = send.send(operation());
+    let mut inspection: Inspection = Box::new(move || {
+        if Instant::now() < deadline {
+            let _ = send.send(operation());
+        }
+    });
+    loop {
+        if Instant::now() >= deadline {
+            return Err("process inspection deadline expired before admission".into());
+        }
+        match worker.try_send(inspection) {
+            Ok(()) => break,
+            Err(std::sync::mpsc::TrySendError::Full(pending)) => {
+                if matches!(admission, InspectionAdmission::Immediate) {
+                    return Err("process inspector is busy".into());
+                }
+                // Cleanup retains this unsubmitted operation and its original deadline.
+                // No native operation is retried, and the queue remains bounded.
+                inspection = pending;
+                bounded_pause(
+                    Duration::from_millis(1)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
-        }))
-        .map_err(|_| "process inspector is busy or unavailable".to_owned())?;
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err("process inspector is unavailable".into());
+            }
+        }
+    }
     receive
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|_| {

@@ -151,7 +151,7 @@ fn assert_missing_document_link(
         omitted.file_name().and_then(|name| name.to_str()),
         Some(target_file_name)
     );
-    let target = omitted;
+    let target: PathBuf = omitted.components().collect();
     assert_eq!(
         error.to_string(),
         format!("Markdown link target is absent from package or archive: {source:?} -> {target:?}")
