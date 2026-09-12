@@ -1,0 +1,16 @@
+[
+  {"name":"retained","prefix":"{\"kind\":\"attempt-retained\"}","public_limit":65536,"launcher_limit":65536},
+  {"name":"pending","prefix":"{\"kind\":\"replay-pending\"}","public_limit":65536,"launcher_limit":65536},
+  {"name":"terminal","prefix":"{\"kind\":\"terminal\"}","public_limit":4194304,"launcher_limit":4194304},
+  {"name":"reject","prefix":"{\"kind\":\"reject\"}","public_limit":4194304,"launcher_limit":4194304},
+  {"name":"qualification-rejected","prefix":"{\"kind\":\"qualification-rejected\"}","public_limit":65536,"launcher_limit":16777216},
+  {"name":"workload-plan","prefix":"{\"kind\":\"workload-plan\"}","public_limit":131072,"launcher_limit":16777216},
+  {"name":"workload-discovery","prefix":"{\"kind\":\"workload-discovery\"}","public_limit":131072,"launcher_limit":16777216},
+  {"name":"probe","prefix":"{\"kind\":\"probe\"}","public_limit":16777216,"launcher_limit":16777216},
+  {"name":"unknown-canonical-kind","prefix":"{\"kind\":\"not-a-response\"}","public_limit":16777216,"launcher_limit":16777216},
+  {"name":"obsolete-key","prefix":"{\"message\":\"attempt-retained\"}","public_limit":null,"launcher_limit":null},
+  {"name":"not-first","prefix":"{\"schema_version\":2,\"kind\":\"attempt-retained\"}","public_limit":null,"launcher_limit":null},
+  {"name":"escaped-kind","prefix":"{\"kind\":\"attempt\\u002dretained\"}","public_limit":null,"launcher_limit":null},
+  {"name":"unterminated-kind","prefix":"{\"kind\":\"attempt-retained","public_limit":null,"launcher_limit":null},
+  {"name":"uppercase-kind","prefix":"{\"kind\":\"Probe\"}","public_limit":null,"launcher_limit":null}
+]

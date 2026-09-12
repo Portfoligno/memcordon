@@ -9,7 +9,7 @@ output. For installation and a first run, see the [README](../README.md).
 ```text
 memcordon [OPTION|BUDGET]... [--] COMMAND [ARGUMENT]...
 memcordon help [TOPIC]
-memcordon doctor [--json] [--require hard|watchdog|sealed]
+memcordon doctor [--json] [--require hard|watchdog|sealed] [--workload-contract PATH] [--probe-execution]
 memcordon plan [OPTION|BUDGET]...
 memcordon clean [--dry-run] [--json]
 ```
@@ -52,6 +52,7 @@ appear between them.
 | Option | Values | Default |
 |---|---|---|
 | `--enforcement` | `auto`, `hard`, `watchdog` | `auto` |
+| `--workload-contract` | bounded V1 contract file path; requires sealed containment | unset |
 | `--wait-for` | `command`, `workload` | `command` |
 | `--command-exit-grace` | duration | `0s` |
 | `--metric` | `native`, `physical-footprint`, `rss`, `virtual` | `native` |
@@ -182,15 +183,32 @@ MemCordon-generated status.
 
 | Utility | Result | JSON contract |
 |---|---|---|
-| `doctor` | Prints the version and selected backend; `--require hard|watchdog` returns `125` when unmet | Schema-2 host, backend, capability, limitation, and requirement data |
-| `plan` | Resolves policy without launching; text includes `launch proof: false` | Schema-4 budgets, requested/effective policy, dormant conditions, effects, limitations, and backoff sample |
-| `clean` | Removes stale MemCordon-owned artifacts; `--dry-run` only lists them; incomplete cleanup returns `125` | Schema-1 cleanup result |
+| `doctor` | Prints the version and selected backend; `--require hard|watchdog|sealed` returns `125` when unmet | Schema-6 host, backend, capability, limitation, requirement, and workload discovery data |
+| `doctor --probe-execution` | Explicit macOS helper/target/cleanup execution check; unsupported or unsuccessful probes return `125` | Separate `doctor-execution-probe` schema-1 envelope containing the schema-6 `doctor` and an `execution` result |
+| `plan` | Resolves policy without launching; text includes `launch proof: false` | Schema-8 budgets, requested/effective policy, dormant conditions, effects, limitations, backoff sample, and workload resolution |
+| `clean` | Removes stale MemCordon-owned artifacts; `--dry-run` only lists them; incomplete cleanup returns `125` | Schema-2 cleanup result |
 
 In plan JSON, backoff configuration is under `request.restart.backoff`.
 `resolution.backoff_sample_ms` contains the first calculated wait when restart
 is enabled and is otherwise empty.
 
 Machine-readable consumers must inspect `schema_version`.
+
+Ordinary `doctor` does not launch a target. `--probe-execution` explicitly runs
+a five-second-deadline native probe on macOS and checks helper readiness,
+kernel-confirmed target exec, target exit zero, and complete observed cleanup.
+Its `execution` fields are `supported`, `helper_ready`, `target_exec_confirmed`,
+`target_exit`, `cleanup_complete`, and nullable `failure`. It does not prove hard
+memory enforcement, sealed containment, or workload-policy compatibility. See
+the [macOS native launch contract](../spec/macos-native-launch-v1.md).
+
+For strict workload admission, pass `--workload-contract PATH` before the
+target command with `--sealed`. The contract describes requirements
+and binds an independently authorized profile, grant and expected policy epoch;
+it cannot create permission. Discovery is advisory, and a planned resolution
+does not prove launch authorization. The
+[workload contract V1 specification](spec-workload-contract-v1.md) defines the
+two supported baseline profiles, exact bounds, and admission/retirement proof.
 
 Human-readable output follows `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE` and
 is plain when redirected by default. JSON, report files, and child streams are
@@ -240,15 +258,22 @@ members before restart.
 
 ### macOS watchdog
 
-MemCordon establishes a fresh process group before target execution, tracks the
-direct child through an owned handle, and discovers descendants by process
-identity. Physical footprint, RSS, and virtual size remain distinct metrics.
-Sampling can miss short bursts, cannot prevent overshoot, and cannot recover a
-descendant that deliberately escapes into another session.
+MemCordon starts native guardian and gated launcher helpers, acknowledges
+readiness and group binding before release, and confirms target exec through a
+kernel process event. The original attempt clock starts before helper startup.
+The runtime retains owned child identities and discovers descendants by
+sampling process identity. Physical footprint, RSS, and virtual size remain
+distinct metrics. Sampling can miss short bursts and descendants that escape
+before observation; it cannot prevent memory overshoot or provide sealed
+custody across arbitrary process/session changes.
 
 Library callers provide an explicit absolute `MemcordonExecutable` for the
 guardian. Workload waiting has no implicit drain timeout. It ends on workload
 completion, explicit deadline, interruption, or a monitoring/cleanup failure.
+Bounded runtime reservations retain unresolved reaping obligations instead of
+silently releasing ownership. The
+[macOS native launch specification](../spec/macos-native-launch-v1.md) describes
+the protocol, resource limits, diagnostics, and qualification boundary.
 
 ## Memory metrics
 
@@ -335,7 +360,7 @@ Circuit policy reports expose `threshold`, `half_life_ms`, and `cooldown_ms`.
 
 ## Execution reports
 
-`--report PATH` writes a mandatory schema-8 JSON document. The document is
+`--report PATH` writes a mandatory schema-9 JSON document. The document is
 pretty-printed, ends in one newline, and is atomically persisted through a
 same-directory temporary file. The parent directory must exist. A write failure
 returns `125`.
@@ -356,6 +381,21 @@ effective values and records dormant restart conditions. `supervision` records
 duration, terminal phase and outcome, wrapper status, attempt and restart
 counters, bounded-history metadata, aggregate outcomes, maximum observed peak,
 deadline state, and circuit state.
+
+Workload resolution and per-attempt policy enforcement must agree with the
+requested contract and process retirement evidence. Provider failures can
+include the bounded public causal projection defined by the
+[Windows causal diagnostics V1 specification](../spec/windows-causal-diagnostics-v1.md).
+Its original and later observations aid diagnosis; they cannot authorize
+successful completion, restart, or terminal acknowledgment.
+
+Native helper startup failures may additionally carry `native_startup`, an
+optional `NativeStartupDiagnosticV1` observation with exact helper paths,
+filesystem identity when observed, startup phase, errno, process/readiness/exec
+facts, and separate cleanup errors. The primary error remains unchanged.
+Execution schema 9 and ordinary doctor schema 6 retain their versions; absent
+startup diagnostics add no field. Strict older decoders may reject this new
+optional failure field and must not silently infer success.
 
 Attempt history has capacity 256. Attempt 1 is retained permanently and the
 latest 255 attempts form a contiguous ascending tail. Declared retained,

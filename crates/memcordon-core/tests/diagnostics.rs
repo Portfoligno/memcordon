@@ -131,6 +131,157 @@ fn response_framing_is_bound_to_the_serialized_protocol() {
     }
 }
 
+#[test]
+fn specification_prefix_fixtures_match_both_response_classifiers() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Fixture {
+        name: String,
+        prefix: String,
+        public_limit: Option<usize>,
+        launcher_limit: Option<usize>,
+    }
+
+    let fixtures: Vec<Fixture> = serde_json::from_str(include_str!(
+        "fixtures/windows-response-frame-prefixes.json"
+    ))
+    .unwrap();
+    assert!(!fixtures.is_empty());
+    for fixture in fixtures {
+        assert!(fixture.prefix.len() <= WINDOWS_RESPONSE_PREFIX_BYTES);
+        assert_eq!(
+            windows_response_frame_limit(fixture.prefix.as_bytes()).ok(),
+            fixture.public_limit,
+            "public: {}",
+            fixture.name
+        );
+        assert_eq!(
+            windows_launcher_response_frame_limit(fixture.prefix.as_bytes()).ok(),
+            fixture.launcher_limit,
+            "launcher: {}",
+            fixture.name
+        );
+    }
+}
+
+#[test]
+fn discriminator_terminator_must_fit_the_exact_prefix_window() {
+    let opening = b"{\"kind\":\"";
+    let quote = b"\"";
+    let closing = b"\"}";
+    for kind_end in [
+        WINDOWS_RESPONSE_PREFIX_BYTES - quote.len(),
+        WINDOWS_RESPONSE_PREFIX_BYTES,
+    ] {
+        let mut frame = opening.to_vec();
+        frame.resize(kind_end, b'x');
+        frame.extend_from_slice(closing);
+        let prefix = &frame[..WINDOWS_RESPONSE_PREFIX_BYTES];
+        for classify in [
+            windows_response_frame_limit,
+            windows_launcher_response_frame_limit,
+        ] {
+            if kind_end < prefix.len() {
+                // An unknown canonical kind receives only a size classification.
+                assert_eq!(
+                    classify(prefix).unwrap(),
+                    memcordon_core::WINDOWS_MAX_FRAME_BYTES
+                );
+            } else {
+                // The closing quote beyond the window cannot authorize allocation.
+                assert!(classify(prefix).is_err());
+            }
+        }
+        assert!(
+            serde_json::from_slice::<memcordon_core::WindowsProviderResponseV1>(&frame).is_err()
+        );
+        assert!(
+            serde_json::from_slice::<memcordon_core::WindowsLauncherResponseV1>(&frame).is_err()
+        );
+    }
+}
+
+#[test]
+fn fragmented_response_prefixes_keep_the_same_bounded_classification() {
+    use std::io::Read;
+
+    struct Fragmented<'a> {
+        remaining: &'a [u8],
+        fragment_bytes: usize,
+    }
+    impl Read for Fragmented<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let bytes = buffer
+                .len()
+                .min(self.fragment_bytes)
+                .min(self.remaining.len());
+            buffer[..bytes].copy_from_slice(&self.remaining[..bytes]);
+            self.remaining = &self.remaining[bytes..];
+            Ok(bytes)
+        }
+    }
+
+    let discriminator = b"{\"kind\":\"attempt-retained\"";
+    let mut frame = discriminator.to_vec();
+    frame.resize(WINDOWS_RESPONSE_PREFIX_BYTES, b' ');
+    let unread_body = b",\"kind\":\"terminal\"}";
+    frame.extend_from_slice(unread_body);
+    for fragment_bytes in 1..=WINDOWS_RESPONSE_PREFIX_BYTES {
+        let mut reader = Fragmented {
+            remaining: &frame,
+            fragment_bytes,
+        };
+        let mut prefix = [0; WINDOWS_RESPONSE_PREFIX_BYTES];
+        reader.read_exact(&mut prefix).unwrap();
+        assert_eq!(reader.remaining, unread_body);
+        assert_eq!(
+            windows_response_frame_limit(&prefix).unwrap(),
+            MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
+        );
+        assert_eq!(
+            windows_launcher_response_frame_limit(&prefix).unwrap(),
+            MAX_DIAGNOSTIC_CONTROL_FRAME_BYTES
+        );
+    }
+    for end in 0..discriminator.len() {
+        let mut reader = Fragmented {
+            remaining: &frame[..end],
+            fragment_bytes: 1,
+        };
+        let mut prefix = [0; WINDOWS_RESPONSE_PREFIX_BYTES];
+        assert_eq!(
+            reader.read_exact(&mut prefix).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert!(windows_response_frame_limit(&frame[..end]).is_err());
+        assert!(windows_launcher_response_frame_limit(&frame[..end]).is_err());
+    }
+}
+
+#[test]
+fn classified_duplicate_and_unknown_kinds_still_fail_full_decoding() {
+    use memcordon_core::{WindowsLauncherResponseV1, WindowsProviderResponseV1};
+
+    let public = br#"{"kind":"qualification-ready","schema_version":2}"#;
+    let private =
+        br#"{"kind":"certification-machine-restart","schema_version":2,"recovered":true}"#;
+    assert!(serde_json::from_slice::<WindowsProviderResponseV1>(public).is_ok());
+    assert!(serde_json::from_slice::<WindowsLauncherResponseV1>(private).is_ok());
+    for invalid in [
+        br#"{"kind":"qualification-ready","kind":"qualification-ready","schema_version":2}"#.as_slice(),
+        br#"{"kind":"certification-machine-restart","kind":"certification-machine-restart","schema_version":2,"recovered":true}"#.as_slice(),
+        br#"{"kind":"attempt-retained","kind":"terminal"}"#.as_slice(),
+        br#"{"kind":"not-a-response","schema_version":2}"#.as_slice(),
+    ] {
+        assert!(windows_response_frame_limit(invalid).is_ok());
+        assert!(windows_launcher_response_frame_limit(invalid).is_ok());
+        assert!(memcordon_core::workload_contract::reject_duplicate_json_keys(invalid).is_err()
+            || invalid == br#"{"kind":"not-a-response","schema_version":2}"#);
+        assert!(serde_json::from_slice::<WindowsProviderResponseV1>(invalid).is_err());
+        assert!(serde_json::from_slice::<WindowsLauncherResponseV1>(invalid).is_err());
+    }
+}
+
 fn event() -> CausalEventV1 {
     CausalEventV1 {
         sequence: 0,
@@ -310,6 +461,92 @@ fn response_prefix_selects_diagnostic_budget_before_payload_allocation() {
         b"{\"kind\":\"unterminated".as_slice(),
     ] {
         assert!(windows_response_frame_limit(invalid).is_err());
+    }
+}
+
+#[test]
+fn eligible_diagnostic_changes_preserve_authority_and_receiptless_posttarget_refusal() {
+    use memcordon_core::{
+        WindowsAttemptTerminalDispositionV1, WindowsLauncherResponseV1, WindowsProviderResponseV1,
+        windows_terminal_outbox_is_bound,
+    };
+
+    let provider = PublicProviderBindingV1 {
+        generation: BoundedText::new("test-provider").unwrap(),
+        source_commit: BoundedText::new("0123456789012345678901234567890123456789").unwrap(),
+        runtime_manifest_sha256: DiagnosticSha256::from_bytes([1; 32]),
+    };
+    let attempt = "02".repeat(32);
+    let request = "03".repeat(32);
+    let mut journal = WindowsCausalDiagnosticsV1::default();
+    journal.observe(event()).unwrap();
+    let original = journal.original.clone();
+    let mut projections = vec![None]; // Expired or omitted public diagnostics.
+    for variant in 0..4 {
+        match variant {
+            0 => {}
+            1 => journal.observe_secondary(event()).unwrap(),
+            2 => journal.loss.persistence_failure_observed = true,
+            3 => journal.loss.writer_unavailable = true,
+            _ => unreachable!(),
+        }
+        let projection = ProviderFailureDiagnosticV1::from_journal(
+            provider.clone(),
+            &attempt,
+            &request,
+            &journal,
+        )
+        .unwrap();
+        assert_eq!(projection.original, original);
+        ProviderFailureDiagnosticV1::parse_bound(
+            &serde_json::to_vec(&projection).unwrap(),
+            &provider,
+            &DiagnosticSha256::from_bytes([2; 32]),
+            &DiagnosticSha256::from_bytes([3; 32]),
+        )
+        .unwrap();
+        projections.push(Some(projection));
+    }
+
+    let mut authority = None;
+    for projection in projections {
+        let public = WindowsProviderResponseV1::Reject {
+            schema_version: memcordon_core::WINDOWS_PUBLIC_PROTOCOL_VERSION,
+            attempt_id: attempt.clone(),
+            nonce: "nonce".to_owned(),
+            request_sha256: request.clone(),
+            rejection: memcordon_core::ProviderRejectionEvidence {
+                provider_failure: projection,
+                workload_admission: None,
+                schema_version: 1,
+                code: "MCSPAWN-FAILED".to_owned(),
+                phase: memcordon_core::BoundarySetupPhase::TargetCreation,
+                detail: "posttarget monitor failure without terminal authority".to_owned(),
+                os_code: None,
+                loader_qualification: None,
+                target_created: true,
+                target_released: true,
+                cleanup_attempted: false,
+                restart_safety: memcordon_core::RestartSafetyProof::default(),
+                terminal_ack_required: false,
+                terminal_receipt: None,
+            },
+        };
+        let private: WindowsLauncherResponseV1 =
+            serde_json::from_value(serde_json::to_value(&public).unwrap()).unwrap();
+        let WindowsLauncherResponseV1::Reject { rejection, .. } = &private else {
+            panic!("fixture must remain a rejection");
+        };
+        assert!(rejection.is_consistent());
+        assert!(!windows_terminal_outbox_is_bound(
+            &attempt,
+            &request,
+            Some(WindowsAttemptTerminalDispositionV1::Posttarget),
+            &private,
+        ));
+        let bytes = public.terminal_authority_json().unwrap();
+        assert_eq!(private.terminal_authority_json().unwrap(), bytes);
+        assert_eq!(authority.get_or_insert_with(|| bytes.clone()), &bytes);
     }
 }
 

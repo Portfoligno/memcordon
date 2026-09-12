@@ -160,6 +160,7 @@ fn finish_error(
             .map(|value| value.report.clone())
             .unwrap_or_else(|| unresolved_report(&args.policy, &args.budgets));
         let error_report = ExecutionErrorReport {
+            native_startup: error.native_startup.clone(),
             policy_enforcement: error.policy_enforcement.clone(),
             category: category_name(error.category).to_owned(),
             code: error.code.to_owned(),
@@ -924,6 +925,9 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
         },
         workload_discovery,
     };
+    if args.probe_execution {
+        return doctor_execution_probe(report, args.json, presentation);
+    }
     if args.json {
         let code = print_json(&report, "doctor", presentation);
         if code != 0 {
@@ -951,6 +955,109 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
         }
     }
     if met { 0 } else { 125 }
+}
+
+#[derive(serde::Serialize)]
+struct ExecutionProbe {
+    supported: bool,
+    helper_ready: bool,
+    target_exec_confirmed: bool,
+    target_exit: Option<i32>,
+    cleanup_complete: bool,
+    failure: Option<String>,
+}
+
+fn doctor_execution_probe(doctor: DoctorReport, json: bool, presentation: &Presentation) -> i32 {
+    #[cfg(target_os = "macos")]
+    let execution = (|| -> Result<memcordon_platform::Execution, Box<Error>> {
+        if !doctor.requirement.met || doctor.requirement.kind.as_deref() == Some("sealed") {
+            return Err(Box::new(Error::new(
+                ErrorCategory::Unsupported,
+                "MCSETUP-PROBE-REQUIREMENT",
+                "execution probe requires an available standard backend",
+            )));
+        }
+        let helper = helper_path()?.expect("macOS self executable");
+        let policy = Policy::unbounded()
+            .with_deadline(std::time::Duration::from_secs(5))
+            .expect("nonzero probe deadline");
+        let command = CommandSpec::new(helper.as_os_str()).args(["__execution-probe"]);
+        memcordon_platform::run(policy, &command, &helper).map_err(Box::new)
+    })();
+    #[cfg(not(target_os = "macos"))]
+    let execution: Result<memcordon_platform::Execution, Box<Error>> = Err(Box::new(Error::new(
+        ErrorCategory::Unsupported,
+        "MCSETUP-PROBE-UNSUPPORTED",
+        "the acknowledged helper execution probe is available on macOS",
+    )));
+    let execution = match execution {
+        Ok(execution) => {
+            let cleanup = execution.outcome.cleanup();
+            let exit = match &execution.outcome {
+                memcordon_core::RunOutcome::Exited {
+                    child: memcordon_core::ChildTermination::ExitCode { code },
+                    ..
+                } => Some(*code),
+                _ => None,
+            };
+            let cleanup_complete = cleanup.direct_child_reaped
+                && cleanup.workload_empty == Some(true)
+                && execution.restart_safety.helpers_reaped
+                && cleanup.errors.is_empty();
+            let target_exec_confirmed = execution.launch.target_released && exit.is_some();
+            let helper_ready = execution.launch.guardian_started_before_authorization;
+            ExecutionProbe {
+                supported: true,
+                helper_ready,
+                target_exec_confirmed,
+                target_exit: exit,
+                cleanup_complete,
+                failure: (!(helper_ready
+                    && target_exec_confirmed
+                    && exit == Some(0)
+                    && cleanup_complete))
+                    .then(|| format!("{:?}", execution.outcome)),
+            }
+        }
+        Err(error) => ExecutionProbe {
+            supported: cfg!(target_os = "macos"),
+            helper_ready: error.guardian_ready_before_release,
+            target_exec_confirmed: false,
+            target_exit: None,
+            cleanup_complete: false,
+            failure: Some(error.to_string()),
+        },
+    };
+    let passed = doctor.requirement.met
+        && execution.helper_ready
+        && execution.target_exec_confirmed
+        && execution.target_exit == Some(0)
+        && execution.cleanup_complete;
+    if json {
+        #[derive(serde::Serialize)]
+        struct ProbeReport {
+            kind: &'static str,
+            schema_version: u32,
+            doctor: DoctorReport,
+            execution: ExecutionProbe,
+        }
+        let report = ProbeReport {
+            kind: "doctor-execution-probe",
+            schema_version: 1,
+            doctor,
+            execution,
+        };
+        if print_json(&report, "doctor execution probe", presentation) != 0 {
+            return 125;
+        }
+    } else {
+        let mut out = presentation.stdout();
+        writeln!(out, "execution probe: helper-ready={} target-exec-confirmed={} target-exit={:?} cleanup-complete={}", execution.helper_ready, execution.target_exec_confirmed, execution.target_exit, execution.cleanup_complete).expect("probe output should be writable");
+        if let Some(failure) = execution.failure {
+            writeln!(out, "{failure}").expect("probe diagnostic should be writable");
+        }
+    }
+    if passed { 0 } else { 125 }
 }
 
 pub(crate) fn clean(args: CleanArgs, presentation: &Presentation) -> i32 {

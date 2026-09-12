@@ -3,6 +3,19 @@ use std::path::Path;
 use memcordon_ci::policy::validate_rust_policy_bytes;
 
 #[test]
+fn native_install_fixture_only_may_override_standard_path() {
+    let fixture = Path::new("crates/memcordon-cli/tests/macos_remediation.rs");
+    let path = b"fn run(command: &mut std::process::Command) { command.env(\"PATH\", \"/usr/bin:/bin\"); }";
+    validate_rust_policy_bytes(fixture, path).unwrap();
+    assert!(validate_rust_policy_bytes(Path::new("crates/example/src/lib.rs"), path).is_err());
+    let custom = b"fn run(command: &mut std::process::Command) { command.env(\"MEMCORDON_FAULT\", \"ready\"); }";
+    assert!(validate_rust_policy_bytes(fixture, custom).is_err());
+    let dynamic =
+        b"fn run(command: &mut std::process::Command, key: &str) { command.env(key, \"value\"); }";
+    assert!(validate_rust_policy_bytes(fixture, dynamic).is_err());
+}
+
+#[test]
 fn unrelated_exec_method_is_not_rejected_by_name() {
     let source = b"struct Example; impl Example { fn exec(&self) {} } fn use_it(value: &Example) { value.exec(); }";
     validate_rust_policy_bytes(Path::new("crates/example/src/lib.rs"), source)

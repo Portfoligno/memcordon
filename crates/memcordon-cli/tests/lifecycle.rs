@@ -184,7 +184,7 @@ fn macos_system_success_and_failure_smoke_tests_are_bounded() {
         serde_json::from_slice(&fs::read(&report_file).unwrap()).unwrap();
     assert_eq!(report.attempts.len(), 1);
     assert!(
-        !report.attempts[0]
+        report.attempts[0]
             .launch
             .guardian_started_before_authorization
     );

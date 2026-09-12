@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use memcordon_core::{ByteSize, NativeArgument};
 
@@ -290,11 +290,19 @@ fn spawn_background(mut args: impl Iterator<Item = OsString>) -> i32 {
     let mut pid_file = None;
     let mut completion_marker = None;
     let mut exit_code = None;
+    let mut exit_gate = None;
+    let mut child_group_gate = None;
     while let Some(argument) = args.next() {
         match argument.to_str() {
             Some("--child-duration") => duration = Some(take_value(&mut args, "--child-duration")),
             Some("--pid-file") => {
                 pid_file = Some(PathBuf::from(take_value(&mut args, "--pid-file")))
+            }
+            Some("--exit-gate") => {
+                exit_gate = Some(PathBuf::from(take_value(&mut args, "--exit-gate")))
+            }
+            Some("--child-group-gate") => {
+                child_group_gate = Some(PathBuf::from(take_value(&mut args, "--child-group-gate")))
             }
             Some("--completion-marker") => {
                 completion_marker =
@@ -314,12 +322,15 @@ fn spawn_background(mut args: impl Iterator<Item = OsString>) -> i32 {
     }
     let executable = std::env::current_exe().unwrap_or_else(|error| fail(error.to_string()));
     let mut command = Command::new(executable);
-    command
-        .arg("hold")
-        .arg("--duration")
-        .arg(duration.unwrap_or_else(|| OsString::from("30s")))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    if let Some(gate) = child_group_gate {
+        command.arg("macos-gated-group-change").arg(gate);
+    } else {
+        command
+            .arg("hold")
+            .arg("--duration")
+            .arg(duration.unwrap_or_else(|| OsString::from("30s")));
+    }
+    command.stdout(Stdio::null()).stderr(Stdio::null());
     if let Some(path) = completion_marker {
         command.arg("--completion-marker").arg(path);
     }
@@ -334,6 +345,15 @@ fn spawn_background(mut args: impl Iterator<Item = OsString>) -> i32 {
     identity
         .publish_to(&path)
         .unwrap_or_else(|error| fail(format!("cannot write child PID file: {error}")));
+    if let Some(gate) = exit_gate {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !gate.exists() {
+            if Instant::now() >= deadline {
+                fail("background root exit gate timed out");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     i32::from(exit_code.unwrap_or(0))
 }
 
@@ -477,6 +497,52 @@ fn main() {
         .and_then(|value| value.to_str().map(str::to_owned))
         .unwrap_or_else(|| fail("a fixture subcommand is required"));
     let status = match command.as_str() {
+        #[cfg(target_os = "macos")]
+        "__macos-guardian" => loop {
+            std::thread::park();
+        },
+        #[cfg(target_os = "macos")]
+        "macos-gated-group-change" => {
+            let gate = PathBuf::from(take_value(&mut args, "group transition gate"));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !gate.exists() {
+                if Instant::now() >= deadline {
+                    fail("group transition gate timed out");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // SAFETY: this disposable descendant deliberately changes its own session/group.
+            if unsafe { libc::setsid() } < 0 {
+                fail("descendant setsid failed");
+            }
+            std::fs::write(gate.with_extension("changed"), b"changed\n")
+                .unwrap_or_else(|error| fail(error.to_string()));
+            std::thread::sleep(Duration::from_secs(20));
+            0
+        }
+        #[cfg(target_os = "macos")]
+        "macos-custody-wrapper" => {
+            let image = PathBuf::from(take_value(&mut args, "memcordon image"));
+            let fixture = PathBuf::from(take_value(&mut args, "fixture image"));
+            let pid_file = PathBuf::from(take_value(&mut args, "descendant marker"));
+            let marker = PathBuf::from(take_value(&mut args, "guardian marker"));
+            memcordon_platform::test_support::macos_custody_wrapper(
+                &image, &fixture, &pid_file, &marker,
+            )
+            .unwrap_or_else(|error| fail(error));
+            0
+        }
+        #[cfg(target_os = "macos")]
+        "macos-closed-stdio" => {
+            use std::os::unix::process::CommandExt;
+            let program = take_value(&mut args, "native executable");
+            // SAFETY: this disposable fixture process deliberately has closed standard streams.
+            for descriptor in [0, 1, 2] {
+                unsafe { libc::close(descriptor) };
+            }
+            let _ = Command::new(program).args(args).exec();
+            126
+        }
         "exit" => exit_fixture(args),
         "hold" | "wait-for-signal" => {
             hold(args);

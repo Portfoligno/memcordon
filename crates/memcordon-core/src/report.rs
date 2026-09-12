@@ -79,6 +79,7 @@ pub enum ReportModelError {
     InvocationBudgets,
     PolicyEnvelope,
     ProviderFailure,
+    NativeStartup,
 }
 
 impl std::fmt::Display for ReportModelError {
@@ -90,6 +91,7 @@ impl std::fmt::Display for ReportModelError {
             Self::InvocationBudgets => "report budget tokens and normalized tokens disagree",
             Self::PolicyEnvelope => "requested and effective report policies disagree",
             Self::ProviderFailure => "provider diagnostic projection is inconsistent",
+            Self::NativeStartup => "native startup diagnostic is inconsistent",
         })
     }
 }
@@ -163,6 +165,30 @@ fn validate_workload_history(
         .map(RequestBindingV1::from_contract)
         .transpose()
         .map_err(|_| ReportModelError::PolicyEnvelope)?;
+    if contract.is_some() && attempts.iter().any(|attempt| {
+        let successful_outcome = attempt
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| crate::supervision::outcome_status(outcome) == 0);
+        let restart_authorized = matches!(
+            attempt.restart_decision.decision,
+            crate::RestartDecisionKind::HalfLifeLogisticBackoff
+                | crate::RestartDecisionKind::CircuitCooldown
+                | crate::RestartDecisionKind::HalfOpenLaunch
+        );
+        // An unavailable policy terminal is an honest failed observation,
+        // but cannot authorize successful completion or another attempt.
+        (successful_outcome || restart_authorized)
+            && !matches!(
+                attempt.policy_enforcement,
+                AttemptPolicyEnforcementV1::Authorized {
+                    terminal: crate::workload_evidence::PolicyTerminalEvidenceV1::Retired { .. },
+                    ..
+                }
+            )
+    }) {
+        return Err(ReportModelError::PolicyEnvelope);
+    }
     let mut bytes = 0usize;
     for (enforcement, number) in attempts
         .iter()
@@ -227,6 +253,17 @@ fn validate_workload_history(
 }
 
 fn validate_provider_failure(error: Option<&ExecutionErrorReport>) -> Result<(), ReportModelError> {
+    if error.is_some_and(|error| {
+        error.native_startup.as_ref().is_some_and(|value| {
+            !value.matches_error_observations(
+                error.target_released,
+                error.workload_may_be_alive,
+                error.os_code,
+            )
+        })
+    }) {
+        return Err(ReportModelError::NativeStartup);
+    }
     for failure in error
         .and_then(|error| error.provider_failure.as_ref())
         .into_iter()
@@ -723,6 +760,8 @@ pub enum OptionEffectReport {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionErrorReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_startup: Option<crate::NativeStartupDiagnosticV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_enforcement: Option<crate::workload_evidence::AttemptPolicyEnforcementV1>,
     pub category: String,

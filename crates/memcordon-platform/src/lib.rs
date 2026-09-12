@@ -7,12 +7,17 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod backend;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 mod guardian;
 #[cfg(target_os = "linux")]
 mod linux_cgroup;
 #[cfg(target_os = "macos")]
+mod macos_launch;
+#[cfg(target_os = "macos")]
 mod macos_watchdog;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use macos_launch::helper as macos_helper;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod sealed;
 mod signal;

@@ -524,7 +524,7 @@ Run memcordon help for topic-specific help.
 ];
 
 pub const DOCTOR_USAGE: &str = with_reference!(
-    "Inspect backend availability without launching a workload.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog|sealed] [--workload-contract PATH]\n\nText prints the version and selected backend; --json prints full capabilities,\nlimitations, and authenticated caller-filtered workload discovery.\n\nOptions (default):\n  --json                         Write schema-6 JSON to stdout; off\n  --require hard|watchdog|sealed Return 125 unless the backend matches; unset\n  --workload-contract PATH       Resolve exact workload requirements; requires --require sealed\n  -h, --help                     Print this help\n\n"
+    "Inspect backend availability without launching a workload by default.\n\nUsage:\n  memcordon doctor [--json] [--require hard|watchdog|sealed] [--workload-contract PATH] [--probe-execution]\n\nOrdinary --json prints schema-6 capabilities, limitations, and authenticated\ncaller-filtered workload discovery. On macOS, explicit --probe-execution runs\na bounded helper/target/cleanup check. Its JSON is a separate schema-1\ndoctor-execution-probe envelope containing the ordinary doctor report.\nThe probe returns 125 when unsupported or unsuccessful; it does not certify\nhard or sealed enforcement.\n\nOptions (default):\n  --json                         Write schema-6 doctor JSON (probe: schema-1 envelope); off\n  --require hard|watchdog|sealed Return 125 unless the backend matches; unset\n  --workload-contract PATH       Resolve exact workload requirements; requires --require sealed\n  --probe-execution              Run the explicit macOS native execution probe; off\n  -h, --help                     Print this help\n\n"
 );
 
 pub const PLAN_USAGE: &str = with_reference!(
@@ -863,6 +863,7 @@ pub enum Requirement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DoctorArgs {
     pub json: bool,
+    pub probe_execution: bool,
     pub requirement: Option<Requirement>,
     pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContractV1>,
 }
@@ -1095,6 +1096,7 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
 
 fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
     let mut json = false;
+    let mut probe_execution = false;
     let mut requirement = None;
     let mut workload_policy = PolicyArgs::default();
     let mut index = 0;
@@ -1106,6 +1108,7 @@ fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
         let (name, inline_value) = split_option(text);
         match name {
             "--json" if inline_value.is_none() => json = true,
+            "--probe-execution" if inline_value.is_none() => probe_execution = true,
             "--workload-contract" => {
                 parse_policy_option(name, inline_value, argv, &mut index, &mut workload_policy)?
             }
@@ -1135,6 +1138,7 @@ fn parse_doctor(argv: &[OsString]) -> Result<Invocation, CliError> {
     }
     Ok(Invocation::Doctor(DoctorArgs {
         json,
+        probe_execution,
         requirement,
         workload_contract: workload_policy.workload_contract,
     }))

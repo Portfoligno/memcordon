@@ -14,6 +14,14 @@ const LAUNCHER_STATUS_ERROR: u8 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InternalInvocation {
+    Probe,
+    #[cfg(target_os = "macos")]
+    MacosHelper {
+        guardian: bool,
+        descriptor: i32,
+        run: u64,
+        command: Vec<std::ffi::OsString>,
+    },
     Launcher {
         control_fd: i32,
         exec_status_fd: i32,
@@ -29,6 +37,41 @@ pub(crate) fn route_internal(
     argv: &[std::ffi::OsString],
 ) -> Option<Result<InternalInvocation, &'static str>> {
     let name = argv.first()?;
+    if name == "__execution-probe" {
+        return Some(if argv.len() == 1 {
+            Ok(InternalInvocation::Probe)
+        } else {
+            Err("execution probe accepts no arguments")
+        });
+    }
+    #[cfg(target_os = "macos")]
+    if name == "__macos-guardian" || name == "__macos-launcher" {
+        let guardian = name == "__macos-guardian";
+        let result = (|| {
+            let descriptor = parse_nonnegative_descriptor(argv.get(1))
+                .map_err(|_| "invalid macOS helper descriptor")?;
+            let run = argv
+                .get(2)
+                .and_then(|value| value.to_str())
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or("invalid macOS helper run binding")?;
+            let command = if guardian && argv.len() == 3 {
+                Vec::new()
+            } else if !guardian && argv.len() >= 5 && argv.get(3).is_some_and(|value| value == "--")
+            {
+                argv.iter().skip(4).cloned().collect()
+            } else {
+                return Err("invalid macOS helper invocation");
+            };
+            Ok(InternalInvocation::MacosHelper {
+                guardian,
+                descriptor,
+                run,
+                command,
+            })
+        })();
+        return Some(result);
+    }
     if name == "__launcher" {
         if argv.len() < 5 || argv.get(3).is_none_or(|argument| argument != "--") {
             return Some(Err(
@@ -85,6 +128,14 @@ fn parse_positive_process_group(value: Option<&std::ffi::OsString>) -> Result<i3
 
 pub(crate) fn execute_internal(invocation: InternalInvocation) -> i32 {
     match invocation {
+        InternalInvocation::Probe => 0,
+        #[cfg(target_os = "macos")]
+        InternalInvocation::MacosHelper {
+            guardian,
+            descriptor,
+            run,
+            command,
+        } => memcordon_platform::macos_helper(guardian, descriptor, run, &command),
         InternalInvocation::Launcher {
             control_fd,
             exec_status_fd,

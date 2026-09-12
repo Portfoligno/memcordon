@@ -32,6 +32,8 @@ const EXPECTED_STATIC_PATHS: &[&str] = &[
     "spec/sealed-windows-provider-v1.md",
     "spec/sealed-windows-v2.md",
     "spec/windows-causal-diagnostics-v1.md",
+    "spec/macos-native-launch-v1.md",
+    "crates/memcordon-core/tests/fixtures/windows-response-frame-prefixes.json",
 ];
 
 fn repository_root() -> PathBuf {
@@ -145,7 +147,11 @@ fn assert_missing_document_link(
         "archive fixture should contain omitted document {omitted:?}"
     );
     let error = validate_markdown_documents(&documents).expect_err(expectation);
-    let target = source.with_file_name(target_file_name);
+    assert_eq!(
+        omitted.file_name().and_then(|name| name.to_str()),
+        Some(target_file_name)
+    );
+    let target = omitted;
     assert_eq!(
         error.to_string(),
         format!("Markdown link target is absent from package or archive: {source:?} -> {target:?}")
@@ -178,9 +184,9 @@ fn native_archive_markdown_links_require_the_workload_specification() {
 fn native_archive_markdown_links_reject_each_missing_sealed_document() {
     assert_missing_document_link(
         Path::new("spec/windows-causal-diagnostics-v1.md"),
-        Path::new("spec/sealed-windows-v2.md"),
+        Path::new("docs/reference.md"),
         "windows-causal-diagnostics-v1.md",
-        "sealed Windows link to missing causal diagnostics specification must fail",
+        "reference link to missing causal diagnostics specification must fail",
     );
     assert_missing_document_link(
         Path::new("docs/sealed-supervision.md"),

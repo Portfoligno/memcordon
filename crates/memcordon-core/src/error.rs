@@ -9,6 +9,253 @@ use crate::{
 
 pub const PROVIDER_REJECTION_MAX_DETAIL_BYTES: usize = 8 * 1024;
 
+/// Observations from native helper startup, separate from the primary error and
+/// from the authority required to authorize or retire a workload. This optional
+/// V1 extension appears only on failed envelopes; strict older consumers may
+/// reject its presence, while absent fields retain the existing wire shape.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "NativeStartupDiagnosticWireV1")]
+pub struct NativeStartupDiagnosticV1 {
+    pub schema_version: u32,
+    pub requested_helper: crate::NativeArgument,
+    pub canonical_helper: Option<crate::NativeArgument>,
+    pub helper_identity: Option<NativeHelperIdentityV1>,
+    pub cwd: Option<crate::NativeArgument>,
+    pub phase: NativeStartupPhaseV1,
+    pub operation: NativeStartupOperationV1,
+    pub native_errno: Option<i32>,
+    pub guardian_pid: Option<u32>,
+    pub guardian_ready: bool,
+    pub launcher_pid: Option<u32>,
+    pub release_sent: bool,
+    pub exec_confirmed: bool,
+    pub cleanup: NativeStartupCleanupV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeHelperIdentityV1 {
+    pub device: u64,
+    pub inode: u64,
+    pub size_bytes: u64,
+    pub sha256: Option<crate::DiagnosticSha256>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeStartupPhaseV1 {
+    HelperResolution,
+    HelperValidation,
+    GuardianSpawn,
+    GuardianReadiness,
+    LauncherSpawn,
+    LauncherReadiness,
+    WorkloadBinding,
+    TargetRelease,
+    TargetExec,
+    Cleanup,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeStartupOperationV1 {
+    ResolveHelper,
+    InspectHelper,
+    InspectWorkingDirectory,
+    SpawnGuardian,
+    ReadGuardianReadiness,
+    SpawnLauncher,
+    ReadLauncherReadiness,
+    BindWorkload,
+    ReleaseTarget,
+    ConfirmTargetExec,
+    ProtocolValidation,
+    TerminateLauncher,
+    ReapLauncher,
+    TerminateGuardian,
+    ReapGuardian,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeStartupCleanupStateV1 {
+    Complete,
+    Incomplete,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeStartupCleanupV1 {
+    pub state: NativeStartupCleanupStateV1,
+    pub errors: Vec<NativeStartupCleanupErrorV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeStartupCleanupErrorV1 {
+    pub operation: NativeStartupOperationV1,
+    pub native_errno: Option<i32>,
+    pub detail: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeStartupDiagnosticWireV1 {
+    schema_version: u32,
+    requested_helper: NativeStartupPathWireV1,
+    canonical_helper: Option<NativeStartupPathWireV1>,
+    helper_identity: Option<NativeHelperIdentityV1>,
+    cwd: Option<NativeStartupPathWireV1>,
+    phase: NativeStartupPhaseV1,
+    operation: NativeStartupOperationV1,
+    native_errno: Option<i32>,
+    guardian_pid: Option<u32>,
+    guardian_ready: bool,
+    launcher_pid: Option<u32>,
+    release_sent: bool,
+    exec_confirmed: bool,
+    cleanup: NativeStartupCleanupV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeStartupPathWireV1 {
+    display: String,
+    raw: Option<NativeStartupPathRawWireV1>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeStartupPathRawWireV1 {
+    encoding: String,
+    data: String,
+}
+
+impl From<NativeStartupPathWireV1> for crate::NativeArgument {
+    fn from(value: NativeStartupPathWireV1) -> Self {
+        Self {
+            display: value.display,
+            raw: value.raw.map(|raw| crate::NativeArgumentRaw {
+                encoding: raw.encoding,
+                data: raw.data,
+            }),
+        }
+    }
+}
+
+impl TryFrom<NativeStartupDiagnosticWireV1> for NativeStartupDiagnosticV1 {
+    type Error = &'static str;
+
+    fn try_from(value: NativeStartupDiagnosticWireV1) -> Result<Self, Self::Error> {
+        let diagnostic = Self {
+            schema_version: value.schema_version,
+            requested_helper: value.requested_helper.into(),
+            canonical_helper: value.canonical_helper.map(Into::into),
+            helper_identity: value.helper_identity,
+            cwd: value.cwd.map(Into::into),
+            phase: value.phase,
+            operation: value.operation,
+            native_errno: value.native_errno,
+            guardian_pid: value.guardian_pid,
+            guardian_ready: value.guardian_ready,
+            launcher_pid: value.launcher_pid,
+            release_sent: value.release_sent,
+            exec_confirmed: value.exec_confirmed,
+            cleanup: value.cleanup,
+        };
+        if !diagnostic.is_consistent() {
+            return Err("native startup diagnostic is inconsistent");
+        }
+        Ok(diagnostic)
+    }
+}
+
+impl NativeStartupDiagnosticV1 {
+    pub fn matches_error_observations(
+        &self,
+        target_released: bool,
+        workload_may_be_alive: bool,
+        os_code: Option<i32>,
+    ) -> bool {
+        self.is_consistent()
+            && self.release_sent == target_released
+            && (self.cleanup.state != NativeStartupCleanupStateV1::Complete
+                || !workload_may_be_alive)
+            && match (self.native_errno, os_code) {
+                (Some(observed), Some(primary)) => observed == primary,
+                _ => true,
+            }
+    }
+
+    pub fn is_consistent(&self) -> bool {
+        self.schema_version == 1
+            && native_startup_path_is_consistent(&self.requested_helper)
+            && self
+                .canonical_helper
+                .as_ref()
+                .is_none_or(native_startup_path_is_consistent)
+            && self
+                .cwd
+                .as_ref()
+                .is_none_or(native_startup_path_is_consistent)
+            && (self.helper_identity.is_none() || self.canonical_helper.is_some())
+            && self.native_errno.is_none_or(|code| code > 0)
+            && self.guardian_pid.is_none_or(|pid| pid != 0)
+            && self.launcher_pid.is_none_or(|pid| pid != 0)
+            && (!self.guardian_ready || self.guardian_pid.is_some())
+            && (self.launcher_pid.is_none() || self.guardian_ready)
+            && (!self.release_sent || (self.guardian_ready && self.launcher_pid.is_some()))
+            && (!self.exec_confirmed || self.release_sent)
+            && self.cleanup.errors.len() <= 16
+            && self.cleanup.errors.iter().all(|error| {
+                error.native_errno.is_none_or(|code| code > 0)
+                    && !error.detail.is_empty()
+                    && error.detail.len() <= 1024
+                    && !error.detail.contains('\0')
+            })
+    }
+}
+
+fn native_startup_path_is_consistent(path: &crate::NativeArgument) -> bool {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+
+    const MAX_PATH_BYTES: usize = 64 * 1024;
+    if path.display.is_empty() || path.display.len() > MAX_PATH_BYTES || path.display.contains('\0')
+    {
+        return false;
+    }
+    let Some(raw) = &path.raw else {
+        return true;
+    };
+    if raw.data.len() > MAX_PATH_BYTES * 2 {
+        return false;
+    }
+    let Ok(bytes) = STANDARD.decode(&raw.data) else {
+        return false;
+    };
+    if bytes.is_empty() || bytes.len() > MAX_PATH_BYTES || STANDARD.encode(&bytes) != raw.data {
+        return false;
+    }
+    match raw.encoding.as_str() {
+        "unix-bytes-base64" => {
+            !bytes.contains(&0) && String::from_utf8_lossy(&bytes) == path.display
+        }
+        "windows-u16le-base64" => {
+            let mut chunks = bytes.chunks_exact(std::mem::size_of::<u16>());
+            let words: Vec<_> = chunks
+                .by_ref()
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            chunks.remainder().is_empty()
+                && !words.contains(&0)
+                && String::from_utf16_lossy(&words) == path.display
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BoundarySetupPhase {
@@ -160,6 +407,7 @@ pub enum ErrorCategory {
 #[derive(Clone, Debug, Error)]
 #[error("{message} ({code})")]
 pub struct Error {
+    pub native_startup: Option<NativeStartupDiagnosticV1>,
     pub policy_enforcement: Option<crate::workload_evidence::AttemptPolicyEnforcementV1>,
     pub category: ErrorCategory,
     pub code: &'static str,
@@ -203,6 +451,7 @@ impl Error {
             provider_rejection: None,
             provider_failure: None,
             policy_enforcement: None,
+            native_startup: None,
         }
     }
 

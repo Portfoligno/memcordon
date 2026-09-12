@@ -667,6 +667,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Check out pushed tag
+        id: source-push
         if: github.event_name == 'push'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -674,12 +675,29 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Check out dispatched tag
+        id: source-dispatch
         if: github.event_name == 'workflow_dispatch'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+      - id: macos-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-deps-release-macos-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+      - id: macos-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/native
+            target/ci/backend-macos
+          key: cargo-target-release-macos-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-push-${{ steps.source-push.outputs.commit }}-dispatch-${{ steps.source-dispatch.outputs.commit }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'MAINTAINERS.md', 'rust-toolchain.toml', '.cargo/**', '.github/**') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite release-macos
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -688,6 +706,22 @@ jobs:
           path: target/ci/reports/backend-macos-watchdog.json
           if-no-files-found: error
           retention-days: 14
+      - if: always() && steps.macos-target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/native
+            target/ci/backend-macos
+          key: ${{ steps.macos-target.outputs.cache-primary-key }}
+      - if: always() && steps.macos-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.macos-deps.outputs.cache-primary-key }}
 
   assemble:
     name: Release / assemble

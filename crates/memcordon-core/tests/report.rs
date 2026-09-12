@@ -107,6 +107,7 @@ fn typed_provider_rejection_round_trips_with_cleanup_proof() {
         terminal_receipt: None,
     };
     let error = ExecutionErrorReport {
+        native_startup: None,
         policy_enforcement: None,
         category: "setup".to_owned(),
         code: "MCSEALED-PROVIDER-REJECTION".to_owned(),
@@ -202,6 +203,7 @@ fn report() -> MemcordonReport {
         None,
         None,
         Some(ExecutionErrorReport {
+            native_startup: None,
             policy_enforcement: None,
             category: "spawn".to_owned(),
             code: "MCSPAWN".to_owned(),
@@ -249,6 +251,208 @@ fn execution_report_rejects_corrupt_or_future_provider_diagnostics() {
         assert!(
             serde_json::from_value::<MemcordonReport>(corrupt).is_err(),
             "accepted corrupt diagnostic field {field}"
+        );
+    }
+}
+
+fn native_startup_diagnostic() -> memcordon_core::NativeStartupDiagnosticV1 {
+    use memcordon_core::{
+        NativeHelperIdentityV1, NativeStartupCleanupErrorV1, NativeStartupCleanupStateV1,
+        NativeStartupCleanupV1, NativeStartupDiagnosticV1, NativeStartupOperationV1,
+        NativeStartupPhaseV1,
+    };
+
+    NativeStartupDiagnosticV1 {
+        schema_version: 1,
+        requested_helper: NativeArgument::from_os(OsStr::new("./memcordon-guardian")),
+        canonical_helper: Some(NativeArgument::from_os(OsStr::new(
+            "/opt/memcordon-guardian",
+        ))),
+        helper_identity: Some(NativeHelperIdentityV1 {
+            device: 1,
+            inode: 2,
+            size_bytes: 4096,
+            sha256: None,
+        }),
+        cwd: Some(NativeArgument::from_os(OsStr::new("/workload"))),
+        phase: NativeStartupPhaseV1::TargetExec,
+        operation: NativeStartupOperationV1::ConfirmTargetExec,
+        native_errno: Some(13),
+        guardian_pid: Some(100),
+        guardian_ready: true,
+        launcher_pid: Some(101),
+        release_sent: true,
+        exec_confirmed: false,
+        cleanup: NativeStartupCleanupV1 {
+            state: NativeStartupCleanupStateV1::Incomplete,
+            errors: vec![NativeStartupCleanupErrorV1 {
+                operation: NativeStartupOperationV1::ReapLauncher,
+                native_errno: Some(4),
+                detail: "launcher reap interrupted".to_owned(),
+            }],
+        },
+    }
+}
+
+#[test]
+fn native_startup_error_envelopes_preserve_primary_and_cleanup_causes() {
+    let diagnostic = native_startup_diagnostic();
+    let mut execution = report();
+    let error = execution.error.as_mut().unwrap();
+    error.target_released = true;
+    error.workload_may_be_alive = true;
+    error.os_code = Some(13);
+    let primary = (error.code.clone(), error.message.clone(), error.os_code);
+    error.native_startup = Some(diagnostic.clone());
+    let valid_envelope = serde_json::to_value(&execution).unwrap();
+    for (field, invalid) in [
+        ("target_released", serde_json::json!(false)),
+        ("os_code", serde_json::json!(5)),
+    ] {
+        let mut corrupt = valid_envelope.clone();
+        corrupt["error"][field] = invalid;
+        assert!(serde_json::from_value::<MemcordonReport>(corrupt).is_err());
+    }
+    let mut false_cleanup = valid_envelope.clone();
+    false_cleanup["error"]["native_startup"]["cleanup"]["state"] = serde_json::json!("complete");
+    assert!(serde_json::from_value::<MemcordonReport>(false_cleanup).is_err());
+    let decoded: MemcordonReport =
+        serde_json::from_slice(&serde_json::to_vec(&execution).unwrap()).unwrap();
+    let error = decoded.error.unwrap();
+    assert_eq!((error.code, error.message, error.os_code), primary);
+    assert_eq!(error.native_startup, Some(diagnostic.clone()));
+
+    let record = SupervisionErrorRecord {
+        native_startup: Some(diagnostic.clone()),
+        category: "helper".to_owned(),
+        code: "MCHELPER-STARTUP".to_owned(),
+        message: "original helper failure".to_owned(),
+        os_code: Some(13),
+        attempt_number: Some(1),
+        supervision_phase: SupervisionPhase::AttemptSetup,
+        launch_phase: Some("native-startup".to_owned()),
+        target_released: true,
+        workload_may_be_alive: true,
+        initial_spawn_failure: None,
+        provider_rejection: None,
+        backend_selection_drift: None,
+    };
+    assert!(record.is_consistent());
+    let mut false_release = record.clone();
+    false_release.target_released = false;
+    assert!(!false_release.is_consistent());
+    let mut false_cleanup = record.clone();
+    false_cleanup.native_startup.as_mut().unwrap().cleanup.state =
+        memcordon_core::NativeStartupCleanupStateV1::Complete;
+    assert!(!false_cleanup.is_consistent());
+    let decoded: SupervisionErrorRecord =
+        serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+    assert_eq!(decoded, record);
+    assert_eq!(decoded.terminal_status(), 125);
+    assert_eq!(
+        decoded.native_startup.unwrap().cleanup.errors[0].native_errno,
+        Some(4)
+    );
+}
+
+#[test]
+fn absent_native_startup_keeps_existing_error_wire_shape() {
+    let execution = report();
+    let before = serde_json::to_vec(&execution).unwrap();
+    assert!(
+        serde_json::to_value(&execution).unwrap()["error"]
+            .get("native_startup")
+            .is_none()
+    );
+    let decoded: MemcordonReport = serde_json::from_slice(&before).unwrap();
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), before);
+    assert!(
+        memcordon_core::Error::new(memcordon_core::ErrorCategory::Setup, "MCHELPER", "original")
+            .native_startup
+            .is_none()
+    );
+
+    let legacy = serde_json::json!({
+        "category":"helper", "code":"MCHELPER", "message":"original", "os_code":null,
+        "attempt_number":1, "supervision_phase":"attempt-setup", "launch_phase":null,
+        "target_released":false, "workload_may_be_alive":false,
+        "initial_spawn_failure":null, "provider_rejection":null
+    });
+    let decoded: SupervisionErrorRecord = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(decoded.native_startup.is_none());
+    assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+}
+
+#[test]
+fn native_startup_rejects_unknown_or_contradictory_observations() {
+    let valid = serde_json::to_value(native_startup_diagnostic()).unwrap();
+    assert!(
+        serde_json::from_value::<memcordon_core::NativeStartupDiagnosticV1>(valid.clone()).is_ok()
+    );
+    for (field, invalid) in [
+        ("schema_version", serde_json::json!(2)),
+        ("phase", serde_json::json!("invented-phase")),
+        ("operation", serde_json::json!("invented-operation")),
+        ("native_errno", serde_json::json!(0)),
+        ("guardian_pid", serde_json::json!(0)),
+        ("guardian_ready", serde_json::json!(false)),
+        ("launcher_pid", serde_json::Value::Null),
+        ("unexpected", serde_json::json!(true)),
+    ] {
+        let mut corrupt = valid.clone();
+        corrupt[field] = invalid;
+        assert!(
+            serde_json::from_value::<memcordon_core::NativeStartupDiagnosticV1>(corrupt).is_err(),
+            "accepted {field}"
+        );
+    }
+    let mut impossible_exec = valid.clone();
+    impossible_exec["exec_confirmed"] = serde_json::json!(true);
+    impossible_exec["release_sent"] = serde_json::json!(false);
+    assert!(
+        serde_json::from_value::<memcordon_core::NativeStartupDiagnosticV1>(
+            impossible_exec.clone()
+        )
+        .is_err()
+    );
+    let mut execution = serde_json::to_value(report()).unwrap();
+    execution["error"]["native_startup"] = impossible_exec;
+    assert!(serde_json::from_value::<MemcordonReport>(execution).is_err());
+    for path in ["requested_helper", "helper_identity", "cleanup"] {
+        let mut corrupt = valid.clone();
+        corrupt[path]["unexpected"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<memcordon_core::NativeStartupDiagnosticV1>(corrupt).is_err()
+        );
+    }
+}
+
+#[test]
+fn native_startup_preserves_native_path_bytes_and_rejects_false_display() {
+    // Deliberately non-text native paths, interpreted independently of the host OS.
+    for (encoding, data) in [
+        ("unix-bytes-base64", "/w=="),
+        ("windows-u16le-base64", "ANg="),
+    ] {
+        let mut diagnostic = native_startup_diagnostic();
+        diagnostic.requested_helper = NativeArgument {
+            display: "\u{fffd}".to_owned(),
+            raw: Some(memcordon_core::NativeArgumentRaw {
+                encoding: encoding.to_owned(),
+                data: data.to_owned(),
+            }),
+        };
+        let bytes = serde_json::to_vec(&diagnostic).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<memcordon_core::NativeStartupDiagnosticV1>(&bytes).unwrap(),
+            diagnostic
+        );
+        diagnostic.requested_helper.display = "not-the-native-path".to_owned();
+        assert!(
+            serde_json::from_slice::<memcordon_core::NativeStartupDiagnosticV1>(
+                &serde_json::to_vec(&diagnostic).unwrap()
+            )
+            .is_err()
         );
     }
 }
@@ -643,6 +847,345 @@ fn safe_proof() -> RestartSafetyProof {
     }
 }
 
+fn strict_retired_sealed_report() -> MemcordonReport {
+    use memcordon_core::workload_contract::*;
+    use memcordon_core::workload_evidence::*;
+    use memcordon_core::workload_registry::*;
+    use memcordon_core::{
+        BoundaryCapability, BoundaryClass, BoundaryRequirement, BoundedText, BoundedVec,
+        DiagnosticSha256, LinuxSealedEvidenceV2, PublicProviderBindingV1,
+    };
+    use std::num::NonZeroU64;
+
+    let digest = DiagnosticSha256::from_bytes([7; 32]);
+    let profile = BaselineProfile::LinuxUnixCreate;
+    let request = WorkloadContractV1 {
+        schema_version: ContractVersionOne::default(),
+        workload_plan_digest: digest.clone(),
+        authorized_profile: profile.reference(),
+        authorization: AuthorizationRef {
+            grant_id: LogicalId::new("reviewed-plan".into()).unwrap(),
+            grant_revision: NonZeroU64::MIN,
+            approved_plan_digest: digest.clone(),
+        },
+        ceiling: profile.ceiling(),
+        requirements: BoundedVec::default(),
+        endpoints: BoundedVec::default(),
+        expected_epoch: PolicyEpoch {
+            service_instance: Nonce128([3; 16]),
+            revision: NonZeroU64::MIN,
+        },
+    };
+    let snapshot = ProviderAdmissionSnapshotV1 {
+        request_digest: memcordon_core::workload_codec::contract_digest(&request).unwrap(),
+        request: request.clone(),
+        registry_digest: digest.clone(),
+        qualification_digest: digest.clone(),
+        admission_nonce: Nonce128([4; 16]),
+        caller_invocation_reference: Nonce128([5; 16]),
+        private_invocation_digest: digest.clone(),
+        caller: CallerSelector::Linux { uid: 1000 },
+        native_profile: profile,
+    };
+    let binding = AttemptBindingV1::from_snapshot(
+        &snapshot,
+        PublicProviderBindingV1 {
+            generation: BoundedText::new("test-provider").unwrap(),
+            source_commit: BoundedText::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            runtime_manifest_sha256: digest,
+        },
+        BoundedText::new("boot-a").unwrap(),
+        BoundedText::new("attempt-a").unwrap(),
+        0,
+    )
+    .unwrap();
+    let checkpoint = VerifiedCheckpointV1::observed(
+        &binding,
+        baseline_observation(profile),
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
+    .unwrap();
+    let enforcement = AttemptPolicyEnforcementV1::retired(binding, checkpoint, true, true).unwrap();
+    assert!(enforcement.valid_native_terminal(Some(&request), profile, "attempt-a", 0, "boot-a"));
+
+    let outcome = RunOutcome::Exited {
+        child: ChildTermination::ExitCode { code: 0 },
+        peak: None,
+        cleanup: cleanup(),
+    };
+    let mut attempt = attempt_record(1, Some(outcome.clone()), None);
+    attempt.policy_enforcement = enforcement.clone();
+    attempt.launch = LaunchEvidence {
+        mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
+        boundary_requested: BoundaryRequirement::Sealed,
+        boundary_effective: BoundaryClass::Sealed,
+        target_released: true,
+        containment_verified_before_authorization: true,
+        guardian_started_before_authorization: true,
+        target_spawn_error_reported: true,
+        boundary_assignment_verified: true,
+        boundary_reconfiguration_denied: true,
+        inherited_resources_restricted: true,
+        frontend_loss_cleanup_authority_verified: true,
+    };
+    attempt.restart_safety.sealed_boundary_retired = true;
+    attempt.boundary_detail =
+        BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2(LinuxSealedEvidenceV2 {
+            schema_version: 2,
+            provider_identity: "memcordon-sealed-agent-v2".to_owned(),
+            control_service_identity: "memcordon-sealed-agent.service:v2".to_owned(),
+            launcher_service_identity: "memcordon-sealed-launcher.service:v2".to_owned(),
+            cgroup_identity_digest: "ab".repeat(32),
+            cgroup_created: true,
+            cgroup_owned_by_provider: true,
+            memory_configuration_verified: true,
+            init_created_into_cgroup: true,
+            pid_namespace_created: true,
+            mount_namespace_created: true,
+            cgroup_namespace_created: true,
+            target_pidfd_verified: true,
+            target_cgroup_membership_verified: true,
+            target_pid_namespace_verified: true,
+            target_initial_credentials_verified: true,
+            initial_provider_capabilities_absent: true,
+            caller_no_new_privs_reproduced: true,
+            caller_capability_bounding_set_reproduced: true,
+            caller_mount_context_reproduced: true,
+            credential_transition_disposition:
+                memcordon_core::CredentialTransitionDisposition::PreserveCallerEnvelope,
+            boundary_independent_of_credentials: true,
+            inherited_descriptors_verified: true,
+            writable_ancestor_cgroup_denied: true,
+            parent_namespace_handles_denied: true,
+            recursive_provider_request_denied: true,
+            guardian_ready: true,
+            target_released: true,
+            cgroup_kill_invoked: true,
+            cgroup_empty_verified: true,
+            namespace_init_reaped: true,
+            guardian_reaped: true,
+            cgroup_removed: true,
+        });
+    assert!(memcordon_core::boundary_evidence_is_consistent(
+        &attempt.launch,
+        &attempt.restart_safety,
+        &attempt.boundary_detail
+    ));
+    let backend = BackendCapabilityReport {
+        boundary: BoundaryCapability {
+            class: BoundaryClass::Sealed,
+            mechanism: "linux-pid-namespace-cgroup-v2".to_owned(),
+            target_gated: true,
+            boundary_verified_before_authorization: true,
+            target_can_reconfigure_boundary: false,
+            frontend_loss_cleanup_authority: true,
+            workload_empty_proof: true,
+            limitations: Vec::new(),
+        },
+        ..BackendCapabilityReport::default()
+    };
+    let mut history = AttemptHistory::default();
+    let mut aggregates = SupervisionAggregates::default();
+    history.append(attempt, &mut aggregates).unwrap();
+    let execution = SupervisionExecution::new(
+        backend.clone(),
+        SupervisionTerminal::AttemptOutcome {
+            attempt_number: 1,
+            outcome,
+        },
+        history,
+        aggregates,
+        RestartSummary::default(),
+        None,
+        10,
+        1,
+    )
+    .unwrap();
+    let mut base = report();
+    base.policy.requested.boundary = BoundaryRequirement::Sealed;
+    base.policy.requested.workload = WorkloadRequestReport::StrictV1 {
+        contract: Box::new(request),
+    };
+    base.policy.effective.boundary = BoundaryClass::Sealed;
+    base.policy.effective.workload = enforcement.resolution().unwrap();
+    MemcordonReport::schema9(
+        base.tool,
+        base.invocation,
+        base.policy,
+        Some(backend),
+        Some(execution),
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn retired_strict_policy_cannot_replace_native_retirement() {
+    let report = strict_retired_sealed_report();
+    let valid = serde_json::to_value(&report).unwrap();
+    assert!(serde_json::from_value::<MemcordonReport>(valid).is_ok());
+    let mut invalid = report;
+    let BoundaryMechanismEvidence::LinuxPidNamespaceCgroupV2(native) =
+        &mut invalid.attempts[0].boundary_detail
+    else {
+        panic!("Linux fixture");
+    };
+    native.cgroup_empty_verified = false;
+    assert!(invalid.attempts[0].policy_enforcement.is_consistent());
+    assert!(
+        serde_json::from_value::<MemcordonReport>(serde_json::to_value(invalid).unwrap()).is_err()
+    );
+}
+
+#[test]
+fn native_retirement_cannot_replace_strict_policy_terminal() {
+    use memcordon_core::workload_evidence::{
+        AdmissionAvailabilityFailure, AttemptPolicyEnforcementV1, PolicyTerminalEvidenceV1,
+    };
+    let report = strict_retired_sealed_report();
+    assert_eq!(report.supervision.as_ref().unwrap().wrapper_exit_code, 0);
+    for variant in ["missing", "invalid", "unavailable"] {
+        let mut invalid = report.clone();
+        let attempt = &mut invalid.attempts[0];
+        assert!(memcordon_core::boundary_evidence_is_consistent(
+            &attempt.launch,
+            &attempt.restart_safety,
+            &attempt.boundary_detail
+        ));
+        if variant == "missing" {
+            attempt.policy_enforcement = AttemptPolicyEnforcementV1::LegacyUnspecified;
+        } else {
+            let AttemptPolicyEnforcementV1::Authorized { terminal, .. } =
+                &mut attempt.policy_enforcement
+            else {
+                panic!("strict fixture");
+            };
+            if variant == "unavailable" {
+                *terminal = PolicyTerminalEvidenceV1::Unavailable {
+                    reason: AdmissionAvailabilityFailure::TerminalUnavailable,
+                };
+            } else {
+                let PolicyTerminalEvidenceV1::Retired {
+                    provider_resources_closed,
+                    ..
+                } = terminal
+                else {
+                    panic!("retired fixture");
+                };
+                *provider_resources_closed = false;
+            }
+        }
+        assert!(
+            serde_json::from_value::<MemcordonReport>(serde_json::to_value(invalid).unwrap())
+                .is_err(),
+            "accepted {variant} strict policy terminal"
+        );
+    }
+}
+
+#[test]
+fn failed_strict_attempt_can_report_unavailable_policy_terminal_without_restart() {
+    use memcordon_core::workload_evidence::{
+        AdmissionAvailabilityFailure, AttemptPolicyEnforcementV1, PolicyTerminalEvidenceV1,
+    };
+    for (outcome, status) in [
+        (
+            RunOutcome::MonitorFailed {
+                error: "policy retirement observation unavailable".to_owned(),
+                child_after_termination: Some(ChildTermination::ExitCode { code: 0 }),
+                cleanup: cleanup(),
+            },
+            125,
+        ),
+        (
+            RunOutcome::Interrupted {
+                signal: memcordon_core::Interruption { signal: 2 },
+                child_after_termination: Some(ChildTermination::UnixSignal { signal: 2 }),
+                cleanup: cleanup(),
+            },
+            130,
+        ),
+        (
+            RunOutcome::Exited {
+                child: ChildTermination::ExitCode { code: 17 },
+                peak: None,
+                cleanup: cleanup(),
+            },
+            17,
+        ),
+    ] {
+        let mut base = strict_retired_sealed_report();
+        let mut attempt = base.attempts.remove(0);
+        let retired_enforcement = serde_json::to_value(&attempt.policy_enforcement).unwrap();
+        let AttemptPolicyEnforcementV1::Authorized { terminal, .. } =
+            &mut attempt.policy_enforcement
+        else {
+            panic!("strict fixture");
+        };
+        *terminal = PolicyTerminalEvidenceV1::Unavailable {
+            reason: AdmissionAvailabilityFailure::TerminalUnavailable,
+        };
+        attempt.outcome = Some(outcome.clone());
+        let original_outcome = outcome.clone();
+        let mut history = AttemptHistory::default();
+        let mut aggregates = SupervisionAggregates::default();
+        history.append(attempt, &mut aggregates).unwrap();
+        let backend = base.backend.clone().unwrap();
+        let execution = SupervisionExecution::new(
+            backend.clone(),
+            SupervisionTerminal::AttemptOutcome {
+                attempt_number: 1,
+                outcome,
+            },
+            history,
+            aggregates,
+            RestartSummary::default(),
+            None,
+            10,
+            1,
+        )
+        .unwrap();
+        let failed = MemcordonReport::schema9(
+            base.tool,
+            base.invocation,
+            base.policy,
+            Some(backend),
+            Some(execution),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            failed.supervision.as_ref().unwrap().wrapper_exit_code,
+            status
+        );
+        assert_eq!(failed.attempts[0].outcome.as_ref(), Some(&original_outcome));
+        let value = serde_json::to_value(failed).unwrap();
+        assert!(serde_json::from_value::<MemcordonReport>(value.clone()).is_ok());
+
+        for decision in [
+            "half-life-logistic-backoff",
+            "circuit-cooldown",
+            "half-open-launch",
+        ] {
+            let mut restart_without_retirement = value.clone();
+            restart_without_retirement["attempts"][0]["restart_decision"]["decision"] =
+                serde_json::json!(decision);
+            let mut with_retirement = restart_without_retirement.clone();
+            with_retirement["attempts"][0]["policy_enforcement"] = retired_enforcement.clone();
+            assert!(serde_json::from_value::<MemcordonReport>(with_retirement).is_ok());
+            assert!(
+                serde_json::from_value::<MemcordonReport>(restart_without_retirement).is_err(),
+                "accepted restart {decision} without strict retirement"
+            );
+        }
+    }
+}
+
 fn cleanup() -> CleanupSummary {
     CleanupSummary {
         direct_child_reaped: true,
@@ -1034,6 +1577,7 @@ fn schema_five_later_helper_error_preserves_prior_attempt() {
         .expect("first");
     let error = SupervisionErrorRecord {
         category: "helper".to_owned(),
+        native_startup: None,
         code: "MCHELPER".to_owned(),
         message: "missing helper".to_owned(),
         os_code: None,
@@ -1084,6 +1628,7 @@ fn schema_five_initial_spawn_status_round_trips_typed_provenance() {
         (InitialSpawnFailure::NotFound, 127),
     ] {
         let error = SupervisionErrorRecord {
+            native_startup: None,
             category: "spawn".to_owned(),
             code: "MCSPAWN-FIXTURE".to_owned(),
             message: "spawn failed".to_owned(),
@@ -1154,6 +1699,7 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
     };
     let error = SupervisionErrorRecord {
         category: "spawn".to_owned(),
+        native_startup: None,
         code: "MCSPAWN-NOT-FOUND".to_owned(),
         message: "sealed target exec failed".to_owned(),
         os_code: Some(2),
@@ -1218,6 +1764,7 @@ fn request_validation_provider_rejection_round_trips_in_schema_eight() {
     let error = SupervisionErrorRecord {
         category: "setup".to_owned(),
         code: "MCSEALED-PROVIDER-REJECTION".to_owned(),
+        native_startup: None,
         message: "provider rejected launch".to_owned(),
         os_code: Some(30),
         attempt_number: Some(1),
@@ -1306,6 +1853,7 @@ fn request_validation_provider_rejection_round_trips_in_schema_eight() {
 #[test]
 fn supervision_constructor_rejects_mismatched_or_misclassified_error_terminal() {
     let mut error = SupervisionErrorRecord {
+        native_startup: None,
         category: "spawn".to_owned(),
         code: "MCSPAWN-FIXTURE".to_owned(),
         message: "spawn failed".to_owned(),
@@ -1367,6 +1915,7 @@ fn supervision_constructor_rejects_mismatched_or_misclassified_error_terminal() 
 #[test]
 fn supervision_constructor_rejects_stale_error_terminal() {
     let error = |number| SupervisionErrorRecord {
+        native_startup: None,
         category: "setup".to_owned(),
         code: "MCSETUP-FIXTURE".to_owned(),
         message: format!("setup failure {number}"),
@@ -1416,6 +1965,7 @@ fn supervision_constructor_rejects_embedded_error_attempt_mismatch() {
     let error = SupervisionErrorRecord {
         category: "setup".to_owned(),
         code: "MCSETUP-FIXTURE".to_owned(),
+        native_startup: None,
         message: "setup failure".to_owned(),
         os_code: None,
         attempt_number: Some(2),

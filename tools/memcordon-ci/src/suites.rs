@@ -784,25 +784,85 @@ fn macos_acceptance(root: &Path, stable: &str) -> Result<()> {
             "macOS acceptance was invoked on the wrong platform".to_owned(),
         ));
     }
+    for (target, scenarios) in [
+        (
+            "lifecycle",
+            memcordon_ci::release_evidence::MACOS_LIFECYCLE_SCENARIOS,
+        ),
+        (
+            "macos_remediation",
+            memcordon_ci::release_evidence::MACOS_REMEDIATION_SCENARIOS,
+        ),
+    ] {
+        for scenario in scenarios {
+            let output = cargo(
+                root,
+                stable,
+                "test",
+                [
+                    "--target-dir",
+                    "target/ci/backend-macos",
+                    "--locked",
+                    "--package",
+                    "memcordon",
+                    "--features",
+                    "test-support",
+                    "--test",
+                    target,
+                    scenario,
+                    "--",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ],
+            )?;
+            capability::require_exact_standard_test_success(&output, scenario)?;
+        }
+    }
+    // This isolated candidate-package installation never replaces the user's verifier.
     cargo(
         root,
         stable,
-        "test",
+        "install",
         [
+            "--path",
+            "crates/memcordon-cli",
+            "--root",
+            "target/ci/macos-installed",
             "--target-dir",
             "target/ci/backend-macos",
+            "--debug",
             "--locked",
-            "--package",
-            "memcordon",
-            "--features",
-            "test-fixtures",
-            "--test",
-            "lifecycle",
-            "--",
-            "--nocapture",
-            "--test-threads=1",
+            "--force",
         ],
     )?;
+    let installed = root.join("target/ci/macos-installed/bin/memcordon");
+    let bytes = CommandSpec::new(&installed, root, Duration::from_secs(10))
+        .args(["doctor", "--probe-execution", "--json"])
+        .run()?;
+    let probe: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if probe["kind"] != "doctor-execution-probe"
+        || probe["schema_version"] != 1
+        || probe["execution"]["helper_ready"] != true
+        || probe["execution"]["target_exec_confirmed"] != true
+        || probe["execution"]["target_exit"] != 0
+        || probe["execution"]["cleanup_complete"] != true
+    {
+        return Err(CiError::Message(
+            "installed macOS execution probe lacks complete native lifecycle evidence".into(),
+        ));
+    }
+    let deadline = CommandSpec::new(&installed, root, Duration::from_secs(5))
+        .args(["+100ms", "--"])
+        .arg(root.join("target/ci/backend-macos/debug/memcordon-test-fixture"))
+        .args(["hold", "--duration", "5s"])
+        .output()?;
+    if deadline.status.code() != Some(123) {
+        return Err(CiError::Message(
+            "installed macOS package did not enforce its deadline".into(),
+        ));
+    }
+    let scenarios = memcordon_ci::release_evidence::macos_scenarios();
     let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
         .map_err(|error| CiError::Message(error.to_string()))?
         .trim()
@@ -811,18 +871,9 @@ fn macos_acceptance(root: &Path, stable: &str) -> Result<()> {
         schema: 1,
         backend: "macos-watchdog",
         certified: true,
-        tests_run: 8,
+        tests_run: u32::try_from(scenarios.len()).expect("static scenario count fits"),
         tests_skipped: 0,
-        scenarios: vec![
-            "hard_unavailability_refuses_before_target_execution",
-            "confirmed_limit_has_dedicated_status",
-            "macos_system_success_and_failure_smoke_tests_are_bounded",
-            "virtual_metric_is_explicitly_supported",
-            "wrapper_interrupt_is_forwarded_cleaned_and_mapped",
-            "guardian_kills_workload_after_wrapper_crash",
-            "command_lifetime_kills_background_descendant_by_birth_identity",
-            "immediate_success_failure_and_status_are_reaped_and_preserved",
-        ],
+        scenarios,
         commit,
         runner_class: "hosted-release-acceptance",
     };

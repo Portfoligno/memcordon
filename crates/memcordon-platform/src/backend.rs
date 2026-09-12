@@ -146,7 +146,7 @@ pub(crate) struct StandardLaunchFacts {
 }
 
 impl StandardLaunchFacts {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn gated_target() -> Self {
         Self {
             target_released: false,
@@ -155,7 +155,7 @@ impl StandardLaunchFacts {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(target_os = "windows")]
     pub(crate) fn contained_spawn_completed() -> Self {
         Self {
             target_released: true,
@@ -164,7 +164,7 @@ impl StandardLaunchFacts {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn record_containment_before_authorization(&mut self) {
         self.containment_verified_before_authorization = true;
     }
@@ -174,7 +174,7 @@ impl StandardLaunchFacts {
         self.guardian_started_before_authorization = !self.target_released;
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn record_authorization_released(&mut self) {
         self.target_released = true;
     }

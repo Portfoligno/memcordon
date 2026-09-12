@@ -30,7 +30,9 @@ mod windows_sealed;
 
 pub use error::{
     BoundarySetupFailure, BoundarySetupPhase, Error, ErrorCategory, InitialSpawnFailure,
-    PROVIDER_REJECTION_MAX_DETAIL_BYTES, ProviderRejectionEvidence,
+    NativeHelperIdentityV1, NativeStartupCleanupErrorV1, NativeStartupCleanupStateV1,
+    NativeStartupCleanupV1, NativeStartupDiagnosticV1, NativeStartupOperationV1,
+    NativeStartupPhaseV1, PROVIDER_REJECTION_MAX_DETAIL_BYTES, ProviderRejectionEvidence,
 };
 pub use outcome::{
     AttemptEventKind, ChildTermination, CleanupErrorRecord, CleanupSummary, DeadlineEvidence,

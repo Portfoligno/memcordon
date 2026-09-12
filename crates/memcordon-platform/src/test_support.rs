@@ -1,5 +1,17 @@
 //! Native containment used only by black-box process tests.
 
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::resource_recovery as macos_resource_recovery;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::{
+    LaunchFault as MacosLaunchFault, disarm_timeout as macos_disarm_timeout,
+    rejects_protocol as macos_rejects_protocol, startup_fault as macos_startup_fault,
+};
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::{
+    custody_wrapper as macos_custody_wrapper, inspector_stall as macos_inspector_stall,
+};
+
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Child, Command};

@@ -638,6 +638,8 @@ fn backend_capability_mismatched_fields(
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SupervisionErrorRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_startup: Option<crate::NativeStartupDiagnosticV1>,
     pub category: String,
     pub code: String,
     pub message: String,
@@ -715,6 +717,13 @@ impl SupervisionErrorRecord {
         initial_spawn_is_consistent
             && provider_rejection_is_consistent
             && backend_drift_is_consistent
+            && self.native_startup.as_ref().is_none_or(|value| {
+                value.matches_error_observations(
+                    self.target_released,
+                    self.workload_may_be_alive,
+                    self.os_code,
+                )
+            })
     }
 }
 

@@ -927,6 +927,7 @@ fn windows_nonspawn_provider_rejection_has_consistent_public_provenance() {
         terminal_receipt: None,
     };
     let record = SupervisionErrorRecord {
+        native_startup: None,
         category: "setup".to_owned(),
         code: "MCSEALED-PROVIDER-REJECTION".to_owned(),
         message: "provider rejected launch".to_owned(),

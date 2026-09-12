@@ -21,6 +21,7 @@ fuzz_target!(|count: u16| {
                     finished_offset_ms: number,
                     outcome: None,
                     error: Some(memcordon_core::SupervisionErrorRecord {
+                        native_startup: None,
                         category: "setup".to_owned(),
                         code: "MCFUZZ".to_owned(),
                         message: "fixture".to_owned(),

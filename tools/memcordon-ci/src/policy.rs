@@ -2872,6 +2872,7 @@ struct RustPolicy {
     names_proc_self_exe: bool,
     calls_env_remove: bool,
     subprocess_env_mutations: usize,
+    standard_path_mutations: usize,
     pre_exec_calls: usize,
     fork_calls: usize,
 }
@@ -2942,6 +2943,11 @@ impl<'ast> Visit<'ast> for RustPolicy {
         }
         if matches!(expression.method.to_string().as_str(), "env" | "envs") {
             self.subprocess_env_mutations += 1;
+            if expression.method == "env"
+                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "PATH")
+            {
+                self.standard_path_mutations += 1;
+            }
         }
         syn::visit::visit_expr_method_call(self, expression);
     }
@@ -2977,7 +2983,10 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
     let sealed_launch =
         Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");
-    if visitor.subprocess_env_mutations != 0 && relative != sealed_launch {
+    let native_path_fixture = relative
+        == Path::new("crates/memcordon-cli/tests/macos_remediation.rs")
+        && visitor.subprocess_env_mutations == visitor.standard_path_mutations;
+    if visitor.subprocess_env_mutations != 0 && relative != sealed_launch && !native_path_fixture {
         visitor
             .violations
             .push("subprocess environment mutation is forbidden".to_owned());
@@ -3064,7 +3073,13 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
         let sealed_launch =
             Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");
-        if visitor.subprocess_env_mutations != 0 && relative != sealed_launch {
+        let native_path_fixture = relative
+            == Path::new("crates/memcordon-cli/tests/macos_remediation.rs")
+            && visitor.subprocess_env_mutations == visitor.standard_path_mutations;
+        if visitor.subprocess_env_mutations != 0
+            && relative != sealed_launch
+            && !native_path_fixture
+        {
             visitor
                 .violations
                 .push("subprocess environment mutation is forbidden".to_owned());

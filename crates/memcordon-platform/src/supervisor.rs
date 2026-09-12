@@ -903,6 +903,7 @@ fn finish_backend_selection_drift(
         mismatched_fields.join(", ")
     );
     let record_error = SupervisionErrorRecord {
+        native_startup: None,
         category: "monitor".to_owned(),
         code: "MCBACKEND-SELECTION-DRIFT".to_owned(),
         message,
@@ -1144,6 +1145,7 @@ fn error_record(
     kind: AttemptKind,
 ) -> SupervisionErrorRecord {
     SupervisionErrorRecord {
+        native_startup: error.native_startup.clone(),
         category: format!("{:?}", error.category).to_ascii_lowercase(),
         code: error.code.to_owned(),
         message: error.message.clone(),

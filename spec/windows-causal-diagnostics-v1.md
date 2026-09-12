@@ -178,11 +178,23 @@ with a typed tombstone on completed records; replay protection, cleanup state,
 owner identity and unacknowledged terminal outboxes remain intact. Failed
 publication retains its quota charge.
 
-Public and private version-two response frames place the compact `message`
+Public and private version-two response frames place the compact `kind`
 discriminator first. Readers inspect at most 256 stack bytes before allocating
 the body. `attempt-retained` and `replay-pending` use the 64 KiB diagnostic frame
 limit; existing terminal payload limits remain separate. Duplicate JSON keys
 are rejected before typed decoding.
+
+The [response-prefix fixtures](../crates/memcordon-core/tests/fixtures/windows-response-frame-prefixes.json)
+are checked against both `windows_response_frame_limit` and
+`windows_launcher_response_frame_limit` in the portable diagnostic tests at
+`crates/memcordon-core/tests/diagnostics.rs`.
+Classification requires the literal first bytes `{"kind":"` and an unescaped
+lowercase/hyphen discriminator terminated within the inspected prefix. Unknown
+canonical kinds select the generic frame ceiling; the complete typed decoder
+still rejects unsupported variants and duplicate discriminators. Classification
+alone does not validate a message. The tests cover the exact 256-byte window,
+fragmented prefix reads, and the different public/private limits for
+qualification and workload responses.
 
 Diagnostics accompany live rejection/replay responses, but are excluded by
 `terminal_authority_json` from immutable outbox and acknowledgment bytes. Replay

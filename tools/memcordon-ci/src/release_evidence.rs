@@ -125,16 +125,44 @@ const WINDOWS_TESTS: &[&str] = &[
     "windows_qualification_advertisement",
 ];
 
-const MACOS_SCENARIOS: &[&str] = &[
+pub const MACOS_LIFECYCLE_SCENARIOS: &[&str] = &[
     "hard_unavailability_refuses_before_target_execution",
     "confirmed_limit_has_dedicated_status",
     "macos_system_success_and_failure_smoke_tests_are_bounded",
     "virtual_metric_is_explicitly_supported",
     "wrapper_interrupt_is_forwarded_cleaned_and_mapped",
     "guardian_kills_workload_after_wrapper_crash",
-    "command_lifetime_kills_background_descendant_by_birth_identity",
+    "default_command_lifetime_kills_background_descendant_before_return",
     "immediate_success_failure_and_status_are_reaped_and_preserved",
+    "command_exit_grace_allows_remaining_workload_to_drain_naturally",
+    "command_exit_grace_force_cleans_survivors_after_expiry",
+    "deadline_remains_authoritative_during_command_exit_grace",
+    "workload_lifetime_waits_for_background_descendant_to_finish_naturally",
+    "workload_lifetime_deadline_cleans_background_descendant",
 ];
+
+pub const MACOS_REMEDIATION_SCENARIOS: &[&str] = &[
+    "guardian_and_launcher_loss_never_execute_target_marker",
+    "missing_helper_and_unacknowledged_readiness_have_bounded_typed_failures",
+    "disarm_timeout_has_nonblocking_drop_and_eventual_owned_reap",
+    "private_protocol_rejects_truncation_duplicates_and_wrong_binding",
+    "installed_layout_probe_works_with_spaces_minimal_path_and_closed_stdio",
+    "large_poll_interval_cannot_postpone_a_short_deadline",
+    "target_exec_failure_is_distinct_from_reserved_child_exit",
+    "requested_deadline_expires_during_unacknowledged_startup",
+    "stalled_inspector_is_bounded_and_guardian_retirement_progresses",
+    "stopped_guardian_cleans_observed_descendant_after_root_and_frontend_exit",
+    "bounded_child_slots_and_descriptors_recover_after_repeated_launches",
+];
+
+pub fn macos_scenarios() -> Vec<&'static str> {
+    MACOS_LIFECYCLE_SCENARIOS
+        .iter()
+        .chain(MACOS_REMEDIATION_SCENARIOS)
+        .copied()
+        .chain(["installed_package_execution_probe_and_deadline"])
+        .collect()
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CertificationRecord {
@@ -1544,12 +1572,13 @@ fn validate_split_windows_certification(
 
 fn validate_macos_report(bytes: &[u8], spec: ReportSpec, expected_commit: &str) -> Result<()> {
     let report: MacosAcceptanceReport = serde_json::from_slice(bytes)?;
-    let expected_count = u32::try_from(MACOS_SCENARIOS.len()).expect("static inventory fits");
-    let ordered_scenarios_match = report.scenarios.len() == MACOS_SCENARIOS.len()
+    let scenarios = macos_scenarios();
+    let expected_count = u32::try_from(scenarios.len()).expect("static inventory fits");
+    let ordered_scenarios_match = report.scenarios.len() == scenarios.len()
         && report
             .scenarios
             .iter()
-            .zip(MACOS_SCENARIOS)
+            .zip(&scenarios)
             .all(|(actual, expected)| actual == expected);
     if report.schema != 1
         || report.backend != spec.backend

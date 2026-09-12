@@ -27,6 +27,8 @@ pub const NATIVE_ARCHIVE_STATIC_PATHS: &[&str] = &[
     "spec/sealed-windows-provider-v1.md",
     "spec/sealed-windows-v2.md",
     "spec/windows-causal-diagnostics-v1.md",
+    "spec/macos-native-launch-v1.md",
+    "crates/memcordon-core/tests/fixtures/windows-response-frame-prefixes.json",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
