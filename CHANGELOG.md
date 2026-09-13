@@ -2,7 +2,40 @@
 
 All notable user-visible changes to MemCordon are documented here.
 
-## Unreleased
+## [0.5.4-rc.1] - 2026-09-13
+
+### Added
+
+- Added `doctor --probe-execution` to check that macOS can start a command and
+  clean it up afterward.
+- Failed macOS launches can now report which startup step failed, the
+  operating-system error, and whether cleanup also failed.
+
+### Fixed
+
+- macOS commands start only after cleanup protection is ready.
+- macOS deadlines now include startup and process inspection. Short deadlines
+  no longer wait for a longer polling interval to elapse.
+- Improved cleanup of background processes on macOS after the main command
+  exits or MemCordon stops unexpectedly, including previously observed
+  processes that start new sessions.
+- Reduced false incomplete-cleanup reports on macOS when process inspection
+  is temporarily busy.
+- Strict workload reports now reject success or restart authorization when
+  workload-policy cleanup is unconfirmed. Failed runs retain their original
+  outcome.
+
+### Compatibility
+
+- `doctor --probe-execution --json` returns a separate schema-1
+  `doctor-execution-probe` object containing the doctor report and execution
+  result. Ordinary doctor JSON remains schema 6.
+- Execution reports remain schema 9. Consumers that reject unknown JSON fields
+  must handle the optional `native_startup` field in failure records.
+- Rust callers constructing `Error`, `ExecutionErrorReport`, or
+  `SupervisionErrorRecord` directly must initialize `native_startup` (use `None`
+  when unavailable). Exhaustive matches must also handle the new
+  `ReportModelError::NativeStartup` variant.
 
 ## [0.5.3-rc.4] - 2026-09-09
 
