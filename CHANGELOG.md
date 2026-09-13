@@ -6,21 +6,25 @@ All notable user-visible changes to MemCordon are documented here.
 
 ### Fixed
 
-- macOS deadline supervision retains target custody in the guardian, separates
-  useful-work expiry from cleanup reserves, and counts setup and system sleep.
-- macOS result output and report persistence have a bounded writer, so an unread
-  diagnostic pipe or stalled report destination cannot indefinitely hold the
-  frontend after native supervision ends. Failed delivery returns `125`.
-- Pre-release attempts no longer count as confirmed target authorizations or
-  authorize restarts without complete retirement evidence.
+- macOS deadlines include startup time and time spent asleep. Deadlines that
+  expire during sleep are handled when the machine resumes. Cleanup has a
+  separate time allowance and does not extend the command's execution budget.
+- On macOS, unread diagnostic output or a stalled report destination no longer
+  causes MemCordon to wait indefinitely after command supervision ends.
+  Failure to deliver output or save the report returns exit code `125`.
+- Attempts interrupted before a command is allowed to run no longer count as
+  confirmed starts. Restarts require confirmed cleanup of the previous attempt.
 
 ### Compatibility
 
-- Execution reports use schema 10 with optional target identity, explicit
-  authorization uncertainty, and runtime deadline and retirement evidence.
-- Plan reports use schema 9 to identify the macOS continuous clock and origin
-  before helper setup. Ordinary doctor reports remain schema 6.
-- The macOS guardian is now the native parent of the target process.
+- Execution JSON consumers must support schema 10 (previously 9), including
+  an absent target PID when no process was created, uncertainty about whether
+  a command was allowed to run, and additional deadline and cleanup details.
+- Plan JSON consumers must support schema 9 (previously 8), which identifies
+  the macOS clock that counts system sleep and the deadline's starting point
+  before startup. Ordinary doctor reports remain schema 6.
+- On macOS, commands that inspect their parent PID now see the guardian process
+  instead of the main MemCordon process.
 
 ## [0.5.4-rc.1] - 2026-09-13
 
