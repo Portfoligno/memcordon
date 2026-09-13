@@ -4,6 +4,8 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+## [0.5.5-rc.1] - 2026-09-13
+
 ### Fixed
 
 - macOS deadlines include startup time and time spent asleep. Deadlines that
