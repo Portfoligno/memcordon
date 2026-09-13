@@ -498,7 +498,7 @@ fn main() {
         .unwrap_or_else(|| fail("a fixture subcommand is required"));
     let status = match command.as_str() {
         #[cfg(target_os = "macos")]
-        "__macos-guardian" => loop {
+        "__macos-guardian" | "__macos-guardian-envelope-v1" => loop {
             std::thread::park();
         },
         #[cfg(target_os = "macos")]
@@ -518,6 +518,161 @@ fn main() {
             std::fs::write(gate.with_extension("changed"), b"changed\n")
                 .unwrap_or_else(|error| fail(error.to_string()));
             std::thread::sleep(Duration::from_secs(20));
+            0
+        }
+        #[cfg(target_os = "macos")]
+        "macos-envelope-parent" => {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            use std::os::unix::ffi::OsStringExt;
+            let image = PathBuf::from(take_value(&mut args, "memcordon image"));
+            let fixture = PathBuf::from(take_value(&mut args, "target fixture"));
+            let directory = PathBuf::from(take_value(&mut args, "target directory"));
+            std::fs::write(directory.join("source"), b"envelope-source\n").unwrap();
+            let source = std::fs::File::open(directory.join("source")).unwrap();
+            let fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD, 64) };
+            if fd < 0 {
+                fail(io::Error::last_os_error().to_string());
+            }
+            let _inherited = unsafe { OwnedFd::from_raw_fd(fd) };
+            let mut mask = 0;
+            unsafe {
+                libc::sigemptyset(&mut mask);
+                libc::sigaddset(&mut mask, libc::SIGUSR2);
+                if libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
+                    fail("cannot set fixture signal mask");
+                }
+                if libc::signal(libc::SIGUSR1, libc::SIG_IGN) == libc::SIG_ERR {
+                    fail("cannot set fixture signal disposition");
+                }
+                libc::umask(0o027);
+            }
+            let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) } != 0 {
+                fail("cannot read fixture descriptor limit");
+            }
+            let mut limits = unsafe { limits.assume_init() };
+            limits.rlim_cur = 256;
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
+                fail("cannot set fixture descriptor limit");
+            }
+            let status = Command::new(image)
+                .args(["+2s", "--"])
+                .arg(fixture)
+                .arg("macos-envelope-target")
+                .arg(&directory)
+                .arg(fd.to_string())
+                .arg(OsString::from_vec(b"native argument \xff".to_vec()))
+                .current_dir(&directory)
+                .env("PATH", OsString::from_vec(b"/native-path-\xff".to_vec()))
+                .status()
+                .unwrap();
+            status.code().unwrap_or(125)
+        }
+        #[cfg(target_os = "macos")]
+        "macos-envelope-target" => {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let directory = PathBuf::from(take_value(&mut args, "expected directory"));
+            let descriptor: i32 = take_value(&mut args, "inherited descriptor")
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let argument = take_value(&mut args, "native argument");
+            if argument.as_bytes() != b"native argument \xff" {
+                fail("native argument bytes changed");
+            }
+            if std::env::var_os("PATH").unwrap().as_bytes() != b"/native-path-\xff" {
+                fail("native environment bytes changed");
+            }
+            let actual_cwd = std::fs::metadata(std::env::current_dir().unwrap()).unwrap();
+            let expected_cwd = std::fs::metadata(&directory).unwrap();
+            if (actual_cwd.dev(), actual_cwd.ino()) != (expected_cwd.dev(), expected_cwd.ino()) {
+                fail("caller cwd changed");
+            }
+            let mut mask = 0;
+            if unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) } != 0
+                || unsafe { libc::sigismember(&mask, libc::SIGUSR2) } != 1
+            {
+                fail("caller signal mask changed");
+            }
+            let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+            if unsafe { libc::sigaction(libc::SIGUSR1, std::ptr::null(), action.as_mut_ptr()) } != 0
+                || unsafe { action.assume_init() }.sa_sigaction != libc::SIG_IGN
+            {
+                fail("caller ignored signal changed");
+            }
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0
+                || unsafe { limit.assume_init() }.rlim_cur != 256
+            {
+                fail("caller resource limit changed");
+            }
+            let expected = b"envelope-source\n";
+            let mut contents = vec![0; expected.len()];
+            if unsafe { libc::pread(descriptor, contents.as_mut_ptr().cast(), contents.len(), 0) }
+                != expected.len() as isize
+                || contents != expected
+            {
+                fail("intended descriptor mapping changed");
+            }
+            for fd in 3..unsafe { libc::getdtablesize() } {
+                if fd != descriptor && unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
+                    fail("unmanifested descriptor survived target exec");
+                }
+            }
+            let output = directory.join("created");
+            std::fs::write(&output, b"caller envelope preserved\n").unwrap();
+            if std::fs::metadata(output).unwrap().permissions().mode() & 0o777 != 0o640 {
+                fail("caller umask changed");
+            }
+            0
+        }
+        #[cfg(target_os = "macos")]
+        "macos-accounting-backend" => {
+            let image = PathBuf::from(take_value(&mut args, "memcordon image"));
+            let fixture = PathBuf::from(take_value(&mut args, "target fixture"));
+            let mut policy =
+                memcordon_core::Policy::new(memcordon_core::ByteSize::from_bytes(16 * 1024 * 1024))
+                    .with_deadline(Duration::from_secs(5))
+                    .unwrap();
+            policy.metric = memcordon_core::Metric::Rss;
+            let command = memcordon_core::CommandSpec::new(fixture)
+                .args(["allocate", "--bytes", "64MiB", "--hold", "20s"]);
+            let execution = memcordon_platform::run(policy, &command, &image)
+                .unwrap_or_else(|error| fail(error.to_string()));
+            if !matches!(
+                execution.outcome,
+                memcordon_core::RunOutcome::LimitExceeded { .. }
+            ) || !execution
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.is_consistent())
+                || !execution.restart_safety.is_safe()
+            {
+                fail(format!(
+                    "native memory outcome or retirement is invalid: {execution:?}"
+                ));
+            }
+            0
+        }
+        #[cfg(target_os = "macos")]
+        "macos-envelope-transfer" => {
+            let directory = PathBuf::from(take_value(&mut args, "fixture directory"));
+            memcordon_platform::test_support::macos_envelope_transfer_fixture(&directory)
+                .unwrap_or_else(|error| fail(error.to_string()));
+            0
+        }
+        #[cfg(target_os = "macos")]
+        "macos-guardian-inspector-wrapper" => {
+            let image = PathBuf::from(take_value(&mut args, "memcordon image"));
+            let fixture = PathBuf::from(take_value(&mut args, "fixture image"));
+            let directory = PathBuf::from(take_value(&mut args, "identity directory"));
+            let both = take_value(&mut args, "both inspectors") == "both";
+            memcordon_platform::test_support::macos_guardian_inspector_wrapper(
+                &image, &fixture, &directory, both,
+            )
+            .unwrap_or_else(|error| fail(error));
             0
         }
         #[cfg(target_os = "macos")]
@@ -544,6 +699,17 @@ fn main() {
             126
         }
         "exit" => exit_fixture(args),
+        #[cfg(target_os = "macos")]
+        "macos-ignore-term" => {
+            let marker = PathBuf::from(take_value(&mut args, "signal readiness marker"));
+            if unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) } == libc::SIG_ERR {
+                fail("cannot ignore graceful signal");
+            }
+            fs::write(marker, b"signal-ready\n").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
         "hold" | "wait-for-signal" => {
             hold(args);
             0

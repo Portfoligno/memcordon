@@ -7,6 +7,7 @@ fuzz_target!(|count: u16| {
         history
             .append(
                 memcordon_core::AttemptRecord {
+                    runtime: None,
                     number,
                     kind: if number == 1 {
                         memcordon_core::AttemptKind::Initial

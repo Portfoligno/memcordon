@@ -1,4 +1,6 @@
 mod application;
+#[cfg(target_os = "macos")]
+mod result_delivery;
 pub(crate) use application::{clean, doctor, execute, plan};
 
 #[cfg(unix)]
@@ -15,6 +17,29 @@ const LAUNCHER_STATUS_ERROR: u8 = 2;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InternalInvocation {
     Probe,
+    #[cfg(target_os = "macos")]
+    ResultWriter,
+    #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+    SynchronousStderrMutant,
+    #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+    ResultWriterFault {
+        phase: memcordon_core::ReportWritePhase,
+        input: std::path::PathBuf,
+        output: std::path::PathBuf,
+        marker: std::path::PathBuf,
+    },
+    #[cfg(target_os = "macos")]
+    MacosInspector {
+        descriptor: i32,
+        run: u64,
+    },
+    #[cfg(target_os = "macos")]
+    MacosEnvelopedGuardian {
+        descriptor: i32,
+        run: u64,
+        envelope: i32,
+        command: Vec<std::ffi::OsString>,
+    },
     #[cfg(target_os = "macos")]
     MacosHelper {
         guardian: bool,
@@ -37,6 +62,80 @@ pub(crate) fn route_internal(
     argv: &[std::ffi::OsString],
 ) -> Option<Result<InternalInvocation, &'static str>> {
     let name = argv.first()?;
+    #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+    if name == "__result-writer-synchronous-stderr-mutant" {
+        return Some(if argv.len() == 1 {
+            Ok(InternalInvocation::SynchronousStderrMutant)
+        } else {
+            Err("stderr mutation accepts no arguments")
+        });
+    }
+    #[cfg(target_os = "macos")]
+    if name == "__macos-guardian-envelope-v1" {
+        return Some((|| {
+            if argv.len() < 6 || argv.get(4).is_none_or(|value| value != "--") {
+                return Err("invalid caller envelope invocation");
+            }
+            let descriptor = parse_nonnegative_descriptor(argv.get(1))
+                .map_err(|_| "invalid guardian descriptor")?;
+            let envelope = parse_nonnegative_descriptor(argv.get(3))
+                .map_err(|_| "invalid envelope descriptor")?;
+            let run = argv[2]
+                .to_str()
+                .and_then(|value| value.parse().ok())
+                .ok_or("invalid guardian run binding")?;
+            Ok(InternalInvocation::MacosEnvelopedGuardian {
+                descriptor,
+                run,
+                envelope,
+                command: argv.iter().skip(5).cloned().collect(),
+            })
+        })());
+    }
+    #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+    if name == "__result-writer-fault" {
+        return Some((|| {
+            if argv.len() != 5 {
+                return Err("writer fault requires phase and three paths");
+            }
+            let phase = match argv[1].to_str() {
+                Some("before-write") => memcordon_core::ReportWritePhase::BeforeWrite,
+                Some("before-rename") => memcordon_core::ReportWritePhase::BeforeRename,
+                Some("before-ack") => memcordon_core::ReportWritePhase::BeforeAck,
+                _ => return Err("unknown writer barrier"),
+            };
+            Ok(InternalInvocation::ResultWriterFault {
+                phase,
+                input: argv[2].clone().into(),
+                output: argv[3].clone().into(),
+                marker: argv[4].clone().into(),
+            })
+        })());
+    }
+    #[cfg(target_os = "macos")]
+    if name == "__macos-inspector-v1" {
+        return Some((|| {
+            if argv.len() != 3 {
+                return Err("inspector requires descriptor and run binding");
+            }
+            let descriptor = parse_nonnegative_descriptor(argv.get(1))
+                .map_err(|_| "invalid inspector descriptor")?;
+            let run = argv
+                .get(2)
+                .and_then(|value| value.to_str())
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or("invalid inspector run binding")?;
+            Ok(InternalInvocation::MacosInspector { descriptor, run })
+        })());
+    }
+    #[cfg(target_os = "macos")]
+    if name == "__result-writer-v1" {
+        return Some(if argv.len() == 1 {
+            Ok(InternalInvocation::ResultWriter)
+        } else {
+            Err("result writer accepts no arguments")
+        });
+    }
     if name == "__execution-probe" {
         return Some(if argv.len() == 1 {
             Ok(InternalInvocation::Probe)
@@ -57,8 +156,7 @@ pub(crate) fn route_internal(
                 .ok_or("invalid macOS helper run binding")?;
             let command = if guardian && argv.len() == 3 {
                 Vec::new()
-            } else if !guardian && argv.len() >= 5 && argv.get(3).is_some_and(|value| value == "--")
-            {
+            } else if argv.len() >= 5 && argv.get(3).is_some_and(|value| value == "--") {
                 argv.iter().skip(4).cloned().collect()
             } else {
                 return Err("invalid macOS helper invocation");
@@ -129,6 +227,28 @@ fn parse_positive_process_group(value: Option<&std::ffi::OsString>) -> Result<i3
 pub(crate) fn execute_internal(invocation: InternalInvocation) -> i32 {
     match invocation {
         InternalInvocation::Probe => 0,
+        #[cfg(target_os = "macos")]
+        InternalInvocation::ResultWriter => result_delivery::writer(),
+        #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+        InternalInvocation::SynchronousStderrMutant => result_delivery::synchronous_stderr_mutant(),
+        #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+        InternalInvocation::ResultWriterFault {
+            phase,
+            input,
+            output,
+            marker,
+        } => result_delivery::fault_test(phase, &input, &output, &marker),
+        #[cfg(target_os = "macos")]
+        InternalInvocation::MacosInspector { descriptor, run } => {
+            memcordon_platform::macos_inspector(descriptor, run)
+        }
+        #[cfg(target_os = "macos")]
+        InternalInvocation::MacosEnvelopedGuardian {
+            descriptor,
+            run,
+            envelope,
+            command,
+        } => memcordon_platform::macos_enveloped_helper(descriptor, run, envelope, &command),
         #[cfg(target_os = "macos")]
         InternalInvocation::MacosHelper {
             guardian,

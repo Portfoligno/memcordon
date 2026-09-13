@@ -778,6 +778,179 @@ pub fn delegated_linux_certification(
     )
 }
 
+fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Err(CiError::Message(
+            "macos-deadline requires native macOS".into(),
+        ));
+    }
+    let evidence = root.join("target/ci/deadline-evidence");
+    if evidence.exists() {
+        fs::remove_dir_all(&evidence)?;
+    }
+    fs::create_dir_all(&evidence)?;
+    fs::write(
+        evidence.join("begin.json"),
+        b"{\"schema_version\":1,\"status\":\"building\"}\n",
+    )?;
+    let result = (|| -> Result<()> {
+        for scenario in [
+            "pending_metric_query_is_answered_before_empty_inspector_retirement",
+            "malformed_native_pid_listings_never_certify_absence",
+            "unresolved_known_identity_is_retained_even_after_root_exit",
+            "mutation_unknown_member_dropping_is_detected",
+            "unrelated_inaccessible_process_does_not_poison_scoped_absence",
+            "unresolved_new_group_member_prevents_false_empty_inventory",
+            "positively_observed_pid_replacement_discharges_only_old_identity",
+            "detached_child_survives_root_exit_and_group_change",
+            "new_confirmed_members_survive_a_concurrent_metadata_failure",
+        ] {
+            let output = cargo(
+                root,
+                stable,
+                "test",
+                [
+                    "--locked",
+                    "--target-dir",
+                    "target/ci/deadline-build",
+                    "--package",
+                    "memcordon-platform",
+                    "--features",
+                    "test-support",
+                    "--test",
+                    "macos_inventory",
+                    scenario,
+                    "--",
+                    "--exact",
+                    "--test-threads=1",
+                ],
+            )?;
+            capability::require_exact_standard_test_success(&output, scenario)?;
+        }
+        for scenario in memcordon_ci::release_evidence::MACOS_REMEDIATION_SCENARIOS {
+            let output = cargo(
+                root,
+                stable,
+                "test",
+                [
+                    "--locked",
+                    "--target-dir",
+                    "target/ci/deadline-build",
+                    "--package",
+                    "memcordon",
+                    "--features",
+                    "test-fixtures",
+                    "--test",
+                    "macos_remediation",
+                    scenario,
+                    "--",
+                    "--exact",
+                    "--test-threads=1",
+                ],
+            )?;
+            capability::require_exact_standard_test_success(&output, scenario)?;
+        }
+        let output = cargo(
+            root,
+            stable,
+            "test",
+            [
+                "--locked",
+                "--target-dir",
+                "target/ci/deadline-build",
+                "--package",
+                "memcordon",
+                "--features",
+                "test-fixtures",
+                "--test",
+                "result_delivery",
+                "result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped",
+                "--",
+                "--exact",
+                "--test-threads=1",
+            ],
+        )?;
+        capability::require_exact_standard_test_success(
+            &output,
+            "result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped",
+        )?;
+        let mut mutations = Vec::new();
+        for (package, target, scenario) in memcordon_ci::release_evidence::MACOS_MUTATION_SCENARIOS
+        {
+            let output = cargo(
+                root,
+                stable,
+                "test",
+                [
+                    "--locked",
+                    "--target-dir",
+                    "target/ci/deadline-build",
+                    "--package",
+                    package,
+                    "--features",
+                    "test-support",
+                    "--test",
+                    target,
+                    scenario,
+                    "--",
+                    "--exact",
+                    "--test-threads=1",
+                ],
+            )?;
+            capability::require_exact_standard_test_success(&output, scenario)?;
+            mutations.push(serde_json::json!({"package": package, "target": target, "scenario": scenario, "executed": 1, "passed": 1}));
+        }
+        let mut inventory = serde_json::to_vec_pretty(
+            &serde_json::json!({"schema_version": 1, "native_scenarios": memcordon_ci::release_evidence::MACOS_REMEDIATION_SCENARIOS, "writer_barrier_scenarios": 3, "mutations": mutations}),
+        )?;
+        inventory.push(b'\n');
+        fs::write(evidence.join("native-inventory.json"), inventory)?;
+        cargo(
+            root,
+            stable,
+            "build",
+            [
+                "--locked",
+                "--target-dir",
+                "target/ci/deadline-build",
+                "--package",
+                "memcordon",
+                "--bin",
+                "memcordon",
+            ],
+        )?;
+        cargo(
+            root,
+            stable,
+            "build",
+            [
+                "--locked",
+                "--target-dir",
+                "target/ci/deadline-oracle-build",
+                "--package",
+                "memcordon-deadline-oracle",
+            ],
+        )?;
+        CommandSpec::new(
+            root.join("target/ci/deadline-oracle-build/debug/memcordon-deadline-oracle"),
+            root,
+            Duration::from_secs(60),
+        )
+        .arg(root.join("target/ci/deadline-build/debug/memcordon"))
+        .arg(&evidence)
+        .run()?;
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        let mut bytes = serde_json::to_vec_pretty(
+            &serde_json::json!({"schema_version": 1, "passed": false, "error": error.to_string()}),
+        )?;
+        bytes.push(b'\n');
+        fs::write(evidence.join("final.json"), bytes)?;
+    }
+    result
+}
+
 fn macos_acceptance(root: &Path, stable: &str) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Err(CiError::Message(
@@ -862,6 +1035,7 @@ fn macos_acceptance(root: &Path, stable: &str) -> Result<()> {
             "installed macOS package did not enforce its deadline".into(),
         ));
     }
+    macos_deadline(root, stable)?;
     let scenarios = memcordon_ci::release_evidence::macos_scenarios();
     let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
         .map_err(|error| CiError::Message(error.to_string()))?
@@ -937,6 +1111,7 @@ pub fn run(root: &Path, suite: Suite) -> Result<()> {
             crate::sealed_windows::channel_parity(root, &toolchains.stable)
         }
         Suite::BackendMacosWatchdog => macos_acceptance(root, &toolchains.stable),
+        Suite::MacosDeadline => macos_deadline(root, &toolchains.stable),
         Suite::ReleasePreflight => {
             release::preflight(root)?;
             policy::run(root)?;

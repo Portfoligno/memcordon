@@ -13,7 +13,7 @@ publish = ["crates-io"]
 autobins = false
 
 [features]
-test-fixtures = ["memcordon-platform/test-support"]
+test-fixtures = ["memcordon-platform/test-support", "memcordon-core/test-support"]
 test-support = ["memcordon-platform/test-support", "test-fixtures"]
 
 [[bin]]

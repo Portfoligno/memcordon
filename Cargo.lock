@@ -638,6 +638,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memcordon-deadline-oracle"
+version = "0.5.5-dev"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "memcordon-platform"
 version = "0.5.5-dev"
 dependencies = [

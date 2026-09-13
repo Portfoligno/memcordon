@@ -1,7 +1,26 @@
 //! Native containment used only by black-box process tests.
+#[cfg(target_os = "macos")]
+pub use crate::macos_deadline::retirement_mutation_probe as macos_retirement_mutation_probe;
 
 #[cfg(target_os = "macos")]
+pub use crate::macos_watchdog::inventory_reconciliation as macos_inventory_reconciliation;
+#[cfg(target_os = "macos")]
+pub use crate::macos_watchdog::pid_inventory_reply as macos_pid_inventory_reply;
+
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::clock_jump as macos_clock_jump;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::control_flood as macos_control_flood;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::repeated_stop as macos_repeated_stop;
+#[cfg(target_os = "macos")]
 pub use crate::macos_launch::resource_recovery as macos_resource_recovery;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::running_guardian_loss as macos_running_guardian_loss;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::submillisecond_deadline as macos_submillisecond_deadline;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::timer_mutation_detected as macos_timer_mutation_detected;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::{
     LaunchFault as MacosLaunchFault, disarm_timeout as macos_disarm_timeout,
@@ -9,9 +28,18 @@ pub use crate::macos_launch::{
 };
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::{
-    custody_wrapper as macos_custody_wrapper, inspector_stall as macos_inspector_stall,
+    custody_wrapper as macos_custody_wrapper,
+    guardian_inspector_wrapper as macos_guardian_inspector_wrapper,
+    inspector_stall as macos_inspector_stall,
+};
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::{
+    empty_inventory_query_transition as macos_empty_inventory_query_transition,
+    nonempty_inventory_query_transition as macos_nonempty_inventory_query_transition,
 };
 
+#[cfg(target_os = "macos")]
+pub use crate::macos_envelope::transfer_fixture as macos_envelope_transfer_fixture;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Child, Command};

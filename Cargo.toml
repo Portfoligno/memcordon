@@ -6,6 +6,7 @@ members = [
     "crates/memcordon-cli",
     "crates/memcordon-testkit",
     "tools/memcordon-ci",
+    "tools/memcordon-deadline-oracle",
     "tools/memcordon-windows-loader-lab",
 ]
 resolver = "2"

@@ -4,6 +4,24 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- macOS deadline supervision retains target custody in the guardian, separates
+  useful-work expiry from cleanup reserves, and counts setup and system sleep.
+- macOS result output and report persistence have a bounded writer, so an unread
+  diagnostic pipe or stalled report destination cannot indefinitely hold the
+  frontend after native supervision ends. Failed delivery returns `125`.
+- Pre-release attempts no longer count as confirmed target authorizations or
+  authorize restarts without complete retirement evidence.
+
+### Compatibility
+
+- Execution reports use schema 10 with optional target identity, explicit
+  authorization uncertainty, and runtime deadline and retirement evidence.
+- Plan reports use schema 9 to identify the macOS continuous clock and origin
+  before helper setup. Ordinary doctor reports remain schema 6.
+- The macOS guardian is now the native parent of the target process.
+
 ## [0.5.4-rc.1] - 2026-09-13
 
 ### Added

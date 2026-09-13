@@ -707,7 +707,6 @@ impl SupervisionErrorRecord {
                     && self.supervision_phase == SupervisionPhase::ActiveAttempt
                     && self.launch_phase.as_deref() == Some("runtime-backend-evidence")
                     && self.attempt_number.is_some()
-                    && self.target_released
                     && self.initial_spawn_failure.is_none()
                     && self.provider_rejection.is_none()
                     && value.is_consistent()
@@ -797,6 +796,7 @@ impl Default for RestartDecisionRecord {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AttemptRecord {
+    pub runtime: Option<crate::RuntimeEvidenceV1>,
     pub policy_enforcement: crate::workload_evidence::AttemptPolicyEnforcementV1,
     pub number: u64,
     pub kind: AttemptKind,
@@ -857,6 +857,7 @@ impl AttemptHistory {
             return Err(SupervisionModelError::AttemptNumber);
         }
         let mut next_aggregates = aggregates.clone();
+        next_aggregates.observe_authorization(&record)?;
         if let Some(outcome) = &record.outcome {
             next_aggregates.observe_outcome(outcome)?;
         } else if let Some(error) = &record.error {
@@ -899,6 +900,37 @@ impl AttemptHistory {
 impl AttemptRecord {
     fn is_consistent(&self) -> bool {
         self.policy_enforcement.is_consistent()
+            && self.target_pid.is_none_or(|pid| pid > 0)
+            && self.runtime.as_ref().is_none_or(|runtime| {
+                runtime.is_consistent()
+                    && (runtime.retirement.is_complete()
+                        || self
+                            .outcome
+                            .as_ref()
+                            .is_none_or(|outcome| outcome_status(outcome) != 0))
+                    && runtime.target_pid.map(std::num::NonZeroU32::get) == self.target_pid
+                    && match runtime.release {
+                        crate::ReleaseEvidence::Issued { exec_confirmed, .. } => {
+                            self.launch.target_released
+                                && self.authorized_offset_ms.is_some()
+                                && self.launch.containment_verified_before_authorization
+                                && self.launch.guardian_started_before_authorization
+                                && (exec_confirmed
+                                    || self
+                                        .outcome
+                                        .as_ref()
+                                        .is_none_or(|outcome| outcome_status(outcome) != 0))
+                        }
+                        crate::ReleaseEvidence::NotIssued => {
+                            !self.launch.target_released && self.authorized_offset_ms.is_none()
+                        }
+                        crate::ReleaseEvidence::Unknown => {
+                            !self.launch.target_released
+                                && self.authorized_offset_ms.is_none()
+                                && !self.restart_safety.is_safe()
+                        }
+                    }
+            })
             && self.number > 0
             && self.outcome.is_some() != self.error.is_some()
             && self
@@ -940,6 +972,7 @@ impl<'de> Deserialize<'de> for AttemptRecord {
         #[derive(Deserialize)]
         struct Wire {
             number: u64,
+            runtime: Option<crate::RuntimeEvidenceV1>,
             policy_enforcement: crate::workload_evidence::AttemptPolicyEnforcementV1,
             kind: AttemptKind,
             phase: AttemptPhase,
@@ -957,6 +990,7 @@ impl<'de> Deserialize<'de> for AttemptRecord {
         }
         let wire = Wire::deserialize(deserializer)?;
         let record = Self {
+            runtime: wire.runtime,
             number: wire.number,
             policy_enforcement: wire.policy_enforcement,
             kind: wire.kind,
@@ -1008,6 +1042,10 @@ impl<'de> Deserialize<'de> for AttemptHistory {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SupervisionAggregates {
+    pub confirmed_authorizations: u64,
+    pub unknown_authorization_attempts: u64,
+    pub retry_attempts_started: u64,
+    pub confirmed_retry_authorizations: u64,
     pub child_exits: u64,
     pub memory_limits: u64,
     pub deadlines: u64,
@@ -1018,6 +1056,74 @@ pub struct SupervisionAggregates {
 }
 
 impl SupervisionAggregates {
+    pub(crate) fn authorizations_match<'a>(
+        &self,
+        records: impl Iterator<Item = &'a AttemptRecord>,
+        total: u64,
+        omitted: u64,
+    ) -> bool {
+        let mut retained = Self::default();
+        for record in records {
+            if retained.observe_authorization(record).is_err() {
+                return false;
+            }
+        }
+        self.confirmed_authorizations
+            .checked_add(self.unknown_authorization_attempts)
+            .is_some_and(|count| count <= total)
+            && self.retry_attempts_started <= total.saturating_sub(1)
+            && self.confirmed_retry_authorizations <= self.confirmed_authorizations
+            && self.confirmed_retry_authorizations <= self.retry_attempts_started
+            && [
+                (
+                    self.confirmed_authorizations,
+                    retained.confirmed_authorizations,
+                ),
+                (
+                    self.unknown_authorization_attempts,
+                    retained.unknown_authorization_attempts,
+                ),
+                (self.retry_attempts_started, retained.retry_attempts_started),
+                (
+                    self.confirmed_retry_authorizations,
+                    retained.confirmed_retry_authorizations,
+                ),
+            ]
+            .into_iter()
+            .all(|(all, visible)| {
+                all.checked_sub(visible)
+                    .is_some_and(|evicted| evicted <= omitted)
+            })
+    }
+    fn observe_authorization(
+        &mut self,
+        record: &AttemptRecord,
+    ) -> Result<(), SupervisionModelError> {
+        let unknown = record
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| matches!(runtime.release, crate::ReleaseEvidence::Unknown));
+        for (counter, increment) in [
+            (
+                &mut self.confirmed_authorizations,
+                record.launch.target_released,
+            ),
+            (&mut self.unknown_authorization_attempts, unknown),
+            (
+                &mut self.retry_attempts_started,
+                record.kind != AttemptKind::Initial,
+            ),
+            (
+                &mut self.confirmed_retry_authorizations,
+                record.kind != AttemptKind::Initial && record.launch.target_released,
+            ),
+        ] {
+            *counter = counter
+                .checked_add(u64::from(increment))
+                .ok_or(SupervisionModelError::CounterRange)?;
+        }
+        Ok(())
+    }
     pub fn observe_outcome(&mut self, outcome: &RunOutcome) -> Result<(), SupervisionModelError> {
         let counter = match outcome {
             RunOutcome::Exited { .. } => &mut self.child_exits,
@@ -1122,8 +1228,6 @@ impl RestartSummary {
     }
     pub(crate) fn is_consistent(&self, targets_authorized: u64) -> bool {
         self.restarts_launched <= targets_authorized
-            && (targets_authorized == 0 || self.restarts_launched == targets_authorized - 1)
-            && (!self.enabled || targets_authorized > 0)
     }
     fn is_standalone_valid(&self) -> bool {
         self.cooldowns <= self.circuit_open_count
@@ -1264,7 +1368,12 @@ impl SupervisionExecution {
             || attempts.retained() > DETAILED_ATTEMPT_CAPACITY
             || attempts.omitted != attempts.total.saturating_sub(attempts.retained() as u64)
             || restart.restarts_launched > targets_authorized
-            || (targets_authorized > 0 && restart.restarts_launched != targets_authorized - 1)
+            || targets_authorized != aggregates.confirmed_authorizations
+            || !aggregates.authorizations_match(
+                attempts.records(),
+                attempts.total,
+                attempts.omitted,
+            )
         {
             return Err(SupervisionModelError::InconsistentExecution);
         }

@@ -8,7 +8,9 @@
 #![forbid(unsafe_code)]
 
 pub mod diagnostics;
+pub mod runtime_evidence;
 pub mod runtime_manifest;
+pub use runtime_evidence::*;
 pub mod workload_codec;
 pub mod workload_contract;
 pub mod workload_discovery;
@@ -43,6 +45,8 @@ pub use policy::{
     Enforcement, Lifetime, Metric, Policy, SwapPolicy,
 };
 pub use policy::{DeadlinePolicy, DeadlineScope};
+#[cfg(feature = "test-support")]
+pub use report::write_report_atomic_with_test_barrier;
 pub use report::{
     AttemptHistoryReport, BackoffPolicyReport, BudgetKindReport, BudgetTokenReport,
     CLEAN_REPORT_SCHEMA_VERSION, CircuitBreakerPolicyReport, CleanReport,
@@ -51,7 +55,7 @@ pub use report::{
     EffectiveRestartPolicyReport, ExecutionErrorReport, HostReport, InvocationReport,
     MemcordonReport, NativeArgument, NativeArgumentRaw, OptionEffectReport,
     PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanResolutionReport, PolicyEnvelopeReport,
-    ReportModelError, RequestedMemoryPolicyReport, RequestedPolicyReport,
+    ReportModelError, ReportWritePhase, RequestedMemoryPolicyReport, RequestedPolicyReport,
     RequestedRestartPolicyReport, RequirementReport, SupervisionReport, SwapReport, ToolReport,
     UnavailableCapabilityReport, write_report_atomic,
 };

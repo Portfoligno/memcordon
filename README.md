@@ -53,6 +53,12 @@ the host permits it. macOS uses sampled watchdog monitoring, which can overshoot
 or miss short bursts. `memcordon doctor --json` reports backend capabilities and
 host limitations without launching a workload.
 
+On macOS the guardian owns the target and services its deadline independently
+of ordinary sampling. Setup counts toward the budget, with separate bounded
+cleanup and result-delivery reserves. Reports use schema 10 and distinguish
+confirmed execution from unknown authorization or incomplete cleanup; see the
+[deadline contract](docs/reference.md#deadline-scopes).
+
 ## Reference
 
 - Run `memcordon --help` or `memcordon help` for command-line reference.

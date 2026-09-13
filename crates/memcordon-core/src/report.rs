@@ -14,8 +14,8 @@ use crate::{
     SupervisionAggregates, SupervisionExecution, SupervisionPhase, SupervisionTerminal,
 };
 
-pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 9;
-pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 8;
+pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 10;
+pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 9;
 pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 6;
 pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 2;
 
@@ -32,6 +32,18 @@ pub struct MemcordonReport {
 }
 
 impl MemcordonReport {
+    /// Builds the current schema-10 report. Older constructor names are aliases,
+    /// not historical schema writers.
+    pub fn schema10(
+        tool: ToolReport,
+        invocation: InvocationReport,
+        policy: PolicyEnvelopeReport,
+        backend: Option<BackendCapabilityReport>,
+        supervision: Option<SupervisionExecution>,
+        error: Option<ExecutionErrorReport>,
+    ) -> Result<Self, ReportModelError> {
+        Self::schema9(tool, invocation, policy, backend, supervision, error)
+    }
     pub fn schema9(
         tool: ToolReport,
         invocation: InvocationReport,
@@ -254,6 +266,16 @@ fn validate_workload_history(
 
 fn validate_provider_failure(error: Option<&ExecutionErrorReport>) -> Result<(), ReportModelError> {
     if error.is_some_and(|error| {
+        error.runtime.as_ref().is_some_and(|runtime| {
+            !runtime.is_consistent()
+                || matches!(runtime.release, crate::ReleaseEvidence::Issued { .. })
+                    != error.target_released
+                || (runtime.retirement.is_complete() && error.workload_may_be_alive)
+        })
+    }) {
+        return Err(ReportModelError::AttemptHistory);
+    }
+    if error.is_some_and(|error| {
         error.native_startup.as_ref().is_some_and(|value| {
             !value.matches_error_observations(
                 error.target_released,
@@ -332,6 +354,17 @@ fn validate_attempt_history(
         || total != summary.attempt_records_created
         || aggregate_total != Some(total)
         || summary.targets_authorized > total
+        || summary.targets_authorized != summary.aggregate.confirmed_authorizations
+        || !summary.aggregate.authorizations_match(
+            attempts.iter(),
+            total,
+            summary.attempt_history.omitted,
+        )
+        || summary.aggregate.unknown_authorization_attempts
+            > total.saturating_sub(summary.targets_authorized)
+        || summary.aggregate.confirmed_retry_authorizations > summary.targets_authorized
+        || summary.aggregate.confirmed_retry_authorizations
+            > summary.aggregate.retry_attempts_started
         || u64::try_from(retained)
             .ok()
             .and_then(|value| value.checked_add(summary.attempt_history.omitted))
@@ -761,6 +794,8 @@ pub enum OptionEffectReport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionErrorReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<crate::RuntimeEvidenceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_startup: Option<crate::NativeStartupDiagnosticV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_enforcement: Option<crate::workload_evidence::AttemptPolicyEnforcementV1>,
@@ -838,19 +873,62 @@ pub struct CleanReport {
 
 #[allow(clippy::result_large_err)]
 pub fn write_report_atomic(path: &Path, report: &MemcordonReport) -> Result<(), Error> {
+    write_report_atomic_observed(path, report, |_| {})
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReportWritePhase {
+    BeforeWrite,
+    BeforeRename,
+    BeforeAck,
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[allow(clippy::result_large_err)]
+pub fn write_report_atomic_with_test_barrier(
+    path: &Path,
+    report: &MemcordonReport,
+    barrier: ReportWritePhase,
+    marker: &Path,
+) -> Result<(), Error> {
+    write_report_atomic_observed(path, report, |phase| {
+        if phase == barrier {
+            let mut bytes =
+                serde_json::to_vec(&(std::process::id(), phase)).expect("bounded barrier marker");
+            bytes.push(b'\n');
+            std::fs::write(marker, bytes).expect("native writer barrier marker");
+            loop {
+                std::thread::park();
+            }
+        }
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn write_report_atomic_observed(
+    path: &Path,
+    report: &MemcordonReport,
+    mut observed: impl FnMut(ReportWritePhase),
+) -> Result<(), Error> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let result = (|| -> Result<(), std::io::Error> {
+        observed(ReportWritePhase::BeforeWrite);
         let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
         serde_json::to_writer_pretty(temporary.as_file_mut(), report)?;
         temporary.write_all(b"\n")?;
         temporary.flush()?;
         temporary.as_file().sync_all()?;
+        observed(ReportWritePhase::BeforeRename);
         temporary.persist(path).map_err(|error| error.error)?;
         #[cfg(unix)]
         File::open(parent)?.sync_all()?;
+        observed(ReportWritePhase::BeforeAck);
         Ok(())
     })();
     result.map_err(|error| report_error(path, error))

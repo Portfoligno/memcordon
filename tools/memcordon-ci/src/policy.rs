@@ -680,6 +680,7 @@ fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Polic
         return Err(failure("CI concurrency policy differs"));
     }
     check_runner_matrix(jobs, "native", &NATIVE_MATRIX, "CI native")?;
+    check_macos_deadline_job(jobs, "macos-deadline")?;
     let configured_matrix: Vec<&str> = policy
         .workflow
         .required_public_matrix
@@ -689,6 +690,87 @@ fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Polic
     let expected_matrix: Vec<&str> = NATIVE_MATRIX.iter().map(|(id, _)| *id).collect();
     if configured_matrix != expected_matrix {
         return Err(failure("public native matrix policy differs"));
+    }
+    Ok(())
+}
+
+fn check_macos_deadline_job(jobs: &Mapping, name: &str) -> Result<()> {
+    check_runner_matrix(
+        jobs,
+        name,
+        &[("arm64", "macos-15"), ("x64", "macos-15-intel")],
+        name,
+    )?;
+    let job = mapping(
+        jobs.get(key(name))
+            .ok_or_else(|| failure("missing macOS deadline job"))?,
+        name,
+    )?;
+    let steps = job
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("macOS deadline steps missing"))?;
+    let mut fingerprint = false;
+    let mut target_cache = false;
+    let mut qualification = false;
+    let mut failure_artifact = false;
+    for step in steps {
+        let step = mapping(step, "macOS deadline step")?;
+        if step.contains_key(key("env")) {
+            return Err(failure(
+                "macOS deadline configuration must use argv, not custom environment",
+            ));
+        }
+        if scalar(step, "run")
+            == Some("./ci-native-fingerprint --output target/ci/native-inputs.bin")
+        {
+            fingerprint = true;
+        }
+        if let Some(with) = step.get(key("with")).and_then(Value::as_mapping) {
+            if scalar(step, "uses").is_some_and(|value| value.starts_with("actions/cache/restore@"))
+                && scalar(with, "path")
+                    .is_some_and(|value| value.lines().any(|path| path.starts_with("target/")))
+            {
+                if !fingerprint
+                    || !scalar(with, "key")
+                        .is_some_and(|value| value.contains("target/ci/native-inputs.bin"))
+                {
+                    return Err(failure(
+                        "macOS compiled cache must follow and bind native fingerprint",
+                    ));
+                }
+                if scalar(with, "path").is_some_and(|value| {
+                    value
+                        .lines()
+                        .any(|path| path.contains("evidence") || path.ends_with("reports"))
+                }) {
+                    return Err(failure("macOS qualification evidence must not be cached"));
+                }
+                target_cache = true;
+            }
+            if scalar(step, "uses")
+                .is_some_and(|value| value.starts_with("actions/upload-artifact@"))
+                && scalar(with, "path") == Some("target/ci/deadline-evidence")
+                && scalar(step, "if") == Some("always()")
+            {
+                failure_artifact = true;
+            }
+        }
+        if scalar(step, "run").is_some_and(|value| {
+            value.ends_with("suite macos-deadline") || value.ends_with("suite release-macos")
+        }) {
+            if !target_cache {
+                return Err(failure(
+                    "macOS deadline qualification lacks exact compiled cache setup",
+                ));
+            }
+            qualification = true;
+        }
+    }
+    if !qualification || !failure_artifact {
+        return Err(failure(
+            "macOS deadline qualification or failure artifacts absent",
+        ));
     }
     Ok(())
 }
@@ -2227,6 +2309,7 @@ fn check_release_structure(
         )?;
         check_split_windows_job(job, contract)?;
     }
+    check_macos_deadline_job(jobs, "macos-acceptance")?;
     let assemble = mapping(
         jobs.get(key("assemble"))
             .ok_or_else(|| failure("release assemble job is absent"))?,
@@ -2983,8 +3066,11 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
     let sealed_launch =
         Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");
-    let native_path_fixture = relative
-        == Path::new("crates/memcordon-cli/tests/macos_remediation.rs")
+    let native_path_fixture = [
+        Path::new("crates/memcordon-cli/tests/macos_remediation.rs"),
+        Path::new("crates/memcordon-cli/src/bin/memcordon-test-fixture.rs"),
+    ]
+    .contains(&relative)
         && visitor.subprocess_env_mutations == visitor.standard_path_mutations;
     if visitor.subprocess_env_mutations != 0 && relative != sealed_launch && !native_path_fixture {
         visitor
@@ -3073,8 +3159,11 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         let macos_watchdog = Path::new("crates/memcordon-platform/src/macos_watchdog.rs");
         let sealed_launch =
             Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");
-        let native_path_fixture = relative
-            == Path::new("crates/memcordon-cli/tests/macos_remediation.rs")
+        let native_path_fixture = [
+            Path::new("crates/memcordon-cli/tests/macos_remediation.rs"),
+            Path::new("crates/memcordon-cli/src/bin/memcordon-test-fixture.rs"),
+        ]
+        .contains(&relative.as_path())
             && visitor.subprocess_env_mutations == visitor.standard_path_mutations;
         if visitor.subprocess_env_mutations != 0
             && relative != sealed_launch
@@ -3427,8 +3516,8 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
         root,
         "crates/memcordon-core/src/report.rs",
         &[
-            "pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 9;",
-            "pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 8;",
+            "pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 10;",
+            "pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 9;",
             "pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 6;",
             "pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 2;",
         ],

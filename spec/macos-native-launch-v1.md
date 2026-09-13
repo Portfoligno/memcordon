@@ -1,4 +1,9 @@
-# macOS native launch V1
+# macOS native launch contract
+
+This document keeps its original path for existing links. The current private
+guardian framing is revision 2; execution reports are schema 10 and plan reports
+are schema 9. Revision 1 reports remain historical observations and must not be
+upgraded by inventing authorization, custody, or clock evidence.
 
 This contract describes the macOS standard watchdog launch path implemented in
 `crates/memcordon-platform/src/macos_launch.rs` and
@@ -18,10 +23,13 @@ streams and closes its private protocol endpoint across successful exec.
 
 The parent requires this order before reporting a successful launch:
 
-1. Reserve native child ownership and spawn the guardian; receive `Ready`.
-2. Spawn the launcher in a fresh process group, still gated; receive `Ready`.
-3. Send the guardian `Bind { group }`; it observes the root identity and returns
-   the matching `Armed { group }` acknowledgment.
+1. Snapshot the caller envelope, reserve native child ownership and spawn the
+   guardian; receive `Hello`.
+2. Send the guardian the immutable continuous-clock work deadline, grace and
+   explicit installed-image capability. Its reserved spawn owner creates the
+   launcher as the guardian's native child in a fresh process group, still gated.
+3. Bind the root identity and restore the caller's signal dispositions and limits in the
+   launcher before the guardian acknowledges readiness and group ownership.
 4. Check guardian liveness and register a kernel process-event witness for the
    owned, unreaped launcher before sending `Release`.
 5. Require both close-on-exec protocol closure and a `NOTE_EXEC` event from the
@@ -32,12 +40,37 @@ Malformed, premature, duplicate, mismatched, or missing acknowledgments fail
 startup. A ready helper, a bound group, and confirmed target exec are separate
 observations. None proves that the workload completed successfully.
 
+Before queueing native creation, the caller owns duplicates of each intended
+non-close-on-exec descriptor, an open cwd directory, the calling thread's signal
+mask, ignored signal dispositions, and resource limits. A separate private
+capture owner performs cwd acquisition and descriptor enumeration under the
+original continuous deadline; the calling thread supplies its own signal mask.
+A timed-out capture remains in that single reserved slot until it settles.
+A separate private
+datagram transfers the descriptors and cwd with `SCM_RIGHTS`. Its strict manifest
+binds the run, version, descriptor count and distinct destination numbers;
+missing, truncated, duplicate or mismatched entries fail before authorization.
+Closed standard descriptors are represented by their absence. Received sources
+are promoted above every destination and private launch endpoints are kept out
+of that destination range. Only the launcher installs target-facing mappings.
+The guardian and inspection helpers have private standard streams, and temporary
+owned copies close when native creation settles. Source open-file descriptions
+are never changed to nonblocking mode.
+
+Darwin provides no supported atomic read-only umask query. The target preserves
+the kernel-inherited umask captured when the guardian is created; MemCordon never
+temporarily changes the embedding process's umask to inspect it. Concurrent host
+umask changes before that native creation boundary therefore select the inherited
+value. Owned descriptors and cwd remain stable across later host close/reuse or
+cwd changes, while resource-limit restoration fails closed if the fresh child
+cannot restore the captured limits.
+
 ## Private framing
 
-Each private socket frame has a u16 big-endian length followed by at most 256
-JSON bytes. The strict frame contains `version` (1), a run correlation value,
-and `message`; messages use the closed `kind` vocabulary `Ready`, `Bind`,
-`Armed`, `Release`, `Disarm`, `Retired`, and `Failure`. The run value binds the
+Each private socket frame has a u16 big-endian length followed by at most 4096
+JSON bytes. The strict frame contains `version` (2), a run correlation value,
+and `message`; the closed vocabulary additionally carries configuration,
+signal restoration, authorization and root-exit observations. The run value binds the
 two private channels to this invocation; it is not a policy grant or signature.
 
 Zero or oversized frames, unknown fields, wrong versions/correlation values,
@@ -47,15 +80,19 @@ reads/writes. The private protocol is not a public executable-control API.
 
 ## Deadline origin and cleanup
 
-The attempt's monotonic clock begins before helper setup. The parent startup
+The Darwin continuous clock begins before helper resolution and counts system
+sleep. The guardian services an expired timer on its next scheduling opportunity
+after resume. The parent startup
 window is at most five seconds and is shortened by the configured attempt or
 remaining supervision deadline. Setup, ready/bind/arm exchange and exec
 confirmation consume that original budget. Monitoring does not restart the
-clock after launch. A separate bounded cleanup budget remains subject to the
-outer supervision deadline where applicable.
+clock after launch. Work expiry anchors the applicable limit grace, then a
+separate three-second retirement reserve and one-second result-delivery reserve.
+Late detection consumes those original reserves instead of renewing them.
 
-The guardian independently observes its private parent lease and samples known
-members. Lease loss triggers emergency cleanup of the bound process group and
+The guardian's finite kqueue loop independently services deadlines and its private
+parent lease. Normal and emergency inspection use separate owned native helpers;
+neither can occupy the guardian's deadline loop. Lease loss triggers emergency cleanup of the bound process group and
 observed identities. Ordinary completion uses `Disarm`/`Retired` plus explicit
 helper reaping. Lost acknowledgments or an expired cleanup budget retain an
 incomplete or unknown result; they cannot be converted into successful cleanup.
@@ -80,19 +117,25 @@ existing slot to the permanent reaper without allocation or blocking. A slot
 is not reusable until its owned wait obligation ends. Root reaping respects an
 outstanding guardian dependency. Exhaustion rejects new native admission.
 
-Potentially blocking inspection/spawn work uses one runtime-owned inspector
-worker and one queued request per process. A busy or unavailable queue rejects
-submission. The caller waits only through its absolute deadline; a stalled
-native operation remains owned by that worker, and no replacement thread is
-created to bypass the bound. This bounds waiting and admission resources; it
-does not promise cancellation of an uninterruptible native operation. A late
-spawn result retains its child ownership and reaping obligation.
+Native creation uses a reserved owner, separately from ordinary sampling.
+Guardian inspection has independent normal and emergency native processes with
+bounded framed results. A busy or unavailable lane rejects submission; it does
+not create replacement workers to bypass the reservation. Outstanding frontend
+inspection also prevents claiming complete native retirement. This bounds
+waiting and admission resources, while leaving uninterruptible native operations
+explicitly unresolved. A late spawn retains child custody and cannot release
+target execution after cancellation.
+
+Final report/diagnostic output runs in a separate writer with a bounded payload
+and delivery deadline. A prepared report may identify that writer, but cannot
+certify its own persistence or the writer's later reap. The independent oracle
+records observed helper birth identities and checks retirement outside MemCordon.
 
 ## Startup failure observations
 
 `Error`, top-level `ExecutionErrorReport`, and `SupervisionErrorRecord` carry
 optional `native_startup: NativeStartupDiagnosticV1`. Absence serializes exactly
-as before. Its own `schema_version` is 1; execution report schema 9 is unchanged.
+as before. Its own `schema_version` is 1; execution reports now use schema 10.
 Strict older consumers may reject the additional failure field. Compatibility
 does not imply acceptance by an independently strict older decoder.
 

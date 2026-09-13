@@ -12,12 +12,24 @@ mod guardian;
 #[cfg(target_os = "linux")]
 mod linux_cgroup;
 #[cfg(target_os = "macos")]
+mod macos_deadline;
+#[cfg(target_os = "macos")]
+mod macos_envelope;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use macos_deadline::continuous_nanos as macos_continuous_nanos;
+#[cfg(target_os = "macos")]
 mod macos_launch;
 #[cfg(target_os = "macos")]
 mod macos_watchdog;
 #[cfg(target_os = "macos")]
+pub use macos_launch::enveloped_helper as macos_enveloped_helper;
+#[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use macos_launch::helper as macos_helper;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use macos_launch::inspector_helper as macos_inspector;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod sealed;
 mod signal;
@@ -70,6 +82,8 @@ pub use backend::{
 };
 #[cfg(target_os = "windows")]
 pub use supervisor::certify_windows_platform_mutant;
+#[cfg(target_os = "macos")]
+pub use supervisor::macos_supervise_from;
 pub use supervisor::{
     AttemptContext, AttemptExecution, SupervisorRequest, capabilities, capabilities_for, supervise,
 };

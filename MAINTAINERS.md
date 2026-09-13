@@ -17,6 +17,9 @@ The workspace separates platform-neutral contracts from native execution:
   exit mapping, and stable public re-exports.
 - `memcordon-testkit` owns black-box process-test support.
 - `tools/memcordon-ci` owns repository policy, certification, and release checks.
+- `tools/memcordon-deadline-oracle` owns independent macOS clock, process identity,
+  stream and teardown observations; it does not link production supervision or
+  testkit supervision.
 
 Every supported launch path establishes containment before allowing target code
 to run. Linux starts an installed MemCordon CLI as a process-group leader and
@@ -24,8 +27,9 @@ uses its binary-private launcher mode. The supervisor assigns and verifies the
 launcher in the cgroup, validates a versioned READY record, starts a crash
 guardian, and only then releases the launcher to execute the typed target.
 Windows creates the target suspended and assigns it to a Job Object; macOS
-establishes a process group before execution. The supervisor retains the
-direct-child handle until it has been reaped. Process-table presence is never
+establishes a process group before execution under the native guardian parent.
+The native owner retains the direct-child handle until it has been reaped.
+Process-table presence is never
 the authority for direct-child liveness.
 
 The launcher and guardian routes are binary-private and absent from public help
@@ -95,7 +99,7 @@ credential boundary. The typed `memcordon-ci` driver performs sequencing with
 argument vectors and monotonic subprocess deadlines.
 
 - `ci.yml` runs repository policy, quality, MSRV, supply-chain, and six-target
-  native checks.
+  native checks, plus the independent macOS deadline lane on both architectures.
 - `deep-ci.yml` runs Miri, fuzz smoke tests, and native stress tests.
 - `backend-certification.yml` produces exact-run Linux and Windows
   sealed-provider evidence.

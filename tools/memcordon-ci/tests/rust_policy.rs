@@ -3,6 +3,31 @@ use std::path::Path;
 use memcordon_ci::policy::validate_rust_policy_bytes;
 
 #[test]
+fn deadline_helpers_preserve_typed_spawning_and_environment_boundaries() {
+    for (path, source) in [
+        (
+            "tools/ci-native-fingerprint.rs",
+            include_str!("../../ci-native-fingerprint.rs"),
+        ),
+        (
+            "tools/memcordon-deadline-oracle/src/native.rs",
+            include_str!("../../memcordon-deadline-oracle/src/native.rs"),
+        ),
+        (
+            "crates/memcordon-cli/src/commands/result_delivery.rs",
+            include_str!("../../../crates/memcordon-cli/src/commands/result_delivery.rs"),
+        ),
+        (
+            "crates/memcordon-platform/src/macos_envelope.rs",
+            include_str!("../../../crates/memcordon-platform/src/macos_envelope.rs"),
+        ),
+    ] {
+        validate_rust_policy_bytes(Path::new(path), source.as_bytes())
+            .expect("native helper policy");
+    }
+}
+
+#[test]
 fn native_install_fixture_only_may_override_standard_path() {
     let fixture = Path::new("crates/memcordon-cli/tests/macos_remediation.rs");
     let path = b"fn run(command: &mut std::process::Command) { command.env(\"PATH\", \"/usr/bin:/bin\"); }";

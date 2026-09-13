@@ -32,7 +32,12 @@ fn bounded_pause(duration: Duration) {
 
 #[link(name = "proc")]
 unsafe extern "C" {
-    fn proc_listallpids(buffer: *mut libc::c_void, buffersize: libc::c_int) -> libc::c_int;
+    fn proc_listpids(
+        kind: u32,
+        typeinfo: u32,
+        buffer: *mut libc::c_void,
+        buffersize: libc::c_int,
+    ) -> libc::c_int;
     fn proc_pidinfo(
         pid: libc::c_int,
         flavor: libc::c_int,
@@ -121,15 +126,17 @@ struct ProcTaskInfo {
     priority: i32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProcessIdentity {
     pub(crate) pid: i32,
     start_seconds: u64,
     start_microseconds: u64,
 }
 
-#[derive(Clone, Copy)]
-struct ProcessSnapshot {
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProcessSnapshot {
     identity: ProcessIdentity,
     parent_pid: i32,
     process_group: i32,
@@ -253,6 +260,13 @@ pub fn run_attempt(
     signal_source: &SignalSource,
     context: crate::supervisor::AttemptContext,
 ) -> Result<Execution, Error> {
+    if inspection_obligations() != 0 {
+        return Err(Error::new(
+            ErrorCategory::Setup,
+            "MCSETUP-INSPECTION-PENDING",
+            "a previous native inspection remains owned; new workload creation is refused",
+        ));
+    }
     if policy.enforcement == Enforcement::Hard {
         return Err(Error::new(
             ErrorCategory::Unsupported,
@@ -261,6 +275,32 @@ pub fn run_attempt(
         ));
     }
     let started = Instant::now();
+    let current_tick = crate::macos_deadline::continuous_nanos()
+        .map_err(|error| Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string()))?;
+    let attempt_origin = if context.restart_attempt == 0 {
+        context.macos_run_origin_ns.unwrap_or(current_tick)
+    } else {
+        current_tick
+    };
+    let work_expiry = match context.macos_work_expires_ns {
+        Some(expiry) => Some(expiry),
+        None => policy
+            .deadline
+            .map(|deadline| crate::macos_deadline::add(attempt_origin, deadline.duration()))
+            .transpose()
+            .map_err(|error| {
+                Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string())
+            })?,
+    };
+    crate::macos_deadline::add(
+        work_expiry.unwrap_or(attempt_origin),
+        policy
+            .limit_grace
+            .max(policy.signal_grace)
+            .max(policy.command_exit_grace),
+    )
+    .and_then(|force| crate::macos_deadline::add(force, Duration::from_secs(4)))
+    .map_err(|error| Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string()))?;
     let mut state = StateMachine::default();
     state
         .transition(RunState::Prepared)
@@ -269,22 +309,87 @@ pub fn run_attempt(
     let startup_deadline = policy.deadline.map_or(startup_deadline, |deadline| {
         startup_deadline.min(started + deadline.duration())
     });
-    let startup_cleanup_deadline = context
-        .supervision_deadline(started)
-        .map_or(startup_deadline + CLEANUP_DEADLINE, |deadline| {
-            deadline.min(startup_deadline + CLEANUP_DEADLINE)
-        });
-    let launch_result = crate::macos_launch::launch(
+    let startup_deadline = work_expiry.map_or(startup_deadline, |expiry| {
+        startup_deadline
+            .min(Instant::now() + Duration::from_nanos(expiry.saturating_sub(current_tick)))
+    });
+    let startup_cleanup_deadline = startup_deadline + CLEANUP_DEADLINE;
+    let startup_expiry = work_expiry
+        .map_or(
+            crate::macos_deadline::add(attempt_origin, Duration::from_secs(5)),
+            |expiry| Ok(expiry.min(attempt_origin.saturating_add(5_000_000_000))),
+        )
+        .map_err(|error| Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string()))?;
+    let boot_identity = crate::macos_deadline::boot_identity()
+        .map_err(|error| Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string()))?;
+    let retained_owner = std::cell::RefCell::new(None::<memcordon_core::OwnerIdentity>);
+    let runtime = |release,
+                   target_pid,
+                   terminal,
+                   force,
+                   complete|
+     -> Result<memcordon_core::RuntimeEvidenceV1, Error> {
+        let retired = crate::macos_deadline::continuous_nanos().map_err(|error| {
+            Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+        })?;
+        let retire = crate::macos_deadline::add(force, CLEANUP_DEADLINE).map_err(|error| {
+            Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+        })?;
+        let delivery =
+            crate::macos_deadline::add(retire, Duration::from_secs(1)).map_err(|error| {
+                Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+            })?;
+        Ok(memcordon_core::RuntimeEvidenceV1 {
+            schema_version: 1,
+            clock: memcordon_core::ClockDomain::DarwinContinuousTicksV1 {
+                boot_identity: boot_identity.clone(),
+                ticks_per_second: 1_000_000_000,
+            },
+            run_origin: context.macos_run_origin_ns.unwrap_or(attempt_origin),
+            attempt_origin,
+            work_expires: work_expiry,
+            startup_expires: startup_expiry,
+            release,
+            target_pid,
+            terminal_observed: Some(terminal),
+            force_requested: None,
+            force_expires: Some(force),
+            retirement_expires: Some(retire),
+            delivery_expires: Some(delivery),
+            retirement: if complete && retired <= retire {
+                memcordon_core::RetirementEvidence::Complete {
+                    at: retired,
+                    target_reaped_or_absent: true,
+                    group_reconciled: true,
+                    detached_identities_discharged: true,
+                    native_obligations_settled: true,
+                    policy_retired: true,
+                }
+            } else {
+                memcordon_core::RetirementEvidence::Unconfirmed {
+                    last_owner: retained_owner.borrow().clone(),
+                }
+            },
+            delivery: memcordon_core::DeliveryEvidence::NotSubmitted,
+        })
+    };
+    let launch_result = crate::macos_launch::launch_with_deadline(
         command,
         memcordon_executable,
         startup_deadline,
         startup_cleanup_deadline,
+        work_expiry,
+        policy.limit_grace,
     );
     if let (Some(deadline), Err(startup)) = (policy.deadline, &launch_result) {
-        let active = context
-            .supervision_deadline_remaining
-            .unwrap_or_else(|| deadline.duration());
-        if startup.error.kind() == io::ErrorKind::TimedOut && started.elapsed() >= active {
+        let active = work_expiry.map_or(deadline.duration(), |expiry| {
+            Duration::from_nanos(expiry.saturating_sub(attempt_origin))
+        });
+        if startup.error.kind() == io::ErrorKind::TimedOut
+            && work_expiry.is_some_and(|expiry| {
+                crate::macos_deadline::continuous_nanos().is_ok_and(|now| now >= expiry)
+            })
+        {
             let complete = startup.diagnostic.cleanup.state
                 == memcordon_core::NativeStartupCleanupStateV1::Complete;
             let mut errors: Vec<CleanupErrorRecord> = startup
@@ -318,7 +423,8 @@ pub fn run_attempt(
                 facts.record_containment_before_authorization();
                 facts.record_authorization_released();
             }
-            let backend = info();
+            let mut backend = info();
+            backend.metric = metric_name(policy.metric);
             let (launch, restart_safety, boundary_detail) =
                 crate::backend::standard_execution_evidence(
                     &backend,
@@ -344,7 +450,20 @@ pub fn run_attempt(
                         deadline.scope(),
                         "pre-spawn".into(),
                         millis(context.supervision_offset + active),
-                        millis(context.supervision_offset + started.elapsed()),
+                        millis(
+                            context.supervision_offset
+                                + Duration::from_nanos(
+                                    crate::macos_deadline::continuous_nanos()
+                                        .map_err(|error| {
+                                            Error::new(
+                                                ErrorCategory::Monitor,
+                                                "MCMONITOR-CLOCK",
+                                                error.to_string(),
+                                            )
+                                        })?
+                                        .saturating_sub(attempt_origin),
+                                ),
+                        ),
                         millis(policy.limit_grace),
                         0,
                         None,
@@ -362,11 +481,29 @@ pub fn run_attempt(
                     cleanup,
                 },
                 backend,
-                child_pid: startup.diagnostic.launcher_pid.unwrap_or(0),
+                child_pid: startup
+                    .diagnostic
+                    .launcher_pid
+                    .and_then(std::num::NonZeroU32::new),
+                runtime: Some(runtime(
+                    startup.release.clone(),
+                    startup
+                        .diagnostic
+                        .launcher_pid
+                        .and_then(std::num::NonZeroU32::new),
+                    crate::macos_deadline::continuous_nanos().map_err(|error| {
+                        Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+                    })?,
+                    work_expiry.unwrap_or(startup_expiry),
+                    complete,
+                )?),
                 duration: started.elapsed(),
-                authorization_offset: startup
-                    .authorized
-                    .map(|instant| instant.saturating_duration_since(started)),
+                authorization_offset: match startup.release {
+                    memcordon_core::ReleaseEvidence::Issued { at, .. } => {
+                        Some(Duration::from_nanos(at.saturating_sub(attempt_origin)))
+                    }
+                    _ => None,
+                },
                 launch,
                 restart_safety,
                 boundary_detail,
@@ -385,12 +522,30 @@ pub fn run_attempt(
         .with_os_error(&startup.error);
         failure.launch_phase = Some(startup.phase);
         failure.target_released = startup.diagnostic.release_sent;
+        failure.target_pid = startup.diagnostic.launcher_pid;
         failure.guardian_ready_before_release = startup.diagnostic.guardian_ready;
         failure.workload_may_be_alive = startup.diagnostic.cleanup.state
             != memcordon_core::NativeStartupCleanupStateV1::Complete;
-        failure.authorization_offset = startup
-            .authorized
-            .map(|authorized| authorized.saturating_duration_since(started));
+        failure.authorization_offset = match startup.release {
+            memcordon_core::ReleaseEvidence::Issued { at, .. } => {
+                Some(Duration::from_nanos(at.saturating_sub(attempt_origin)))
+            }
+            _ => None,
+        };
+        failure.cgroup_verified_before_release = startup.diagnostic.release_sent;
+        if let Ok(now) = crate::macos_deadline::continuous_nanos() {
+            failure.runtime = runtime(
+                startup.release.clone(),
+                startup
+                    .diagnostic
+                    .launcher_pid
+                    .and_then(std::num::NonZeroU32::new),
+                now,
+                now,
+                !failure.workload_may_be_alive,
+            )
+            .ok();
+        }
         if !failure.workload_may_be_alive {
             failure.restart_safety = Some(memcordon_core::RestartSafetyProof {
                 direct_child_reaped: true,
@@ -421,7 +576,32 @@ pub fn run_attempt(
     })?;
     let mut child = launch.child;
     let guardian = launch.guardian;
-    let authorized = launch.authorized;
+    let force_receipt = guardian.force_receipt().map_err(|error| {
+        Error::new(
+            ErrorCategory::Monitor,
+            "MCMONITOR-GUARDIAN",
+            error.to_string(),
+        )
+    })?;
+    let guardian_pid = guardian.pid();
+    if let Ok(identity) = inspect_until(Instant::now() + Duration::from_millis(100), move || {
+        process_snapshot(guardian_pid as i32)
+            .map(|snapshot| snapshot.identity)
+            .map_err(|error| error.to_string())
+    }) {
+        if let Some(start_identity) = identity
+            .start_seconds
+            .checked_mul(1_000_000)
+            .and_then(|value| value.checked_add(identity.start_microseconds))
+        {
+            *retained_owner.borrow_mut() =
+                std::num::NonZeroU32::new(guardian_pid).map(|pid| memcordon_core::OwnerIdentity {
+                    pid,
+                    start_identity,
+                });
+        }
+    }
+    let release_tick = launch.release_tick;
     let mut launch_facts = crate::backend::StandardLaunchFacts::gated_target();
     launch_facts.record_containment_before_authorization();
     launch_facts.record_guardian_spawn_completed();
@@ -458,19 +638,20 @@ pub fn run_attempt(
         known.insert(snapshot.identity);
     }
     let cleanup_expiry = std::cell::Cell::new(None);
+    let terminal_tick = std::cell::Cell::new(None);
+    let force_tick = std::cell::Cell::new(None);
     let cleanup_budget = || {
+        terminal_tick.set(
+            terminal_tick
+                .get()
+                .or_else(|| crate::macos_deadline::continuous_nanos().ok()),
+        );
+        force_tick.set(force_tick.get().or(terminal_tick.get()));
         if let Some(deadline) = cleanup_expiry.get() {
             return Some(deadline);
         }
-        let cap = policy
-            .limit_grace
-            .max(policy.signal_grace)
-            .saturating_add(CLEANUP_DEADLINE);
-        let deadline = context
-            .supervision_deadline(started)
-            .map_or(Instant::now() + cap, |deadline| {
-                deadline.min(Instant::now() + cap)
-            });
+        let cap = CLEANUP_DEADLINE;
+        let deadline = Instant::now() + cap;
         cleanup_expiry.set(Some(deadline));
         Some(deadline)
     };
@@ -478,6 +659,23 @@ pub fn run_attempt(
     let mut peak = 0_u64;
 
     let mut pending_signal = None;
+    let terminate_and_cleanup = |child: &mut Child,
+                                 stored: &mut Option<ChildTermination>,
+                                 root,
+                                 known: &mut HashSet<ProcessIdentity>,
+                                 signal,
+                                 grace,
+                                 deadline| {
+        retire_workload(
+            &guardian,
+            child,
+            stored,
+            root,
+            known,
+            (signal, grace),
+            deadline,
+        )
+    };
     let mut command_exit_grace_started = None;
     let mut outcome = loop {
         let mut cycle_error = guardian.alive().err().map(|error| error.to_string());
@@ -505,13 +703,9 @@ pub fn run_attempt(
                             .unwrap_or_else(|| deadline.duration()))
                     .min(Instant::now() + Duration::from_millis(250))
                 });
-        match discover(
-            root_pid,
-            &mut known,
-            inspection_deadline,
-            InspectionAdmission::Immediate,
-        ) {
-            Ok(snapshots) => {
+        match guardian.inventory(inspection_deadline) {
+            Ok((snapshots, identities)) => {
+                known = identities;
                 workload_empty = snapshots.is_empty();
                 if policy.lifetime == Lifetime::Workload
                     && stored_status.is_some()
@@ -523,11 +717,34 @@ pub fn run_attempt(
                             .unwrap_or(ChildTermination::Unavailable),
                     );
                 }
-                if let Some(limit) = policy.memory {
-                    match sample(&snapshots, policy.metric, inspection_deadline) {
+                if let Some(limit) = policy.memory.filter(|_| !workload_empty) {
+                    match guardian.sample(policy.metric, inspection_deadline) {
                         Ok(usage) => {
                             peak = peak.max(usage);
                             if usage >= limit.bytes() {
+                                let now =
+                                    crate::macos_deadline::continuous_nanos().map_err(|error| {
+                                        Error::new(
+                                            ErrorCategory::Monitor,
+                                            "MCMONITOR-CLOCK",
+                                            error.to_string(),
+                                        )
+                                    })?;
+                                terminal_tick.set(Some(now));
+                                force_tick.set(Some(
+                                    crate::macos_deadline::add(now, policy.limit_grace).map_err(
+                                        |error| {
+                                            Error::new(
+                                                ErrorCategory::Monitor,
+                                                "MCMONITOR-CLOCK",
+                                                error.to_string(),
+                                            )
+                                        },
+                                    )?,
+                                ));
+                                cleanup_expiry.set(Some(
+                                    Instant::now() + policy.limit_grace + CLEANUP_DEADLINE,
+                                ));
                                 let cleanup = terminate_and_cleanup(
                                     &mut child,
                                     &mut stored_status,
@@ -570,19 +787,36 @@ pub fn run_attempt(
         }
 
         if let Some(deadline) = policy.deadline {
-            let active_duration = context
-                .supervision_deadline_remaining
-                .unwrap_or_else(|| deadline.duration());
-            if started.elapsed() >= active_duration {
+            let active_duration = work_expiry.map_or(deadline.duration(), |expiry| {
+                Duration::from_nanos(expiry.saturating_sub(attempt_origin))
+            });
+            let clock_now = crate::macos_deadline::continuous_nanos().map_err(|error| {
+                Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+            })?;
+            if work_expiry.is_some_and(|expiry| clock_now >= expiry) {
+                let observed = Duration::from_nanos(clock_now.saturating_sub(attempt_origin));
+                terminal_tick.set(Some(clock_now));
                 let grace_started = Instant::now();
-                let effective_grace =
-                    context
-                        .supervision_deadline(started)
-                        .map_or(policy.limit_grace, |deadline| {
-                            policy
-                                .limit_grace
-                                .min(deadline.saturating_duration_since(Instant::now()))
-                        });
+                let continuous_force = crate::macos_deadline::add(
+                    work_expiry.expect("deadline exists"),
+                    policy.limit_grace,
+                )
+                .map_err(|error| {
+                    Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+                })?;
+                let force = Instant::now()
+                    + Duration::from_nanos(continuous_force.saturating_sub(clock_now));
+                force_tick.set(Some(continuous_force));
+                let effective_grace = force.saturating_duration_since(Instant::now());
+                let remaining_retirement = crate::macos_deadline::remaining_retirement(
+                    continuous_force,
+                    clock_now,
+                    CLEANUP_DEADLINE,
+                )
+                .map_err(|error| {
+                    Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+                })?;
+                cleanup_expiry.set(Some(Instant::now() + remaining_retirement));
                 let cleanup = terminate_and_cleanup(
                     &mut child,
                     &mut stored_status,
@@ -596,7 +830,6 @@ pub fn run_attempt(
                     effective_grace,
                     cleanup_budget(),
                 );
-                let observed = started.elapsed();
                 break RunOutcome::DeadlineExceeded {
                     deadline: DeadlineEvidence::new(
                         millis(deadline.duration()),
@@ -641,6 +874,18 @@ pub fn run_attempt(
         }
 
         if let Some(signal) = pending_signal.take().or_else(|| signal_source.take()) {
+            let now = crate::macos_deadline::continuous_nanos().map_err(|error| {
+                Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+            })?;
+            terminal_tick.set(Some(now));
+            force_tick.set(Some(
+                crate::macos_deadline::add(now, policy.signal_grace).map_err(|error| {
+                    Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+                })?,
+            ));
+            cleanup_expiry.set(Some(
+                Instant::now() + policy.signal_grace + CLEANUP_DEADLINE,
+            ));
             let cleanup = terminate_and_cleanup(
                 &mut child,
                 &mut stored_status,
@@ -667,6 +912,9 @@ pub fn run_attempt(
                 grace_started.elapsed() >= policy.command_exit_grace
             };
             if completed {
+                // Natural completion starts its own fixed retirement reserve,
+                // including when no termination or final memory sample is needed.
+                let completion_deadline = cleanup_budget();
                 let cleanup = if workload_empty {
                     CleanupSummary {
                         direct_child_reaped: false,
@@ -675,11 +923,12 @@ pub fn run_attempt(
                     }
                 } else {
                     cleanup_after_direct_exit(
+                        &guardian,
                         &mut child,
                         &mut stored_status,
                         root_pid,
                         &mut known,
-                        cleanup_budget(),
+                        completion_deadline,
                     )
                 };
                 break RunOutcome::Exited {
@@ -690,13 +939,15 @@ pub fn run_attempt(
             }
         }
 
-        let wait = command_exit_grace_started.map_or(policy.poll_interval, |grace_started| {
-            policy.poll_interval.min(
-                policy
-                    .command_exit_grace
-                    .saturating_sub(grace_started.elapsed()),
-            )
-        });
+        let wait = command_exit_grace_started
+            .map_or(policy.poll_interval, |grace_started| {
+                policy.poll_interval.min(
+                    policy
+                        .command_exit_grace
+                        .saturating_sub(grace_started.elapsed()),
+                )
+            })
+            .min(Duration::from_millis(20));
         let wait = policy.deadline.map_or(wait, |deadline| {
             wait.min(
                 context
@@ -731,7 +982,8 @@ pub fn run_attempt(
 
     let cleanup_deadline =
         cleanup_budget().expect("cleanup budget always has an absolute deadline");
-    let child_reaped = if outcome.cleanup().workload_empty == Some(true) {
+    let inspections_settled = inspection_obligations() == 0;
+    let child_reaped = if outcome.cleanup().workload_empty == Some(true) && inspections_settled {
         child.retire(cleanup_deadline)
     } else {
         Err(io::Error::other(
@@ -745,8 +997,14 @@ pub fn run_attempt(
             message: error.to_string(),
         });
     }
-    let mut helpers_reaped = true;
-    let retirement = if outcome.cleanup().workload_empty == Some(true) {
+    let mut helpers_reaped = inspections_settled;
+    if !helpers_reaped {
+        outcome.cleanup_mut().errors.push(CleanupErrorRecord {
+            operation: "retire-frontend-inspection".into(),
+            message: "a queued or active native inspection remains runtime-owned".into(),
+        });
+    }
+    let retirement = if outcome.cleanup().workload_empty == Some(true) && inspections_settled {
         guardian.disarm(cleanup_deadline)
     } else {
         drop(guardian);
@@ -784,13 +1042,37 @@ pub fn run_attempt(
     };
     let (launch, restart_safety, boundary_detail) =
         crate::backend::standard_execution_evidence(&backend, launch_facts, cleanup_facts);
+    let mut runtime = runtime(
+        memcordon_core::ReleaseEvidence::Issued {
+            at: release_tick,
+            exec_confirmed: true,
+        },
+        std::num::NonZeroU32::new(child_pid),
+        terminal_tick.get().unwrap_or(attempt_origin),
+        force_tick.get().unwrap_or(attempt_origin),
+        restart_safety.is_safe(),
+    )?;
+    let force_requested = force_receipt.load(std::sync::atomic::Ordering::Acquire);
+    runtime.force_requested = (force_requested != 0).then_some(force_requested);
+    if let Some(at) = runtime.force_requested {
+        // The guardian can observe expiry and request force before the frontend
+        // wakes. Its receipt is a concrete terminal observation in the same clock.
+        runtime.terminal_observed = Some(
+            runtime
+                .terminal_observed
+                .map_or(at, |observed| observed.min(at)),
+        );
+    }
     Ok(Execution {
         policy_enforcement: Default::default(),
         outcome,
         backend,
-        child_pid,
+        child_pid: std::num::NonZeroU32::new(child_pid),
+        runtime: Some(runtime),
         duration: started.elapsed(),
-        authorization_offset: Some(authorized.saturating_duration_since(started)),
+        authorization_offset: Some(Duration::from_nanos(
+            release_tick.saturating_sub(attempt_origin),
+        )),
         launch,
         restart_safety,
         boundary_detail,
@@ -825,84 +1107,61 @@ fn termination_from_status(status: ExitStatus) -> ChildTermination {
     }
 }
 
-fn terminate_and_cleanup(
+fn retire_workload(
+    guardian: &crate::macos_launch::Guardian,
     child: &mut Child,
     stored: &mut Option<ChildTermination>,
-    root_pid: i32,
+    _root_pid: i32,
     known: &mut HashSet<ProcessIdentity>,
-    initial_signal: i32,
-    grace: Duration,
-    supervision_deadline: Option<Instant>,
+    termination: (i32, Duration),
+    retirement_deadline: Option<Instant>,
 ) -> CleanupSummary {
+    let (initial_signal, grace) = termination;
     let mut summary = CleanupSummary {
         graceful_attempted: initial_signal != libc::SIGKILL,
         force_attempted: initial_signal == libc::SIGKILL,
         ..CleanupSummary::default()
     };
-    signal_workload(
-        root_pid,
-        known,
-        initial_signal,
-        &mut summary,
-        supervision_deadline,
-    );
-    if initial_signal != libc::SIGKILL && !grace.is_zero() {
-        let grace_deadline = Instant::now()
-            .checked_add(grace)
-            .unwrap_or_else(Instant::now);
-        let grace_deadline =
-            supervision_deadline.map_or(grace_deadline, |deadline| grace_deadline.min(deadline));
-        while Instant::now() < grace_deadline {
-            if try_reap(child, stored).ok().flatten().is_some() {
-                break;
-            }
-            bounded_pause(
-                Duration::from_millis(10)
-                    .min(grace_deadline.saturating_duration_since(Instant::now())),
-            );
-        }
+    if let Err(error) = guardian.signal_stop(initial_signal, grace) {
+        summary.errors.push(CleanupErrorRecord {
+            operation: "guardian-stop".into(),
+            message: error.to_string(),
+        });
     }
-    if initial_signal != libc::SIGKILL {
-        summary.force_attempted = true;
-        signal_workload(
-            root_pid,
-            known,
-            libc::SIGKILL,
-            &mut summary,
-            supervision_deadline,
-        );
-    }
-
-    let deadline = Instant::now()
-        .checked_add(CLEANUP_DEADLINE)
-        .unwrap_or_else(Instant::now);
-    let deadline = supervision_deadline.map_or(deadline, |supervision| deadline.min(supervision));
+    let started = Instant::now();
+    let deadline = retirement_deadline.unwrap_or_else(|| started + grace + CLEANUP_DEADLINE);
     let mut empty = false;
     while Instant::now() < deadline {
-        match discover(root_pid, known, deadline, InspectionAdmission::Cleanup) {
-            Ok(snapshots) => {
+        match guardian.inventory(deadline) {
+            Ok((snapshots, identities)) => {
+                *known = identities;
                 if snapshots.is_empty() {
                     empty = true;
                     break;
                 }
-                for survivor in snapshots {
-                    kill_identity(survivor.identity, libc::SIGKILL, &mut summary, deadline);
-                }
             }
-            Err(error) => {
+            Err(message) => {
                 summary.errors.push(CleanupErrorRecord {
-                    operation: "discover".to_owned(),
-                    message: error,
+                    operation: "guardian-retirement-inventory".into(),
+                    message,
                 });
                 break;
             }
+        }
+        if started.elapsed() >= grace {
+            summary.force_attempted = true;
         }
         bounded_pause(
             Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
         );
     }
-    summary.workload_empty = Some(empty);
-
+    summary.workload_empty = empty.then_some(true);
+    if !empty && summary.errors.is_empty() {
+        summary.errors.push(CleanupErrorRecord {
+            operation: "guardian-retirement-inventory".into(),
+            message: "retirement deadline expired with unresolved workload membership".into(),
+        });
+    }
     while stored.is_none() && Instant::now() < deadline {
         match child.observe() {
             Ok(Some(status)) => *stored = Some(termination_from_status(status)),
@@ -911,7 +1170,7 @@ fn terminate_and_cleanup(
             ),
             Err(error) => {
                 summary.errors.push(CleanupErrorRecord {
-                    operation: "reap-direct-child".to_owned(),
+                    operation: "observe-direct-child".into(),
                     message: error.to_string(),
                 });
                 break;
@@ -920,15 +1179,15 @@ fn terminate_and_cleanup(
     }
     if stored.is_none() {
         summary.errors.push(CleanupErrorRecord {
-            operation: "reap-direct-child".to_owned(),
-            message: "cleanup deadline expired".to_owned(),
+            operation: "observe-direct-child".into(),
+            message: "retirement deadline expired".into(),
         });
     }
-    summary.direct_child_reaped = false;
     summary
 }
 
 fn cleanup_after_direct_exit(
+    guardian: &crate::macos_launch::Guardian,
     child: &mut Child,
     stored: &mut Option<ChildTermination>,
     root_pid: i32,
@@ -938,8 +1197,8 @@ fn cleanup_after_direct_exit(
     let deadline = supervision_deadline.map_or(Instant::now() + CLEANUP_DEADLINE, |deadline| {
         deadline.min(Instant::now() + CLEANUP_DEADLINE)
     });
-    match discover(root_pid, known, deadline, InspectionAdmission::Cleanup) {
-        Ok(snapshots)
+    match guardian.inventory(deadline) {
+        Ok((snapshots, _))
             if snapshots
                 .iter()
                 .all(|snapshot| snapshot.identity.pid == root_pid) =>
@@ -950,23 +1209,23 @@ fn cleanup_after_direct_exit(
                 ..CleanupSummary::default()
             }
         }
-        Ok(_) => terminate_and_cleanup(
+        Ok(_) => retire_workload(
+            guardian,
             child,
             stored,
             root_pid,
             known,
-            libc::SIGKILL,
-            Duration::ZERO,
+            (libc::SIGKILL, Duration::ZERO),
             supervision_deadline,
         ),
         Err(error) => {
-            let mut summary = terminate_and_cleanup(
+            let mut summary = retire_workload(
+                guardian,
                 child,
                 stored,
                 root_pid,
                 known,
-                libc::SIGKILL,
-                Duration::ZERO,
+                (libc::SIGKILL, Duration::ZERO),
                 supervision_deadline,
             );
             summary.errors.push(CleanupErrorRecord {
@@ -975,126 +1234,6 @@ fn cleanup_after_direct_exit(
             });
             summary
         }
-    }
-}
-
-fn signal_workload(
-    root_pid: i32,
-    known: &HashSet<ProcessIdentity>,
-    signal: i32,
-    summary: &mut CleanupSummary,
-    cleanup_deadline: Option<Instant>,
-) {
-    // SAFETY: negative `root_pid` intentionally addresses the child-owned process group.
-    let result = unsafe { libc::kill(-root_pid, signal) };
-    if result != 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            summary.errors.push(CleanupErrorRecord {
-                operation: "signal-process-group".to_owned(),
-                message: error.to_string(),
-            });
-        }
-    }
-    let deadline = cleanup_deadline.unwrap_or_else(|| Instant::now() + Duration::from_millis(100));
-    for identity in known {
-        kill_identity(*identity, signal, summary, deadline);
-    }
-}
-
-pub(crate) fn root_identity(pid: i32) -> io::Result<ProcessIdentity> {
-    let snapshot = process_snapshot(pid)?;
-    if snapshot.process_group != pid {
-        return Err(io::Error::other("launcher does not own its process group"));
-    }
-    Ok(snapshot.identity)
-}
-
-pub(crate) fn kill_bound_group(identity: ProcessIdentity) {
-    let deadline = Instant::now() + Duration::from_millis(100);
-    let _ = inspect_until(deadline, move || {
-        if process_snapshot(identity.pid).is_ok_and(|current| {
-            current.identity == identity && current.process_group == identity.pid
-        }) && Instant::now() < deadline
-        {
-            // SAFETY: the current native start identity matches the bound launcher leader.
-            unsafe { libc::kill(-identity.pid, libc::SIGKILL) };
-        }
-        Ok(())
-    });
-}
-
-pub(crate) fn guardian_members(identity: ProcessIdentity, known: &mut HashSet<ProcessIdentity>) {
-    // This is sampled process custody, not a new hard containment guarantee.
-    // Retaining a living member lets crash cleanup survive the root being reaped
-    // by init after the wrapper dies.
-    let captured = known.clone();
-    let result = inspect_until(Instant::now() + Duration::from_millis(100), move || {
-        let all = list_processes()?;
-        let bound = all.iter().any(|snapshot| {
-            snapshot.identity == identity
-                || (captured.contains(&snapshot.identity) && snapshot.process_group == identity.pid)
-        });
-        Ok(all
-            .into_iter()
-            .filter(|snapshot| {
-                !snapshot.zombie
-                    && (captured.contains(&snapshot.identity)
-                        || (bound && snapshot.process_group == identity.pid))
-            })
-            .map(|snapshot| snapshot.identity)
-            .collect::<HashSet<_>>())
-    });
-    if let Ok(current) = result {
-        *known = current;
-    }
-}
-
-pub(crate) fn kill_guardian_members(identity: ProcessIdentity, known: &HashSet<ProcessIdentity>) {
-    kill_bound_group(identity);
-    let mut summary = CleanupSummary::default();
-    let deadline = Instant::now() + Duration::from_millis(100);
-    for member in known {
-        kill_identity(*member, libc::SIGKILL, &mut summary, deadline);
-    }
-}
-
-fn kill_identity(
-    identity: ProcessIdentity,
-    signal: i32,
-    summary: &mut CleanupSummary,
-    deadline: Instant,
-) {
-    if Instant::now() >= deadline {
-        if !summary
-            .errors
-            .iter()
-            .any(|error| error.operation == "validate-process-identity")
-        {
-            summary.errors.push(CleanupErrorRecord {
-                operation: "validate-process-identity".into(),
-                message:
-                    "identity inspection deadline expired with signalling obligations remaining"
-                        .into(),
-            });
-        }
-        return;
-    }
-    let result = inspect_with_admission(deadline, InspectionAdmission::Cleanup, move || {
-        let mut summary = CleanupSummary::default();
-        if process_snapshot(identity.pid).is_ok_and(|current| current.identity == identity)
-            && Instant::now() < deadline
-        {
-            kill_pid(identity.pid, signal, &mut summary);
-        }
-        Ok(summary.errors)
-    });
-    match result {
-        Ok(errors) => summary.errors.extend(errors),
-        Err(message) => summary.errors.push(CleanupErrorRecord {
-            operation: "validate-process-identity".into(),
-            message,
-        }),
     }
 }
 
@@ -1112,25 +1251,34 @@ fn kill_pid(pid: i32, signal: i32, summary: &mut CleanupSummary) {
     }
 }
 
-fn discover(
-    root_pid: i32,
-    known: &mut HashSet<ProcessIdentity>,
-    deadline: Instant,
-    admission: InspectionAdmission,
-) -> Result<Vec<ProcessSnapshot>, String> {
-    let captured = known.clone();
-    let (snapshots, updated) = inspect_with_admission(deadline, admission, move || {
-        let mut captured = captured;
-        let result = discover_native(root_pid, &mut captured)?;
-        Ok((result, captured))
-    })?;
-    *known = updated;
-    Ok(snapshots)
+type Inspection = Box<dyn FnOnce() + Send>;
+static INSPECTION_OBLIGATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn inspection_obligations() -> usize {
+    INSPECTION_OBLIGATIONS.load(std::sync::atomic::Ordering::Acquire)
 }
 
-type Inspection = Box<dyn FnOnce() + Send>;
+struct InspectionObligation;
+
+impl InspectionObligation {
+    fn reserve() -> Self {
+        INSPECTION_OBLIGATIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for InspectionObligation {
+    fn drop(&mut self) {
+        INSPECTION_OBLIGATIONS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 static INSPECTOR: std::sync::OnceLock<Result<std::sync::mpsc::SyncSender<Inspection>, String>> =
     std::sync::OnceLock::new();
+static EMERGENCY_INSPECTOR: std::sync::OnceLock<
+    Result<std::sync::mpsc::SyncSender<Inspection>, String>,
+> = std::sync::OnceLock::new();
 
 pub(crate) fn inspect_until<T: Send + 'static>(
     deadline: Instant,
@@ -1176,7 +1324,11 @@ fn inspect_with_admission_observer<T: Send + 'static>(
     if Instant::now() >= deadline {
         return Err("process inspection deadline expired before admission".into());
     }
-    let worker = INSPECTOR
+    let lane = match admission {
+        InspectionAdmission::Immediate => &INSPECTOR,
+        InspectionAdmission::Cleanup => &EMERGENCY_INSPECTOR,
+    };
+    let worker = lane
         .get_or_init(|| {
             let (send, receive) = std::sync::mpsc::sync_channel::<Inspection>(1);
             std::thread::Builder::new()
@@ -1192,9 +1344,14 @@ fn inspect_with_admission_observer<T: Send + 'static>(
         .as_ref()
         .map_err(Clone::clone)?;
     let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let obligation = InspectionObligation::reserve();
     let mut inspection: Inspection = Box::new(move || {
         if Instant::now() < deadline {
-            let _ = send.send(operation());
+            let result = operation();
+            drop(obligation);
+            let _ = send.send(result);
+        } else {
+            drop(obligation);
         }
     });
     loop {
@@ -1234,25 +1391,87 @@ fn discover_native(
     root_pid: i32,
     known: &mut HashSet<ProcessIdentity>,
 ) -> Result<Vec<ProcessSnapshot>, String> {
-    let all = list_processes()?;
-    let by_pid: HashMap<_, _> = all
+    let inventory = list_inventory()?;
+    let mut relevant = HashSet::from([root_pid]);
+    relevant.extend(known.iter().map(|identity| identity.pid));
+    if !inventory.unresolved.is_empty() {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for snapshot in &inventory.snapshots {
+                if (snapshot.process_group == root_pid || relevant.contains(&snapshot.parent_pid))
+                    && relevant.insert(snapshot.identity.pid)
+                {
+                    changed = true;
+                }
+            }
+        }
+        relevant.extend(list_pids(
+            2,
+            u32::try_from(root_pid).map_err(|_| "invalid root group")?,
+        )?);
+        let parents: Vec<_> = relevant.iter().copied().collect();
+        for parent in parents {
+            relevant.extend(list_pids(
+                6,
+                u32::try_from(parent).map_err(|_| "invalid parent identity")?,
+            )?);
+        }
+    }
+    reconcile_inventory(root_pid, known, inventory, &relevant)
+}
+
+pub(crate) fn guardian_inventory(
+    root: i32,
+    known: &mut HashSet<ProcessIdentity>,
+    signal: Option<i32>,
+) -> Result<Vec<ProcessSnapshot>, String> {
+    let snapshots = discover_native(root, known)?;
+    if let Some(signal) = signal {
+        for snapshot in &snapshots {
+            match process_snapshot(snapshot.identity.pid) {
+                Ok(current) if current.identity == snapshot.identity => {
+                    let mut summary = CleanupSummary::default();
+                    kill_pid(snapshot.identity.pid, signal, &mut summary);
+                    if let Some(error) = summary.errors.first() {
+                        return Err(error.message.clone());
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => return Err(format!("guardian identity is unconfirmed: {error}")),
+            }
+        }
+    }
+    Ok(snapshots)
+}
+
+fn reconcile_inventory(
+    root_pid: i32,
+    known: &mut HashSet<ProcessIdentity>,
+    inventory: Inventory,
+    relevant: &HashSet<i32>,
+) -> Result<Vec<ProcessSnapshot>, String> {
+    let by_pid: HashMap<_, _> = inventory
+        .snapshots
         .iter()
         .copied()
         .map(|snapshot| (snapshot.identity.pid, snapshot))
         .collect();
+    // Metadata uncertainty does not discharge an already observed identity.
     known.retain(|identity| {
-        by_pid
-            .get(&identity.pid)
-            .is_some_and(|snapshot| snapshot.identity == *identity)
+        inventory.unresolved.contains(&identity.pid)
+            || by_pid
+                .get(&identity.pid)
+                .is_some_and(|snapshot| snapshot.identity == *identity)
     });
     if let Some(root) = by_pid.get(&root_pid) {
         known.insert(root.identity);
     }
-
     let mut changed = true;
     while changed {
         changed = false;
-        for snapshot in &all {
+        for snapshot in &inventory.snapshots {
             if (snapshot.process_group == root_pid
                 || known
                     .iter()
@@ -1263,48 +1482,162 @@ fn discover_native(
             }
         }
     }
-    Ok(all
+    if inventory
+        .unresolved
+        .iter()
+        .any(|pid| relevant.contains(pid) || known.iter().any(|identity| identity.pid == *pid))
+    {
+        return Err(
+            "workload identity has unresolved native metadata; absence is unconfirmed".into(),
+        );
+    }
+    Ok(inventory
+        .snapshots
         .into_iter()
         .filter(|snapshot| !snapshot.zombie && known.contains(&snapshot.identity))
         .collect())
 }
 
-fn list_processes() -> Result<Vec<ProcessSnapshot>, String> {
-    // SAFETY: a null buffer with length zero is the documented sizing query.
-    let count = unsafe { proc_listallpids(std::ptr::null_mut(), 0) };
-    if count < 0 {
-        return Err(format!(
-            "proc_listallpids sizing failed: {}",
-            io::Error::last_os_error()
-        ));
+struct Inventory {
+    snapshots: Vec<ProcessSnapshot>,
+    unresolved: Vec<i32>,
+}
+
+#[cfg(feature = "test-support")]
+pub type InventoryReconciliation = (Result<Vec<i32>, String>, Vec<(i32, u64)>);
+
+#[cfg(feature = "test-support")]
+pub fn inventory_reconciliation(
+    known: &[(i32, u64)],
+    snapshots: &[(i32, u64, i32, i32, bool)],
+    unresolved: &[i32],
+    relevant: &[i32],
+) -> InventoryReconciliation {
+    let mut known: HashSet<_> = known
+        .iter()
+        .map(|(pid, birth)| ProcessIdentity {
+            pid: *pid,
+            start_seconds: *birth,
+            start_microseconds: 0,
+        })
+        .collect();
+    let inventory = Inventory {
+        snapshots: snapshots
+            .iter()
+            .map(|(pid, birth, parent, group, zombie)| ProcessSnapshot {
+                identity: ProcessIdentity {
+                    pid: *pid,
+                    start_seconds: *birth,
+                    start_microseconds: 0,
+                },
+                parent_pid: *parent,
+                process_group: *group,
+                zombie: *zombie,
+            })
+            .collect(),
+        unresolved: unresolved.to_vec(),
+    };
+    let result = reconcile_inventory(
+        100,
+        &mut known,
+        inventory,
+        &relevant.iter().copied().collect(),
+    )
+    .map(|snapshots| {
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot.identity.pid)
+            .collect()
+    });
+    let mut retained: Vec<_> = known
+        .iter()
+        .map(|identity| (identity.pid, identity.start_seconds))
+        .collect();
+    retained.sort_unstable();
+    (result, retained)
+}
+
+fn list_inventory() -> Result<Inventory, String> {
+    let pids = list_pids(1, 0)?;
+    let mut inventory = Inventory {
+        snapshots: Vec::new(),
+        unresolved: Vec::new(),
+    };
+    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        match process_snapshot(pid) {
+            Ok(snapshot) => inventory.snapshots.push(snapshot),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(_) => inventory.unresolved.push(pid),
+        }
     }
-    let capacity = usize::try_from(count)
-        .unwrap_or(0)
-        .saturating_add(128)
-        .max(128);
-    if capacity > 32768 {
-        return Err("native process inventory exceeds 32768 entries".into());
-    }
-    let mut pids = vec![0_i32; capacity];
-    let byte_len = pids
+    Ok(inventory)
+}
+
+fn list_pids(kind: u32, identity: u32) -> Result<Vec<i32>, String> {
+    // The direct API returns bytes (unlike proc_listallpids' PID count). A fixed
+    // native capacity makes both allocation and overflow interpretation explicit.
+    let mut pids = vec![0_i32; 32768];
+    let byte_length = pids
         .len()
         .checked_mul(std::mem::size_of::<i32>())
-        .and_then(|bytes| i32::try_from(bytes).ok())
-        .ok_or_else(|| "process list buffer is too large".to_owned())?;
-    // SAFETY: `pids` is writable for exactly `byte_len` bytes.
-    let filled = unsafe { proc_listallpids(pids.as_mut_ptr().cast(), byte_len) };
-    if filled < 0 {
-        return Err(format!(
-            "proc_listallpids failed: {}",
-            io::Error::last_os_error()
-        ));
+        .and_then(|length| i32::try_from(length).ok())
+        .ok_or("PID buffer range")?;
+    // SAFETY: __error is this thread's errno; clear it before the native call so
+    // a zero reply cannot inherit a prior ESRCH and certify false absence.
+    unsafe {
+        *libc::__error() = 0;
     }
-    pids.truncate(usize::try_from(filled).unwrap_or(0).min(pids.len()));
-    Ok(pids
-        .into_iter()
-        .filter(|pid| *pid > 0)
-        .filter_map(|pid| process_snapshot(pid).ok())
-        .collect())
+    // SAFETY: storage is writable for byte_length bytes and selectors are native constants.
+    let filled = unsafe { proc_listpids(kind, identity, pids.as_mut_ptr().cast(), byte_length) };
+    let error = io::Error::last_os_error();
+    decode_pid_inventory(kind, pids, filled, error)
+}
+
+fn decode_pid_inventory(
+    kind: u32,
+    mut pids: Vec<i32>,
+    filled: i32,
+    error: io::Error,
+) -> Result<Vec<i32>, String> {
+    if filled < 0 || (filled == 0 && error.raw_os_error() != Some(0)) {
+        return Err(format!("native PID inventory failed: {error}"));
+    }
+    let bytes = usize::try_from(filled).map_err(|_| "negative PID byte count")?;
+    if bytes
+        >= pids
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or("PID buffer range")?
+    {
+        return Err("native process inventory saturated; absence is unconfirmed".into());
+    }
+    if bytes % std::mem::size_of::<i32>() != 0 || (kind == 1 && bytes == 0) {
+        return Err("native process inventory has an invalid byte count".into());
+    }
+    pids.truncate(bytes / std::mem::size_of::<i32>());
+    pids.retain(|pid| *pid > 0);
+    Ok(pids)
+}
+
+#[cfg(feature = "test-support")]
+pub fn pid_inventory_reply(
+    kind: u32,
+    pids: Vec<i32>,
+    filled: i32,
+    errno: i32,
+) -> Result<Vec<i32>, String> {
+    decode_pid_inventory(kind, pids, filled, io::Error::from_raw_os_error(errno))
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_root_exited(pid: i32) -> io::Result<bool> {
+    match process_snapshot(pid) {
+        Ok(snapshot) => Ok(snapshot.zombie),
+        // Darwin may stop publishing BSD metadata for a zombie. The fixture's
+        // stopped guardian still owns this unreaped PID, so reuse is impossible.
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 fn process_snapshot(pid: i32) -> Result<ProcessSnapshot, io::Error> {
@@ -1313,9 +1646,17 @@ fn process_snapshot(pid: i32) -> Result<ProcessSnapshot, io::Error> {
         .map_err(|_| io::Error::other("proc_bsdinfo size cannot fit c_int"))?;
     // SAFETY: `info` points to writable storage of `size` bytes and is initialized only if the
     // function reports that exact structure size.
+    unsafe {
+        *libc::__error() = 0;
+    }
     let read = unsafe { proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
     if read != size {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return Err(if read > 0 || error.raw_os_error() == Some(0) {
+            io::Error::other("native process metadata reply has an invalid size")
+        } else {
+            error
+        });
     }
     // SAFETY: the successful exact-size call initialized the entire structure.
     let info = unsafe { info.assume_init() };
@@ -1331,12 +1672,7 @@ fn process_snapshot(pid: i32) -> Result<ProcessSnapshot, io::Error> {
     })
 }
 
-fn sample(snapshots: &[ProcessSnapshot], metric: Metric, deadline: Instant) -> Result<u64, String> {
-    let snapshots = snapshots.to_vec();
-    inspect_until(deadline, move || sample_native(&snapshots, metric))
-}
-
-fn sample_native(snapshots: &[ProcessSnapshot], metric: Metric) -> Result<u64, String> {
+pub(crate) fn sample_native(snapshots: &[ProcessSnapshot], metric: Metric) -> Result<u64, String> {
     let mut total = 0_u64;
     for snapshot in snapshots {
         match process_usage(snapshot.identity.pid, metric) {

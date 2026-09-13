@@ -26,6 +26,103 @@ fn native_runtime() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
+fn repeated_stop_events_preserve_first_grace_and_retirement_deadline() {
+    let _runtime = native_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    memcordon_platform::test_support::macos_repeated_stop(
+        image(),
+        fixture(),
+        &directory.path().join("signal-ready"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn running_guardian_loss_is_prompt_and_never_clean_retirement() {
+    let _runtime = native_runtime();
+    memcordon_platform::test_support::macos_running_guardian_loss(image(), fixture()).unwrap();
+}
+
+#[test]
+fn submillisecond_remaining_admission_never_renews_budget() {
+    let _runtime = native_runtime();
+    memcordon_platform::test_support::macos_submillisecond_deadline(image()).unwrap();
+}
+
+#[test]
+fn mutation_disabled_guardian_timer_is_detected() {
+    let _runtime = native_runtime();
+    memcordon_platform::test_support::macos_timer_mutation_detected(image(), fixture()).unwrap();
+}
+
+#[test]
+fn continuous_clock_jump_expires_original_guardian_deadline() {
+    let _runtime = native_runtime();
+    memcordon_platform::test_support::macos_clock_jump(image(), fixture()).unwrap();
+}
+
+#[test]
+fn valid_control_flood_cannot_starve_guardian_deadline() {
+    let _runtime = native_runtime();
+    memcordon_platform::test_support::macos_control_flood(image(), fixture()).unwrap();
+}
+
+#[test]
+fn mutation_release_after_cancel_is_detected() {
+    let _runtime = native_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("forbidden target marker");
+    let command = CommandSpec::new(fixture())
+        .args([OsString::from("gate-marker"), marker.as_os_str().to_owned()]);
+    let _ = macos_startup_fault(
+        &command,
+        image(),
+        MacosLaunchFault::NativeSpawnHeldReleaseAfterCancel,
+    )
+    .unwrap();
+    assert!(
+        marker.exists(),
+        "release-after-cancel mutation must trip the target marker oracle"
+    );
+}
+
+#[test]
+fn held_native_spawn_publication_is_cancelled_after_startup_expiry() {
+    let _runtime = native_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("late target marker");
+    let command = CommandSpec::new(fixture())
+        .args([OsString::from("gate-marker"), marker.as_os_str().to_owned()]);
+    let started = Instant::now();
+    let diagnostic =
+        macos_startup_fault(&command, image(), MacosLaunchFault::NativeSpawnHeld).unwrap();
+    assert!(
+        diagnostic.launcher_pid.is_some(),
+        "native creation phase must be reached"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "publication must cross the original startup boundary"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "late publication must retain bounded cleanup"
+    );
+    assert!(
+        !marker.exists(),
+        "expired creation must never execute target code"
+    );
+    assert!(!diagnostic.release_sent);
+    assert!(!diagnostic.exec_confirmed);
+    assert_eq!(
+        diagnostic.cleanup.state,
+        NativeStartupCleanupStateV1::Complete,
+        "{diagnostic:?}"
+    );
+    assert!(diagnostic.is_consistent());
+}
+
+#[test]
 fn guardian_and_launcher_loss_never_execute_target_marker() {
     let _runtime = native_runtime();
     for fault in [
@@ -76,15 +173,16 @@ fn disarm_timeout_has_nonblocking_drop_and_eventual_owned_reap() {
 #[test]
 fn private_protocol_rejects_truncation_duplicates_and_wrong_binding() {
     let _runtime = native_runtime();
-    let body = br#"{"version":1,"run":7,"message":{"kind":"Ready"}}"#;
+    let body = br#"{"version":2,"run":7,"sequence":0,"message":{"kind":"Ready"}}"#;
     let mut valid = (body.len() as u16).to_be_bytes().to_vec();
     valid.extend_from_slice(body);
     assert!(!macos_rejects_protocol(&valid));
     for body in [
-        br#"{"version":2,"run":7,"message":{"kind":"Ready"}}"#.as_slice(),
-        br#"{"version":1,"run":8,"message":{"kind":"Ready"}}"#.as_slice(),
-        br#"{"version":1,"run":7,"run":7,"message":{"kind":"Ready"}}"#.as_slice(),
-        br#"{"version":1,"run":7,"message":{"kind":"Armed","group":9}}"#.as_slice(),
+        br#"{"version":1,"run":7,"sequence":0,"message":{"kind":"Ready"}}"#.as_slice(),
+        br#"{"version":2,"run":8,"sequence":0,"message":{"kind":"Ready"}}"#.as_slice(),
+        br#"{"version":2,"run":7,"run":7,"sequence":0,"message":{"kind":"Ready"}}"#.as_slice(),
+        br#"{"version":2,"run":7,"sequence":0,"message":{"kind":"Armed","group":9}}"#.as_slice(),
+        br#"{"version":2,"run":7,"sequence":1,"message":{"kind":"Ready"}}"#.as_slice(),
     ] {
         let mut frame = (body.len() as u16).to_be_bytes().to_vec();
         frame.extend_from_slice(body);
@@ -127,6 +225,69 @@ fn installed_layout_probe_works_with_spaces_minimal_path_and_closed_stdio() {
 }
 
 #[test]
+fn isolated_accounting_reports_memory_limits_and_complete_retirement() {
+    let _runtime = native_runtime();
+    for metric in ["rss", "physical-footprint"] {
+        let directory = tempfile::tempdir().unwrap();
+        let report = directory.path().join("memory.json");
+        let mut command = Command::new(image());
+        command
+            .args([
+                "+16MiB",
+                "+5s",
+                "--limit-grace",
+                "0ms",
+                "--metric",
+                metric,
+                "--report",
+            ])
+            .arg(&report)
+            .arg("--")
+            .arg(fixture())
+            .args(["allocate", "--bytes", "64MiB", "--hold", "20s"]);
+        let output = run_with_deadline(&mut command, Duration::from_secs(9)).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(124),
+            "{metric}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(report).unwrap();
+        let report: memcordon_core::MemcordonReport = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            matches!(
+                report.attempts[0].runtime.as_ref().unwrap().retirement,
+                memcordon_core::RetirementEvidence::Complete { .. }
+            ),
+            "{:?}",
+            report.attempts[0]
+        );
+        let runtime = report.attempts[0].runtime.as_ref().unwrap();
+        let force = runtime
+            .force_requested
+            .expect("guardian's actual force request receipt");
+        assert!(force >= runtime.terminal_observed.unwrap());
+        assert!(force <= runtime.retirement_expires.unwrap());
+    }
+}
+
+#[test]
+fn native_accounting_backend_preserves_consistent_retirement() {
+    let _runtime = native_runtime();
+    let mut command = Command::new(fixture());
+    command
+        .arg("macos-accounting-backend")
+        .arg(image())
+        .arg(fixture());
+    let output = run_with_deadline(&mut command, Duration::from_secs(10)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn large_poll_interval_cannot_postpone_a_short_deadline() {
     let _runtime = native_runtime();
     let mut command = Command::new(image());
@@ -138,6 +299,42 @@ fn large_poll_interval_cannot_postpone_a_short_deadline() {
     let output = run_with_deadline(&mut command, Duration::from_secs(3)).unwrap();
     assert_eq!(output.status.code(), Some(123));
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn caller_envelope_owns_descriptor_and_cwd_snapshots_and_rejects_bad_manifests() {
+    let _runtime = native_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let mut command = Command::new(fixture());
+    command.arg("macos-envelope-transfer").arg(directory.path());
+    let output = run_with_deadline(&mut command, Duration::from_secs(5)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn caller_envelope_preserves_native_bytes_signals_limits_umask_and_exact_descriptors() {
+    let _runtime = native_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let mut command = Command::new(fixture());
+    command
+        .arg("macos-envelope-parent")
+        .arg(image())
+        .arg(fixture())
+        .arg(directory.path());
+    let output = run_with_deadline(&mut command, Duration::from_secs(10)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("created")).unwrap(),
+        b"caller envelope preserved\n"
+    );
 }
 
 #[test]
@@ -274,6 +471,93 @@ fn stopped_guardian_cleans_observed_descendant_after_root_and_frontend_exit() {
         descendant_gone && guardian_gone,
         "retained native member identity did not survive loss of root and frontend"
     );
+}
+
+#[test]
+#[allow(
+    clippy::zombie_processes,
+    reason = "the complementary lose_frontend branches both kill and reap the wrapper; readiness timeout also reaps"
+)]
+fn guardian_inspector_stalls_preserve_custody_after_frontend_death() {
+    let _runtime = native_runtime();
+    for (lanes, lose_frontend) in [("normal", true), ("both", true), ("normal", false)] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut wrapper = Command::new(fixture())
+            .args(["macos-guardian-inspector-wrapper"])
+            .arg(image())
+            .arg(fixture())
+            .arg(directory.path())
+            .arg(lanes)
+            .spawn()
+            .unwrap();
+        let ready = directory.path().join("guardian");
+        let ready_by = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < ready_by {
+            assert!(
+                wrapper.try_wait().unwrap().is_none(),
+                "guardian fault fixture exited before readiness"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !ready.exists() {
+            let _ = wrapper.kill();
+            let _ = wrapper.wait();
+            panic!("guardian inspector fault barrier not reached");
+        }
+        let guardian = read_identity(&ready);
+        let target = read_identity(&directory.path().join("target"));
+        let normal = read_identity(&directory.path().join("normal"));
+        let emergency = read_identity(&directory.path().join("emergency"));
+        if lose_frontend {
+            wrapper.kill().unwrap();
+            wrapper.wait().unwrap();
+        }
+        let stopped_by = Instant::now() + Duration::from_secs(2);
+        while target.still_exists().unwrap() && Instant::now() < stopped_by {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let target_stopped = !target.still_exists().unwrap();
+        let custody_retained = guardian.still_exists().unwrap();
+        if !lose_frontend {
+            assert!(
+                wrapper.try_wait().unwrap().is_none(),
+                "frontend exited before guardian deadline observation"
+            );
+            wrapper.kill().unwrap();
+            wrapper.wait().unwrap();
+        }
+        for helper in [normal, emergency] {
+            if helper.still_exists().unwrap() {
+                // SAFETY: the exact fixture-owned birth identity is still present.
+                assert_eq!(unsafe { libc::kill(helper.pid as i32, libc::SIGCONT) }, 0);
+            }
+        }
+        let retired_by = Instant::now() + Duration::from_secs(3);
+        while [guardian, normal, emergency]
+            .iter()
+            .any(|identity| identity.still_exists().unwrap())
+            && Instant::now() < retired_by
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let retired = [guardian, normal, emergency]
+            .iter()
+            .all(|identity| !identity.still_exists().unwrap());
+        for identity in [target, guardian, normal, emergency] {
+            if identity.still_exists().unwrap() {
+                let _ = memcordon_platform::test_support::force_terminate(identity.pid);
+            }
+        }
+        assert!(
+            target_stopped,
+            "guardian timer failed with {lanes} inspectors stopped"
+        );
+        assert!(
+            custody_retained,
+            "guardian abandoned a stopped inspector obligation"
+        );
+        assert!(retired, "resumed inspector obligations did not retire");
+    }
 }
 
 #[test]

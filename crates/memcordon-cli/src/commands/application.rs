@@ -1,10 +1,13 @@
 use std::io::Write as _;
+#[cfg(not(target_os = "macos"))]
 use std::path::Path;
 
 use memcordon::exit_mapping::error_exit_code;
 use memcordon::invocation::{
     BudgetSet, BudgetToken, CleanArgs, DoctorArgs, ExecutionArgs, PlanArgs, PolicyArgs, Requirement,
 };
+#[cfg(not(target_os = "macos"))]
+use memcordon_core::write_report_atomic;
 use memcordon_core::{
     BackendCapabilityReport, BackoffPolicyReport, BoundaryCapability, BoundaryClass,
     BoundaryRequirement, BudgetKindReport, BudgetTokenReport, CLEAN_REPORT_SCHEMA_VERSION,
@@ -17,9 +20,11 @@ use memcordon_core::{
     PolicyEnvelopeReport, RequestedMemoryPolicyReport, RequestedPolicyReport,
     RequestedRestartPolicyReport, RequirementReport, RestartCondition, RestartConditions,
     RestartPolicy, RestartSettings, SupervisionExecution, SupervisionTerminal, SwapPolicy,
-    SwapReport, ToolReport, UnavailableCapabilityReport, write_report_atomic,
+    SwapReport, ToolReport, UnavailableCapabilityReport,
 };
-use memcordon_platform::{SupervisorRequest, capabilities, cleanup_stale, probe, supervise};
+#[cfg(not(target_os = "macos"))]
+use memcordon_platform::supervise;
+use memcordon_platform::{SupervisorRequest, capabilities, cleanup_stale, probe};
 
 use crate::presentation::{self, ExecutionSummary, Presentation, SummaryTone};
 
@@ -32,6 +37,7 @@ struct Resolution {
 }
 
 pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
+    #[cfg(not(target_os = "macos"))]
     if let Some(path) = &args.output.report_path {
         let parent = path
             .parent()
@@ -52,10 +58,24 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
     }
     let (program, arguments) = args.command.split_first().expect("router requires command");
     let command = CommandSpec::new(program.clone()).args(arguments.iter().cloned());
+    #[cfg(target_os = "macos")]
+    let run_origin = match memcordon_platform::macos_continuous_nanos() {
+        Ok(origin) => origin,
+        Err(error) => {
+            return finish_error(
+                &args,
+                &command,
+                None,
+                Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string()),
+                presentation,
+            );
+        }
+    };
     let resolution = match resolve(&args.policy, &args.budgets) {
         Ok(value) => value,
         Err(error) => return finish_error(&args, &command, None, *error, presentation),
     };
+    #[cfg(not(target_os = "macos"))]
     if !args.output.quiet {
         render_effect_warnings(
             &resolution.report.effects,
@@ -64,21 +84,96 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
             presentation,
         );
     }
-    let helper = match helper_path() {
+    #[cfg(target_os = "macos")]
+    let helper_result = bounded_helper_path(
+        run_origin,
+        resolution
+            .policy
+            .deadline
+            .map(|deadline| deadline.duration()),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let helper_result = helper_path();
+    let helper = match helper_result {
         Ok(value) => value,
         Err(error) => {
             return finish_error(&args, &command, Some(&resolution), *error, presentation);
         }
     };
-    match supervise(SupervisorRequest {
+    let request = SupervisorRequest {
         policy: resolution.policy.clone(),
         restart: resolution.restart.clone(),
         command: command.clone(),
         memcordon_executable: helper,
         resolved_backend: Some(resolution.backend.clone()),
-    }) {
+    };
+    #[cfg(target_os = "macos")]
+    let result = memcordon_platform::macos_supervise_from(request, run_origin);
+    #[cfg(not(target_os = "macos"))]
+    let result = supervise(request);
+    match result {
         Ok(execution) => finish_execution(&args, &command, &resolution, execution, presentation),
         Err(error) => finish_error(&args, &command, Some(&resolution), error, presentation),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn bounded_helper_path(
+    origin: u64,
+    work: Option<std::time::Duration>,
+) -> Result<Option<std::path::PathBuf>, Box<Error>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static RESERVED: AtomicBool = AtomicBool::new(false);
+    // An expired work budget never permits target launch. Its finite retirement
+    // reserve still permits resolving the image needed to construct the native
+    // not-issued observation; supervision receives the original origin.
+    let budget = work.map_or(std::time::Duration::from_secs(5), |work| {
+        work.saturating_add(std::time::Duration::from_secs(3))
+            .min(std::time::Duration::from_secs(5))
+    });
+    let expiry = u64::try_from(budget.as_nanos())
+        .ok()
+        .and_then(|budget| origin.checked_add(budget));
+    let error = || {
+        Box::new(Error::new(
+            ErrorCategory::Setup,
+            "MCSETUP-MEMCORDON-EXECUTABLE",
+            "helper resolution did not complete within startup budget",
+        ))
+    };
+    let Some(expiry) = expiry else {
+        return Err(error());
+    };
+    if RESERVED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(error());
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("helper-resolution".into())
+        .spawn(move || {
+            let _ = sender.send(helper_path());
+            RESERVED.store(false, Ordering::Release);
+        })
+        .is_err()
+    {
+        RESERVED.store(false, Ordering::Release);
+        return Err(error());
+    }
+    loop {
+        // Check completion first so an immediate deadline still enters native
+        // supervision and records a truthful not-issued deadline attempt.
+        match receiver.try_recv() {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return Err(error()),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if memcordon_platform::macos_continuous_nanos().map_err(|_| error())? >= expiry {
+            return Err(error());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -101,6 +196,7 @@ fn helper_path() -> Result<Option<std::path::PathBuf>, Box<Error>> {
     Ok(None)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn finish_execution(
     args: &ExecutionArgs,
     command: &CommandSpec,
@@ -144,6 +240,7 @@ fn finish_execution(
     exit_code
 }
 
+#[cfg(not(target_os = "macos"))]
 fn finish_error(
     args: &ExecutionArgs,
     command: &CommandSpec,
@@ -160,6 +257,7 @@ fn finish_error(
             .map(|value| value.report.clone())
             .unwrap_or_else(|| unresolved_report(&args.policy, &args.budgets));
         let error_report = ExecutionErrorReport {
+            runtime: error.runtime.clone(),
             native_startup: error.native_startup.clone(),
             policy_enforcement: error.policy_enforcement.clone(),
             category: category_name(error.category).to_owned(),
@@ -205,6 +303,159 @@ fn finish_error(
     exit_code
 }
 
+#[cfg(target_os = "macos")]
+fn finish_execution(
+    args: &ExecutionArgs,
+    command: &CommandSpec,
+    resolution: &Resolution,
+    execution: SupervisionExecution,
+    _presentation: &Presentation,
+) -> i32 {
+    let exit_code = execution.wrapper_exit_code();
+    let mut diagnostics = Vec::new();
+    let return_deadline = execution
+        .attempts()
+        .records()
+        .last()
+        .and_then(|attempt| attempt.runtime.as_ref())
+        .and_then(|runtime| runtime.delivery_expires);
+    deferred_warnings(args, resolution, &mut diagnostics);
+    if args.output.summary || matches!(exit_code, 123..=125) {
+        presentation::write_summary(&mut diagnostics, execution_summary(&execution))
+            .expect("memory summary serialization");
+    }
+    let report = if args.output.report_path.is_some() {
+        match report(
+            args,
+            command,
+            &resolution.report,
+            Some(resolution.backend.clone()),
+            Some(execution),
+            None,
+        ) {
+            Ok(report) => Some(report),
+            Err(error) => {
+                presentation::write_runtime_error(
+                    &mut diagnostics,
+                    format_args!("could not construct execution report: {error}"),
+                )
+                .expect("memory error serialization");
+                super::result_delivery::deliver(diagnostics, None, None, return_deadline);
+                return 125;
+            }
+        }
+    } else {
+        None
+    };
+    if super::result_delivery::deliver(
+        diagnostics,
+        args.output.report_path.as_deref(),
+        report,
+        return_deadline,
+    ) {
+        exit_code
+    } else {
+        125
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn finish_error(
+    args: &ExecutionArgs,
+    command: &CommandSpec,
+    resolution: Option<&Resolution>,
+    error: Error,
+    _presentation: &Presentation,
+) -> i32 {
+    let exit_code = error_exit_code(&error);
+    let mut diagnostics = Vec::new();
+    let return_deadline = error
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.delivery_expires);
+    if let Some(resolution) = resolution {
+        deferred_warnings(args, resolution, &mut diagnostics);
+    }
+    presentation::write_runtime_error(&mut diagnostics, &error)
+        .expect("memory error serialization");
+    let report = if args.output.report_path.is_some() {
+        let policy = resolution
+            .map(|value| value.report.clone())
+            .unwrap_or_else(|| unresolved_report(&args.policy, &args.budgets));
+        let error_report = ExecutionErrorReport {
+            runtime: error.runtime.clone(),
+            native_startup: error.native_startup.clone(),
+            policy_enforcement: error.policy_enforcement.clone(),
+            category: category_name(error.category).to_owned(),
+            code: error.code.to_owned(),
+            message: error.message.clone(),
+            os_code: error.os_code,
+            attempt_number: None,
+            supervision_phase: Some("initial-setup".to_owned()),
+            launch_phase: error.launch_phase.map(str::to_owned),
+            target_released: error.target_released,
+            workload_may_be_alive: error.workload_may_be_alive,
+            boundary_setup_failure: error.boundary_setup_failure.clone(),
+            provider_rejection: error.provider_rejection.clone(),
+            provider_failure: error.provider_failure.clone(),
+        };
+        match report(
+            args,
+            command,
+            &policy,
+            resolution.map(|value| value.backend.clone()),
+            None,
+            Some(error_report),
+        ) {
+            Ok(report) => Some(report),
+            Err(report_error) => {
+                presentation::write_runtime_error(
+                    &mut diagnostics,
+                    format_args!("could not construct failure report: {report_error}"),
+                )
+                .expect("memory error serialization");
+                super::result_delivery::deliver(diagnostics, None, None, return_deadline);
+                return 125;
+            }
+        }
+    } else {
+        None
+    };
+    if super::result_delivery::deliver(
+        diagnostics,
+        args.output.report_path.as_deref(),
+        report,
+        return_deadline,
+    ) {
+        exit_code
+    } else {
+        125
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn deferred_warnings(args: &ExecutionArgs, resolution: &Resolution, out: &mut Vec<u8>) {
+    if args.output.quiet {
+        return;
+    }
+    for effect in &resolution.report.effects {
+        if let OptionEffectReport::Ignored {
+            option,
+            requested,
+            reason,
+        } = effect
+        {
+            if (option == "restart-on" && args.policy.restart_on.is_none())
+                || (option == "swap" && !args.policy.explicit.swap)
+            {
+                continue;
+            }
+            presentation::write_warning(out, option, requested, reason)
+                .expect("memory warning serialization");
+        }
+    }
+}
+
 fn report(
     args: &ExecutionArgs,
     command: &CommandSpec,
@@ -236,7 +487,7 @@ fn report(
     {
         policy.effective.workload = resolution;
     }
-    MemcordonReport::schema9(
+    MemcordonReport::schema10(
         tool_report(),
         InvocationReport {
             syntax: "plus-budgets-v1".to_owned(),
@@ -577,10 +828,14 @@ fn policy_report(
             option: "deadline-origin".to_owned(),
             requested: "platform-authorization".to_owned(),
             effective: deadline_origin(backend.name).to_owned(),
-            reason: format!(
-                "the {:?} deadline clock starts at the backend authorization boundary",
-                deadline.scope()
-            ),
+            reason: if backend.name == "macos-watchdog" {
+                "the deadline clock starts before initial helper setup".to_owned()
+            } else {
+                format!(
+                    "the {:?} deadline clock starts at the backend authorization boundary",
+                    deadline.scope()
+                )
+            },
         });
     }
     if policy.memory.is_some() || policy.deadline.is_some() {
@@ -622,7 +877,7 @@ fn policy_report(
                 duration_ms: milliseconds(deadline.duration()),
                 scope: deadline.scope(),
                 origin: Some(deadline_origin(backend.name).to_owned()),
-                clock: "rust-instant".to_owned(),
+                clock: deadline_clock(backend.name).to_owned(),
             }),
             wait_for: effective_wait.to_owned(),
             signal_grace_ms: milliseconds(policy.signal_grace),
@@ -676,7 +931,7 @@ fn requested_report(
             duration_ms: milliseconds(duration),
             scope: args.deadline_scope,
             origin: None,
-            clock: "rust-instant".to_owned(),
+            clock: requested_deadline_clock().to_owned(),
         }),
         wait_for: wait_name(args.wait_for).to_owned(),
         signal_grace_ms: milliseconds(args.signal_grace),
@@ -745,7 +1000,7 @@ fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeRe
                 duration_ms: milliseconds(duration),
                 scope: args.deadline_scope,
                 origin: None,
-                clock: "rust-instant".to_owned(),
+                clock: requested_deadline_clock().to_owned(),
             }),
             wait_for: wait_name(args.wait_for).to_owned(),
             signal_grace_ms: milliseconds(args.signal_grace),
@@ -1204,8 +1459,22 @@ fn deadline_origin(backend: &str) -> &'static str {
     match backend {
         "linux-cgroup-v2" => "installed-cli-release-byte",
         "windows-job-object" => "suspended-thread-resume",
-        "macos-watchdog" => "pre-spawn",
+        "macos-watchdog" => "before-helper-setup",
         _ => "platform-authorization",
+    }
+}
+fn deadline_clock(backend: &str) -> &'static str {
+    if backend == "macos-watchdog" {
+        "darwin-continuous-nanoseconds-v1"
+    } else {
+        "rust-instant"
+    }
+}
+fn requested_deadline_clock() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "darwin-continuous-nanoseconds-v1"
+    } else {
+        "rust-instant"
     }
 }
 fn uses_linux_cgroup_memory(backend: &str) -> bool {
@@ -1224,6 +1493,7 @@ fn category_name(value: ErrorCategory) -> &'static str {
         ErrorCategory::Report => "report",
     }
 }
+#[cfg(not(target_os = "macos"))]
 fn render_effect_warnings(
     effects: &[OptionEffectReport],
     restart_conditions_explicit: bool,

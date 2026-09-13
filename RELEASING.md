@@ -36,6 +36,15 @@ described in [MAINTAINERS.md](MAINTAINERS.md). Record user-visible changes in
   yank, or owner-management authority.
 - Start from a clean checkout of the intended release commit after every public
   CI check has passed.
+- Require the independent `macos-deadline` controller on both macOS architectures
+  for the exact source and native SDK/compiler identity. Keep its current-run
+  evidence outside compiled caches. Its forced teardown can never turn failed
+  native cleanup into successful qualification.
+- Keep deadline-contract qualification separate from installed-PATH installer
+  acceptance. A synthetic command returning `123` can satisfy a deadline test;
+  the real installer must finish normally with its required postconditions and
+  complete cleanup. No source build, automatic downgrade, or interrupted run
+  substitutes for the explicitly selected installed artifact.
 - Confirm the fixed `ubuntu-24.04`, `windows-2025`, and Windows ARM64 native
   jobs are available. A skipped scenario or failed runtime qualification
   blocks release.

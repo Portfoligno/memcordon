@@ -229,6 +229,28 @@ fn post_attempt_backend_drift_retains_typed_runtime_evidence() {
     );
     let _: memcordon_core::SupervisionExecution =
         serde_json::from_value(encoded.clone()).expect("typed drift execution must round trip");
+    let mut preauthorization = encoded.clone();
+    preauthorization["targets_authorized"] = serde_json::json!(0);
+    preauthorization["aggregates"]["confirmed_authorizations"] = serde_json::json!(0);
+    preauthorization["terminal"]["error"]["target_released"] = serde_json::json!(false);
+    preauthorization["attempts"]["first"]["error"]["target_released"] = serde_json::json!(false);
+    preauthorization["attempts"]["first"]["launch"]["target_released"] = serde_json::json!(false);
+    preauthorization["attempts"]["first"]["target_pid"] = serde_json::Value::Null;
+    preauthorization["attempts"]["first"]["authorized_offset_ms"] = serde_json::Value::Null;
+    let preauthorization: memcordon_core::SupervisionExecution = serde_json::from_value(
+        preauthorization,
+    )
+    .expect("backend drift before authorization must retain a valid zero-authorization failure");
+    assert_eq!(preauthorization.targets_authorized(), 0);
+    assert_eq!(
+        preauthorization
+            .attempts()
+            .first
+            .as_ref()
+            .unwrap()
+            .target_pid,
+        None
+    );
     let mut inaccurate = encoded;
     inaccurate["terminal"]["error"]["backend_selection_drift"]["mismatched_fields"] =
         serde_json::json!(["startup_containment"]);
@@ -433,6 +455,8 @@ fn only_exact_retired_sealed_retry_deadline_rejection_is_outside_attempt() {
     supervision_policy.deadline =
         Some(DeadlinePolicy::new(Duration::from_secs(30), DeadlineScope::Supervision).unwrap());
     let retry = AttemptContext {
+        macos_run_origin_ns: None,
+        macos_work_expires_ns: None,
         restart_attempt: 1,
         supervision_offset: Duration::from_secs(25),
         supervision_deadline_remaining: Some(Duration::from_secs(5)),
@@ -446,6 +470,8 @@ fn only_exact_retired_sealed_retry_deadline_rejection_is_outside_attempt() {
     );
 
     let initial = AttemptContext {
+        macos_run_origin_ns: None,
+        macos_work_expires_ns: None,
         restart_attempt: 0,
         supervision_offset: Duration::ZERO,
         supervision_deadline_remaining: None,

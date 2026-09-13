@@ -68,6 +68,7 @@ enum Suite {
     PackageWindowsSealed,
     ChannelParityWindowsSealed,
     BackendMacosWatchdog,
+    MacosDeadline,
     ReleasePreflight,
     ReleaseNative,
     ReleaseMacos,

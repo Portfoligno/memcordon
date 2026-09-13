@@ -258,9 +258,12 @@ members before restart.
 
 ### macOS watchdog
 
-MemCordon starts native guardian and gated launcher helpers, acknowledges
-readiness and group binding before release, and confirms target exec through a
-kernel process event. The original attempt clock starts before helper startup.
+MemCordon starts a native guardian that owns the gated launcher as its child,
+acknowledges readiness and group binding before release, and confirms target
+exec through a kernel process event. The guardian becomes the target's parent;
+applications that inspect their parent PID observe this custody change.
+The original attempt clock starts before helper startup. The Darwin continuous
+clock counts system sleep; expiry is serviced when the machine resumes.
 The runtime retains owned child identities and discovers descendants by
 sampling process identity. Physical footprint, RSS, and virtual size remain
 distinct metrics. Sampling can miss short bursts and descendants that escape
@@ -307,11 +310,20 @@ or incapable of retaining members.
 
 ### Deadline scopes
 
-An attempt deadline resets when each target is authorized to run: at the Linux
-release-byte write, Windows suspended-thread resume, or macOS pre-spawn. It may
-trigger a configured restart. A supervision deadline starts with the first
-authorization, includes later cleanup, setup, backoff, and cooldown, and is
-terminal. Confirmed memory evidence wins a same-cycle deadline race.
+On macOS an attempt deadline begins with attempt setup, before helper creation.
+A supervision deadline begins before the first setup and includes later setup,
+backoff and cooldown. Startup cannot refresh that deadline. A deadline before
+release cannot authorize a restart. On Linux and Windows the existing native
+authorization origins remain release-byte write and suspended-thread resume.
+Confirmed memory evidence wins a same-cycle deadline race.
+
+Useful work and retirement have separate budgets on macOS. Deadline retirement
+uses the original expiry plus the applicable limit grace and a three-second
+cleanup reserve; result delivery has one additional second. Late detection
+consumes these reserves rather than renewing them. With zero limit grace,
+`+10m` therefore has a 600-second work boundary and a 604-second normal return
+boundary. These are scheduling contracts, not a promise to execute while the
+machine is asleep or the kernel has stopped scheduling the guardian.
 
 ### Backoff
 
@@ -360,10 +372,16 @@ Circuit policy reports expose `threshold`, `half_life_ms`, and `cooldown_ms`.
 
 ## Execution reports
 
-`--report PATH` writes a mandatory schema-9 JSON document. The document is
+`--report PATH` writes a mandatory schema-10 JSON document. The document is
 pretty-printed, ends in one newline, and is atomically persisted through a
 same-directory temporary file. The parent directory must exist. A write failure
 returns `125`.
+
+On macOS a separate bounded writer performs report persistence and wrapper
+diagnostics. A blocked destination returns `125`; a timeout racing atomic
+replacement leaves persistence uncertain. File presence alone cannot prove
+successful delivery. The report records the primary execution cause before
+delivery, and cannot certify its own writer's later acknowledgment or reap.
 
 The envelope contains tool and native invocation identity, requested/effective
 policy, nullable backend capability, a supervision summary, bounded attempt
@@ -393,9 +411,13 @@ Native helper startup failures may additionally carry `native_startup`, an
 optional `NativeStartupDiagnosticV1` observation with exact helper paths,
 filesystem identity when observed, startup phase, errno, process/readiness/exec
 facts, and separate cleanup errors. The primary error remains unchanged.
-Execution schema 9 and ordinary doctor schema 6 retain their versions; absent
-startup diagnostics add no field. Strict older decoders may reject this new
-optional failure field and must not silently infer success.
+Execution schema 10 adds explicit authorization uncertainty and runtime clock,
+deadline, retirement and delivery evidence. A target PID can be absent before
+native creation. Confirmed authorization and unknown attempts are separate
+counters; neither attempt count nor retry count implies an issued grant.
+Historical schema 9 observations must not be promoted by inventing these facts.
+Ordinary doctor schema 6 is unchanged; absent startup diagnostics add no field.
+Plan schema 9 names the macOS continuous clock and origin before helper setup.
 
 Attempt history has capacity 256. Attempt 1 is retained permanently and the
 latest 255 attempts form a contiguous ascending tail. Declared retained,

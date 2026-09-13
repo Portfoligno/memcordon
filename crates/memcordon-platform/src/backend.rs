@@ -63,7 +63,8 @@ pub struct Execution {
     pub policy_enforcement: memcordon_core::workload_evidence::AttemptPolicyEnforcementV1,
     pub outcome: RunOutcome,
     pub backend: BackendInfo,
-    pub child_pid: u32,
+    pub child_pid: Option<std::num::NonZeroU32>,
+    pub runtime: Option<memcordon_core::RuntimeEvidenceV1>,
     pub duration: Duration,
     pub authorization_offset: Option<Duration>,
     pub launch: LaunchEvidence,
@@ -285,6 +286,8 @@ pub fn run(
         memcordon_executable,
         &signal,
         crate::supervisor::AttemptContext {
+            macos_run_origin_ns: None,
+            macos_work_expires_ns: None,
             restart_attempt: 0,
             supervision_offset: Duration::ZERO,
             supervision_deadline_remaining: None,
@@ -315,6 +318,8 @@ pub fn run(
         memcordon_executable,
         &signal,
         crate::supervisor::AttemptContext {
+            macos_run_origin_ns: None,
+            macos_work_expires_ns: None,
             restart_attempt: 0,
             supervision_offset: Duration::ZERO,
             supervision_deadline_remaining: None,
@@ -352,6 +357,8 @@ pub fn run(policy: Policy, command: &CommandSpec) -> Result<Execution, Error> {
                 .with_os_error(&error)
         })?;
         let context = crate::supervisor::AttemptContext {
+            macos_run_origin_ns: None,
+            macos_work_expires_ns: None,
             restart_attempt: 0,
             supervision_offset: Duration::ZERO,
             supervision_deadline_remaining: None,

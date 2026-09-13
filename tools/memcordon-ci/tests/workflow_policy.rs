@@ -7,6 +7,36 @@ fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
+#[test]
+fn macos_deadline_rejects_missing_native_fingerprint_and_failure_evidence() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy");
+    let fixture = include_str!("../../../.github/workflows/ci.yml");
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/ci.yml"),
+        fixture.as_bytes(),
+        &repository_policy,
+    )
+    .expect("complete independent deadline lane");
+    for missing in [
+        "./ci-native-fingerprint --output target/ci/native-inputs.bin",
+        "target/ci/deadline-evidence",
+    ] {
+        let invalid = fixture.replace(missing, "missing-deadline-proof");
+        assert!(
+            policy::validate_workflow_bytes(
+                &root,
+                Path::new(".github/workflows/ci.yml"),
+                invalid.as_bytes(),
+                &repository_policy
+            )
+            .is_err(),
+            "missing required evidence was accepted: {missing}"
+        );
+    }
+}
+
 fn workflow_with_job_timeout(fixture: &str, job_id: &str, timeout_minutes: u64) -> Vec<u8> {
     let mut document: Value =
         serde_yaml::from_str(fixture).expect("workflow fixture should deserialize");

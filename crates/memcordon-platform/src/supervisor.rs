@@ -118,8 +118,10 @@ pub struct AttemptExecution {
     pub restart_safety: RestartSafetyProof,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct AttemptContext {
+    pub macos_run_origin_ns: Option<u64>,
+    pub macos_work_expires_ns: Option<u64>,
     pub restart_attempt: u64,
     pub supervision_offset: Duration,
     pub supervision_deadline_remaining: Option<Duration>,
@@ -236,11 +238,45 @@ pub fn capabilities_for(
 #[cfg(unix)]
 #[allow(clippy::result_large_err)]
 pub fn supervise(request: SupervisorRequest) -> Result<SupervisionExecution, Error> {
+    #[cfg(target_os = "macos")]
+    {
+        let origin = crate::macos_continuous_nanos().map_err(|error| {
+            Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string())
+        })?;
+        macos_supervise_from(request, origin)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let resolved_backend = validate_resolved_backend(&request)?;
+        let signal = SignalSource::install().map_err(|error| {
+            Error::new(ErrorCategory::Setup, "MCSETUP-SIGNAL", error.to_string())
+                .with_os_error(&error)
+        })?;
+        supervise_with(request, &signal, resolved_backend)
+    }
+}
+
+/// Continue the initial CLI run clock established before helper resolution.
+#[cfg(target_os = "macos")]
+#[allow(clippy::result_large_err)]
+pub fn macos_supervise_from(
+    request: SupervisorRequest,
+    origin: u64,
+) -> Result<SupervisionExecution, Error> {
+    let now = crate::macos_continuous_nanos()
+        .map_err(|error| Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string()))?;
+    if origin > now {
+        return Err(Error::new(
+            ErrorCategory::Setup,
+            "MCSETUP-CLOCK",
+            "run origin is in the future",
+        ));
+    }
     let resolved_backend = validate_resolved_backend(&request)?;
     let signal = SignalSource::install().map_err(|error| {
         Error::new(ErrorCategory::Setup, "MCSETUP-SIGNAL", error.to_string()).with_os_error(&error)
     })?;
-    supervise_with(request, &signal, resolved_backend)
+    supervise_with_origin(request, &signal, resolved_backend, Some(origin))
 }
 
 #[cfg(target_os = "windows")]
@@ -314,12 +350,71 @@ pub fn supervise(_request: SupervisorRequest) -> Result<SupervisionExecution, Er
 }
 
 #[allow(clippy::result_large_err)]
+#[cfg(not(target_os = "macos"))]
 fn supervise_with<I: InterruptionWait>(
     request: SupervisorRequest,
     signal: &I,
     resolved_backend: Option<BackendCapabilityReport>,
 ) -> Result<SupervisionExecution, Error> {
+    supervise_with_origin(request, signal, resolved_backend, None)
+}
+
+#[allow(clippy::result_large_err)]
+fn supervise_with_origin<I: InterruptionWait>(
+    request: SupervisorRequest,
+    signal: &I,
+    resolved_backend: Option<BackendCapabilityReport>,
+    supplied_origin: Option<u64>,
+) -> Result<SupervisionExecution, Error> {
     let started = Instant::now();
+    #[cfg(target_os = "macos")]
+    let run_origin = match supplied_origin {
+        Some(origin) => origin,
+        None => crate::macos_continuous_nanos().map_err(|error| {
+            Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string())
+        })?,
+    };
+    #[cfg(target_os = "macos")]
+    let macos_run_origin_ns = Some(run_origin);
+    #[cfg(not(target_os = "macos"))]
+    let macos_run_origin_ns: Option<u64> = None;
+    #[cfg(not(target_os = "macos"))]
+    let _ = supplied_origin;
+    #[cfg(target_os = "macos")]
+    let started = started
+        .checked_sub(Duration::from_nanos(
+            crate::macos_continuous_nanos()
+                .map_err(|error| {
+                    Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string())
+                })?
+                .saturating_sub(run_origin),
+        ))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCategory::Setup,
+                "MCSETUP-CLOCK",
+                "run origin exceeds local timing range",
+            )
+        })?;
+    let macos_work_expires_ns = match (macos_run_origin_ns, request.policy.deadline) {
+        (Some(origin), Some(deadline))
+            if deadline.scope() == memcordon_core::DeadlineScope::Supervision =>
+        {
+            Some(
+                u64::try_from(deadline.duration().as_nanos())
+                    .ok()
+                    .and_then(|duration| origin.checked_add(duration))
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorCategory::Usage,
+                            "MCUSAGE-DEADLINE-RANGE",
+                            "deadline exceeds the continuous clock range",
+                        )
+                    })?,
+            )
+        }
+        _ => None,
+    };
     let mut history = AttemptHistory::default();
     let mut aggregates = SupervisionAggregates::default();
     let mut targets_authorized = 0_u64;
@@ -331,10 +426,12 @@ fn supervise_with<I: InterruptionWait>(
         }
     };
     let mut backend = resolved_backend;
-    let mut supervision_origin_offset = None;
+    let mut supervision_origin_offset = macos_run_origin_ns.map(|_| Duration::ZERO);
     loop {
         let attempt_started = started.elapsed();
         let context = AttemptContext {
+            macos_run_origin_ns,
+            macos_work_expires_ns,
             restart_attempt: history.total,
             supervision_offset: attempt_started,
             supervision_deadline_remaining: supervision_remaining(
@@ -425,6 +522,7 @@ fn supervise_with<I: InterruptionWait>(
                 history
                     .append(
                         AttemptRecord {
+                            runtime: error.runtime.clone(),
                             number,
                             policy_enforcement: error.policy_enforcement.clone().unwrap_or_else(|| {
                                 request.policy.workload_contract().map_or_else(Default::default, |contract|
@@ -435,7 +533,7 @@ fn supervise_with<I: InterruptionWait>(
                             }),
                             kind,
                             phase: AttemptPhase::Failed,
-                            target_pid: error.target_pid,
+                            target_pid: error.target_pid.or_else(|| error.runtime.as_ref().and_then(|runtime| runtime.target_pid.map(std::num::NonZeroU32::get))),
                             started_offset_ms: Some(millis(attempt_started)),
                             authorized_offset_ms: error
                                 .authorization_offset
@@ -493,7 +591,7 @@ fn supervise_with<I: InterruptionWait>(
                     (!fields.is_empty()).then(|| (selected.clone(), fields))
                 }) {
                     targets_authorized = targets_authorized
-                        .checked_add(1)
+                        .checked_add(u64::from(attempt.execution.launch.target_released))
                         .ok_or_else(counter_error)?;
                     let number = history.total.checked_add(1).ok_or_else(counter_error)?;
                     return finish_backend_selection_drift(
@@ -516,11 +614,16 @@ fn supervise_with<I: InterruptionWait>(
                 }
                 backend = Some(observed);
                 targets_authorized = targets_authorized
-                    .checked_add(1)
+                    .checked_add(u64::from(attempt.execution.launch.target_released))
                     .ok_or_else(counter_error)?;
                 let number = history.total.checked_add(1).ok_or_else(counter_error)?;
                 let outcome = attempt.execution.outcome.clone();
-                let trigger = restart_condition(&outcome);
+                let trigger = attempt
+                    .execution
+                    .launch
+                    .target_released
+                    .then(|| restart_condition(&outcome))
+                    .flatten();
                 let mut decision = RestartDecisionRecord::default();
                 let action = match (&mut coordinator, trigger) {
                     (Some(coordinator), Some(trigger)) => coordinator
@@ -610,11 +713,12 @@ fn supervise_with<I: InterruptionWait>(
                 history
                     .append(
                         AttemptRecord {
+                            runtime: attempt.execution.runtime,
                             number,
                             kind,
                             phase: AttemptPhase::Completed,
                             policy_enforcement: attempt.execution.policy_enforcement,
-                            target_pid: Some(attempt.execution.child_pid),
+                            target_pid: attempt.execution.child_pid.map(std::num::NonZeroU32::get),
                             started_offset_ms: Some(millis(attempt_started)),
                             authorized_offset_ms: attempt
                                 .execution
@@ -774,6 +878,23 @@ fn attempt_execution(execution: Execution) -> Result<AttemptExecution, Error> {
 
 #[allow(clippy::result_large_err)]
 fn validate_backend_execution(execution: &Execution) -> Result<(), Error> {
+    if execution.launch.target_released != execution.authorization_offset.is_some()
+        || (execution.launch.target_released && execution.child_pid.is_none())
+        || execution.runtime.as_ref().is_some_and(|runtime| {
+            !runtime.is_consistent()
+                || runtime.target_pid != execution.child_pid
+                || matches!(
+                    runtime.release,
+                    memcordon_core::ReleaseEvidence::Issued { .. }
+                ) != execution.launch.target_released
+        })
+    {
+        return Err(Error::new(
+            ErrorCategory::Monitor,
+            "MCRESTART-AUTHORIZATION-EVIDENCE",
+            "backend release, target identity, and runtime evidence disagree",
+        ));
+    }
     if memcordon_core::boundary_evidence_is_consistent(
         &execution.launch,
         &execution.restart_safety,
@@ -925,11 +1046,12 @@ fn finish_backend_selection_drift(
     history
         .append(
             AttemptRecord {
+                runtime: attempt.execution.runtime,
                 number,
                 policy_enforcement: attempt.execution.policy_enforcement,
                 kind,
                 phase: AttemptPhase::Failed,
-                target_pid: Some(attempt.execution.child_pid),
+                target_pid: attempt.execution.child_pid.map(std::num::NonZeroU32::get),
                 started_offset_ms: Some(millis(attempt_started)),
                 authorized_offset_ms: attempt
                     .execution
@@ -1046,7 +1168,8 @@ pub(crate) fn test_backend_selection_drift_execution(
                     },
                 },
                 backend,
-                child_pid: 42,
+                child_pid: std::num::NonZeroU32::new(42),
+                runtime: None,
                 duration: Duration::from_millis(2),
                 authorization_offset: Some(Duration::from_millis(1)),
                 launch: launch.clone(),

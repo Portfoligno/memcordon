@@ -158,7 +158,12 @@ fn immediate_success_failure_and_status_are_reaped_and_preserved() {
             &mut wrapped(fixture(), &["exit", "--code", &code.to_string()]),
             Duration::from_secs(2),
         );
-        assert_eq!(output.status.code(), Some(code), "iteration {iteration}");
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "iteration {iteration}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_stdout_empty(&output);
     }
 }
@@ -276,7 +281,12 @@ fn command_exit_grace_allows_remaining_workload_to_drain_naturally() {
         .arg(&completion_marker);
 
     let output = completed(&mut invocation, Duration::from_secs(4));
-    assert_eq!(output.status.code(), Some(37));
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_stdout_empty(&output);
     assert!(
         completion_marker.exists(),
@@ -401,7 +411,12 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
         .arg(&completion_marker);
 
     let output = completed(&mut invocation, Duration::from_secs(6));
-    assert_eq!(output.status.code(), Some(123));
+    assert_eq!(
+        output.status.code(),
+        Some(123),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_stdout_empty(&output);
     assert!(
         !completion_marker.exists(),
@@ -429,6 +444,17 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn workload_lifetime_waits_for_background_descendant_to_finish_naturally() {
+    assert_natural_workload_completion("100ms", Duration::from_secs(3));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn natural_workload_completion_starts_retirement_reserve_at_completion() {
+    assert_natural_workload_completion("3500ms", Duration::from_secs(7));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_natural_workload_completion(child_duration: &str, outer_deadline: Duration) {
     if !backend_available() {
         return;
     }
@@ -440,7 +466,7 @@ fn workload_lifetime_waits_for_background_descendant_to_finish_naturally() {
         &[
             "spawn-background",
             "--child-duration",
-            "100ms",
+            child_duration,
             "--exit-code",
             "37",
         ],
@@ -451,8 +477,13 @@ fn workload_lifetime_waits_for_background_descendant_to_finish_naturally() {
         .arg("--completion-marker")
         .arg(&completion_marker);
 
-    let output = completed(&mut invocation, Duration::from_secs(3));
-    assert_eq!(output.status.code(), Some(37));
+    let output = completed(&mut invocation, outer_deadline);
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_stdout_empty(&output);
     assert!(
         completion_marker.exists(),

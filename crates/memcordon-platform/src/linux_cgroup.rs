@@ -891,7 +891,10 @@ pub fn run_attempt(
         policy_enforcement: Default::default(),
         outcome,
         backend,
-        child_pid: u32::try_from(child_pid).unwrap_or_default(),
+        child_pid: std::num::NonZeroU32::new(
+            u32::try_from(child_pid).expect("validated positive child pid"),
+        ),
+        runtime: None,
         duration: started.elapsed(),
         authorization_offset: Some(authorized.saturating_duration_since(started)),
         launch,

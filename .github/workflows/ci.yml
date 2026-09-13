@@ -269,3 +269,63 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.native-deps.outputs.cache-primary-key }}
+
+  macos-deadline:
+    name: macOS deadline / ${{ matrix.id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: arm64
+            runner: macos-15
+          - id: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: deadline-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: deadline-sources-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint
+      - run: ./ci-native-fingerprint --output target/ci/native-inputs.bin
+      - id: deadline-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/deadline-build
+            target/ci/deadline-oracle-build
+          key: deadline-target-v1-${{ matrix.id }}-${{ github.sha }}-${{ hashFiles('target/ci/native-inputs.bin') }}
+      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite macos-deadline
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: macos-deadline-${{ matrix.id }}
+          path: target/ci/deadline-evidence
+          if-no-files-found: error
+          retention-days: 14
+      - if: always() && steps.deadline-target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/deadline-build
+            target/ci/deadline-oracle-build
+          key: ${{ steps.deadline-target.outputs.cache-primary-key }}
+      - if: always() && steps.deadline-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.deadline-deps.outputs.cache-primary-key }}

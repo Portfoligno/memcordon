@@ -456,7 +456,8 @@ pub fn run(
         policy_enforcement: terminal.policy_enforcement.clone(),
         outcome,
         backend: crate::linux_cgroup::sealed_info(qualification),
-        child_pid: terminal.target_pid,
+        child_pid: std::num::NonZeroU32::new(terminal.target_pid),
+        runtime: None,
         duration: started.elapsed(),
         authorization_offset: Some(Duration::from_millis(terminal.authorization_offset_millis)),
         launch: memcordon_core::LaunchEvidence {

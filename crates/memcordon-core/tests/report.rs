@@ -107,6 +107,7 @@ fn typed_provider_rejection_round_trips_with_cleanup_proof() {
         terminal_receipt: None,
     };
     let error = ExecutionErrorReport {
+        runtime: None,
         native_startup: None,
         policy_enforcement: None,
         category: "setup".to_owned(),
@@ -203,6 +204,7 @@ fn report() -> MemcordonReport {
         None,
         None,
         Some(ExecutionErrorReport {
+            runtime: None,
             native_startup: None,
             policy_enforcement: None,
             category: "spawn".to_owned(),
@@ -1199,7 +1201,9 @@ fn attempt_record(
     outcome: Option<RunOutcome>,
     error: Option<SupervisionErrorRecord>,
 ) -> AttemptRecord {
+    let released = outcome.is_some() || error.as_ref().is_some_and(|error| error.target_released);
     AttemptRecord {
+        runtime: None,
         policy_enforcement: Default::default(),
         number,
         kind: if number == 1 {
@@ -1212,11 +1216,9 @@ fn attempt_record(
         } else {
             AttemptPhase::Failed
         },
-        target_pid: outcome
-            .is_some()
-            .then(|| u32::try_from(number).expect("fixture number") + 100),
+        target_pid: released.then(|| u32::try_from(number).expect("fixture number") + 100),
         started_offset_ms: Some(number),
-        authorized_offset_ms: outcome.is_some().then_some(number + 1),
+        authorized_offset_ms: released.then_some(number + 1),
         terminal_offset_ms: outcome.is_some().then_some(number + 2),
         finished_offset_ms: number + 3,
         outcome,
@@ -1224,7 +1226,7 @@ fn attempt_record(
         restart_decision: RestartDecisionRecord::default(),
         launch: LaunchEvidence {
             mechanism: "fixture".to_owned(),
-            target_released: true,
+            target_released: released,
             containment_verified_before_authorization: true,
             guardian_started_before_authorization: true,
             target_spawn_error_reported: false,
@@ -1406,6 +1408,7 @@ fn deadline_report_value(attempts: u64) -> serde_json::Value {
     let terminal = history
         .recent
         .back()
+        .or(history.first.as_ref())
         .and_then(|record| record.outcome.clone())
         .expect("terminal");
     let execution = SupervisionExecution::new(
@@ -1610,13 +1613,22 @@ fn schema_five_later_helper_error_preserves_prior_attempt() {
         coordinator.summary().clone(),
         None,
         2_000,
-        2,
+        1,
     )
     .expect("execution");
     let value = serde_json::to_value(report_from_execution(execution)).expect("json");
     assert_eq!(value["attempts"].as_array().map(Vec::len), Some(2));
     assert_eq!(value["attempts"][0]["number"], 1);
     assert_eq!(value["attempts"][1]["error"]["code"], "MCHELPER");
+    assert_eq!(value["supervision"]["targets_authorized"], 1);
+    assert_eq!(
+        value["supervision"]["aggregate"]["retry_attempts_started"],
+        1
+    );
+    assert_eq!(
+        value["supervision"]["aggregate"]["confirmed_retry_authorizations"],
+        0
+    );
     assert_eq!(value["supervision"]["wrapper_exit_code"], 125);
     let _: MemcordonReport = serde_json::from_value(value).expect("round trip");
 }
@@ -1661,7 +1673,7 @@ fn schema_five_initial_spawn_status_round_trips_typed_provenance() {
             RestartSummary::default(),
             None,
             4,
-            0,
+            1,
         )
         .expect("typed spawn terminal");
         let value = serde_json::to_value(report_from_execution(execution)).expect("json");
@@ -1731,7 +1743,7 @@ fn sealed_exec_failure_round_trips_authenticated_provider_provenance() {
         RestartSummary::default(),
         None,
         4,
-        0,
+        1,
     )
     .expect("authenticated sealed spawn provenance must remain reportable");
     let value = serde_json::to_value(report_from_execution(execution)).expect("json");
@@ -2148,6 +2160,9 @@ fn attempt_history_evicts_only_after_the_production_capacity_and_aggregates_all(
             assert_eq!(history.total, number);
             assert_eq!(history.omitted, number - retained);
             assert_eq!(aggregates.deadlines, number);
+            assert_eq!(aggregates.confirmed_authorizations, number);
+            assert_eq!(aggregates.confirmed_retry_authorizations, number - 1);
+            assert_eq!(aggregates.retry_attempts_started, number - 1);
             assert_eq!(history.first.as_ref().expect("first").number, 1);
             assert_eq!(
                 history.recent.front().expect("tail start").number,
@@ -2156,4 +2171,77 @@ fn attempt_history_evicts_only_after_the_production_capacity_and_aggregates_all(
             assert_eq!(history.recent.back().expect("last").number, number);
         }
     }
+}
+
+#[test]
+fn unknown_authorization_survives_eviction_without_becoming_a_confirmed_grant() {
+    let mut history = AttemptHistory::default();
+    let mut aggregates = SupervisionAggregates::default();
+    for number in 1..=300 {
+        let outcome = RunOutcome::DeadlineExceeded {
+            deadline: DeadlineEvidence::new(
+                10,
+                DeadlineScope::Attempt,
+                "test-origin".to_owned(),
+                number,
+                number,
+                0,
+                0,
+                None,
+                None,
+            )
+            .unwrap(),
+            child_after_termination: None,
+            peak: None,
+            cleanup: cleanup(),
+        };
+        let mut record = attempt_record(number, Some(outcome), None);
+        if number == 2 {
+            record.launch.target_released = false;
+            record.authorized_offset_ms = None;
+            record.restart_safety = RestartSafetyProof::default();
+            record.runtime = Some(memcordon_core::RuntimeEvidenceV1 {
+                schema_version: 1,
+                clock: memcordon_core::ClockDomain::DarwinContinuousTicksV1 {
+                    boot_identity: "fixture-boot".to_owned(),
+                    ticks_per_second: 1_000_000_000,
+                },
+                run_origin: 0,
+                attempt_origin: 2,
+                work_expires: Some(10),
+                startup_expires: 10,
+                release: memcordon_core::ReleaseEvidence::Unknown,
+                target_pid: record.target_pid.and_then(std::num::NonZeroU32::new),
+                terminal_observed: Some(10),
+                force_requested: None,
+                force_expires: Some(10),
+                retirement_expires: Some(13),
+                delivery_expires: Some(14),
+                retirement: memcordon_core::RetirementEvidence::Unconfirmed { last_owner: None },
+                delivery: memcordon_core::DeliveryEvidence::NotSubmitted,
+            });
+        }
+        history.append(record, &mut aggregates).unwrap();
+    }
+    assert!(!history.records().any(|record| record.number == 2));
+    assert_eq!(aggregates.confirmed_authorizations, 299);
+    assert_eq!(aggregates.unknown_authorization_attempts, 1);
+    assert_eq!(aggregates.retry_attempts_started, 299);
+    assert_eq!(aggregates.confirmed_retry_authorizations, 298);
+}
+
+#[test]
+fn mutation_successful_backend_result_counted_as_authorization_is_rejected() {
+    let mut value = deadline_report_value(1);
+    value["supervision"]["targets_authorized"] = serde_json::json!(0);
+    value["supervision"]["aggregate"]["confirmed_authorizations"] = serde_json::json!(0);
+    value["attempts"][0]["launch"]["target_released"] = serde_json::json!(false);
+    value["attempts"][0]["authorized_offset_ms"] = serde_json::Value::Null;
+    value["attempts"][0]["target_pid"] = serde_json::Value::Null;
+    let valid: MemcordonReport = serde_json::from_value(value.clone())
+        .expect("a preauthorization deadline is a valid backend result");
+    assert_eq!(valid.supervision.unwrap().targets_authorized, 0);
+    // Mutate the historical Ok(Execution) counter without granting launch authority.
+    value["supervision"]["targets_authorized"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<MemcordonReport>(value).is_err());
 }

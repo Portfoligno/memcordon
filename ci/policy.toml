@@ -6,10 +6,10 @@ production_packages = [
   "memcordon",
   "memcordon-testkit",
 ]
-ci_packages = ["memcordon-ci", "memcordon-windows-loader-lab"]
-ci_package_rust_versions = { memcordon-ci = "1.88.0", memcordon-windows-loader-lab = "1.85.0" }
+ci_packages = ["memcordon-ci", "memcordon-windows-loader-lab", "memcordon-deadline-oracle"]
+ci_package_rust_versions = { memcordon-ci = "1.88.0", memcordon-windows-loader-lab = "1.85.0", memcordon-deadline-oracle = "1.85.0" }
 publish_packages = ["memcordon-core", "memcordon-platform", "memcordon-windows-launch-core", "memcordon"]
-non_publish_packages = ["memcordon-testkit", "memcordon-ci", "memcordon-windows-loader-lab"]
+non_publish_packages = ["memcordon-testkit", "memcordon-ci", "memcordon-windows-loader-lab", "memcordon-deadline-oracle"]
 
 [workflow]
 required_public_matrix = [
@@ -22,6 +22,9 @@ required_public_matrix = [
 ]
 self_extracting_shell_allowlist = []
 allowed_run_commands = [
+  "rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint",
+  "./ci-native-fingerprint --output target/ci/native-inputs.bin",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite macos-deadline",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job",
   "rustup toolchain install 1.97.1 --profile minimal",

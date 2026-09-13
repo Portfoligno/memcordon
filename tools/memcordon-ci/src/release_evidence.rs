@@ -138,10 +138,23 @@ pub const MACOS_LIFECYCLE_SCENARIOS: &[&str] = &[
     "command_exit_grace_force_cleans_survivors_after_expiry",
     "deadline_remains_authoritative_during_command_exit_grace",
     "workload_lifetime_waits_for_background_descendant_to_finish_naturally",
+    "natural_workload_completion_starts_retirement_reserve_at_completion",
     "workload_lifetime_deadline_cleans_background_descendant",
 ];
 
 pub const MACOS_REMEDIATION_SCENARIOS: &[&str] = &[
+    "running_guardian_loss_is_prompt_and_never_clean_retirement",
+    "repeated_stop_events_preserve_first_grace_and_retirement_deadline",
+    "submillisecond_remaining_admission_never_renews_budget",
+    "mutation_disabled_guardian_timer_is_detected",
+    "continuous_clock_jump_expires_original_guardian_deadline",
+    "valid_control_flood_cannot_starve_guardian_deadline",
+    "mutation_release_after_cancel_is_detected",
+    "isolated_accounting_reports_memory_limits_and_complete_retirement",
+    "native_accounting_backend_preserves_consistent_retirement",
+    "caller_envelope_owns_descriptor_and_cwd_snapshots_and_rejects_bad_manifests",
+    "caller_envelope_preserves_native_bytes_signals_limits_umask_and_exact_descriptors",
+    "held_native_spawn_publication_is_cancelled_after_startup_expiry",
     "guardian_and_launcher_loss_never_execute_target_marker",
     "missing_helper_and_unacknowledged_readiness_have_bounded_typed_failures",
     "disarm_timeout_has_nonblocking_drop_and_eventual_owned_reap",
@@ -152,7 +165,41 @@ pub const MACOS_REMEDIATION_SCENARIOS: &[&str] = &[
     "requested_deadline_expires_during_unacknowledged_startup",
     "stalled_inspector_is_bounded_and_guardian_retirement_progresses",
     "stopped_guardian_cleans_observed_descendant_after_root_and_frontend_exit",
+    "guardian_inspector_stalls_preserve_custody_after_frontend_death",
     "bounded_child_slots_and_descriptors_recover_after_repeated_launches",
+];
+
+pub const MACOS_MUTATION_SCENARIOS: &[(&str, &str, &str)] = &[
+    (
+        "memcordon",
+        "macos_remediation",
+        "mutation_disabled_guardian_timer_is_detected",
+    ),
+    (
+        "memcordon-platform",
+        "macos_deadline",
+        "mutation_expired_work_cleanup_clamp_is_detected",
+    ),
+    (
+        "memcordon-platform",
+        "macos_inventory",
+        "mutation_unknown_member_dropping_is_detected",
+    ),
+    (
+        "memcordon",
+        "macos_remediation",
+        "mutation_release_after_cancel_is_detected",
+    ),
+    (
+        "memcordon",
+        "result_delivery",
+        "mutation_synchronous_final_stderr_is_detected",
+    ),
+    (
+        "memcordon-core",
+        "report",
+        "mutation_successful_backend_result_counted_as_authorization_is_rejected",
+    ),
 ];
 
 pub fn macos_scenarios() -> Vec<&'static str> {

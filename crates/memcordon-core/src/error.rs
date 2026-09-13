@@ -407,6 +407,7 @@ pub enum ErrorCategory {
 #[derive(Clone, Debug, Error)]
 #[error("{message} ({code})")]
 pub struct Error {
+    pub runtime: Option<crate::RuntimeEvidenceV1>,
     pub native_startup: Option<NativeStartupDiagnosticV1>,
     pub policy_enforcement: Option<crate::workload_evidence::AttemptPolicyEnforcementV1>,
     pub category: ErrorCategory,
@@ -452,6 +453,7 @@ impl Error {
             provider_failure: None,
             policy_enforcement: None,
             native_startup: None,
+            runtime: None,
         }
     }
 
