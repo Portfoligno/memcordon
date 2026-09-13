@@ -1150,6 +1150,29 @@ pub(crate) fn inspect_with_admission<T: Send + 'static>(
     admission: InspectionAdmission,
     operation: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
+    inspect_with_admission_observer(deadline, admission, operation, || {})
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn inspect_until_admitted<T: Send + 'static>(
+    deadline: Instant,
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+    admitted: impl FnOnce(),
+) -> Result<T, String> {
+    inspect_with_admission_observer(
+        deadline,
+        InspectionAdmission::Immediate,
+        operation,
+        admitted,
+    )
+}
+
+fn inspect_with_admission_observer<T: Send + 'static>(
+    deadline: Instant,
+    admission: InspectionAdmission,
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+    admitted: impl FnOnce(),
+) -> Result<T, String> {
     if Instant::now() >= deadline {
         return Err("process inspection deadline expired before admission".into());
     }
@@ -1179,7 +1202,10 @@ pub(crate) fn inspect_with_admission<T: Send + 'static>(
             return Err("process inspection deadline expired before admission".into());
         }
         match worker.try_send(inspection) {
-            Ok(()) => break,
+            Ok(()) => {
+                admitted();
+                break;
+            }
             Err(std::sync::mpsc::TrySendError::Full(pending)) => {
                 if matches!(admission, InspectionAdmission::Immediate) {
                     return Err("process inspector is busy".into());

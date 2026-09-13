@@ -1024,7 +1024,9 @@ pub fn rejects_protocol(bytes: &[u8]) -> bool {
 
 #[cfg(feature = "test-support")]
 pub fn inspector_stall(image: &Path) -> Result<(), String> {
-    use crate::macos_watchdog::{InspectionAdmission, inspect_with_admission};
+    use crate::macos_watchdog::{
+        InspectionAdmission, inspect_until_admitted, inspect_with_admission,
+    };
 
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut launch = launch(
@@ -1051,6 +1053,8 @@ pub fn inspector_stall(image: &Path) -> Result<(), String> {
     entered
         .recv_timeout(Duration::from_secs(1))
         .map_err(|error| error.to_string())?;
+    let queued_executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let queued_operation = queued_executed.clone();
     let result = (|| {
         let started = Instant::now();
         let expired: Result<(), String> = crate::macos_watchdog::inspect_until(started, || {
@@ -1059,15 +1063,48 @@ pub fn inspector_stall(image: &Path) -> Result<(), String> {
         if !expired.is_err_and(|error| error.contains("deadline expired")) {
             return Err("expired monitoring inspection was admitted".into());
         }
-        let queued =
-            crate::macos_watchdog::inspect_until(started + Duration::from_millis(20), || Ok(()));
-        let full =
-            crate::macos_watchdog::inspect_until(started + Duration::from_millis(50), || Ok(()));
-        if !queued.is_err_and(|error| error.contains("deadline expired"))
-            || !full.is_err_and(|error| error.contains("busy"))
-            || started.elapsed() > Duration::from_millis(200)
+        let mut full = None;
+        let queued = inspect_until_admitted(
+            // Admission is a readiness precondition, using the same bounded
+            // budget as the worker-entry handshake above.
+            Instant::now() + Duration::from_secs(1),
+            move || {
+                queued_operation.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            || {
+                // Successful admission proves the slot is occupied. Check capacity
+                // before waiting for this queued request's deadline, with a fresh budget.
+                full = Some(crate::macos_watchdog::inspect_until(
+                    Instant::now() + Duration::from_secs(1),
+                    || Ok(()),
+                ));
+            },
+        );
+        let Some(full) = full else {
+            return Err(format!("queued inspection was not admitted: {queued:?}"));
+        };
+        if !queued
+            .as_ref()
+            .is_err_and(|error| error.contains("deadline expired"))
         {
-            return Err("stalled inspector did not preserve timeout and capacity rejection".into());
+            return Err(format!("queued inspection did not time out: {queued:?}"));
+        }
+        if !full.as_ref().is_err_and(|error| error.contains("busy")) {
+            return Err(format!(
+                "occupied inspector did not reject capacity: {full:?}"
+            ));
+        }
+        let stalled = done
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|error| format!("stalled inspection caller did not return: {error}"))?;
+        if !stalled
+            .as_ref()
+            .is_err_and(|error| error.contains("deadline expired"))
+        {
+            return Err(format!(
+                "stalled inspection caller did not time out: {stalled:?}"
+            ));
         }
         let expired: Result<(), String> = inspect_with_admission(
             Instant::now() + Duration::from_millis(20),
@@ -1101,10 +1138,10 @@ pub fn inspector_stall(image: &Path) -> Result<(), String> {
     release_worker
         .join()
         .map_err(|_| "inspector release fixture panicked".to_owned())?;
-    let _ = done
-        .recv_timeout(Duration::from_secs(1))
-        .map_err(|error| error.to_string())?;
     recovered?;
+    if queued_executed.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("expired queued inspection executed after worker release".into());
+    }
     let native_error = inspect_with_admission(
         Instant::now() + Duration::from_secs(1),
         InspectionAdmission::Cleanup,
