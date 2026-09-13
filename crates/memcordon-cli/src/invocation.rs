@@ -292,7 +292,7 @@ Rules:
             r#"Configure execution reports and optional wrapper output.
 
 Output options (value; default):
-  --report PATH                          Write schema-9 JSON to PATH; unset
+  --report PATH                          Write schema-10 JSON to PATH; unset
   --summary                              Write one final summary line to stderr; off
   --quiet                                Suppress optional wrapper output; off
 
@@ -303,7 +303,7 @@ Rules:
 
 Utility JSON:
   doctor --json    schema-6
-  plan --json      schema-8
+  plan --json      schema-9
   clean --json     schema-2
 
 "#
@@ -324,7 +324,7 @@ Usage:
 Utilities:
   help      List topics or show one topic
   doctor    Print the version and selected backend; JSON uses schema-6
-  plan      Resolve policy with launch proof false; JSON uses schema-8
+  plan      Resolve policy with launch proof false; JSON uses schema-9
   clean     Inspect or remove stale owned artifacts; JSON uses schema-2
   --version Print one version line
 
@@ -471,7 +471,7 @@ Circuit breaker (requires --restart or --restart-on):
   and cannot be set by itself.
 
 Output:
-  --report PATH                          Write a schema-9 JSON report; unset
+  --report PATH                          Write a schema-10 JSON report; unset
   --summary                              Final summary line on stderr; off
   --quiet                                Suppress optional MemCordon output; off
 
@@ -492,7 +492,7 @@ Utilities:
 Utility options:
   doctor --json                       Write schema-6 JSON to stdout; off
   doctor --require hard|watchdog|sealed Require the selected backend class; unset
-  plan --json                         Write schema-8 JSON to stdout; off
+  plan --json                         Write schema-9 JSON to stdout; off
   clean --dry-run                     List without removing artifacts; off
   clean --json                        Write schema-2 JSON to stdout; off
 
@@ -567,7 +567,7 @@ Policy options (value; default):
   --circuit-threshold SCORE              Decayed failure pressure to open; unset
   --circuit-cooldown DURATION            Minimum circuit quarantine; unset
   --circuit-half-life DURATION           Failure-pressure half-life; backoff half-life
-  --json                                 Write schema-8 JSON to stdout; off
+  --json                                 Write schema-9 JSON to stdout; off
   -h, --help                             Print this help
 
 Rules:

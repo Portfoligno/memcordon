@@ -933,17 +933,22 @@ impl Guardian {
         let query = channel.sent;
         channel
             .send(Message::InventoryQuery { query, metric }, deadline)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                format!("send guardian inventory query {query} ({metric:?}): {error}")
+            })?;
         channel.inventory_query = Some(query);
         let result = (|| {
             let mut payload = Vec::new();
             loop {
                 if Instant::now() >= deadline {
-                    return Err("guardian inventory deadline expired".into());
+                    return Err(format!(
+                        "guardian inventory query {query} ({metric:?}) deadline expired after {} response bytes",
+                        payload.len()
+                    ));
                 }
-                let message = channel
-                    .receive(deadline)
-                    .map_err(|error| error.to_string())?;
+                let message = channel.receive(deadline).map_err(|error| {
+                    format!("receive guardian inventory query {query} ({metric:?}): {error}")
+                })?;
                 match message {
                     Some(Message::InventoryChunk {
                         bytes, finished, ..
@@ -3420,10 +3425,10 @@ fn timer_progress(
         let mut channel = shared.lock().map_err(|_| "guardian channel poisoned")?;
         channel
             .send(Message::InterruptClock, end)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("install clock interruption: {error}"))?;
         channel
             .expect(Message::ClockInterruptible, end)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("acknowledge clock interruption: {error}"))?;
         if jump {
             channel
                 .send(
@@ -3433,32 +3438,39 @@ fn timer_progress(
                     },
                     end,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| format!("advance fixture clock: {error}"))?;
         }
         if disable_timer {
             channel
                 .send(Message::DisableWorkTimer, end)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| format!("disable fixture work timer: {error}"))?;
         }
     }
     let guardian_pid = attempt.guardian.child.pid;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let interrupt_stop = stop.clone();
     let interrupts = std::thread::spawn(move || -> Result<(), String> {
-        for _ in 0..2200 {
+        while !interrupt_stop.load(Ordering::Acquire) && Instant::now() < end {
             // The unreaped native guardian remains owned until this sender joins.
             if unsafe { libc::kill(guardian_pid, libc::SIGUSR2) } != 0 {
-                return Err(io::Error::last_os_error().to_string());
+                return Err(format!(
+                    "produce native interruption: {}",
+                    io::Error::last_os_error()
+                ));
             }
             std::thread::sleep(Duration::from_millis(1));
         }
         Ok(())
     });
     let producer = shared.clone();
+    let flood_stop = stop.clone();
     let flood = std::thread::spawn(move || -> Result<(), String> {
-        let mut channel = producer.lock().map_err(|_| "guardian channel poisoned")?;
-        for _ in 0..320 {
-            channel
+        while !flood_stop.load(Ordering::Acquire) && Instant::now() < end {
+            producer
+                .lock()
+                .map_err(|_| "guardian channel poisoned")?
                 .send(Message::Heartbeat, end)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| format!("produce control heartbeat: {error}"))?;
             // Keep valid traffic present across the work boundary and mutation
             // observation without allowing heartbeat loss to mask a disabled timer.
             std::thread::sleep(Duration::from_millis(10));
@@ -3470,24 +3482,30 @@ fn timer_progress(
     } else {
         observed_start + Duration::from_millis(2500)
     };
-    let mut expired_without_termination = false;
-    while !crate::macos_watchdog::fixture_root_exited(attempt.child.pid)
-        .map_err(|error| error.to_string())?
-    {
-        if Instant::now() >= observation_deadline {
-            expired_without_termination = true;
-            break;
+    let observation = (|| -> Result<bool, String> {
+        while !crate::macos_watchdog::fixture_root_exited(attempt.child.pid)
+            .map_err(|error| format!("observe native termination: {error}"))?
+        {
+            if Instant::now() >= observation_deadline {
+                return Ok(true);
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+        Ok(false)
+    })();
+    // Producer lifetime follows the observation, not an iteration count whose
+    // sleeps may overrun the original cleanup budget on a scheduled CI runner.
+    stop.store(true, Ordering::Release);
     // Close the lease after observing native termination, then require the
     // guardian's successful reap; the fixture never kills the workload itself.
-    flood
+    let flood_result = flood
         .join()
-        .map_err(|_| "control flood producer panicked")??;
-    interrupts
+        .map_err(|_| "control flood producer panicked".to_owned())
+        .and_then(std::convert::identity);
+    let interrupt_result = interrupts
         .join()
-        .map_err(|_| "native interruption producer panicked")??;
+        .map_err(|_| "native interruption producer panicked".to_owned())
+        .and_then(std::convert::identity);
     drop(attempt.child);
     attempt.guardian.channel.take();
     drop(shared);
@@ -3495,7 +3513,7 @@ fn timer_progress(
         .guardian
         .child
         .retire(end)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("retire control flood guardian: {error}"))?;
     if !attempt
         .guardian
         .child
@@ -3504,7 +3522,9 @@ fn timer_progress(
     {
         return Err("control flood did not finish with complete owned retirement".into());
     }
-    if expired_without_termination {
+    flood_result?;
+    interrupt_result?;
+    if observation? {
         return Err("valid control traffic starved the original native deadline".into());
     }
     Ok(())

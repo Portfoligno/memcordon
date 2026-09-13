@@ -1790,13 +1790,13 @@ fn validate_service_privilege_readback(root: &Path, report_dir: &Path) -> Result
     )
 }
 
-fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str) -> Result<()> {
+fn prepare_provider(root: &Path, stable: &str) -> Result<()> {
     if (
         memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
         memcordon_core::PLAN_REPORT_SCHEMA_VERSION,
         memcordon_core::DOCTOR_REPORT_SCHEMA_VERSION,
         memcordon_core::CLEAN_REPORT_SCHEMA_VERSION,
-    ) != (9, 8, 6, 2)
+    ) != (10, 9, 6, 2)
     {
         return Err(CiError::Message(
             "Linux sealed certification has not been updated for the report schemas".to_owned(),
@@ -1825,6 +1825,10 @@ fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str
             "--bins",
         ],
     )?;
+    Ok(())
+}
+
+fn certification_body(root: &Path, stable: &str, report_dir: &Path, commit: &str) -> Result<()> {
     privileged_agent(root, ["package", "install", "--ephemeral-ci"])?;
     agent(root, ["package", "verify"])?;
     privileged_agent(root, ["package", "upgrade", "--ephemeral-ci"])?;
@@ -2052,8 +2056,13 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
             status: "running",
         },
     )?;
+    let mut installation_attempted = false;
     let result = match &commit {
-        Ok(commit) => certification_body(root, stable, &report_dir, commit),
+        Ok(commit) => prepare_provider(root, stable).and_then(|()| {
+            // Cleanup is required even when installation only partially succeeds.
+            installation_attempted = true;
+            certification_body(root, stable, &report_dir, commit)
+        }),
         Err(error) => Err(CiError::Message(error.to_string())),
     };
     let provider_service = result
@@ -2071,9 +2080,13 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
     } else {
         (None, None)
     };
-    let uninstall = privileged_agent(root, ["package", "uninstall", "--ephemeral-ci"]);
+    let uninstall = installation_attempted
+        .then(|| privileged_agent(root, ["package", "uninstall", "--ephemeral-ci"]));
     let primary_error = result.as_ref().err().map(ToString::to_string);
-    let cleanup_error = uninstall.as_ref().err().map(ToString::to_string);
+    let cleanup_error = uninstall
+        .as_ref()
+        .and_then(|result| result.as_ref().err())
+        .map(ToString::to_string);
     if primary_error.is_some() || cleanup_error.is_some() {
         write_json(
             &report_dir.join("certification-failure.json"),

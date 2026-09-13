@@ -338,6 +338,28 @@ fn caller_envelope_preserves_native_bytes_signals_limits_umask_and_exact_descrip
 }
 
 #[test]
+fn caller_envelope_preserves_additional_inherited_caller_descriptor() {
+    let _runtime = native_runtime();
+    let directory = tempfile::tempdir().unwrap();
+    let mut command = Command::new(fixture());
+    command
+        .arg("macos-envelope-caller")
+        .arg(image())
+        .arg(fixture())
+        .arg(directory.path());
+    let output = run_with_deadline(&mut command, Duration::from_secs(10)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("created")).unwrap(),
+        b"caller envelope preserved\n"
+    );
+}
+
+#[test]
 fn target_exec_failure_is_distinct_from_reserved_child_exit() {
     let _runtime = native_runtime();
     let directory = tempfile::tempdir().unwrap();

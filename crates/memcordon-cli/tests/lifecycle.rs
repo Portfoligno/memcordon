@@ -411,11 +411,12 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
         .arg(&completion_marker);
 
     let output = completed(&mut invocation, Duration::from_secs(6));
+    let report_text = fs::read_to_string(&report_file);
     assert_eq!(
         output.status.code(),
         Some(123),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        "{}; execution report: {report_text:?}",
+        String::from_utf8_lossy(&output.stderr),
     );
     assert_stdout_empty(&output);
     assert!(
@@ -424,10 +425,9 @@ fn deadline_remains_authoritative_during_command_exit_grace() {
     );
     let identity = read_identity(&pid_file);
     assert_process_gone(identity);
-    let report: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(&report_file).expect("execution report should be readable"),
-    )
-    .expect("execution report should be valid JSON");
+    let report: serde_json::Value =
+        serde_json::from_str(&report_text.expect("execution report should be readable"))
+            .expect("execution report should be valid JSON");
     assert_eq!(report["supervision"]["terminal"]["kind"], "attempt-outcome");
     assert_eq!(
         report["attempts"][0]["outcome"]["outcome"],

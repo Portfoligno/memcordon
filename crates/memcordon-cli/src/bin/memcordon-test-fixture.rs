@@ -19,6 +19,28 @@ fn take_value(args: &mut impl Iterator<Item = OsString>, option: &str) -> OsStri
         .unwrap_or_else(|| fail(format!("{option} requires a value")))
 }
 
+#[cfg(target_os = "macos")]
+fn open_descriptors() -> Vec<(i32, i32)> {
+    // SAFETY: these calls inspect only this disposable fixture's descriptor table.
+    let limit = unsafe { libc::getdtablesize() };
+    if limit < 0 {
+        fail(io::Error::last_os_error().to_string());
+    }
+    let mut descriptors = Vec::new();
+    for fd in 0..limit {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 {
+            descriptors.push((fd, flags));
+        } else if io::Error::last_os_error().raw_os_error() != Some(libc::EBADF) {
+            fail(format!(
+                "inspect descriptor {fd}: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    descriptors
+}
+
 fn parse_duration(value: &OsStr) -> Duration {
     let value = value
         .to_str()
@@ -521,12 +543,45 @@ fn main() {
             0
         }
         #[cfg(target_os = "macos")]
+        "macos-envelope-caller" => {
+            use std::os::fd::AsRawFd;
+
+            let image = PathBuf::from(take_value(&mut args, "memcordon image"));
+            let fixture = PathBuf::from(take_value(&mut args, "target fixture"));
+            let directory = PathBuf::from(take_value(&mut args, "target directory"));
+            let inherited = std::fs::File::create(directory.join("ambient-source")).unwrap();
+            let descriptor = inherited.as_raw_fd();
+            // This disposable process owns the descriptor and has no other threads.
+            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            if flags < 0
+                || unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0
+            {
+                fail(io::Error::last_os_error().to_string());
+            }
+            let status = Command::new(&fixture)
+                .arg("macos-envelope-parent")
+                .arg(image)
+                .arg(&fixture)
+                .arg(directory)
+                .arg(descriptor.to_string())
+                .status()
+                .unwrap();
+            status.code().unwrap_or(125)
+        }
+        #[cfg(target_os = "macos")]
         "macos-envelope-parent" => {
             use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
             use std::os::unix::ffi::OsStringExt;
             let image = PathBuf::from(take_value(&mut args, "memcordon image"));
             let fixture = PathBuf::from(take_value(&mut args, "target fixture"));
             let directory = PathBuf::from(take_value(&mut args, "target directory"));
+            if let Some(ambient) = args.next() {
+                let ambient: i32 = ambient.to_str().unwrap().parse().unwrap();
+                let flags = unsafe { libc::fcntl(ambient, libc::F_GETFD) };
+                if flags < 0 || flags & libc::FD_CLOEXEC != 0 {
+                    fail("additional caller descriptor was not inherited into the parent fixture");
+                }
+            }
             std::fs::write(directory.join("source"), b"envelope-source\n").unwrap();
             let source = std::fs::File::open(directory.join("source")).unwrap();
             let fd = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD, 64) };
@@ -555,12 +610,19 @@ fn main() {
             if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
                 fail("cannot set fixture descriptor limit");
             }
+            // The caller may itself inherit descriptors from Cargo or its runner.
+            // Require their exact preservation, while excluding CLOEXEC sources.
+            let expected_descriptors: Vec<_> = open_descriptors()
+                .into_iter()
+                .filter_map(|(fd, flags)| (flags & libc::FD_CLOEXEC == 0).then_some(fd))
+                .collect();
             let status = Command::new(image)
                 .args(["+2s", "--"])
                 .arg(fixture)
                 .arg("macos-envelope-target")
                 .arg(&directory)
                 .arg(fd.to_string())
+                .arg(serde_json::to_string(&expected_descriptors).unwrap())
                 .arg(OsString::from_vec(b"native argument \xff".to_vec()))
                 .current_dir(&directory)
                 .env("PATH", OsString::from_vec(b"/native-path-\xff".to_vec()))
@@ -578,6 +640,10 @@ fn main() {
                 .unwrap()
                 .parse()
                 .unwrap();
+            let expected_descriptors: Vec<i32> = serde_json::from_slice(
+                take_value(&mut args, "expected descriptor manifest").as_bytes(),
+            )
+            .unwrap();
             let argument = take_value(&mut args, "native argument");
             if argument.as_bytes() != b"native argument \xff" {
                 fail("native argument bytes changed");
@@ -616,10 +682,12 @@ fn main() {
             {
                 fail("intended descriptor mapping changed");
             }
-            for fd in 3..unsafe { libc::getdtablesize() } {
-                if fd != descriptor && unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {
-                    fail("unmanifested descriptor survived target exec");
-                }
+            let actual_descriptors: Vec<_> =
+                open_descriptors().into_iter().map(|(fd, _)| fd).collect();
+            if actual_descriptors != expected_descriptors {
+                fail(format!(
+                    "target descriptor manifest changed: expected {expected_descriptors:?}, actual {actual_descriptors:?}"
+                ));
             }
             let output = directory.join("created");
             std::fs::write(&output, b"caller envelope preserved\n").unwrap();
