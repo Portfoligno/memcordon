@@ -507,9 +507,9 @@ fn workload_lifetime_deadline_cleans_background_descendant() {
     )
     .expect("execution report should be valid JSON");
     let cleanup = &report["attempts"][0]["outcome"]["cleanup"];
-    assert_eq!(cleanup["direct_child_reaped"], true);
-    assert_eq!(cleanup["workload_empty"], true);
-    assert_eq!(cleanup["errors"], serde_json::json!([]));
+    assert_eq!(cleanup["direct_child_reaped"], true, "{report:#}");
+    assert_eq!(cleanup["workload_empty"], true, "{report:#}");
+    assert_eq!(cleanup["errors"], serde_json::json!([]), "{report:#}");
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
     fs::remove_file(report_file).expect("temporary report should be removable");
 }

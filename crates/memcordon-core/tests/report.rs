@@ -2004,6 +2004,10 @@ fn supervision_constructor_rejects_embedded_error_attempt_mismatch() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "bulk report JSON round trips exceed the interpreter budget; native coverage retains the full wire boundary, with typed capacity and compact wire checks under Miri"
+)]
 fn schema_five_truncates_three_hundred_attempts_but_aggregates_all() {
     let value = deadline_report_value(300);
     assert_eq!(value["supervision"]["attempt_history"]["retained"], 256);
@@ -2025,9 +2029,18 @@ fn schema_five_truncates_three_hundred_attempts_but_aggregates_all() {
     oversized["supervision"]["attempt_history"]["omitted"] = serde_json::json!(44);
     oversized["supervision"]["attempt_records_created"] = serde_json::json!(301);
     assert!(serde_json::from_value::<MemcordonReport>(oversized).is_err());
+}
 
+#[test]
+fn schema_five_rejects_compact_history_contradictions() {
     let value = deadline_report_value(3);
     let _: MemcordonReport = serde_json::from_value(value.clone()).expect("compact valid report");
+
+    for capacity in [DETAILED_ATTEMPT_CAPACITY - 1, DETAILED_ATTEMPT_CAPACITY + 1] {
+        let mut wrong_capacity = value.clone();
+        wrong_capacity["supervision"]["attempt_history"]["capacity"] = serde_json::json!(capacity);
+        assert!(serde_json::from_value::<MemcordonReport>(wrong_capacity).is_err());
+    }
 
     let mut missing_first = value.clone();
     missing_first["attempts"][0]["number"] = serde_json::json!(45);
@@ -2048,7 +2061,10 @@ fn schema_five_truncates_three_hundred_attempts_but_aggregates_all() {
     let mut aggregate_mismatch = value;
     aggregate_mismatch["supervision"]["aggregate"]["deadlines"] = serde_json::json!(4);
     assert!(serde_json::from_value::<MemcordonReport>(aggregate_mismatch).is_err());
+}
 
+#[test]
+fn schema_five_rejects_compact_supervision_contradictions() {
     let valid = serde_json::to_value(report_from_execution({
         let mut history = AttemptHistory::default();
         let mut aggregates = SupervisionAggregates::default();
@@ -2094,5 +2110,50 @@ fn schema_five_truncates_three_hundred_attempts_but_aggregates_all() {
         let mut contradictory = valid.clone();
         mutation(&mut contradictory);
         assert!(serde_json::from_value::<MemcordonReport>(contradictory).is_err());
+    }
+}
+
+#[test]
+fn attempt_history_evicts_only_after_the_production_capacity_and_aggregates_all() {
+    // Exercise the real capacity under Miri without constructing and repeatedly
+    // decoding hundreds of nested JSON records. The bulk wire test above keeps
+    // native serialization and oversized-array rejection coverage unchanged.
+    assert_eq!(DETAILED_ATTEMPT_CAPACITY, 256);
+    let mut history = AttemptHistory::default();
+    let mut aggregates = SupervisionAggregates::default();
+    for number in 1..=300 {
+        let outcome = RunOutcome::DeadlineExceeded {
+            deadline: DeadlineEvidence::new(
+                10,
+                DeadlineScope::Attempt,
+                "test-origin".to_owned(),
+                number,
+                number,
+                0,
+                0,
+                None,
+                None,
+            )
+            .expect("evidence"),
+            child_after_termination: None,
+            peak: None,
+            cleanup: cleanup(),
+        };
+        history
+            .append(attempt_record(number, Some(outcome), None), &mut aggregates)
+            .expect("append");
+        if [255, 256, 257, 300].contains(&number) {
+            let retained = number.min(256);
+            assert_eq!(history.retained() as u64, retained);
+            assert_eq!(history.total, number);
+            assert_eq!(history.omitted, number - retained);
+            assert_eq!(aggregates.deadlines, number);
+            assert_eq!(history.first.as_ref().expect("first").number, 1);
+            assert_eq!(
+                history.recent.front().expect("tail start").number,
+                number - retained + 2
+            );
+            assert_eq!(history.recent.back().expect("last").number, number);
+        }
     }
 }
