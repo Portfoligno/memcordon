@@ -922,7 +922,12 @@ impl AttemptRecord {
                                         .is_none_or(|outcome| outcome_status(outcome) != 0))
                         }
                         crate::ReleaseEvidence::NotIssued => {
-                            !self.launch.target_released && self.authorized_offset_ms.is_none()
+                            !self.launch.target_released
+                                && self.authorized_offset_ms.is_none()
+                                && self
+                                    .outcome
+                                    .as_ref()
+                                    .is_none_or(|outcome| outcome_status(outcome) != 0)
                         }
                         crate::ReleaseEvidence::Unknown => {
                             !self.launch.target_released

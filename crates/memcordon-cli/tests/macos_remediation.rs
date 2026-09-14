@@ -25,6 +25,59 @@ fn native_runtime() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn public_signal_policy(signal: &str, number: i32) {
+    use std::os::unix::process::ExitStatusExt;
+
+    let _runtime = native_runtime();
+    for policy in ["ignored", "default", "caught", "blocked-default"] {
+        for route in ["direct", "supervised"] {
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("signal-marker");
+            let mut command = Command::new(fixture());
+            command.args(["macos-signal-parent", signal, policy, route]);
+            command.arg(image()).arg(fixture()).arg(&marker);
+            let output = run_with_deadline(&mut command, Duration::from_secs(7)).unwrap();
+            assert_eq!(
+                std::fs::read(&marker).unwrap_or_default(),
+                b"signal policy verified\n",
+                "{signal}/{policy}/{route}: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let survives = matches!(policy, "ignored" | "blocked-default");
+            assert_eq!(marker.with_extension("completed").exists(), survives);
+            if survives {
+                assert!(output.status.success(), "{signal}/{policy}/{route}");
+            } else if route == "direct" {
+                assert_eq!(output.status.signal(), Some(number));
+            } else {
+                assert_eq!(output.status.code(), Some(128 + number));
+            }
+            if route == "supervised" {
+                let bytes = std::fs::read(marker.with_extension("json")).unwrap();
+                let _: memcordon_core::MemcordonReport = serde_json::from_slice(&bytes).unwrap();
+                let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(report["supervision"]["targets_authorized"], 1);
+                assert_eq!(report["attempts"][0]["outcome"]["outcome"], "exited");
+            }
+        }
+    }
+}
+
+#[test]
+fn public_frontend_preserves_sigint_exec_policy() {
+    public_signal_policy("interrupt", libc::SIGINT);
+}
+
+#[test]
+fn public_frontend_preserves_sigterm_exec_policy() {
+    public_signal_policy("terminate", libc::SIGTERM);
+}
+
+#[test]
+fn public_frontend_preserves_sighup_exec_policy() {
+    public_signal_policy("hangup", libc::SIGHUP);
+}
+
 #[test]
 fn repeated_stop_events_preserve_first_grace_and_retirement_deadline() {
     let _runtime = native_runtime();

@@ -331,6 +331,11 @@ struct Frame {
 }
 
 struct Channel {
+    invalidated: bool,
+    write_attempted: bool,
+    #[cfg(feature = "test-support")]
+    cancel_release_prefix: Option<i32>,
+    admission: Option<crate::signal::LaunchAdmission>,
     stream: UnixStream,
     run: u64,
     sent: u64,
@@ -446,6 +451,11 @@ impl Channel {
         }
         Ok(Self {
             stream,
+            invalidated: false,
+            write_attempted: false,
+            #[cfg(feature = "test-support")]
+            cancel_release_prefix: None,
+            admission: None,
             run,
             sent: 0,
             received: 0,
@@ -457,6 +467,15 @@ impl Channel {
     fn transfer(&mut self, bytes: &mut [u8], write: bool, deadline: Instant) -> io::Result<bool> {
         let mut offset = 0;
         while offset < bytes.len() {
+            if let Some(admission) = &self.admission {
+                if let Err(error) = admission.check() {
+                    // Invalidate every clone of this endpoint. Never splice a stop
+                    // frame into a partially transmitted release frame.
+                    let _ = self.stream.shutdown(std::net::Shutdown::Both);
+                    self.invalidated = true;
+                    return Err(error);
+                }
+            }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -464,6 +483,7 @@ impl Channel {
                 ));
             }
             let result = if write {
+                self.write_attempted = true;
                 self.stream.write(&bytes[offset..])
             } else {
                 self.stream.read(&mut bytes[offset..])
@@ -487,7 +507,7 @@ impl Channel {
                     let wait = deadline
                         .saturating_duration_since(Instant::now())
                         .as_millis()
-                        .min(50) as i32;
+                        .min(10) as i32;
                     // SAFETY: poll receives one live owned socket and a bounded timeout.
                     if unsafe { libc::poll(&mut poll, 1, wait) } < 0
                         && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
@@ -501,6 +521,8 @@ impl Channel {
         Ok(true)
     }
     fn send(&mut self, message: Message, deadline: Instant) -> io::Result<()> {
+        #[cfg(feature = "test-support")]
+        let releasing = message == Message::Release;
         let mut bytes = serde_json::to_vec(&Frame {
             version: 2,
             run: self.run,
@@ -510,8 +532,23 @@ impl Channel {
         if bytes.len() > FRAME_LIMIT {
             return Err(io::Error::other("private launch frame exceeds bound"));
         }
-        self.transfer(&mut (bytes.len() as u16).to_be_bytes(), true, deadline)?;
-        self.transfer(&mut bytes, true, deadline)?;
+        self.transfer(&mut (bytes.len() as u16).to_be_bytes(), true, deadline)
+            .inspect_err(|_| {
+                self.invalidated = true;
+                let _ = self.stream.shutdown(std::net::Shutdown::Both);
+            })?;
+        #[cfg(feature = "test-support")]
+        if releasing {
+            if let (Some(signal), Some(admission)) =
+                (self.cancel_release_prefix.take(), &self.admission)
+            {
+                admission.record_for_test(signal);
+            }
+        }
+        self.transfer(&mut bytes, true, deadline).inspect_err(|_| {
+            self.invalidated = true;
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        })?;
         self.sent = self
             .sent
             .checked_add(1)
@@ -520,6 +557,11 @@ impl Channel {
     }
     fn receive(&mut self, deadline: Instant) -> io::Result<Option<Message>> {
         loop {
+            if let Some(admission) = &self.admission {
+                if let Err(error) = admission.check() {
+                    return Err(error);
+                }
+            }
             match self.receive_available()? {
                 Some(Some(Message::ForceRequested { at })) => {
                     self.force_receipt
@@ -554,7 +596,7 @@ impl Channel {
             let wait = deadline
                 .saturating_duration_since(Instant::now())
                 .as_millis()
-                .clamp(1, 20) as i32;
+                .clamp(1, 10) as i32;
             // SAFETY: one owned socket and finite wait.
             if unsafe { libc::poll(&mut poll, 1, wait) } < 0
                 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
@@ -638,7 +680,29 @@ fn native_spawn(
     quiet: bool,
     deadline: Instant,
 ) -> io::Result<Child> {
-    native_spawn_context(path, args, endpoint, quiet, deadline, None, None)
+    native_spawn_context(path, args, endpoint, quiet, deadline, None, None, None)
+        .map_err(|failure| failure.error)
+}
+
+struct NativeSpawnFailure {
+    error: io::Error,
+    pending: bool,
+}
+impl From<io::Error> for NativeSpawnFailure {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            pending: false,
+        }
+    }
+}
+impl NativeSpawnFailure {
+    fn pending(error: io::Error) -> Self {
+        Self {
+            error,
+            pending: true,
+        }
+    }
 }
 
 fn native_spawn_context(
@@ -649,7 +713,11 @@ fn native_spawn_context(
     deadline: Instant,
     context: Option<crate::macos_envelope::Envelope>,
     auxiliary: Option<(RawFd, std::os::fd::OwnedFd)>,
-) -> io::Result<Child> {
+    admission: Option<&crate::signal::LaunchAdmission>,
+) -> Result<Child, NativeSpawnFailure> {
+    if let Some(admission) = admission {
+        admission.check()?;
+    }
     let expires = crate::macos_deadline::add(
         crate::macos_deadline::continuous_nanos()?,
         deadline.saturating_duration_since(Instant::now()),
@@ -659,7 +727,7 @@ fn native_spawn_context(
     // SAFETY: this duplicates only the private endpoint and retains CLOEXEC in the parent.
     let source = unsafe { libc::fcntl(endpoint, libc::F_DUPFD_CLOEXEC, 3) };
     if source < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(io::Error::last_os_error().into());
     }
     // SAFETY: the new duplicate is uniquely owned until spawn finishes.
     let source = unsafe { std::os::fd::OwnedFd::from_raw_fd(source) };
@@ -700,21 +768,34 @@ fn native_spawn_context(
                     target: false,
                 },
             );
-            let _ = send.send(result);
+            if let Err(returned) = send.send(result) {
+                if let Ok(child) = returned.0 {
+                    // This worker creates only an unconfigured helper; no target
+                    // configuration has crossed its private lease yet.
+                    let _ = child.kill();
+                }
+            }
         }))
         .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "native spawn slot busy"))?;
     loop {
-        if crate::macos_deadline::continuous_nanos()? >= expires {
-            return Err(io::Error::new(
+        if let Some(admission) = admission {
+            admission.check().map_err(NativeSpawnFailure::pending)?;
+        }
+        if crate::macos_deadline::continuous_nanos().map_err(NativeSpawnFailure::pending)?
+            >= expires
+        {
+            return Err(NativeSpawnFailure::pending(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "native creation remains owned in flight",
-            ));
+            )));
         }
         match receive.recv_timeout(Duration::from_millis(2)) {
-            Ok(result) => return result,
+            Ok(result) => return result.map_err(NativeSpawnFailure::from),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::other("native creation owner unavailable"));
+                return Err(NativeSpawnFailure::pending(io::Error::other(
+                    "native creation owner unavailable",
+                )));
             }
         }
     }
@@ -1034,14 +1115,28 @@ pub(crate) struct Launch {
     pub(crate) release_tick: u64,
 }
 pub(crate) struct StartupError {
+    pub(crate) cancellation_observed: Option<u64>,
+    pub(crate) cancellation_force: Option<u64>,
     pub(crate) phase: &'static str,
     pub(crate) error: io::Error,
     pub(crate) diagnostic: memcordon_core::NativeStartupDiagnosticV1,
     pub(crate) release: memcordon_core::ReleaseEvidence,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LaunchFault {
+    #[cfg(feature = "test-support")]
+    CancelBeforeCommit(i32),
+    #[cfg(feature = "test-support")]
+    CancelAfterCommit(i32),
+    #[cfg(feature = "test-support")]
+    CancelReleasePrefix(i32),
+    #[cfg(feature = "test-support")]
+    CancelAfterIssue(i32),
+    #[cfg(feature = "test-support")]
+    CancelAfterSend(i32),
+    #[cfg(feature = "test-support")]
+    CancelAfterExec(i32),
     GuardianBeforeArm,
     GuardianAfterArm,
     LauncherBeforeExec,
@@ -1067,6 +1162,31 @@ pub(crate) fn launch(
     )
 }
 
+pub(crate) fn launch_controlled(
+    command: &CommandSpec,
+    image: &Path,
+    deadline: Instant,
+    cleanup_deadline: Instant,
+    work: Option<u64>,
+    grace: Duration,
+    signal_grace: Duration,
+    signal: &crate::signal::SignalSource,
+) -> Result<Launch, Box<StartupError>> {
+    // The restart coordinator calls again only after proven retirement. Clearing
+    // admission preserves every interruption bit for the entire run.
+    signal.admission.next_attempt();
+    launch_configured(
+        command,
+        image,
+        deadline,
+        cleanup_deadline,
+        None,
+        work,
+        grace,
+        Some((signal, signal_grace)),
+    )
+}
+
 pub(crate) fn launch_with_deadline(
     command: &CommandSpec,
     image: &Path,
@@ -1083,6 +1203,7 @@ pub(crate) fn launch_with_deadline(
         None,
         work,
         grace,
+        None,
     )
 }
 
@@ -1101,6 +1222,7 @@ fn launch_inner(
         fault,
         None,
         Duration::ZERO,
+        None,
     )
 }
 
@@ -1112,7 +1234,10 @@ fn launch_configured(
     fault: Option<LaunchFault>,
     work: Option<u64>,
     grace: Duration,
+    signal: Option<(&crate::signal::SignalSource, Duration)>,
 ) -> Result<Launch, Box<StartupError>> {
+    let signal_grace = signal.map_or(Duration::ZERO, |(_, grace)| grace);
+    let signal = signal.map(|(signal, _)| signal);
     use memcordon_core::{
         NativeArgument, NativeStartupCleanupErrorV1, NativeStartupCleanupStateV1 as CleanupState,
         NativeStartupCleanupV1, NativeStartupDiagnosticV1, NativeStartupOperationV1 as Operation,
@@ -1138,12 +1263,15 @@ fn launch_configured(
         },
     };
     let mut guardian_owner = None;
+    let mut pending_capture_or_creation = false;
     let mut configured = false;
     let mut release = memcordon_core::ReleaseEvidence::NotIssued;
     let mut phase = "helper-spawn";
     if Instant::now() >= deadline {
         diagnostic.cleanup.state = CleanupState::Complete;
         return Err(Box::new(StartupError {
+            cancellation_observed: None,
+            cancellation_force: None,
             phase,
             error: io::Error::new(io::ErrorKind::TimedOut, "startup expired before creation"),
             diagnostic,
@@ -1151,13 +1279,26 @@ fn launch_configured(
         }));
     }
     let result = (|| {
+        if let Some(signal) = signal {
+            signal.admission.check()?;
+        }
         let mut run = 0_u64;
         // SAFETY: initializes the exact local run binding.
         unsafe { libc::arc4random_buf((&mut run as *mut u64).cast(), std::mem::size_of_val(&run)) };
         let now = crate::macos_deadline::continuous_nanos()?;
         let startup =
             crate::macos_deadline::add(now, deadline.saturating_duration_since(Instant::now()))?;
-        let envelope = crate::macos_envelope::Envelope::capture_bounded(deadline)?;
+        let snapshot = match signal {
+            Some(signal) => signal.snapshot.clone(),
+            None => crate::signal::CallerSignalSnapshot::capture()?,
+        };
+        pending_capture_or_creation = true;
+        let envelope = crate::macos_envelope::Envelope::capture_bounded(
+            deadline,
+            snapshot,
+            signal.map(|signal| &signal.admission),
+        )?;
+        pending_capture_or_creation = false;
         let (envelope_send, envelope_receive) = std::os::unix::net::UnixDatagram::pair()?;
         envelope.send(&envelope_send, run)?;
         let auxiliary = (
@@ -1175,6 +1316,7 @@ fn launch_configured(
             command.program().to_owned(),
         ];
         args.extend(command.arguments().iter().cloned());
+        pending_capture_or_creation = true;
         let child = native_spawn_context(
             image,
             &args,
@@ -1183,8 +1325,14 @@ fn launch_configured(
             deadline,
             Some(envelope),
             Some(auxiliary),
-        )?;
+            signal.map(|signal| &signal.admission),
+        )
+        .map_err(|failure| {
+            pending_capture_or_creation = failure.pending;
+            failure.error
+        })?;
         diagnostic.guardian_pid = Some(child.id());
+        pending_capture_or_creation = false;
         drop(endpoint);
         guardian_owner = Some(Guardian {
             channel: Some(channel.clone()),
@@ -1194,6 +1342,7 @@ fn launch_configured(
         let mut control = channel
             .lock()
             .map_err(|_| io::Error::other("guardian channel poisoned"))?;
+        control.admission = signal.map(|signal| signal.admission.clone());
         phase = "helper-ready";
         diagnostic.phase = Phase::GuardianReadiness;
         diagnostic.operation = Operation::ReadGuardianReadiness;
@@ -1206,6 +1355,9 @@ fn launch_configured(
         if fault == Some(LaunchFault::NativeSpawnHeldReleaseAfterCancel) {
             control.send(Message::HoldSpawnReleaseAfterCancel, deadline)?;
         }
+        // A failed partial Configure may still reach the guardian. Preserve its
+        // custody from before the first write, rather than killing it on error.
+        configured = true;
         control.send(
             Message::Configure {
                 image: image.as_os_str().as_bytes().to_vec(),
@@ -1217,7 +1369,6 @@ fn launch_configured(
             },
             deadline,
         )?;
-        configured = true;
         control.expect(Message::Ready, deadline)?;
         diagnostic.guardian_ready = true;
         #[cfg(feature = "test-support")]
@@ -1266,9 +1417,41 @@ fn launch_configured(
         phase = "target-release";
         diagnostic.phase = Phase::TargetRelease;
         diagnostic.operation = Operation::ReleaseTarget;
-        control.send(Message::Release, deadline)?;
-        // A sent request without its receipt is uncertain, never known not-issued.
+        #[cfg(feature = "test-support")]
+        if let (Some(LaunchFault::CancelBeforeCommit(number)), Some(signal)) = (fault, signal) {
+            signal.admission.record_for_test(number);
+        }
+        if let Some(signal) = signal {
+            signal.admission.commit()?;
+            #[cfg(feature = "test-support")]
+            if let Some(LaunchFault::CancelAfterCommit(number)) = fault {
+                signal.admission.record_for_test(number);
+            }
+            signal.admission.check()?;
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "release admission expired",
+            ));
+        }
+        // Exposure begins before the first fallible write, including a partial frame.
+        #[cfg(feature = "test-support")]
+        if let Some(LaunchFault::CancelReleasePrefix(number)) = fault {
+            control.cancel_release_prefix = Some(number);
+        }
+        control.write_attempted = false;
         release = memcordon_core::ReleaseEvidence::Unknown;
+        if let Err(error) = control.send(Message::Release, deadline) {
+            if !control.write_attempted {
+                release = memcordon_core::ReleaseEvidence::NotIssued;
+            }
+            return Err(error);
+        }
+        #[cfg(feature = "test-support")]
+        if let (Some(LaunchFault::CancelAfterSend(number)), Some(signal)) = (fault, signal) {
+            signal.admission.record_for_test(number);
+        }
         match control.receive(deadline)? {
             Some(Message::ReleaseIssued { at }) => {
                 release = memcordon_core::ReleaseEvidence::Issued {
@@ -1276,6 +1459,11 @@ fn launch_configured(
                     exec_confirmed: false,
                 };
                 diagnostic.release_sent = true;
+                #[cfg(feature = "test-support")]
+                if let (Some(LaunchFault::CancelAfterIssue(number)), Some(signal)) = (fault, signal)
+                {
+                    signal.admission.record_for_test(number);
+                }
             }
             _ => return Err(io::Error::other("guardian release receipt unavailable")),
         }
@@ -1296,6 +1484,14 @@ fn launch_configured(
         if let memcordon_core::ReleaseEvidence::Issued { exec_confirmed, .. } = &mut release {
             *exec_confirmed = true;
         }
+        #[cfg(feature = "test-support")]
+        if let (Some(LaunchFault::CancelAfterExec(number)), Some(signal)) = (fault, signal) {
+            signal.admission.record_for_test(number);
+        }
+        if let Some(signal) = signal {
+            signal.admission.check()?;
+        }
+        control.admission = None;
         drop(control);
         Ok(Child {
             pid,
@@ -1314,6 +1510,35 @@ fn launch_configured(
             },
         }),
         Err(error) => {
+            let cancellation_observed = signal
+                .filter(|signal| signal.take().is_some())
+                .and_then(|signal| signal.admission.observed_at().ok());
+            let cancellation_force = cancellation_observed.and_then(|observed| {
+                let allowance = if matches!(release, memcordon_core::ReleaseEvidence::NotIssued) {
+                    Duration::ZERO
+                } else {
+                    signal_grace
+                };
+                crate::macos_deadline::add(observed, allowance)
+                    .ok()
+                    .map(|force| {
+                        work.map_or(force, |work| {
+                            force.min(
+                                work.saturating_add(grace.as_nanos().min(u64::MAX as u128) as u64),
+                            )
+                        })
+                    })
+            });
+            let cleanup_deadline = cancellation_force
+                .and_then(|force| {
+                    crate::macos_deadline::continuous_nanos().ok().map(|now| {
+                        Instant::now()
+                            + Duration::from_nanos(
+                                force.saturating_add(3_000_000_000).saturating_sub(now),
+                            )
+                    })
+                })
+                .map_or(cleanup_deadline, |cancel| cleanup_deadline.min(cancel));
             #[cfg(feature = "test-support")]
             if RUNNING_GUARDIAN_LOSS.get() == Some(0) {
                 RUNNING_GUARDIAN_LOSS_FAILURE.with_borrow_mut(|failure| {
@@ -1322,10 +1547,57 @@ fn launch_configured(
             }
             diagnostic.native_errno = error.raw_os_error();
             if let Some(guardian) = guardian_owner.as_mut() {
-                // Closing the final frontend lease transfers cleanup to the actual native parent.
-                guardian.channel.take();
+                // Before any Configure write, the helper cannot own a target.
+                // Retire it immediately rather than waiting for a readiness peer
+                // that never implemented the private protocol to close its output.
                 if !configured {
                     let _ = guardian.child.kill();
+                }
+                // Closing the final frontend lease transfers cleanup to the actual native parent.
+                if let Some(channel) = guardian.channel.take() {
+                    if let Ok(mut channel) = channel.lock() {
+                        channel.admission = None;
+                        if !channel.invalidated
+                            && !matches!(release, memcordon_core::ReleaseEvidence::NotIssued)
+                        {
+                            if let (Some(signal), Some(force)) =
+                                (signal.and_then(|signal| signal.take()), cancellation_force)
+                            {
+                                let _ = channel
+                                    .send(Message::SignalStop { signal, force }, cleanup_deadline);
+                            }
+                        }
+                        if channel.invalidated {
+                            let _ = channel.stream.shutdown(std::net::Shutdown::Both);
+                        } else {
+                            // Keep the read side alive while the guardian retires,
+                            // including an exec receipt already in flight. Its
+                            // output must not fail merely because we cancelled.
+                            let _ = channel.stream.shutdown(std::net::Shutdown::Write);
+                            while let Ok(Some(message)) = channel.receive(cleanup_deadline) {
+                                match message {
+                                    Message::ReleaseIssued { at } => {
+                                        release = memcordon_core::ReleaseEvidence::Issued {
+                                            at,
+                                            exec_confirmed: false,
+                                        };
+                                        diagnostic.release_sent = true;
+                                    }
+                                    Message::Released => {
+                                        if let memcordon_core::ReleaseEvidence::Issued {
+                                            exec_confirmed,
+                                            ..
+                                        } = &mut release
+                                        {
+                                            *exec_confirmed = true;
+                                            diagnostic.exec_confirmed = true;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                 }
                 match guardian.child.retire(cleanup_deadline) {
                     Ok(())
@@ -1341,13 +1613,15 @@ fn launch_configured(
                         detail: error.to_string(),
                     }),
                 }
-            } else if error.kind() != io::ErrorKind::TimedOut {
+            } else if !pending_capture_or_creation && error.kind() != io::ErrorKind::TimedOut {
                 diagnostic.cleanup.state = CleanupState::Complete;
             }
             if !diagnostic.cleanup.errors.is_empty() {
                 diagnostic.cleanup.state = CleanupState::Incomplete;
             }
             Err(Box::new(StartupError {
+                cancellation_observed,
+                cancellation_force,
                 phase,
                 error,
                 diagnostic,
@@ -2798,6 +3072,54 @@ pub fn startup_fault(
             Err("injected startup fault unexpectedly released the target".into())
         }
     }
+}
+
+#[cfg(feature = "test-support")]
+pub fn cancellation_fault(
+    command: &CommandSpec,
+    image: &Path,
+    fault: LaunchFault,
+) -> Result<
+    (
+        memcordon_core::ReleaseEvidence,
+        memcordon_core::NativeStartupDiagnosticV1,
+    ),
+    String,
+> {
+    let cancellation = crate::CancellationHandle::new();
+    let snapshot = crate::CallerSignalSnapshot::capture().map_err(|error| error.to_string())?;
+    let signal = crate::signal::SignalSource::host(snapshot, cancellation)
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let result = launch_configured(
+        command,
+        image,
+        deadline,
+        deadline + Duration::from_secs(3),
+        Some(fault),
+        None,
+        Duration::ZERO,
+        Some((&signal, Duration::from_millis(100))),
+    );
+    let startup = match result {
+        Err(error) => error,
+        Ok(launch) => {
+            let _ = launch.child.kill();
+            return Err("cancellation fixture unexpectedly completed admission".into());
+        }
+    };
+    if startup.error.kind() != io::ErrorKind::Interrupted || signal.take().is_none() {
+        return Err(format!(
+            "cancellation fixture did not reach interruption: {}",
+            startup.error
+        ));
+    }
+    signal.admission.next_attempt();
+    if signal.admission.commit().is_ok() {
+        return Err("cancelled run admitted another attempt".into());
+    }
+    signal.finish().map_err(|error| error.to_string())?;
+    Ok((startup.release, startup.diagnostic))
 }
 
 #[cfg(feature = "test-support")]

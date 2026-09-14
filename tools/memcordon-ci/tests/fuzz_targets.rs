@@ -44,7 +44,8 @@ fn malformed_or_empty_inventory_cannot_silently_lose_coverage() {
 fn workflow_requires_complete_static_shards_and_cache_inputs() {
     let workflow = include_str!("../../../.github/workflows/deep-ci.yml");
     let validate = |source: &str| {
-        let yaml: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
+        let mut yaml: serde_yaml::Value = serde_yaml::from_str(source).unwrap();
+        memcordon_ci::managed_workflow::validate_and_project(&mut yaml)?;
         memcordon_ci::policy::check_fuzz_shards(yaml["jobs"]["fuzz"].as_mapping().unwrap())
     };
     validate(workflow).unwrap();
@@ -68,7 +69,8 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
             "accepted {to}"
         );
     }
-    let yaml: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
+    let mut yaml: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
+    memcordon_ci::managed_workflow::validate_and_project(&mut yaml).unwrap();
     let baseline = yaml["jobs"]["fuzz"].as_mapping().unwrap();
     for (name, value) in [
         ("if", serde_yaml::Value::Bool(false)),

@@ -75,6 +75,13 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
         Ok(value) => value,
         Err(error) => return finish_error(&args, &command, None, *error, presentation),
     };
+    #[cfg(target_os = "macos")]
+    let context = match memcordon_platform::MacosExecutionContext::owned(run_origin) {
+        Ok(context) => context,
+        Err(error) => {
+            return finish_error(&args, &command, Some(&resolution), error, presentation);
+        }
+    };
     #[cfg(not(target_os = "macos"))]
     if !args.output.quiet {
         render_effect_warnings(
@@ -87,6 +94,7 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
     #[cfg(target_os = "macos")]
     let helper_result = bounded_helper_path(
         run_origin,
+        &context,
         resolution
             .policy
             .deadline
@@ -97,6 +105,8 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
     let helper = match helper_result {
         Ok(value) => value,
         Err(error) => {
+            #[cfg(target_os = "macos")]
+            let error = Box::new(finish_context_error(context, *error));
             return finish_error(&args, &command, Some(&resolution), *error, presentation);
         }
     };
@@ -108,7 +118,7 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
         resolved_backend: Some(resolution.backend.clone()),
     };
     #[cfg(target_os = "macos")]
-    let result = memcordon_platform::macos_supervise_from(request, run_origin);
+    let result = context.supervise(request);
     #[cfg(not(target_os = "macos"))]
     let result = supervise(request);
     match result {
@@ -118,12 +128,28 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
 }
 
 #[cfg(target_os = "macos")]
+fn finish_context_error(
+    context: memcordon_platform::MacosExecutionContext,
+    mut error: Error,
+) -> Error {
+    if let Err(restoration) = context.finish() {
+        error.message.push_str("; signal restoration also failed: ");
+        error.message.push_str(&restoration.to_string());
+    }
+    error
+}
+
+#[cfg(target_os = "macos")]
 fn bounded_helper_path(
     origin: u64,
+    context: &memcordon_platform::MacosExecutionContext,
     work: Option<std::time::Duration>,
 ) -> Result<Option<std::path::PathBuf>, Box<Error>> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static RESERVED: AtomicBool = AtomicBool::new(false);
+    if context.interruption().is_some() {
+        return Ok(None);
+    }
     // An expired work budget never permits target launch. Its finite retirement
     // reserve still permits resolving the image needed to construct the native
     // not-issued observation; supervision receives the original origin.
@@ -163,6 +189,11 @@ fn bounded_helper_path(
         return Err(error());
     }
     loop {
+        // Cancellation leaves the existing worker responsible for its capture;
+        // no replacement worker or target may be launched for this run.
+        if context.interruption().is_some() {
+            return Ok(None);
+        }
         // Check completion first so an immediate deadline still enters native
         // supervision and records a truthful not-issued deadline attempt.
         match receiver.try_recv() {
@@ -1232,12 +1263,34 @@ fn doctor_execution_probe(doctor: DoctorReport, json: bool, presentation: &Prese
                 "execution probe requires an available standard backend",
             )));
         }
-        let helper = helper_path()?.expect("macOS self executable");
+        let origin = memcordon_platform::macos_continuous_nanos().map_err(|error| {
+            Box::new(Error::new(
+                ErrorCategory::Setup,
+                "MCSETUP-CLOCK",
+                error.to_string(),
+            ))
+        })?;
+        let context = memcordon_platform::MacosExecutionContext::owned(origin).map_err(Box::new)?;
+        let helper =
+            match bounded_helper_path(origin, &context, Some(std::time::Duration::from_secs(5))) {
+                Ok(Some(helper)) => helper,
+                Ok(None) => {
+                    context.finish().map_err(Box::new)?;
+                    return Err(Box::new(Error::new(
+                        ErrorCategory::Setup,
+                        "MCSETUP-PROBE-INTERRUPTED",
+                        "execution probe interrupted before helper resolution",
+                    )));
+                }
+                Err(error) => {
+                    return Err(Box::new(finish_context_error(context, *error)));
+                }
+            };
         let policy = Policy::unbounded()
             .with_deadline(std::time::Duration::from_secs(5))
             .expect("nonzero probe deadline");
         let command = CommandSpec::new(helper.as_os_str()).args(["__execution-probe"]);
-        memcordon_platform::run(policy, &command, &helper).map_err(Box::new)
+        context.run(policy, &command, &helper).map_err(Box::new)
     })();
     #[cfg(not(target_os = "macos"))]
     let execution: Result<memcordon_platform::Execution, Box<Error>> = Err(Box::new(Error::new(

@@ -9,7 +9,7 @@ use std::time::Instant;
 const MAX_FDS: usize = 128;
 const MAX_MANIFEST: usize = 4096;
 type CaptureRequest = (
-    libc::sigset_t,
+    crate::signal::CallerSignalSnapshot,
     Instant,
     mpsc::SyncSender<io::Result<Envelope>>,
 );
@@ -52,7 +52,11 @@ pub(crate) fn duplicate(fd: RawFd, floor: RawFd) -> io::Result<OwnedFd> {
 }
 
 impl Envelope {
-    pub(crate) fn capture_bounded(deadline: Instant) -> io::Result<Self> {
+    pub(crate) fn capture_bounded(
+        deadline: Instant,
+        snapshot: crate::signal::CallerSignalSnapshot,
+        admission: Option<&crate::signal::LaunchAdmission>,
+    ) -> io::Result<Self> {
         let expires = crate::macos_deadline::add(
             crate::macos_deadline::continuous_nanos()?,
             deadline.saturating_duration_since(Instant::now()),
@@ -60,22 +64,20 @@ impl Envelope {
         // The mask is thread-local and must be sampled on the invoking thread.
         // Filesystem/descriptor enumeration remains owned by the single capture
         // worker; timing out does not submit another unbounded replacement.
-        let mut mask = 0;
-        check(unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) })?;
         let worker = CAPTURE
             .get_or_init(|| {
                 let (sender, receiver) = mpsc::sync_channel::<CaptureRequest>(0);
                 std::thread::Builder::new()
                     .name("memcordon-caller-envelope".into())
                     .spawn(move || {
-                        while let Ok((mask, deadline, sender)) = receiver.recv() {
+                        while let Ok((snapshot, deadline, sender)) = receiver.recv() {
                             let result = if Instant::now() >= deadline {
                                 Err(io::Error::new(
                                     io::ErrorKind::TimedOut,
                                     "caller capture admission expired",
                                 ))
                             } else {
-                                Self::capture_with_mask(mask)
+                                Self::capture_with_snapshot(snapshot)
                             };
                             let _ = sender.send(result);
                         }
@@ -86,8 +88,11 @@ impl Envelope {
             .as_ref()
             .map_err(|message| io::Error::other(message.clone()))?;
         let (sender, receiver) = mpsc::sync_channel(1);
-        let mut request = (mask, deadline, sender);
+        let mut request = (snapshot, deadline, sender);
         loop {
+            if let Some(admission) = admission {
+                admission.check()?;
+            }
             match worker.try_send(request) {
                 Ok(()) => break,
                 Err(mpsc::TrySendError::Full(returned)) => request = returned,
@@ -104,6 +109,9 @@ impl Envelope {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         loop {
+            if let Some(admission) = admission {
+                admission.check()?;
+            }
             if crate::macos_deadline::continuous_nanos()? >= expires {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -130,12 +138,10 @@ impl Envelope {
     }
     #[cfg(feature = "test-support")]
     pub(crate) fn capture() -> io::Result<Self> {
-        let mut mask = 0;
-        check(unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) })?;
-        Self::capture_with_mask(mask)
+        Self::capture_with_snapshot(crate::signal::CallerSignalSnapshot::capture()?)
     }
 
-    fn capture_with_mask(mask: libc::sigset_t) -> io::Result<Self> {
+    fn capture_with_snapshot(snapshot: crate::signal::CallerSignalSnapshot) -> io::Result<Self> {
         let limit = unsafe { libc::getdtablesize() };
         if !(3..=1_048_576).contains(&limit) {
             return Err(error());
@@ -166,19 +172,6 @@ impl Envelope {
             return Err(io::Error::last_os_error());
         }
         let cwd = unsafe { OwnedFd::from_raw_fd(cwd) };
-        let mut ignored = Vec::new();
-        for signal in 1..=libc::SIGUSR2 {
-            if [libc::SIGKILL, libc::SIGSTOP].contains(&signal) {
-                continue;
-            }
-            let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
-            if unsafe { libc::sigaction(signal, std::ptr::null(), action.as_mut_ptr()) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if unsafe { action.assume_init() }.sa_sigaction == libc::SIG_IGN {
-                ignored.push(signal);
-            }
-        }
         let mut limits = Vec::new();
         for resource in [
             libc::RLIMIT_CPU,
@@ -202,8 +195,8 @@ impl Envelope {
             descriptors,
             cwd,
             settings: Settings {
-                mask,
-                ignored,
+                mask: snapshot.mask,
+                ignored: snapshot.ignored,
                 limits,
             },
         })
@@ -462,9 +455,12 @@ pub fn transfer_fixture(directory: &std::path::Path) -> io::Result<()> {
 
 impl Settings {
     pub(crate) fn restore(&self) -> io::Result<()> {
-        if self.ignored.iter().any(|signal| {
-            !(1..=libc::SIGUSR2).contains(signal) || [libc::SIGKILL, libc::SIGSTOP].contains(signal)
-        }) {
+        if self.ignored.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.ignored.iter().any(|signal| {
+                !(1..=libc::SIGUSR2).contains(signal)
+                    || [libc::SIGKILL, libc::SIGSTOP].contains(signal)
+            })
+        {
             return Err(error());
         }
         for signal in 1..=libc::SIGUSR2 {

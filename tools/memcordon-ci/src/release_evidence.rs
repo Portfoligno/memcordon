@@ -143,6 +143,9 @@ pub const MACOS_LIFECYCLE_SCENARIOS: &[&str] = &[
 ];
 
 pub const MACOS_REMEDIATION_SCENARIOS: &[&str] = &[
+    "public_frontend_preserves_sigint_exec_policy",
+    "public_frontend_preserves_sigterm_exec_policy",
+    "public_frontend_preserves_sighup_exec_policy",
     "running_guardian_loss_is_prompt_and_never_clean_retirement",
     "repeated_stop_events_preserve_first_grace_and_retirement_deadline",
     "submillisecond_remaining_admission_never_renews_budget",
@@ -199,6 +202,49 @@ pub const MACOS_MUTATION_SCENARIOS: &[(&str, &str, &str)] = &[
         "memcordon-core",
         "report",
         "mutation_successful_backend_result_counted_as_authorization_is_rejected",
+    ),
+];
+
+pub const MACOS_ADMISSION_SCENARIOS: &[(&str, &str, &str)] = &[
+    (
+        "memcordon-platform",
+        "test-support",
+        "cancelled_supervision_with_no_helper_is_a_reportable_interruption",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "host_cancellation_handle_cannot_own_two_contexts",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "cancellation_before_commit_remains_sticky_across_attempts",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "commit_and_cancellation_share_one_ordered_state",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "committed_admission_is_not_a_second_release_permission",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "host_managed_pre_cancelled_run_never_resolves_or_creates_a_helper",
+    ),
+    (
+        "memcordon-platform",
+        "test-support",
+        "owned_signal_actions_restore_in_isolated_process",
+    ),
+    (
+        "memcordon",
+        "test-fixtures",
+        "cancellation_at_native_release_boundaries_never_reopens_admission",
     ),
 ];
 

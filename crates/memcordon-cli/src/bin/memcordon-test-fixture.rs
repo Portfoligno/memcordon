@@ -520,6 +520,10 @@ fn main() {
         .unwrap_or_else(|| fail("a fixture subcommand is required"));
     let status = match command.as_str() {
         #[cfg(target_os = "macos")]
+        "macos-signal-parent" => macos_signal_parent(args),
+        #[cfg(target_os = "macos")]
+        "macos-signal-target" => macos_signal_target(args),
+        #[cfg(target_os = "macos")]
         "__macos-guardian" | "__macos-guardian-envelope-v1" => loop {
             std::thread::park();
         },
@@ -861,4 +865,123 @@ fn main() {
         _ => fail("unknown fixture subcommand"),
     };
     std::process::exit(status);
+}
+
+#[cfg(target_os = "macos")]
+fn fixture_signal(value: &OsStr) -> i32 {
+    match value.to_str() {
+        Some("interrupt") => libc::SIGINT,
+        Some("terminate") => libc::SIGTERM,
+        Some("hangup") => libc::SIGHUP,
+        _ => fail("unknown fixture signal"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+extern "C" fn fixture_caught_signal(_: libc::c_int) {}
+
+#[cfg(target_os = "macos")]
+fn macos_signal_parent(mut args: impl Iterator<Item = OsString>) -> i32 {
+    use std::os::unix::process::CommandExt;
+
+    let signal_name = take_value(&mut args, "signal");
+    let signal = fixture_signal(&signal_name);
+    let policy = take_value(&mut args, "signal policy");
+    let route = take_value(&mut args, "execution route");
+    let image = PathBuf::from(take_value(&mut args, "frontend"));
+    let fixture = PathBuf::from(take_value(&mut args, "target"));
+    let marker = PathBuf::from(take_value(&mut args, "marker"));
+    let (disposition, blocked, expected) = match policy.to_str() {
+        Some("ignored") => (libc::SIG_IGN, false, "ignored"),
+        Some("default") => (libc::SIG_DFL, false, "default"),
+        Some("caught") => (
+            fixture_caught_signal as *const () as usize,
+            false,
+            "default",
+        ),
+        Some("blocked-default") => (libc::SIG_DFL, true, "blocked-default"),
+        _ => fail("unknown fixture signal policy"),
+    };
+    // SAFETY: only this disposable fixture process changes its signal state.
+    // Native exec below reproduces ignored dispositions and the calling mask.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = disposition;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+            fail(io::Error::last_os_error().to_string());
+        }
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigaddset(&mut mask, signal);
+        if libc::pthread_sigmask(
+            if blocked {
+                libc::SIG_BLOCK
+            } else {
+                libc::SIG_UNBLOCK
+            },
+            &mask,
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            fail("cannot set fixture calling mask");
+        }
+    }
+    let mut command = match route.to_str() {
+        Some("direct") => Command::new(&fixture),
+        Some("supervised") => {
+            let mut command = Command::new(&image);
+            command.args(["+2s", "--quiet", "--report"]);
+            command
+                .arg(marker.with_extension("json"))
+                .arg("--")
+                .arg(&fixture);
+            command
+        }
+        _ => fail("unknown fixture execution route"),
+    };
+    command
+        .arg("macos-signal-target")
+        .arg(signal_name)
+        .arg(expected)
+        .arg(marker);
+    fail(command.exec().to_string());
+}
+
+#[cfg(target_os = "macos")]
+fn macos_signal_target(mut args: impl Iterator<Item = OsString>) -> i32 {
+    let signal = fixture_signal(&take_value(&mut args, "signal"));
+    let expected = take_value(&mut args, "expected signal policy");
+    let marker = PathBuf::from(take_value(&mut args, "marker"));
+    let ignored = expected == "ignored";
+    let blocked = expected == "blocked-default";
+    // SAFETY: read our own dispositions/mask and signal this fixture only.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        if libc::sigaction(signal, std::ptr::null(), &mut action) != 0
+            || libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) != 0
+        {
+            fail("cannot inspect target signal policy");
+        }
+        if action.sa_sigaction
+            != if ignored {
+                libc::SIG_IGN
+            } else {
+                libc::SIG_DFL
+            }
+            || (libc::sigismember(&mask, signal) == 1) != blocked
+        {
+            fail("target signal policy differs from caller exec semantics");
+        }
+        fs::write(&marker, b"signal policy verified\n").unwrap();
+        if libc::raise(signal) != 0 {
+            fail("target self-signal failed");
+        }
+    }
+    if !ignored && !blocked {
+        fail("default unblocked target survived self-signal");
+    }
+    fs::write(marker.with_extension("completed"), b"signal survived\n").unwrap();
+    0
 }

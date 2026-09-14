@@ -25,19 +25,21 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint
+      - run: ./ci-native-fingerprint --output target/ci/native-inputs.bin
       - id: standard-target
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             target/ci/bootstrap
             target/ci/standard-backend
-          key: cargo-target-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ steps.source.outputs.commit }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup
+          key: managed-v2-cargo-target-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ steps.source.outputs.commit }}-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
+      - run: ./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-cgroup
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: backend-standard-linux-cgroup-v2-x64
@@ -53,7 +55,10 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
           compression-level: 0
-      - if: always() && steps.standard-target.outputs.cache-hit != 'true'
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/debug/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.standard-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.standard-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -64,9 +69,9 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
           key: ${{ steps.standard-deps.outputs.cache-primary-key }}
 
   standard-windows:
@@ -82,19 +87,21 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint
+      - run: ./ci-native-fingerprint --output target/ci/native-inputs.bin
       - id: standard-target
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
             target/ci/bootstrap
             target/ci/standard-backend
-          key: cargo-target-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ steps.source.outputs.commit }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job
+          key: managed-v2-cargo-target-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ steps.source.outputs.commit }}-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
+      - run: ./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-job
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: backend-standard-windows-job-object-x64
@@ -110,7 +117,10 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
           compression-level: 0
-      - if: always() && steps.standard-target.outputs.cache-hit != 'true'
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/debug/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.standard-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.standard-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -121,9 +131,9 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
           key: ${{ steps.standard-deps.outputs.cache-primary-key }}
 
   linux:
@@ -138,10 +148,13 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint
+      - run: ./ci-native-fingerprint --output target/ci/native-inputs.bin
       - id: certification-target
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -149,9 +162,8 @@ jobs:
             target/ci/bootstrap
             target/ci/backend
             target/ci/sealed-agent
-          key: cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2
+          key: managed-v2-cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
+      - run: ./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -161,7 +173,10 @@ jobs:
           retention-days: 14
           compression-level: 0
           include-hidden-files: true
-      - if: always() && steps.certification-target.outputs.cache-hit != 'true'
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/debug/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.certification-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.certification-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -173,9 +188,9 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
           key: ${{ steps.certification-deps.outputs.cache-primary-key }}
 
   windows-provider-lifecycle:
@@ -203,10 +218,13 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-deps-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint
+      - run: ./ci-native-fingerprint --output target/ci/native-inputs.bin
       - id: lifecycle-target
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -214,9 +232,8 @@ jobs:
             target/ci/bootstrap
             target/ci/backend
             target/ci/windows-sealed
-          key: cargo-target-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-provider-lifecycle
+          key: managed-v2-cargo-target-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
+      - run: ./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -225,7 +242,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
-      - if: always() && steps.lifecycle-target.outputs.cache-hit != 'true'
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/debug/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.lifecycle-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.lifecycle-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -237,9 +257,9 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
           key: ${{ steps.lifecycle-deps.outputs.cache-primary-key }}
 
   windows-package-channel:
@@ -267,10 +287,13 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-deps-windows-package-channel-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-windows-package-channel-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint
+      - run: ./ci-native-fingerprint --output target/ci/native-inputs.bin
       - id: package-target
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -278,12 +301,11 @@ jobs:
             target/ci/bootstrap
             target/ci/windows-sealed
             target/ci/windows-sealed-cargo
-          key: cargo-target-windows-package-channel-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
+          key: managed-v2-cargo-target-windows-package-channel-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
       - name: Certify packaged Cargo channel
         env:
           CARGO_TARGET_DIR: target/ci/windows-sealed-cargo/build
-        run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-package-channel
+        run: ./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -292,7 +314,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
-      - if: always() && steps.package-target.outputs.cache-hit != 'true'
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/debug/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.package-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.package-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -304,9 +329,9 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
           key: ${{ steps.package-deps.outputs.cache-primary-key }}
 
   windows-loader-lab:
@@ -335,10 +360,13 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-deps-windows-loader-lab-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-windows-loader-lab-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint
+      - run: ./ci-native-fingerprint --output target/ci/native-inputs.bin
       - id: lab-target
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -346,9 +374,8 @@ jobs:
             target/ci/bootstrap
             target/ci/windows-sealed
             target/ci/windows-loader-lab
-          key: cargo-target-windows-loader-lab-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-loader-lab
+          key: managed-v2-cargo-target-windows-loader-lab-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
+      - run: ./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-lab
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -357,7 +384,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
-      - if: always() && steps.lab-target.outputs.cache-hit != 'true'
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/debug/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.lab-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.lab-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -369,9 +399,9 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
           key: ${{ steps.lab-deps.outputs.cache-primary-key }}
 
   windows-loader-production:
@@ -394,10 +424,13 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint
+      - run: ./ci-native-fingerprint --output target/ci/native-inputs.bin
       - id: certification-target
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -406,9 +439,8 @@ jobs:
             target/ci/backend
             target/ci/windows-sealed
             target/ci/windows-sealed-cargo
-          key: cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-loader-production
+          key: managed-v2-cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
+      - run: ./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -417,7 +449,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
-      - if: always() && steps.certification-target.outputs.cache-hit != 'true'
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/debug/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.certification-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.certification-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -430,7 +465,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
           key: ${{ steps.certification-deps.outputs.cache-primary-key }}

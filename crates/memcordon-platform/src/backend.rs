@@ -309,21 +309,13 @@ pub fn run(
             "watchdog poll interval must be at least 10ms",
         ));
     }
-    let signal = crate::signal::SignalSource::install().map_err(|error| {
-        Error::new(ErrorCategory::Setup, "MCSETUP-SIGNAL", error.to_string()).with_os_error(&error)
+    let origin = crate::macos_continuous_nanos().map_err(|error| {
+        Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string()).with_os_error(&error)
     })?;
-    crate::macos_watchdog::run_attempt(
+    crate::supervisor::MacosExecutionContext::owned(origin)?.run(
         policy,
         command,
         memcordon_executable,
-        &signal,
-        crate::supervisor::AttemptContext {
-            macos_run_origin_ns: None,
-            macos_work_expires_ns: None,
-            restart_attempt: 0,
-            supervision_offset: Duration::ZERO,
-            supervision_deadline_remaining: None,
-        },
     )
 }
 

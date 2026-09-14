@@ -14,7 +14,7 @@ functional requirements, logical endpoints, and an expected policy epoch.
 The provider obtains caller identity from its authenticated native channel.
 A workload file cannot supply authoritative caller identity or create a grant.
 
-The implemented [profile catalogue](https://github.com/Portfoligno/memcordon/blob/main/crates/memcordon-core/src/workload_registry.rs)
+The implemented [profile catalogue](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-core/src/workload_registry.rs)
 contains these two baseline definitions:
 
 | Profile | Direct socket ceiling | Implemented functional admission |
@@ -47,7 +47,7 @@ successful TCP is rejected as `policy-incompatible` before target authorization.
 
 ## Strict input and deterministic resolution
 
-[WorkloadContractV1](https://github.com/Portfoligno/memcordon/blob/main/crates/memcordon-core/src/workload_contract.rs) uses a
+[WorkloadContractV1](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-core/src/workload_contract.rs) uses a
 closed schema. Its strict parser rejects unknown fields/variants, duplicate
 JSON keys, malformed digests/nonces, zero revisions, excessive bounds,
 duplicate IDs, and unresolved or cyclic endpoint references. Logical IDs are
@@ -80,7 +80,7 @@ returned with an explicit remaining count. Unknown or unavailable functionality
 never becomes an implicit permission. A rejection cannot authorize the target;
 allocated resources still require native cleanup.
 
-The [shared limits](https://github.com/Portfoligno/memcordon/blob/main/crates/memcordon-core/src/workload_limits.rs) include:
+The [shared limits](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-core/src/workload_limits.rs) include:
 
 | Object | Limit |
 | --- | --- |
@@ -101,7 +101,7 @@ marked complete.
 
 ## Canonical bytes and commitment order
 
-The [canonical codec](https://github.com/Portfoligno/memcordon/blob/main/crates/memcordon-core/src/workload_codec.rs) is separate
+The [canonical codec](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-core/src/workload_codec.rs) is separate
 from JSON formatting. Each domain is ASCII followed by NUL and schema 1 as a
 big-endian u16. Strings and vector counts use big-endian u16 lengths/counts;
 revisions and restart numbers use big-endian u64. Digests and nonces use raw
@@ -151,9 +151,9 @@ and invocation records without publishing environment, argv, or raw credentials.
 Hashes detect substitution against independently trusted expected values; they
 do not authenticate a provider by themselves.
 
-The [independent fixed vectors and derivation](https://github.com/Portfoligno/memcordon/blob/main/crates/memcordon-core/tests/fixtures/workload_independent/README.md)
+The [independent fixed vectors and derivation](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-core/tests/fixtures/workload_independent/README.md)
 specify concrete contract, registry, effective, attempt, and checkpoint
-preimages and external SHA-256 answers. Their [tests](https://github.com/Portfoligno/memcordon/blob/main/crates/memcordon-core/tests/workload_independent_vectors.rs)
+preimages and external SHA-256 answers. Their [tests](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-core/tests/workload_independent_vectors.rs)
 also exercise ordering invariance, malformed decoding, identity substitution,
 discovery capacity, and incomplete checkpoints/retirement.
 
@@ -169,8 +169,8 @@ memcordon-sealed-agent package policy apply --file approved-policy.json
 Apply parses the bounded configuration before activation. Native leases
 serialize activation against admission, preserve immutable snapshots needed by
 live bindings, and reject capacity exhaustion. See the
-[Linux registry](https://github.com/Portfoligno/memcordon/blob/main/crates/memcordon-cli/src/bin/memcordon-sealed-agent/policy_registry.rs)
-and [Windows registry](https://github.com/Portfoligno/memcordon/blob/main/crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/policy_registry.rs).
+[Linux registry](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-cli/src/bin/memcordon-sealed-agent/policy_registry.rs)
+and [Windows registry](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/policy_registry.rs).
 The administrator-facing policy area is distinct from private attempt state.
 
 An activation binds a registry digest to a service-instance nonce and nonzero
@@ -186,7 +186,7 @@ Failure to observe retirement before the bounded deadline returns an error
 even when revocation has already activated. A later drain activation cannot
 clear the revocation latch for an admission still live.
 
-[Discovery](https://github.com/Portfoligno/memcordon/blob/main/crates/memcordon-core/src/workload_discovery.rs) returns
+[Discovery](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-core/src/workload_discovery.rs) returns
 caller-filtered grants, support/availability, profile/catalog/qualification
 bindings, optional active epoch/registry identity, completeness, and a maximum
 TTL of 60 seconds. Its target-authorized field is fixed false. Discovery is
@@ -206,7 +206,7 @@ durability facts, bound to the exact attempt and baseline restriction.
 
 | Surface | Implemented revision |
 | --- | --- |
-| Execution / plan / doctor report | 9 / 8 / 6 |
+| Execution / plan / doctor report | 10 / 9 / 6 |
 | Workload contract and profile semantics | 1 |
 | Generic provider contract / Linux launch wire | 3 / 3 |
 | Windows public / private wire | 2 / 2 |
@@ -223,7 +223,7 @@ to a current qualified strict attempt.
 
 ## Qualification, certification, and release scope
 
-[Runtime artifact references](https://github.com/Portfoligno/memcordon/blob/main/crates/memcordon-core/src/runtime_manifest.rs)
+[Runtime artifact references](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/crates/memcordon-core/src/runtime_manifest.rs)
 state both the qualified target and whether it qualifies the package target.
 The Linux profile artifact currently names `x86_64-unknown-linux-gnu`; attaching
 that artifact to another Linux package does not qualify that package target.
@@ -232,7 +232,7 @@ qualification artifacts. Actual native qualification remains necessary for
 the corresponding installed component set and host observations.
 
 Ordinary backend certification remains independent of sealed workload
-admission. The [standard catalogue](https://github.com/Portfoligno/memcordon/blob/main/tools/memcordon-ci/src/standard_contract.rs)
+admission. The [standard catalogue](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/tools/memcordon-ci/src/standard_contract.rs)
 requires 23 Linux x64 scenarios on `ubuntu-24.04` and 17 Windows x64 scenarios
 on `windows-2025`. The historical standard floor is preserved separately from
 the current catalogue, with the Linux guardian-observation regression appended.
@@ -241,7 +241,7 @@ Standard certificate schema 3 binds the exact catalogue digest, standard
 boundary/backend, native target, source commit, runtime observations, ordered
 named passing tests, and zero skips. Hosted release certificates additionally
 bind repository, run, workflow reference/commit, source, and exact release job
-through [certification provenance](https://github.com/Portfoligno/memcordon/blob/main/tools/memcordon-ci/src/certification_context.rs).
+through [certification provenance](https://github.com/Portfoligno/memcordon/blob/0.5.5-rc.1/tools/memcordon-ci/src/certification_context.rs).
 A local observation cannot satisfy a hosted producer-origin check. Standard
 and sealed jobs, artifacts, and required release records remain distinct.
 Compilation caches cannot substitute for fresh native scenario execution.

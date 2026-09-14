@@ -44,7 +44,11 @@ Before queueing native creation, the caller owns duplicates of each intended
 non-close-on-exec descriptor, an open cwd directory, the calling thread's signal
 mask, ignored signal dispositions, and resource limits. A separate private
 capture owner performs cwd acquisition and descriptor enumeration under the
-original continuous deadline; the calling thread supplies its own signal mask.
+original continuous deadline; the calling thread supplies its own signal mask
+and ignored-disposition snapshot, captured before supervisor handlers replace
+the intercepted actions. The capture worker never rediscovers those dispositions
+from the supervisor's handlers. Native exec resets caught handlers to defaults;
+host handler pointers are not transferred to another executable.
 A timed-out capture remains in that single reserved slot until it settles.
 A separate private
 datagram transfers the descriptors and cwd with `SCM_RIGHTS`. Its strict manifest
@@ -64,6 +68,41 @@ umask changes before that native creation boundary therefore select the inherite
 value. Owned descriptors and cwd remain stable across later host close/reuse or
 cwd changes, while resource-limit restoration fails closed if the fresh child
 cannot restore the captured limits.
+
+## Signal ownership and startup interruption
+
+The CLI establishes one owned execution context before bounded helper lookup and
+retains it through all attempts. The context restores complete original signal
+actions explicitly before returning a successful library result. Owned mode
+requires exclusive management of intercepted process-wide dispositions and
+cooperative quiescence between sessions; it cannot synchronize arbitrary host
+libraries calling `sigaction`. Embedders that manage their own signals use an
+owned caller snapshot and host-managed cancellation instead of installing a
+second supervisor handler set. Host-managed contexts change no global signal
+actions and retain the original caller-thread mask for target execution.
+Each cancellation handle belongs to one run; cloned handles only route signals
+to that run. Finishing or dropping a context does not make its handle reusable.
+A fresh handle may already be cancelled before its first context is established.
+
+Interruption is sticky for the entire run. Cancellation published before atomic
+frontend admission prevents submission of a release request. This ordering is
+defined at frontend publication, not the physical instant a key is pressed or a
+signal is sent. A blocked or undispatched signal has not yet been published.
+Admission commitment alone does not prove guardian release or target execution.
+
+Before any release bytes can be exposed, cancellation can retain `not-issued`.
+After possible exposure with no authoritative receipt, release remains `unknown`;
+cleanup must not manufacture complete runtime retirement to serialize it.
+Confirmed release retains `issued`, including whether exec was witnessed.
+Interrupted startup may have no PID or a prepared launcher PID and does not
+invent a child exit code. Only authoritative release counts as confirmed target
+authorization. Every observed interruption vetoes restart, including when a
+higher-priority deadline or memory event is the terminal outcome.
+
+Signals delivered to the frontend interrupt supervision even when the target
+inherits an ignored disposition for that signal. The ordinary sampled-watchdog
+and undiscovered-descendant limitations remain unchanged. Execution schema 10,
+runtime evidence V1 and private framing V2 retain their existing meanings.
 
 ## Private framing
 

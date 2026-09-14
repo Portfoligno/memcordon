@@ -345,14 +345,14 @@ fn public_windows_release_smoke_is_structurally_required() {
         ),
         (
             "public verification command",
-            "      - run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/verify-bootstrap --package memcordon-ci -- release verify-public\n",
+            "      - run: ./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public\n",
             "",
             "verify-public step count differs",
         ),
         (
             "target cache path",
-            "          path: target/ci/verify-bootstrap\n          key: cargo-target-release-verify-public-v2-",
-            "          path: target/ci/other\n          key: cargo-target-release-verify-public-v2-",
+            "          path: target/ci/verify-bootstrap\n          key: managed-v2-cargo-target-release-verify-public-v2-",
+            "          path: target/ci/other\n          key: managed-v2-cargo-target-release-verify-public-v2-",
             "verify-public verify-public-target cache inputs differ",
         ),
     ] {

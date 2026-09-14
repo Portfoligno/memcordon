@@ -1,5 +1,40 @@
 //! Native containment used only by black-box process tests.
 #[cfg(target_os = "macos")]
+pub fn macos_signal_installation(
+    failure: Option<usize>,
+    interrupt: Option<usize>,
+) -> std::io::Result<Option<i32>> {
+    crate::signal::SignalSource::installation_fixture(failure, interrupt)
+}
+#[cfg(target_os = "macos")]
+pub struct MacosAdmission(crate::signal::LaunchAdmission);
+#[cfg(target_os = "macos")]
+impl Default for MacosAdmission {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[cfg(target_os = "macos")]
+impl MacosAdmission {
+    pub fn new() -> Self {
+        Self(crate::signal::LaunchAdmission::Host(
+            crate::CancellationHandle::new(),
+        ))
+    }
+    pub fn record(&self, signal: i32) {
+        self.0.record_for_test(signal);
+    }
+    pub fn commit(&self) -> std::io::Result<()> {
+        self.0.commit()
+    }
+    pub fn interruption(&self) -> Option<i32> {
+        self.0.interruption()
+    }
+    pub fn next_attempt(&self) {
+        self.0.next_attempt();
+    }
+}
+#[cfg(target_os = "macos")]
 pub use crate::macos_deadline::retirement_mutation_probe as macos_retirement_mutation_probe;
 
 #[cfg(target_os = "macos")]
@@ -23,8 +58,9 @@ pub use crate::macos_launch::submillisecond_deadline as macos_submillisecond_dea
 pub use crate::macos_launch::timer_mutation_detected as macos_timer_mutation_detected;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::{
-    LaunchFault as MacosLaunchFault, disarm_timeout as macos_disarm_timeout,
-    rejects_protocol as macos_rejects_protocol, startup_fault as macos_startup_fault,
+    LaunchFault as MacosLaunchFault, cancellation_fault as macos_cancellation_fault,
+    disarm_timeout as macos_disarm_timeout, rejects_protocol as macos_rejects_protocol,
+    startup_fault as macos_startup_fault,
 };
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::{

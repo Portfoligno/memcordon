@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
+pub mod build_context;
 pub mod capability;
 pub mod certification_context;
 pub mod command;
 pub mod config;
 pub mod fuzz_targets;
 pub mod line_evidence;
+pub mod managed_workflow;
 pub mod miri_targets;
 pub mod policy;
 pub mod producer_metadata;

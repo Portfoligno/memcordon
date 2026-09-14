@@ -479,7 +479,7 @@ pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
                 (
                     "always() && steps.fuzz-deps.outputs.cache-hit != 'true'",
                     "${{ steps.fuzz-deps.outputs.cache-primary-key }}",
-                    "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n",
+                    "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n",
                 ),
             ];
             let (condition, cache_key, path) = expected[index - 7];
@@ -505,7 +505,7 @@ pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
             exact_mapping_keys(with, &["path", "key"], "fuzz shared cache")?;
             let (path, cache_key) = if index == 1 {
                 (
-                    "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n",
+                    "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n",
                     "cargo-deps-deep-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml') }}",
                 )
             } else {
@@ -559,11 +559,11 @@ pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
         != [
             ("rustup toolchain install 1.97.1 --profile minimal", None),
             (
-                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite fuzz-first",
+                "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-first",
                 Some("matrix.shard == 'first'"),
             ),
             (
-                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite fuzz-second",
+                "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-second",
                 Some("matrix.shard == 'second'"),
             ),
         ]
@@ -728,8 +728,11 @@ fn check_macos_deadline_job(jobs: &Mapping, name: &str) -> Result<()> {
         }
         if let Some(with) = step.get(key("with")).and_then(Value::as_mapping) {
             if scalar(step, "uses").is_some_and(|value| value.starts_with("actions/cache/restore@"))
-                && scalar(with, "path")
-                    .is_some_and(|value| value.lines().any(|path| path.starts_with("target/")))
+                && scalar(with, "path").is_some_and(|value| {
+                    value.lines().any(|path| {
+                        path.starts_with("target/") && !path.starts_with("target/ci/source-home/")
+                    })
+                })
             {
                 if !fingerprint
                     || !scalar(with, "key")
@@ -898,10 +901,10 @@ fn check_standard_certification_job(
     }
     let expected_suite = match contract.target {
         crate::standard_contract::StandardTarget::LinuxX64 => {
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-cgroup"
+            "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-cgroup"
         }
         crate::standard_contract::StandardTarget::WindowsX64 => {
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-windows-job"
+            "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-job"
         }
     };
     let commands: Vec<_> = steps
@@ -1014,7 +1017,7 @@ fn check_standard_certification_job(
     for (id, path, cache_key) in [
         (
             "standard-deps",
-            "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n",
+            "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n",
             dependency_key,
         ),
         (
@@ -1142,8 +1145,7 @@ fn check_certification_cache(
     target_key: &str,
     context: &str,
 ) -> Result<()> {
-    const DEPENDENCY_PATHS: &str =
-        "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n";
+    const DEPENDENCY_PATHS: &str = "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n";
     const TARGET_PATHS: &str = "target/ci/bootstrap\ntarget/ci/backend\n";
     const LINUX_TARGET_PATHS: &str =
         "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/sealed-agent\n";
@@ -1306,8 +1308,8 @@ fn check_certification_job(
     ];
     if windows {
         expected_run_commands.extend([
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-provider-lifecycle",
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-package-channel",
+            "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
+            "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
         ]);
     }
     if run_commands != expected_run_commands {
@@ -1445,7 +1447,7 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         1,
         linux_dependency_key,
         linux_target_key,
-        "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2",
+        "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2",
         "backend-linux-sealed-v2",
         "target/ci/reports/linux-sealed-v2",
         "backend certification linux job",
@@ -1495,8 +1497,8 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         SplitWindowsJobContract {
             name: "windows-loader-production",
             suite: concat!(
-                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap ",
-                "--package memcordon-ci -- suite windows-loader-production"
+                "./target/ci/control-bootstrap/debug/memcordon-ci ",
+                "--build-context target/ci/native-inputs.bin suite windows-loader-production"
             ),
             artifact_name: "windows-loader-production-${{ matrix.id }}",
             artifact_path: "target/ci/reports/windows-sealed-v2/loader-production",
@@ -1512,8 +1514,8 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         SplitWindowsJobContract {
             name: "windows-provider-lifecycle",
             suite: concat!(
-                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap ",
-                "--package memcordon-ci -- suite windows-provider-lifecycle"
+                "./target/ci/control-bootstrap/debug/memcordon-ci ",
+                "--build-context target/ci/native-inputs.bin suite windows-provider-lifecycle"
             ),
             artifact_name: "windows-provider-lifecycle-${{ matrix.id }}",
             artifact_path: "target/ci/reports/windows-sealed-v2",
@@ -1532,8 +1534,8 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         SplitWindowsJobContract {
             name: "windows-package-channel",
             suite: concat!(
-                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap ",
-                "--package memcordon-ci -- suite windows-package-channel"
+                "./target/ci/control-bootstrap/debug/memcordon-ci ",
+                "--build-context target/ci/native-inputs.bin suite windows-package-channel"
             ),
             artifact_name: "windows-package-channel-${{ matrix.id }}",
             artifact_path: "target/ci/windows-sealed-cargo",
@@ -1552,8 +1554,8 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         SplitWindowsJobContract {
             name: "windows-loader-lab",
             suite: concat!(
-                "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap ",
-                "--package memcordon-ci -- suite windows-loader-lab"
+                "./target/ci/control-bootstrap/debug/memcordon-ci ",
+                "--build-context target/ci/native-inputs.bin suite windows-loader-lab"
             ),
             artifact_name: "windows-loader-lab-${{ matrix.id }}",
             artifact_path: "target/ci/reports/windows-sealed-v2/loader-lab",
@@ -1641,8 +1643,7 @@ fn check_split_windows_job(job: &Mapping, contract: SplitWindowsJobContract<'_>)
     {
         return Err(failure(format!("{context} action cardinality differs")));
     }
-    const DEPENDENCY_CACHE_PATH: &str =
-        "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n";
+    const DEPENDENCY_CACHE_PATH: &str = "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n";
     for (id, expected_path) in [
         (contract.dependency_cache_id, DEPENDENCY_CACHE_PATH),
         (contract.target_cache_id, contract.target_cache_path),
@@ -2160,10 +2161,7 @@ fn check_release_structure(
             "rustup toolchain install {} --profile minimal",
             toolchains.msrv
         ),
-        format!(
-            "rustup run {} cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite release-preflight",
-            toolchains.stable
-        ),
+        "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite release-preflight".into(),
     ];
     if actual_run_commands.len() != expected_run_commands.len()
         || !actual_run_commands
@@ -2216,7 +2214,7 @@ fn check_release_structure(
         2,
         linux_dependency_key,
         linux_target_key,
-        "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite backend-linux-sealed-v2",
+        "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2",
         "release-certification-linux",
         "target/ci/reports/linux-sealed-v2",
         &linux_context,
@@ -2236,7 +2234,7 @@ fn check_release_structure(
     for contract in [
         SplitWindowsJobContract {
             name: "windows-loader-production",
-            suite: "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-loader-production",
+            suite: "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production",
             artifact_name: "release-windows-loader-production-${{ matrix.id }}",
             artifact_path: "target/ci/reports/windows-sealed-v2/loader-production",
             dependency: Some("native"),
@@ -2253,7 +2251,7 @@ fn check_release_structure(
         },
         SplitWindowsJobContract {
             name: "windows-provider-lifecycle",
-            suite: "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-provider-lifecycle",
+            suite: "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
             artifact_name: "release-windows-provider-lifecycle-${{ matrix.id }}",
             artifact_path: "target/ci/reports/windows-sealed-v2/provider-lifecycle",
             dependency: Some("windows-loader-production"),
@@ -2276,7 +2274,7 @@ fn check_release_structure(
         },
         SplitWindowsJobContract {
             name: "windows-package-channel",
-            suite: "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- suite windows-package-channel",
+            suite: "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
             artifact_name: "release-windows-package-channel-${{ matrix.id }}",
             artifact_path: "target/ci/windows-sealed-cargo",
             dependency: Some("windows-provider-lifecycle"),
@@ -2348,7 +2346,7 @@ fn check_release_structure(
         ("run", "rustup toolchain install 1.97.1 --profile minimal"),
         (
             "run",
-            "rustup run 1.97.1 cargo run --locked --target-dir target/ci/bootstrap --package memcordon-ci -- release assemble",
+            "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin release assemble",
         ),
         (
             "uses",
@@ -2507,10 +2505,7 @@ fn check_verify_public_job(
             "rustup toolchain install {} --profile minimal",
             toolchains.stable
         ),
-        format!(
-            "rustup run {} cargo run --locked --target-dir target/ci/verify-bootstrap --package memcordon-ci -- release verify-public",
-            toolchains.stable
-        ),
+        "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public".into(),
     ];
     if run_commands.len() != expected.len()
         || !run_commands
@@ -2528,7 +2523,7 @@ fn check_verify_public_job(
     for (id, path, key_fragment) in [
         (
             "verify-public-deps",
-            "~/.cargo/registry/index\n~/.cargo/registry/cache\n~/.cargo/git/db\n",
+            "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n",
             "cargo-deps-release-verify-public-v2-",
         ),
         (
@@ -2663,7 +2658,8 @@ fn validate_workflow_bytes_into(
             "release-bootstrap workflow and environment references are forbidden",
         ));
     }
-    let document = parse_yaml(bytes)?;
+    let mut document = parse_yaml(bytes)?;
+    crate::managed_workflow::validate_and_project(&mut document)?;
     let workflow = mapping(&document, "workflow")?;
     if workflow.contains_key(key("shell")) || workflow.contains_key(key("env")) {
         return Err(failure(format!(
@@ -3051,6 +3047,16 @@ impl<'ast> Visit<'ast> for RustPolicy {
     }
 }
 
+fn managed_compilation_environment_boundary(relative: &Path) -> bool {
+    [
+        Path::new("tools/ci-native-fingerprint.rs"),
+        Path::new("tools/memcordon-ci/src/build_context.rs"),
+        // This integration fixture injects a rejected compiler override into the seed.
+        Path::new("tools/memcordon-ci/tests/build_context.rs"),
+    ]
+    .contains(&relative)
+}
+
 /// Parses untrusted Rust source and applies the repository's semantic subprocess policy.
 pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     let source = std::str::from_utf8(bytes)
@@ -3072,7 +3078,11 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     ]
     .contains(&relative)
         && visitor.subprocess_env_mutations == visitor.standard_path_mutations;
-    if visitor.subprocess_env_mutations != 0 && relative != sealed_launch && !native_path_fixture {
+    if visitor.subprocess_env_mutations != 0
+        && relative != sealed_launch
+        && !native_path_fixture
+        && !managed_compilation_environment_boundary(relative)
+    {
         visitor
             .violations
             .push("subprocess environment mutation is forbidden".to_owned());
@@ -3168,6 +3178,7 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         if visitor.subprocess_env_mutations != 0
             && relative != sealed_launch
             && !native_path_fixture
+            && !managed_compilation_environment_boundary(relative)
         {
             visitor
                 .violations
@@ -3981,6 +3992,7 @@ jobs:
                     .clone(),
             );
         }
+        crate::managed_workflow::validate_and_project(&mut document)?;
         let workflow = mapping(&document, "release workflow")?;
         let jobs = mapping(
             workflow

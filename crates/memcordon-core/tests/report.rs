@@ -2245,3 +2245,155 @@ fn mutation_successful_backend_result_counted_as_authorization_is_rejected() {
     value["supervision"]["targets_authorized"] = serde_json::json!(1);
     assert!(serde_json::from_value::<MemcordonReport>(value).is_err());
 }
+
+fn interrupted_startup_report(
+    release: memcordon_core::ReleaseEvidence,
+    pid: Option<u32>,
+) -> MemcordonReport {
+    use memcordon_core::{ClockDomain, DeliveryEvidence, RetirementEvidence, RuntimeEvidenceV1};
+    let uncertain = matches!(release, memcordon_core::ReleaseEvidence::Unknown);
+    let issued = matches!(release, memcordon_core::ReleaseEvidence::Issued { .. });
+    let outcome = RunOutcome::Interrupted {
+        signal: memcordon_core::Interruption { signal: 2 },
+        child_after_termination: None,
+        cleanup: cleanup(),
+    };
+    let mut record = attempt_record(1, Some(outcome.clone()), None);
+    record.target_pid = pid;
+    record.launch.target_released = issued;
+    record.authorized_offset_ms = issued.then_some(2);
+    if uncertain {
+        record.restart_safety = RestartSafetyProof::default();
+    }
+    record.runtime = Some(RuntimeEvidenceV1 {
+        schema_version: 1,
+        clock: ClockDomain::DarwinContinuousTicksV1 {
+            boot_identity: "fixture-boot".to_owned(),
+            ticks_per_second: 1_000_000_000,
+        },
+        run_origin: 0,
+        attempt_origin: 1,
+        work_expires: Some(100),
+        startup_expires: 80,
+        release,
+        target_pid: pid.and_then(std::num::NonZeroU32::new),
+        terminal_observed: Some(3),
+        force_requested: None,
+        force_expires: Some(3),
+        retirement_expires: Some(10),
+        delivery_expires: Some(11),
+        retirement: if uncertain {
+            RetirementEvidence::Unconfirmed { last_owner: None }
+        } else {
+            RetirementEvidence::Complete {
+                at: 4,
+                target_reaped_or_absent: true,
+                group_reconciled: true,
+                detached_identities_discharged: true,
+                native_obligations_settled: true,
+                policy_retired: true,
+            }
+        },
+        delivery: DeliveryEvidence::Prepared,
+    });
+    let mut history = AttemptHistory::default();
+    let mut aggregates = SupervisionAggregates::default();
+    history.append(record, &mut aggregates).unwrap();
+    report_from_execution(
+        SupervisionExecution::new(
+            BackendCapabilityReport::default(),
+            SupervisionTerminal::AttemptOutcome {
+                attempt_number: 1,
+                outcome,
+            },
+            history,
+            aggregates,
+            RestartSummary::default(),
+            None,
+            4,
+            u64::from(issued),
+        )
+        .unwrap(),
+    )
+}
+
+#[test]
+fn interrupted_startup_release_states_round_trip_without_synthetic_child_exit() {
+    use memcordon_core::ReleaseEvidence;
+    for (release, pid, authorized, unknown) in [
+        (ReleaseEvidence::NotIssued, None, 0, 0),
+        (ReleaseEvidence::NotIssued, Some(123), 0, 0),
+        (ReleaseEvidence::Unknown, None, 0, 1),
+        (ReleaseEvidence::Unknown, Some(123), 0, 1),
+        (
+            ReleaseEvidence::Issued {
+                at: 2,
+                exec_confirmed: false,
+            },
+            Some(123),
+            1,
+            0,
+        ),
+        (
+            ReleaseEvidence::Issued {
+                at: 2,
+                exec_confirmed: true,
+            },
+            Some(123),
+            1,
+            0,
+        ),
+    ] {
+        let report = interrupted_startup_report(release, pid);
+        let encoded = serde_json::to_value(report).unwrap();
+        assert_eq!(encoded["schema_version"], 10);
+        assert_eq!(encoded["attempts"][0]["outcome"]["outcome"], "interrupted");
+        assert_eq!(encoded["supervision"]["targets_authorized"], authorized);
+        assert_eq!(
+            encoded["supervision"]["aggregate"]["unknown_authorization_attempts"],
+            unknown
+        );
+        assert!(encoded["attempts"][0]["outcome"]["child_after_termination"].is_null());
+        let decoded: MemcordonReport = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.supervision.unwrap().wrapper_exit_code, 130);
+    }
+}
+
+#[test]
+fn interrupted_startup_cannot_be_mutated_into_authorization_or_complete_unknown_retirement() {
+    use memcordon_core::ReleaseEvidence;
+    let mut not_issued =
+        serde_json::to_value(interrupted_startup_report(ReleaseEvidence::NotIssued, None)).unwrap();
+    not_issued["attempts"][0]["launch"]["target_released"] = true.into();
+    assert!(serde_json::from_value::<MemcordonReport>(not_issued).is_err());
+    let mut unknown = serde_json::to_value(interrupted_startup_report(
+        ReleaseEvidence::Unknown,
+        Some(123),
+    ))
+    .unwrap();
+    let complete = serde_json::to_value(interrupted_startup_report(
+        ReleaseEvidence::NotIssued,
+        Some(123),
+    ))
+    .unwrap();
+    unknown["attempts"][0]["runtime"]["retirement"] =
+        complete["attempts"][0]["runtime"]["retirement"].clone();
+    assert!(serde_json::from_value::<MemcordonReport>(unknown).is_err());
+}
+
+#[test]
+fn not_issued_runtime_cannot_claim_successful_child_completion() {
+    let value = serde_json::to_value(interrupted_startup_report(
+        memcordon_core::ReleaseEvidence::NotIssued,
+        Some(123),
+    ))
+    .unwrap();
+    let mut attempt = value["attempts"][0].clone();
+    attempt["outcome"] = serde_json::to_value(RunOutcome::Exited {
+        child: ChildTermination::ExitCode { code: 0 },
+        peak: None,
+        cleanup: cleanup(),
+    })
+    .unwrap();
+    assert!(serde_json::from_value::<AttemptRecord>(attempt).is_err());
+}

@@ -185,7 +185,7 @@ MemCordon-generated status.
 |---|---|---|
 | `doctor` | Prints the version and selected backend; `--require hard|watchdog|sealed` returns `125` when unmet | Schema-6 host, backend, capability, limitation, requirement, and workload discovery data |
 | `doctor --probe-execution` | Explicit macOS helper/target/cleanup execution check; unsupported or unsuccessful probes return `125` | Separate `doctor-execution-probe` schema-1 envelope containing the schema-6 `doctor` and an `execution` result |
-| `plan` | Resolves policy without launching; text includes `launch proof: false` | Schema-8 budgets, requested/effective policy, dormant conditions, effects, limitations, backoff sample, and workload resolution |
+| `plan` | Resolves policy without launching; text includes `launch proof: false` | Schema-9 budgets, requested/effective policy, dormant conditions, effects, limitations, backoff sample, and workload resolution |
 | `clean` | Removes stale MemCordon-owned artifacts; `--dry-run` only lists them; incomplete cleanup returns `125` | Schema-2 cleanup result |
 
 In plan JSON, backoff configuration is under `request.restart.backoff`.

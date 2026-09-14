@@ -10,7 +10,9 @@ pub const WINDOWS_PACKAGE_POLICY_TESTS: [&str; 3] = [
     "windows::package::policy_rollback_tests::mixed_runtime_component_is_rejected_before_execution",
     "windows::package::policy_rollback_tests::legacy_manifest_absence_survives_failed_upgrade_qualification",
 ];
-pub const DIAGNOSTIC_TESTS: [&str; 14] = [
+pub const DIAGNOSTIC_TESTS: [&str; 16] = [
+    "windows_postauthorization_retirement::receiptless_posttarget_rejection_cannot_bypass_terminal_binding",
+    "windows_replay_retention::final_outbox_store_failure_preserves_primary_and_bounds_secondary_diagnostics",
     "windows::record::record_fault_tests::native_publisher_process_exit_preserves_atomic_old_or_new_record",
     "windows::record::record_fault_tests::native_publication_fault_matrix_preserves_original_and_honest_commit_boundary",
     "windows::record::record_fault_tests::stale_revision_original_replacement_and_staging_collision_never_publish",

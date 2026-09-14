@@ -1571,15 +1571,15 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
     }
     execution_sources.layout().write_cargo_configuration()?;
     let target_root = channel.join("build");
-    rustup_cargo(
+    memcordon_ci::build_context::run_isolated_cargo(
         execution_sources.layout().root(),
         stable,
         execution_sources
             .layout()
             .cargo_install_arguments(&install_root, &target_root),
         DEADLINE,
-    )
-    .run()?;
+        Some(&install_root),
+    )?;
     let agent = install_root.join("bin").join("memcordon-sealed-agent.exe");
     let cli = install_root.join("bin").join("memcordon.exe");
     verify_target_desktop_bootstrap(

@@ -246,11 +246,8 @@ fn fuzz(
         .join("bin")
         .join("cargo-fuzz");
     for target in &targets {
-        CommandSpec::new("rustup", root, CARGO_DEADLINE)
+        CommandSpec::toolchain_program("rustup", root, nightly, &cargo_fuzz, CARGO_DEADLINE)
             .args([
-                OsString::from("run"),
-                OsString::from(nightly),
-                cargo_fuzz.clone().into_os_string(),
                 OsString::from("fuzz"),
                 OsString::from("build"),
                 OsString::from(target),
@@ -258,23 +255,26 @@ fn fuzz(
             .run()?;
     }
     for target in &targets {
-        CommandSpec::new("rustup", root, Duration::from_secs(5 * 60))
-            .args([
-                OsString::from("run"),
-                OsString::from(nightly),
-                cargo_fuzz.clone().into_os_string(),
-                OsString::from("fuzz"),
-                OsString::from("run"),
-                OsString::from(target),
-                OsString::from("--"),
-                OsString::from("-max_total_time=30"),
-                OsString::from(if target.starts_with("workload-") {
-                    "-max_len=1048576"
-                } else {
-                    "-max_len=4096"
-                }),
-            ])
-            .run()?;
+        CommandSpec::toolchain_program(
+            "rustup",
+            root,
+            nightly,
+            &cargo_fuzz,
+            Duration::from_secs(5 * 60),
+        )
+        .args([
+            OsString::from("fuzz"),
+            OsString::from("run"),
+            OsString::from(target),
+            OsString::from("--"),
+            OsString::from("-max_total_time=30"),
+            OsString::from(if target.starts_with("workload-") {
+                "-max_len=1048576"
+            } else {
+                "-max_len=4096"
+            }),
+        ])
+        .run()?;
     }
     Ok(())
 }
@@ -388,18 +388,13 @@ fn certification_cargo(
     arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
     deadline: Duration,
 ) -> Result<Vec<u8>> {
-    let mut command_arguments = vec![
-        OsString::from("run"),
-        OsString::from(toolchain),
-        OsString::from("cargo"),
-        OsString::from(subcommand),
-    ];
+    let mut command_arguments = vec![OsString::from(subcommand)];
     command_arguments.extend(
         arguments
             .into_iter()
             .map(|argument| argument.as_ref().to_os_string()),
     );
-    CommandSpec::new(rustup, root, deadline)
+    CommandSpec::cargo(rustup, root, toolchain, deadline)
         .args(command_arguments)
         .run()
 }
@@ -873,6 +868,37 @@ fn macos_deadline(root: &Path, stable: &str) -> Result<()> {
         capability::require_exact_standard_test_success(
             &output,
             "result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped",
+        )?;
+        let mut admission = Vec::new();
+        for (package, feature, scenario) in
+            memcordon_ci::release_evidence::MACOS_ADMISSION_SCENARIOS
+        {
+            let output = cargo(
+                root,
+                stable,
+                "test",
+                [
+                    "--locked",
+                    "--target-dir",
+                    "target/ci/deadline-build",
+                    "--package",
+                    package,
+                    "--features",
+                    feature,
+                    "--test",
+                    "macos_admission",
+                    scenario,
+                    "--",
+                    "--exact",
+                    "--test-threads=1",
+                ],
+            )?;
+            capability::require_exact_standard_test_success(&output, scenario)?;
+            admission.push(serde_json::json!({"package": package, "target": "macos_admission", "scenario": scenario, "executed": 1, "passed": 1}));
+        }
+        fs::write(
+            evidence.join("admission-inventory.json"),
+            serde_json::to_vec_pretty(&admission)?,
         )?;
         let mut mutations = Vec::new();
         for (package, target, scenario) in memcordon_ci::release_evidence::MACOS_MUTATION_SCENARIOS

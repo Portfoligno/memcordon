@@ -836,17 +836,7 @@ fn rustup_cargo(
     stable: &str,
     arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
 ) -> Result<Vec<u8>> {
-    let mut args = vec![
-        OsString::from("run"),
-        OsString::from(stable),
-        OsString::from("cargo"),
-    ];
-    args.extend(
-        arguments
-            .into_iter()
-            .map(|argument| argument.as_ref().to_os_string()),
-    );
-    CommandSpec::new("rustup", root, DEADLINE).args(args).run()
+    memcordon_ci::command::rustup_cargo(root, stable, arguments, DEADLINE).run()
 }
 
 fn agent(root: &Path, arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Result<Vec<u8>> {

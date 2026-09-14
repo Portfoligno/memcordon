@@ -80,10 +80,12 @@ pub use backend::{
     BackendCleanupFacts, BackendInfo, BoundaryQualification, BoundarySupport, Execution,
     ProbeReport, SealedAvailability, cleanup_stale, probe, run,
 };
+#[cfg(target_os = "macos")]
+pub use signal::{CallerSignalSnapshot, CancellationHandle};
 #[cfg(target_os = "windows")]
 pub use supervisor::certify_windows_platform_mutant;
-#[cfg(target_os = "macos")]
-pub use supervisor::macos_supervise_from;
 pub use supervisor::{
     AttemptContext, AttemptExecution, SupervisorRequest, capabilities, capabilities_for, supervise,
 };
+#[cfg(target_os = "macos")]
+pub use supervisor::{MacosExecutionContext, macos_supervise_from};

@@ -17,6 +17,9 @@ use memcordon_ci::{CiError, Result, command, config, policy};
     about = "Typed MemCordon CI and release orchestrator"
 )]
 struct Cli {
+    /// Previously measured immutable compilation context; never supplied by env.
+    #[arg(long)]
+    build_context: Option<PathBuf>,
     /// Cargo's credential-provider protocol mode marker.
     #[arg(long, hide = true)]
     cargo_plugin: bool,
@@ -26,6 +29,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopLevel {
+    BuildContext {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    AuditBuildContext {
+        #[arg(long)]
+        input: PathBuf,
+    },
     Suite {
         #[arg(value_enum)]
         suite: Suite,
@@ -111,7 +122,18 @@ fn workspace_root(start: &Path) -> Result<PathBuf> {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let root = workspace_root(&std::env::current_dir()?)?;
-    match (cli.cargo_plugin, cli.command) {
+    if let Some(path) = cli.build_context {
+        memcordon_ci::build_context::activate(
+            memcordon_ci::build_context::ValidatedBuildContext::read(&path)?,
+        )?;
+    }
+    let result = match (cli.cargo_plugin, cli.command) {
+        (false, Some(TopLevel::BuildContext { output })) => {
+            memcordon_ci::build_context::ValidatedBuildContext::prepare(&root)?.write(&output)
+        }
+        (false, Some(TopLevel::AuditBuildContext { input })) => {
+            memcordon_ci::build_context::ValidatedBuildContext::read(&input)?.audit()
+        }
         (true, None) => release::cargo_credential_provider(&root),
         (false, Some(TopLevel::Suite { suite })) => suites::run(&root, suite),
         (false, Some(TopLevel::Release { command })) => release::run(&root, command),
@@ -126,7 +148,11 @@ fn run() -> Result<()> {
         _ => Err(CiError::Message(
             "exactly one CI command or --cargo-plugin is required".to_owned(),
         )),
+    };
+    if let Some(context) = memcordon_ci::build_context::active() {
+        context.audit()?;
     }
+    result
 }
 
 fn main() {

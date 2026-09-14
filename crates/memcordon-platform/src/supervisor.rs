@@ -263,20 +263,108 @@ pub fn macos_supervise_from(
     request: SupervisorRequest,
     origin: u64,
 ) -> Result<SupervisionExecution, Error> {
-    let now = crate::macos_continuous_nanos()
-        .map_err(|error| Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string()))?;
-    if origin > now {
-        return Err(Error::new(
-            ErrorCategory::Setup,
-            "MCSETUP-CLOCK",
-            "run origin is in the future",
-        ));
+    MacosExecutionContext::owned(origin)?.supervise(request)
+}
+
+/// A run-scoped signal snapshot and cancellation/admission owner.
+/// Owned mode requires exclusive management of intercepted dispositions and
+/// quiescent handler dispatch between sequential sessions. Multithreaded hosts
+/// that route their own signals should use `host_managed`.
+#[cfg(target_os = "macos")]
+pub struct MacosExecutionContext {
+    origin: u64,
+    signal: SignalSource,
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::result_large_err)]
+impl MacosExecutionContext {
+    pub fn owned(origin: u64) -> Result<Self, Error> {
+        Self::validate_origin(origin)?;
+        let signal = SignalSource::install().map_err(Self::signal_error)?;
+        Ok(Self { origin, signal })
     }
-    let resolved_backend = validate_resolved_backend(&request)?;
-    let signal = SignalSource::install().map_err(|error| {
+
+    pub fn host_managed(
+        origin: u64,
+        snapshot: crate::CallerSignalSnapshot,
+        cancellation: crate::CancellationHandle,
+    ) -> Result<Self, Error> {
+        Self::validate_origin(origin)?;
+        Ok(Self {
+            origin,
+            signal: SignalSource::host(snapshot, cancellation).map_err(Self::signal_error)?,
+        })
+    }
+
+    fn signal_error(error: std::io::Error) -> Error {
         Error::new(ErrorCategory::Setup, "MCSETUP-SIGNAL", error.to_string()).with_os_error(&error)
-    })?;
-    supervise_with_origin(request, &signal, resolved_backend, Some(origin))
+    }
+
+    fn validate_origin(origin: u64) -> Result<(), Error> {
+        let now = crate::macos_continuous_nanos().map_err(|error| {
+            Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string())
+        })?;
+        if origin > now {
+            return Err(Error::new(
+                ErrorCategory::Setup,
+                "MCSETUP-CLOCK",
+                "run origin is in the future",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn interruption(&self) -> Option<i32> {
+        self.signal.take()
+    }
+
+    pub fn finish(self) -> Result<(), Error> {
+        self.signal.finish().map_err(Self::signal_error)
+    }
+
+    pub fn supervise(self, request: SupervisorRequest) -> Result<SupervisionExecution, Error> {
+        let result = validate_resolved_backend(&request).and_then(|backend| {
+            supervise_with_origin(request, &self.signal, backend, Some(self.origin))
+        });
+        Self::finish_result(result, self.finish())
+    }
+
+    pub fn run(
+        self,
+        policy: Policy,
+        command: &CommandSpec,
+        helper: &std::path::Path,
+    ) -> Result<Execution, Error> {
+        let result = crate::macos_watchdog::run_attempt(
+            policy,
+            command,
+            helper,
+            &self.signal,
+            AttemptContext {
+                macos_run_origin_ns: Some(self.origin),
+                macos_work_expires_ns: None,
+                restart_attempt: 0,
+                supervision_offset: Duration::ZERO,
+                supervision_deadline_remaining: None,
+            },
+        );
+        Self::finish_result(result, self.finish())
+    }
+
+    fn finish_result<T>(result: Result<T, Error>, finish: Result<(), Error>) -> Result<T, Error> {
+        match (result, finish) {
+            (Err(mut primary), Err(restoration)) => {
+                primary.message = format!(
+                    "{}; signal restoration: {}",
+                    primary.message, restoration.message
+                );
+                Err(primary)
+            }
+            (_, Err(restoration)) => Err(restoration),
+            (result, Ok(())) => result,
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -838,13 +926,23 @@ fn run_unix_attempt(
         )?);
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let helper = request.memcordon_executable.as_deref().ok_or_else(|| {
-        Error::new(
-            ErrorCategory::Usage,
-            "MCUSAGE-MEMCORDON-EXECUTABLE",
-            "Unix execution requires an explicit MemCordon helper path",
-        )
-    })?;
+    let helper = request
+        .memcordon_executable
+        .as_deref()
+        .or_else(|| {
+            #[cfg(target_os = "macos")]
+            if signal.take().is_some() {
+                return Some(std::path::Path::new(""));
+            }
+            None
+        })
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCategory::Usage,
+                "MCUSAGE-MEMCORDON-EXECUTABLE",
+                "Unix execution requires an explicit MemCordon helper path",
+            )
+        })?;
     #[cfg(target_os = "linux")]
     let execution = crate::linux_cgroup::run_attempt(
         request.policy.clone(),

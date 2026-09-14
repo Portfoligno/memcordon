@@ -28,6 +28,29 @@ fn deadline_helpers_preserve_typed_spawning_and_environment_boundaries() {
 }
 
 #[test]
+fn closed_compilation_environment_is_confined_to_reviewed_context_builders() {
+    let source = b"fn run(command: &mut std::process::Command) { command.env_clear().env(\"RUSTC\", \"/pinned/rustc\"); }";
+    for path in [
+        "tools/ci-native-fingerprint.rs",
+        "tools/memcordon-ci/src/build_context.rs",
+    ] {
+        validate_rust_policy_bytes(Path::new(path), source).unwrap();
+    }
+    for path in [
+        "tools/memcordon-ci/src/suites.rs",
+        "crates/example/src/lib.rs",
+        "tools/other.rs",
+    ] {
+        assert!(validate_rust_policy_bytes(Path::new(path), source).is_err());
+    }
+    validate_rust_policy_bytes(
+        Path::new("tools/memcordon-ci/src/build_context.rs"),
+        include_bytes!("../src/build_context.rs"),
+    )
+    .unwrap();
+}
+
+#[test]
 fn native_install_fixture_only_may_override_standard_path() {
     let fixture = Path::new("crates/memcordon-cli/tests/macos_remediation.rs");
     let path = b"fn run(command: &mut std::process::Command) { command.env(\"PATH\", \"/usr/bin:/bin\"); }";

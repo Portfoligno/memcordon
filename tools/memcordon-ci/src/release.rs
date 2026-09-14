@@ -1453,7 +1453,7 @@ fn smoke_packaged_memcordon_install(
         })?,
     )?;
     let install_root = temporary.path().join("install");
-    rustup_cargo(
+    memcordon_ci::build_context::run_isolated_cargo(
         temporary.path(),
         stable,
         [
@@ -1465,8 +1465,8 @@ fn smoke_packaged_memcordon_install(
             cli.into_os_string(),
         ],
         RELEASE_DEADLINE,
-    )
-    .run()?;
+        Some(&install_root),
+    )?;
     let binaries = install_root.join("bin");
     let cli_name = installed_binary_name("memcordon");
     let agent_name = installed_binary_name("memcordon-sealed-agent");
@@ -4175,8 +4175,8 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
     let default_cargo_binaries = configured_default_cargo_binaries(&release)?;
     let toolchains = config::toolchains(root)?;
     let manifest_argument = manifest_path.into_os_string();
-    rustup_cargo(
-        root,
+    memcordon_ci::build_context::run_isolated_cargo(
+        temporary.path(),
         &toolchains.stable,
         [
             OsString::from("generate-lockfile"),
@@ -4184,10 +4184,10 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
             manifest_argument.clone(),
         ],
         RELEASE_DEADLINE,
-    )
-    .run()?;
-    rustup_cargo(
-        root,
+        None,
+    )?;
+    memcordon_ci::build_context::run_isolated_cargo(
+        temporary.path(),
         &toolchains.stable,
         [
             OsString::from("check"),
@@ -4196,12 +4196,12 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
             manifest_argument,
         ],
         RELEASE_DEADLINE,
-    )
-    .run()?;
+        None,
+    )?;
     if record.name == "memcordon" {
         let install_root = temporary.path().join("install");
-        rustup_cargo(
-            root,
+        memcordon_ci::build_context::run_isolated_cargo(
+            temporary.path(),
             &toolchains.stable,
             [
                 OsString::from("install"),
@@ -4213,8 +4213,8 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
                 install_root.clone().into_os_string(),
             ],
             RELEASE_DEADLINE,
-        )
-        .run()?;
+            Some(&install_root),
+        )?;
         let binary_directory = install_root.join("bin");
         let cli_name = installed_binary_name("memcordon");
         let agent_name = installed_binary_name("memcordon-sealed-agent");

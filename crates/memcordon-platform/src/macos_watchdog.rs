@@ -339,6 +339,7 @@ pub fn run_attempt(
             crate::macos_deadline::add(retire, Duration::from_secs(1)).map_err(|error| {
                 Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
             })?;
+        let complete = complete && !matches!(release, memcordon_core::ReleaseEvidence::Unknown);
         Ok(memcordon_core::RuntimeEvidenceV1 {
             schema_version: 1,
             clock: memcordon_core::ClockDomain::DarwinContinuousTicksV1 {
@@ -373,25 +374,33 @@ pub fn run_attempt(
             delivery: memcordon_core::DeliveryEvidence::NotSubmitted,
         })
     };
-    let launch_result = crate::macos_launch::launch_with_deadline(
+    let launch_result = crate::macos_launch::launch_controlled(
         command,
         memcordon_executable,
         startup_deadline,
         startup_cleanup_deadline,
         work_expiry,
         policy.limit_grace,
+        policy.signal_grace,
+        signal_source,
     );
-    if let (Some(deadline), Err(startup)) = (policy.deadline, &launch_result) {
-        let active = work_expiry.map_or(deadline.duration(), |expiry| {
-            Duration::from_nanos(expiry.saturating_sub(attempt_origin))
-        });
-        if startup.error.kind() == io::ErrorKind::TimedOut
+    if let Err(startup) = &launch_result {
+        let interruption = signal_source.take();
+        let expired = policy.deadline.is_some()
+            && (startup.error.kind() == io::ErrorKind::TimedOut || interruption.is_some())
             && work_expiry.is_some_and(|expiry| {
-                crate::macos_deadline::continuous_nanos().is_ok_and(|now| now >= expiry)
-            })
-        {
+                startup.cancellation_observed.map_or_else(
+                    || crate::macos_deadline::continuous_nanos().is_ok_and(|now| now >= expiry),
+                    |observed| observed >= expiry,
+                )
+            });
+        if interruption.is_some() || expired {
+            let active = work_expiry.map_or(Duration::ZERO, |expiry| {
+                Duration::from_nanos(expiry.saturating_sub(attempt_origin))
+            });
             let complete = startup.diagnostic.cleanup.state
-                == memcordon_core::NativeStartupCleanupStateV1::Complete;
+                == memcordon_core::NativeStartupCleanupStateV1::Complete
+                && !matches!(startup.release, memcordon_core::ReleaseEvidence::Unknown);
             let mut errors: Vec<CleanupErrorRecord> = startup
                 .diagnostic
                 .cleanup
@@ -444,41 +453,52 @@ pub fn run_attempt(
                 );
             return Ok(Execution {
                 policy_enforcement: Default::default(),
-                outcome: RunOutcome::DeadlineExceeded {
-                    deadline: DeadlineEvidence::new(
-                        millis(deadline.duration()),
-                        deadline.scope(),
-                        "pre-spawn".into(),
-                        millis(context.supervision_offset + active),
-                        millis(
-                            context.supervision_offset
-                                + Duration::from_nanos(
-                                    crate::macos_deadline::continuous_nanos()
-                                        .map_err(|error| {
-                                            Error::new(
-                                                ErrorCategory::Monitor,
-                                                "MCMONITOR-CLOCK",
-                                                error.to_string(),
-                                            )
-                                        })?
-                                        .saturating_sub(attempt_origin),
-                                ),
-                        ),
-                        millis(policy.limit_grace),
-                        0,
-                        None,
-                        None,
-                    )
-                    .map_err(|error| {
-                        Error::new(
-                            ErrorCategory::Monitor,
-                            "MCLIMIT-DEADLINE-EVIDENCE",
-                            error.to_string(),
+                outcome: if !expired {
+                    RunOutcome::Interrupted {
+                        signal: Interruption {
+                            signal: interruption.expect("observed interruption"),
+                        },
+                        child_after_termination: None,
+                        cleanup,
+                    }
+                } else {
+                    let deadline = policy.deadline.expect("expired policy deadline");
+                    RunOutcome::DeadlineExceeded {
+                        deadline: DeadlineEvidence::new(
+                            millis(deadline.duration()),
+                            deadline.scope(),
+                            "pre-spawn".into(),
+                            millis(context.supervision_offset + active),
+                            millis(
+                                context.supervision_offset
+                                    + Duration::from_nanos(
+                                        crate::macos_deadline::continuous_nanos()
+                                            .map_err(|error| {
+                                                Error::new(
+                                                    ErrorCategory::Monitor,
+                                                    "MCMONITOR-CLOCK",
+                                                    error.to_string(),
+                                                )
+                                            })?
+                                            .saturating_sub(attempt_origin),
+                                    ),
+                            ),
+                            millis(policy.limit_grace),
+                            0,
+                            None,
+                            None,
                         )
-                    })?,
-                    child_after_termination: None,
-                    peak: None,
-                    cleanup,
+                        .map_err(|error| {
+                            Error::new(
+                                ErrorCategory::Monitor,
+                                "MCLIMIT-DEADLINE-EVIDENCE",
+                                error.to_string(),
+                            )
+                        })?,
+                        child_after_termination: None,
+                        peak: None,
+                        cleanup,
+                    }
                 },
                 backend,
                 child_pid: startup
@@ -491,10 +511,26 @@ pub fn run_attempt(
                         .diagnostic
                         .launcher_pid
                         .and_then(std::num::NonZeroU32::new),
-                    crate::macos_deadline::continuous_nanos().map_err(|error| {
-                        Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
-                    })?,
-                    work_expiry.unwrap_or(startup_expiry),
+                    startup
+                        .cancellation_observed
+                        .map_or_else(|| crate::macos_deadline::continuous_nanos(), Ok)
+                        .map_err(|error| {
+                            Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+                        })?,
+                    if expired {
+                        work_expiry.unwrap_or(startup_expiry)
+                    } else {
+                        startup
+                            .cancellation_force
+                            .map_or_else(|| crate::macos_deadline::continuous_nanos(), Ok)
+                            .map_err(|error| {
+                                Error::new(
+                                    ErrorCategory::Monitor,
+                                    "MCMONITOR-CLOCK",
+                                    error.to_string(),
+                                )
+                            })?
+                    },
                     complete,
                 )?),
                 duration: started.elapsed(),

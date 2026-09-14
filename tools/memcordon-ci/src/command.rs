@@ -11,9 +11,21 @@ use crate::{CiError, Result};
 pub struct CommandSpec {
     program: PathBuf,
     arguments: Vec<OsString>,
+    toolchain: Option<ToolchainInvocation>,
     credential_policy: CredentialPolicy,
     current_dir: PathBuf,
     deadline: Duration,
+}
+
+#[derive(Clone, Debug)]
+enum ToolchainInvocation {
+    Cargo {
+        toolchain: String,
+    },
+    Program {
+        toolchain: String,
+        executable: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,10 +39,42 @@ impl CommandSpec {
         Self {
             program: program.into(),
             arguments: Vec::new(),
+            toolchain: None,
             credential_policy: CredentialPolicy::RemoveInherited,
             current_dir: current_dir.to_path_buf(),
             deadline,
         }
+    }
+
+    /// Cargo compilation with explicit toolchain ownership. `rustup` is used
+    /// only outside a managed build; managed builds select measured executables.
+    pub fn cargo(
+        rustup: impl Into<PathBuf>,
+        current_dir: &Path,
+        toolchain: &str,
+        deadline: Duration,
+    ) -> Self {
+        let mut command = Self::new(rustup, current_dir, deadline);
+        command.toolchain = Some(ToolchainInvocation::Cargo {
+            toolchain: toolchain.into(),
+        });
+        command
+    }
+
+    /// A tool that compiles through the selected toolchain, such as cargo-fuzz.
+    pub fn toolchain_program(
+        rustup: impl Into<PathBuf>,
+        current_dir: &Path,
+        toolchain: &str,
+        executable: impl Into<PathBuf>,
+        deadline: Duration,
+    ) -> Self {
+        let mut command = Self::new(rustup, current_dir, deadline);
+        command.toolchain = Some(ToolchainInvocation::Program {
+            toolchain: toolchain.into(),
+            executable: executable.into(),
+        });
+        command
     }
 
     pub fn arg(mut self, argument: impl Into<OsString>) -> Self {
@@ -79,15 +123,55 @@ impl CommandSpec {
         }
     }
 
+    pub fn materialize(
+        &self,
+        context: Option<&crate::build_context::ValidatedBuildContext>,
+    ) -> Result<Command> {
+        let mut command = match (&self.toolchain, context) {
+            (Some(ToolchainInvocation::Cargo { toolchain }), Some(context)) => {
+                context.cargo_command(toolchain, &self.arguments, &self.current_dir)?
+            }
+            (
+                Some(ToolchainInvocation::Program {
+                    toolchain,
+                    executable,
+                }),
+                Some(context),
+            ) => context.toolchain_command(
+                toolchain,
+                executable,
+                &self.arguments,
+                &self.current_dir,
+            )?,
+            (invocation, _) => {
+                let mut command = Command::new(&self.program);
+                match invocation {
+                    Some(ToolchainInvocation::Cargo { toolchain }) => {
+                        command.args(["run", toolchain, "cargo"]);
+                    }
+                    Some(ToolchainInvocation::Program {
+                        toolchain,
+                        executable,
+                    }) => {
+                        command.args(["run", toolchain]).arg(executable);
+                    }
+                    None => {}
+                }
+                command.args(&self.arguments).current_dir(&self.current_dir);
+                command
+            }
+        };
+        self.apply_environment(&mut command);
+        Ok(command)
+    }
+
     pub fn output(&self) -> Result<ObservedOutput> {
-        eprintln!("ci subprocess program: {:?}", self.program);
-        for argument in &self.arguments {
+        let mut command = self.materialize(crate::build_context::active())?;
+        eprintln!("ci subprocess program: {:?}", command.get_program());
+        for argument in command.get_args() {
             eprintln!("ci subprocess argument: {argument:?}");
         }
         eprintln!("ci subprocess deadline: {:?}", self.deadline);
-        let mut command = Command::new(&self.program);
-        command.args(&self.arguments).current_dir(&self.current_dir);
-        self.apply_environment(&mut command);
         run_with_deadline(&mut command, self.deadline).map_err(Into::into)
     }
 }
@@ -98,7 +182,7 @@ pub fn rustup_cargo(
     arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
     deadline: Duration,
 ) -> CommandSpec {
-    let mut spec = CommandSpec::new("rustup", root, deadline).args(["run", toolchain, "cargo"]);
+    let mut spec = CommandSpec::cargo("rustup", root, toolchain, deadline);
     for argument in arguments {
         spec = spec.arg(argument.as_ref().to_os_string());
     }
