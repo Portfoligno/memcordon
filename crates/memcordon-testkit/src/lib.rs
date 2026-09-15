@@ -1,11 +1,5 @@
 #![forbid(unsafe_code)]
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use memcordon_platform::test_support::unsearchable_directory;
-
-#[cfg(target_os = "macos")]
-pub use memcordon_platform::test_support::macos_read_only_descriptor_path;
-
 use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
@@ -273,5 +267,3 @@ pub fn assert_stdout_empty(output: &ObservedOutput) {
         String::from_utf8_lossy(&output.stdout)
     );
 }
-#[cfg(windows)]
-pub use memcordon_platform::test_support::{windows_file_identity, windows_reparse_data};

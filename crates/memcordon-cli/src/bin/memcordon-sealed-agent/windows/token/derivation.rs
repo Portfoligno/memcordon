@@ -1,6 +1,6 @@
 use super::attestation::open_thread_token;
 #[cfg(test)]
-use super::fixture_derivation::nested_initial_thread_token_from_source;
+use super::certification_derivation::nested_initial_thread_token_from_source;
 use super::query::*;
 use super::*;
 use windows_sys::Win32::Security::CreateRestrictedToken;

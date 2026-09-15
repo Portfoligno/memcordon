@@ -292,6 +292,7 @@ fn stress(root: &Path, stable: &str) -> Result<()> {
         "memcordon",
         "memcordon-testkit",
         "memcordon-ci",
+        "memcordon-native-inspect",
         "memcordon-windows-loader-lab",
     ] {
         fs::write(

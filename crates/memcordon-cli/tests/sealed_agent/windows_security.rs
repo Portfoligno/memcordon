@@ -4379,7 +4379,7 @@ fn assert_cleanup_create_once_for_current_token(
                     .unwrap_or_else(|error| {
                         panic!("{scenario} cannot read unexpected directory grant: {error}")
                     });
-                let cached_fixture = fixture.map(|fixture| fixture.fixture_snapshot());
+                let cached_fixture = fixture.map(|fixture| fixture.certification_snapshot());
                 panic!(
                     "{scenario} unexpectedly acquired shared-root delete-child authority: requested=0x{FILE_DELETE_CHILD:08x} granted=0x{granted:08x} access_check_allowed={access_check_allowed} access_check_granted=0x{access_check_granted:08x} cached_fixture={cached_fixture:?}"
                 );
@@ -4596,7 +4596,7 @@ fn assert_qualification_create_once_for_write_restricted_token(
 #[test]
 fn restricted_impersonation_guard_scopes_the_same_attested_token_handle() {
     let guard = crate::windows::token::impersonate_restricted_current_thread().unwrap();
-    let expected_fixture = guard.fixture_snapshot();
+    let expected_fixture = guard.certification_snapshot();
     let mut observations = 0;
     guard
         .with_effective_token_for_test(|token| {
@@ -4614,7 +4614,7 @@ fn restricted_impersonation_guard_scopes_the_same_attested_token_handle() {
         .unwrap();
 
     assert_eq!(observations, 2);
-    assert_eq!(guard.fixture_snapshot(), expected_fixture);
+    assert_eq!(guard.certification_snapshot(), expected_fixture);
     guard.revert().unwrap();
 }
 

@@ -104,8 +104,8 @@ const SESSION_BROKER_NORMALIZED_SOURCE_PRIVILEGES: &[(&str, bool)] = &[
 use super::{pipe, process, record, security};
 
 mod attestation;
+mod certification_derivation;
 mod derivation;
-mod fixture_derivation;
 mod query;
 mod service_attestation;
 
@@ -119,6 +119,22 @@ pub(crate) use attestation::{
     require_same_process_token_query, require_same_token_instance, revert_entry_thread_token,
     token_attestation_snapshot, token_query_attestation_snapshot,
 };
+#[cfg(not(test))]
+pub(super) use certification_derivation::{
+    NestedTargetTokens, RestrictedImpersonationGuard, TokenCertificationSnapshot,
+    impersonate_deny_only_admin_current_thread, impersonate_low_integrity_current_thread,
+    impersonate_ordinary_current_thread, impersonate_restricted_current_thread,
+    impersonate_write_restricted_current_thread, nested_target_tokens, restricted_current_primary,
+    write_restricted_current_primary,
+};
+#[cfg(test)]
+pub(crate) use certification_derivation::{
+    NestedTargetTokens, RestrictedImpersonationGuard, TokenCertificationSnapshot,
+    impersonate_deny_only_admin_current_thread, impersonate_low_integrity_current_thread,
+    impersonate_ordinary_current_thread, impersonate_restricted_current_thread,
+    impersonate_write_restricted_current_thread, nested_target_tokens, restricted_current_primary,
+    write_restricted_current_primary,
+};
 pub(crate) use derivation::{
     LauncherHolderTokenDerivation, LauncherHolderTokenDerivationError,
     LauncherHolderTokenDerivationStage, SessionBrokerHolderToken,
@@ -129,22 +145,15 @@ pub(crate) use derivation::{
     validate_normalized_session_broker_source_snapshot, with_scoped_loader_profile_privileges,
     with_scoped_service_owner_restore_privilege, with_session_broker_launch_privileges,
 };
-pub(crate) use fixture_derivation::{
-    NestedTargetTokens, RestrictedImpersonationGuard, TokenFixtureSnapshot,
-    impersonate_deny_only_admin_current_thread, impersonate_low_integrity_current_thread,
-    impersonate_ordinary_current_thread, impersonate_restricted_current_thread,
-    impersonate_write_restricted_current_thread, nested_target_tokens, restricted_current_primary,
-    write_restricted_current_primary,
-};
 pub(crate) use query::{
     AttachedCreationCarrierGuard, TokenOpenError, TokenRestrictingSidInventory,
     attach_creation_carrier_to_thread, authenticate_pipe_client,
-    current_creation_carrier_attestation, current_thread_envelope, current_thread_fixture_snapshot,
-    enabled_group_entry_matches, envelope, envelope_mismatch_fields, groups_digest,
-    privileges_digest, process_token, process_token_detailed, process_token_query_attestation,
-    process_user_sid, require_thread_token_absent, restricted_sid_count,
-    restricting_sid_entry_matches, revert_creation_carrier_and_attest_absent, sid_string,
-    thread_token_attestation, token_group_entries, token_has_enabled_group,
+    current_creation_carrier_attestation, current_thread_certification_snapshot,
+    current_thread_envelope, enabled_group_entry_matches, envelope, envelope_mismatch_fields,
+    groups_digest, privileges_digest, process_token, process_token_detailed,
+    process_token_query_attestation, process_user_sid, require_thread_token_absent,
+    restricted_sid_count, restricting_sid_entry_matches, revert_creation_carrier_and_attest_absent,
+    sid_string, thread_token_attestation, token_group_entries, token_has_enabled_group,
     token_has_restricting_sid, token_is_restricted, token_logon_sid, token_privilege_entries,
     token_restricting_sid_attributes, token_restricting_sid_inventory, token_restricting_sids,
     token_user_sid,
@@ -155,16 +164,16 @@ pub(crate) use service_attestation::{
 };
 
 #[cfg(test)]
+pub(crate) use certification_derivation::{
+    effective_thread_token_identity_validation_for_test, restricted_fixture_open_error_for_test,
+};
+#[cfg(test)]
 pub(crate) use derivation::{
     canonical_same_access_restricting_sids_for_test,
     exact_disabled_privilege_set_transition_for_test, holder_access_mask_readback_for_test,
     nested_initial_thread_token_for_test, normalized_session_broker_privilege_entries_for_test,
     validate_authenticated_users_matches_for_test, validate_logon_sid_group_inventory_for_test,
     validate_target_user_matches_for_test, validate_token_logon_sid_attributes_for_test,
-};
-#[cfg(test)]
-pub(crate) use fixture_derivation::{
-    effective_thread_token_identity_validation_for_test, restricted_fixture_open_error_for_test,
 };
 #[cfg(test)]
 pub(crate) use query::{privilege_is_enabled_sensitive_for_test, token_query_error_for_test};

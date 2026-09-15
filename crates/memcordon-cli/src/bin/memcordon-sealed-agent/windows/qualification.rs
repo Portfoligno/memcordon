@@ -746,7 +746,7 @@ struct TokenFixtureObservation {
 impl TokenFixtureObservation {
     fn current() -> Result<Self, String> {
         Ok(Self::from_snapshot(
-            super::token::current_thread_fixture_snapshot().map_err(|detail| {
+            super::token::current_thread_certification_snapshot().map_err(|detail| {
                 token_fixture_failure(
                     "elevated-admin",
                     "token-snapshot",
@@ -758,10 +758,10 @@ impl TokenFixtureObservation {
     }
 
     fn retained(guard: &super::token::RestrictedImpersonationGuard) -> Self {
-        Self::from_snapshot(guard.fixture_snapshot())
+        Self::from_snapshot(guard.certification_snapshot())
     }
 
-    fn from_snapshot(snapshot: super::token::TokenFixtureSnapshot) -> Self {
+    fn from_snapshot(snapshot: super::token::TokenCertificationSnapshot) -> Self {
         Self {
             envelope: snapshot.envelope,
             restricted_sid_count: snapshot.restricted_sid_count,

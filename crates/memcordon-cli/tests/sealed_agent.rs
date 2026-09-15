@@ -19,8 +19,6 @@ mod protocol;
 mod rejection;
 #[path = "../src/bin/memcordon-sealed-agent/request.rs"]
 mod request;
-#[path = "../src/bin/memcordon-sealed-agent/state.rs"]
-mod state;
 
 #[cfg(target_os = "linux")]
 #[path = "../src/bin/memcordon-sealed-agent/linux/mod.rs"]

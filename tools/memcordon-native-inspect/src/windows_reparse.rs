@@ -1,4 +1,4 @@
-//! Read native reparse evidence without resolving or launching its target.
+//! Native inventory evidence only: read reparse bytes without target activation.
 use std::fs::OpenOptions;
 use std::io;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -41,12 +41,7 @@ pub fn windows_reparse_data(path: &std::path::Path) -> io::Result<Vec<u8>> {
     if success == 0 {
         return Err(io::Error::last_os_error());
     }
-    if returned as usize > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "native reparse data exceeds buffer",
-        ));
-    }
+    crate::initialized_reparse_bytes(&data, returned as usize)?;
     data.truncate(returned as usize);
     Ok(data)
 }

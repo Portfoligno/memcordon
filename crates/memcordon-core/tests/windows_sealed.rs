@@ -670,6 +670,31 @@ fn windows_attempt_state_machine_rejects_authorization_shortcuts() {
 }
 
 #[test]
+fn windows_resource_owning_states_require_termination_before_empty() {
+    use WindowsAttemptStateV1::*;
+    for state in [
+        BoundaryCreated,
+        GuardianReady,
+        TargetCreatedSuspended,
+        Authorized,
+    ] {
+        assert!(windows_attempt_transition_allowed(state, Terminating));
+        assert!(!windows_attempt_transition_allowed(state, Empty));
+    }
+    assert!(windows_attempt_transition_allowed(Terminating, Empty));
+    for state in [
+        BoundaryCreated,
+        GuardianReady,
+        TargetCreatedSuspended,
+        Authorized,
+        Terminating,
+        Empty,
+    ] {
+        assert!(!windows_attempt_transition_allowed(Empty, state));
+    }
+}
+
+#[test]
 fn windows_durable_attempt_parser_authenticates_and_bounds_real_records() {
     let digest = sha256(&[]);
     let mut record = WindowsDurableAttemptRecordV1 {

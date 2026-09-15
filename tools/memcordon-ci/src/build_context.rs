@@ -287,7 +287,7 @@ impl<'a> MeasurementScope<'a> {
 // including ACLs, rather than access(2) or a mode-bit approximation.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn inaccessible_directory_identity(path: &Path, metadata: &fs::Metadata) -> Result<Option<String>> {
-    let Some(identity) = memcordon_testkit::unsearchable_directory(path, metadata)? else {
+    let Some(identity) = memcordon_native_inspect::unsearchable_directory(path, metadata)? else {
         return Ok(None);
     };
     Ok(Some(serde_json::to_string(&(
@@ -476,7 +476,7 @@ impl ContentReader {
             let progress = progress.worker();
             Some(crate::inventory_workers::InventoryWorkers::new(
                 move |(path, mut file, expected): (PathBuf, fs::File, fs::Metadata), buffer| {
-                    let identity = memcordon_testkit::windows_file_identity(&file)?;
+                    let identity = memcordon_native_inspect::windows_file_identity(&file)?;
                     let digest = progress.run(Operation::ReadHash, &path, || {
                         digest_reader(&mut file, buffer, &progress)
                     })?;
@@ -485,7 +485,7 @@ impl ContentReader {
                     if windows_file_stamp(&expected) != windows_file_stamp(&after)
                         || windows_file_stamp(&expected)
                             != windows_file_stamp(&fs::symlink_metadata(&path)?)
-                        || identity != memcordon_testkit::windows_file_identity(&current)?
+                        || identity != memcordon_native_inspect::windows_file_identity(&current)?
                     {
                         return Err(CiError::Message(format!(
                             "native input changed during read: {path:?}"
@@ -553,7 +553,7 @@ fn resolution_error(
         use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             let evidence = progress.run(Operation::Access, path, || {
-                memcordon_testkit::windows_reparse_data(path)
+                memcordon_native_inspect::windows_reparse_data(path)
             });
             let diagnostic = match evidence {
                 Ok(data) => crate::reparse_diagnostic::describe(&data)

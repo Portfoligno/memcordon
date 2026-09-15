@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod diagnostics;
+pub mod linux_fault_contract;
 pub mod runtime_evidence;
 pub mod runtime_manifest;
 pub use runtime_evidence::*;

@@ -54,7 +54,7 @@ pub fn protected_digest(path: &Path) -> io::Result<String> {
             "system digest requires a root-owned non-writable regular file",
         ));
     }
-    let descriptor_path = memcordon_testkit::macos_read_only_descriptor_path(&file)?;
+    let descriptor_path = memcordon_native_inspect::macos_read_only_descriptor_path(&file)?;
     if validate_system_path(&descriptor_path)? != canonical {
         return Err(io::Error::other(
             "system digest descriptor escaped selected path",

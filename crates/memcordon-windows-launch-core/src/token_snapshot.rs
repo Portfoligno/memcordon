@@ -1,6 +1,9 @@
+//! Token audit identity and canonical envelope hashing; no token mutation authority.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// V1 token identity, pinned by launch DTO V1 vectors and shared plan admission.
+/// A decoded identity is an observation, not an owned token or authorization grant.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetTokenIdentityV1 {

@@ -381,19 +381,7 @@ impl Drop for AttemptCleanupGuard {
 }
 
 #[cfg(feature = "test-support")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FaultPoint {
-    FrontendLossBeforeAuthorization,
-    FrontendLossAfterAuthorization,
-    ProviderWorkerLossAfterGuardianCreation,
-    GuardianLossBeforeAuthorization,
-    GuardianLossAfterAuthorization,
-    NamespaceInitFailureBeforeTarget,
-    CgroupKillFailureAfterAuthorization,
-    PersistentPopulatedAfterAuthorization,
-    NamespaceInitReapDelayAfterAuthorization,
-    GuardianReapFailureAfterAuthorization,
-}
+pub use memcordon_core::linux_fault_contract::FaultPoint;
 
 fn encode_guardian_terminal(claim: GuardianTerminalClaim) -> [u8; GUARDIAN_TERMINAL_RECORD_LENGTH] {
     let mut encoded = [0_u8; GUARDIAN_TERMINAL_RECORD_LENGTH];

@@ -11,7 +11,7 @@ mod artifact;
 mod attributes;
 mod create;
 mod desktop;
-mod environment;
+mod environment_identity;
 mod evidence;
 mod handshake;
 #[cfg(windows)]
@@ -30,7 +30,7 @@ pub use create::{
     SuspendedProcessFactory, create_package_loader_probe,
 };
 pub use desktop::DesktopBindingV1;
-pub use environment::PreparedEnvironmentIdentityV1;
+pub use environment_identity::PreparedEnvironmentIdentityV1;
 pub use evidence::{
     CleanupOutcomeV1, CleanupStatusV1, LoaderReadyEvidenceV1, MAX_FAILURE_DETAIL_BYTES,
     NativeCallOutcomeV1, NativeStatusV1, WindowsLoaderQualificationFailureV2,

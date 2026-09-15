@@ -42,6 +42,14 @@ struct Scenario {
 }
 
 impl Scenario {
+    const fn fault(scenario: memcordon_core::linux_fault_contract::LinuxFaultScenario) -> Self {
+        Self {
+            test_module: "linux_sealed",
+            name: scenario.selector,
+            class: scenario.class,
+        }
+    }
+
     fn exact_name(self) -> String {
         memcordon_ci::sealed_selector::exact_test_name(self.test_module, self.name)
     }
@@ -186,31 +194,24 @@ const SCENARIOS: &[Scenario] = &[
         name: "sealed_target_cannot_disable_namespace_init",
         class: "escape",
     },
-    Scenario {
-        test_module: "linux_sealed",
-        name: "sealed_frontend_loss_before_authorization_never_runs_target",
-        class: "crash",
-    },
-    Scenario {
-        test_module: "linux_sealed",
-        name: "sealed_frontend_loss_after_authorization_triggers_guardian",
-        class: "crash",
-    },
-    Scenario {
-        test_module: "linux_sealed",
-        name: "sealed_provider_worker_loss_triggers_guardian",
-        class: "crash",
-    },
-    Scenario {
-        test_module: "linux_sealed",
-        name: "sealed_guardian_loss_before_authorization_fails_closed",
-        class: "crash",
-    },
-    Scenario {
-        test_module: "linux_sealed",
-        name: "sealed_guardian_loss_after_authorization_cannot_report_success",
-        class: "crash",
-    },
+    Scenario::fault(
+        memcordon_core::linux_fault_contract::FaultPoint::FrontendLossBeforeAuthorization
+            .scenario(),
+    ),
+    Scenario::fault(
+        memcordon_core::linux_fault_contract::FaultPoint::FrontendLossAfterAuthorization.scenario(),
+    ),
+    Scenario::fault(
+        memcordon_core::linux_fault_contract::FaultPoint::ProviderWorkerLossAfterGuardianCreation
+            .scenario(),
+    ),
+    Scenario::fault(
+        memcordon_core::linux_fault_contract::FaultPoint::GuardianLossBeforeAuthorization
+            .scenario(),
+    ),
+    Scenario::fault(
+        memcordon_core::linux_fault_contract::FaultPoint::GuardianLossAfterAuthorization.scenario(),
+    ),
     Scenario {
         test_module: "linux_sealed",
         name: "sealed_native_nonzero_exit_preserves_provenance",
@@ -256,36 +257,27 @@ const SCENARIOS: &[Scenario] = &[
         name: "sealed_recovery_blocks_capability_while_live_state_is_ambiguous",
         class: "recovery",
     },
-    Scenario {
-        test_module: "linux_sealed",
-        name: "sealed_faults_before_authorization_never_create_marker",
-        class: "fault",
-    },
-    Scenario {
-        test_module: "linux_sealed",
-        name: "sealed_namespace_init_failure_is_typed_prompt_and_retired",
-        class: "fault",
-    },
-    Scenario {
-        test_module: "linux_sealed",
-        name: "sealed_cgroup_kill_failure_never_reports_retirement",
-        class: "fault",
-    },
-    Scenario {
-        test_module: "linux_sealed",
-        name: "sealed_persistent_populated_state_blocks_restart",
-        class: "fault",
-    },
-    Scenario {
-        test_module: "linux_sealed",
-        name: "sealed_namespace_init_reap_delay_blocks_result",
-        class: "fault",
-    },
-    Scenario {
-        test_module: "linux_sealed",
-        name: "sealed_guardian_reap_failure_blocks_result",
-        class: "fault",
-    },
+    Scenario::fault(memcordon_core::linux_fault_contract::DESCRIPTOR_SET_SCENARIO),
+    Scenario::fault(
+        memcordon_core::linux_fault_contract::FaultPoint::NamespaceInitFailureBeforeTarget
+            .scenario(),
+    ),
+    Scenario::fault(
+        memcordon_core::linux_fault_contract::FaultPoint::CgroupKillFailureAfterAuthorization
+            .scenario(),
+    ),
+    Scenario::fault(
+        memcordon_core::linux_fault_contract::FaultPoint::PersistentPopulatedAfterAuthorization
+            .scenario(),
+    ),
+    Scenario::fault(
+        memcordon_core::linux_fault_contract::FaultPoint::NamespaceInitReapDelayAfterAuthorization
+            .scenario(),
+    ),
+    Scenario::fault(
+        memcordon_core::linux_fault_contract::FaultPoint::GuardianReapFailureAfterAuthorization
+            .scenario(),
+    ),
     Scenario {
         test_module: "linux_package",
         name: "sealed_package_identity_rejects_tampered_provider",
@@ -608,122 +600,7 @@ struct FaultScenarioEvidence {
     final_cgroup_absent: bool,
 }
 
-#[derive(Clone, Copy)]
-struct ExpectedFaultEvidence {
-    code: &'static str,
-    phase: &'static str,
-    target_created: bool,
-    target_released: bool,
-    cleanup_retired: bool,
-    retirement_owner: &'static str,
-    guardian_reaped: bool,
-}
-
-fn expected_fault_evidence(selector: &str) -> Option<ExpectedFaultEvidence> {
-    let expected = match selector {
-        "sealed_frontend_loss_before_authorization_never_runs_target" => ExpectedFaultEvidence {
-            code: "MCSEALED-FRONTEND-LOSS-BEFORE-AUTHORIZATION",
-            phase: "authorization",
-            target_created: true,
-            target_released: false,
-            cleanup_retired: true,
-            retirement_owner: "guardian",
-            guardian_reaped: true,
-        },
-        "sealed_frontend_loss_after_authorization_triggers_guardian" => ExpectedFaultEvidence {
-            code: "MCSEALED-FRONTEND-LOSS-AFTER-AUTHORIZATION",
-            phase: "monitoring",
-            target_created: true,
-            target_released: true,
-            cleanup_retired: true,
-            retirement_owner: "guardian",
-            guardian_reaped: true,
-        },
-        "sealed_provider_worker_loss_triggers_guardian" => ExpectedFaultEvidence {
-            code: "MCSEALED-PROVIDER-WORKER-LOSS",
-            phase: "guardian-startup",
-            target_created: false,
-            target_released: false,
-            cleanup_retired: true,
-            retirement_owner: "guardian",
-            guardian_reaped: true,
-        },
-        "sealed_guardian_loss_before_authorization_fails_closed" => ExpectedFaultEvidence {
-            code: "MCSEALED-GUARDIAN-LOSS-BEFORE-AUTHORIZATION",
-            phase: "authorization",
-            target_created: true,
-            target_released: false,
-            cleanup_retired: true,
-            retirement_owner: "provider",
-            guardian_reaped: true,
-        },
-        "sealed_guardian_loss_after_authorization_cannot_report_success" => ExpectedFaultEvidence {
-            code: "MCSEALED-GUARDIAN-LOSS-AFTER-AUTHORIZATION",
-            phase: "monitoring",
-            target_created: true,
-            target_released: true,
-            cleanup_retired: true,
-            retirement_owner: "provider",
-            guardian_reaped: true,
-        },
-        "sealed_faults_before_authorization_never_create_marker" => ExpectedFaultEvidence {
-            code: "MCSEALED-LAUNCH-DESCRIPTOR-SET",
-            phase: "request-validation",
-            target_created: false,
-            target_released: false,
-            cleanup_retired: false,
-            retirement_owner: "provider",
-            guardian_reaped: false,
-        },
-        "sealed_namespace_init_failure_is_typed_prompt_and_retired" => ExpectedFaultEvidence {
-            code: "MCSEALED-NAMESPACE-INIT-TARGET-FORK",
-            phase: "target-creation",
-            target_created: false,
-            target_released: false,
-            cleanup_retired: true,
-            retirement_owner: "provider",
-            guardian_reaped: true,
-        },
-        "sealed_cgroup_kill_failure_never_reports_retirement" => ExpectedFaultEvidence {
-            code: "MCSEALED-CGROUP-KILL-FAILURE",
-            phase: "retirement",
-            target_created: true,
-            target_released: true,
-            cleanup_retired: true,
-            retirement_owner: "provider",
-            guardian_reaped: true,
-        },
-        "sealed_persistent_populated_state_blocks_restart" => ExpectedFaultEvidence {
-            code: "MCSEALED-CGROUP-NOT-EMPTY",
-            phase: "retirement",
-            target_created: true,
-            target_released: true,
-            cleanup_retired: true,
-            retirement_owner: "provider",
-            guardian_reaped: true,
-        },
-        "sealed_namespace_init_reap_delay_blocks_result" => ExpectedFaultEvidence {
-            code: "MCSEALED-NAMESPACE-INIT-REAP-DELAY",
-            phase: "retirement",
-            target_created: true,
-            target_released: true,
-            cleanup_retired: true,
-            retirement_owner: "provider",
-            guardian_reaped: true,
-        },
-        "sealed_guardian_reap_failure_blocks_result" => ExpectedFaultEvidence {
-            code: "MCSEALED-GUARDIAN-REAP-FAILURE",
-            phase: "retirement",
-            target_created: true,
-            target_released: true,
-            cleanup_retired: true,
-            retirement_owner: "provider",
-            guardian_reaped: true,
-        },
-        _ => return None,
-    };
-    Some(expected)
-}
+use memcordon_core::linux_fault_contract::expected_fault_evidence;
 
 impl FaultScenarioEvidence {
     fn validate(&self, scenario: Scenario) -> Result<()> {

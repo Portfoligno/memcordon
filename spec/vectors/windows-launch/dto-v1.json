@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "environment": "{\"encoding\":\"utf-16le-double-nul\",\"byte_len\":4,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+  "desktop": "{\"exact_name\":\"MemCordon\\\\Qualification\",\"security_descriptor_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"window_station_security_descriptor_sddl\":\"D:P(A;;GA;;;SY)\",\"desktop_security_descriptor_sddl\":\"D:P(A;;GA;;;SY)\"}",
+  "token": "{\"envelope_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"authentication_id\":7,\"session_id\":0}",
+  "handles": "{\"roles\":[]}",
+  "roles": ["\"standard-input\"", "\"standard-output\"", "\"standard-error\"", "\"loader-ready\""]
+}

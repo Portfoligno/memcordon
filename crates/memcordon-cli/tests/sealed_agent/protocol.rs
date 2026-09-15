@@ -1,7 +1,6 @@
 use crate::protocol::{
     Frame, MessageKind, PROTOCOL_VERSION, ProtocolError, read_frame, write_frame,
 };
-use crate::state::{AttemptState, AttemptStateMachine};
 
 #[test]
 fn frame_round_trips_native_counted_payload() {
@@ -41,34 +40,4 @@ fn payload_corruption_is_rejected() {
         read_frame(&mut bytes.as_slice()),
         Err(ProtocolError::PayloadDigestMismatch)
     );
-}
-
-#[test]
-fn retirement_cannot_skip_empty_proof() {
-    let mut machine = AttemptStateMachine::default();
-    assert!(machine.transition(AttemptState::Retired).is_err());
-}
-
-#[test]
-fn every_resource_owning_preauthorization_state_can_enter_cleanup() {
-    let setup_path = [
-        AttemptState::BoundaryCreated,
-        AttemptState::GuardianReady,
-        AttemptState::TargetCreatedGated,
-        AttemptState::AssignmentVerified,
-        AttemptState::ResourceInheritanceVerified,
-        AttemptState::Authorized,
-    ];
-    for failure_state in setup_path {
-        let mut machine = AttemptStateMachine::default();
-        for state in setup_path {
-            machine.transition(state).unwrap();
-            if state == failure_state {
-                break;
-            }
-        }
-        machine.transition(AttemptState::Terminating).unwrap();
-        machine.transition(AttemptState::Empty).unwrap();
-        machine.transition(AttemptState::Retired).unwrap();
-    }
 }

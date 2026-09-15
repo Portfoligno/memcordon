@@ -1,4 +1,4 @@
-//! Descriptor-backed identity checks for native CI system inputs.
+//! Native inventory authority: read-only filesystem and descriptor path identity.
 use std::ffi::{CStr, OsStr};
 use std::fs::File;
 use std::io;

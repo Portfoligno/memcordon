@@ -6,10 +6,10 @@ production_packages = [
   "memcordon",
   "memcordon-testkit",
 ]
-ci_packages = ["memcordon-ci", "memcordon-windows-loader-lab", "memcordon-deadline-oracle"]
-ci_package_rust_versions = { memcordon-ci = "1.88.0", memcordon-windows-loader-lab = "1.85.0", memcordon-deadline-oracle = "1.85.0" }
+ci_packages = ["memcordon-ci", "memcordon-windows-loader-lab", "memcordon-deadline-oracle", "memcordon-native-inspect"]
+ci_package_rust_versions = { memcordon-ci = "1.88.0", memcordon-windows-loader-lab = "1.85.0", memcordon-deadline-oracle = "1.85.0", memcordon-native-inspect = "1.85.0" }
 publish_packages = ["memcordon-core", "memcordon-platform", "memcordon-windows-launch-core", "memcordon"]
-non_publish_packages = ["memcordon-testkit", "memcordon-ci", "memcordon-windows-loader-lab", "memcordon-deadline-oracle"]
+non_publish_packages = ["memcordon-testkit", "memcordon-ci", "memcordon-windows-loader-lab", "memcordon-deadline-oracle", "memcordon-native-inspect"]
 
 [workflow]
 required_public_matrix = [

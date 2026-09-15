@@ -1,4 +1,4 @@
-//! Stable volume and file identity from an already owned native descriptor.
+//! Native inventory authority: volume and file identity from an owned descriptor.
 use std::fs::File;
 use std::io;
 use std::os::windows::io::AsRawHandle;

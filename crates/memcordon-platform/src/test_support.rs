@@ -1,22 +1,6 @@
 //! Native containment used only by black-box process tests.
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::protocol_expectation_fixture as macos_protocol_expectation_fixture;
-#[cfg(windows)]
-mod windows_file_identity;
-#[cfg(windows)]
-pub use windows_file_identity::windows_file_identity;
-#[cfg(windows)]
-mod windows_reparse;
-#[cfg(windows)]
-pub use windows_reparse::windows_reparse_data;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-mod native_access;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use native_access::{UnsearchableDirectory, unsearchable_directory};
-#[cfg(target_os = "macos")]
-mod system_input;
-#[cfg(target_os = "macos")]
-pub use system_input::macos_read_only_descriptor_path;
 #[cfg(target_os = "macos")]
 pub fn macos_signal_installation(
     failure: Option<usize>,

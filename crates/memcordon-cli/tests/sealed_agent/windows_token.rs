@@ -14,9 +14,9 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::windows::qualification::prepare_frontend_canaries_for_test;
 use crate::windows::token::{
-    RestrictedImpersonationGuard, TokenFixtureSnapshot, canonical_same_access_restricting_sids,
-    current_process_token_for_access_check, current_process_token_for_attestation,
-    current_process_token_for_attestation_and_access_check,
+    RestrictedImpersonationGuard, TokenCertificationSnapshot,
+    canonical_same_access_restricting_sids, current_process_token_for_access_check,
+    current_process_token_for_attestation, current_process_token_for_attestation_and_access_check,
     effective_thread_token_identity_validation_for_test, enabled_group_entry_matches, envelope,
     exact_disabled_privilege_set_transition_for_test, granted_handle_access, groups_digest,
     impersonate_deny_only_admin_current_thread, impersonate_low_integrity_current_thread,
@@ -88,17 +88,17 @@ fn bytes(words: &[usize], byte_length: usize) -> &[u8] {
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), byte_length) }
 }
 
-fn assert_cached_fixture_snapshot(
+fn assert_cached_certification_snapshot(
     scenario: &str,
     constructor: fn() -> Result<RestrictedImpersonationGuard, String>,
-    validate: impl FnOnce(&TokenFixtureSnapshot),
+    validate: impl FnOnce(&TokenCertificationSnapshot),
 ) {
     let before = crate::windows::token::current_thread_envelope().unwrap();
     let installed_image = std::env::current_exe().unwrap();
     let frontend_canaries = prepare_frontend_canaries_for_test(&installed_image, scenario).unwrap();
     {
         let fixture = constructor().unwrap();
-        let snapshot = fixture.fixture_snapshot();
+        let snapshot = fixture.certification_snapshot();
         validate(&snapshot);
         frontend_canaries.validate_for_test().unwrap();
         let advertised = frontend_canaries.raw_values();
@@ -116,8 +116,8 @@ fn assert_cached_fixture_snapshot(
 }
 
 #[test]
-fn qualification_fixture_snapshots_and_canaries_are_prepared_before_impersonation() {
-    assert_cached_fixture_snapshot(
+fn qualification_certification_snapshots_and_canaries_are_prepared_before_impersonation() {
+    assert_cached_certification_snapshot(
         "restricted",
         impersonate_restricted_current_thread,
         |snapshot| {
@@ -126,14 +126,14 @@ fn qualification_fixture_snapshots_and_canaries_are_prepared_before_impersonatio
             assert!(!snapshot.restricting_sids.is_empty());
         },
     );
-    assert_cached_fixture_snapshot(
+    assert_cached_certification_snapshot(
         "ordinary-user",
         impersonate_ordinary_current_thread,
         |snapshot| {
             assert!(!snapshot.envelope.elevated);
         },
     );
-    assert_cached_fixture_snapshot(
+    assert_cached_certification_snapshot(
         "write-restricted",
         impersonate_write_restricted_current_thread,
         |snapshot| {
@@ -141,14 +141,14 @@ fn qualification_fixture_snapshots_and_canaries_are_prepared_before_impersonatio
             assert!(snapshot.write_restricted);
         },
     );
-    assert_cached_fixture_snapshot(
+    assert_cached_certification_snapshot(
         "low-integrity",
         impersonate_low_integrity_current_thread,
         |snapshot| {
             assert_eq!(snapshot.envelope.integrity_level, "S-1-16-4096");
         },
     );
-    assert_cached_fixture_snapshot(
+    assert_cached_certification_snapshot(
         "deny-only-admin",
         impersonate_deny_only_admin_current_thread,
         |snapshot| {

@@ -1,3 +1,8 @@
+// Binary unit tests owned by windows::policy_registry::directory_tests.
+// Compile route: cargo test -p memcordon --bin memcordon-sealed-agent --features test-support.
+// Required native architectures: Windows x64 and ARM64.
+// Included by the owning module under cfg(test); not a standalone integration target.
+
 use super::*;
 
 #[test]

@@ -587,13 +587,15 @@ pub fn current_thread_envelope() -> Result<WindowsCallerTokenEnvelopeV1, String>
     envelope(token.raw())
 }
 
-pub fn current_thread_fixture_snapshot() -> Result<TokenFixtureSnapshot, String> {
+pub fn current_thread_certification_snapshot() -> Result<TokenCertificationSnapshot, String> {
     let token = current_thread_token()?;
-    token_fixture_snapshot(token.raw())
+    token_certification_snapshot(token.raw())
 }
 
-pub(super) fn token_fixture_snapshot(token: HANDLE) -> Result<TokenFixtureSnapshot, String> {
-    Ok(TokenFixtureSnapshot {
+pub(super) fn token_certification_snapshot(
+    token: HANDLE,
+) -> Result<TokenCertificationSnapshot, String> {
+    Ok(TokenCertificationSnapshot {
         envelope: envelope(token)?,
         restricted_sid_count: restricted_sid_count(token)?,
         restricting_sids: token_restricting_sids(token)?,

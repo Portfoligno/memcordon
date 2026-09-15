@@ -1,3 +1,8 @@
+// Binary unit tests owned by windows::job::native_diagnostic_codes.
+// Compile route: cargo test -p memcordon --bin memcordon-sealed-agent --features test-support.
+// Required native architectures: Windows x64 and ARM64.
+// Included by the owning module under cfg(test); not a standalone integration target.
+
 use super::*;
 use windows_sys::Win32::Foundation::{ERROR_INVALID_HANDLE, SetLastError};
 use windows_sys::Win32::System::Threading::CreateEventW;

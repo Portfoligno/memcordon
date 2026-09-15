@@ -1,4 +1,4 @@
-//! Effective filesystem access used by the native CI input inventory.
+//! Native inventory authority: effective search denial and credential identity.
 use std::fs::Metadata;
 use std::io;
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};

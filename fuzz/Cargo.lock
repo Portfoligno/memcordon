@@ -681,6 +681,7 @@ dependencies = [
  "hex",
  "libc",
  "memcordon-core",
+ "memcordon-native-inspect",
  "memcordon-testkit",
  "memcordon-windows-launch-core",
  "semver",
@@ -725,6 +726,14 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "toml",
+]
+
+[[package]]
+name = "memcordon-native-inspect"
+version = "0.5.6-dev"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
