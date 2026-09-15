@@ -92,20 +92,17 @@ impl Fixture {
     }
 
     fn assert_native_records_required(&self, root: &Path, records: &[Value]) {
-        let mut wire = self.wire.clone();
-        wire["discovery_roots"] = serde_json::json!([root]);
-        let inputs = wire["inputs"].as_array_mut().unwrap();
-        inputs.extend_from_slice(records);
-        inputs.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-        self.read(&wire).unwrap().audit().unwrap();
+        let capture = BuildInputSnapshot::capture_native_tree(root).unwrap();
+        capture
+            .verify_serialized_inputs(&serde_json::to_vec(records).unwrap())
+            .unwrap();
         for record in records {
-            let mut omitted = wire.clone();
-            omitted["inputs"]
-                .as_array_mut()
-                .unwrap()
-                .retain(|input| input["path"] != record["path"]);
+            let mut omitted = records.to_vec();
+            omitted.retain(|input| input["path"] != record["path"]);
             assert!(
-                self.read(&omitted).unwrap().audit().is_err(),
+                capture
+                    .verify_serialized_inputs(&serde_json::to_vec(&omitted).unwrap())
+                    .is_err(),
                 "omitted native record {record}"
             );
         }
@@ -119,7 +116,14 @@ fn reviewed_v3_records_match_real_capture_and_roundtrip() {
     let records: Value = serde_json::from_slice(&capture.serialized_inputs().unwrap()).unwrap();
     assert_eq!(records, fixture.wire["inputs"]);
     let context = fixture.read(&fixture.wire).unwrap();
-    context.audit().unwrap();
+    assert!(
+        context
+            .audit()
+            .unwrap_err()
+            .to_string()
+            .contains("invocation workspace"),
+        "a wire-only fixture must not authorize the active workspace"
+    );
     let written = fixture.temporary.path().join("written.json");
     context.write(&written).unwrap();
     let bytes = std::fs::read(written).unwrap();
@@ -131,14 +135,19 @@ fn reviewed_v3_records_match_real_capture_and_roundtrip() {
 }
 
 #[test]
-fn every_omitted_v3_input_is_rejected_by_actual_audit() {
+fn every_omitted_v3_input_is_rejected_by_shared_record_comparison() {
     let fixture = Fixture::new();
-    fixture.read(&fixture.wire).unwrap().audit().unwrap();
+    let capture = BuildInputSnapshot::capture(&fixture.root).unwrap();
+    capture
+        .verify_serialized_inputs(&serde_json::to_vec(&fixture.wire["inputs"]).unwrap())
+        .unwrap();
     for index in 0..fixture.wire["inputs"].as_array().unwrap().len() {
         let mut omitted = fixture.wire.clone();
         let missing = omitted["inputs"].as_array_mut().unwrap().remove(index);
         assert!(
-            fixture.read(&omitted).unwrap().audit().is_err(),
+            capture
+                .verify_serialized_inputs(&serde_json::to_vec(&omitted["inputs"]).unwrap())
+                .is_err(),
             "omitted {missing}"
         );
     }
@@ -195,14 +204,16 @@ fn native_file_batches_preserve_the_same_records_as_serial_capture() {
             .all(|record| record["digest"] == ABC_SHA256)
     );
     native.audit().unwrap();
-    let mut wire = fixture.wire.clone();
-    wire["inputs"] = serde_json::to_value(&records).unwrap();
-    fixture.read(&wire).unwrap().audit().unwrap();
+    native
+        .verify_serialized_inputs(&serde_json::to_vec(&records).unwrap())
+        .unwrap();
     for index in 0..records.len() {
-        let mut omitted = wire.clone();
-        let missing = omitted["inputs"].as_array_mut().unwrap().remove(index);
+        let mut omitted = records.clone();
+        let missing = omitted.remove(index);
         assert!(
-            fixture.read(&omitted).unwrap().audit().is_err(),
+            native
+                .verify_serialized_inputs(&serde_json::to_vec(&omitted).unwrap())
+                .is_err(),
             "omitted batch record {missing}"
         );
     }

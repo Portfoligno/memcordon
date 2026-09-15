@@ -9,6 +9,20 @@ use crate::Result;
 
 pub const RELEASE_SCHEMA_VERSION: u32 = 4;
 
+/// Resolve the invocation workspace independently of a loaded build manifest.
+pub fn workspace_root(start: &Path) -> Result<std::path::PathBuf> {
+    let mut current = Some(start);
+    while let Some(path) = current {
+        if path.join("Cargo.toml").is_file() && path.join("ci").is_dir() {
+            return Ok(path.to_path_buf());
+        }
+        current = path.parent();
+    }
+    Err(crate::CiError::Message(
+        "could not locate the MemCordon workspace".to_owned(),
+    ))
+}
+
 /// Derive and validate the canonical dependency order for public workspace packages.
 pub fn publish_order(metadata: &Metadata, configured: &[String]) -> Result<Vec<String>> {
     let configured_set: BTreeSet<&str> = configured.iter().map(String::as_str).collect();

@@ -3,6 +3,8 @@
 
 pub mod coverage;
 mod history;
+pub mod hosted;
+pub mod hosted_client;
 mod inventory;
 pub mod native_runner;
 pub mod observation;

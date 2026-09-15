@@ -22,6 +22,8 @@ required_public_matrix = [
 ]
 self_extracting_shell_allowlist = []
 allowed_run_commands = [
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin source collect --workflow .github/workflows/ci.yml --output target/ci/reports/source-coverage/ci.json",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin source collect --workflow .github/workflows/backend-certification.yml --output target/ci/reports/source-coverage/backend.json",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin",
   "rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe",
   "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin",
@@ -77,6 +79,18 @@ file = ".github/workflows/backend-certification.yml"
 variable = "CARGO_TARGET_DIR"
 source = "target/ci/windows-sealed-cargo/build"
 steps = ["Certify packaged Cargo channel"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/ci.yml"
+variable = "GITHUB_TOKEN"
+source = "${{ github.token }}"
+steps = ["Collect and verify source execution"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/backend-certification.yml"
+variable = "GITHUB_TOKEN"
+source = "${{ github.token }}"
+steps = ["Collect and verify source execution"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"

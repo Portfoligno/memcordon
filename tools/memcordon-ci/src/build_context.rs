@@ -21,6 +21,19 @@ use crate::{CiError, Result};
 
 static ACTIVE: OnceLock<ValidatedBuildContext> = OnceLock::new();
 
+#[cfg(test)]
+#[path = "../tests/build_context/selection.rs"]
+mod selection_tests;
+
+fn require_same_inputs(measured: &[Input], recorded: &[Input]) -> Result<()> {
+    if measured != recorded {
+        return Err(CiError::Message(
+            "managed build inputs changed; cache publication and qualification rejected".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// A content snapshot of a declared input tree, including modes and links.
 /// Output paths are excluded only by the full managed profile, not this API.
 #[derive(Clone, Debug)]
@@ -72,6 +85,13 @@ impl BuildInputSnapshot {
     /// exports bytes, not an input constructor or cache-authorization token.
     pub fn serialized_inputs(&self) -> Result<Vec<u8>> {
         Ok(serde_json::to_vec(&self.inputs)?)
+    }
+
+    /// Compare recorded tree bytes with this freshly captured tree. This checks
+    /// only the declared tree; it does not enroll toolchains or authorize a cache.
+    pub fn verify_serialized_inputs(&self, bytes: &[u8]) -> Result<()> {
+        let recorded: Vec<Input> = serde_json::from_slice(bytes)?;
+        require_same_inputs(&self.inputs, &recorded)
     }
     pub fn audit(&self) -> Result<()> {
         if Self::capture_with_policy(&self.root, self.native_discovery)?.inputs != self.inputs {
@@ -812,6 +832,79 @@ pub fn installed_toolchains_command(
     Ok(command)
 }
 
+fn enrollment_identity_output(
+    recorded: Option<&ValidatedBuildContext>,
+    command: &mut Command,
+) -> Result<Vec<u8>> {
+    if let Some(recorded) = recorded {
+        recorded.require_recorded_selector(Path::new(command.get_program()))?;
+    }
+    identity_output(command)
+}
+
+fn enrollment_output(
+    recorded: Option<&ValidatedBuildContext>,
+    program: &Path,
+    args: &[&OsStr],
+    env: &BTreeMap<OsString, OsString>,
+    cwd: &Path,
+) -> Result<Vec<u8>> {
+    if let Some(recorded) = recorded {
+        recorded.require_recorded_selector(program)?;
+    }
+    output(program, args, env, cwd)
+}
+
+fn enroll_miri_sysroot(
+    root: &Path,
+    env: &mut BTreeMap<OsString, OsString>,
+    recorded: Option<&ValidatedBuildContext>,
+    setup: impl FnOnce(&BTreeMap<OsString, OsString>) -> Result<Vec<u8>>,
+) -> Result<PathBuf> {
+    let selected = root.join(environment::MANAGED_MIRI_SYSROOT_RELATIVE);
+    for path in [
+        root.join("target"),
+        root.join("target/ci"),
+        selected.clone(),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(CiError::Message(
+                    "managed Miri sysroot has a redirected or non-directory ancestor".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    env.insert(
+        "MIRI_SYSROOT".into(),
+        environment::command_path(root)?
+            .join(environment::MANAGED_MIRI_SYSROOT_RELATIVE)
+            .into_os_string(),
+    );
+    if let Some(recorded) = recorded {
+        if !recorded.input_roots.contains(&selected) || !selected.is_dir() {
+            return Err(CiError::Message(
+                "managed Miri sysroot is missing from the recorded input closure".into(),
+            ));
+        }
+    } else {
+        let reported = PathBuf::from(
+            String::from_utf8(setup(env)?)
+                .map_err(|error| CiError::Message(error.to_string()))?
+                .trim(),
+        );
+        if reported.canonicalize()? != selected.canonicalize()? {
+            return Err(CiError::Message(
+                "Miri setup did not use the independently selected sysroot".into(),
+            ));
+        }
+    }
+    Ok(selected.canonicalize()?)
+}
+
 fn identity_output(command: &mut Command) -> Result<Vec<u8>> {
     let description = format!(
         "program={:?} arguments={:?}",
@@ -841,6 +934,14 @@ impl ValidatedBuildContext {
     }
 
     fn prepare_inner(root: &Path) -> Result<Self> {
+        let mut context = Self::enroll(root, None)?;
+        context.inputs = context.measure_inputs()?;
+        Ok(context)
+    }
+
+    // Enrollment is derived from the invocation environment and pinned workspace
+    // configuration, never from declarations in a loaded cache manifest.
+    fn enroll(root: &Path, recorded: Option<&Self>) -> Result<Self> {
         let root = root.canonicalize()?;
         let command_root = environment::command_path(&root)?;
         let ambient: BTreeMap<_, _> = std::env::vars_os().collect();
@@ -884,7 +985,13 @@ impl ValidatedBuildContext {
         environment::reject_cargo_configuration(&root, &PathBuf::from(home).join(".cargo"))?;
         let cargo_home = command_root.join("target/ci/source-home");
         environment::reject_cargo_configuration(&root, &cargo_home)?;
-        fs::create_dir_all(&cargo_home)?;
+        if recorded.is_none() {
+            fs::create_dir_all(&cargo_home)?;
+        } else if !cargo_home.is_dir() {
+            return Err(CiError::Message(
+                "managed Cargo home is missing during audit".into(),
+            ));
+        }
         env.insert("CARGO_HOME".into(), cargo_home.into_os_string());
         let rustup = environment::resolve_tool(OsStr::new("rustup"), &env)?;
         let config = crate::config::toolchains(&root)?;
@@ -909,12 +1016,10 @@ impl ValidatedBuildContext {
                 input_roots.push(source);
             }
         }
-        let installed = identity_output(&mut installed_toolchains_command(
-            &rustup,
-            &config.stable,
-            &env,
-            &root,
-        )?)?;
+        let installed = enrollment_identity_output(
+            recorded,
+            &mut installed_toolchains_command(&rustup, &config.stable, &env, &root)?,
+        )?;
         for toolchain in [&config.stable, &config.msrv, &config.miri] {
             if !String::from_utf8_lossy(&installed)
                 .lines()
@@ -927,7 +1032,8 @@ impl ValidatedBuildContext {
             {
                 continue;
             }
-            let bytes = output(
+            let bytes = enrollment_output(
+                recorded,
                 &rustup,
                 &[
                     OsStr::new("which"),
@@ -960,34 +1066,34 @@ impl ValidatedBuildContext {
             .and_then(|job| job.to_str())
             .is_some_and(|job| job.contains("miri"))
         {
-            let bytes = output(
-                &rustup,
-                &[
-                    OsStr::new("run"),
-                    OsStr::new(&config.miri),
-                    OsStr::new("cargo"),
-                    OsStr::new("miri"),
-                    OsStr::new("setup"),
-                    OsStr::new("--print-sysroot"),
-                ],
-                &env,
+            input_roots.push(enroll_miri_sysroot(
                 &root,
-            )?;
-            input_roots.push(
-                PathBuf::from(
-                    String::from_utf8(bytes)
-                        .map_err(|error| CiError::Message(error.to_string()))?
-                        .trim(),
-                )
-                .canonicalize()?,
-            );
+                &mut env,
+                recorded,
+                |selected| {
+                    output(
+                        &rustup,
+                        &[
+                            OsStr::new("run"),
+                            OsStr::new(&config.miri),
+                            OsStr::new("cargo"),
+                            OsStr::new("miri"),
+                            OsStr::new("setup"),
+                            OsStr::new("--print-sysroot"),
+                        ],
+                        selected,
+                        &root,
+                    )
+                },
+            )?);
         }
         // The declared native input closure includes compiler/linker binaries,
         // SDK resources and system headers/libraries. These are content measured.
         #[cfg(target_os = "macos")]
         {
             let xcode = environment::resolve_tool(OsStr::new("xcode-select"), &env)?;
-            let developer = output(&xcode, &[OsStr::new("--print-path")], &env, &root)?;
+            let developer =
+                enrollment_output(recorded, &xcode, &[OsStr::new("--print-path")], &env, &root)?;
             input_roots.push(PathBuf::from(
                 String::from_utf8(developer)
                     .map_err(|error| CiError::Message(error.to_string()))?
@@ -1041,7 +1147,7 @@ impl ValidatedBuildContext {
                 .map(|value| (key.to_owned(), native(value)))
         })
         .collect();
-        let mut context = Self {
+        Ok(Self {
             schema_version: 3,
             root,
             environment: env
@@ -1053,9 +1159,7 @@ impl ValidatedBuildContext {
             discovery_roots,
             inputs: Vec::new(),
             worker,
-        };
-        context.inputs = context.measure_inputs()?;
-        Ok(context)
+        })
     }
 
     fn measure_inputs(&self) -> Result<Vec<Input>> {
@@ -1113,17 +1217,66 @@ impl ValidatedBuildContext {
     }
 
     fn audit_inner(&self) -> Result<()> {
+        let root = crate::config::workspace_root(&std::env::current_dir()?)?.canonicalize()?;
+        if self.root != root {
+            return Err(CiError::Message(
+                "managed build context does not belong to the invocation workspace".into(),
+            ));
+        }
+        self.audit_with_discovery(|| Self::enroll(&root, Some(self)))
+    }
+
+    fn audit_with_discovery(&self, discover: impl FnOnce() -> Result<Self>) -> Result<()> {
+        // Discovery may execute selectors. Reject any recorded input drift before
+        // those executables run, then retain the post-discovery measurement.
+        require_same_inputs(&self.measure_inputs()?, &self.inputs)?;
+        self.audit_enrollment(&discover()?)
+    }
+
+    fn require_recorded_selector(&self, path: &Path) -> Result<()> {
+        if !fs::metadata(path)?.is_file() {
+            return Err(CiError::Message(
+                "discovery selector is not a regular file".into(),
+            ));
+        }
+        let current = BuildInputSnapshot::capture(path)?;
+        if current.inputs.is_empty()
+            || current
+                .inputs
+                .iter()
+                .any(|input| !self.inputs.contains(input))
+        {
+            return Err(CiError::Message(format!(
+                "discovery selector is absent from or differs from recorded inputs: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn audit_enrollment(&self, enrolled: &Self) -> Result<()> {
+        for (field, equal) in [
+            ("root", self.root == enrolled.root),
+            ("environment", self.environment == enrolled.environment),
+            ("toolchains", self.toolchains == enrolled.toolchains),
+            ("input_roots", self.input_roots == enrolled.input_roots),
+            (
+                "discovery_roots",
+                self.discovery_roots == enrolled.discovery_roots,
+            ),
+        ] {
+            if !equal {
+                return Err(CiError::Message(format!(
+                    "managed build input enrollment differs for {field}; cache publication and qualification rejected"
+                )));
+            }
+        }
         let env = self.environment()?;
         let cargo_home = env
             .get(OsStr::new("CARGO_HOME"))
             .ok_or_else(|| CiError::Message("missing managed Cargo home".into()))?;
         environment::reject_cargo_configuration(&self.root, Path::new(cargo_home))?;
-        if self.measure_inputs()? != self.inputs {
-            return Err(CiError::Message(
-                "managed build inputs changed; cache publication and qualification rejected".into(),
-            ));
-        }
-        Ok(())
+        require_same_inputs(&self.measure_inputs()?, &self.inputs)
     }
 
     pub fn environment(&self) -> Result<BTreeMap<OsString, OsString>> {

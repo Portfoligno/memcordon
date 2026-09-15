@@ -159,7 +159,11 @@ fn run() -> io::Result<()> {
                 .current_dir(&work)
                 .env_clear()
                 .envs(&env)
-                .env("CARGO_HOME", &cargo_home);
+                .env("CARGO_HOME", &cargo_home)
+                .env(
+                    "MIRI_SYSROOT",
+                    root.join(environment::MANAGED_MIRI_SYSROOT_RELATIVE),
+                );
             run_bounded("prepare Miri sysroot", &mut setup)?;
         }
     }

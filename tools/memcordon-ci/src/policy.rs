@@ -641,7 +641,121 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
     Ok(())
 }
 
+fn check_source_collection_job(jobs: &Mapping, dependency: &str, command: &str) -> Result<()> {
+    let job = mapping(
+        jobs.get(key("source-evidence"))
+            .ok_or_else(|| failure("source evidence collection job is absent"))?,
+        "source evidence job",
+    )?;
+    if scalar(job, "needs") != Some(dependency) || scalar(job, "if") != Some("always()") {
+        return Err(failure(
+            "source evidence collection dependency or failure handling differs",
+        ));
+    }
+    let permissions = mapping(
+        job.get(key("permissions"))
+            .ok_or_else(|| failure("source evidence permissions absent"))?,
+        "source evidence permissions",
+    )?;
+    exact_mapping_keys(
+        permissions,
+        &["contents", "actions"],
+        "source evidence permissions",
+    )?;
+    if scalar(permissions, "contents") != Some("read")
+        || scalar(permissions, "actions") != Some("read")
+    {
+        return Err(failure(
+            "source evidence requires read-only contents/actions permissions",
+        ));
+    }
+    let steps = job
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("source evidence steps absent"))?;
+    let matching = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter(|step| scalar(step, "run") == Some(command))
+        .collect::<Vec<_>>();
+    let [step] = matching.as_slice() else {
+        return Err(failure(
+            "source evidence collection command is missing or duplicated",
+        ));
+    };
+    let env = mapping(
+        step.get(key("env"))
+            .ok_or_else(|| failure("source evidence credential absent"))?,
+        "source evidence environment",
+    )?;
+    exact_mapping_keys(env, &["GITHUB_TOKEN"], "source evidence environment")?;
+    if scalar(env, "GITHUB_TOKEN") != Some("${{ github.token }}")
+        || step.contains_key(key("if"))
+        || step.contains_key(key("continue-on-error"))
+    {
+        return Err(failure(
+            "source evidence credential or command failure handling differs",
+        ));
+    }
+    Ok(())
+}
+
+fn check_miri_cache_inputs(jobs: &Mapping) -> Result<()> {
+    let miri = mapping(
+        jobs.get(key("miri"))
+            .ok_or_else(|| failure("deep CI Miri job is absent"))?,
+        "deep CI Miri",
+    )?;
+    let steps = miri
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("deep CI Miri steps are absent"))?;
+    let mut cache_routes = BTreeSet::new();
+    for step in steps {
+        let step = mapping(step, "Miri step")?;
+        let Some(action) = scalar(step, "uses") else {
+            continue;
+        };
+        let route = if action.starts_with("actions/cache/restore@") {
+            "restore"
+        } else if action.starts_with("actions/cache/save@") {
+            "save"
+        } else {
+            continue;
+        };
+        let Some(paths) = step
+            .get(key("with"))
+            .and_then(Value::as_mapping)
+            .and_then(|with| scalar(with, "path"))
+        else {
+            continue;
+        };
+        if paths.lines().any(|path| path == "target/ci") {
+            if !paths.lines().any(|path| {
+                path.strip_prefix('!')
+                    == Some(crate::build_context::environment::MANAGED_MIRI_SYSROOT_RELATIVE)
+            }) {
+                return Err(failure(
+                    "Miri compiled cache must exclude the independently enrolled sysroot",
+                ));
+            }
+            cache_routes.insert(route);
+        }
+    }
+    if cache_routes != BTreeSet::from(["restore", "save"]) {
+        return Err(failure(
+            "Miri compiled cache must retain split restore/save routes",
+        ));
+    }
+    Ok(())
+}
+
 fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Policy) -> Result<()> {
+    check_source_collection_job(
+        jobs,
+        "native",
+        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin source collect --workflow .github/workflows/ci.yml --output target/ci/reports/source-coverage/ci.json",
+    )?;
     let events = mapping(
         workflow
             .get(key("on"))
@@ -1404,6 +1518,11 @@ fn check_certification_job(
 }
 
 fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
+    check_source_collection_job(
+        jobs,
+        "windows-package-channel",
+        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin source collect --workflow .github/workflows/backend-certification.yml --output target/ci/reports/source-coverage/backend.json",
+    )?;
     check_push_and_dispatch_events(workflow, "backend certification")?;
     check_top_level_permissions(workflow)?;
     let concurrency = mapping(
@@ -1435,6 +1554,7 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
             "windows-loader-lab",
             "standard-linux",
             "standard-windows",
+            "source-evidence",
         ],
         "backend certification jobs",
     )?;
@@ -1602,7 +1722,8 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
                 .ok_or_else(|| failure(format!("{} job is absent", contract.name)))?,
             contract.name,
         )?;
-        check_split_windows_job(job, contract)?;
+        let source_observations = contract.name == "windows-package-channel";
+        check_split_windows_job(job, contract, source_observations)?;
     }
     Ok(())
 }
@@ -1622,7 +1743,11 @@ struct SplitWindowsJobContract<'a> {
     timeout_minutes: u64,
 }
 
-fn check_split_windows_job(job: &Mapping, contract: SplitWindowsJobContract<'_>) -> Result<()> {
+fn check_split_windows_job(
+    job: &Mapping,
+    contract: SplitWindowsJobContract<'_>,
+    source_observations: bool,
+) -> Result<()> {
     let context = contract.name;
     let expected_keys: &[&str] = match (contract.dependency, contract.condition) {
         (Some(_), Some(_)) => &[
@@ -1664,7 +1789,7 @@ fn check_split_windows_job(job: &Mapping, contract: SplitWindowsJobContract<'_>)
     if action_steps(steps, checkout_action)?.len() != contract.checkout_count
         || action_steps(steps, restore_action)?.len() != 2
         || action_steps(steps, save_action)?.len() != 2
-        || action_steps(steps, upload_action)?.len() != 1
+        || action_steps(steps, upload_action)?.len() != 1 + usize::from(source_observations)
     {
         return Err(failure(format!("{context} action cardinality differs")));
     }
@@ -1755,7 +1880,32 @@ fn check_split_windows_job(job: &Mapping, contract: SplitWindowsJobContract<'_>)
         }
     }
 
-    let upload = action_steps(steps, upload_action)?[0];
+    let mut uploads = action_steps(steps, upload_action)?;
+    if source_observations {
+        let observation = uploads
+            .iter()
+            .position(|step| scalar(step, "name") == Some("Upload source execution observations"))
+            .ok_or_else(|| failure("package channel source observations upload is absent"))?;
+        let step = uploads.remove(observation);
+        exact_mapping_keys(step, &["name", "if", "uses", "with"], context)?;
+        let inputs = mapping(
+            step.get(key("with"))
+                .ok_or_else(|| failure("source observation upload inputs absent"))?,
+            context,
+        )?;
+        exact_mapping_keys(inputs, &["name", "path", "if-no-files-found"], context)?;
+        if scalar(step, "if") != Some("always()")
+            || scalar(inputs, "name")
+                != Some(
+                    "source-observations-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}",
+                )
+            || scalar(inputs, "path") != Some("target/ci/source-observations")
+            || scalar(inputs, "if-no-files-found") != Some("warn")
+        {
+            return Err(failure("package channel source observation upload differs"));
+        }
+    }
+    let upload = uploads[0];
     if scalar(upload, "if") != Some("always()") {
         return Err(failure(format!(
             "{context} artifact upload must run under always()"
@@ -2330,7 +2480,7 @@ fn check_release_structure(
                 .ok_or_else(|| failure(format!("release {} job is absent", contract.name)))?,
             contract.name,
         )?;
-        check_split_windows_job(job, contract)?;
+        check_split_windows_job(job, contract, false)?;
     }
     check_macos_deadline_job(jobs, "macos-acceptance")?;
     let assemble = mapping(
@@ -2684,6 +2834,15 @@ fn validate_workflow_bytes_into(
         ));
     }
     let mut document = parse_yaml(bytes)?;
+    if relative == Path::new(".github/workflows/deep-ci.yml") {
+        let raw = mapping(&document, "deep CI workflow")?;
+        let jobs = mapping(
+            raw.get(key("jobs"))
+                .ok_or_else(|| failure("deep CI jobs absent"))?,
+            "deep CI jobs",
+        )?;
+        check_miri_cache_inputs(jobs)?;
+    }
     crate::managed_workflow::validate_and_project(&mut document)?;
     let workflow = mapping(&document, "workflow")?;
     if workflow.contains_key(key("shell")) || workflow.contains_key(key("env")) {

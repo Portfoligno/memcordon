@@ -72,6 +72,12 @@ enum TopLevel {
 #[derive(Subcommand)]
 enum SourceCommand {
     Validate,
+    Collect {
+        #[arg(long)]
+        workflow: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     Merge {
         #[arg(long, required = true)]
         plan: Vec<PathBuf>,
@@ -151,16 +157,7 @@ enum ReleaseCommand {
 }
 
 fn workspace_root(start: &Path) -> Result<PathBuf> {
-    let mut current = Some(start);
-    while let Some(path) = current {
-        if path.join("Cargo.toml").is_file() && path.join("ci").is_dir() {
-            return Ok(path.to_path_buf());
-        }
-        current = path.parent();
-    }
-    Err(CiError::Message(
-        "could not locate the MemCordon workspace".to_owned(),
-    ))
+    config::workspace_root(start)
 }
 
 fn run() -> Result<()> {
@@ -203,6 +200,11 @@ fn run() -> Result<()> {
         ),
         (false, Some(TopLevel::Source { command })) => match command {
             SourceCommand::Validate => memcordon_ci::source_registry::run(&root),
+            SourceCommand::Collect { workflow, output } => {
+                memcordon_ci::source_registry::hosted_client::collect_current(
+                    &root, &workflow, &output,
+                )
+            }
             SourceCommand::Merge {
                 plan,
                 attestation,

@@ -1,0 +1,29 @@
+schema = 1
+
+[[lane]]
+suite = "native"
+workflow = ".github/workflows/ci.yml"
+job = "native"
+matrix = "windows-x64"
+runner = "windows-x64"
+
+[[lane]]
+suite = "native"
+workflow = ".github/workflows/ci.yml"
+job = "native"
+matrix = "windows-arm64"
+runner = "windows-arm64"
+
+[[lane]]
+suite = "windows-package-channel"
+workflow = ".github/workflows/backend-certification.yml"
+job = "windows-package-channel"
+matrix = "x64"
+runner = "windows-x64"
+
+[[lane]]
+suite = "windows-package-channel"
+workflow = ".github/workflows/backend-certification.yml"
+job = "windows-package-channel"
+matrix = "arm64"
+runner = "windows-arm64"

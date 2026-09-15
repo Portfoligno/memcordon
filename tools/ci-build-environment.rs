@@ -19,6 +19,9 @@ pub use paths::command_path;
 #[path = "ci-progress.rs"]
 pub mod progress;
 
+/// Bootstrap prepares this tree; the controller enrolls it as immutable input.
+pub const MANAGED_MIRI_SYSROOT_RELATIVE: &str = "target/ci/miri-sysroot";
+
 /// Name matching is separate from host path syntax so both policies can be tested.
 #[derive(Clone, Copy)]
 pub enum EnvironmentNames {

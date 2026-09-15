@@ -38,10 +38,12 @@ jobs:
             target/ci
             !target/ci/control-bootstrap
             !target/ci/source-home
+            !target/ci/miri-sysroot
             !target/ci/native-inputs.bin
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
+            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: managed-v2-cargo-target-deep-v1-miri-nightly-2026-07-31-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'crates/**', 'tools/**', 'ci/**') }}
@@ -56,10 +58,12 @@ jobs:
             target/ci
             !target/ci/control-bootstrap
             !target/ci/source-home
+            !target/ci/miri-sysroot
             !target/ci/native-inputs.bin
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
+            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: ${{ steps.miri-target.outputs.cache-primary-key }}
@@ -106,6 +110,7 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
+            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
             fuzz/target
@@ -133,6 +138,7 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
+            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
             fuzz/target
@@ -202,6 +208,7 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
+            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: managed-v2-cargo-target-deep-v1-stress-${{ matrix.id }}-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'crates/**', 'tools/**', 'ci/**') }}
@@ -220,6 +227,7 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
+            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: ${{ steps.stress-target.outputs.cache-primary-key }}

@@ -1,0 +1,42 @@
+{
+  "vector_version": 1,
+  "stages": ["a-production-replica", "b-target-boundary", "c-one-factor", "d-observer"],
+  "harness_statuses": ["complete", "incomplete", "cleanup-failed"],
+  "token_variants": ["production-target", "caller-primary", "privilege-disabled", "fully-restricted-restricted-code", "write-restricted-restricted-code", "write-restricted-write-restricted-code"],
+  "observers": ["none", "debug-event-pump", "full-debugger", "loader-snaps", "passive-etw", "external-procmon", "external-wpr"],
+  "run": {
+    "schema_version": 1,
+    "run_id": "reviewed-loader-lab-v1",
+    "os": {"os":"windows", "architecture":"x86_64", "major_version":10, "minor_version":0, "build_number":26100},
+    "package_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "harness_status": "complete",
+    "scenarios": [{
+      "scenario_id":"stage-a",
+      "production_equivalent":true,
+      "perturbed":false,
+      "launch_plan_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "token_variant":"production-target",
+      "desktop_variant":"production-private",
+      "environment_variant":"production-prepared",
+      "security_descriptor_variant":"production-exact",
+      "profile_variant":"production-unloaded",
+      "parent_variant":"production-launcher",
+      "observer":"none",
+      "observer_evidence":null,
+      "target_token_envelope_sha256":null,
+      "prepared_inputs":null,
+      "suspended_process":null,
+      "loader_ready_process_identity":null,
+      "loader_ready_token_envelope_sha256":null,
+      "loader_ready_process_snapshot":null,
+      "process_create":{"completed":true,"status":null},
+      "failure_stage":null,
+      "failure_status":null,
+      "target_exit_code":0,
+      "handshake":{"authenticated":{"protocol_version":19}},
+      "cleanup":{"status":"complete","stable_code":null},
+      "attachments":[{"relative_path":"stage-a.json","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","byte_length":1,"media_type":"application/json","redaction":"redacted-summary"}]
+    }],
+    "artifacts":[{"relative_path":"stage-a.json","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","byte_length":1,"media_type":"application/json","redaction":"redacted-summary"}]
+  }
+}

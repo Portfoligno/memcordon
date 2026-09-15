@@ -1,0 +1,164 @@
+{
+  "schema": 1,
+  "evidence_class": "hosted-workflow-history",
+  "execution_attested": false,
+  "repository": "Portfoligno/memcordon",
+  "commit": "a3944bbfeb9c3768b4acf8de0e21efeabaf12ae8",
+  "workflow_id": 325082760,
+  "workflow_path": ".github/workflows/ci.yml",
+  "workflow_name": "CI",
+  "run_id": 34955039571,
+  "run_attempt": 1,
+  "event": "push",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.com/Portfoligno/memcordon/actions/runs/34955039571",
+  "created_at": "2026-09-15T09:53:56Z",
+  "updated_at": "2026-09-15T10:31:51Z",
+  "jobs": [
+    {
+      "job_id": 104334940238,
+      "name": "macOS deadline / arm64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017546",
+      "labels": [
+        "macos-15"
+      ],
+      "started_at": "2026-09-15T09:54:06Z",
+      "completed_at": "2026-09-15T10:05:51Z"
+    },
+    {
+      "job_id": 104334940452,
+      "name": "policy",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017537",
+      "labels": [
+        "ubuntu-24.04"
+      ],
+      "started_at": "2026-09-15T09:54:00Z",
+      "completed_at": "2026-09-15T10:02:49Z"
+    },
+    {
+      "job_id": 104334940459,
+      "name": "native / macos-x64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017547",
+      "labels": [
+        "macos-15-intel"
+      ],
+      "started_at": "2026-09-15T10:02:53Z",
+      "completed_at": "2026-09-15T10:29:00Z"
+    },
+    {
+      "job_id": 104334940511,
+      "name": "macOS deadline / x64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017551",
+      "labels": [
+        "macos-15-intel"
+      ],
+      "started_at": "2026-09-15T10:06:11Z",
+      "completed_at": "2026-09-15T10:31:50Z"
+    },
+    {
+      "job_id": 104334940570,
+      "name": "native / linux-x64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017536",
+      "labels": [
+        "ubuntu-24.04"
+      ],
+      "started_at": "2026-09-15T09:54:01Z",
+      "completed_at": "2026-09-15T10:07:05Z"
+    },
+    {
+      "job_id": 104334940578,
+      "name": "native / macos-arm64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017548",
+      "labels": [
+        "macos-15"
+      ],
+      "started_at": "2026-09-15T10:04:58Z",
+      "completed_at": "2026-09-15T10:16:48Z"
+    },
+    {
+      "job_id": 104334940593,
+      "name": "native / linux-arm64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017550",
+      "labels": [
+        "ubuntu-24.04-arm"
+      ],
+      "started_at": "2026-09-15T10:05:56Z",
+      "completed_at": "2026-09-15T10:18:11Z"
+    },
+    {
+      "job_id": 104334940596,
+      "name": "supply chain",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017538",
+      "labels": [
+        "ubuntu-24.04"
+      ],
+      "started_at": "2026-09-15T09:54:00Z",
+      "completed_at": "2026-09-15T10:18:03Z"
+    },
+    {
+      "job_id": 104334940660,
+      "name": "native / windows-arm64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017544",
+      "labels": [
+        "windows-11-arm"
+      ],
+      "started_at": "2026-09-15T09:54:00Z",
+      "completed_at": "2026-09-15T10:25:52Z"
+    },
+    {
+      "job_id": 104334940676,
+      "name": "quality",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017540",
+      "labels": [
+        "ubuntu-24.04"
+      ],
+      "started_at": "2026-09-15T09:53:59Z",
+      "completed_at": "2026-09-15T10:04:50Z"
+    },
+    {
+      "job_id": 104334940697,
+      "name": "MSRV 1.85.0",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017539",
+      "labels": [
+        "ubuntu-24.04"
+      ],
+      "started_at": "2026-09-15T09:54:00Z",
+      "completed_at": "2026-09-15T10:06:06Z"
+    },
+    {
+      "job_id": 104334940715,
+      "name": "native / windows-x64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017542",
+      "labels": [
+        "windows-2025"
+      ],
+      "started_at": "2026-09-15T09:54:00Z",
+      "completed_at": "2026-09-15T10:16:40Z"
+    }
+  ]
+}

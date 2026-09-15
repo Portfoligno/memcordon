@@ -8,6 +8,54 @@ fn repository_root() -> PathBuf {
 }
 
 #[test]
+fn miri_output_cache_cannot_overwrite_the_independently_enrolled_sysroot() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).unwrap();
+    let path = Path::new(".github/workflows/deep-ci.yml");
+    let fixture = include_str!("../../../.github/workflows/deep-ci.yml");
+    policy::validate_workflow_bytes(&root, path, fixture.as_bytes(), &repository_policy).unwrap();
+    for action in ["actions/cache/restore@", "actions/cache/save@"] {
+        let mut document: Value = serde_yaml::from_str(fixture).unwrap();
+        let steps = document["jobs"]["miri"]["steps"].as_sequence_mut().unwrap();
+        let step = steps
+            .iter_mut()
+            .find(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with(action))
+                    && step["with"]["path"]
+                        .as_str()
+                        .is_some_and(|paths| paths.lines().any(|path| path == "target/ci"))
+            })
+            .unwrap();
+        let paths = step["with"]["path"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .filter(|path| {
+                path.strip_prefix('!')
+                    != Some(memcordon_ci::build_context::environment::MANAGED_MIRI_SYSROOT_RELATIVE)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        step["with"]["path"] = Value::String(paths);
+        let error = policy::validate_workflow_bytes(
+            &root,
+            path,
+            serde_yaml::to_string(&document).unwrap().as_bytes(),
+            &repository_policy,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Miri compiled cache must exclude"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn macos_deadline_rejects_missing_native_fingerprint_and_failure_evidence() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy");

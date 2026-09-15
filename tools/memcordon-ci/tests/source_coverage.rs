@@ -264,7 +264,7 @@ fn attestation_fixture() -> (
     let bound = serde_json::json!({"package_id": "package", "package_name": "memcordon", "manifest_path": "Cargo.toml", "target_name": "memcordon-sealed-agent", "target_kinds": ["bin"], "features": ["test-support"], "execution": execution});
     let observation = serde_json::json!({"toolchain": "stable", "invocation": invocation, "command_sha256": digest(&serde_json::to_vec(&typed).unwrap()), "stdout_sha256": "stdout", "stderr_sha256": "stderr", "exit_code": 0, "success": true, "error": null, "native_executions": [bound]});
     let journal = serde_json::json!({
-        "schema": 1, "commit": plan.commit, "checkout_clean": true, "suite": "native", "workflow": "CI", "run_id": "123", "job": "native-windows-x64", "runner": "hosted-test-runner",
+        "schema": 1, "commit": plan.commit, "checkout_clean": true, "suite": "native", "workflow": "CI", "run_id": "123", "run_attempt": "1", "job": "native-windows-x64", "runner": "hosted-test-runner",
         "architecture": "x86_64", "platform": "windows", "execution_attested": false, "suite_success": true, "native_invocations": 1,
         "observations": [observation]
     });

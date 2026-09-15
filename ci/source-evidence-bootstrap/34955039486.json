@@ -1,0 +1,116 @@
+{
+  "schema": 1,
+  "evidence_class": "hosted-workflow-history",
+  "execution_attested": false,
+  "repository": "Portfoligno/memcordon",
+  "commit": "a3944bbfeb9c3768b4acf8de0e21efeabaf12ae8",
+  "workflow_id": 325625200,
+  "workflow_path": ".github/workflows/deep-ci.yml",
+  "workflow_name": "Deep CI",
+  "run_id": 34955039486,
+  "run_attempt": 1,
+  "event": "push",
+  "status": "completed",
+  "conclusion": "success",
+  "html_url": "https://github.com/Portfoligno/memcordon/actions/runs/34955039486",
+  "created_at": "2026-09-15T09:53:56Z",
+  "updated_at": "2026-09-15T11:09:47Z",
+  "jobs": [
+    {
+      "job_id": 104334939965,
+      "name": "Miri",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017533",
+      "labels": [
+        "ubuntu-24.04"
+      ],
+      "started_at": "2026-09-15T09:54:00Z",
+      "completed_at": "2026-09-15T10:30:18Z"
+    },
+    {
+      "job_id": 104334940047,
+      "name": "fuzz smoke / first",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017532",
+      "labels": [
+        "ubuntu-24.04"
+      ],
+      "started_at": "2026-09-15T09:54:00Z",
+      "completed_at": "2026-09-15T10:30:50Z"
+    },
+    {
+      "job_id": 104334940123,
+      "name": "stress / windows-x64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017541",
+      "labels": [
+        "windows-2025"
+      ],
+      "started_at": "2026-09-15T09:54:00Z",
+      "completed_at": "2026-09-15T10:40:30Z"
+    },
+    {
+      "job_id": 104334940139,
+      "name": "stress / linux-x64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017535",
+      "labels": [
+        "ubuntu-24.04"
+      ],
+      "started_at": "2026-09-15T09:54:00Z",
+      "completed_at": "2026-09-15T10:12:50Z"
+    },
+    {
+      "job_id": 104334940143,
+      "name": "fuzz smoke / second",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017534",
+      "labels": [
+        "ubuntu-24.04"
+      ],
+      "started_at": "2026-09-15T09:54:00Z",
+      "completed_at": "2026-09-15T10:31:59Z"
+    },
+    {
+      "job_id": 104334940149,
+      "name": "stress / macos-arm64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017545",
+      "labels": [
+        "macos-15"
+      ],
+      "started_at": "2026-09-15T09:54:06Z",
+      "completed_at": "2026-09-15T10:27:26Z"
+    },
+    {
+      "job_id": 104334940269,
+      "name": "stress / macos-x64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017549",
+      "labels": [
+        "macos-15-intel"
+      ],
+      "started_at": "2026-09-15T10:05:21Z",
+      "completed_at": "2026-09-15T11:09:46Z"
+    },
+    {
+      "job_id": 104334940280,
+      "name": "stress / windows-arm64",
+      "status": "completed",
+      "conclusion": "success",
+      "runner_name": "GitHub Actions 1000017543",
+      "labels": [
+        "windows-11-arm"
+      ],
+      "started_at": "2026-09-15T09:54:00Z",
+      "completed_at": "2026-09-15T10:37:30Z"
+    }
+  ]
+}

@@ -1373,6 +1373,14 @@ id = "tools.memcordon-ci.src.source_registry.history"
 original_path = "tools/memcordon-ci/src/source_registry/history.rs"
 
 [[identity]]
+id = "tools.memcordon-ci.src.source_registry.hosted"
+original_path = "tools/memcordon-ci/src/source_registry/hosted.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.source_registry.hosted_client"
+original_path = "tools/memcordon-ci/src/source_registry/hosted_client.rs"
+
+[[identity]]
 id = "tools.memcordon-ci.src.source_registry.inventory"
 original_path = "tools/memcordon-ci/src/source_registry/inventory.rs"
 
@@ -1443,6 +1451,10 @@ original_path = "tools/memcordon-ci/tests/bootstrap_profile.rs"
 [[identity]]
 id = "tools.memcordon-ci.tests.build_context"
 original_path = "tools/memcordon-ci/tests/build_context.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.build_context.selection"
+original_path = "tools/memcordon-ci/tests/build_context/selection.rs"
 
 [[identity]]
 id = "tools.memcordon-ci.tests.build_context_vectors"
@@ -1593,6 +1605,10 @@ id = "tools.memcordon-ci.tests.source_coverage"
 original_path = "tools/memcordon-ci/tests/source_coverage.rs"
 
 [[identity]]
+id = "tools.memcordon-ci.tests.source_hosted"
+original_path = "tools/memcordon-ci/tests/source_hosted.rs"
+
+[[identity]]
 id = "tools.memcordon-ci.tests.source_identity"
 original_path = "tools/memcordon-ci/tests/source_identity.rs"
 
@@ -1727,6 +1743,10 @@ original_path = "tools/memcordon-windows-loader-lab/src/target.rs"
 [[identity]]
 id = "tools.memcordon-windows-loader-lab.tests.lab_contract"
 original_path = "tools/memcordon-windows-loader-lab/tests/lab_contract.rs"
+
+[[identity]]
+id = "tools.memcordon-windows-loader-lab.tests.versioned_contract"
+original_path = "tools/memcordon-windows-loader-lab/tests/versioned_contract.rs"
 
 [[retired]]
 id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.state"

@@ -4987,6 +4987,40 @@ work_packages = [
 decision = "Register the exact protected invariant and execution route; retain or split according to the owning subsystem, with zero-skip and platform evidence."
 
 [[source]]
+id = "tools.memcordon-ci.tests.build_context.selection"
+path = "tools/memcordon-ci/tests/build_context/selection.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["selection retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ['path-module:tools/memcordon-ci/src/build_context.rs:selection_tests:private:["cfg(test)"]']
+routes = ['path-module:tools/memcordon-ci/src/build_context.rs:selection_tests:private:["cfg(test)"]']
+cfg = []
+item_visibility = [
+    "fn:changed_inputs_are_rejected_before_discovery_can_execute_or_repair_them#1:private",
+    "fn:copy#1:private",
+    "fn:correct_enrollment_still_requires_every_record_and_current_content#1:private",
+    "fn:enrollment_binds_workspace_environment_and_selected_toolchain#1:private",
+    "fn:fixture#1:private",
+    "fn:independent_enrollment_rejects_self_consistent_root_and_record_omissions#1:private",
+    "fn:miri_sysroot_is_independently_selected_forwarded_and_never_repaired_by_audit#1:private",
+    "fn:omitted_selector_is_rejected_before_the_discovery_command_runs#1:private",
+    "use:std :: cell :: Cell#1:private",
+    "use:std :: collections :: BTreeMap#1:private",
+    "use:std :: ffi :: OsStr#1:private",
+    "use:super :: { ValidatedBuildContext , enroll_miri_sysroot , enrollment_identity_output , native , require_same_inputs , }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "CI-01",
+    "GOV-05",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "tools.memcordon-ci.tests.build_context_vectors"
 path = "tools/memcordon-ci/tests/build_context_vectors.rs"
 owner = "tests"
@@ -5008,7 +5042,7 @@ cfg = [
 ]
 item_visibility = [
     "const:ABC_SHA256#1:private",
-    "fn:every_omitted_v3_input_is_rejected_by_actual_audit#1:private",
+    "fn:every_omitted_v3_input_is_rejected_by_shared_record_comparison#1:private",
     "fn:mode#1/expression:6#1/use:std :: os :: unix :: fs :: PermissionsExt#1:private",
     "fn:mode#1:private",
     "fn:native#1:private",
@@ -6446,6 +6480,52 @@ work_packages = [
 decision = "Maintain explicit ownership and validate source inventory changes."
 
 [[source]]
+id = "tools.memcordon-ci.tests.source_hosted"
+path = "tools/memcordon-ci/tests/source_hosted.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["source_hosted retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-ci:test:source_hosted:features=[]"]
+routes = ["cargo:memcordon-ci:test:source_hosted:features=[]"]
+cfg = []
+item_visibility = [
+    "const:COMMIT#1:private",
+    "fn:archive#1:private",
+    "fn:archived_native_evidence_requires_actual_execution_and_authenticated_lane#1/use:memcordon_ci :: source_registry :: coverage :: { Coverage , Evidence , Plan , PlannedSource , SkipPolicy , }#1:private",
+    "fn:archived_native_evidence_requires_actual_execution_and_authenticated_lane#1/use:memcordon_ci :: source_registry :: hosted :: { ExpectedLane , ExpectedRun , HostedArchive , attest_archive , }#1:private",
+    "fn:archived_native_evidence_requires_actual_execution_and_authenticated_lane#1/use:memcordon_ci :: source_registry :: observation :: { Invocation , digest }#1:private",
+    "fn:archived_native_evidence_requires_actual_execution_and_authenticated_lane#1:private",
+    "fn:artifact#1:private",
+    "fn:artifacts_require_authenticated_digest_size_and_same_run_repository#1:private",
+    "fn:attestation#1:private",
+    "fn:checked_in_lanes_cover_every_declared_suite_and_architecture#1/use:memcordon_ci :: source_registry :: hosted_client :: { Lane , resolve_lane , validate_lane_coverage , }#1:private",
+    "fn:checked_in_lanes_cover_every_declared_suite_and_architecture#1:private",
+    "fn:collection_workflows_require_origin_jobs_and_fail_closed_execution#1:private",
+    "fn:job#1:private",
+    "fn:native_emitter_requires_unique_successful_job_from_current_attempt#1:private",
+    "fn:release_requires_successful_exact_repository_workflow_and_commit#1:private",
+    "fn:run#1:private",
+    "fn:workflow_lane_identity_comes_from_exact_matrix_not_runner_claim#1/use:memcordon_ci :: source_registry :: hosted_client :: { Lane , resolve_lane }#1:private",
+    "fn:workflow_lane_identity_comes_from_exact_matrix_not_runner_claim#1:private",
+    "fn:zip_reader_rejects_traversal_size_limits_and_absent_journals#1/use:memcordon_ci :: source_registry :: hosted :: read_journals#1:private",
+    "fn:zip_reader_rejects_traversal_size_limits_and_absent_journals#1:private",
+    "use:memcordon_ci :: source_registry :: hosted :: { Admission , Artifact , Job , WorkflowRun , validate_archive , validate_emitter , validate_run , }#1:private",
+    "use:memcordon_ci :: source_registry :: observation :: Attestation#1:private",
+    "use:serde_json :: json#1:private",
+    "use:sha2 :: { Digest , Sha256 }#1:private",
+    "use:std :: io :: { Cursor , Write }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "tools.memcordon-ci.tests.source_identity"
 path = "tools/memcordon-ci/tests/source_identity.rs"
 owner = "tests"
@@ -7095,6 +7175,7 @@ item_visibility = [
     "fn:fuzz_dependency_cache_keys_require_the_fuzz_lockfile#1:private",
     "fn:linux_certification_uploads_retain_hidden_failure_diagnostics#1:private",
     "fn:macos_deadline_rejects_missing_native_fingerprint_and_failure_evidence#1:private",
+    "fn:miri_output_cache_cannot_overwrite_the_independently_enrolled_sysroot#1:private",
     "fn:named_github_environments_are_rejected#1:private",
     "fn:public_windows_release_smoke_is_structurally_required#1:private",
     "fn:release_preflight_binds_provisioning_and_cache_to_toolchain_config#1:private",
@@ -7278,3 +7359,39 @@ work_packages = [
     "WIN-03",
 ]
 decision = "Register the exact protected invariant and execution route; retain or split according to the owning subsystem, with zero-skip and platform evidence."
+
+[[source]]
+id = "tools.memcordon-windows-loader-lab.tests.versioned_contract"
+path = "tools/memcordon-windows-loader-lab/tests/versioned_contract.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["versioned_contract retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-windows-loader-lab:test:versioned_contract:features=[]"]
+routes = ["cargo:memcordon-windows-loader-lab:test:versioned_contract:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:diagnostic_scenario_labels_preserve_version_one_wire_names#1:private",
+    "fn:failed_target_is_diagnostic_but_failed_cleanup_invalidates_harness#1:private",
+    "fn:reviewed_run_preserves_shared_production_evidence_contracts#1:private",
+    "fn:reviewed_run_rejects_unknown_fields_and_authority_drift#1:private",
+    "fn:run#1:private",
+    "fn:variants#1:private",
+    "fn:vectors#1:private",
+    "use:memcordon_windows_launch_core :: { CleanupOutcomeV1 , HandshakeOutcomeV1 , PRODUCTION_LOADER_READY_SCHEMA_VERSION , }#1:private",
+    "use:memcordon_windows_loader_lab :: scenario :: { DiagnosticObserverV1 , DiagnosticTokenVariantV1 , HarnessStatusV1 , LoaderLabRunV1 , LoaderLabStageV1 , }#1:private",
+    "use:serde :: { Serialize , de :: DeserializeOwned }#1:private",
+    "use:serde_json :: { Value , json }#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "WIN-03",
+    "GOV-05",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
