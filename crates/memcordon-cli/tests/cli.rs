@@ -904,6 +904,25 @@ fn invalid_limits_and_boundaries_have_stable_codes() {
 }
 
 #[test]
+fn fuzz_limit_token_crash_preserves_marker_and_byte_size_grammar() {
+    let seed = include_str!(
+        "../../../fuzz/seeds/limit_token/crash-af64fe7e1fcf0d5cdb801c2a522fed2988d50419"
+    );
+    let exact_crash = seed.strip_suffix('\n').expect("tracked seed ends with LF");
+    assert_eq!(exact_crash.as_bytes(), b"+5");
+    let parsed = LimitToken::parse(OsString::from(exact_crash)).unwrap();
+    assert_eq!(parsed.raw, OsStr::new(exact_crash));
+    assert_eq!(parsed.bytes.bytes(), 5);
+    let canonical = parsed.bytes.to_string();
+    assert_eq!(
+        canonical.parse::<memcordon_core::ByteSize>().unwrap(),
+        parsed.bytes
+    );
+    let error = LimitToken::parse(OsString::from(canonical)).unwrap_err();
+    assert_eq!(error.code, "MCCLI-MISSING-LIMIT-MARKER");
+}
+
+#[test]
 fn compatibility_routes_return_stable_actionable_diagnostics() {
     for (command, code, replacement) in [
         ("run", "MCCLI-LEGACY-RUN", "memcordon [OPTION|BUDGET]..."),

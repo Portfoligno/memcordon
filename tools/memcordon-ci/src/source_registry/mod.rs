@@ -1,8 +1,11 @@
 //! Owner: source governance. Inputs are Git inventory, strict declarations and Rust syntax.
 //! Output is source accountability, never a claim that declared tests executed.
 
+pub mod coverage;
 mod history;
 mod inventory;
+pub mod native_runner;
+pub mod observation;
 mod policy;
 mod report;
 mod routing;

@@ -3885,6 +3885,7 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
 }
 
 pub fn run(root: &Path) -> Result<()> {
+    crate::source_identity::validate_checkout(root)?;
     crate::source_registry::run(root)?;
     crate::fuzz_targets::validate(root)?;
     let policy = config::policy(root)?;

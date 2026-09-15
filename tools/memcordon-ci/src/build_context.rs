@@ -1152,6 +1152,29 @@ impl ValidatedBuildContext {
         self.toolchain_command(toolchain, cargo, arguments, directory)
     }
 
+    /// Enroll only an internally constructed native argv observer. Caller CLI
+    /// configuration remains rejected by the ordinary Cargo validation first.
+    pub fn cargo_command_with_native_runner(
+        &self,
+        toolchain: &str,
+        arguments: &[OsString],
+        directory: &Path,
+        runner: &crate::source_registry::native_runner::RunnerConfiguration,
+    ) -> Result<Command> {
+        let _validated = self.cargo_command(toolchain, arguments, directory)?;
+        runner.verify(&self.root)?;
+        let cargo = self
+            .toolchains
+            .get(toolchain)
+            .expect("validated enrolled toolchain");
+        let mut observed = vec![
+            OsString::from("--config"),
+            runner.path().as_os_str().to_owned(),
+        ];
+        observed.extend_from_slice(arguments);
+        self.toolchain_command(toolchain, cargo, &observed, directory)
+    }
+
     pub fn toolchain_command(
         &self,
         toolchain: &str,

@@ -12,15 +12,11 @@ consumers = ["cargo:memcordon:custom-build:build-script-build:features=[]"]
 routes = ["cargo:memcordon:custom-build:build-script-build:features=[]"]
 cfg = []
 item_visibility = [
-    "fn:git_directory#1:private",
     "fn:main#1:private",
-    "fn:packaged_commit#1:private",
-    "fn:valid_commit#1:private",
-    "fn:watch_git_identity#1:private",
-    "fn:workspace_commit#1:private",
+    "mod:build_support#1:private",
     "use:std :: fs#1:private",
     "use:std :: io :: Write#1:private",
-    "use:std :: path :: { Path , PathBuf }#1:private",
+    "use:std :: path :: PathBuf#1:private",
 ]
 platforms = ["portable"]
 work_packages = [
@@ -29,6 +25,100 @@ work_packages = [
     "GOV-07",
 ]
 decision = "Keep a thin build script, extract deterministic source-identity selection into testable pure helpers, prefer `.cargo_vcs_info.json`, and make release/preflight reject `unknown` identities."
+
+[[source]]
+id = "crates.memcordon-cli.build_support.identity"
+path = "crates/memcordon-cli/build_support/identity.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "retain"
+protected_invariants = ["Pure identity selection. Inherited environment commit strings are not inputs."]
+consumers = ["module:crates/memcordon-cli/build_support/mod.rs:identity:pub:[]"]
+routes = ["module:crates/memcordon-cli/build_support/mod.rs:identity:pub:[]"]
+cfg = []
+item_visibility = [
+    "const:GIT_SHA1_BYTES#1:private",
+    "const:GIT_SHA256_BYTES#1:private",
+    "fn:packaged_commit#1:pub",
+    "fn:reference#1:pub",
+    "fn:release_commit#1:pub",
+    "fn:resolve_head#1:pub",
+    "fn:select#1:pub",
+    "fn:valid_commit#1:pub",
+    "struct:PackageGit#1/field:_dirty#1:private",
+    "struct:PackageGit#1/field:sha1#1:private",
+    "struct:PackageGit#1:private",
+    "struct:Packaged#1/field:_path_in_vcs#1:private",
+    "struct:Packaged#1/field:git#1:private",
+    "struct:Packaged#1:private",
+    "struct:Released#1/field:schema#1:private",
+    "struct:Released#1/field:source_commit#1:private",
+    "struct:Released#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.build_support.mod"
+path = "crates/memcordon-cli/build_support/mod.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "retain"
+protected_invariants = ["mod retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = [
+    "module:crates/memcordon-cli/build.rs:build_support:private:[]",
+    "path-module:crates/memcordon-cli/tests/build_identity.rs:build_support:private:[]",
+]
+routes = [
+    "module:crates/memcordon-cli/build.rs:build_support:private:[]",
+    "path-module:crates/memcordon-cli/tests/build_identity.rs:build_support:private:[]",
+]
+cfg = []
+item_visibility = [
+    "fn:load#1:pub",
+    "fn:read#1:private",
+    "mod:identity#1:pub",
+    "mod:runtime#1:pub",
+    "struct:BuildIdentity#1/field:commit#1:pub",
+    "struct:BuildIdentity#1/field:inputs#1:pub",
+    "struct:BuildIdentity#1:pub",
+    "use:std :: fs#1:private",
+    "use:std :: path :: { Path , PathBuf }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.build_support.runtime"
+path = "crates/memcordon-cli/build_support/runtime.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "retain"
+protected_invariants = ["Target-only selection, independent of the build host."]
+consumers = ["module:crates/memcordon-cli/build_support/mod.rs:runtime:pub:[]"]
+routes = ["module:crates/memcordon-cli/build_support/mod.rs:runtime:pub:[]"]
+cfg = []
+item_visibility = ["fn:static_msvc#1:pub"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
 
 [[source]]
 id = "crates.memcordon-cli.src.bin.memcordon-embedding-fixture"

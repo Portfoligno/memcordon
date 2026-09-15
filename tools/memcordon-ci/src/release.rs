@@ -609,6 +609,7 @@ pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
         return Err(failure("release worktree or index is dirty"));
     }
     let commit = git_text(root, &["rev-parse", "HEAD"])?;
+    memcordon_ci::source_identity::validate(&commit)?;
     let tags = git_text(root, &["tag", "--points-at", "HEAD"])?;
     let exact_tags: Vec<(&str, Version)> = tags
         .lines()
@@ -1085,6 +1086,7 @@ fn package_crate(
     maximum_package_bytes: u64,
     default_cargo_binaries: &BTreeSet<String>,
 ) -> Result<CrateRecord> {
+    memcordon_ci::source_identity::validate(source_commit)?;
     let inventory_arguments = vec![
         OsString::from("package"),
         OsString::from("--locked"),
@@ -1179,6 +1181,7 @@ fn validate_agent_package_inspection(
     expected_version: &str,
     expected_source_commit: &str,
 ) -> Result<()> {
+    memcordon_ci::source_identity::validate(expected_source_commit)?;
     let inspection: AgentPackageInspection = serde_json::from_slice(output)?;
     let sha256_text_length = sha256_bytes(&[]).len();
     let valid_digest = |digest: &String| {

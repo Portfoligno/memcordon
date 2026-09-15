@@ -885,3 +885,20 @@ shard = "second"
 hosts = ["linux-x64", "linux-arm64"]
 import_mode = "direct"
 parity_required = false
+
+[[targets]]
+id = "fuzz-53"
+bin = "runtime-evidence"
+production_unit = "core::runtime_evidence"
+class = "roundtrip"
+invariants = ["Accepted cross-field evidence remains consistent and preserves canonical JSON", "Unknown authority fields and incomplete native retirement cannot authorize evidence", "Release at startup expiry is rejected"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/runtime-evidence"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false

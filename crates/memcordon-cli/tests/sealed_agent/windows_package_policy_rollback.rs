@@ -1,7 +1,12 @@
-// Binary unit tests owned by windows::package::policy_rollback_tests.
-// Compile route: cargo test -p memcordon --bin memcordon-sealed-agent --features test-support.
+// Private module: windows::package::policy_rollback_tests.
+// Authoritative native route: --test sealed_agent --features test-support,
+// one exact WINDOWS_PACKAGE_POLICY_TESTS selector with --exact --ignored.
+// windows-package-channel (also package-windows-sealed) installs an ephemeral
+// provider before this route and retains package cleanup after it completes.
 // Required native architectures: Windows x64 and ARM64.
-// Included by the owning module under cfg(test); not a standalone integration target.
+// The integration target includes windows/mod.rs and supplies CARGO_BIN_EXE_*.
+// Binary-unit compilation also sees these ignored tests, but is not their
+// execution owner and does not supply integration binary lookup metadata.
 
 use super::*;
 

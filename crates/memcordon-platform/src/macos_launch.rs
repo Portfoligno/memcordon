@@ -689,6 +689,30 @@ impl Channel {
             return Ok(None);
         }
         let frame: Frame = serde_json::from_slice(&self.input[prefix..prefix + length])?;
+        // Internally tagged unit variants can ignore extra fields even with the
+        // enum's deny_unknown_fields annotation. Compare only declared keys,
+        // preserving optional-field omission and every existing valid encoding.
+        // The first typed decode above still rejects duplicate typed fields.
+        let raw: serde_json::Value = serde_json::from_slice(&self.input[prefix..prefix + length])?;
+        let declared = serde_json::to_value(&frame.message)?;
+        let fields = raw
+            .get("message")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "private message must be an object",
+                )
+            })?;
+        let declared = declared
+            .as_object()
+            .expect("internally tagged message serializes as object");
+        if fields.keys().any(|field| !declared.contains_key(field)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown private message field",
+            ));
+        }
         if frame.version != 2 || frame.run != self.run || frame.sequence != self.received {
             return Err(io::Error::other(
                 "private protocol binding or sequence mismatch",
@@ -803,6 +827,61 @@ pub fn protocol_expectation_fixture(case: u8) -> io::Result<()> {
     }
     drop(sender);
     receiver.expect(Message::Released, deadline)
+}
+
+/// Characterize the actual private sender without exposing protocol types as API.
+#[cfg(feature = "test-support")]
+pub fn protocol_encode_fixture(message: &[u8], run: u64, sequence: u64) -> io::Result<Vec<u8>> {
+    if message.len() > FRAME_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fixture message exceeds frame bound",
+        ));
+    }
+    let message: Message = serde_json::from_slice(message)?;
+    let (left, right) = private_pair()?;
+    right.set_read_timeout(Some(Duration::from_secs(1)))?;
+    let mut sender = Channel::new(left, run)?;
+    sender.sent = sequence;
+    sender.send(message, Instant::now() + Duration::from_secs(1))?;
+    drop(sender);
+    let mut bytes = Vec::new();
+    right
+        .take((FRAME_LIMIT + std::mem::size_of::<u16>() + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Feed bounded wire transcripts through the production framing/binding parser.
+#[cfg(feature = "test-support")]
+pub fn protocol_decode_fixture(bytes: &[u8], run: u64, sequence: u64) -> io::Result<Vec<String>> {
+    if bytes.len() > FRAME_LIMIT + std::mem::size_of::<u16>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fixture transcript exceeds frame bound",
+        ));
+    }
+    let (left, mut right) = private_pair()?;
+    right.set_write_timeout(Some(Duration::from_secs(1)))?;
+    let mut receiver = Channel::new(left, run)?;
+    receiver.received = sequence;
+    right.write_all(bytes)?;
+    drop(right);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut messages = Vec::new();
+    loop {
+        match receiver.receive_available()? {
+            Some(Some(message)) => messages.push(serde_json::to_string(&message)?),
+            Some(None) => return Ok(messages),
+            None if Instant::now() < deadline => {}
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fixture transcript stalled",
+                ));
+            }
+        }
+    }
 }
 
 fn native_spawn(

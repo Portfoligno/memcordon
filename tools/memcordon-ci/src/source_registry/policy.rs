@@ -10,6 +10,9 @@ pub(super) fn validate(records: &[Source], inventory: &BTreeSet<String>) -> Resu
     let mut paths = BTreeSet::new();
     let mut replaced = BTreeSet::new();
     for source in records {
+        for coverage in &source.coverage {
+            coverage.validate()?;
+        }
         if !ids.insert(source.id.as_str()) || !paths.insert(source.path.clone()) {
             return Err(CiError::Message(format!(
                 "duplicate source id or path: {}",

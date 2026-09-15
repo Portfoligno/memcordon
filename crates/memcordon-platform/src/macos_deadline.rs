@@ -21,12 +21,36 @@ pub fn continuous_nanos() -> io::Result<u64> {
             "Darwin continuous clock timebase unavailable",
         ));
     }
+    convert_ticks(ticks, timebase.numer, timebase.denom)
+}
+
+fn convert_ticks(ticks: u64, numerator: u32, denominator: u32) -> io::Result<u64> {
     let nanos = u128::from(ticks)
-        .checked_mul(u128::from(timebase.numer))
-        .and_then(|value| value.checked_div(u128::from(timebase.denom)))
+        .checked_mul(u128::from(numerator))
+        .and_then(|value| value.checked_div(u128::from(denominator)))
         .and_then(|value| u64::try_from(value).ok())
         .ok_or_else(|| io::Error::other("Darwin continuous clock range exceeded"))?;
     Ok(nanos)
+}
+
+#[cfg(feature = "test-support")]
+pub fn timebase_conversion_fixture(
+    ticks: u64,
+    numerator: u32,
+    denominator: u32,
+) -> io::Result<u64> {
+    convert_ticks(ticks, numerator, denominator)
+}
+
+#[cfg(feature = "test-support")]
+pub fn deadline_add_fixture(origin: u64, budget: u64) -> io::Result<u64> {
+    add(origin, Duration::from_nanos(budget))
+}
+
+#[cfg(feature = "test-support")]
+pub fn retirement_remaining_fixture(force: u64, observed: u64, reserve: u64) -> io::Result<u64> {
+    u64::try_from(remaining_retirement(force, observed, Duration::from_nanos(reserve))?.as_nanos())
+        .map_err(io::Error::other)
 }
 
 pub(crate) fn add(origin: u64, duration: Duration) -> io::Result<u64> {

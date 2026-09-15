@@ -2720,6 +2720,7 @@ pub fn validate_required_certification_records(
     origin: &ExpectedCertificationOrigin,
     mut resolve: impl FnMut(&str) -> Result<Vec<u8>>,
 ) -> Result<()> {
+    crate::source_identity::validate(&origin.source_commit)?;
     let mut expected: BTreeMap<String, String> = REPORTS
         .iter()
         .map(|spec| (spec.record_key.into(), spec.evidence_path.into()))

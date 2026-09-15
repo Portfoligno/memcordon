@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "timebase": [
+    {"name":"identity", "ticks":42, "numerator":1, "denominator":1, "expected":42},
+    {"name":"fractional-floor", "ticks":5, "numerator":125, "denominator":3, "expected":208},
+    {"name":"wide-intermediate", "ticks":18446744073709551615, "numerator":3, "denominator":3, "expected":18446744073709551615},
+    {"name":"result-overflow", "ticks":18446744073709551615, "numerator":2, "denominator":1, "expected":null},
+    {"name":"unavailable-timebase", "ticks":1, "numerator":1, "denominator":0, "expected":null}
+  ],
+  "addition": [
+    {"name":"zero-budget", "origin":100, "budget":0, "expected":100},
+    {"name":"interruption-force-boundary", "origin":123, "budget":30, "expected":153},
+    {"name":"force-retirement-boundary", "origin":153, "budget":3000, "expected":3153},
+    {"name":"retirement-delivery-boundary", "origin":3153, "budget":1000, "expected":4153},
+    {"name":"boundary-overflow", "origin":18446744073709551615, "budget":1, "expected":null}
+  ],
+  "remaining": [
+    {"name":"delayed-observation-retains-original-reserve", "force":153, "observed":1153, "reserve":3000, "expected":2000},
+    {"name":"exact-equality-exhausted", "force":153, "observed":3153, "reserve":3000, "expected":0},
+    {"name":"late-observation-does-not-renew", "force":153, "observed":4000, "reserve":3000, "expected":0},
+    {"name":"reserve-overflow", "force":18446744073709551615, "observed":0, "reserve":1, "expected":null}
+  ]
+}

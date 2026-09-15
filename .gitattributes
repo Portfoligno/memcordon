@@ -1,1 +1,2 @@
 /packaging/linux/** text eol=lf
+/fuzz/seeds/** text eol=lf

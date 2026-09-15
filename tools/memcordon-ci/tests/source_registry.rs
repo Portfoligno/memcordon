@@ -29,6 +29,7 @@ fn source() -> Source {
         work_packages: vec!["GOV-01".into()],
         decision: "Keep policy validation independent of native authority".into(),
         replaces: vec![],
+        coverage: vec![],
     }
 }
 

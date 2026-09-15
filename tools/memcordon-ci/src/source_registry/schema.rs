@@ -28,4 +28,6 @@ pub struct Source {
     pub decision: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub replaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage: Vec<super::coverage::Coverage>,
 }

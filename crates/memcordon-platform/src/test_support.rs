@@ -2,6 +2,11 @@
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::protocol_expectation_fixture as macos_protocol_expectation_fixture;
 #[cfg(target_os = "macos")]
+pub use crate::macos_launch::{
+    protocol_decode_fixture as macos_protocol_decode_fixture,
+    protocol_encode_fixture as macos_protocol_encode_fixture,
+};
+#[cfg(target_os = "macos")]
 pub fn macos_signal_installation(
     failure: Option<usize>,
     interrupt: Option<usize>,
@@ -38,6 +43,12 @@ impl MacosAdmission {
 }
 #[cfg(target_os = "macos")]
 pub use crate::macos_deadline::retirement_mutation_probe as macos_retirement_mutation_probe;
+#[cfg(target_os = "macos")]
+pub use crate::macos_deadline::{
+    deadline_add_fixture as macos_deadline_add_fixture,
+    retirement_remaining_fixture as macos_retirement_remaining_fixture,
+    timebase_conversion_fixture as macos_timebase_conversion_fixture,
+};
 
 #[cfg(target_os = "macos")]
 pub use crate::macos_watchdog::inventory_reconciliation as macos_inventory_reconciliation;

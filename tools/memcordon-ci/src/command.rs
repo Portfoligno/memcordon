@@ -127,10 +127,24 @@ impl CommandSpec {
         &self,
         context: Option<&crate::build_context::ValidatedBuildContext>,
     ) -> Result<Command> {
+        self.materialize_native(context, None)
+    }
+
+    fn materialize_native(
+        &self,
+        context: Option<&crate::build_context::ValidatedBuildContext>,
+        runner: Option<&crate::source_registry::native_runner::RunnerConfiguration>,
+    ) -> Result<Command> {
         let mut command = match (&self.toolchain, context) {
-            (Some(ToolchainInvocation::Cargo { toolchain }), Some(context)) => {
-                context.cargo_command(toolchain, &self.arguments, &self.current_dir)?
-            }
+            (Some(ToolchainInvocation::Cargo { toolchain }), Some(context)) => match runner {
+                Some(runner) => context.cargo_command_with_native_runner(
+                    toolchain,
+                    &self.arguments,
+                    &self.current_dir,
+                    runner,
+                )?,
+                None => context.cargo_command(toolchain, &self.arguments, &self.current_dir)?,
+            },
             (
                 Some(ToolchainInvocation::Program {
                     toolchain,
@@ -157,6 +171,10 @@ impl CommandSpec {
                     }
                     None => {}
                 }
+                if let Some(runner) = runner {
+                    runner.verify(&self.current_dir)?;
+                    command.arg("--config").arg(runner.path());
+                }
                 command.args(&self.arguments).current_dir(&self.current_dir);
                 command
             }
@@ -166,14 +184,99 @@ impl CommandSpec {
     }
 
     pub fn output(&self) -> Result<ObservedOutput> {
-        let mut command = self.materialize(crate::build_context::active())?;
+        let mut observed = self.clone();
+        let mut native_directory = None;
+        let mut runner = None;
+        if matches!(self.toolchain, Some(ToolchainInvocation::Cargo { .. }))
+            && self
+                .arguments
+                .first()
+                .is_some_and(|argument| argument == "test")
+            && !self.arguments.iter().any(|argument| argument == "--no-run")
+            && let Some(configuration) =
+                crate::source_registry::observation::native_configuration(self.deadline)?
+        {
+            native_directory = configuration.path().parent().map(Path::to_path_buf);
+            if self.arguments.iter().any(|argument| {
+                argument.to_str().is_some_and(|text| {
+                    text == "--message-format" || text.starts_with("--message-format=")
+                })
+            }) {
+                return Err(CiError::Message(
+                    "native evidence owns Cargo's artifact message format".into(),
+                ));
+            }
+            observed
+                .arguments
+                .insert(1, OsString::from("--message-format=json"));
+            runner = Some(configuration);
+        }
+        let mut command =
+            observed.materialize_native(crate::build_context::active(), runner.as_ref())?;
         eprintln!("ci subprocess program: {:?}", command.get_program());
         for argument in command.get_args() {
             eprintln!("ci subprocess argument: {argument:?}");
         }
         eprintln!("ci subprocess deadline: {:?}", self.deadline);
-        run_with_deadline(&mut command, self.deadline).map_err(Into::into)
+        let result = run_with_deadline(&mut command, self.deadline);
+        let toolchain = match &self.toolchain {
+            Some(
+                ToolchainInvocation::Cargo { toolchain }
+                | ToolchainInvocation::Program { toolchain, .. },
+            ) => Some(toolchain.as_str()),
+            None => None,
+        };
+        let recorded = match &result {
+            Ok(output) => crate::source_registry::observation::record(
+                &command,
+                Ok(output),
+                native_directory.as_deref(),
+                toolchain,
+            ),
+            Err(error) => crate::source_registry::observation::record(
+                &command,
+                Err(&error.to_string()),
+                native_directory.as_deref(),
+                toolchain,
+            ),
+        };
+        let runner_checked = runner
+            .as_ref()
+            .map_or(Ok(()), |runner| runner.verify(&self.current_dir));
+        let evidence_failures: Vec<_> = [recorded, runner_checked]
+            .into_iter()
+            .filter_map(std::result::Result::err)
+            .map(|error| error.to_string())
+            .collect();
+        let recorded = if evidence_failures.is_empty() {
+            Ok(())
+        } else {
+            Err(CiError::Message(evidence_failures.join("; ")))
+        };
+        preserve_observed_outcome(result, recorded)
     }
+}
+
+/// Evidence errors remain fatal while preserving the original process outcome.
+pub fn preserve_observed_outcome(
+    result: std::result::Result<ObservedOutput, memcordon_testkit::ProcessTestError>,
+    recorded: Result<()>,
+) -> Result<ObservedOutput> {
+    if let Err(evidence_error) = recorded {
+        let original = match &result {
+            Ok(output) => format!(
+                "status={}; stdout={:?}; stderr={:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => error.to_string(),
+        };
+        return Err(CiError::Message(format!(
+            "subprocess observation failed: {evidence_error}; original subprocess outcome: {original}"
+        )));
+    }
+    result.map_err(Into::into)
 }
 
 pub fn rustup_cargo(

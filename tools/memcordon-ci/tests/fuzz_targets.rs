@@ -3,6 +3,34 @@ use std::collections::BTreeSet;
 use memcordon_ci::fuzz_targets::{FuzzShard, targets};
 
 #[test]
+fn reviewed_seed_bytes_are_checkout_independent() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let output = memcordon_ci::command::git(
+        root,
+        [
+            "check-attr",
+            "eol",
+            "--",
+            "fuzz/seeds/capability-mask/reviewed-input",
+            "fuzz/seeds/namespace-identity/reviewed-input",
+            "fuzz/seeds/terminal-receipt-v2/reviewed-input",
+        ],
+    )
+    .unwrap();
+    let output = std::str::from_utf8(&output).unwrap();
+    let rows: Vec<_> = output.lines().collect();
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter().all(|line| line.ends_with(": eol: lf")),
+        "{output}"
+    );
+}
+
+#[test]
 fn realistic_seed_records_fit_their_declared_input_classes() {
     use memcordon_ci::fuzz_targets::{CharterRegistry, prepare_corpus};
     use memcordon_core::sealed_provider::{envelope, terminal};
@@ -48,7 +76,14 @@ fn realistic_seed_records_fit_their_declared_input_classes() {
     let streams: Vec<memcordon_core::WindowsRemoteStreamV1> =
         serde_json::from_slice(&seed("windows-handle-manifest")).unwrap();
     memcordon_core::validate_windows_stream_manifest(&streams).unwrap();
-    let policy = memcordon_ci::config::parse_policy(&seed("policy_parser")).unwrap();
+    let policy_seed = seed("policy_parser");
+    assert!(
+        !std::str::from_utf8(&policy_seed)
+            .unwrap()
+            .contains("${{ secrets."),
+        "parser fixtures must not copy live credential sources"
+    );
+    let policy = memcordon_ci::config::parse_policy(&policy_seed).unwrap();
     memcordon_ci::policy::validate_workflow_bytes(
         root,
         std::path::Path::new(".github/workflows/ci.yml"),
@@ -383,9 +418,31 @@ fn shards_cover_current_and_future_manifest_targets_exactly_once() {
         assert!(first.is_disjoint(&second));
         assert_eq!(first.union(&second).cloned().collect::<Vec<_>>(), all);
         assert!(first.len().abs_diff(second.len()) <= 1);
-        assert_ne!(first.contains("report_json"), first.contains("schema_four"));
     }
-    assert_eq!(targets(manifest, None).unwrap().len(), 52);
+    let registry = memcordon_ci::fuzz_targets::CharterRegistry::parse(
+        manifest,
+        include_str!("../../../fuzz/targets.toml"),
+    )
+    .unwrap();
+    assert_eq!(
+        targets(manifest, None).unwrap().len(),
+        registry.targets.len()
+    );
+    // Real CI placement follows stable charters, not the legacy inventory
+    // helper's sorted-index partition when a new target is inserted.
+    let production_first = registry
+        .selected(Some(FuzzShard::First), "linux-x64")
+        .unwrap();
+    assert!(
+        production_first
+            .iter()
+            .any(|target| target.bin == "report_json")
+    );
+    assert!(
+        !production_first
+            .iter()
+            .any(|target| target.bin == "schema_four")
+    );
 }
 
 #[test]

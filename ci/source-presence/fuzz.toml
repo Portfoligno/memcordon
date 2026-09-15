@@ -644,6 +644,31 @@ work_packages = [
 decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
 
 [[source]]
+id = "fuzz.fuzz_targets.runtime_evidence"
+path = "fuzz/fuzz_targets/runtime_evidence.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["runtime_evidence retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:runtime-evidence"]
+routes = ["cargo:memcordon-fuzz:bin:runtime-evidence"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: runtime_evidence :: { ReleaseEvidence , RuntimeEvidenceV1 }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "MAC-06",
+    "GOV-03",
+    "GOV-05",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "fuzz.fuzz_targets.runtime_manifest"
 path = "fuzz/fuzz_targets/runtime_manifest.rs"
 owner = "fuzz"

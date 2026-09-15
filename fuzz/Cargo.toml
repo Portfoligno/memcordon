@@ -383,4 +383,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "runtime-evidence"
+path = "fuzz_targets/runtime_evidence.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

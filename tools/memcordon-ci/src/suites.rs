@@ -301,6 +301,19 @@ fn fuzz(
         )?;
         build?;
     }
+    if targets
+        .iter()
+        .any(|charter| charter.bin == memcordon_ci::fuzz_migration::CANONICAL)
+    {
+        memcordon_ci::fuzz_migration::run(
+            root,
+            &registry,
+            nightly,
+            &cargo_fuzz,
+            &tools.cargo_fuzz,
+            host,
+        )?;
+    }
     for charter in &targets {
         let corpus = prepare_corpus(root, charter)?;
         write_evidence(

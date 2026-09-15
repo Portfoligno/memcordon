@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "wire_version": 2,
+  "production": [
+    {
+      "name": "Hello",
+      "message": "{\"kind\":\"Hello\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Hello\"}}"
+    },
+    {
+      "name": "Ready",
+      "message": "{\"kind\":\"Ready\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Ready\"}}"
+    },
+    {
+      "name": "Bind",
+      "message": "{\"kind\":\"Bind\",\"group\":123}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Bind\",\"group\":123}}"
+    },
+    {
+      "name": "Armed",
+      "message": "{\"kind\":\"Armed\",\"group\":123}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Armed\",\"group\":123}}"
+    },
+    {
+      "name": "Release",
+      "message": "{\"kind\":\"Release\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Release\"}}"
+    },
+    {
+      "name": "Disarm",
+      "message": "{\"kind\":\"Disarm\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Disarm\"}}"
+    },
+    {
+      "name": "Retired",
+      "message": "{\"kind\":\"Retired\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Retired\"}}"
+    },
+    {
+      "name": "Failure",
+      "message": "{\"kind\":\"Failure\",\"errno\":2}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Failure\",\"errno\":2}}"
+    },
+    {
+      "name": "FailureDetail",
+      "message": "{\"kind\":\"FailureDetail\",\"message\":\"fixture failure\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"FailureDetail\",\"message\":\"fixture failure\"}}"
+    },
+    {
+      "name": "Configure",
+      "message": "{\"kind\":\"Configure\",\"image\":[47,98,105,110,47,116,114,117,101],\"boot_identity\":\"fixture-boot\",\"startup\":100,\"work\":200,\"grace\":30}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Configure\",\"image\":[47,98,105,110,47,116,114,117,101],\"boot_identity\":\"fixture-boot\",\"startup\":100,\"work\":200,\"grace\":30}}"
+    },
+    {
+      "name": "Prepared",
+      "message": "{\"kind\":\"Prepared\",\"pid\":123}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Prepared\",\"pid\":123}}"
+    },
+    {
+      "name": "Released",
+      "message": "{\"kind\":\"Released\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Released\"}}"
+    },
+    {
+      "name": "ReleaseIssued",
+      "message": "{\"kind\":\"ReleaseIssued\",\"at\":110}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"ReleaseIssued\",\"at\":110}}"
+    },
+    {
+      "name": "ForceRequested",
+      "message": "{\"kind\":\"ForceRequested\",\"at\":200}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"ForceRequested\",\"at\":200}}"
+    },
+    {
+      "name": "Observe",
+      "message": "{\"kind\":\"Observe\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Observe\"}}"
+    },
+    {
+      "name": "Reap",
+      "message": "{\"kind\":\"Reap\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Reap\"}}"
+    },
+    {
+      "name": "Stop",
+      "message": "{\"kind\":\"Stop\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Stop\"}}"
+    },
+    {
+      "name": "Heartbeat",
+      "message": "{\"kind\":\"Heartbeat\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Heartbeat\"}}"
+    },
+    {
+      "name": "StopAt",
+      "message": "{\"kind\":\"StopAt\",\"force\":200}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"StopAt\",\"force\":200}}"
+    },
+    {
+      "name": "SignalStop",
+      "message": "{\"kind\":\"SignalStop\",\"signal\":2,\"force\":200}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"SignalStop\",\"signal\":2,\"force\":200}}"
+    },
+    {
+      "name": "RestoreSignal",
+      "message": "{\"kind\":\"RestoreSignal\",\"settings\":{\"mask\":0,\"ignored\":[2,15],\"limits\":[[4,32,64]]}}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"RestoreSignal\",\"settings\":{\"mask\":0,\"ignored\":[2,15],\"limits\":[[4,32,64]]}}}"
+    },
+    {
+      "name": "InventoryQuery",
+      "message": "{\"kind\":\"InventoryQuery\",\"query\":9,\"metric\":null}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"InventoryQuery\",\"query\":9,\"metric\":null}}"
+    },
+    {
+      "name": "InventoryChunk",
+      "message": "{\"kind\":\"InventoryChunk\",\"query\":9,\"bytes\":[1,2,3],\"finished\":true}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"InventoryChunk\",\"query\":9,\"bytes\":[1,2,3],\"finished\":true}}"
+    },
+    {
+      "name": "Status",
+      "message": "{\"kind\":\"Status\",\"raw\":0,\"reaped\":true}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Status\",\"raw\":0,\"reaped\":true}}"
+    }
+  ],
+  "test_support": [
+    {
+      "name": "HoldSpawn",
+      "message": "{\"kind\":\"HoldSpawn\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"HoldSpawn\"}}"
+    },
+    {
+      "name": "HoldSpawnReleaseAfterCancel",
+      "message": "{\"kind\":\"HoldSpawnReleaseAfterCancel\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"HoldSpawnReleaseAfterCancel\"}}"
+    },
+    {
+      "name": "SpawnHeld",
+      "message": "{\"kind\":\"SpawnHeld\",\"pid\":123}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"SpawnHeld\",\"pid\":123}}"
+    },
+    {
+      "name": "ResumeSpawn",
+      "message": "{\"kind\":\"ResumeSpawn\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"ResumeSpawn\"}}"
+    },
+    {
+      "name": "InterruptClock",
+      "message": "{\"kind\":\"InterruptClock\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"InterruptClock\"}}"
+    },
+    {
+      "name": "ClockInterruptible",
+      "message": "{\"kind\":\"ClockInterruptible\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"ClockInterruptible\"}}"
+    },
+    {
+      "name": "AdvanceClock",
+      "message": "{\"kind\":\"AdvanceClock\",\"nanos\":123}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"AdvanceClock\",\"nanos\":123}}"
+    },
+    {
+      "name": "DisableWorkTimer",
+      "message": "{\"kind\":\"DisableWorkTimer\"}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"DisableWorkTimer\"}}"
+    },
+    {
+      "name": "StallInspectors",
+      "message": "{\"kind\":\"StallInspectors\",\"both\":true}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"StallInspectors\",\"both\":true}}"
+    },
+    {
+      "name": "InspectorsStalled",
+      "message": "{\"kind\":\"InspectorsStalled\",\"normal\":123,\"emergency\":124}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"InspectorsStalled\",\"normal\":123,\"emergency\":124}}"
+    },
+    {
+      "name": "Snapshot",
+      "message": "{\"kind\":\"Snapshot\",\"pid\":123}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Snapshot\",\"pid\":123}}"
+    },
+    {
+      "name": "Observed",
+      "message": "{\"kind\":\"Observed\",\"pid\":123,\"observed\":true}",
+      "frame": "{\"version\":2,\"run\":7,\"sequence\":0,\"message\":{\"kind\":\"Observed\",\"pid\":123,\"observed\":true}}"
+    }
+  ]
+}

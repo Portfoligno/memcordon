@@ -21,9 +21,11 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(parsed) = LimitToken::parse(token.clone()) {
             assert_eq!(parsed.raw, token);
             assert_eq!(
-                LimitToken::parse(parsed.bytes.to_string().into())
-                    .unwrap()
-                    .bytes,
+                parsed
+                    .bytes
+                    .to_string()
+                    .parse::<memcordon_core::ByteSize>()
+                    .unwrap(),
                 parsed.bytes
             );
         }

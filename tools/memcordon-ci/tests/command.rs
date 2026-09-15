@@ -69,6 +69,51 @@ fn enrolled_auxiliaries_use_closed_toolchain_context_but_workloads_keep_their_en
         "worker": {}
     })).unwrap()).unwrap();
     let context = ValidatedBuildContext::read(&manifest).unwrap();
+    let runner = memcordon_ci::source_registry::native_runner::RunnerConfiguration::create(
+        &root,
+        &root.join("target/ci/source-observations/enrollment"),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    let alias_container = tempfile::tempdir().unwrap();
+    let alias = alias_container.path().join("workspace-alias");
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    let aliased_runner = memcordon_ci::source_registry::native_runner::RunnerConfiguration::create(
+        &alias,
+        &alias.join("target/ci/source-observations/aliased-enrollment"),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    aliased_runner.verify(&root).unwrap();
+    aliased_runner.verify(&alias).unwrap();
+    let observed = context
+        .cargo_command_with_native_runner("nightly", &["test".into()], &root, &runner)
+        .unwrap();
+    assert_eq!(
+        observed.get_args().collect::<Vec<_>>(),
+        [
+            OsStr::new("--config"),
+            runner.path().as_os_str(),
+            OsStr::new("test")
+        ]
+    );
+    assert!(
+        context
+            .cargo_command_with_native_runner(
+                "nightly",
+                &["--config".into(), "untrusted.toml".into(), "test".into()],
+                &root,
+                &runner
+            )
+            .is_err()
+    );
+    assert!(runner.verify(&root.join("sysroot")).is_err());
+    std::fs::write(runner.path(), "[env]\nUNTRUSTED = 'changed'\n").unwrap();
+    assert!(
+        context
+            .cargo_command_with_native_runner("nightly", &["test".into()], &root, &runner)
+            .is_err()
+    );
     for (spec, (tool, arguments)) in memcordon_ci::command::supply_chain_commands(&root, "nightly")
         .into_iter()
         .zip([

@@ -105,7 +105,7 @@ steps = ["Attempt crates.io OIDC publication in slot 1"]
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+source = "fixture-only-credential-source"
 steps = ["Publish new crate with fallback credential in slot 1"]
 
 [[workflow.environment_allowlist]]
@@ -123,7 +123,7 @@ steps = ["Attempt crates.io OIDC publication in slot 2"]
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+source = "fixture-only-credential-source"
 steps = ["Publish new crate with fallback credential in slot 2"]
 
 [[workflow.environment_allowlist]]
@@ -141,7 +141,7 @@ steps = ["Attempt crates.io OIDC publication in slot 3"]
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+source = "fixture-only-credential-source"
 steps = ["Publish new crate with fallback credential in slot 3"]
 
 [[workflow.environment_allowlist]]
@@ -159,7 +159,7 @@ steps = ["Attempt crates.io OIDC publication in slot 4"]
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
-source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+source = "fixture-only-credential-source"
 steps = ["Publish new crate with fallback credential in slot 4"]
 
 [test]

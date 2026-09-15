@@ -342,7 +342,7 @@ cfg = [
     'fn:native_null_device_identity#2:cfg(not (target_os = "linux"))',
     'fn:protected_native_digest#1:cfg(target_os = "macos")',
     "fn:resolution_error#1/expression:927#1:cfg(windows)",
-    "fn:run_isolated_cargo#1/local:2797#1/expression:2798#1/expression:2824#1/local:2844#1:cfg(windows)",
+    "fn:run_isolated_cargo#1/local:2831#1/expression:2832#1/expression:2858#1/local:2878#1:cfg(windows)",
     "fn:windows_file_stamp#1:cfg(windows)",
     "impl:ContentReader:#1/method:finish#1/expression:883#1:cfg(windows)",
     "impl:ContentReader:#1/method:new#1/expression:878#1/expression:880#1:cfg(windows)",
@@ -412,6 +412,7 @@ item_visibility = [
     "impl:ValidatedBuildContext:#1/method:audit#1:pub",
     "impl:ValidatedBuildContext:#1/method:audit_inner#1:private",
     "impl:ValidatedBuildContext:#1/method:cargo_command#1:pub",
+    "impl:ValidatedBuildContext:#1/method:cargo_command_with_native_runner#1:pub",
     "impl:ValidatedBuildContext:#1/method:digest#1:pub",
     "impl:ValidatedBuildContext:#1/method:environment#1:pub",
     "impl:ValidatedBuildContext:#1/method:measure_inputs#1:private",
@@ -571,6 +572,7 @@ item_visibility = [
     "enum:ToolchainInvocation#1/variant:Program#1:enum-member",
     "enum:ToolchainInvocation#1:private",
     "fn:git#1:pub",
+    "fn:preserve_observed_outcome#1:pub",
     "fn:rustup_cargo#1:pub",
     "fn:supply_chain_commands#1:pub",
     "impl:CommandSpec:#1/method:apply_environment#1:pub",
@@ -579,6 +581,7 @@ item_visibility = [
     "impl:CommandSpec:#1/method:cargo#1:pub",
     "impl:CommandSpec:#1/method:inherit_crates_io_registry_token#1:pub",
     "impl:CommandSpec:#1/method:materialize#1:pub",
+    "impl:CommandSpec:#1/method:materialize_native#1:private",
     "impl:CommandSpec:#1/method:new#1:pub",
     "impl:CommandSpec:#1/method:output#1:pub",
     "impl:CommandSpec:#1/method:run#1:pub",
@@ -742,6 +745,70 @@ work_packages = [
     "GOV-01",
 ]
 decision = "Give the module an explicit owner and test charter, make it private behind narrow root re-exports, and merge only if the source registry shows no distinct invariant or consumer."
+
+[[source]]
+id = "tools.memcordon-ci.src.fuzz_migration"
+path = "tools/memcordon-ci/src/fuzz_migration.rs"
+owner = "ci"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "retain"
+protected_invariants = ["PROV-05 evidence for the two still-active package inspection targets."]
+consumers = ["module:tools/memcordon-ci/src/lib.rs:fuzz_migration:pub:[]"]
+routes = ["module:tools/memcordon-ci/src/lib.rs:fuzz_migration:pub:[]"]
+cfg = []
+item_visibility = [
+    "const:CANONICAL#1:pub",
+    "const:DUPLICATE#1:pub",
+    "fn:execute#1:private",
+    "fn:minimize#1:pub",
+    "fn:prepare#1:pub",
+    "fn:replay#1:pub",
+    "fn:run#1:pub",
+    "fn:verify#1:pub",
+    "fn:write#1:private",
+    "struct:Evidence#1/field:cargo_fuzz_version#1:private",
+    "struct:Evidence#1/field:failure#1:private",
+    "struct:Evidence#1/field:generated_artifacts#1:private",
+    "struct:Evidence#1/field:historical_discovery_complete#1:private",
+    "struct:Evidence#1/field:host#1:private",
+    "struct:Evidence#1/field:inputs#1:private",
+    "struct:Evidence#1/field:minimized#1:private",
+    "struct:Evidence#1/field:native_acceptance_complete#1:private",
+    "struct:Evidence#1/field:nightly#1:private",
+    "struct:Evidence#1/field:retirement_authorized#1:private",
+    "struct:Evidence#1/field:schema#1:private",
+    "struct:Evidence#1/field:source_commit#1:private",
+    "struct:Evidence#1/field:stages#1:private",
+    "struct:Evidence#1:private",
+    "struct:Inputs#1/field:corpus#1:pub",
+    "struct:Inputs#1/field:crashes#1:pub",
+    "struct:Inputs#1/field:searched_paths#1:pub",
+    "struct:Inputs#1:pub",
+    "struct:Invocation#1/field:arguments#1:pub",
+    "struct:Invocation#1/field:input_sha256#1:pub",
+    "struct:Invocation#1/field:phase#1:pub",
+    "struct:Invocation#1:pub",
+    "struct:Stage#1/field:completed#1:private",
+    "struct:Stage#1/field:failure#1:private",
+    "struct:Stage#1/field:invocation#1:private",
+    "struct:Stage#1:private",
+    "use:crate :: command :: { CommandSpec , git }#1:private",
+    "use:crate :: fuzz_targets :: { Charter , CharterRegistry , CorpusEntry , merge_corpora , preserve_artifacts , }#1:private",
+    "use:crate :: { CiError , Result }#1:private",
+    "use:serde :: Serialize#1:private",
+    "use:std :: ffi :: OsString#1:private",
+    "use:std :: path :: { Path , PathBuf }#1:private",
+    "use:std :: time :: Duration#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "PROV-05",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
 
 [[source]]
 id = "tools.memcordon-ci.src.fuzz_targets"
@@ -998,6 +1065,7 @@ item_visibility = [
     "mod:certification_context#1:pub",
     "mod:command#1:pub",
     "mod:config#1:pub",
+    "mod:fuzz_migration#1:pub",
     "mod:fuzz_targets#1:pub",
     "mod:inventory_progress#1:pub",
     "mod:inventory_reader#1:pub",
@@ -1015,6 +1083,7 @@ item_visibility = [
     "mod:scenario_diagnostic#1:pub",
     "mod:sealed_identity#1:pub",
     "mod:sealed_selector#1:pub",
+    "mod:source_identity#1:pub",
     "mod:source_registry#1:pub",
     "mod:standard_contract#1:pub",
     "mod:standard_runner#1:pub",
@@ -1085,6 +1154,17 @@ item_visibility = [
     "enum:ReleaseCommand#1/variant:VerifyCrates#1:enum-member",
     "enum:ReleaseCommand#1/variant:VerifyPublic#1:enum-member",
     "enum:ReleaseCommand#1:private",
+    "enum:SourceCommand#1/variant:Attest#1/field:journal#1:private",
+    "enum:SourceCommand#1/variant:Attest#1/field:output#1:private",
+    "enum:SourceCommand#1/variant:Attest#1/field:plan#1:private",
+    "enum:SourceCommand#1/variant:Attest#1:enum-member",
+    "enum:SourceCommand#1/variant:Merge#1/field:attestation#1:private",
+    "enum:SourceCommand#1/variant:Merge#1/field:output#1:private",
+    "enum:SourceCommand#1/variant:Merge#1/field:plan#1:private",
+    "enum:SourceCommand#1/variant:Merge#1:enum-member",
+    "enum:SourceCommand#1/variant:Plan#1/field:output#1:private",
+    "enum:SourceCommand#1/variant:Plan#1/field:suite#1:private",
+    "enum:SourceCommand#1/variant:Plan#1:enum-member",
     "enum:SourceCommand#1/variant:Routes#1/field:output#1:private",
     "enum:SourceCommand#1/variant:Routes#1:enum-member",
     "enum:SourceCommand#1/variant:Validate#1:enum-member",
@@ -1123,6 +1203,10 @@ item_visibility = [
     "enum:TopLevel#1/variant:DelegatedLinuxCertification#1/field:rustup#1:private",
     "enum:TopLevel#1/variant:DelegatedLinuxCertification#1/field:uid#1:private",
     "enum:TopLevel#1/variant:DelegatedLinuxCertification#1:enum-member",
+    "enum:TopLevel#1/variant:NativeTestRunner#1/field:arguments#1:private",
+    "enum:TopLevel#1/variant:NativeTestRunner#1/field:deadline_ms#1:private",
+    "enum:TopLevel#1/variant:NativeTestRunner#1/field:directory#1:private",
+    "enum:TopLevel#1/variant:NativeTestRunner#1:enum-member",
     "enum:TopLevel#1/variant:Release#1/field:command#1:private",
     "enum:TopLevel#1/variant:Release#1:enum-member",
     "enum:TopLevel#1/variant:Source#1/field:command#1:private",
@@ -1463,19 +1547,19 @@ cfg = [
     'const:LINUX_PROVIDER_QUALIFICATION_ARGUMENTS#1:cfg(any (target_os = "linux" , test))',
     'enum:LinuxProviderFrontendStage#1:cfg(any (target_os = "linux" , test))',
     "fn:existing_or_create#1:cfg(test)",
-    "fn:inspect_extract_and_smoke#1/expression:3853#1:cfg(unix)",
-    "fn:inspect_extract_and_smoke#1/expression:3881#1/expression:3918#1/expression:3939#1:cfg(unix)",
-    'fn:inspect_extract_and_smoke#1/expression:3881#1/expression:3918#1/expression:4004#1:cfg(target_os = "linux")',
-    'fn:inspect_extract_and_smoke#1/expression:3881#1/expression:3918#1/expression:4014#1:cfg(target_os = "windows")',
+    "fn:inspect_extract_and_smoke#1/expression:3866#1:cfg(unix)",
+    "fn:inspect_extract_and_smoke#1/expression:3894#1/expression:3931#1/expression:3952#1:cfg(unix)",
+    'fn:inspect_extract_and_smoke#1/expression:3894#1/expression:3931#1/expression:4017#1:cfg(target_os = "linux")',
+    'fn:inspect_extract_and_smoke#1/expression:3894#1/expression:3931#1/expression:4027#1:cfg(target_os = "windows")',
     'fn:linux_provider_frontend_arguments#1:cfg(any (target_os = "linux" , test))',
     'fn:smoke_linux_provider#1:cfg(target_os = "linux")',
-    'fn:smoke_packaged_memcordon_install#1/expression:2699#1:cfg(target_os = "linux")',
-    'fn:smoke_packaged_memcordon_install#1/expression:2725#1:cfg(target_os = "windows")',
+    'fn:smoke_packaged_memcordon_install#1/expression:2712#1:cfg(target_os = "linux")',
+    'fn:smoke_packaged_memcordon_install#1/expression:2738#1:cfg(target_os = "windows")',
     'fn:smoke_windows_provider#1:cfg(target_os = "windows")',
     'fn:validate_linux_provider_qualification#1:cfg(any (target_os = "linux" , test))',
     'fn:verify_absent_paths#1:cfg(any (target_os = "linux" , test))',
-    'fn:verify_crate_consumer#1/expression:8727#1/expression:8909#1:cfg(target_os = "linux")',
-    'fn:verify_crate_consumer#1/expression:8727#1/expression:8935#1:cfg(target_os = "windows")',
+    'fn:verify_crate_consumer#1/expression:8740#1/expression:8922#1:cfg(target_os = "linux")',
+    'fn:verify_crate_consumer#1/expression:8740#1/expression:8948#1:cfg(target_os = "windows")',
     'fn:verify_linux_provider_absent#1:cfg(target_os = "linux")',
     'fn:verify_windows_provider_absent#1:cfg(target_os = "windows")',
     "impl:HttpEndpoints:#1/method:fixed_test_server#1:cfg(test)",
@@ -1661,8 +1745,8 @@ item_visibility = [
     "fn:github_token#1:private",
     "fn:host_target#1:private",
     "fn:http_status#1:private",
-    "fn:inspect_extract_and_smoke#1/expression:3853#1/use:std :: os :: unix :: fs :: PermissionsExt#1:private",
-    "fn:inspect_extract_and_smoke#1/expression:3881#1/expression:3918#1/expression:3939#1/use:std :: os :: unix :: fs :: PermissionsExt#1:private",
+    "fn:inspect_extract_and_smoke#1/expression:3866#1/use:std :: os :: unix :: fs :: PermissionsExt#1:private",
+    "fn:inspect_extract_and_smoke#1/expression:3894#1/expression:3931#1/expression:3952#1/use:std :: os :: unix :: fs :: PermissionsExt#1:private",
     "fn:inspect_extract_and_smoke#1:private",
     "fn:installed_binary_name#1:private",
     "fn:is_lowercase_hex_digest#1:private",
@@ -3173,6 +3257,85 @@ work_packages = [
 decision = "Split lifecycle, qualification, channel parity, scenario execution, and artifact validation behind one certification transaction."
 
 [[source]]
+id = "tools.memcordon-ci.src.source_identity"
+path = "tools/memcordon-ci/src/source_identity.rs"
+owner = "ci"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "retain"
+protected_invariants = ["Release authority requires an exact source object id, never `unknown` or a"]
+consumers = ["module:tools/memcordon-ci/src/lib.rs:source_identity:pub:[]"]
+routes = ["module:tools/memcordon-ci/src/lib.rs:source_identity:pub:[]"]
+cfg = []
+item_visibility = [
+    "fn:validate#1/const:GIT_OBJECT_BYTES#1:private",
+    "fn:validate#1:pub",
+    "fn:validate_checkout#1:pub",
+    "use:crate :: { CiError , Result }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "tools.memcordon-ci.src.source_registry.coverage"
+path = "tools/memcordon-ci/src/source_registry/coverage.rs"
+owner = "ci"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "retain"
+protected_invariants = ["A declared test selector resolves to exact observed names; empty or ambiguous declarations never become execution evidence."]
+consumers = ["module:tools/memcordon-ci/src/source_registry/mod.rs:coverage:pub:[]"]
+routes = ["module:tools/memcordon-ci/src/source_registry/mod.rs:coverage:pub:[]"]
+cfg = []
+item_visibility = [
+    "enum:Evidence#1/variant:Behavior#1:enum-member",
+    "enum:Evidence#1/variant:Compile#1:enum-member",
+    "enum:Evidence#1/variant:Fuzz#1:enum-member",
+    "enum:Evidence#1:pub",
+    "enum:SkipPolicy#1/variant:ExplicitlyIgnored#1:enum-member",
+    "enum:SkipPolicy#1/variant:Forbidden#1:enum-member",
+    "enum:SkipPolicy#1:pub",
+    "fn:declared_test_names#1:pub",
+    "fn:parse_test_list#1:pub",
+    "fn:write_plan#1:pub",
+    "impl:Coverage:#1/method:resolve#1:pub",
+    "impl:Coverage:#1/method:validate#1:pub",
+    "impl:Plan:#1/method:from_sources#1:pub",
+    "struct:Coverage#1/field:cargo_package#1:pub",
+    "struct:Coverage#1/field:cargo_target#1:pub",
+    "struct:Coverage#1/field:evidence#1:pub",
+    "struct:Coverage#1/field:runner#1:pub",
+    "struct:Coverage#1/field:skip_policy#1:pub",
+    "struct:Coverage#1/field:suite#1:pub",
+    "struct:Coverage#1/field:test_binary#1:pub",
+    "struct:Coverage#1/field:tests#1:pub",
+    "struct:Coverage#1:pub",
+    "struct:Plan#1/field:commit#1:pub",
+    "struct:Plan#1/field:schema#1:pub",
+    "struct:Plan#1/field:sources#1:pub",
+    "struct:Plan#1/field:suite#1:pub",
+    "struct:Plan#1:pub",
+    "struct:PlannedSource#1/field:route#1:pub",
+    "struct:PlannedSource#1/field:source_id#1:pub",
+    "struct:PlannedSource#1:pub",
+    "use:crate :: { CiError , Result }#1:private",
+    "use:serde :: { Deserialize , Serialize }#1:private",
+    "use:std :: collections :: BTreeSet#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "tools.memcordon-ci.src.source_registry.history"
 path = "tools/memcordon-ci/src/source_registry/history.rs"
 owner = "ci"
@@ -3206,6 +3369,7 @@ item_visibility = [
 platforms = ["portable"]
 work_packages = [
     "GOV-01",
+    "GOV-02",
     "TEST-02",
 ]
 decision = "Maintain explicit ownership and validate source inventory changes."
@@ -3231,6 +3395,7 @@ item_visibility = [
 platforms = ["portable"]
 work_packages = [
     "GOV-01",
+    "GOV-02",
     "TEST-02",
 ]
 decision = "Maintain explicit ownership and validate source inventory changes."
@@ -3254,8 +3419,11 @@ item_visibility = [
     "fn:validate#1:pub",
     "fn:validate_history#1:pub",
     "fn:validate_records#1:pub",
+    "mod:coverage#1:pub",
     "mod:history#1:private",
     "mod:inventory#1:private",
+    "mod:native_runner#1:pub",
+    "mod:observation#1:pub",
     "mod:policy#1:private",
     "mod:report#1:private",
     "mod:routing#1:private",
@@ -3269,6 +3437,174 @@ item_visibility = [
 platforms = ["portable"]
 work_packages = [
     "GOV-01",
+    "GOV-02",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "tools.memcordon-ci.src.source_registry.native_runner"
+path = "tools/memcordon-ci/src/source_registry/native_runner.rs"
+owner = "ci"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "retain"
+protected_invariants = ["Cargo-selected native argv and containment remain unchanged while measured binary, ignored-list and execution-count identities agree."]
+consumers = ["module:tools/memcordon-ci/src/source_registry/mod.rs:native_runner:pub:[]"]
+routes = ["module:tools/memcordon-ci/src/source_registry/mod.rs:native_runner:pub:[]"]
+cfg = []
+item_visibility = [
+    "fn:bind_artifacts#1:pub",
+    "fn:listing_arguments#1:pub",
+    "fn:run#1/use:std :: io :: Write#1:private",
+    "fn:run#1:pub",
+    "fn:verify_successful_execution#1:pub",
+    "fn:write_configuration#1/struct:Configuration#1/field:target#1:private",
+    "fn:write_configuration#1/struct:Configuration#1:private",
+    "fn:write_configuration#1/struct:Runner#1/field:runner#1:private",
+    "fn:write_configuration#1/struct:Runner#1:private",
+    "fn:write_configuration#1:pub",
+    "impl:RunnerConfiguration:#1/method:create#1:pub",
+    "impl:RunnerConfiguration:#1/method:path#1:pub",
+    "impl:RunnerConfiguration:#1/method:verify#1:pub",
+    "struct:BoundExecution#1/field:execution#1:pub",
+    "struct:BoundExecution#1/field:features#1:pub",
+    "struct:BoundExecution#1/field:manifest_path#1:pub",
+    "struct:BoundExecution#1/field:package_id#1:pub",
+    "struct:BoundExecution#1/field:package_name#1:pub",
+    "struct:BoundExecution#1/field:target_kinds#1:pub",
+    "struct:BoundExecution#1/field:target_name#1:pub",
+    "struct:BoundExecution#1:pub",
+    "struct:NativeExecution#1/field:arguments#1:pub",
+    "struct:NativeExecution#1/field:binary#1:pub",
+    "struct:NativeExecution#1/field:binary_sha256#1:pub",
+    "struct:NativeExecution#1/field:executed_tests#1:pub",
+    "struct:NativeExecution#1/field:ignored_tests#1:pub",
+    "struct:NativeExecution#1/field:listed_tests#1:pub",
+    "struct:NativeExecution#1/field:schema#1:pub",
+    "struct:NativeExecution#1/field:selected_tests#1:pub",
+    "struct:NativeExecution#1/field:stderr_sha256#1:pub",
+    "struct:NativeExecution#1/field:stdout_sha256#1:pub",
+    "struct:NativeExecution#1/field:success#1:pub",
+    "struct:NativeExecution#1:pub",
+    "struct:RunnerConfiguration#1/field:digest#1:private",
+    "struct:RunnerConfiguration#1/field:executable#1:private",
+    "struct:RunnerConfiguration#1/field:executable_digest#1:private",
+    "struct:RunnerConfiguration#1/field:path#1:private",
+    "struct:RunnerConfiguration#1/field:root#1:private",
+    "struct:RunnerConfiguration#1:pub",
+    "use:crate :: { CiError , Result }#1:private",
+    "use:memcordon_core :: NativeArgument#1:private",
+    "use:serde :: { Deserialize , Serialize }#1:private",
+    "use:std :: collections :: BTreeSet#1:private",
+    "use:std :: ffi :: OsString#1:private",
+    "use:std :: path :: { Path , PathBuf }#1:private",
+    "use:std :: time :: { Duration , Instant }#1:private",
+    "use:super :: coverage :: parse_test_list#1:private",
+    "use:super :: observation :: digest#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "tools.memcordon-ci.src.source_registry.observation"
+path = "tools/memcordon-ci/src/source_registry/observation.rs"
+owner = "ci"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "retain"
+protected_invariants = ["Commit, runner, source-route and command identities must agree before successful native evidence can attest declared behavior."]
+consumers = ["module:tools/memcordon-ci/src/source_registry/mod.rs:observation:pub:[]"]
+routes = ["module:tools/memcordon-ci/src/source_registry/mod.rs:observation:pub:[]"]
+cfg = []
+item_visibility = [
+    "fn:attest_bytes#1/use:super :: coverage :: Evidence#1:private",
+    "fn:attest_bytes#1:pub",
+    "fn:begin#1:pub",
+    "fn:digest#1:pub",
+    "fn:finish#1:pub",
+    "fn:native_configuration#1:pub",
+    "fn:persist#1:private",
+    "fn:record#1:pub",
+    "fn:validate_merge#1/use:std :: collections :: BTreeSet#1:private",
+    "fn:validate_merge#1:pub",
+    "fn:write_attestation#1:pub",
+    "fn:write_merge#1/struct:Merged#1/field:attestations#1:private",
+    "fn:write_merge#1/struct:Merged#1/field:commit#1:private",
+    "fn:write_merge#1/struct:Merged#1/field:conclusion#1:private",
+    "fn:write_merge#1/struct:Merged#1/field:plans#1:private",
+    "fn:write_merge#1/struct:Merged#1/field:schema#1:private",
+    "fn:write_merge#1/struct:Merged#1:private",
+    "fn:write_merge#1:pub",
+    "static:ACTIVE#1:private",
+    "struct:Attestation#1/field:commit#1:pub",
+    "struct:Attestation#1/field:conclusion#1:pub",
+    "struct:Attestation#1/field:job#1:pub",
+    "struct:Attestation#1/field:journal_sha256#1:pub",
+    "struct:Attestation#1/field:run_id#1:pub",
+    "struct:Attestation#1/field:runner#1:pub",
+    "struct:Attestation#1/field:runner_name#1:pub",
+    "struct:Attestation#1/field:schema#1:pub",
+    "struct:Attestation#1/field:sources#1:pub",
+    "struct:Attestation#1/field:suite#1:pub",
+    "struct:Attestation#1/field:toolchains#1:pub",
+    "struct:Attestation#1/field:workflow#1:pub",
+    "struct:Attestation#1:pub",
+    "struct:AttestedSource#1/field:binary_sha256#1:pub",
+    "struct:AttestedSource#1/field:command_sha256#1:pub",
+    "struct:AttestedSource#1/field:coverage_sha256#1:pub",
+    "struct:AttestedSource#1/field:source_id#1:pub",
+    "struct:AttestedSource#1/field:tests#1:pub",
+    "struct:AttestedSource#1:pub",
+    "struct:Invocation#1/field:arguments#1:pub",
+    "struct:Invocation#1/field:current_directory#1:pub",
+    "struct:Invocation#1/field:program#1:pub",
+    "struct:Invocation#1:pub",
+    "struct:Journal#1/field:architecture#1:private",
+    "struct:Journal#1/field:checkout_clean#1:private",
+    "struct:Journal#1/field:commit#1:private",
+    "struct:Journal#1/field:execution_attested#1:private",
+    "struct:Journal#1/field:job#1:private",
+    "struct:Journal#1/field:native_invocations#1:private",
+    "struct:Journal#1/field:observations#1:private",
+    "struct:Journal#1/field:output#1:private",
+    "struct:Journal#1/field:platform#1:private",
+    "struct:Journal#1/field:root#1:private",
+    "struct:Journal#1/field:run_id#1:private",
+    "struct:Journal#1/field:runner#1:private",
+    "struct:Journal#1/field:schema#1:private",
+    "struct:Journal#1/field:suite#1:private",
+    "struct:Journal#1/field:suite_success#1:private",
+    "struct:Journal#1/field:workflow#1:private",
+    "struct:Journal#1:private",
+    "struct:Observation#1/field:command_sha256#1:pub",
+    "struct:Observation#1/field:error#1:pub",
+    "struct:Observation#1/field:exit_code#1:pub",
+    "struct:Observation#1/field:invocation#1:pub",
+    "struct:Observation#1/field:native_executions#1:pub",
+    "struct:Observation#1/field:stderr_sha256#1:pub",
+    "struct:Observation#1/field:stdout_sha256#1:pub",
+    "struct:Observation#1/field:success#1:pub",
+    "struct:Observation#1/field:toolchain#1:pub",
+    "struct:Observation#1:pub",
+    "use:crate :: { CiError , Result }#1:private",
+    "use:memcordon_core :: NativeArgument#1:private",
+    "use:memcordon_testkit :: ObservedOutput#1:private",
+    "use:serde :: { Deserialize , Serialize }#1:private",
+    "use:sha2 :: { Digest , Sha256 }#1:private",
+    "use:std :: path :: { Path , PathBuf }#1:private",
+    "use:std :: process :: Command#1:private",
+    "use:std :: sync :: Mutex#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
     "TEST-02",
 ]
 decision = "Maintain explicit ownership and validate source inventory changes."
@@ -3293,6 +3629,7 @@ item_visibility = [
 platforms = ["portable"]
 work_packages = [
     "GOV-01",
+    "GOV-02",
     "TEST-02",
 ]
 decision = "Maintain explicit ownership and validate source inventory changes."
@@ -3324,6 +3661,7 @@ item_visibility = [
 platforms = ["portable"]
 work_packages = [
     "GOV-01",
+    "GOV-02",
     "TEST-02",
 ]
 decision = "Maintain explicit ownership and validate source inventory changes."
@@ -3377,6 +3715,7 @@ item_visibility = [
 platforms = ["portable"]
 work_packages = [
     "GOV-01",
+    "GOV-02",
     "TEST-02",
 ]
 decision = "Maintain explicit ownership and validate source inventory changes."
@@ -3398,6 +3737,7 @@ item_visibility = [
     "struct:Domain#1:pub",
     "struct:Source#1/field:cfg#1:pub",
     "struct:Source#1/field:consumers#1:pub",
+    "struct:Source#1/field:coverage#1:pub",
     "struct:Source#1/field:decision#1:pub",
     "struct:Source#1/field:disposition#1:pub",
     "struct:Source#1/field:id#1:pub",
@@ -3417,6 +3757,7 @@ item_visibility = [
 platforms = ["portable"]
 work_packages = [
     "GOV-01",
+    "GOV-02",
     "TEST-02",
 ]
 decision = "Maintain explicit ownership and validate source inventory changes."
@@ -3894,6 +4235,7 @@ item_visibility = [
     "fn:clock#1/struct:Timebase#1/field:numer#1:private",
     "fn:clock#1/struct:Timebase#1:private",
     "fn:clock#1:private",
+    "fn:convert_clock_ticks#1:private",
     "fn:create_before_deadline#1:private",
     "fn:fixture#1:private",
     "fn:identity#1:private",
@@ -3902,6 +4244,29 @@ item_visibility = [
     "fn:run#1:pub(super)",
     "fn:same_identity#1:private",
     "fn:scenario#1:private",
+    "fn:validate_deadline_vectors#1/struct:Addition#1/field:budget#1:private",
+    "fn:validate_deadline_vectors#1/struct:Addition#1/field:expected#1:private",
+    "fn:validate_deadline_vectors#1/struct:Addition#1/field:name#1:private",
+    "fn:validate_deadline_vectors#1/struct:Addition#1/field:origin#1:private",
+    "fn:validate_deadline_vectors#1/struct:Addition#1:private",
+    "fn:validate_deadline_vectors#1/struct:Conversion#1/field:denominator#1:private",
+    "fn:validate_deadline_vectors#1/struct:Conversion#1/field:expected#1:private",
+    "fn:validate_deadline_vectors#1/struct:Conversion#1/field:name#1:private",
+    "fn:validate_deadline_vectors#1/struct:Conversion#1/field:numerator#1:private",
+    "fn:validate_deadline_vectors#1/struct:Conversion#1/field:ticks#1:private",
+    "fn:validate_deadline_vectors#1/struct:Conversion#1:private",
+    "fn:validate_deadline_vectors#1/struct:Remaining#1/field:expected#1:private",
+    "fn:validate_deadline_vectors#1/struct:Remaining#1/field:force#1:private",
+    "fn:validate_deadline_vectors#1/struct:Remaining#1/field:name#1:private",
+    "fn:validate_deadline_vectors#1/struct:Remaining#1/field:observed#1:private",
+    "fn:validate_deadline_vectors#1/struct:Remaining#1/field:reserve#1:private",
+    "fn:validate_deadline_vectors#1/struct:Remaining#1:private",
+    "fn:validate_deadline_vectors#1/struct:Vectors#1/field:addition#1:private",
+    "fn:validate_deadline_vectors#1/struct:Vectors#1/field:remaining#1:private",
+    "fn:validate_deadline_vectors#1/struct:Vectors#1/field:schema_version#1:private",
+    "fn:validate_deadline_vectors#1/struct:Vectors#1/field:timebase#1:private",
+    "fn:validate_deadline_vectors#1/struct:Vectors#1:private",
+    "fn:validate_deadline_vectors#1:private",
     "impl:Capture < R >:#1/method:drain#1:private",
     "impl:Capture < R >:#1/method:new#1:private",
     "impl:FrontendOwner:Drop#1/method:drop#1:private",

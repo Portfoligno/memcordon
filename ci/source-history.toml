@@ -5,6 +5,18 @@ id = "crates.memcordon-cli.build"
 original_path = "crates/memcordon-cli/build.rs"
 
 [[identity]]
+id = "crates.memcordon-cli.build_support.identity"
+original_path = "crates/memcordon-cli/build_support/identity.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.build_support.mod"
+original_path = "crates/memcordon-cli/build_support/mod.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.build_support.runtime"
+original_path = "crates/memcordon-cli/build_support/runtime.rs"
+
+[[identity]]
 id = "crates.memcordon-cli.src.bin.memcordon-embedding-fixture"
 original_path = "crates/memcordon-cli/src/bin/memcordon-embedding-fixture.rs"
 
@@ -343,6 +355,10 @@ original_path = "crates/memcordon-cli/tests/application/clean.rs"
 [[identity]]
 id = "crates.memcordon-cli.tests.backend_contract"
 original_path = "crates/memcordon-cli/tests/backend_contract.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.build_identity"
+original_path = "crates/memcordon-cli/tests/build_identity.rs"
 
 [[identity]]
 id = "crates.memcordon-cli.tests.cli"
@@ -757,6 +773,10 @@ id = "crates.memcordon-core.tests.runtime_evidence"
 original_path = "crates/memcordon-core/tests/runtime_evidence.rs"
 
 [[identity]]
+id = "crates.memcordon-core.tests.runtime_evidence_vectors"
+original_path = "crates/memcordon-core/tests/runtime_evidence_vectors.rs"
+
+[[identity]]
 id = "crates.memcordon-core.tests.windows_package_cleanup"
 original_path = "crates/memcordon-core/tests/windows_package_cleanup.rs"
 
@@ -887,6 +907,10 @@ original_path = "crates/memcordon-platform/tests/macos_deadline.rs"
 [[identity]]
 id = "crates.memcordon-platform.tests.macos_inventory"
 original_path = "crates/memcordon-platform/tests/macos_inventory.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.tests.macos_protocol_vectors"
+original_path = "crates/memcordon-platform/tests/macos_protocol_vectors.rs"
 
 [[identity]]
 id = "crates.memcordon-platform.tests.sealed_exec"
@@ -1093,6 +1117,10 @@ id = "fuzz.fuzz_targets.restart_controller"
 original_path = "fuzz/fuzz_targets/restart_controller.rs"
 
 [[identity]]
+id = "fuzz.fuzz_targets.runtime_evidence"
+original_path = "fuzz/fuzz_targets/runtime_evidence.rs"
+
+[[identity]]
 id = "fuzz.fuzz_targets.runtime_manifest"
 original_path = "fuzz/fuzz_targets/runtime_manifest.rs"
 
@@ -1237,6 +1265,10 @@ id = "tools.memcordon-ci.src.config"
 original_path = "tools/memcordon-ci/src/config.rs"
 
 [[identity]]
+id = "tools.memcordon-ci.src.fuzz_migration"
+original_path = "tools/memcordon-ci/src/fuzz_migration.rs"
+
+[[identity]]
 id = "tools.memcordon-ci.src.fuzz_targets"
 original_path = "tools/memcordon-ci/src/fuzz_targets.rs"
 
@@ -1325,6 +1357,14 @@ id = "tools.memcordon-ci.src.sealed_windows"
 original_path = "tools/memcordon-ci/src/sealed_windows.rs"
 
 [[identity]]
+id = "tools.memcordon-ci.src.source_identity"
+original_path = "tools/memcordon-ci/src/source_identity.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.source_registry.coverage"
+original_path = "tools/memcordon-ci/src/source_registry/coverage.rs"
+
+[[identity]]
 id = "tools.memcordon-ci.src.source_registry.history"
 original_path = "tools/memcordon-ci/src/source_registry/history.rs"
 
@@ -1335,6 +1375,14 @@ original_path = "tools/memcordon-ci/src/source_registry/inventory.rs"
 [[identity]]
 id = "tools.memcordon-ci.src.source_registry.mod"
 original_path = "tools/memcordon-ci/src/source_registry/mod.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.source_registry.native_runner"
+original_path = "tools/memcordon-ci/src/source_registry/native_runner.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.source_registry.observation"
+original_path = "tools/memcordon-ci/src/source_registry/observation.rs"
 
 [[identity]]
 id = "tools.memcordon-ci.src.source_registry.policy"
@@ -1411,6 +1459,10 @@ original_path = "tools/memcordon-ci/tests/environment_names.rs"
 [[identity]]
 id = "tools.memcordon-ci.tests.fingerprint_progress"
 original_path = "tools/memcordon-ci/tests/fingerprint_progress.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.fuzz_migration"
+original_path = "tools/memcordon-ci/tests/fuzz_migration.rs"
 
 [[identity]]
 id = "tools.memcordon-ci.tests.fuzz_targets"
@@ -1527,6 +1579,14 @@ original_path = "tools/memcordon-ci/tests/sealed_package_targets.rs"
 [[identity]]
 id = "tools.memcordon-ci.tests.sealed_privilege"
 original_path = "tools/memcordon-ci/tests/sealed_privilege.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.source_coverage"
+original_path = "tools/memcordon-ci/tests/source_coverage.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.source_identity"
+original_path = "tools/memcordon-ci/tests/source_identity.rs"
 
 [[identity]]
 id = "tools.memcordon-ci.tests.source_registry"

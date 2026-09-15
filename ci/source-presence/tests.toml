@@ -138,6 +138,41 @@ work_packages = [
 decision = "Register the exact protected invariant and execution route; retain or split according to the owning subsystem, with zero-skip and platform evidence."
 
 [[source]]
+id = "crates.memcordon-cli.tests.build_identity"
+path = "crates/memcordon-cli/tests/build_identity.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["build_identity retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon:test:build_identity:features=[]"]
+routes = ["cargo:memcordon:test:build_identity:features=[]"]
+cfg = []
+item_visibility = [
+    "const:COMMIT#1:private",
+    "const:OTHER#1:private",
+    "fn:archives_use_explicit_release_metadata_and_reject_invalid_package_bytes#1:private",
+    "fn:directory_checkout_detached_head_and_dirty_files_keep_exact_identity#1:private",
+    "fn:exact_hashes_and_reference_paths_are_validated#1/use:build_support :: identity :: { reference , valid_commit }#1:private",
+    "fn:exact_hashes_and_reference_paths_are_validated#1:private",
+    "fn:inherited_workflow_commit_cannot_override_checkout_files#1:private",
+    "fn:linked_worktree_resolves_common_loose_and_packed_refs#1:private",
+    "fn:packaged_metadata_precedes_checkout_and_release#1/use:build_support :: identity :: select#1:private",
+    "fn:packaged_metadata_precedes_checkout_and_release#1:private",
+    "fn:static_runtime_selection_follows_target_not_host#1:private",
+    "fn:write#1:private",
+    "mod:build_support#1:private",
+    "use:std :: path :: Path#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "crates.memcordon-cli.tests.cli"
 path = "crates/memcordon-cli/tests/cli.rs"
 owner = "tests"
@@ -176,6 +211,7 @@ item_visibility = [
     "fn:duration_parser_accepts_decimal_hours_with_bounded_millisecond_semantics#1:private",
     "fn:execution#1:private",
     "fn:execution_options_and_budgets_are_fully_interleavable#1:private",
+    "fn:fuzz_limit_token_crash_preserves_marker_and_byte_size_grammar#1:private",
     "fn:half_life_backoff_scalars_are_validated_after_order_independent_collection#1:private",
     "fn:hour_unit_is_shared_by_time_budget_and_every_duration_option#1:private",
     "fn:inferred_restart_conditions_are_silent_but_remain_machine_readable#1:private",
@@ -1960,6 +1996,22 @@ work_packages = [
 ]
 decision = "Relocate beside the owning `windows/diagnostics` module (or retain with an explicit owner header), register it as Windows binary-unit coverage, and require its exact tests in the Windows unit-test lane."
 
+[[source.coverage]]
+suite = "native"
+cargo_package = "memcordon"
+cargo_target = "bin:memcordon-sealed-agent"
+test_binary = "memcordon-sealed-agent"
+tests = [
+    "windows::diagnostics::causal_capture_tests::source_capture_and_record_cleanup_share_one_ordered_journal",
+    "windows::diagnostics::causal_capture_tests::unwinding_and_reentrant_capture_preserve_original_and_expose_loss",
+]
+runner = [
+    "windows-x64",
+    "windows-arm64",
+]
+skip_policy = "forbidden"
+evidence = "behavior"
+
 [[source]]
 id = "crates.memcordon-cli.tests.sealed_agent.windows_certification_token_support"
 path = "crates/memcordon-cli/tests/sealed_agent/windows_certification_token_support.rs"
@@ -2152,6 +2204,19 @@ work_packages = [
 ]
 decision = "Relocate beside the owning `windows/job` module (or retain with an explicit owner header), register it as Windows binary-unit coverage, and require its exact tests in the Windows unit-test lane."
 
+[[source.coverage]]
+suite = "native"
+cargo_package = "memcordon"
+cargo_target = "bin:memcordon-sealed-agent"
+test_binary = "memcordon-sealed-agent"
+tests = ["windows::job::native_diagnostic_codes::job_wrappers_capture_native_codes_before_last_error_changes"]
+runner = [
+    "windows-x64",
+    "windows-arm64",
+]
+skip_policy = "forbidden"
+evidence = "behavior"
+
 [[source]]
 id = "crates.memcordon-cli.tests.sealed_agent.windows_package_policy_rollback"
 path = "crates/memcordon-cli/tests/sealed_agent/windows_package_policy_rollback.rs"
@@ -2185,6 +2250,23 @@ work_packages = [
 ]
 decision = "Relocate beside the owning `windows/package` module (or retain with an explicit owner header), register it as Windows binary-unit coverage, and require its exact tests in the Windows unit-test lane."
 
+[[source.coverage]]
+suite = "windows-package-channel"
+cargo_package = "memcordon"
+cargo_target = "test:sealed_agent"
+test_binary = "sealed_agent"
+tests = [
+    "windows::package::policy_rollback_tests::legacy_manifest_absence_survives_failed_upgrade_qualification",
+    "windows::package::policy_rollback_tests::mixed_runtime_component_is_rejected_before_execution",
+    "windows::package::policy_rollback_tests::partial_uninstall_restores_captured_images_manifest_and_policy",
+]
+runner = [
+    "windows-x64",
+    "windows-arm64",
+]
+skip_policy = "explicitly-ignored"
+evidence = "behavior"
+
 [[source]]
 id = "crates.memcordon-cli.tests.sealed_agent.windows_policy_directory"
 path = "crates/memcordon-cli/tests/sealed_agent/windows_policy_directory.rs"
@@ -2211,6 +2293,19 @@ work_packages = [
     "TEST-01",
 ]
 decision = "Relocate beside the owning `windows/policy_registry` module (or retain with an explicit owner header), register it as Windows binary-unit coverage, and require its exact tests in the Windows unit-test lane."
+
+[[source.coverage]]
+suite = "native"
+cargo_package = "memcordon"
+cargo_target = "bin:memcordon-sealed-agent"
+test_binary = "memcordon-sealed-agent"
+tests = ["windows::policy_registry::directory_tests::policy_directory_pin_allows_atomic_child_publication_and_prevents_directory_rename"]
+runner = [
+    "windows-x64",
+    "windows-arm64",
+]
+skip_policy = "forbidden"
+evidence = "behavior"
 
 [[source]]
 id = "crates.memcordon-cli.tests.sealed_agent.windows_postauthorization_retirement"
@@ -2378,6 +2473,28 @@ work_packages = [
 ]
 decision = "Relocate beside the owning `windows/record` module (or retain with an explicit owner header), register it as Windows binary-unit coverage, and require its exact tests in the Windows unit-test lane."
 
+[[source.coverage]]
+suite = "native"
+cargo_package = "memcordon"
+cargo_target = "bin:memcordon-sealed-agent"
+test_binary = "memcordon-sealed-agent"
+tests = [
+    "windows::record::record_fault_tests::publication_mutex_policy_accepts_service_owners_and_rejects_other_accounts",
+    "windows::record::record_fault_tests::publication_mutex_preserves_exclusivity_without_owner_mutation_rights",
+    "windows::record::record_fault_tests::native_publisher_process_exit_preserves_atomic_old_or_new_record",
+    "windows::record::record_fault_tests::native_publication_fault_matrix_preserves_original_and_honest_commit_boundary",
+    "windows::record::record_fault_tests::stale_revision_original_replacement_and_staging_collision_never_publish",
+    "windows::record::record_fault_tests::native_rename_sharing_failure_retains_typed_code_and_original",
+    "windows::record::record_fault_tests::both_native_disk_full_codes_are_captured_before_formatting",
+    "windows::record::record_fault_tests::frozen_native_publication_does_not_own_workload_job_cleanup",
+]
+runner = [
+    "windows-x64",
+    "windows-arm64",
+]
+skip_policy = "forbidden"
+evidence = "behavior"
+
 [[source]]
 id = "crates.memcordon-cli.tests.sealed_agent.windows_replay_retention"
 path = "crates/memcordon-cli/tests/sealed_agent/windows_replay_retention.rs"
@@ -2444,6 +2561,19 @@ work_packages = [
     "TEST-01",
 ]
 decision = "Relocate beside the owning `windows/control_service` module (or retain with an explicit owner header), register it as Windows binary-unit coverage, and require its exact tests in the Windows unit-test lane."
+
+[[source.coverage]]
+suite = "native"
+cargo_package = "memcordon"
+cargo_target = "bin:memcordon-sealed-agent"
+test_binary = "memcordon-sealed-agent"
+tests = ["windows::control_service::retained_binding_tests::authenticated_retained_binding_rejects_other_attempt_request_process_creation_and_token"]
+runner = [
+    "windows-x64",
+    "windows-arm64",
+]
+skip_policy = "forbidden"
+evidence = "behavior"
 
 [[source]]
 id = "crates.memcordon-cli.tests.sealed_agent.windows_security"
@@ -2800,6 +2930,22 @@ work_packages = [
 ]
 decision = "Relocate beside the owning `windows/startup_diagnostics` module (or retain with an explicit owner header), register it as Windows binary-unit coverage, and require its exact tests in the Windows unit-test lane."
 
+[[source.coverage]]
+suite = "native"
+cargo_package = "memcordon"
+cargo_target = "bin:memcordon-sealed-agent"
+test_binary = "memcordon-sealed-agent"
+tests = [
+    "windows::startup_diagnostics::tests::original_startup_cause_round_trips_with_code_and_process_identity",
+    "windows::startup_diagnostics::tests::original_startup_cause_is_utf8_and_json_escape_bounded",
+]
+runner = [
+    "windows-x64",
+    "windows-arm64",
+]
+skip_policy = "forbidden"
+evidence = "behavior"
+
 [[source]]
 id = "crates.memcordon-cli.tests.sealed_agent.windows_token"
 path = "crates/memcordon-cli/tests/sealed_agent/windows_token.rs"
@@ -2894,6 +3040,24 @@ work_packages = [
     "TEST-01",
 ]
 decision = "Relocate beside the owning `windows/attempt_store` module (or retain with an explicit owner header), register it as Windows binary-unit coverage, and require its exact tests in the Windows unit-test lane."
+
+[[source.coverage]]
+suite = "native"
+cargo_package = "memcordon"
+cargo_target = "bin:memcordon-sealed-agent"
+test_binary = "memcordon-sealed-agent"
+tests = [
+    "windows::attempt_store::writer_queue_tests::frozen_writer_bounds_queue_without_claiming_commit_or_waiting_on_io",
+    "windows::attempt_store::writer_queue_tests::writer_unavailable_and_completion_contention_fail_without_pending_leaks",
+    "windows::attempt_store::writer_queue_tests::cloned_lane_cannot_enqueue_after_retirement_proof",
+    "windows::attempt_store::writer_queue_tests::retire_cannot_prove_completion_while_an_enqueue_is_in_flight",
+]
+runner = [
+    "windows-x64",
+    "windows-arm64",
+]
+skip_policy = "forbidden"
+evidence = "behavior"
 
 [[source]]
 id = "crates.memcordon-cli.tests.sealed_agent_distribution"
@@ -3446,8 +3610,41 @@ work_packages = [
     "GOV-05",
     "MAC-06",
     "TEST-01",
+    "GOV-03",
+    "TEST-02",
 ]
 decision = "Register the exact protected invariant and execution route; retain or split according to the owning subsystem, with zero-skip and platform evidence."
+
+[[source]]
+id = "crates.memcordon-core.tests.runtime_evidence_vectors"
+path = "crates/memcordon-core/tests/runtime_evidence_vectors.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["runtime_evidence_vectors retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-core:test:runtime_evidence_vectors:features=[]"]
+routes = ["cargo:memcordon-core:test:runtime_evidence_vectors:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:canonical_runtime_evidence_vectors_preserve_exact_json#1:private",
+    "fn:delivery_variants_preserve_grammar_without_claiming_persistence#1/use:memcordon_core :: runtime_evidence :: DeliveryEvidence#1:private",
+    "fn:delivery_variants_preserve_grammar_without_claiming_persistence#1:private",
+    "fn:runtime_evidence_rejects_unknown_fields_at_each_authority_boundary#1:private",
+    "fn:runtime_evidence_vectors_reject_cross_field_contradictions#1:private",
+    "fn:vectors#1:private",
+    "use:memcordon_core :: runtime_evidence :: RuntimeEvidenceV1#1:private",
+    "use:serde_json :: { Value , json }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "MAC-06",
+    "GOV-03",
+    "GOV-05",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
 
 [[source]]
 id = "crates.memcordon-core.tests.windows_package_cleanup"
@@ -3828,6 +4025,7 @@ cfg = [
     "struct:OuterTestBoundary#3:cfg(not (any (unix , windows)))",
     "struct:WindowsTestToken#1:cfg(windows)",
     'use:crate :: macos_deadline :: retirement_mutation_probe as macos_retirement_mutation_probe#1:cfg(target_os = "macos")',
+    'use:crate :: macos_deadline :: { deadline_add_fixture as macos_deadline_add_fixture , retirement_remaining_fixture as macos_retirement_remaining_fixture , timebase_conversion_fixture as macos_timebase_conversion_fixture , }#1:cfg(target_os = "macos")',
     'use:crate :: macos_envelope :: transfer_fixture as macos_envelope_transfer_fixture#1:cfg(target_os = "macos")',
     'use:crate :: macos_launch :: clock_jump as macos_clock_jump#1:cfg(target_os = "macos")',
     'use:crate :: macos_launch :: control_flood as macos_control_flood#1:cfg(target_os = "macos")',
@@ -3842,6 +4040,7 @@ cfg = [
     'use:crate :: macos_launch :: { LaunchFault as MacosLaunchFault , cancellation_fault as macos_cancellation_fault , disarm_timeout as macos_disarm_timeout , rejects_protocol as macos_rejects_protocol , startup_fault as macos_startup_fault , }#1:cfg(target_os = "macos")',
     'use:crate :: macos_launch :: { custody_wrapper as macos_custody_wrapper , guardian_inspector_wrapper as macos_guardian_inspector_wrapper , inspector_stall as macos_inspector_stall , }#1:cfg(target_os = "macos")',
     'use:crate :: macos_launch :: { empty_inventory_query_transition as macos_empty_inventory_query_transition , nonempty_inventory_query_transition as macos_nonempty_inventory_query_transition , }#1:cfg(target_os = "macos")',
+    'use:crate :: macos_launch :: { protocol_decode_fixture as macos_protocol_decode_fixture , protocol_encode_fixture as macos_protocol_encode_fixture , }#1:cfg(target_os = "macos")',
     'use:crate :: macos_watchdog :: inventory_reconciliation as macos_inventory_reconciliation#1:cfg(target_os = "macos")',
     'use:crate :: macos_watchdog :: pid_inventory_reply as macos_pid_inventory_reply#1:cfg(target_os = "macos")',
     'use:memcordon_core :: ByteSize#1:cfg(target_os = "linux")',
@@ -3977,6 +4176,7 @@ item_visibility = [
     "struct:WindowsTestToken#1/tuple:0#1/field:windows_sys :: Win32 :: Foundation :: HANDLE#1:private",
     "struct:WindowsTestToken#1:private",
     "use:crate :: macos_deadline :: retirement_mutation_probe as macos_retirement_mutation_probe#1:pub",
+    "use:crate :: macos_deadline :: { deadline_add_fixture as macos_deadline_add_fixture , retirement_remaining_fixture as macos_retirement_remaining_fixture , timebase_conversion_fixture as macos_timebase_conversion_fixture , }#1:pub",
     "use:crate :: macos_envelope :: transfer_fixture as macos_envelope_transfer_fixture#1:pub",
     "use:crate :: macos_launch :: clock_jump as macos_clock_jump#1:pub",
     "use:crate :: macos_launch :: control_flood as macos_control_flood#1:pub",
@@ -3991,6 +4191,7 @@ item_visibility = [
     "use:crate :: macos_launch :: { LaunchFault as MacosLaunchFault , cancellation_fault as macos_cancellation_fault , disarm_timeout as macos_disarm_timeout , rejects_protocol as macos_rejects_protocol , startup_fault as macos_startup_fault , }#1:pub",
     "use:crate :: macos_launch :: { custody_wrapper as macos_custody_wrapper , guardian_inspector_wrapper as macos_guardian_inspector_wrapper , inspector_stall as macos_inspector_stall , }#1:pub",
     "use:crate :: macos_launch :: { empty_inventory_query_transition as macos_empty_inventory_query_transition , nonempty_inventory_query_transition as macos_nonempty_inventory_query_transition , }#1:pub",
+    "use:crate :: macos_launch :: { protocol_decode_fixture as macos_protocol_decode_fixture , protocol_encode_fixture as macos_protocol_encode_fixture , }#1:pub",
     "use:crate :: macos_watchdog :: inventory_reconciliation as macos_inventory_reconciliation#1:pub",
     "use:crate :: macos_watchdog :: pid_inventory_reply as macos_pid_inventory_reply#1:pub",
     "use:memcordon_core :: ByteSize#1:private",
@@ -4094,6 +4295,8 @@ routes = ["cargo:memcordon-platform:test:macos_deadline:features=[]"]
 cfg = [':cfg(all (target_os = "macos" , feature = "test-support"))']
 item_visibility = [
     "fn:mutation_expired_work_cleanup_clamp_is_detected#1:private",
+    "fn:production_deadline_arithmetic_matches_independent_data_vectors#1/use:memcordon_platform :: test_support :: { macos_deadline_add_fixture , macos_retirement_remaining_fixture , macos_timebase_conversion_fixture , }#1:private",
+    "fn:production_deadline_arithmetic_matches_independent_data_vectors#1:private",
     "use:memcordon_platform :: test_support :: macos_retirement_mutation_probe as probe#1:private",
     "use:std :: time :: Duration#1:private",
 ]
@@ -4146,6 +4349,37 @@ work_packages = [
     "TEST-01",
 ]
 decision = "Register the exact protected invariant and execution route; retain or split according to the owning subsystem, with zero-skip and platform evidence."
+
+[[source]]
+id = "crates.memcordon-platform.tests.macos_protocol_vectors"
+path = "crates/memcordon-platform/tests/macos_protocol_vectors.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["macos_protocol_vectors retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-platform:test:macos_protocol_vectors:features=[]"]
+routes = ["cargo:memcordon-platform:test:macos_protocol_vectors:features=[]"]
+cfg = [':cfg(all (target_os = "macos" , feature = "test-support"))']
+item_visibility = [
+    "fn:every_reviewed_message_preserves_exact_version_two_wire_bytes#1:private",
+    "fn:strict_message_keys_preserve_optional_omission_and_reject_duplicate_typed_fields#1:private",
+    "fn:transcript_sequence_binding_and_failure_shapes_are_preserved#1:private",
+    "fn:vectors#1:private",
+    "fn:wire#1:private",
+    "use:memcordon_platform :: test_support :: { macos_protocol_decode_fixture as decode , macos_protocol_encode_fixture as encode , }#1:private",
+]
+platforms = [
+    "macos-x64",
+    "macos-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "MAC-01",
+    "GOV-05",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
 
 [[source]]
 id = "crates.memcordon-platform.tests.sealed_exec"
@@ -4888,6 +5122,40 @@ work_packages = [
 decision = "Register the exact protected invariant and execution route; retain or split according to the owning subsystem, with zero-skip and platform evidence."
 
 [[source]]
+id = "tools.memcordon-ci.tests.fuzz_migration"
+path = "tools/memcordon-ci/tests/fuzz_migration.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["fuzz_migration retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-ci:test:fuzz_migration:features=[]"]
+routes = ["cargo:memcordon-ci:test:fuzz_migration:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:migration_preserves_inputs_and_distinguishes_crashes_from_reports#1/use:sha2 :: Digest#1:private",
+    "fn:migration_preserves_inputs_and_distinguishes_crashes_from_reports#1:private",
+    "fn:migration_refuses_empty_or_incompatible_inputs#1:private",
+    "fn:ordered_proof_replays_original_crashes_again_after_minimization#1/use:memcordon_ci :: fuzz_migration :: { Inputs , verify }#1:private",
+    "fn:ordered_proof_replays_original_crashes_again_after_minimization#1/use:memcordon_ci :: fuzz_targets :: merge_corpora#1:private",
+    "fn:ordered_proof_replays_original_crashes_again_after_minimization#1:private",
+    "fn:registry#1:private",
+    "fn:replay_and_cmin_preserve_native_argument_boundaries#1:private",
+    "use:memcordon_ci :: fuzz_migration :: { CANONICAL , DUPLICATE , minimize , prepare , replay }#1:private",
+    "use:memcordon_ci :: fuzz_targets :: CharterRegistry#1:private",
+    "use:std :: ffi :: OsString#1:private",
+    "use:std :: path :: Path#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "PROV-05",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "tools.memcordon-ci.tests.fuzz_targets"
 path = "tools/memcordon-ci/tests/fuzz_targets.rs"
 owner = "tests"
@@ -4913,6 +5181,7 @@ item_visibility = [
     "fn:realistic_seed_records_fit_their_declared_input_classes#1:private",
     "fn:restored_corpus_inputs_are_included_in_target_evidence#1/use:memcordon_ci :: fuzz_targets :: { CharterRegistry , prepare_corpus }#1:private",
     "fn:restored_corpus_inputs_are_included_in_target_evidence#1:private",
+    "fn:reviewed_seed_bytes_are_checkout_independent#1:private",
     "fn:shards_cover_current_and_future_manifest_targets_exactly_once#1:private",
     "fn:source_inclusion_cannot_claim_direct_production_import#1/use:memcordon_ci :: fuzz_targets :: { CharterRegistry , validate }#1:private",
     "fn:source_inclusion_cannot_claim_direct_production_import#1:private",
@@ -6039,6 +6308,69 @@ work_packages = [
 decision = "Keep the regression only with a registry entry naming the unique invariant, owning Cargo target, exact suite, applicable runners, and skip policy; merge overlapping cases after equivalence is proven."
 
 [[source]]
+id = "tools.memcordon-ci.tests.source_coverage"
+path = "tools/memcordon-ci/tests/source_coverage.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["source_coverage retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-ci:test:source_coverage:features=[]"]
+routes = ["cargo:memcordon-ci:test:source_coverage:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:attestation_fixture#1/use:memcordon_ci :: source_registry :: coverage :: { Plan , PlannedSource }#1:private",
+    "fn:attestation_fixture#1/use:memcordon_ci :: source_registry :: observation :: digest#1:private",
+    "fn:attestation_fixture#1:private",
+    "fn:attestation_rejects_wrong_identity_failed_suite_and_missing_execution#1/use:memcordon_ci :: source_registry :: observation :: attest_bytes#1:private",
+    "fn:attestation_rejects_wrong_identity_failed_suite_and_missing_execution#1:private",
+    "fn:cargo_runner_records_the_actual_selected_test_artifact#1:private",
+    "fn:declared_module_selectors_cannot_match_neighbor_or_absent_tests#1:private",
+    "fn:merge_requires_each_declared_runner_and_exact_coverage_digest#1/use:memcordon_ci :: source_registry :: observation :: { attest_bytes , validate_merge }#1:private",
+    "fn:merge_requires_each_declared_runner_and_exact_coverage_digest#1:private",
+    "fn:native_adapter_preserves_exact_selector_and_measures_executed_binary#1:private",
+    "fn:native_list_requires_unique_test_records#1:private",
+    "fn:route#1:private",
+    "fn:runner_configuration_is_structured_argv_even_for_spaces_and_metacharacters#1:private",
+    "fn:skipped_or_unexecuted_tests_cannot_be_promoted_to_successful_coverage#1:private",
+    "use:memcordon_ci :: source_registry :: coverage :: { Coverage , Evidence , SkipPolicy , parse_test_list }#1:private",
+    "use:memcordon_ci :: source_registry :: native_runner#1:private",
+    "use:std :: collections :: BTreeSet#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "tools.memcordon-ci.tests.source_identity"
+path = "tools/memcordon-ci/tests/source_identity.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["source_identity retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-ci:test:source_identity:features=[]"]
+routes = ["cargo:memcordon-ci:test:source_identity:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:certification_rejects_unknown_before_resolving_artifacts#1/use:memcordon_ci :: certification_context :: ExpectedCertificationOrigin#1:private",
+    "fn:certification_rejects_unknown_before_resolving_artifacts#1:private",
+    "fn:publication_requires_full_source_identity#1/use:memcordon_ci :: source_identity :: validate#1:private",
+    "fn:publication_requires_full_source_identity#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "tools.memcordon-ci.tests.source_registry"
 path = "tools/memcordon-ci/tests/source_registry.rs"
 owner = "tests"
@@ -6068,6 +6400,7 @@ item_visibility = [
 platforms = ["portable"]
 work_packages = [
     "GOV-01",
+    "GOV-02",
     "TEST-02",
 ]
 decision = "Maintain explicit ownership and validate source inventory changes."

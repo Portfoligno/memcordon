@@ -119,6 +119,91 @@ fn same_identity(expected: Identity) -> io::Result<bool> {
     }))
 }
 
+fn convert_clock_ticks(ticks: u64, numerator: u32, denominator: u32) -> io::Result<u64> {
+    let wide = u128::from(ticks) * u128::from(numerator);
+    let nanos = wide
+        .checked_div(u128::from(denominator))
+        .ok_or_else(|| io::Error::other("Mach timebase unavailable"))?;
+    u64::try_from(nanos).map_err(io::Error::other)
+}
+
+fn validate_deadline_vectors() -> Result<Vec<serde_json::Value>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Conversion {
+        name: String,
+        ticks: u64,
+        numerator: u32,
+        denominator: u32,
+        expected: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Addition {
+        name: String,
+        origin: u64,
+        budget: u64,
+        expected: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Remaining {
+        name: String,
+        force: u64,
+        observed: u64,
+        reserve: u64,
+        expected: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Vectors {
+        schema_version: u32,
+        timebase: Vec<Conversion>,
+        addition: Vec<Addition>,
+        remaining: Vec<Remaining>,
+    }
+    let vectors: Vectors =
+        serde_json::from_str(include_str!("../../../spec/vectors/macos-deadline-v1.json"))?;
+    if vectors.schema_version != 1
+        || vectors.timebase.is_empty()
+        || vectors.addition.is_empty()
+        || vectors.remaining.is_empty()
+    {
+        return Err("invalid independent deadline vector inventory".into());
+    }
+    let mut observations = Vec::new();
+    let mut record = |name: String, actual: Option<u64>, expected: Option<u64>| -> Result<()> {
+        if actual != expected {
+            return Err(format!("independent deadline vector mismatch: {name}").into());
+        }
+        observations
+            .push(serde_json::json!({"name": name, "actual": actual, "expected": expected}));
+        Ok(())
+    };
+    for case in vectors.timebase {
+        record(
+            case.name,
+            convert_clock_ticks(case.ticks, case.numerator, case.denominator).ok(),
+            case.expected,
+        )?;
+    }
+    for case in vectors.addition {
+        record(
+            case.name,
+            case.origin.checked_add(case.budget),
+            case.expected,
+        )?;
+    }
+    for case in vectors.remaining {
+        let actual = case
+            .force
+            .checked_add(case.reserve)
+            .map(|expiry| expiry.saturating_sub(case.observed));
+        record(case.name, actual, case.expected)?;
+    }
+    Ok(observations)
+}
+
 fn clock() -> io::Result<u64> {
     #[repr(C)]
     struct Timebase {
@@ -134,8 +219,7 @@ fn clock() -> io::Result<u64> {
         return Err(io::Error::other("Mach timebase unavailable"));
     }
     let ticks = unsafe { mach_continuous_time() };
-    u64::try_from(u128::from(ticks) * u128::from(info.numer) / u128::from(info.denom))
-        .map_err(io::Error::other)
+    convert_clock_ticks(ticks, info.numer, info.denom)
 }
 
 #[derive(Serialize)]
@@ -422,6 +506,12 @@ fn fixture(mode: &str, marker: &Path) -> Result<()> {
 
 pub(super) fn run() -> Result<()> {
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if arguments.as_slice() == [OsString::from("--deadline-vectors")] {
+        let observations = validate_deadline_vectors()?;
+        serde_json::to_writer(std::io::stdout(), &observations)?;
+        println!();
+        return Ok(());
+    }
     if arguments.first().is_some_and(|value| value == "--fixture") && arguments.len() == 3 {
         return fixture(
             arguments[1].to_str().ok_or("invalid fixture mode")?,
@@ -434,6 +524,10 @@ pub(super) fn run() -> Result<()> {
     let executable = PathBuf::from(&arguments[0]);
     let evidence = PathBuf::from(&arguments[1]);
     fs::create_dir_all(&evidence)?;
+    fs::write(
+        evidence.join("deadline-vectors.json"),
+        serde_json::to_vec_pretty(&validate_deadline_vectors()?)?,
+    )?;
     fs::write(
         evidence.join("begin.json"),
         b"{\"schema_version\":1,\"status\":\"started\"}\n",

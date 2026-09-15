@@ -1279,6 +1279,13 @@ item_visibility = [
     "enum:RetirementObligation#1/variant:WorkloadPolicy#1:enum-member",
     "enum:RetirementObligation#1:pub",
     "fn:bounded_obligations#1:private",
+    "impl:ReleaseEvidence:Deserialize < 'de >#1/method:deserialize#1/enum:Wire#1/variant:Issued#1/field:at#1:private",
+    "impl:ReleaseEvidence:Deserialize < 'de >#1/method:deserialize#1/enum:Wire#1/variant:Issued#1/field:exec_confirmed#1:private",
+    "impl:ReleaseEvidence:Deserialize < 'de >#1/method:deserialize#1/enum:Wire#1/variant:Issued#1:enum-member",
+    "impl:ReleaseEvidence:Deserialize < 'de >#1/method:deserialize#1/enum:Wire#1/variant:NotIssued#1:enum-member",
+    "impl:ReleaseEvidence:Deserialize < 'de >#1/method:deserialize#1/enum:Wire#1/variant:Unknown#1:enum-member",
+    "impl:ReleaseEvidence:Deserialize < 'de >#1/method:deserialize#1/enum:Wire#1:private",
+    "impl:ReleaseEvidence:Deserialize < 'de >#1/method:deserialize#1:private",
     "impl:RetirementEvidence:#1/method:is_complete#1:pub",
     "impl:RuntimeEvidenceV1:#1/method:is_consistent#1:pub",
     "impl:RuntimeEvidenceV1:Deserialize < 'de >#1/method:deserialize#1/struct:Wire#1/field:attempt_origin#1:private",
@@ -1325,6 +1332,8 @@ work_packages = [
     "GOV-01",
     "GOV-05",
     "MAC-06",
+    "GOV-03",
+    "TEST-02",
 ]
 decision = "Retain the V1 contract, add golden vectors and a dedicated fuzzer, document extension/version rules, and test parity with records emitted by CLI/platform code."
 

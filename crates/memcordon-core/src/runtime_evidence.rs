@@ -15,12 +15,32 @@ pub enum ClockDomain {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ReleaseEvidence {
     NotIssued,
     Issued { at: u64, exec_confirmed: bool },
     Unknown,
+}
+
+impl<'de> Deserialize<'de> for ReleaseEvidence {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Empty struct variants enforce unknown-field rejection, unlike serde's
+        // internally tagged unit variants. The public representation and all
+        // valid serialized bytes remain unchanged.
+        #[derive(Deserialize)]
+        #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+        enum Wire {
+            NotIssued {},
+            Issued { at: u64, exec_confirmed: bool },
+            Unknown {},
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::NotIssued {} => Self::NotIssued,
+            Wire::Issued { at, exec_confirmed } => Self::Issued { at, exec_confirmed },
+            Wire::Unknown {} => Self::Unknown,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -90,7 +110,7 @@ impl RetirementEvidence {
 
 /// Describes preparation only: an execution report cannot certify its own write.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DeliveryEvidence {
     NotSubmitted,
     Prepared,
