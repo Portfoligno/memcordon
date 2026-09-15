@@ -1,21 +1,17 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-
-#[cfg(target_os = "linux")]
-#[path = "../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/envelope.rs"]
-mod envelope;
-#[cfg(target_os = "linux")]
-#[path = "../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/request.rs"]
-mod request;
+use memcordon_core::sealed_provider::envelope::parse_namespace_identity;
 
 fuzz_target!(|data: &[u8]| {
-    if let Ok(identity) = std::str::from_utf8(data) {
-        #[cfg(target_os = "linux")]
-        let _ = envelope::parse_namespace_identity(identity, "pid");
-        #[cfg(not(target_os = "linux"))]
-        let _ = identity
-            .strip_prefix("pid:[")
-            .and_then(|value| value.strip_suffix(']'));
+    if let Ok(identity) = std::str::from_utf8(data)
+        && let Ok(inode) = parse_namespace_identity(identity, "pid")
+    {
+        assert_eq!(
+            parse_namespace_identity(&format!("pid:[{inode}]"), "pid"),
+            Ok(inode)
+        );
+        assert!(parse_namespace_identity(identity, "mnt").is_err());
+        assert!(parse_namespace_identity(&format!("{identity}trailing"), "pid").is_err());
     }
 });

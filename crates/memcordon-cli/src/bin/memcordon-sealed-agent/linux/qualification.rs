@@ -217,7 +217,8 @@ fn qualify_after_package_verification() -> Result<QualificationReceipt, String> 
         digest.update(facts.caller_envelope_digest.as_bytes());
     }
     let receipt = QualificationReceipt {
-        schema_version: 3,
+        schema_version:
+            memcordon_core::sealed_provider::qualification::QUALIFICATION_SCHEMA_VERSION,
         workload_profile: memcordon_core::workload_registry::BaselineProfile::LinuxUnixCreate
             .reference(),
         workload_profile_probe_verified: profile_verified,

@@ -28,6 +28,17 @@ mod windows;
 include!(concat!(env!("OUT_DIR"), "/source_commit.rs"));
 
 fn main() {
+    #[cfg(feature = "test-support")]
+    if std::env::args_os()
+        .skip(1)
+        .eq([std::ffi::OsString::from("--provider-contract-fingerprint")])
+    {
+        println!(
+            "{}",
+            memcordon_core::sealed_provider::fingerprint::provider_contract_fingerprint()
+        );
+        return;
+    }
     let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
     if arguments.len() == 1 && arguments[0].as_os_str() == OsStr::new("--version") {
         println!(

@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod linux_fault_contract;
 pub mod runtime_evidence;
 pub mod runtime_manifest;
+pub mod sealed_provider;
 pub use runtime_evidence::*;
 pub mod workload_codec;
 pub mod workload_contract;

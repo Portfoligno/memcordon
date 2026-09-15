@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
-#[path = "../src/bin/memcordon-sealed-agent/inspection_schema.rs"]
-mod schema;
+use memcordon_core::sealed_provider::inspection as schema;
 
 use memcordon_core::runtime_manifest::{
     InstalledPolicyObservationV1, NativeProviderProtocols, QualificationArtifactReferenceV1,

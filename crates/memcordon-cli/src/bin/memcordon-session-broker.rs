@@ -21,6 +21,17 @@ mod windows;
 include!(concat!(env!("OUT_DIR"), "/source_commit.rs"));
 
 fn main() {
+    #[cfg(feature = "test-support")]
+    if std::env::args_os()
+        .skip(1)
+        .eq([std::ffi::OsString::from("--provider-contract-fingerprint")])
+    {
+        println!(
+            "{}",
+            memcordon_core::sealed_provider::fingerprint::provider_contract_fingerprint()
+        );
+        return;
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version")) {
         println!("memcordon-session-broker {}", env!("CARGO_PKG_VERSION"));
         return;

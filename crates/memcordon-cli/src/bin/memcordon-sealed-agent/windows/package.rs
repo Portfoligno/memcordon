@@ -3599,7 +3599,7 @@ pub fn installed_inspection(
         _ => return Err("unsupported installed inspection architecture".into()),
     };
     Ok(InstalledProviderInspectionV4 {
-        schema_version: 5,
+        schema_version: memcordon_core::sealed_provider::inspection::INSPECTION_SCHEMA_VERSION,
         agent,
         installed_executable_sha256,
         installed_artifacts_valid: true,

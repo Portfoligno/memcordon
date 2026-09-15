@@ -34,6 +34,17 @@ Provider installation and mutation require root. Inspection is credential-free.
 ";
 
 fn main() {
+    #[cfg(feature = "test-support")]
+    if std::env::args_os()
+        .skip(1)
+        .eq([std::ffi::OsString::from("--provider-contract-fingerprint")])
+    {
+        println!(
+            "{}",
+            memcordon_core::sealed_provider::fingerprint::provider_contract_fingerprint()
+        );
+        return;
+    }
     #[cfg(target_os = "windows")]
     let entry_thread_token_transition =
         windows::token::revert_entry_thread_token().unwrap_or_else(|_| std::process::abort());

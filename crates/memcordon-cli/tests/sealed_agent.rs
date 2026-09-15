@@ -9,16 +9,13 @@ mod policy_registry;
 #[path = "sealed_agent/policy_revocation.rs"]
 mod policy_revocation;
 
-#[path = "../src/bin/memcordon-sealed-agent/inspection_schema.rs"]
-mod inspection_schema;
+use memcordon_core::sealed_provider::inspection as inspection_schema;
 #[path = "../src/bin/memcordon-sealed-agent/package.rs"]
 mod package;
-#[path = "../src/bin/memcordon-sealed-agent/protocol.rs"]
-mod protocol;
+use memcordon_core::sealed_provider::protocol;
 #[path = "../src/bin/memcordon-sealed-agent/rejection.rs"]
 mod rejection;
-#[path = "../src/bin/memcordon-sealed-agent/request.rs"]
-mod request;
+use memcordon_core::sealed_provider::request;
 
 #[cfg(target_os = "linux")]
 #[path = "../src/bin/memcordon-sealed-agent/linux/mod.rs"]

@@ -3592,13 +3592,13 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
     )?;
     require_credential_transition_fragments(
         root,
-        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/protocol.rs",
+        "crates/memcordon-core/src/sealed_provider/protocol.rs",
         &["pub const PROTOCOL_VERSION: u16 = 3;"],
         &["linux-pid-namespace-cgroup-v1"],
     )?;
     require_credential_transition_fragments(
         root,
-        "crates/memcordon-cli/src/bin/memcordon-sealed-agent/request.rs",
+        "crates/memcordon-core/src/sealed_provider/request.rs",
         &[
             "pub const LAUNCH_REQUEST_VERSION: u16 = 3;",
             "pub const LAUNCH_BROKER_REQUEST_VERSION: u16 = 3;",

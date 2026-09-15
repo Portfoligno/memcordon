@@ -154,7 +154,7 @@ pub(crate) fn inspect() -> Result<AgentPackageInspectionV4, String> {
         crate::windows::package::compiled_metadata()?,
     );
     Ok(AgentPackageInspectionV4 {
-        schema_version: 5,
+        schema_version: memcordon_core::sealed_provider::inspection::INSPECTION_SCHEMA_VERSION,
         native_protocols: if cfg!(target_os = "windows") {
             memcordon_core::runtime_manifest::NativeProviderProtocols::Windows {
                 provider_contract: 3,
@@ -209,7 +209,7 @@ fn installed_inspection() -> Result<InstalledProviderInspectionV4, String> {
             Err(_) => memcordon_core::runtime_manifest::InstalledPolicyObservationV1::Unavailable,
         };
         Ok(InstalledProviderInspectionV4 {
-            schema_version: 5,
+            schema_version: memcordon_core::sealed_provider::inspection::INSPECTION_SCHEMA_VERSION,
             agent,
             installed_executable_sha256,
             installed_artifacts_valid: true,
@@ -231,7 +231,7 @@ fn installed_inspection() -> Result<InstalledProviderInspectionV4, String> {
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         Ok(InstalledProviderInspectionV4 {
-            schema_version: 5,
+            schema_version: memcordon_core::sealed_provider::inspection::INSPECTION_SCHEMA_VERSION,
             agent,
             installed_executable_sha256: String::new(),
             installed_artifacts_valid: false,

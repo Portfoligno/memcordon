@@ -25,6 +25,27 @@ fn native_runtime() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn signal_report_diagnostic(path: &Path) -> String {
+    use std::io::Read;
+    // A diagnostic cap, not an acceptance limit: the ordinary report assertions
+    // below still decode the complete report on every successful execution.
+    const MAX_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
+    let result = (|| -> std::io::Result<Vec<u8>> {
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take((MAX_DIAGNOSTIC_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })();
+    match result {
+        Ok(bytes) if bytes.len() <= MAX_DIAGNOSTIC_BYTES => {
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+        Ok(_) => "report exceeds bounded diagnostic capture (1 MiB)".into(),
+        Err(error) => format!("unavailable: {error}"),
+    }
+}
+
 fn public_signal_policy(signal: &str, number: i32) {
     use std::os::unix::process::ExitStatusExt;
 
@@ -46,7 +67,13 @@ fn public_signal_policy(signal: &str, number: i32) {
             let survives = matches!(policy, "ignored" | "blocked-default");
             assert_eq!(marker.with_extension("completed").exists(), survives);
             if survives {
-                assert!(output.status.success(), "{signal}/{policy}/{route}");
+                assert!(
+                    output.status.success(),
+                    "{signal}/{policy}/{route}: status={:?}; stderr={}; report={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr),
+                    signal_report_diagnostic(&marker.with_extension("json")),
+                );
             } else if route == "direct" {
                 assert_eq!(output.status.signal(), Some(number));
             } else {

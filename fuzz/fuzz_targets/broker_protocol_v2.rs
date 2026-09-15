@@ -4,10 +4,8 @@ use std::io::Cursor;
 
 use libfuzzer_sys::fuzz_target;
 
-#[path = "../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/protocol.rs"]
-mod protocol;
-#[path = "../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/request.rs"]
-mod request;
+use memcordon_core::sealed_provider::protocol;
+use memcordon_core::sealed_provider::request;
 fuzz_target!(|data: &[u8]| {
     if let Ok(frame) = protocol::read_frame(&mut Cursor::new(data)) {
         let mut encoded = Vec::new();
@@ -23,7 +21,10 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(decoded) = request::decode_launch_broker_request(data) {
         let encoded = request::encode_launch_broker_request(&decoded)
             .expect("validated broker request is encodable");
-        assert_eq!(request::decode_launch_broker_request(&encoded).unwrap(), decoded);
+        assert_eq!(
+            request::decode_launch_broker_request(&encoded).unwrap(),
+            decoded
+        );
         let mut altered = decoded.clone();
         altered.request_authentication_binding[0] ^= 1;
         assert!(request::encode_launch_broker_request(&altered).is_err());
