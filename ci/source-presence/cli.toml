@@ -1,0 +1,1254 @@
+schema = 1
+
+[[source]]
+id = "crates.memcordon-cli.build"
+path = "crates/memcordon-cli/build.rs"
+owner = "cli"
+kind = "build"
+visibility = "binary-private"
+disposition = "harden"
+protected_invariants = ["build retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon:custom-build:build-script-build:features=[]"]
+routes = ["cargo:memcordon:custom-build:build-script-build:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:git_directory#1:private",
+    "fn:main#1:private",
+    "fn:packaged_commit#1:private",
+    "fn:valid_commit#1:private",
+    "fn:watch_git_identity#1:private",
+    "fn:workspace_commit#1:private",
+    "use:std :: fs#1:private",
+    "use:std :: io :: Write#1:private",
+    "use:std :: path :: { Path , PathBuf }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-07",
+]
+decision = "Keep a thin build script, extract deterministic source-identity selection into testable pure helpers, prefer `.cargo_vcs_info.json`, and make release/preflight reject `unknown` identities."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-embedding-fixture"
+path = "crates/memcordon-cli/src/bin/memcordon-embedding-fixture.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["memcordon-embedding-fixture retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ['cargo:memcordon:bin:memcordon-embedding-fixture:features=["test-fixtures"]']
+routes = ['cargo:memcordon:bin:memcordon-embedding-fixture:features=["test-fixtures"]']
+cfg = [
+    'fn:main#1/local:114#1:cfg(target_os = "linux")',
+    'fn:main#1/local:6#1:cfg(target_os = "linux")',
+    'use:memcordon :: MemcordonExecutable#1:cfg(target_os = "linux")',
+]
+item_visibility = [
+    "fn:main#1:private",
+    "use:memcordon :: MemcordonExecutable#1:private",
+    "use:memcordon :: exit_mapping :: { error_exit_code , outcome_exit_code }#1:private",
+    "use:memcordon :: invocation :: LimitToken#1:private",
+    "use:memcordon :: { CommandSpec , Enforcement , Limiter , Policy }#1:private",
+    "use:std :: ffi :: OsString#1:private",
+    "use:std :: fs :: File#1:private",
+    "use:std :: sync :: Arc#1:private",
+    "use:std :: sync :: atomic :: { AtomicBool , Ordering }#1:private",
+    "use:std :: thread#1:private",
+    "use:std :: time :: Duration#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-07",
+]
+decision = "Retain with an explicit source-registry owner, consumer, invariant, visibility tier, and acceptance evidence; make no structural change unless the boundary review fails."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-test-fixture.credentials"
+path = "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/credentials.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Sealed fixture credential transition assertions and descendants."]
+consumers = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/main.rs:credentials:private:["cfg(target_os = \"linux\")"]']
+routes = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/main.rs:credentials:private:["cfg(target_os = \"linux\")"]']
+cfg = [
+    'fn:capability_bounding_set#1:cfg(target_os = "linux")',
+    'fn:spawn_elevated_transition_descendant#1:cfg(target_os = "linux")',
+]
+item_visibility = [
+    "fn:capability_bounding_set#1:private",
+    "fn:command_assert_bounding_capability_absent#1:pub(super)",
+    "fn:command_assert_credential_transition_root#1:pub(super)",
+    "fn:command_assert_effective_uid#1:pub(super)",
+    "fn:command_assert_file_capability_transition#1:pub(super)",
+    "fn:command_elevated_transition_descendant#1:pub(super)",
+    "fn:command_identity#1:pub(super)",
+    "fn:spawn_elevated_transition_descendant#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "PROV-07",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-test-fixture"
+path = "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/main.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["main retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ['cargo:memcordon:bin:memcordon-sealed-test-fixture:features=["test-support"]']
+routes = ['cargo:memcordon:bin:memcordon-sealed-test-fixture:features=["test-support"]']
+cfg = [
+    'fn:main#1/expression:24#1:cfg(target_os = "linux")',
+    'fn:main#1/expression:52#1:cfg(not (target_os = "linux"))',
+    'mod:credentials#1:cfg(target_os = "linux")',
+    'mod:namespace#1:cfg(target_os = "linux")',
+    'mod:process#1:cfg(target_os = "linux")',
+]
+item_visibility = [
+    "fn:main#1:private",
+    "mod:credentials#1:private",
+    "mod:namespace#1:private",
+    "mod:process#1:private",
+    "mod:registry#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-07",
+    "PROV-07",
+    "TEST-02",
+]
+decision = "Apply the same fixture-command registry pattern; keep sealed-only modes under `test-support` and prove archive exclusion."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-test-fixture.namespace"
+path = "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/namespace.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Sealed fixture cgroup, namespace, mount, and recursion assertions."]
+consumers = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/main.rs:namespace:private:["cfg(target_os = \"linux\")"]']
+routes = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/main.rs:namespace:private:["cfg(target_os = \"linux\")"]']
+cfg = []
+item_visibility = [
+    "fn:command_assert_mount_marker#1:pub(super)",
+    "fn:command_assert_recursive_provider_rejected#1:pub(super)",
+    "fn:command_deny_cgroup#1:pub(super)",
+    "fn:command_deny_cgroup_mount#1:pub(super)",
+    "fn:command_deny_setns#1/expression:14#1/local:15#1/expression:16#1/expression:21#1/expression:22#1/use:std :: os :: fd :: AsRawFd#1:private",
+    "fn:command_deny_setns#1:pub(super)",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "PROV-07",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-test-fixture.process"
+path = "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/process.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Sealed fixture process, stream, and readiness handlers."]
+consumers = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/main.rs:process:private:["cfg(target_os = \"linux\")"]']
+routes = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/main.rs:process:private:["cfg(target_os = \"linux\")"]']
+cfg = []
+item_visibility = [
+    "fn:command_child#1:pub(super)",
+    "fn:command_concurrency_gate#1:pub(super)",
+    "fn:command_double_fork#1:pub(super)",
+    "fn:command_exit#1:pub(super)",
+    "fn:command_exit_126#1:pub(super)",
+    "fn:command_exit_127#1:pub(super)",
+    "fn:command_exit_17#1:pub(super)",
+    "fn:command_fault_ready#1:pub(super)",
+    "fn:command_fork_storm#1:pub(super)",
+    "fn:command_frontend_exit_before_ready#1:pub(super)",
+    "fn:command_frontend_hold#1:pub(super)",
+    "fn:command_mark#1:pub(super)",
+    "fn:command_retained_stream#1:pub(super)",
+    "fn:command_setsid#1:pub(super)",
+    "use:std :: io :: Write as _#1:private",
+    "use:std :: os :: unix :: fs :: OpenOptionsExt as _#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "PROV-07",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-test-fixture.registry"
+path = "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/registry.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Sealed fixture command/argument-parser authority and side-effect inventory."]
+consumers = ["module:crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/main.rs:registry:private:[]"]
+routes = ["module:crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/main.rs:registry:private:[]"]
+cfg = ['struct:FixtureCommand#1/field:handler#1:cfg(target_os = "linux")']
+item_visibility = [
+    "const:COMMANDS#1:pub(super)",
+    "struct:FixtureCommand#1/field:argument_parser#1:pub",
+    "struct:FixtureCommand#1/field:available#1:pub",
+    "struct:FixtureCommand#1/field:expected_side_effects#1:pub",
+    "struct:FixtureCommand#1/field:handler#1:pub",
+    "struct:FixtureCommand#1/field:name#1:pub",
+    "struct:FixtureCommand#1/field:owner#1:pub",
+    "struct:FixtureCommand#1/field:owning_suites#1:pub",
+    "struct:FixtureCommand#1/field:platform_cfg#1:pub",
+    "struct:FixtureCommand#1/field:privilege_needs#1:pub",
+    "struct:FixtureCommand#1:pub(super)",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "PROV-07",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-session-broker"
+path = "crates/memcordon-cli/src/bin/memcordon-session-broker.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "harden"
+protected_invariants = ["memcordon-session-broker retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon:bin:memcordon-session-broker:features=[]"]
+routes = ["cargo:memcordon:bin:memcordon-session-broker:features=[]"]
+cfg = [
+    'fn:main#1/expression:31#1:cfg(target_os = "windows")',
+    'fn:main#1/expression:45#1:cfg(not (target_os = "windows"))',
+    'fn:main#1/expression:7#1:cfg(feature = "test-support")',
+    'macro:include#1:cfg(target_os = "windows")',
+    'mod:admission#1:cfg(target_os = "windows")',
+    'mod:inspection_schema#1:cfg(target_os = "windows")',
+    'mod:package#1:cfg(target_os = "windows")',
+    'mod:policy_registry#1:cfg(target_os = "windows")',
+    'mod:protocol#1:cfg(target_os = "windows")',
+    'mod:windows#1:cfg(target_os = "windows")',
+]
+item_visibility = [
+    "fn:main#1:private",
+    "mod:admission#1:private",
+    "mod:inspection_schema#1:private",
+    "mod:package#1:private",
+    "mod:policy_registry#1:private",
+    "mod:protocol#1:private",
+    "mod:windows#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-07",
+    "PROV-01",
+]
+decision = "Retain with an explicit source-registry owner, consumer, invariant, visibility tier, and acceptance evidence; make no structural change unless the boundary review fails."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-target-desktop-bootstrap"
+path = "crates/memcordon-cli/src/bin/memcordon-target-desktop-bootstrap.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "harden"
+protected_invariants = ["memcordon-target-desktop-bootstrap retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon:bin:memcordon-target-desktop-bootstrap:features=[]"]
+routes = ["cargo:memcordon:bin:memcordon-target-desktop-bootstrap:features=[]"]
+cfg = [
+    ':cfg_attr(feature = "test-support" , allow (dead_code))',
+    'fn:main#1/expression:39#1:cfg(target_os = "windows")',
+    'fn:main#1/expression:7#1:cfg(feature = "test-support")',
+    'fn:main#1/expression:87#1:cfg(not (target_os = "windows"))',
+    'macro:compile_error#1:cfg(all (target_os = "windows" , not (memcordon_static_vcruntime)))',
+    'macro:include#1:cfg(target_os = "windows")',
+    'mod:admission#1:cfg(target_os = "windows")',
+    'mod:inspection_schema#1:cfg(target_os = "windows")',
+    'mod:package#1:cfg(target_os = "windows")',
+    'mod:policy_registry#1:cfg(target_os = "windows")',
+    'mod:protocol#1:cfg(target_os = "windows")',
+    'mod:windows#1:cfg(target_os = "windows")',
+]
+item_visibility = [
+    "fn:main#1:private",
+    "mod:admission#1:private",
+    "mod:inspection_schema#1:private",
+    "mod:package#1:private",
+    "mod:policy_registry#1:private",
+    "mod:protocol#1:private",
+    "mod:windows#1:private",
+    "use:std :: ffi :: { OsStr , OsString }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-07",
+    "PROV-01",
+]
+decision = "Retain with an explicit source-registry owner, consumer, invariant, visibility tier, and acceptance evidence; make no structural change unless the boundary review fails."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.io"
+path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/io.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Fixture io handlers; invoked only through the command registry."]
+consumers = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:io:private:[]"]
+routes = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:io:private:[]"]
+cfg = []
+item_visibility = [
+    "fn:assert_no_memcordon_environment#1:pub(super)",
+    "fn:command_assert_no_memcordon_environment#1:pub(super)",
+    "fn:command_gate_failure#1:pub(super)",
+    "fn:command_gate_marker#1:pub(super)",
+    "fn:command_gate_wait#1:pub(super)",
+    "fn:command_record_argv#1:pub(super)",
+    "fn:gate_failure#1:pub(super)",
+    "fn:gate_marker#1:pub(super)",
+    "fn:gate_wait#1:pub(super)",
+    "fn:record_argv#1:pub(super)",
+    "use:super :: *#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "PROV-07",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.macos"
+path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/macos.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Fixture macos handlers; invoked only through the command registry."]
+consumers = ['module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:macos:private:["cfg(target_os = \"macos\")"]']
+routes = ['module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:macos:private:["cfg(target_os = \"macos\")"]']
+cfg = [
+    'fn:fixture_caught_signal#1:cfg(target_os = "macos")',
+    'fn:fixture_signal#1:cfg(target_os = "macos")',
+    'fn:macos_signal_parent#1:cfg(target_os = "macos")',
+    'fn:macos_signal_target#1:cfg(target_os = "macos")',
+    'fn:open_descriptors#1:cfg(target_os = "macos")',
+]
+item_visibility = [
+    "fn:command_macos_accounting_backend#1:pub(super)",
+    "fn:command_macos_closed_stdio#1/expression:1145#1/use:std :: os :: unix :: process :: CommandExt#1:private",
+    "fn:command_macos_closed_stdio#1:pub(super)",
+    "fn:command_macos_custody_wrapper#1:pub(super)",
+    "fn:command_macos_envelope_caller#1/expression:420#1/use:std :: os :: fd :: AsRawFd#1:private",
+    "fn:command_macos_envelope_caller#1:pub(super)",
+    "fn:command_macos_envelope_parent#1/expression:505#1/use:std :: os :: fd :: { AsRawFd , FromRawFd , OwnedFd }#1:private",
+    "fn:command_macos_envelope_parent#1/expression:505#1/use:std :: os :: unix :: ffi :: OsStringExt#1:private",
+    "fn:command_macos_envelope_parent#1:pub(super)",
+    "fn:command_macos_envelope_target#1/expression:727#1/use:std :: os :: unix :: ffi :: OsStrExt#1:private",
+    "fn:command_macos_envelope_target#1/expression:727#1/use:std :: os :: unix :: fs :: { MetadataExt , PermissionsExt }#1:private",
+    "fn:command_macos_envelope_target#1:pub(super)",
+    "fn:command_macos_envelope_transfer#1:pub(super)",
+    "fn:command_macos_gated_group_change#1:pub(super)",
+    "fn:command_macos_guardian#1:pub(super)",
+    "fn:command_macos_guardian_inspector_wrapper#1:pub(super)",
+    "fn:command_macos_ignore_term#1:pub(super)",
+    "fn:command_macos_signal_parent#1:pub(super)",
+    "fn:command_macos_signal_target#1:pub(super)",
+    "fn:fixture_caught_signal#1:private",
+    "fn:fixture_signal#1:pub(super)",
+    "fn:macos_signal_parent#1/use:std :: os :: unix :: process :: CommandExt#1:private",
+    "fn:macos_signal_parent#1:pub(super)",
+    "fn:macos_signal_target#1:pub(super)",
+    "fn:open_descriptors#1:pub(super)",
+    "use:super :: *#1:private",
+]
+platforms = [
+    "macos-x64",
+    "macos-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "PROV-07",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture"
+path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["main retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ['cargo:memcordon:bin:memcordon-test-fixture:features=["test-fixtures"]']
+routes = ['cargo:memcordon:bin:memcordon-test-fixture:features=["test-fixtures"]']
+cfg = ['mod:macos#1:cfg(target_os = "macos")']
+item_visibility = [
+    "fn:fail#1:private",
+    "fn:main#1:private",
+    "fn:parse_duration#1:private",
+    "fn:parse_pid_duration_and_completion#1:private",
+    "fn:take_value#1:private",
+    "fn:write_pid#1:private",
+    "mod:io#1:private",
+    "mod:macos#1:private",
+    "mod:memory#1:private",
+    "mod:network#1:private",
+    "mod:process#1:private",
+    "mod:registry#1:private",
+    "mod:windows#1:private",
+    "use:memcordon_core :: { ByteSize , NativeArgument }#1:private",
+    "use:std :: ffi :: { OsStr , OsString }#1:private",
+    "use:std :: fs#1:private",
+    "use:std :: io :: { self as std_io , Write }#1:private",
+    "use:std :: path :: { Path , PathBuf }#1:private",
+    "use:std :: process :: { Child , Command , Stdio }#1:private",
+    "use:std :: str :: FromStr#1:private",
+    "use:std :: thread#1:private",
+    "use:std :: time :: { Duration , Instant }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-07",
+    "PROV-07",
+    "TEST-02",
+]
+decision = "Move handlers into domain modules behind a declarative fixture-command registry that records platforms and owning suites; keep one feature-gated binary identity."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.memory"
+path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/memory.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Fixture memory handlers; invoked only through the command registry."]
+consumers = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:memory:private:[]"]
+routes = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:memory:private:[]"]
+cfg = []
+item_visibility = [
+    "fn:allocate#1:pub(super)",
+    "fn:command_allocate#1:pub(super)",
+    "fn:command_burst#1:pub(super)",
+    "fn:touch_allocation#1:pub(super)",
+    "use:super :: *#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "PROV-07",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.network"
+path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/network.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Fixture network handlers; invoked only through the command registry."]
+consumers = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:network:private:[]"]
+routes = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:network:private:[]"]
+cfg = []
+item_visibility = [
+    "fn:command_tcp_client#1:pub(super)",
+    "fn:command_tcp_loopback#1:pub(super)",
+    "fn:tcp_client#1/use:std :: io :: { Read , Write }#1:private",
+    "fn:tcp_client#1:pub(super)",
+    "fn:tcp_loopback#1/use:std :: io :: { Read , Write }#1:private",
+    "fn:tcp_loopback#1:pub(super)",
+    "use:super :: *#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "PROV-07",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.process"
+path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/process.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Fixture process handlers; invoked only through the command registry."]
+consumers = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:process:private:[]"]
+routes = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:process:private:[]"]
+cfg = [
+    "fn:new_session_and_hold#1:cfg(unix)",
+    "fn:new_session_and_hold#2:cfg(not (unix))",
+]
+item_visibility = [
+    "fn:assert_native_containment#1:pub(super)",
+    "fn:command_assert_native_containment#1:pub(super)",
+    "fn:command_exit#1:pub(super)",
+    "fn:command_fork_continually#1:pub(super)",
+    "fn:command_hold#1:pub(super)",
+    "fn:command_monitor_failure#1:pub(super)",
+    "fn:command_new_session_and_hold#1:pub(super)",
+    "fn:command_print_pid_and_hold#1:pub(super)",
+    "fn:command_spawn_background#1:pub(super)",
+    "fn:command_spawn_tree#1:pub(super)",
+    "fn:command_spin#1:pub(super)",
+    "fn:exit_fixture#1:pub(super)",
+    "fn:fork_continually#1:pub(super)",
+    "fn:hold#1:pub(super)",
+    "fn:new_session_and_hold#1:pub(super)",
+    "fn:new_session_and_hold#2:pub(super)",
+    "fn:spawn_background#1:pub(super)",
+    "fn:spawn_tree#1:pub(super)",
+    "use:super :: *#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "PROV-07",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.registry"
+path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/registry.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Declarative command authority and argument-parser inventory."]
+consumers = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:registry:private:[]"]
+routes = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:registry:private:[]"]
+cfg = [
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:10#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:11#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:12#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:13#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:14#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:15#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:16#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:18#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:4#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:5#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:6#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:7#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:8#1:cfg(target_os = "macos")',
+    'const:COMMANDS#1/expression:2#1/expression:3#1/expression:9#1:cfg(target_os = "macos")',
+]
+item_visibility = [
+    "const:COMMANDS#1:pub(super)",
+    "struct:FixtureCommand#1/field:argument_parser#1:pub",
+    "struct:FixtureCommand#1/field:expected_side_effects#1:pub",
+    "struct:FixtureCommand#1/field:handler#1:pub",
+    "struct:FixtureCommand#1/field:name#1:pub",
+    "struct:FixtureCommand#1/field:owner#1:pub",
+    "struct:FixtureCommand#1/field:owning_suites#1:pub",
+    "struct:FixtureCommand#1/field:platform_cfg#1:pub",
+    "struct:FixtureCommand#1/field:privilege_needs#1:pub",
+    "struct:FixtureCommand#1:pub(super)",
+    "use:super :: *#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "PROV-07",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.windows"
+path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/windows.rs"
+owner = "cli"
+kind = "fixture"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Fixture windows handlers; invoked only through the command registry."]
+consumers = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:windows:private:[]"]
+routes = ["module:crates/memcordon-cli/src/bin/memcordon-test-fixture/main.rs:windows:private:[]"]
+cfg = [
+    "fn:attempt_job_breakaway#1:cfg(windows)",
+    "fn:attempt_job_breakaway#2:cfg(not (windows))",
+]
+item_visibility = [
+    "fn:attempt_job_breakaway#1/const:CREATE_BREAKAWAY_FROM_JOB#1:private",
+    "fn:attempt_job_breakaway#1/use:std :: os :: windows :: process :: CommandExt#1:private",
+    "fn:attempt_job_breakaway#1:pub(super)",
+    "fn:attempt_job_breakaway#2:pub(super)",
+    "fn:command_attempt_job_breakaway#1:pub(super)",
+    "use:super :: *#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "PROV-07",
+    "GOV-07",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-cli.src.commands"
+path = "crates/memcordon-cli/src/commands.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "harden"
+protected_invariants = ["commands retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["module:crates/memcordon-cli/src/main.rs:commands:private:[]"]
+routes = ["module:crates/memcordon-cli/src/main.rs:commands:private:[]"]
+cfg = [
+    "const:LAUNCHER_STATUS_ERROR#1:cfg(unix)",
+    "const:LAUNCHER_STATUS_LENGTH#1:cfg(unix)",
+    "const:LAUNCHER_STATUS_MAGIC#1:cfg(unix)",
+    "const:LAUNCHER_STATUS_READY#1:cfg(unix)",
+    "const:LAUNCHER_STATUS_VERSION#1:cfg(unix)",
+    'enum:InternalInvocation#1/variant:MacosEnvelopedGuardian#1:cfg(target_os = "macos")',
+    'enum:InternalInvocation#1/variant:MacosHelper#1:cfg(target_os = "macos")',
+    'enum:InternalInvocation#1/variant:MacosInspector#1:cfg(target_os = "macos")',
+    'enum:InternalInvocation#1/variant:ResultWriter#1:cfg(target_os = "macos")',
+    'enum:InternalInvocation#1/variant:ResultWriterFault#1:cfg(all (target_os = "macos" , feature = "test-fixtures"))',
+    'enum:InternalInvocation#1/variant:SynchronousStderrMutant#1:cfg(all (target_os = "macos" , feature = "test-fixtures"))',
+    'fn:execute_internal#1/expression:481#1:cfg(all (target_os = "macos" , feature = "test-fixtures"))',
+    'fn:execute_internal#1/expression:481#1:cfg(all (target_os = "macos" , feature = "test-fixtures"))',
+    'fn:execute_internal#1/expression:481#1:cfg(target_os = "macos")',
+    'fn:execute_internal#1/expression:481#1:cfg(target_os = "macos")',
+    'fn:execute_internal#1/expression:481#1:cfg(target_os = "macos")',
+    'fn:execute_internal#1/expression:481#1:cfg(target_os = "macos")',
+    "fn:guardian#1:cfg(unix)",
+    "fn:guardian#2:cfg(not (unix))",
+    "fn:launcher#1:cfg(unix)",
+    "fn:launcher#2:cfg(not (unix))",
+    'fn:route_internal#1/expression:104#1:cfg(all (target_os = "macos" , feature = "test-fixtures"))',
+    'fn:route_internal#1/expression:11#1:cfg(all (target_os = "macos" , feature = "test-fixtures"))',
+    'fn:route_internal#1/expression:156#1:cfg(target_os = "macos")',
+    'fn:route_internal#1/expression:207#1:cfg(target_os = "macos")',
+    'fn:route_internal#1/expression:245#1:cfg(target_os = "macos")',
+    'fn:route_internal#1/expression:30#1:cfg(target_os = "macos")',
+    "fn:write_launcher_status#1:cfg(unix)",
+    'mod:result_delivery#1:cfg(target_os = "macos")',
+]
+item_visibility = [
+    "const:LAUNCHER_STATUS_ERROR#1:private",
+    "const:LAUNCHER_STATUS_LENGTH#1:private",
+    "const:LAUNCHER_STATUS_MAGIC#1:private",
+    "const:LAUNCHER_STATUS_READY#1:private",
+    "const:LAUNCHER_STATUS_VERSION#1:private",
+    "enum:InternalInvocation#1/variant:Guardian#1/field:control_fd#1:private",
+    "enum:InternalInvocation#1/variant:Guardian#1/field:process_group#1:private",
+    "enum:InternalInvocation#1/variant:Guardian#1:enum-member",
+    "enum:InternalInvocation#1/variant:Launcher#1/field:command#1:private",
+    "enum:InternalInvocation#1/variant:Launcher#1/field:control_fd#1:private",
+    "enum:InternalInvocation#1/variant:Launcher#1/field:exec_status_fd#1:private",
+    "enum:InternalInvocation#1/variant:Launcher#1:enum-member",
+    "enum:InternalInvocation#1/variant:MacosEnvelopedGuardian#1/field:command#1:private",
+    "enum:InternalInvocation#1/variant:MacosEnvelopedGuardian#1/field:descriptor#1:private",
+    "enum:InternalInvocation#1/variant:MacosEnvelopedGuardian#1/field:envelope#1:private",
+    "enum:InternalInvocation#1/variant:MacosEnvelopedGuardian#1/field:run#1:private",
+    "enum:InternalInvocation#1/variant:MacosEnvelopedGuardian#1:enum-member",
+    "enum:InternalInvocation#1/variant:MacosHelper#1/field:command#1:private",
+    "enum:InternalInvocation#1/variant:MacosHelper#1/field:descriptor#1:private",
+    "enum:InternalInvocation#1/variant:MacosHelper#1/field:guardian#1:private",
+    "enum:InternalInvocation#1/variant:MacosHelper#1/field:run#1:private",
+    "enum:InternalInvocation#1/variant:MacosHelper#1:enum-member",
+    "enum:InternalInvocation#1/variant:MacosInspector#1/field:descriptor#1:private",
+    "enum:InternalInvocation#1/variant:MacosInspector#1/field:run#1:private",
+    "enum:InternalInvocation#1/variant:MacosInspector#1:enum-member",
+    "enum:InternalInvocation#1/variant:Probe#1:enum-member",
+    "enum:InternalInvocation#1/variant:ResultWriter#1:enum-member",
+    "enum:InternalInvocation#1/variant:ResultWriterFault#1/field:input#1:private",
+    "enum:InternalInvocation#1/variant:ResultWriterFault#1/field:marker#1:private",
+    "enum:InternalInvocation#1/variant:ResultWriterFault#1/field:output#1:private",
+    "enum:InternalInvocation#1/variant:ResultWriterFault#1/field:phase#1:private",
+    "enum:InternalInvocation#1/variant:ResultWriterFault#1:enum-member",
+    "enum:InternalInvocation#1/variant:SynchronousStderrMutant#1:enum-member",
+    "enum:InternalInvocation#1:pub(crate)",
+    "fn:execute_internal#1:pub(crate)",
+    "fn:guardian#1:private",
+    "fn:guardian#2:private",
+    "fn:launcher#1/use:std :: os :: unix :: process :: CommandExt#1:private",
+    "fn:launcher#1:private",
+    "fn:launcher#2:private",
+    "fn:parse_nonnegative_descriptor#1:private",
+    "fn:parse_positive_process_group#1:private",
+    "fn:route_internal#1:pub(crate)",
+    "fn:write_launcher_status#1:private",
+    "mod:application#1:private",
+    "mod:result_delivery#1:private",
+    "use:application :: { clean , doctor , execute , plan }#1:pub(crate)",
+]
+platforms = ["portable"]
+work_packages = ["GOV-01"]
+decision = "Retain with an explicit source-registry owner, consumer, invariant, visibility tier, and acceptance evidence; make no structural change unless the boundary review fails."
+
+[[source]]
+id = "crates.memcordon-cli.src.commands.application"
+path = "crates/memcordon-cli/src/commands/application.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "extract"
+protected_invariants = ["application retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["module:crates/memcordon-cli/src/commands.rs:application:private:[]"]
+routes = ["module:crates/memcordon-cli/src/commands.rs:application:private:[]"]
+cfg = [
+    'fn:bounded_helper_path#1:cfg(target_os = "macos")',
+    'fn:deferred_warnings#1:cfg(target_os = "macos")',
+    'fn:doctor_execution_probe#1/local:2405#1:cfg(target_os = "macos")',
+    'fn:doctor_execution_probe#1/local:2522#1:cfg(not (target_os = "macos"))',
+    'fn:execute#1/expression:1#1:cfg(not (target_os = "macos"))',
+    'fn:execute#1/expression:115#1:cfg(not (target_os = "macos"))',
+    'fn:execute#1/local:135#1:cfg(target_os = "macos")',
+    'fn:execute#1/local:148#1:cfg(not (target_os = "macos"))',
+    'fn:execute#1/local:151#1/expression:152#1/expression:155#1/local:156#1:cfg(target_os = "macos")',
+    'fn:execute#1/local:194#1:cfg(target_os = "macos")',
+    'fn:execute#1/local:198#1:cfg(not (target_os = "macos"))',
+    'fn:execute#1/local:52#1:cfg(target_os = "macos")',
+    'fn:execute#1/local:95#1:cfg(target_os = "macos")',
+    'fn:finish_context_error#1:cfg(target_os = "macos")',
+    'fn:finish_error#1:cfg(not (target_os = "macos"))',
+    'fn:finish_error#2:cfg(target_os = "macos")',
+    'fn:finish_execution#1:cfg(not (target_os = "macos"))',
+    'fn:finish_execution#2:cfg(target_os = "macos")',
+    'fn:helper_path#1:cfg(any (target_os = "linux" , target_os = "macos"))',
+    'fn:helper_path#2:cfg(not (any (target_os = "linux" , target_os = "macos")))',
+    'fn:render_effect_warnings#1:cfg(not (target_os = "macos"))',
+    "mod:tests#1:cfg(test)",
+    'use:memcordon_core :: write_report_atomic#1:cfg(not (target_os = "macos"))',
+    'use:memcordon_platform :: supervise#1:cfg(not (target_os = "macos"))',
+    'use:std :: path :: Path#1:cfg(not (target_os = "macos"))',
+]
+item_visibility = [
+    "fn:add_condition#1:private",
+    "fn:bounded_helper_path#1/static:RESERVED#1:private",
+    "fn:bounded_helper_path#1/use:std :: sync :: atomic :: { AtomicBool , Ordering }#1:private",
+    "fn:bounded_helper_path#1:private",
+    "fn:budget_tokens#1:private",
+    "fn:category_name#1:private",
+    "fn:clean#1:pub(crate)",
+    "fn:clean_failure_report#1:private",
+    "fn:deadline_clock#1:private",
+    "fn:deadline_origin#1:private",
+    "fn:deadline_token#1:private",
+    "fn:deferred_warnings#1:private",
+    "fn:doctor#1/use:memcordon_core :: workload_discovery :: DiscoveryReportV1#1:private",
+    "fn:doctor#1/use:memcordon_core :: workload_evidence :: { AdmissionAvailabilityFailure , AuthorizationKnowledge , RequestBindingV1 , WorkloadResolutionReportV1 , }#1:private",
+    "fn:doctor#1:pub(crate)",
+    "fn:doctor_execution_probe#1/expression:2633#1/struct:ProbeReport#1/field:doctor#1:private",
+    "fn:doctor_execution_probe#1/expression:2633#1/struct:ProbeReport#1/field:execution#1:private",
+    "fn:doctor_execution_probe#1/expression:2633#1/struct:ProbeReport#1/field:kind#1:private",
+    "fn:doctor_execution_probe#1/expression:2633#1/struct:ProbeReport#1/field:schema_version#1:private",
+    "fn:doctor_execution_probe#1/expression:2633#1/struct:ProbeReport#1:private",
+    "fn:doctor_execution_probe#1:private",
+    "fn:enforcement_name#1:private",
+    "fn:execute#1:pub(crate)",
+    "fn:execution_summary#1:private",
+    "fn:finish_context_error#1:private",
+    "fn:finish_error#1:private",
+    "fn:finish_error#2:private",
+    "fn:finish_execution#1:private",
+    "fn:finish_execution#2:private",
+    "fn:helper_path#1:private",
+    "fn:helper_path#2:private",
+    "fn:metric_name#1:private",
+    "fn:milliseconds#1:private",
+    "fn:plan#1:pub(crate)",
+    "fn:policy_report#1:private",
+    "fn:print_json#1:private",
+    "fn:render_effect_warnings#1:private",
+    "fn:report#1:private",
+    "fn:requested_deadline_clock#1:private",
+    "fn:requested_report#1:private",
+    "fn:resolve#1:private",
+    "fn:restart_condition_name#1:private",
+    "fn:sealed_boundary_unsupported#1:private",
+    "fn:swap_name#1:private",
+    "fn:swap_report#1:private",
+    "fn:tool_report#1:private",
+    "fn:unavailable_backend_capability#1:private",
+    "fn:unresolved_report#1:private",
+    "fn:uses_linux_cgroup_memory#1:private",
+    "fn:wait_name#1:private",
+    "fn:workload_restriction#1/use:memcordon_core :: workload_evidence :: BaselineRestrictionObservationV1 as Observation#1:private",
+    "fn:workload_restriction#1:private",
+    "mod:tests#1:private",
+    "struct:ExecutionProbe#1/field:cleanup_complete#1:private",
+    "struct:ExecutionProbe#1/field:failure#1:private",
+    "struct:ExecutionProbe#1/field:helper_ready#1:private",
+    "struct:ExecutionProbe#1/field:supported#1:private",
+    "struct:ExecutionProbe#1/field:target_exec_confirmed#1:private",
+    "struct:ExecutionProbe#1/field:target_exit#1:private",
+    "struct:ExecutionProbe#1:private",
+    "struct:Resolution#1/field:backend#1:private",
+    "struct:Resolution#1/field:policy#1:private",
+    "struct:Resolution#1/field:report#1:private",
+    "struct:Resolution#1/field:restart#1:private",
+    "struct:Resolution#1:private",
+    "use:crate :: presentation :: { self , ExecutionSummary , Presentation , SummaryTone }#1:private",
+    "use:memcordon :: exit_mapping :: error_exit_code#1:private",
+    "use:memcordon :: invocation :: { BudgetSet , BudgetToken , CleanArgs , DoctorArgs , ExecutionArgs , PlanArgs , PolicyArgs , Requirement , }#1:private",
+    "use:memcordon_core :: write_report_atomic#1:private",
+    "use:memcordon_core :: { BackendCapabilityReport , BackoffPolicyReport , BoundaryCapability , BoundaryClass , BoundaryRequirement , BudgetKindReport , BudgetTokenReport , CLEAN_REPORT_SCHEMA_VERSION , CircuitBreakerPolicyReport , CleanReport , CommandSpec , DOCTOR_REPORT_SCHEMA_VERSION , DeadlinePolicyReport , DeadlineScope , DoctorReport , DormantRestartCondition , EffectiveMemoryPolicyReport , EffectivePolicyReport , EffectiveRestartPolicyReport , Enforcement , Error , ErrorCategory , ExecutionErrorReport , HALF_LIFE_LOGISTIC_MODEL , HalfLifeLogisticBackoffState , HostReport , InvocationReport , Lifetime , MemcordonReport , Metric , OptionEffectReport , PLAN_REPORT_SCHEMA_VERSION , PlanReport , PlanResolutionReport , Policy , PolicyEnvelopeReport , RequestedMemoryPolicyReport , RequestedPolicyReport , RequestedRestartPolicyReport , RequirementReport , RestartCondition , RestartConditions , RestartPolicy , RestartSettings , SupervisionExecution , SupervisionTerminal , SwapPolicy , SwapReport , ToolReport , UnavailableCapabilityReport , }#1:private",
+    "use:memcordon_platform :: supervise#1:private",
+    "use:memcordon_platform :: { SupervisorRequest , capabilities , cleanup_stale , probe }#1:private",
+    "use:std :: io :: Write as _#1:private",
+    "use:std :: path :: Path#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-06",
+    "MAC-05",
+]
+decision = "Keep command orchestration in a thin façade; extract report construction, terminal/error precedence, and delivery settlement into typed modules."
+
+[[source]]
+id = "crates.memcordon-cli.src.commands.result_delivery"
+path = "crates/memcordon-cli/src/commands/result_delivery.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "harden"
+protected_invariants = ["A result writer has output authority, but never target-launch authority."]
+consumers = ['module:crates/memcordon-cli/src/commands.rs:result_delivery:private:["cfg(target_os = \"macos\")"]']
+routes = ['module:crates/memcordon-cli/src/commands.rs:result_delivery:private:["cfg(target_os = \"macos\")"]']
+cfg = [
+    'fn:deliver#1/expression:45#1/expression:51#1:cfg(feature = "test-fixtures")',
+    'fn:deliver_inner#1/local:91#1/expression:92#1:cfg(feature = "test-fixtures")',
+    'fn:deliver_inner#1:cfg(feature = "test-fixtures")',
+    'fn:fault_test#1:cfg(feature = "test-fixtures")',
+    'fn:synchronous_stderr_mutant#1:cfg(feature = "test-fixtures")',
+    'fn:writer#1/local:432#1/expression:433#1/expression:434#1/expression:435#1/expression:436#1/expression:537#1/expression:550#1:cfg(feature = "test-fixtures")',
+    'struct:Payload#1/field:barrier#1:cfg(feature = "test-fixtures")',
+]
+item_visibility = [
+    "const:DELIVERY_NANOS#1:private",
+    "const:MAX_PAYLOAD#1:private",
+    "const:REAP_RESERVE_NANOS#1:private",
+    "fn:deliver#1:pub(super)",
+    "fn:deliver_inner#1:private",
+    "fn:fault_test#1:pub(super)",
+    "fn:now#1:private",
+    "fn:retire_writer#1:private",
+    "fn:synchronous_stderr_mutant#1:pub(super)",
+    "fn:write_diagnostics#1:private",
+    "fn:writer#1:pub(super)",
+    "impl:BoundedBytes:Write#1/method:flush#1:private",
+    "impl:BoundedBytes:Write#1/method:write#1:private",
+    "static:OWNER_RESERVED#1:private",
+    "struct:BoundedBytes#1/tuple:0#1/field:Vec < u8 >#1:private",
+    "struct:BoundedBytes#1:private",
+    "struct:Payload#1/field:barrier#1:private",
+    "struct:Payload#1/field:diagnostics#1:private",
+    "struct:Payload#1/field:report#1:private",
+    "struct:Payload#1/field:report_path#1:private",
+    "struct:Payload#1/field:schema#1:private",
+    "struct:Payload#1:private",
+    "use:memcordon_core :: MemcordonReport#1:private",
+    "use:serde :: { Deserialize , Serialize }#1:private",
+    "use:std :: ffi :: OsString#1:private",
+    "use:std :: io :: { self , Read , Write }#1:private",
+    "use:std :: os :: fd :: AsRawFd#1:private",
+    "use:std :: os :: unix :: ffi :: { OsStrExt , OsStringExt }#1:private",
+    "use:std :: path :: { Path , PathBuf }#1:private",
+    "use:std :: process :: { Child , Command , Stdio }#1:private",
+    "use:std :: sync :: atomic :: { AtomicBool , Ordering }#1:private",
+    "use:std :: sync :: mpsc#1:private",
+    "use:std :: time :: Duration#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "MAC-05",
+]
+decision = "Replace the process-global Boolean owner with a bounded lease registry, add a typed acknowledgement containing writer identity and content digest, and verify child reap before accepting delivery."
+
+[[source]]
+id = "crates.memcordon-cli.src.exit_mapping"
+path = "crates/memcordon-cli/src/exit_mapping.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "harden"
+protected_invariants = ["exit_mapping retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["module:crates/memcordon-cli/src/lib.rs:exit_mapping:pub:[]"]
+routes = ["module:crates/memcordon-cli/src/lib.rs:exit_mapping:pub:[]"]
+cfg = []
+item_visibility = [
+    "fn:child_exit_code#1:private",
+    "fn:error_exit_code#1:pub",
+    "fn:outcome_exit_code#1:pub",
+    "use:memcordon_core :: { ChildTermination , Error , ErrorCategory , RunOutcome }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+]
+decision = "Correct the module’s stated responsibility, document its consumers and compatibility obligations, and either strengthen the boundary or merge the forwarding layer."
+
+[[source]]
+id = "crates.memcordon-cli.src.invocation"
+path = "crates/memcordon-cli/src/invocation.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "harden"
+protected_invariants = ["invocation retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["module:crates/memcordon-cli/src/lib.rs:invocation:pub:[]"]
+routes = ["module:crates/memcordon-cli/src/lib.rs:invocation:pub:[]"]
+cfg = []
+item_visibility = [
+    "const:CLEAN_USAGE#1:pub",
+    "const:DOCTOR_USAGE#1:pub",
+    "const:HELP_TOPIC_USAGE#1:pub",
+    "const:HELP_USAGE#1:pub",
+    "const:PLAN_USAGE#1:pub",
+    "const:PUBLIC_POLICY_OPTIONS#1:pub",
+    "const:REFERENCE_URL#1:pub",
+    "const:ROOT_USAGE#1:pub",
+    "enum:BudgetToken#1/variant:Memory#1/field:bytes#1:private",
+    "enum:BudgetToken#1/variant:Memory#1/field:raw#1:private",
+    "enum:BudgetToken#1/variant:Memory#1:enum-member",
+    "enum:BudgetToken#1/variant:Time#1/field:duration#1:private",
+    "enum:BudgetToken#1/variant:Time#1/field:raw#1:private",
+    "enum:BudgetToken#1/variant:Time#1:enum-member",
+    "enum:BudgetToken#1:pub",
+    "enum:HelpKind#1/variant:Clean#1:enum-member",
+    "enum:HelpKind#1/variant:Doctor#1:enum-member",
+    "enum:HelpKind#1/variant:Plan#1:enum-member",
+    "enum:HelpKind#1/variant:Root#1:enum-member",
+    "enum:HelpKind#1:pub",
+    "enum:Invocation#1/variant:Clean#1/tuple:0#1/field:CleanArgs#1:private",
+    "enum:Invocation#1/variant:Clean#1:enum-member",
+    "enum:Invocation#1/variant:Doctor#1/tuple:0#1/field:DoctorArgs#1:private",
+    "enum:Invocation#1/variant:Doctor#1:enum-member",
+    "enum:Invocation#1/variant:Execute#1/tuple:0#1/field:ExecutionArgs#1:private",
+    "enum:Invocation#1/variant:Execute#1:enum-member",
+    "enum:Invocation#1/variant:Help#1/tuple:0#1/field:HelpKind#1:private",
+    "enum:Invocation#1/variant:Help#1:enum-member",
+    "enum:Invocation#1/variant:Plan#1/tuple:0#1/field:PlanArgs#1:private",
+    "enum:Invocation#1/variant:Plan#1:enum-member",
+    "enum:Invocation#1/variant:Version#1:enum-member",
+    "enum:Invocation#1:pub",
+    "enum:Requirement#1/variant:Hard#1:enum-member",
+    "enum:Requirement#1/variant:Sealed#1:enum-member",
+    "enum:Requirement#1/variant:Watchdog#1:enum-member",
+    "enum:Requirement#1:pub",
+    "fn:exact_root_flag#1:private",
+    "fn:exact_utility_help#1:private",
+    "fn:invalid_value#1:private",
+    "fn:legacy#1:private",
+    "fn:option_value#1:private",
+    "fn:parse_budget#1:pub",
+    "fn:parse_clean#1:private",
+    "fn:parse_doctor#1:private",
+    "fn:parse_execution#1:private",
+    "fn:parse_help#1:private",
+    "fn:parse_plan#1:private",
+    "fn:parse_policy_option#1/expression:1402#1/use:std :: io :: Read#1:private",
+    "fn:parse_policy_option#1:private",
+    "fn:route#1:pub",
+    "fn:split_option#1:private",
+    "fn:strict_text#1:private",
+    "fn:unknown_option#1:private",
+    "fn:validate_policy_dependencies#1:private",
+    "impl:BudgetSet:#1/method:memory_token#1:pub",
+    "impl:BudgetSet:#1/method:push#1:private",
+    "impl:CliError:#1/method:new#1:pub",
+    "impl:CliError:#1/method:with_help#1:pub",
+    "impl:LimitToken:#1/method:display#1:pub",
+    "impl:LimitToken:#1/method:parse#1:pub",
+    "impl:PolicyArgs:#1/method:policy#1:pub",
+    "impl:PolicyArgs:Default#1/method:default#1:private",
+    "struct:BudgetSet#1/field:deadline#1:pub",
+    "struct:BudgetSet#1/field:memory#1:pub",
+    "struct:BudgetSet#1/field:source_order#1:pub",
+    "struct:BudgetSet#1:pub",
+    "struct:CleanArgs#1/field:dry_run#1:pub",
+    "struct:CleanArgs#1/field:json#1:pub",
+    "struct:CleanArgs#1:pub",
+    "struct:CliError#1/field:code#1:pub",
+    "struct:CliError#1/field:help#1:pub",
+    "struct:CliError#1/field:message#1:pub",
+    "struct:CliError#1:pub",
+    "struct:DoctorArgs#1/field:json#1:pub",
+    "struct:DoctorArgs#1/field:probe_execution#1:pub",
+    "struct:DoctorArgs#1/field:requirement#1:pub",
+    "struct:DoctorArgs#1/field:workload_contract#1:pub",
+    "struct:DoctorArgs#1:pub",
+    "struct:ExecutionArgs#1/field:budgets#1:pub",
+    "struct:ExecutionArgs#1/field:command#1:pub",
+    "struct:ExecutionArgs#1/field:output#1:pub",
+    "struct:ExecutionArgs#1/field:policy#1:pub",
+    "struct:ExecutionArgs#1:pub",
+    "struct:ExplicitPolicyOptions#1/field:boundary#1:pub",
+    "struct:ExplicitPolicyOptions#1/field:command_exit_grace#1:pub",
+    "struct:ExplicitPolicyOptions#1/field:deadline_scope#1:pub",
+    "struct:ExplicitPolicyOptions#1/field:enforcement#1:pub",
+    "struct:ExplicitPolicyOptions#1/field:limit_grace#1:pub",
+    "struct:ExplicitPolicyOptions#1/field:metric#1:pub",
+    "struct:ExplicitPolicyOptions#1/field:poll_interval#1:pub",
+    "struct:ExplicitPolicyOptions#1/field:restart_tuning#1:pub",
+    "struct:ExplicitPolicyOptions#1/field:swap#1:pub",
+    "struct:ExplicitPolicyOptions#1:pub",
+    "struct:LimitToken#1/field:bytes#1:pub",
+    "struct:LimitToken#1/field:raw#1:pub",
+    "struct:LimitToken#1:pub",
+    "struct:OutputRequest#1/field:quiet#1:pub",
+    "struct:OutputRequest#1/field:report_path#1:pub",
+    "struct:OutputRequest#1/field:summary#1:pub",
+    "struct:OutputRequest#1:pub",
+    "struct:PlanArgs#1/field:budgets#1:pub",
+    "struct:PlanArgs#1/field:json#1:pub",
+    "struct:PlanArgs#1/field:policy#1:pub",
+    "struct:PlanArgs#1:pub",
+    "struct:PolicyArgs#1/field:backoff#1:pub",
+    "struct:PolicyArgs#1/field:backoff_asymptote_interval#1:private",
+    "struct:PolicyArgs#1/field:backoff_base_interval#1:private",
+    "struct:PolicyArgs#1/field:backoff_multiplier#1:private",
+    "struct:PolicyArgs#1/field:backoff_recovery_half_life#1:private",
+    "struct:PolicyArgs#1/field:boundary#1:pub",
+    "struct:PolicyArgs#1/field:circuit_breaker#1:pub",
+    "struct:PolicyArgs#1/field:circuit_cooldown#1:private",
+    "struct:PolicyArgs#1/field:circuit_half_life#1:private",
+    "struct:PolicyArgs#1/field:circuit_threshold#1:private",
+    "struct:PolicyArgs#1/field:command_exit_grace#1:pub",
+    "struct:PolicyArgs#1/field:deadline_scope#1:pub",
+    "struct:PolicyArgs#1/field:enforcement#1:pub",
+    "struct:PolicyArgs#1/field:explicit#1:pub",
+    "struct:PolicyArgs#1/field:limit_grace#1:pub",
+    "struct:PolicyArgs#1/field:metric#1:pub",
+    "struct:PolicyArgs#1/field:poll_interval#1:pub",
+    "struct:PolicyArgs#1/field:restart#1:pub",
+    "struct:PolicyArgs#1/field:restart_limit#1:pub",
+    "struct:PolicyArgs#1/field:restart_on#1:pub",
+    "struct:PolicyArgs#1/field:signal_grace#1:pub",
+    "struct:PolicyArgs#1/field:swap#1:pub",
+    "struct:PolicyArgs#1/field:wait_for#1:pub",
+    "struct:PolicyArgs#1/field:workload_contract#1:pub",
+    "struct:PolicyArgs#1:pub",
+    "use:crate :: parse_duration#1:private",
+    "use:memcordon_core :: { BackoffMultiplier , BoundaryRequirement , ByteSize , CircuitBreakerPolicy , DeadlinePolicy , DeadlineScope , Enforcement , HalfLifeLogisticBackoffPolicy , Lifetime , Metric , Policy , RestartConditions , RestartLimit , SwapPolicy , }#1:private",
+    "use:std :: ffi :: { OsStr , OsString }#1:private",
+    "use:std :: num :: NonZeroU64#1:private",
+    "use:std :: path :: PathBuf#1:private",
+    "use:std :: time :: Duration#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+]
+decision = "Correct the module’s stated responsibility, document its consumers and compatibility obligations, and either strengthen the boundary or merge the forwarding layer."
+
+[[source]]
+id = "crates.memcordon-cli.src.lib"
+path = "crates/memcordon-cli/src/lib.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "harden"
+protected_invariants = ["Run a typed native command under MemCordon's platform containment."]
+consumers = ["cargo:memcordon:lib:memcordon:features=[]"]
+routes = ["cargo:memcordon:lib:memcordon:features=[]"]
+cfg = [
+    'impl:Limiter:#1/method:run#1/expression:590#1:cfg(any (target_os = "linux" , target_os = "macos"))',
+    'impl:Limiter:#1/method:run#1/expression:615#1:cfg(not (any (target_os = "linux" , target_os = "macos")))',
+]
+item_visibility = [
+    "fn:default_restart_settings#1:private",
+    "fn:parse_duration#1:pub",
+    "fn:rebuild_settings#1:private",
+    "fn:resolve_restart_policy#1:pub",
+    "impl:ExecutablePathError:fmt :: Display#1/method:fmt#1:private",
+    "impl:Limiter:#1/method:command#1:pub",
+    "impl:Limiter:#1/method:memcordon_executable#1:pub",
+    "impl:Limiter:#1/method:new#1:pub",
+    "impl:Limiter:#1/method:run#1:pub",
+    "impl:MemcordonExecutable:#1/method:as_path#1:pub",
+    "impl:MemcordonExecutable:#1/method:new#1:pub",
+    "impl:Supervisor:#1/method:circuit_breaker#1:pub",
+    "impl:Supervisor:#1/method:command#1:pub",
+    "impl:Supervisor:#1/method:half_life_logistic_backoff#1:pub",
+    "impl:Supervisor:#1/method:memcordon_executable#1:pub",
+    "impl:Supervisor:#1/method:new#1:pub",
+    "impl:Supervisor:#1/method:restart#1:pub",
+    "impl:Supervisor:#1/method:restart_limit#1:pub",
+    "impl:Supervisor:#1/method:restart_on#1:pub",
+    "impl:Supervisor:#1/method:run#1:pub",
+    "mod:exit_mapping#1:pub",
+    "mod:invocation#1:pub",
+    "struct:ExecutablePathError#1/field:path#1:private",
+    "struct:ExecutablePathError#1:pub",
+    "struct:Limiter#1/field:command#1:private",
+    "struct:Limiter#1/field:memcordon_executable#1:private",
+    "struct:Limiter#1/field:policy#1:private",
+    "struct:Limiter#1:pub",
+    "struct:MemcordonExecutable#1/tuple:0#1/field:PathBuf#1:private",
+    "struct:MemcordonExecutable#1:pub",
+    "struct:Supervisor#1/field:command#1:private",
+    "struct:Supervisor#1/field:memcordon_executable#1:private",
+    "struct:Supervisor#1/field:policy#1:private",
+    "struct:Supervisor#1/field:restart#1:private",
+    "struct:Supervisor#1:pub",
+    "use:memcordon_core :: { BoundaryRequirement , ByteSize , ChildTermination , CircuitBreakerPolicy , CleanupSummary , CommandSpec , Enforcement , Error , HalfLifeLogisticBackoffPolicy , Lifetime , Metric , Policy , RestartConditions , RestartLimit , RestartPolicy , RestartSettings , RunOutcome , SupervisionExecution , }#1:pub",
+    "use:memcordon_platform :: { BackendInfo , ProbeReport , probe }#1:pub",
+    "use:std :: time :: Duration#1:private",
+    "use:std :: { fmt , path :: { Path , PathBuf } , }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+]
+decision = "Keep the root/entry boundary thin, classify every export and route in the source registry, and move substantive policy into owned modules."
+
+[[source]]
+id = "crates.memcordon-cli.src.main"
+path = "crates/memcordon-cli/src/main.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "harden"
+protected_invariants = ["main retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon:bin:memcordon:features=[]"]
+routes = ["cargo:memcordon:bin:memcordon:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:main#1:private",
+    "mod:commands#1:private",
+    "mod:presentation#1:private",
+    "use:memcordon :: invocation :: { CLEAN_USAGE , DOCTOR_USAGE , HelpKind , Invocation , PLAN_USAGE , ROOT_USAGE , route , }#1:private",
+    "use:presentation :: Presentation#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+]
+decision = "Keep the root/entry boundary thin, classify every export and route in the source registry, and move substantive policy into owned modules."
+
+[[source]]
+id = "crates.memcordon-cli.src.presentation"
+path = "crates/memcordon-cli/src/presentation.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "harden"
+protected_invariants = ["presentation retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = [
+    "module:crates/memcordon-cli/src/main.rs:presentation:private:[]",
+    "path-module:crates/memcordon-cli/tests/colour_policy.rs:presentation:private:[]",
+    "path-module:crates/memcordon-cli/tests/presentation.rs:presentation:private:[]",
+]
+routes = [
+    "module:crates/memcordon-cli/src/main.rs:presentation:private:[]",
+    "path-module:crates/memcordon-cli/tests/colour_policy.rs:presentation:private:[]",
+    "path-module:crates/memcordon-cli/tests/presentation.rs:presentation:private:[]",
+]
+cfg = []
+item_visibility = [
+    "enum:SummaryTone#1/variant:Error#1:enum-member",
+    "enum:SummaryTone#1/variant:Success#1:enum-member",
+    "enum:SummaryTone#1/variant:Warning#1:enum-member",
+    "enum:SummaryTone#1:pub(crate)",
+    "fn:code_style#1:private",
+    "fn:error_style#1:private",
+    "fn:force_colour_requested#1:pub(crate)",
+    "fn:is_wrapped_term#1:private",
+    "fn:label_style#1:private",
+    "fn:split_aligned_term#1:private",
+    "fn:success_style#1:private",
+    "fn:token_style#1:private",
+    "fn:tone_style#1:private",
+    "fn:warning_style#1:private",
+    "fn:write_clean_action#1:pub(crate)",
+    "fn:write_help#1:pub(crate)",
+    "fn:write_json#1:pub(crate)",
+    "fn:write_label_value#1:pub(crate)",
+    "fn:write_runtime_error#1:pub(crate)",
+    "fn:write_selected_backend#1:pub(crate)",
+    "fn:write_summary#1:pub(crate)",
+    "fn:write_usage_error#1:pub(crate)",
+    "fn:write_version#1:pub(crate)",
+    "fn:write_warning#1:pub(crate)",
+    "impl:ColourPolicy:#1/method:choice#1:pub(crate)",
+    "impl:ColourPolicy:#1/method:from_process#1:private",
+    "impl:ColourPolicy:#1/method:new#1:pub(crate)",
+    "impl:Presentation:#1/method:automatic#1:pub(crate)",
+    "impl:Presentation:#1/method:machine_stdout#1:pub(crate)",
+    "impl:Presentation:#1/method:stderr#1:pub(crate)",
+    "impl:Presentation:#1/method:stdout#1:pub(crate)",
+    "struct:ColourPolicy#1/field:ci#1:private",
+    "struct:ColourPolicy#1/field:clicolor#1:private",
+    "struct:ColourPolicy#1/field:force_colour#1:private",
+    "struct:ColourPolicy#1/field:no_color#1:private",
+    "struct:ColourPolicy#1/field:terminal_supports_color#1:private",
+    "struct:ColourPolicy#1:pub(crate)",
+    "struct:ExecutionSummary#1/field:attempts#1:pub(crate)",
+    "struct:ExecutionSummary#1/field:backend#1:pub(crate)",
+    "struct:ExecutionSummary#1/field:failure_code#1:pub(crate)",
+    "struct:ExecutionSummary#1/field:failure_detail#1:pub(crate)",
+    "struct:ExecutionSummary#1/field:failure_phase#1:pub(crate)",
+    "struct:ExecutionSummary#1/field:outcome#1:pub(crate)",
+    "struct:ExecutionSummary#1/field:restarts#1:pub(crate)",
+    "struct:ExecutionSummary#1/field:status#1:pub(crate)",
+    "struct:ExecutionSummary#1/field:tone#1:pub(crate)",
+    "struct:ExecutionSummary#1:pub(crate)",
+    "struct:Presentation#1/field:stderr_choice#1:private",
+    "struct:Presentation#1/field:stdout_choice#1:private",
+    "struct:Presentation#1:pub(crate)",
+    "use:anstream :: { AutoStream , ColorChoice }#1:private",
+    "use:anstyle :: { AnsiColor , Style }#1:private",
+    "use:std :: ffi :: OsStr#1:private",
+    "use:std :: fmt#1:private",
+    "use:std :: io :: IsTerminal#1:private",
+    "use:std :: io :: { self , Write }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+]
+decision = "Correct the module’s stated responsibility, document its consumers and compatibility obligations, and either strengthen the boundary or merge the forwarding layer."

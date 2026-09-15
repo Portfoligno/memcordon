@@ -22,6 +22,7 @@ pub mod runtime_manifest;
 pub mod scenario_diagnostic;
 pub mod sealed_identity;
 pub mod sealed_selector;
+pub mod source_registry;
 pub mod standard_contract;
 pub mod standard_runner;
 pub mod windows_channel_identity;

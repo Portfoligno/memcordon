@@ -17,6 +17,14 @@ fuzz_target!(|data: &[u8]| {
             7 => RunState::Cleaning,
             _ => RunState::Finished,
         };
-        let _ = machine.transition(state);
+        let previous = machine.state();
+        match machine.transition(state) {
+            Ok(()) => assert_eq!(machine.state(), state),
+            Err(error) => {
+                assert_eq!(machine.state(), previous);
+                assert_eq!(error.from, previous);
+                assert_eq!(error.to, state);
+            }
+        }
     }
 });

@@ -1,0 +1,165 @@
+schema_version = 4
+repository = "Portfoligno/memcordon"
+workflow = "release.yml"
+registry = "crates-io"
+publish_packages = ["memcordon-core", "memcordon-platform", "memcordon-windows-launch-core", "memcordon"]
+github_api_version = "2022-11-28"
+# Shared deadline for GitHub throttling across a release operation, including public verification.
+github_rate_limit_wait_seconds = 3700
+maximum_package_bytes = 10485760
+maximum_asset_bytes = 134217728
+
+[registry_credentials]
+policy = "oidc-first-new-crate-fallback"
+fallback_token_secret = "MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK"
+
+[assets]
+output_directory = "target/ci/release-bundle"
+manifest = "release-manifest.json"
+publication_report = "publication-report.json"
+checksums = "SHA256SUMS"
+notes = "RELEASE_NOTES.md"
+
+[[assets.target]]
+id = "linux-x64"
+rust_target = "x86_64-unknown-linux-gnu"
+archive = "tar-gz"
+sealed = "included"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon"
+mode = 493
+role = "public-cli"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-sealed-agent"
+archive_path = "memcordon-sealed-agent"
+mode = 493
+role = "sealed-agent"
+
+[[assets.target]]
+id = "linux-arm64"
+rust_target = "aarch64-unknown-linux-gnu"
+archive = "tar-gz"
+sealed = "included"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon"
+mode = 493
+role = "public-cli"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-sealed-agent"
+archive_path = "memcordon-sealed-agent"
+mode = 493
+role = "sealed-agent"
+
+[[assets.target]]
+id = "macos-arm64"
+rust_target = "aarch64-apple-darwin"
+archive = "tar-gz"
+sealed = "not-applicable"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon"
+mode = 493
+role = "public-cli"
+
+[[assets.target]]
+id = "macos-x64"
+rust_target = "x86_64-apple-darwin"
+archive = "tar-gz"
+sealed = "not-applicable"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon"
+mode = 493
+role = "public-cli"
+
+[[assets.target]]
+id = "windows-x64"
+rust_target = "x86_64-pc-windows-msvc"
+archive = "zip"
+sealed = "included"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon.exe"
+mode = 493
+role = "public-cli"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-sealed-agent"
+archive_path = "memcordon-sealed-agent.exe"
+mode = 493
+role = "sealed-agent"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-target-desktop-bootstrap"
+archive_path = "memcordon-target-desktop-bootstrap.exe"
+mode = 493
+role = "desktop-bootstrap"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-session-broker"
+archive_path = "memcordon-session-broker.exe"
+mode = 493
+role = "session-broker"
+
+[[assets.target]]
+id = "windows-arm64"
+rust_target = "aarch64-pc-windows-msvc"
+archive = "zip"
+sealed = "included"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon"
+archive_path = "memcordon.exe"
+mode = 493
+role = "public-cli"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-sealed-agent"
+archive_path = "memcordon-sealed-agent.exe"
+mode = 493
+role = "sealed-agent"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-target-desktop-bootstrap"
+archive_path = "memcordon-target-desktop-bootstrap.exe"
+mode = 493
+role = "desktop-bootstrap"
+
+[[assets.target.executable]]
+package = "memcordon"
+binary = "memcordon-session-broker"
+archive_path = "memcordon-session-broker.exe"
+mode = 493
+role = "session-broker"
+
+[registry_wait]
+initial_milliseconds = 500
+maximum_milliseconds = 8000
+total_seconds = 300
+
+[network_retry]
+initial_milliseconds = 500
+maximum_milliseconds = 8000
+total_seconds = 120

@@ -29,6 +29,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopLevel {
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
     BuildContext {
         #[arg(long)]
         output: PathBuf,
@@ -53,6 +57,15 @@ enum TopLevel {
         uid: String,
         #[arg(long)]
         context_file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum SourceCommand {
+    Validate,
+    Routes {
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -128,6 +141,12 @@ fn run() -> Result<()> {
         )?;
     }
     let result = match (cli.cargo_plugin, cli.command) {
+        (false, Some(TopLevel::Source { command })) => match command {
+            SourceCommand::Validate => memcordon_ci::source_registry::run(&root),
+            SourceCommand::Routes { output } => {
+                memcordon_ci::source_registry::routes(&root, &output)
+            }
+        },
         (false, Some(TopLevel::BuildContext { output })) => {
             memcordon_ci::build_context::ValidatedBuildContext::prepare(&root)?.write(&output)
         }

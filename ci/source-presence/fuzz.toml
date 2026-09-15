@@ -1,0 +1,1248 @@
+schema = 1
+
+[[source]]
+id = "fuzz.fuzz_targets.agent_package_inspection"
+path = "fuzz/fuzz_targets/agent_package_inspection.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["agent_package_inspection retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:agent-package-inspection"]
+routes = ["cargo:memcordon-fuzz:bin:agent-package-inspection"]
+cfg = []
+item_visibility = [
+    "fn:check#1:private",
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: sealed_provider :: inspection as inspection_schema#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "PROV-05",
+    "TEST-02",
+]
+decision = "Retain as the canonical package-inspection target, import the production-shared schema, and add strict validation, size, and round-trip properties."
+
+[[source]]
+id = "fuzz.fuzz_targets.backoff_multiplier"
+path = "fuzz/fuzz_targets/backoff_multiplier.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["backoff_multiplier retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:backoff_multiplier"]
+routes = ["cargo:memcordon-fuzz:bin:backoff_multiplier"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.bounded_history"
+path = "fuzz/fuzz_targets/bounded_history.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["bounded_history retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:bounded_history"]
+routes = ["cargo:memcordon-fuzz:bin:bounded_history"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.broker_protocol_v2"
+path = "fuzz/fuzz_targets/broker_protocol_v2.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["broker_protocol_v2 retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:broker-protocol-v2"]
+routes = ["cargo:memcordon-fuzz:bin:broker-protocol-v2"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: sealed_provider :: protocol#1:private",
+    "use:memcordon_core :: sealed_provider :: request#1:private",
+    "use:std :: io :: Cursor#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "PROV-02",
+    "TEST-02",
+]
+decision = "Rewrite the target to fuzz production-shared frame/request code. Remove the abstract state machine; use actual platform transition validators only where the target asserts a real production invariant."
+
+[[source]]
+id = "fuzz.fuzz_targets.budget_classifier"
+path = "fuzz/fuzz_targets/budget_classifier.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["budget_classifier retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:budget_classifier"]
+routes = ["cargo:memcordon-fuzz:bin:budget_classifier"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.byte_size"
+path = "fuzz/fuzz_targets/byte_size.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["byte_size retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:byte_size"]
+routes = ["cargo:memcordon-fuzz:bin:byte_size"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.caller_envelope_status"
+path = "fuzz/fuzz_targets/caller_envelope_status.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["caller_envelope_status retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:caller-envelope-status"]
+routes = ["cargo:memcordon-fuzz:bin:caller-envelope-status"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: sealed_provider :: envelope#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.capability_mask"
+path = "fuzz/fuzz_targets/capability_mask.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["capability_mask retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:capability-mask"]
+routes = ["cargo:memcordon-fuzz:bin:capability-mask"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: sealed_provider :: envelope :: parse_capability_mask#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.cargo_bin_inventory"
+path = "fuzz/fuzz_targets/cargo_bin_inventory.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["cargo_bin_inventory retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:cargo-bin-inventory"]
+routes = ["cargo:memcordon-fuzz:bin:cargo-bin-inventory"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.channel_pairing"
+path = "fuzz/fuzz_targets/channel_pairing.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["channel_pairing retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:channel-pairing"]
+routes = ["cargo:memcordon-fuzz:bin:channel-pairing"]
+cfg = []
+item_visibility = [
+    "fn:check#1:private",
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: sealed_provider :: inspection as inspection_schema#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.cleanup_json"
+path = "fuzz/fuzz_targets/cleanup_json.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["cleanup_json retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:cleanup_json"]
+routes = ["cargo:memcordon-fuzz:bin:cleanup_json"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.duration"
+path = "fuzz/fuzz_targets/duration.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["duration retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:duration"]
+routes = ["cargo:memcordon-fuzz:bin:duration"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.half_life_logistic_recurrence"
+path = "fuzz/fuzz_targets/half_life_logistic_recurrence.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["half_life_logistic_recurrence retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:half_life_logistic_recurrence"]
+routes = ["cargo:memcordon-fuzz:bin:half_life_logistic_recurrence"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.installed_provider_inspection"
+path = "fuzz/fuzz_targets/installed_provider_inspection.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["installed_provider_inspection retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:installed-provider-inspection"]
+routes = ["cargo:memcordon-fuzz:bin:installed-provider-inspection"]
+cfg = []
+item_visibility = [
+    "fn:check#1:private",
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: sealed_provider :: inspection as inspection_schema#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.invocation_router"
+path = "fuzz/fuzz_targets/invocation_router.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["invocation_router retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:invocation_router"]
+routes = ["cargo:memcordon-fuzz:bin:invocation_router"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon :: invocation :: route#1:private",
+    "use:std :: ffi :: OsString#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.limit_token"
+path = "fuzz/fuzz_targets/limit_token.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["limit_token retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:limit_token"]
+routes = ["cargo:memcordon-fuzz:bin:limit_token"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon :: invocation :: LimitToken#1:private",
+    "use:std :: ffi :: OsString#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.linux_evidence_v2"
+path = "fuzz/fuzz_targets/linux_evidence_v2.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["linux_evidence_v2 retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:linux-evidence-v2"]
+routes = ["cargo:memcordon-fuzz:bin:linux-evidence-v2"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: BoundaryMechanismEvidence#1:private",
+]
+platforms = [
+    "linux-x64",
+    "linux-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.mount_context_manifest"
+path = "fuzz/fuzz_targets/mount_context_manifest.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["mount_context_manifest retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:mount-context-manifest"]
+routes = ["cargo:memcordon-fuzz:bin:mount-context-manifest"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.namespace_identity"
+path = "fuzz/fuzz_targets/namespace_identity.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["namespace_identity retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:namespace-identity"]
+routes = ["cargo:memcordon-fuzz:bin:namespace-identity"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: sealed_provider :: envelope :: parse_namespace_identity#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.native_argument"
+path = "fuzz/fuzz_targets/native_argument.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["native_argument retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:native_argument"]
+routes = ["cargo:memcordon-fuzz:bin:native_argument"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: NativeArgument#1:private",
+    "use:std :: ffi :: OsString#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.outcome_json"
+path = "fuzz/fuzz_targets/outcome_json.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["outcome_json retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:outcome_json"]
+routes = ["cargo:memcordon-fuzz:bin:outcome_json"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.outcome_sequences"
+path = "fuzz/fuzz_targets/outcome_sequences.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["outcome_sequences retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:outcome_sequences"]
+routes = ["cargo:memcordon-fuzz:bin:outcome_sequences"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: { RunState , StateMachine }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.policy_parser"
+path = "fuzz/fuzz_targets/policy_parser.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["policy_parser retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:policy_parser"]
+routes = ["cargo:memcordon-fuzz:bin:policy_parser"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.provider_recursion_proof"
+path = "fuzz/fuzz_targets/provider_recursion_proof.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["provider_recursion_proof retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:provider-recursion-proof"]
+routes = ["cargo:memcordon-fuzz:bin:provider-recursion-proof"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: sealed_provider :: cgroup_membership#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.qualification_receipt_v2"
+path = "fuzz/fuzz_targets/qualification_receipt_v2.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["qualification_receipt_v2 retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:qualification-receipt-v2"]
+routes = ["cargo:memcordon-fuzz:bin:qualification-receipt-v2"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: sealed_provider :: qualification#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.release_asset_components"
+path = "fuzz/fuzz_targets/release_asset_components.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["release_asset_components retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:release-asset-components"]
+routes = ["cargo:memcordon-fuzz:bin:release-asset-components"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.report_json"
+path = "fuzz/fuzz_targets/report_json.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["report_json retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:report_json"]
+routes = ["cargo:memcordon-fuzz:bin:report_json"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.restart_controller"
+path = "fuzz/fuzz_targets/restart_controller.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["restart_controller retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:restart_controller"]
+routes = ["cargo:memcordon-fuzz:bin:restart_controller"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.runtime_manifest"
+path = "fuzz/fuzz_targets/runtime_manifest.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["runtime_manifest retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:runtime-manifest"]
+routes = ["cargo:memcordon-fuzz:bin:runtime-manifest"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.schema_four"
+path = "fuzz/fuzz_targets/schema_four.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["schema_four retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:schema_four"]
+routes = ["cargo:memcordon-fuzz:bin:schema_four"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.service_unit_policy"
+path = "fuzz/fuzz_targets/service_unit_policy.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["service_unit_policy retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:service-unit-policy"]
+routes = ["cargo:memcordon-fuzz:bin:service-unit-policy"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.state_machine"
+path = "fuzz/fuzz_targets/state_machine.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["state_machine retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:state_machine"]
+routes = ["cargo:memcordon-fuzz:bin:state_machine"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: { RunState , StateMachine }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.terminal_receipt_v2"
+path = "fuzz/fuzz_targets/terminal_receipt_v2.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["terminal_receipt_v2 retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:terminal-receipt-v2"]
+routes = ["cargo:memcordon-fuzz:bin:terminal-receipt-v2"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: sealed_provider :: terminal :: parse_terminal#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_argv"
+path = "fuzz/fuzz_targets/windows_argv.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["windows_argv retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-argv"]
+routes = ["cargo:memcordon-fuzz:bin:windows-argv"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_attempt_record"
+path = "fuzz/fuzz_targets/windows_attempt_record.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["windows_attempt_record retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-attempt-record"]
+routes = ["cargo:memcordon-fuzz:bin:windows-attempt-record"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: { WindowsCertificationPhaseV1 , parse_and_authenticate_windows_attempt_record , windows_certification_transition_allowed , }#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_causal_diagnostics"
+path = "fuzz/fuzz_targets/windows_causal_diagnostics.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["windows_causal_diagnostics retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-causal-diagnostics"]
+routes = ["cargo:memcordon-fuzz:bin:windows-causal-diagnostics"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: *#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_environment_block"
+path = "fuzz/fuzz_targets/windows_environment_block.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["windows_environment_block retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-environment-block"]
+routes = ["cargo:memcordon-fuzz:bin:windows-environment-block"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: { WindowsEnvironmentEntryV1 , encode_windows_environment_block }#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_handle_manifest"
+path = "fuzz/fuzz_targets/windows_handle_manifest.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["windows_handle_manifest retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-handle-manifest"]
+routes = ["cargo:memcordon-fuzz:bin:windows-handle-manifest"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: { WindowsRemoteStreamV1 , validate_windows_stream_manifest }#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_package_inspection"
+path = "fuzz/fuzz_targets/windows_package_inspection.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "retire-after-evidence"
+protected_invariants = ["windows_package_inspection retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-package-inspection"]
+routes = ["cargo:memcordon-fuzz:bin:windows-package-inspection"]
+cfg = []
+item_visibility = [
+    "fn:check#1:private",
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: sealed_provider :: inspection as inspection_schema#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "PROV-05",
+    "TEST-02",
+]
+decision = "Remove after the corpus/artifact alias migration to `agent-package-inspection`; keep a target-alias record for triage and old crash names."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_private_launcher_protocol"
+path = "fuzz/fuzz_targets/windows_private_launcher_protocol.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["windows_private_launcher_protocol retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-private-launcher-protocol"]
+routes = ["cargo:memcordon-fuzz:bin:windows-private-launcher-protocol"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: { WindowsLauncherRequestV1 , WindowsLauncherResponseV1 }#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_public_provider_protocol"
+path = "fuzz/fuzz_targets/windows_public_provider_protocol.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["windows_public_provider_protocol retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-public-provider-protocol"]
+routes = ["cargo:memcordon-fuzz:bin:windows-public-provider-protocol"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: { WindowsProviderRequestV1 , WindowsProviderResponseV1 }#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_qualification"
+path = "fuzz/fuzz_targets/windows_qualification.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["windows_qualification retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-qualification"]
+routes = ["cargo:memcordon-fuzz:bin:windows-qualification"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: WindowsQualificationReceiptV1#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_security_descriptor"
+path = "fuzz/fuzz_targets/windows_security_descriptor.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["windows_security_descriptor retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-security-descriptor"]
+routes = ["cargo:memcordon-fuzz:bin:windows-security-descriptor"]
+cfg = []
+item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_terminal_receipt"
+path = "fuzz/fuzz_targets/windows_terminal_receipt.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["windows_terminal_receipt retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-terminal-receipt"]
+routes = ["cargo:memcordon-fuzz:bin:windows-terminal-receipt"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: WindowsTerminalReceiptV1#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.windows_token_envelope"
+path = "fuzz/fuzz_targets/windows_token_envelope.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["windows_token_envelope retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:windows-token-envelope"]
+routes = ["cargo:memcordon-fuzz:bin:windows-token-envelope"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: WindowsCallerTokenEnvelopeV1#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.workflow_parser"
+path = "fuzz/fuzz_targets/workflow_parser.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["workflow_parser retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:workflow_parser"]
+routes = ["cargo:memcordon-fuzz:bin:workflow_parser"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:std :: path :: Path#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.workload_canonical"
+path = "fuzz/fuzz_targets/workload_canonical.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["workload_canonical retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:workload-canonical"]
+routes = ["cargo:memcordon-fuzz:bin:workload-canonical"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: workload_codec :: { decode_contract , encode_contract }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.workload_discovery"
+path = "fuzz/fuzz_targets/workload_discovery.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["workload_discovery retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:workload-discovery"]
+routes = ["cargo:memcordon-fuzz:bin:workload-discovery"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: workload_contract :: reject_duplicate_json_keys#1:private",
+    "use:memcordon_core :: workload_discovery :: DiscoveryReportV1#1:private",
+    "use:memcordon_core :: workload_registry :: BaselineProfile#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.workload_receipt"
+path = "fuzz/fuzz_targets/workload_receipt.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["workload_receipt retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:workload-receipt"]
+routes = ["cargo:memcordon-fuzz:bin:workload-receipt"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: workload_contract :: reject_duplicate_json_keys#1:private",
+    "use:memcordon_core :: workload_evidence :: *#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.workload_registry"
+path = "fuzz/fuzz_targets/workload_registry.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["workload_registry retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:workload-registry"]
+routes = ["cargo:memcordon-fuzz:bin:workload-registry"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: workload_registry :: PolicyRegistryV1#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.workload_request"
+path = "fuzz/fuzz_targets/workload_request.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["workload_request retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-fuzz:bin:workload-request"]
+routes = ["cargo:memcordon-fuzz:bin:workload-request"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: workload_codec :: { decode_contract , encode_contract }#1:private",
+    "use:memcordon_core :: workload_contract :: WorkloadContractV1#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."
+
+[[source]]
+id = "fuzz.fuzz_targets.workload_transitions"
+path = "fuzz/fuzz_targets/workload_transitions.rs"
+owner = "fuzz"
+kind = "fuzz"
+visibility = "test-only"
+disposition = "harden"
+protected_invariants = ["Abstract evidence transitions only: no authenticated native handles are fuzz input."]
+consumers = ["cargo:memcordon-fuzz:bin:workload-transitions"]
+routes = ["cargo:memcordon-fuzz:bin:workload-transitions"]
+cfg = []
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: workload_contract :: { Nonce128 , reject_duplicate_json_keys }#1:private",
+    "use:memcordon_core :: workload_evidence :: *#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "GOV-03",
+    "TEST-02",
+]
+decision = "Add a `fuzz/targets.toml` charter with production unit, invariant set, max input, corpus owner, aliases, and retention policy; strengthen the harness or consolidate it before treating it as permanent."

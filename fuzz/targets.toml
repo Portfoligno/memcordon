@@ -1,0 +1,887 @@
+# Stable IDs are append-only; binary renames must preserve IDs and record aliases.
+# Legacy inspection aliases remain separate until PROV-05 replay evidence permits retirement.
+schema = 1
+
+[[targets]]
+id = "agent-package-inspection"
+bin = "agent-package-inspection"
+production_unit = "core::sealed_provider::inspection"
+class = "roundtrip"
+invariants = ["Accepted inspection values preserve canonical JSON and reject unknown authority fields"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-2"
+bin = "backoff_multiplier"
+production_unit = "core::BackoffMultiplier"
+class = "cross-field"
+invariants = ["Accepted multipliers are at least one and at most the specified maximum ratio"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-3"
+bin = "bounded_history"
+production_unit = "core::BoundedHistory"
+class = "state"
+invariants = ["Retained entries never exceed capacity and omitted count equals total minus retained"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-4"
+bin = "broker-protocol-v2"
+production_unit = "core::sealed_provider::{protocol,request}"
+class = "roundtrip"
+invariants = ["Frames preserve concatenated stream boundaries; validated request binding mutations and trailing bytes are rejected"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-5"
+bin = "budget_classifier"
+production_unit = "core::parse_budget"
+class = "parser"
+invariants = ["Non-ASCII budget spellings are explicitly classified as invalid Unicode"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-6"
+bin = "byte_size"
+production_unit = "core::ByteSize"
+class = "roundtrip"
+invariants = ["Accepted byte quantities preserve exact byte count through canonical decimal byte spelling"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/byte_size"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-7"
+bin = "caller-envelope-status"
+production_unit = "memcordon_core::sealed_provider::envelope::parse_proc_status"
+class = "parser"
+invariants = ["Accepted caller status preserves parsed authority fields under irrelevant-line insertion"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/caller-envelope-status"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-8"
+bin = "capability-mask"
+production_unit = "memcordon_core::sealed_provider::envelope::parse_capability_mask"
+class = "roundtrip"
+invariants = ["Accepted capability masks preserve bits under canonical hexadecimal spelling"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/capability-mask"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-9"
+bin = "cargo-bin-inventory"
+production_unit = "ci::fuzz_targets::targets"
+class = "parser"
+invariants = ["Accepted Cargo inventory is unique and sorted; duplicate binary names are rejected"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/cargo-bin-inventory"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-10"
+bin = "channel-pairing"
+production_unit = "core::sealed_provider::inspection::validate_exact_provider_pairing"
+class = "cross-field"
+invariants = ["Exact equal package versions pair; changing one version rejects authorization pairing"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-11"
+bin = "cleanup_json"
+production_unit = "core::CleanupSummary"
+class = "roundtrip"
+invariants = ["Accepted cleanup evidence preserves all values through canonical JSON roundtrip"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-12"
+bin = "duration"
+production_unit = "memcordon::parse_duration"
+class = "roundtrip"
+invariants = ["Accepted durations preserve exact seconds and nanoseconds under canonical duration spelling"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/duration"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-13"
+bin = "half_life_logistic_recurrence"
+production_unit = "core::backoff"
+class = "state"
+invariants = ["Elapsed recovery remains between immediate pulse and base pulse bounds"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-14"
+bin = "installed-provider-inspection"
+production_unit = "core::sealed_provider::inspection"
+class = "roundtrip"
+invariants = ["Accepted installed inspection values preserve canonical JSON and reject unknown authority fields"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-15"
+bin = "invocation_router"
+production_unit = "memcordon::invocation::route"
+class = "parser"
+invariants = ["Reserved command routing remains separate from child invocation classification"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-16"
+bin = "limit_token"
+production_unit = "memcordon::invocation::LimitToken"
+class = "parser"
+invariants = ["Recognized limit variants preserve quantity and suffix interpretation"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/limit_token"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-17"
+bin = "linux-evidence-v2"
+production_unit = "core::BoundaryMechanismEvidence"
+class = "roundtrip"
+invariants = ["Accepted boundary evidence survives canonical JSON decode"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-18"
+bin = "mount-context-manifest"
+production_unit = "ci::release_evidence::fuzz_linux_mount_context_manifest"
+class = "policy"
+invariants = ["Mount-context evidence preserves parsed fields under canonical JSON and rejects removal of required reproduction evidence"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-19"
+bin = "namespace-identity"
+production_unit = "memcordon_core::sealed_provider::envelope::parse_namespace_identity"
+class = "parser"
+invariants = ["Namespace identities preserve type and inode under canonical spelling"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/namespace-identity"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-20"
+bin = "native_argument"
+production_unit = "core::NativeArgument"
+class = "roundtrip"
+invariants = ["Native argument serialization preserves the exact operating-system byte representation"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-21"
+bin = "outcome_json"
+production_unit = "core::RunOutcome"
+class = "roundtrip"
+invariants = ["Accepted outcomes preserve all values through canonical JSON roundtrip"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-22"
+bin = "outcome_sequences"
+production_unit = "core::StateMachine"
+class = "state"
+invariants = ["Rejected transitions leave the current state unchanged; accepted transitions publish the requested state"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-23"
+bin = "policy_parser"
+production_unit = "ci::config::parse_policy"
+class = "parser"
+invariants = ["Accepted policy is invariant under semantics-preserving TOML reserialization"]
+max_input_bytes = 65536
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/policy_parser"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-24"
+bin = "provider-recursion-proof"
+production_unit = "memcordon_core::sealed_provider::cgroup_membership::is_sealed"
+class = "parser"
+invariants = ["Provider recursion proof recognizes only complete authorized cgroup path components"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/provider-recursion-proof"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-25"
+bin = "qualification-receipt-v2"
+production_unit = "core::sealed_provider::qualification"
+class = "cross-field"
+invariants = ["Receipt completeness survives roundtrip and removing each mandatory true fact makes it incomplete"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-26"
+bin = "release-asset-components"
+production_unit = "ci::config::Release"
+class = "parser"
+invariants = ["Accepted release manifests preserve component values under TOML normalization"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/release-asset-components"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-27"
+bin = "report_json"
+production_unit = "core::MemcordonReport"
+class = "roundtrip"
+invariants = ["Accepted reports preserve all values through canonical JSON roundtrip"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-28"
+bin = "restart_controller"
+production_unit = "core::RestartCoordinator"
+class = "state"
+invariants = ["Unsafe cleanup evidence forbids restart; interrupted waits do not increment restart count"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-29"
+bin = "runtime-manifest"
+production_unit = "ci::runtime_manifest::fuzz_runtime_manifest"
+class = "policy"
+invariants = ["Accepted runtime manifests preserve all validated values under canonical JSON"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-30"
+bin = "schema_four"
+production_unit = "core::MemcordonReport"
+class = "roundtrip"
+invariants = ["Reports declare the current execution schema and preserve canonical JSON"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-31"
+bin = "service-unit-policy"
+production_unit = "ci::release_evidence::fuzz_linux_service_unit_policy"
+class = "policy"
+invariants = ["Package verification survives JSON normalization; removing package verification or the control User directive rejects authorization"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-32"
+bin = "state_machine"
+production_unit = "core::StateMachine"
+class = "state"
+invariants = ["Rejected transitions leave the current state unchanged; accepted transitions publish the requested state"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-33"
+bin = "terminal-receipt-v2"
+production_unit = "memcordon_core::sealed_provider::terminal::parse_terminal"
+class = "cross-field"
+invariants = ["Terminal fields preserve semantic identity under reordering; duplicate, unknown, or incomplete records are rejected"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/terminal-receipt-v2"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-34"
+bin = "windows-argv"
+production_unit = "core::windows_argv"
+class = "roundtrip"
+invariants = ["Windows command-line encoding and decoding preserve every NUL-free argument"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-35"
+bin = "windows-attempt-record"
+production_unit = "core::WindowsAttemptRecord"
+class = "state"
+invariants = ["Durable attempt identity authenticates transitions; retired states have no outgoing authorization transition"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-36"
+bin = "windows-causal-diagnostics"
+production_unit = "core::WindowsAttemptDiagnostics"
+class = "cross-field"
+invariants = ["Secondary diagnostics preserve causal identity; wrong attempt projection is rejected"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-37"
+bin = "windows-environment-block"
+production_unit = "core::encode_windows_environment"
+class = "roundtrip"
+invariants = ["Accepted environment blocks terminate with the required double NUL"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-38"
+bin = "windows-handle-manifest"
+production_unit = "memcordon_core::WindowsRemoteStreamV1 / validate_windows_stream_manifest"
+class = "cross-field"
+invariants = ["Handle-transfer validity survives serialization and duplicate stream identities are rejected"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/windows-handle-manifest"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-39"
+bin = "windows-package-inspection"
+production_unit = "core::sealed_provider::inspection"
+class = "roundtrip"
+invariants = ["Historical alias candidate retains accepted inspection roundtrip and unknown-field rejection until replay retirement"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-40"
+bin = "windows-private-launcher-protocol"
+production_unit = "core::WindowsLauncherRequestV1"
+class = "roundtrip"
+invariants = ["Accepted private launcher requests and responses preserve canonical JSON values"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-41"
+bin = "windows-public-provider-protocol"
+production_unit = "core::WindowsProviderRequestV1"
+class = "roundtrip"
+invariants = ["Accepted public provider requests and responses preserve canonical JSON values"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-42"
+bin = "windows-qualification"
+production_unit = "core::WindowsQualificationReceipt"
+class = "cross-field"
+invariants = ["Receipt consistency is preserved by canonical JSON roundtrip"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-43"
+bin = "windows-security-descriptor"
+production_unit = "memcordon_core::validate_windows_security_descriptor_text"
+class = "parser"
+invariants = ["Accepted security descriptor contracts contain no embedded NUL and retain required authority sections"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/windows-security-descriptor"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-44"
+bin = "windows-terminal-receipt"
+production_unit = "core::WindowsTerminalReceipt"
+class = "cross-field"
+invariants = ["Bounded terminal inventory never exceeds the contract maximum"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-45"
+bin = "windows-token-envelope"
+production_unit = "memcordon_core::WindowsCallerTokenEnvelopeV1"
+class = "roundtrip"
+invariants = ["Accepted token envelope values preserve canonical JSON"]
+max_input_bytes = 4096
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-46"
+bin = "workflow_parser"
+production_unit = "ci::policy::validate_workflow_bytes"
+class = "policy"
+invariants = ["Accepted workflow validation is unaffected by inert leading whitespace"]
+max_input_bytes = 65536
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/workflow_parser"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-47"
+bin = "workload-canonical"
+production_unit = "core::workload_contract"
+class = "roundtrip"
+invariants = ["Accepted canonical binary contracts re-encode identically and reject trailing bytes"]
+max_input_bytes = 1048576
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-48"
+bin = "workload-discovery"
+production_unit = "core::workload_discovery"
+class = "cross-field"
+invariants = ["Validated profiles survive JSON; semantic digest substitution rejects discovery"]
+max_input_bytes = 1048576
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/workload-discovery"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-49"
+bin = "workload-receipt"
+production_unit = "core::workload_receipt"
+class = "cross-field"
+invariants = ["Terminal success implies consistency and admission; removing terminal evidence prevents success"]
+max_input_bytes = 1048576
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/workload-receipt"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-50"
+bin = "workload-registry"
+production_unit = "core::workload_registry"
+class = "roundtrip"
+invariants = ["Validated registry canonical digest is invariant under JSON roundtrip"]
+max_input_bytes = 1048576
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/workload-registry"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-51"
+bin = "workload-request"
+production_unit = "core::workload_request"
+class = "roundtrip"
+invariants = ["Valid requests preserve binary and JSON canonical representations"]
+max_input_bytes = 1048576
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/bootstrap"
+artifact_retention_days = 90
+aliases = []
+shard = "first"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false
+
+[[targets]]
+id = "fuzz-52"
+bin = "workload-transitions"
+production_unit = "core::workload_transition"
+class = "state"
+invariants = ["Incomplete retirement evidence and nonce mutation cannot authorize terminal success"]
+max_input_bytes = 1048576
+timeout_class = "smoke-30-seconds"
+corpus_owner = "memcordon-maintainers"
+seed_directory = "fuzz/seeds/workload-transitions"
+artifact_retention_days = 90
+aliases = []
+shard = "second"
+hosts = ["linux-x64", "linux-arm64"]
+import_mode = "direct"
+parity_required = false

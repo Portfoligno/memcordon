@@ -1,0 +1,1665 @@
+schema = 1
+
+[[identity]]
+id = "crates.memcordon-cli.build"
+original_path = "crates/memcordon-cli/build.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-embedding-fixture"
+original_path = "crates/memcordon-cli/src/bin/memcordon-embedding-fixture.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.admission"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/admission.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.inspection_schema"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/inspection_schema.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.attempt"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/attempt.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.cgroup"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/cgroup.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.cgroup_membership"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/cgroup_membership.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.clock"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/clock.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.envelope"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/envelope.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.guardian"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/guardian.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.launch"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.launcher"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launcher.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.mod"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/mod.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.namespace"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/namespace.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.qualification"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/qualification.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.qualification_schema"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/qualification_schema.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.recovery"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/recovery.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.runtime_manifest"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/runtime_manifest.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.service"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/service.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.startup"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/startup.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.transport"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/transport.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.main"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.package"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/package.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.policy_registry"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/policy_registry.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.protocol"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/protocol.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.rejection"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/rejection.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.request"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/request.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.state"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/state.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.attempt_store"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/attempt_store.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.control_service"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/control_service.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.diagnostics"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/diagnostics.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.guardian"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/guardian.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.guardian_service"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/guardian_service.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.job"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/job.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.launcher_service"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/launcher_service.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.loader_access"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/loader_access.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.mod"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/mod.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.package"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/package.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.pipe"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/pipe.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.policy_registry"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/policy_registry.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.process"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/process.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.process_impl"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/process_impl.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.process_impl.desktop_loader"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/process_impl/desktop_loader.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.process_impl.guardian_process"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/process_impl/guardian_process.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.process_impl.handles"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/process_impl/handles.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.process_impl.target"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/process_impl/target.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.qualification"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/qualification.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.record"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/record.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.security"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/security.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.service"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/service.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.service_manager"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/service_manager.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.session_broker"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/session_broker.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.settlement"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/settlement.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.startup_diagnostics"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/startup_diagnostics.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.token"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/token.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.token.attestation"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/token/attestation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.token.derivation"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/token/derivation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.token.fixture_derivation"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/token/fixture_derivation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.token.query"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/token/query.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.token.service_attestation"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/token/service_attestation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.windows.user_api"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/windows/user_api.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-test-fixture"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-test-fixture.credentials"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/credentials.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-test-fixture.namespace"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/namespace.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-test-fixture.process"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/process.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-test-fixture.registry"
+original_path = "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/registry.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-session-broker"
+original_path = "crates/memcordon-cli/src/bin/memcordon-session-broker.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-target-desktop-bootstrap"
+original_path = "crates/memcordon-cli/src/bin/memcordon-target-desktop-bootstrap.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture"
+original_path = "crates/memcordon-cli/src/bin/memcordon-test-fixture.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.io"
+original_path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/io.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.macos"
+original_path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/macos.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.memory"
+original_path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/memory.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.network"
+original_path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/network.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.process"
+original_path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/process.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.registry"
+original_path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/registry.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.bin.memcordon-test-fixture.windows"
+original_path = "crates/memcordon-cli/src/bin/memcordon-test-fixture/windows.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.commands"
+original_path = "crates/memcordon-cli/src/commands.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.commands.application"
+original_path = "crates/memcordon-cli/src/commands/application.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.commands.result_delivery"
+original_path = "crates/memcordon-cli/src/commands/result_delivery.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.exit_mapping"
+original_path = "crates/memcordon-cli/src/exit_mapping.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.invocation"
+original_path = "crates/memcordon-cli/src/invocation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.lib"
+original_path = "crates/memcordon-cli/src/lib.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.main"
+original_path = "crates/memcordon-cli/src/main.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.src.presentation"
+original_path = "crates/memcordon-cli/src/presentation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.application.clean"
+original_path = "crates/memcordon-cli/tests/application/clean.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.backend_contract"
+original_path = "crates/memcordon-cli/tests/backend_contract.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.cli"
+original_path = "crates/memcordon-cli/tests/cli.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.colour_policy"
+original_path = "crates/memcordon-cli/tests/colour_policy.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.documentation"
+original_path = "crates/memcordon-cli/tests/documentation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.exit_mapping"
+original_path = "crates/memcordon-cli/tests/exit_mapping.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.fixture_inventory"
+original_path = "crates/memcordon-cli/tests/fixture_inventory.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.inspection_schema"
+original_path = "crates/memcordon-cli/tests/inspection_schema.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.internal_invocation"
+original_path = "crates/memcordon-cli/tests/internal_invocation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.library_api"
+original_path = "crates/memcordon-cli/tests/library_api.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.lifecycle"
+original_path = "crates/memcordon-cli/tests/lifecycle.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.macos_admission"
+original_path = "crates/memcordon-cli/tests/macos_admission.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.macos_control_deadline"
+original_path = "crates/memcordon-cli/tests/macos_control_deadline.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.macos_protocol_evidence"
+original_path = "crates/memcordon-cli/tests/macos_protocol_evidence.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.macos_remediation"
+original_path = "crates/memcordon-cli/tests/macos_remediation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.presentation"
+original_path = "crates/memcordon-cli/tests/presentation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.provider_contract_parity"
+original_path = "crates/memcordon-cli/tests/provider_contract_parity.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.result_delivery"
+original_path = "crates/memcordon-cli/tests/result_delivery.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent"
+original_path = "crates/memcordon-cli/tests/sealed_agent.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.attempt_record_atomic"
+original_path = "crates/memcordon-cli/tests/sealed_agent/attempt_record_atomic.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.cgroup_grace"
+original_path = "crates/memcordon-cli/tests/sealed_agent/cgroup_grace.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.exec_status"
+original_path = "crates/memcordon-cli/tests/sealed_agent/exec_status.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.guardian_terminal"
+original_path = "crates/memcordon-cli/tests/sealed_agent/guardian_terminal.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.launcher_activation"
+original_path = "crates/memcordon-cli/tests/sealed_agent/launcher_activation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.linux_cgroup_readback"
+original_path = "crates/memcordon-cli/tests/sealed_agent/linux_cgroup_readback.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.linux_faults"
+original_path = "crates/memcordon-cli/tests/sealed_agent/linux_faults.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.linux_package"
+original_path = "crates/memcordon-cli/tests/sealed_agent/linux_package.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.linux_provider"
+original_path = "crates/memcordon-cli/tests/sealed_agent/linux_provider.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.linux_recovery"
+original_path = "crates/memcordon-cli/tests/sealed_agent/linux_recovery.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.linux_recovery_inventory"
+original_path = "crates/memcordon-cli/tests/sealed_agent/linux_recovery_inventory.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.linux_sealed"
+original_path = "crates/memcordon-cli/tests/sealed_agent/linux_sealed.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.linux_service"
+original_path = "crates/memcordon-cli/tests/sealed_agent/linux_service.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.linux_startup"
+original_path = "crates/memcordon-cli/tests/sealed_agent/linux_startup.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.namespace_startup"
+original_path = "crates/memcordon-cli/tests/sealed_agent/namespace_startup.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.native_workload_admission"
+original_path = "crates/memcordon-cli/tests/sealed_agent/native_workload_admission.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.package"
+original_path = "crates/memcordon-cli/tests/sealed_agent/package.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.package_verification"
+original_path = "crates/memcordon-cli/tests/sealed_agent/package_verification.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.policy_revocation"
+original_path = "crates/memcordon-cli/tests/sealed_agent/policy_revocation.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.protocol"
+original_path = "crates/memcordon-cli/tests/sealed_agent/protocol.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.rejection"
+original_path = "crates/memcordon-cli/tests/sealed_agent/rejection.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.request"
+original_path = "crates/memcordon-cli/tests/sealed_agent/request.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.support.concurrency"
+original_path = "crates/memcordon-cli/tests/sealed_agent/support/concurrency.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.support.mod"
+original_path = "crates/memcordon-cli/tests/sealed_agent/support/mod.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.support.retained_streams"
+original_path = "crates/memcordon-cli/tests/sealed_agent/support/retained_streams.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.support.sealed_faults"
+original_path = "crates/memcordon-cli/tests/sealed_agent/support/sealed_faults.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_causal_capture"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_causal_capture.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_certification_token_support"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_certification_token_support.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_guardian_startup"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_guardian_startup.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_handle_provenance"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_handle_provenance.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_install_intent"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_install_intent.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_native_diagnostic_codes"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_native_diagnostic_codes.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_package_policy_rollback"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_package_policy_rollback.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_policy_directory"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_policy_directory.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_postauthorization_retirement"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_postauthorization_retirement.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_qualification"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_qualification.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_qualification_artifacts"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_qualification_artifacts.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_record_faults"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_record_faults.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_replay_retention"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_replay_retention.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_retained_binding"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_retained_binding.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_security"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_security.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_service_manager"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_service_manager.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_startup_diagnostics"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_startup_diagnostics.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_token"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_token.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent.windows_writer_queue"
+original_path = "crates/memcordon-cli/tests/sealed_agent/windows_writer_queue.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.sealed_agent_distribution"
+original_path = "crates/memcordon-cli/tests/sealed_agent_distribution.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.stress"
+original_path = "crates/memcordon-cli/tests/stress.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.windows_settlement"
+original_path = "crates/memcordon-cli/tests/windows_settlement.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.diagnostics"
+original_path = "crates/memcordon-core/src/diagnostics.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.error"
+original_path = "crates/memcordon-core/src/error.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.lib"
+original_path = "crates/memcordon-core/src/lib.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.linux_fault_contract"
+original_path = "crates/memcordon-core/src/linux_fault_contract.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.outcome"
+original_path = "crates/memcordon-core/src/outcome.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.policy"
+original_path = "crates/memcordon-core/src/policy.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.report"
+original_path = "crates/memcordon-core/src/report.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.restart"
+original_path = "crates/memcordon-core/src/restart.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.runtime_evidence"
+original_path = "crates/memcordon-core/src/runtime_evidence.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.runtime_manifest"
+original_path = "crates/memcordon-core/src/runtime_manifest.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.sealed_provider.cgroup_membership"
+original_path = "crates/memcordon-core/src/sealed_provider/cgroup_membership.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.sealed_provider.envelope"
+original_path = "crates/memcordon-core/src/sealed_provider/envelope.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.sealed_provider.fingerprint"
+original_path = "crates/memcordon-core/src/sealed_provider/fingerprint.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.sealed_provider.inspection"
+original_path = "crates/memcordon-core/src/sealed_provider/inspection.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.sealed_provider.mod"
+original_path = "crates/memcordon-core/src/sealed_provider/mod.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.sealed_provider.protocol"
+original_path = "crates/memcordon-core/src/sealed_provider/protocol.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.sealed_provider.qualification"
+original_path = "crates/memcordon-core/src/sealed_provider/qualification.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.sealed_provider.request"
+original_path = "crates/memcordon-core/src/sealed_provider/request.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.sealed_provider.terminal"
+original_path = "crates/memcordon-core/src/sealed_provider/terminal.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.state_machine"
+original_path = "crates/memcordon-core/src/state_machine.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.supervision"
+original_path = "crates/memcordon-core/src/supervision.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.test_support"
+original_path = "crates/memcordon-core/src/test_support.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.windows_pe"
+original_path = "crates/memcordon-core/src/windows_pe.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.windows_sealed"
+original_path = "crates/memcordon-core/src/windows_sealed.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.workload_codec"
+original_path = "crates/memcordon-core/src/workload_codec.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.workload_contract"
+original_path = "crates/memcordon-core/src/workload_contract.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.workload_discovery"
+original_path = "crates/memcordon-core/src/workload_discovery.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.workload_evidence"
+original_path = "crates/memcordon-core/src/workload_evidence.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.workload_limits"
+original_path = "crates/memcordon-core/src/workload_limits.rs"
+
+[[identity]]
+id = "crates.memcordon-core.src.workload_registry"
+original_path = "crates/memcordon-core/src/workload_registry.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.diagnostics"
+original_path = "crates/memcordon-core/tests/diagnostics.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.policy"
+original_path = "crates/memcordon-core/tests/policy.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.provider_contract_vectors"
+original_path = "crates/memcordon-core/tests/provider_contract_vectors.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.provider_linux_contracts"
+original_path = "crates/memcordon-core/tests/provider_linux_contracts.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.report"
+original_path = "crates/memcordon-core/tests/report.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.restart"
+original_path = "crates/memcordon-core/tests/restart.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.restart_supervision"
+original_path = "crates/memcordon-core/tests/restart_supervision.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.runtime_evidence"
+original_path = "crates/memcordon-core/tests/runtime_evidence.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.windows_package_cleanup"
+original_path = "crates/memcordon-core/tests/windows_package_cleanup.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.windows_pe"
+original_path = "crates/memcordon-core/tests/windows_pe.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.windows_qualification_rejection"
+original_path = "crates/memcordon-core/tests/windows_qualification_rejection.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.windows_sealed"
+original_path = "crates/memcordon-core/tests/windows_sealed.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.windows_startup_attestation"
+original_path = "crates/memcordon-core/tests/windows_startup_attestation.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.workload_contract"
+original_path = "crates/memcordon-core/tests/workload_contract.rs"
+
+[[identity]]
+id = "crates.memcordon-core.tests.workload_independent_vectors"
+original_path = "crates/memcordon-core/tests/workload_independent_vectors.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.backend"
+original_path = "crates/memcordon-platform/src/backend.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.guardian"
+original_path = "crates/memcordon-platform/src/guardian.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.lib"
+original_path = "crates/memcordon-platform/src/lib.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.linux_cgroup"
+original_path = "crates/memcordon-platform/src/linux_cgroup.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.macos_deadline"
+original_path = "crates/memcordon-platform/src/macos_deadline.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.macos_envelope"
+original_path = "crates/memcordon-platform/src/macos_envelope.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.macos_launch"
+original_path = "crates/memcordon-platform/src/macos_launch.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.macos_watchdog"
+original_path = "crates/memcordon-platform/src/macos_watchdog.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.sealed.client"
+original_path = "crates/memcordon-platform/src/sealed/client.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.sealed.linux_runtime"
+original_path = "crates/memcordon-platform/src/sealed/linux_runtime.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.sealed.mod"
+original_path = "crates/memcordon-platform/src/sealed/mod.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.sealed.windows"
+original_path = "crates/memcordon-platform/src/sealed/windows.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.sealed.windows_runtime"
+original_path = "crates/memcordon-platform/src/sealed/windows_runtime.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.signal"
+original_path = "crates/memcordon-platform/src/signal.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.supervisor"
+original_path = "crates/memcordon-platform/src/supervisor.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.test_support"
+original_path = "crates/memcordon-platform/src/test_support.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.test_support.native_access"
+original_path = "crates/memcordon-platform/src/test_support/native_access.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.test_support.system_input"
+original_path = "crates/memcordon-platform/src/test_support/system_input.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.test_support.windows_file_identity"
+original_path = "crates/memcordon-platform/src/test_support/windows_file_identity.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.test_support.windows_reparse"
+original_path = "crates/memcordon-platform/src/test_support/windows_reparse.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.unix_watchdog"
+original_path = "crates/memcordon-platform/src/unix_watchdog.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.src.windows_job"
+original_path = "crates/memcordon-platform/src/windows_job.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.tests.linux_cgroup"
+original_path = "crates/memcordon-platform/tests/linux_cgroup.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.tests.macos_admission"
+original_path = "crates/memcordon-platform/tests/macos_admission.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.tests.macos_deadline"
+original_path = "crates/memcordon-platform/tests/macos_deadline.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.tests.macos_inventory"
+original_path = "crates/memcordon-platform/tests/macos_inventory.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.tests.sealed_exec"
+original_path = "crates/memcordon-platform/tests/sealed_exec.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.tests.supervisor"
+original_path = "crates/memcordon-platform/tests/supervisor.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.tests.test_support"
+original_path = "crates/memcordon-platform/tests/test_support.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.tests.windows_job"
+original_path = "crates/memcordon-platform/tests/windows_job.rs"
+
+[[identity]]
+id = "crates.memcordon-testkit.src.lib"
+original_path = "crates/memcordon-testkit/src/lib.rs"
+
+[[identity]]
+id = "crates.memcordon-testkit.tests.outer_boundary"
+original_path = "crates/memcordon-testkit/tests/outer_boundary.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.artifact"
+original_path = "crates/memcordon-windows-launch-core/src/artifact.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.attributes"
+original_path = "crates/memcordon-windows-launch-core/src/attributes.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.create"
+original_path = "crates/memcordon-windows-launch-core/src/create.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.desktop"
+original_path = "crates/memcordon-windows-launch-core/src/desktop.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.environment"
+original_path = "crates/memcordon-windows-launch-core/src/environment.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.evidence"
+original_path = "crates/memcordon-windows-launch-core/src/evidence.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.handshake"
+original_path = "crates/memcordon-windows-launch-core/src/handshake.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.lib"
+original_path = "crates/memcordon-windows-launch-core/src/lib.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.native"
+original_path = "crates/memcordon-windows-launch-core/src/native.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.plan"
+original_path = "crates/memcordon-windows-launch-core/src/plan.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.prepared"
+original_path = "crates/memcordon-windows-launch-core/src/prepared.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.token"
+original_path = "crates/memcordon-windows-launch-core/src/token.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.src.token_snapshot"
+original_path = "crates/memcordon-windows-launch-core/src/token_snapshot.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.tests.desktop_material"
+original_path = "crates/memcordon-windows-launch-core/tests/desktop_material.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.tests.dto_vectors"
+original_path = "crates/memcordon-windows-launch-core/tests/dto_vectors.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.tests.native_security"
+original_path = "crates/memcordon-windows-launch-core/tests/native_security.rs"
+
+[[identity]]
+id = "crates.memcordon-windows-launch-core.tests.production_contract"
+original_path = "crates/memcordon-windows-launch-core/tests/production_contract.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.agent_package_inspection"
+original_path = "fuzz/fuzz_targets/agent_package_inspection.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.backoff_multiplier"
+original_path = "fuzz/fuzz_targets/backoff_multiplier.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.bounded_history"
+original_path = "fuzz/fuzz_targets/bounded_history.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.broker_protocol_v2"
+original_path = "fuzz/fuzz_targets/broker_protocol_v2.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.budget_classifier"
+original_path = "fuzz/fuzz_targets/budget_classifier.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.byte_size"
+original_path = "fuzz/fuzz_targets/byte_size.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.caller_envelope_status"
+original_path = "fuzz/fuzz_targets/caller_envelope_status.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.capability_mask"
+original_path = "fuzz/fuzz_targets/capability_mask.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.cargo_bin_inventory"
+original_path = "fuzz/fuzz_targets/cargo_bin_inventory.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.channel_pairing"
+original_path = "fuzz/fuzz_targets/channel_pairing.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.cleanup_json"
+original_path = "fuzz/fuzz_targets/cleanup_json.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.duration"
+original_path = "fuzz/fuzz_targets/duration.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.half_life_logistic_recurrence"
+original_path = "fuzz/fuzz_targets/half_life_logistic_recurrence.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.installed_provider_inspection"
+original_path = "fuzz/fuzz_targets/installed_provider_inspection.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.invocation_router"
+original_path = "fuzz/fuzz_targets/invocation_router.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.limit_token"
+original_path = "fuzz/fuzz_targets/limit_token.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.linux_evidence_v2"
+original_path = "fuzz/fuzz_targets/linux_evidence_v2.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.mount_context_manifest"
+original_path = "fuzz/fuzz_targets/mount_context_manifest.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.namespace_identity"
+original_path = "fuzz/fuzz_targets/namespace_identity.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.native_argument"
+original_path = "fuzz/fuzz_targets/native_argument.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.outcome_json"
+original_path = "fuzz/fuzz_targets/outcome_json.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.outcome_sequences"
+original_path = "fuzz/fuzz_targets/outcome_sequences.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.policy_parser"
+original_path = "fuzz/fuzz_targets/policy_parser.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.provider_recursion_proof"
+original_path = "fuzz/fuzz_targets/provider_recursion_proof.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.qualification_receipt_v2"
+original_path = "fuzz/fuzz_targets/qualification_receipt_v2.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.release_asset_components"
+original_path = "fuzz/fuzz_targets/release_asset_components.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.report_json"
+original_path = "fuzz/fuzz_targets/report_json.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.restart_controller"
+original_path = "fuzz/fuzz_targets/restart_controller.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.runtime_manifest"
+original_path = "fuzz/fuzz_targets/runtime_manifest.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.schema_four"
+original_path = "fuzz/fuzz_targets/schema_four.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.service_unit_policy"
+original_path = "fuzz/fuzz_targets/service_unit_policy.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.state_machine"
+original_path = "fuzz/fuzz_targets/state_machine.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.terminal_receipt_v2"
+original_path = "fuzz/fuzz_targets/terminal_receipt_v2.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_argv"
+original_path = "fuzz/fuzz_targets/windows_argv.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_attempt_record"
+original_path = "fuzz/fuzz_targets/windows_attempt_record.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_causal_diagnostics"
+original_path = "fuzz/fuzz_targets/windows_causal_diagnostics.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_environment_block"
+original_path = "fuzz/fuzz_targets/windows_environment_block.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_handle_manifest"
+original_path = "fuzz/fuzz_targets/windows_handle_manifest.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_package_inspection"
+original_path = "fuzz/fuzz_targets/windows_package_inspection.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_private_launcher_protocol"
+original_path = "fuzz/fuzz_targets/windows_private_launcher_protocol.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_public_provider_protocol"
+original_path = "fuzz/fuzz_targets/windows_public_provider_protocol.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_qualification"
+original_path = "fuzz/fuzz_targets/windows_qualification.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_security_descriptor"
+original_path = "fuzz/fuzz_targets/windows_security_descriptor.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_terminal_receipt"
+original_path = "fuzz/fuzz_targets/windows_terminal_receipt.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.windows_token_envelope"
+original_path = "fuzz/fuzz_targets/windows_token_envelope.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.workflow_parser"
+original_path = "fuzz/fuzz_targets/workflow_parser.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.workload_canonical"
+original_path = "fuzz/fuzz_targets/workload_canonical.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.workload_discovery"
+original_path = "fuzz/fuzz_targets/workload_discovery.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.workload_receipt"
+original_path = "fuzz/fuzz_targets/workload_receipt.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.workload_registry"
+original_path = "fuzz/fuzz_targets/workload_registry.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.workload_request"
+original_path = "fuzz/fuzz_targets/workload_request.rs"
+
+[[identity]]
+id = "fuzz.fuzz_targets.workload_transitions"
+original_path = "fuzz/fuzz_targets/workload_transitions.rs"
+
+[[identity]]
+id = "tools.ci-build-environment"
+original_path = "tools/ci-build-environment.rs"
+
+[[identity]]
+id = "tools.ci-command-path"
+original_path = "tools/ci-command-path.rs"
+
+[[identity]]
+id = "tools.ci-msvc-environment"
+original_path = "tools/ci-msvc-environment.rs"
+
+[[identity]]
+id = "tools.ci-native-fingerprint"
+original_path = "tools/ci-native-fingerprint.rs"
+
+[[identity]]
+id = "tools.ci-progress"
+original_path = "tools/ci-progress.rs"
+
+[[identity]]
+id = "tools.ci-windows-compiler"
+original_path = "tools/ci-windows-compiler.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.bin.memcordon-native-input-digest"
+original_path = "tools/memcordon-ci/src/bin/memcordon-native-input-digest.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.build_context"
+original_path = "tools/memcordon-ci/src/build_context.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.capability"
+original_path = "tools/memcordon-ci/src/capability.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.certification_context"
+original_path = "tools/memcordon-ci/src/certification_context.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.command"
+original_path = "tools/memcordon-ci/src/command.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.config"
+original_path = "tools/memcordon-ci/src/config.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.fuzz_targets"
+original_path = "tools/memcordon-ci/src/fuzz_targets.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.inventory_progress"
+original_path = "tools/memcordon-ci/src/inventory_progress.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.inventory_reader"
+original_path = "tools/memcordon-ci/src/inventory_reader.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.inventory_workers"
+original_path = "tools/memcordon-ci/src/inventory_workers.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.lib"
+original_path = "tools/memcordon-ci/src/lib.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.line_evidence"
+original_path = "tools/memcordon-ci/src/line_evidence.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.main"
+original_path = "tools/memcordon-ci/src/main.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.managed_workflow"
+original_path = "tools/memcordon-ci/src/managed_workflow.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.miri_targets"
+original_path = "tools/memcordon-ci/src/miri_targets.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.native_file_digest"
+original_path = "tools/memcordon-ci/src/native_file_digest.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.policy"
+original_path = "tools/memcordon-ci/src/policy.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.producer_metadata"
+original_path = "tools/memcordon-ci/src/producer_metadata.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.release"
+original_path = "tools/memcordon-ci/src/release.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.release_archive"
+original_path = "tools/memcordon-ci/src/release_archive.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.release_evidence"
+original_path = "tools/memcordon-ci/src/release_evidence.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.reparse_diagnostic"
+original_path = "tools/memcordon-ci/src/reparse_diagnostic.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.runtime_manifest"
+original_path = "tools/memcordon-ci/src/runtime_manifest.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.scenario_diagnostic"
+original_path = "tools/memcordon-ci/src/scenario_diagnostic.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.sealed_identity"
+original_path = "tools/memcordon-ci/src/sealed_identity.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.sealed_linux"
+original_path = "tools/memcordon-ci/src/sealed_linux.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.sealed_selector"
+original_path = "tools/memcordon-ci/src/sealed_selector.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.sealed_windows"
+original_path = "tools/memcordon-ci/src/sealed_windows.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.source_registry.history"
+original_path = "tools/memcordon-ci/src/source_registry/history.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.source_registry.inventory"
+original_path = "tools/memcordon-ci/src/source_registry/inventory.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.source_registry.mod"
+original_path = "tools/memcordon-ci/src/source_registry/mod.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.source_registry.policy"
+original_path = "tools/memcordon-ci/src/source_registry/policy.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.source_registry.report"
+original_path = "tools/memcordon-ci/src/source_registry/report.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.source_registry.routing"
+original_path = "tools/memcordon-ci/src/source_registry/routing.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.source_registry.schema"
+original_path = "tools/memcordon-ci/src/source_registry/schema.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.standard_contract"
+original_path = "tools/memcordon-ci/src/standard_contract.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.standard_runner"
+original_path = "tools/memcordon-ci/src/standard_runner.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.suites"
+original_path = "tools/memcordon-ci/src/suites.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.windows_channel_identity"
+original_path = "tools/memcordon-ci/src/windows_channel_identity.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.windows_package_cleanup"
+original_path = "tools/memcordon-ci/src/windows_package_cleanup.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.windows_package_staging"
+original_path = "tools/memcordon-ci/src/windows_package_staging.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.windows_qualification_artifacts"
+original_path = "tools/memcordon-ci/src/windows_qualification_artifacts.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.workload_qualification"
+original_path = "tools/memcordon-ci/src/workload_qualification.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.bootstrap_profile"
+original_path = "tools/memcordon-ci/tests/bootstrap_profile.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.build_context"
+original_path = "tools/memcordon-ci/tests/build_context.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.capability"
+original_path = "tools/memcordon-ci/tests/capability.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.command"
+original_path = "tools/memcordon-ci/tests/command.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.credential_provider_cli"
+original_path = "tools/memcordon-ci/tests/credential_provider_cli.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.environment_names"
+original_path = "tools/memcordon-ci/tests/environment_names.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.fingerprint_progress"
+original_path = "tools/memcordon-ci/tests/fingerprint_progress.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.fuzz_targets"
+original_path = "tools/memcordon-ci/tests/fuzz_targets.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.inventory_progress"
+original_path = "tools/memcordon-ci/tests/inventory_progress.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.inventory_reader"
+original_path = "tools/memcordon-ci/tests/inventory_reader.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.inventory_workers"
+original_path = "tools/memcordon-ci/tests/inventory_workers.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.line_evidence"
+original_path = "tools/memcordon-ci/tests/line_evidence.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.linux_fault_inventory"
+original_path = "tools/memcordon-ci/tests/linux_fault_inventory.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.managed_workflow"
+original_path = "tools/memcordon-ci/tests/managed_workflow.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.manifest_versions"
+original_path = "tools/memcordon-ci/tests/manifest_versions.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.miri_targets"
+original_path = "tools/memcordon-ci/tests/miri_targets.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.msrv_source"
+original_path = "tools/memcordon-ci/tests/msrv_source.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.msvc_discovery"
+original_path = "tools/memcordon-ci/tests/msvc_discovery.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.msvc_selection"
+original_path = "tools/memcordon-ci/tests/msvc_selection.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.native_access"
+original_path = "tools/memcordon-ci/tests/native_access.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.native_devices"
+original_path = "tools/memcordon-ci/tests/native_devices.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.native_file_digest"
+original_path = "tools/memcordon-ci/tests/native_file_digest.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.native_symlink_access"
+original_path = "tools/memcordon-ci/tests/native_symlink_access.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.package_output"
+original_path = "tools/memcordon-ci/tests/package_output.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.policy_metadata"
+original_path = "tools/memcordon-ci/tests/policy_metadata.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.producer_metadata"
+original_path = "tools/memcordon-ci/tests/producer_metadata.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.release.unit"
+original_path = "tools/memcordon-ci/tests/release/unit.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.release_archive"
+original_path = "tools/memcordon-ci/tests/release_archive.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.release_configuration"
+original_path = "tools/memcordon-ci/tests/release_configuration.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.release_evidence"
+original_path = "tools/memcordon-ci/tests/release_evidence.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.reparse_diagnostic"
+original_path = "tools/memcordon-ci/tests/reparse_diagnostic.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.rust_policy"
+original_path = "tools/memcordon-ci/tests/rust_policy.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.scenario_diagnostic"
+original_path = "tools/memcordon-ci/tests/scenario_diagnostic.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.sealed_identity"
+original_path = "tools/memcordon-ci/tests/sealed_identity.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.sealed_package_targets"
+original_path = "tools/memcordon-ci/tests/sealed_package_targets.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.sealed_privilege"
+original_path = "tools/memcordon-ci/tests/sealed_privilege.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.source_registry"
+original_path = "tools/memcordon-ci/tests/source_registry.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.standard_certification"
+original_path = "tools/memcordon-ci/tests/standard_certification.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.standard_contract"
+original_path = "tools/memcordon-ci/tests/standard_contract.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.standard_runner_lifecycle"
+original_path = "tools/memcordon-ci/tests/standard_runner_lifecycle.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.standard_workflow_mutations"
+original_path = "tools/memcordon-ci/tests/standard_workflow_mutations.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.support.standard"
+original_path = "tools/memcordon-ci/tests/support/standard.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.tool_resolution"
+original_path = "tools/memcordon-ci/tests/tool_resolution.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.toolchain_identity"
+original_path = "tools/memcordon-ci/tests/toolchain_identity.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.windows_channel_identity"
+original_path = "tools/memcordon-ci/tests/windows_channel_identity.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.windows_command_paths"
+original_path = "tools/memcordon-ci/tests/windows_command_paths.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.windows_loader_desktop_contract"
+original_path = "tools/memcordon-ci/tests/windows_loader_desktop_contract.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.windows_package_cleanup"
+original_path = "tools/memcordon-ci/tests/windows_package_cleanup.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.windows_package_staging"
+original_path = "tools/memcordon-ci/tests/windows_package_staging.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.windows_path_admission"
+original_path = "tools/memcordon-ci/tests/windows_path_admission.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.windows_qualification_artifacts"
+original_path = "tools/memcordon-ci/tests/windows_qualification_artifacts.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.workflow_policy"
+original_path = "tools/memcordon-ci/tests/workflow_policy.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.yaml_limits"
+original_path = "tools/memcordon-ci/tests/yaml_limits.rs"
+
+[[identity]]
+id = "tools.memcordon-deadline-oracle.src.main"
+original_path = "tools/memcordon-deadline-oracle/src/main.rs"
+
+[[identity]]
+id = "tools.memcordon-deadline-oracle.src.native"
+original_path = "tools/memcordon-deadline-oracle/src/native.rs"
+
+[[identity]]
+id = "tools.memcordon-native-inspect.src.lib"
+original_path = "tools/memcordon-native-inspect/src/lib.rs"
+
+[[identity]]
+id = "tools.memcordon-native-inspect.src.reparse_reply"
+original_path = "tools/memcordon-native-inspect/src/reparse_reply.rs"
+
+[[identity]]
+id = "tools.memcordon-native-inspect.tests.native_inspection"
+original_path = "tools/memcordon-native-inspect/tests/native_inspection.rs"
+
+[[identity]]
+id = "tools.memcordon-native-inspect.tests.windows_reparse"
+original_path = "tools/memcordon-native-inspect/tests/windows_reparse.rs"
+
+[[identity]]
+id = "tools.memcordon-windows-loader-lab.src.artifact"
+original_path = "tools/memcordon-windows-loader-lab/src/artifact.rs"
+
+[[identity]]
+id = "tools.memcordon-windows-loader-lab.src.bin.memcordon-loader-smoke-target"
+original_path = "tools/memcordon-windows-loader-lab/src/bin/memcordon-loader-smoke-target.rs"
+
+[[identity]]
+id = "tools.memcordon-windows-loader-lab.src.controller"
+original_path = "tools/memcordon-windows-loader-lab/src/controller.rs"
+
+[[identity]]
+id = "tools.memcordon-windows-loader-lab.src.lib"
+original_path = "tools/memcordon-windows-loader-lab/src/lib.rs"
+
+[[identity]]
+id = "tools.memcordon-windows-loader-lab.src.main"
+original_path = "tools/memcordon-windows-loader-lab/src/main.rs"
+
+[[identity]]
+id = "tools.memcordon-windows-loader-lab.src.observer"
+original_path = "tools/memcordon-windows-loader-lab/src/observer.rs"
+
+[[identity]]
+id = "tools.memcordon-windows-loader-lab.src.scenario"
+original_path = "tools/memcordon-windows-loader-lab/src/scenario.rs"
+
+[[identity]]
+id = "tools.memcordon-windows-loader-lab.src.spawner"
+original_path = "tools/memcordon-windows-loader-lab/src/spawner.rs"
+
+[[identity]]
+id = "tools.memcordon-windows-loader-lab.src.target"
+original_path = "tools/memcordon-windows-loader-lab/src/target.rs"
+
+[[identity]]
+id = "tools.memcordon-windows-loader-lab.tests.lab_contract"
+original_path = "tools/memcordon-windows-loader-lab/tests/lab_contract.rs"
+
+[[retired]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.state"
+reason = "PROV-02: unused abstract state model removed; production Linux fault and Windows record transitions remain authoritative."

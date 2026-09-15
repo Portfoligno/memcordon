@@ -426,6 +426,7 @@ pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
         None,
         None,
         None,
+        None,
     ];
     if steps.len() != identities.len() {
         return Err(failure("fuzz ordered step inventory differs"));
@@ -465,7 +466,7 @@ pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
         {
             return Err(failure("fuzz cache restore action differs"));
         }
-        if index >= 7 {
+        if (7..=9).contains(&index) {
             let expected = [
                 (
                     "always() && steps.fuzz-target.outputs.cache-hit != 'true'",
@@ -496,6 +497,29 @@ pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
                 || scalar(with, "path") != Some(path)
             {
                 return Err(failure("fuzz cache save ordering or inputs differ"));
+            }
+        }
+        if index == 10 {
+            let with = mapping(
+                step.get(key("with")).expect("exact step keys"),
+                "fuzz evidence upload",
+            )?;
+            exact_mapping_keys(
+                with,
+                &["name", "path", "retention-days", "if-no-files-found"],
+                "fuzz evidence upload",
+            )?;
+            if scalar(step, "uses")
+                != Some("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+                || scalar(step, "if") != Some("always()")
+                || scalar(with, "name") != Some("fuzz-evidence-${{ matrix.shard }}")
+                || scalar(with, "path") != Some("target/ci/reports/fuzz")
+                || with.get(key("retention-days")).and_then(Value::as_u64) != Some(90)
+                || scalar(with, "if-no-files-found") != Some("warn")
+            {
+                return Err(failure(
+                    "fuzz evidence identity, retention, or upload gate differs",
+                ));
             }
         }
         if matches!(index, 1 | 3) {
@@ -531,7 +555,7 @@ pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
             exact_mapping_keys(with, &["path", "key"], "fuzz target cache")?;
             if scalar(with, "key")
                 != Some(
-                    "cargo-target-deep-v3-fuzz-${{ runner.os }}-${{ runner.arch }}-${{ matrix.shard }}-nightly-2026-07-31-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'crates/**', 'tools/**', 'ci/**', '.github/workflows/deep-ci.yml') }}",
+                    "cargo-target-deep-v3-fuzz-${{ runner.os }}-${{ runner.arch }}-${{ matrix.shard }}-nightly-2026-07-31-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'fuzz/targets.toml', 'fuzz/seeds/**', 'crates/**', 'tools/**', 'ci/**', '.github/workflows/deep-ci.yml') }}",
                 )
                 || scalar(with, "path") != Some("target/ci\nfuzz/target\n")
                 || scalar(step, "if").is_some()
@@ -3097,7 +3121,7 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
         Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");
     let native_path_fixture = [
         Path::new("crates/memcordon-cli/tests/macos_remediation.rs"),
-        Path::new("crates/memcordon-cli/src/bin/memcordon-test-fixture.rs"),
+        Path::new("crates/memcordon-cli/src/bin/memcordon-test-fixture/macos.rs"),
     ]
     .contains(&relative)
         && visitor.subprocess_env_mutations == visitor.standard_path_mutations;
@@ -3191,7 +3215,7 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
             Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launch.rs");
         let native_path_fixture = [
             Path::new("crates/memcordon-cli/tests/macos_remediation.rs"),
-            Path::new("crates/memcordon-cli/src/bin/memcordon-test-fixture.rs"),
+            Path::new("crates/memcordon-cli/src/bin/memcordon-test-fixture/macos.rs"),
         ]
         .contains(&relative.as_path())
             && visitor.subprocess_env_mutations == visitor.standard_path_mutations;
@@ -3252,8 +3276,9 @@ fn is_reviewed_raw_fork_boundary(relative: &Path) -> bool {
             || path == Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/service.rs")
             || path
                 == Path::new(
-                    "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture.rs",
+                    "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/process.rs",
                 )
+            || path == Path::new("crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/credentials.rs")
             || path == Path::new("crates/memcordon-cli/tests/sealed_agent/linux_faults.rs")
             || path == Path::new("crates/memcordon-cli/tests/sealed_agent/linux_sealed.rs")
             || path == Path::new("crates/memcordon-cli/tests/sealed_agent/launcher_activation.rs")
@@ -3565,6 +3590,96 @@ fn require_credential_transition_fragments(
     Ok(())
 }
 
+/// Bind the native qualification receipt constructor to the reviewed shared schema constant.
+pub fn validate_qualification_schema_binding(contract: &str, producer: &str) -> Result<()> {
+    let contract = syn::parse_file(contract)
+        .map_err(|error| failure(format!("qualification contract syntax: {error}")))?;
+    let constants: Vec<_> = contract
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Const(item) if item.ident == "QUALIFICATION_SCHEMA_VERSION" => Some(item),
+            _ => None,
+        })
+        .collect();
+    if constants.len() != 1 {
+        return Err(failure(
+            "qualification schema needs exactly one shared constant",
+        ));
+    }
+    let constant = constants[0];
+    let u32_type = matches!(&*constant.ty, syn::Type::Path(value) if value.qself.is_none() && value.path.is_ident("u32"));
+    let version_three = matches!(&*constant.expr, syn::Expr::Lit(value) if matches!(&value.lit, syn::Lit::Int(value) if value.base10_parse::<u32>().ok() == Some(3)));
+    if !matches!(constant.vis, syn::Visibility::Public(_))
+        || !u32_type
+        || !version_three
+        || constant.attrs.iter().any(|attribute| {
+            attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+        })
+    {
+        return Err(failure(
+            "qualification shared schema must remain public u32 version 3",
+        ));
+    }
+    struct Constructors {
+        count: usize,
+        valid: bool,
+    }
+    impl<'ast> Visit<'ast> for Constructors {
+        fn visit_expr_struct(&mut self, value: &'ast syn::ExprStruct) {
+            if value
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "QualificationReceipt")
+            {
+                self.count += 1;
+                let fields: Vec<_> = value.fields.iter().filter(|field| matches!(&field.member, syn::Member::Named(name) if name == "schema_version")).collect();
+                self.valid &= fields.len() == 1
+                    && fields.first().is_some_and(|field| {
+                        let syn::Expr::Path(expression) = &field.expr else {
+                            return false;
+                        };
+                        expression.qself.is_none()
+                            && expression
+                                .path
+                                .segments
+                                .iter()
+                                .map(|segment| segment.ident.to_string())
+                                .eq([
+                                    "memcordon_core",
+                                    "sealed_provider",
+                                    "qualification",
+                                    "QUALIFICATION_SCHEMA_VERSION",
+                                ]
+                                .into_iter()
+                                .map(str::to_owned))
+                    });
+            }
+            syn::visit::visit_expr_struct(self, value);
+        }
+    }
+    let producer = syn::parse_file(producer)
+        .map_err(|error| failure(format!("qualification producer syntax: {error}")))?;
+    let mut constructors = Constructors {
+        count: 0,
+        valid: true,
+    };
+    for item in &producer.items {
+        if let syn::Item::Fn(function) = item
+            && function.sig.ident == "qualify_after_package_verification"
+        {
+            constructors.visit_block(&function.block);
+        }
+    }
+    if constructors.count != 1 || !constructors.valid {
+        return Err(failure(
+            "native qualification receipt must use the shared schema constant",
+        ));
+    }
+    Ok(())
+}
+
 fn check_credential_transition_redesign(root: &Path) -> Result<()> {
     require_credential_transition_fragments(
         root,
@@ -3615,7 +3730,6 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
         root,
         "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/qualification.rs",
         &[
-            "schema_version: 3",
             "linux-pid-namespace-cgroup-v2",
             "preserve-caller-envelope",
             "setid_transition_certification_digest",
@@ -3623,6 +3737,14 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
             "recursive_provider_request_rejected",
         ],
         &["linux-pid-namespace-cgroup-v1"],
+    )?;
+    validate_qualification_schema_binding(
+        &fs::read_to_string(
+            root.join("crates/memcordon-core/src/sealed_provider/qualification.rs"),
+        )?,
+        &fs::read_to_string(
+            root.join("crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/qualification.rs"),
+        )?,
     )?;
     let selectors = [
         "sealed_setid_transition_preserves_boundary",
@@ -3763,6 +3885,8 @@ fn check_credential_transition_redesign(root: &Path) -> Result<()> {
 }
 
 pub fn run(root: &Path) -> Result<()> {
+    crate::source_registry::run(root)?;
+    crate::fuzz_targets::validate(root)?;
     let policy = config::policy(root)?;
     let release = config::release(root)?;
     for command in &policy.workflow.allowed_run_commands {

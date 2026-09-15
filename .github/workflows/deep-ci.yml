@@ -109,7 +109,7 @@ jobs:
             !target/ci/release-bundle
             !target/ci/release-inputs
             fuzz/target
-          key: managed-v2-cargo-target-deep-v3-fuzz-${{ runner.os }}-${{ runner.arch }}-${{ matrix.shard }}-nightly-2026-07-31-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'crates/**', 'tools/**', 'ci/**', '.github/workflows/deep-ci.yml') }}
+          key: managed-v2-cargo-target-deep-v3-fuzz-${{ runner.os }}-${{ runner.arch }}-${{ matrix.shard }}-nightly-2026-07-31-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'fuzz/targets.toml', 'fuzz/seeds/**', 'crates/**', 'tools/**', 'ci/**', '.github/workflows/deep-ci.yml') }}
       - id: fuzz-tools
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -150,6 +150,13 @@ jobs:
             target/ci/source-home/registry/cache
             target/ci/source-home/git/db
           key: ${{ steps.fuzz-deps.outputs.cache-primary-key }}
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fuzz-evidence-${{ matrix.shard }}
+          path: target/ci/reports/fuzz
+          retention-days: 90
+          if-no-files-found: warn
 
   stress:
     name: stress / ${{ matrix.id }}

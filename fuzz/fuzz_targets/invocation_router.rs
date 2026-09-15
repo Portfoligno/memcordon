@@ -20,5 +20,27 @@ fuzz_target!(|data: &[u8]| {
             }
         })
         .collect();
-    let _ = route(&arguments);
+    if let Ok(invocation) = route(&arguments) {
+        let first = arguments.first().unwrap();
+        if matches!(invocation, memcordon::invocation::Invocation::Execute(_)) {
+            assert!(
+                ![
+                    "help",
+                    "doctor",
+                    "plan",
+                    "clean",
+                    "--help",
+                    "-h",
+                    "--version",
+                    "-V"
+                ]
+                .iter()
+                .any(|reserved| first == reserved)
+            );
+        }
+        if matches!(invocation, memcordon::invocation::Invocation::Version) {
+            assert_eq!(arguments.len(), 1);
+            assert!(first == "--version" || first == "-V");
+        }
+    }
 });

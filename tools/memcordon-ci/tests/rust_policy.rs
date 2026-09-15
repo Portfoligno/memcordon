@@ -3,6 +3,44 @@ use std::path::Path;
 use memcordon_ci::policy::validate_rust_policy_bytes;
 
 #[test]
+fn qualification_schema_policy_binds_native_constructor_to_shared_version() {
+    use memcordon_ci::policy::validate_qualification_schema_binding;
+    let contract = "pub const QUALIFICATION_SCHEMA_VERSION: u32 = 3;";
+    let producer = "fn qualify_after_package_verification() { let receipt = QualificationReceipt { schema_version: memcordon_core::sealed_provider::qualification::QUALIFICATION_SCHEMA_VERSION }; }";
+    validate_qualification_schema_binding(contract, producer).unwrap();
+    validate_qualification_schema_binding(
+        include_str!("../../../crates/memcordon-core/src/sealed_provider/qualification.rs"),
+        include_str!(
+            "../../../crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/qualification.rs"
+        ),
+    )
+    .unwrap();
+    for changed in [
+        contract.replace("= 3", "= 2"),
+        contract.replace("pub const", "const"),
+        contract.replace("u32", "u16"),
+        format!("#[cfg(test)] {contract}"),
+        format!("{contract}\n{contract}"),
+    ] {
+        assert!(validate_qualification_schema_binding(&changed, producer).is_err());
+    }
+    for changed in [
+        producer.replace(
+            "memcordon_core::sealed_provider::qualification::QUALIFICATION_SCHEMA_VERSION",
+            "3",
+        ),
+        producer.replace("QUALIFICATION_SCHEMA_VERSION", "OTHER_SCHEMA_VERSION"),
+        producer.replace(
+            "qualify_after_package_verification",
+            "unrelated_test_helper",
+        ),
+        producer.replace("schema_version:", "other_field:"),
+    ] {
+        assert!(validate_qualification_schema_binding(contract, &changed).is_err());
+    }
+}
+
+#[test]
 fn compiler_selector_removal_is_confined_to_the_generated_fixture_child() {
     let fixture = Path::new("tools/memcordon-ci/tests/build_context.rs");
     let allowed = br#"fn generated_fixture_child(child: &mut std::process::Command) {
@@ -137,13 +175,21 @@ fn pre_exec_and_raw_fork_are_confined_to_exact_reviewed_boundaries() {
         "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/launcher.rs",
         "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/namespace.rs",
         "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/service.rs",
-        "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/process.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/credentials.rs",
         "crates/memcordon-cli/tests/sealed_agent/linux_faults.rs",
         "crates/memcordon-cli/tests/sealed_agent/linux_sealed.rs",
         "crates/memcordon-cli/tests/sealed_agent/launcher_activation.rs",
     ] {
         validate_rust_policy_bytes(Path::new(reviewed), fork)
             .expect("an exact reviewed sealed-provider boundary may fork");
+    }
+    for path in [
+        "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/main.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/registry.rs",
+        "crates/memcordon-cli/src/bin/memcordon-sealed-test-fixture/namespace.rs",
+    ] {
+        assert!(validate_rust_policy_bytes(Path::new(path), fork).is_err());
     }
     assert!(
         validate_rust_policy_bytes(

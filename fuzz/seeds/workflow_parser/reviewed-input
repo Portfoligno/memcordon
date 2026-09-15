@@ -1,0 +1,449 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - "**"
+  merge_group:
+    types:
+      - checks_requested
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Restore Cargo sources
+        id: policy-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - name: Restore policy target
+        id: policy-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci
+            !target/ci/control-bootstrap
+            !target/ci/source-home
+            !target/ci/native-inputs.bin
+            !target/ci/reports
+            !target/ci/*evidence*
+            !target/ci/*diagnostic*
+            !target/ci/release-bundle
+            !target/ci/release-inputs
+          key: managed-v2-cargo-target-v1-${{ runner.os }}-${{ runner.arch }}-policy-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'tools/**', 'ci/**', '.github/**') }}
+      - name: Run repository policy
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite policy
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - name: Save policy target
+        if: always() && steps.policy-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.policy-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci
+            !target/ci/control-bootstrap
+            !target/ci/source-home
+            !target/ci/native-inputs.bin
+            !target/ci/reports
+            !target/ci/*evidence*
+            !target/ci/*diagnostic*
+            !target/ci/release-bundle
+            !target/ci/release-inputs
+          key: ${{ steps.policy-target.outputs.cache-primary-key }}
+      - name: Save Cargo sources
+        if: always() && steps.policy-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: ${{ steps.policy-deps.outputs.cache-primary-key }}
+
+  quality:
+    name: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Restore Cargo sources
+        id: quality-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - name: Install quality Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - name: Restore quality target
+        id: quality-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci
+            !target/ci/control-bootstrap
+            !target/ci/source-home
+            !target/ci/native-inputs.bin
+            !target/ci/reports
+            !target/ci/*evidence*
+            !target/ci/*diagnostic*
+            !target/ci/release-bundle
+            !target/ci/release-inputs
+          key: managed-v2-cargo-target-v1-${{ runner.os }}-${{ runner.arch }}-quality-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', '.github/workflows/**') }}
+      - name: Run quality suite
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite quality
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - name: Save quality target
+        if: always() && steps.quality-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.quality-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci
+            !target/ci/control-bootstrap
+            !target/ci/source-home
+            !target/ci/native-inputs.bin
+            !target/ci/reports
+            !target/ci/*evidence*
+            !target/ci/*diagnostic*
+            !target/ci/release-bundle
+            !target/ci/release-inputs
+          key: ${{ steps.quality-target.outputs.cache-primary-key }}
+      - name: Save Cargo sources
+        if: always() && steps.quality-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: ${{ steps.quality-deps.outputs.cache-primary-key }}
+
+  msrv:
+    name: MSRV 1.85.0
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Restore Cargo sources
+        id: msrv-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-v1-${{ runner.os }}-${{ runner.arch }}-1.85.0-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml') }}
+      - name: Install CI driver Rust
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - name: Install declared MSRV
+        run: rustup toolchain install 1.85.0 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - name: Restore MSRV target
+        id: msrv-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci
+            !target/ci/control-bootstrap
+            !target/ci/source-home
+            !target/ci/native-inputs.bin
+            !target/ci/reports
+            !target/ci/*evidence*
+            !target/ci/*diagnostic*
+            !target/ci/release-bundle
+            !target/ci/release-inputs
+          key: managed-v2-cargo-target-v1-${{ runner.os }}-${{ runner.arch }}-msrv-1.85.0-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'ci/**') }}
+      - name: Run MSRV suite
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite msrv
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - name: Save MSRV target
+        if: always() && steps.msrv-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.msrv-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci
+            !target/ci/control-bootstrap
+            !target/ci/source-home
+            !target/ci/native-inputs.bin
+            !target/ci/reports
+            !target/ci/*evidence*
+            !target/ci/*diagnostic*
+            !target/ci/release-bundle
+            !target/ci/release-inputs
+          key: ${{ steps.msrv-target.outputs.cache-primary-key }}
+      - name: Save Cargo sources
+        if: always() && steps.msrv-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: ${{ steps.msrv-deps.outputs.cache-primary-key }}
+
+  supply-chain:
+    name: supply chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Restore Cargo sources
+        id: supply-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tools/**/Cargo.toml', 'ci/tools.toml', 'ci/deny.toml') }}
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - name: Restore pinned tools
+        id: supply-tools
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci-tools
+          key: managed-v2-cargo-tools-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'ci/tools.toml') }}
+      - name: Restore supply target
+        id: supply-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci
+            !target/ci/control-bootstrap
+            !target/ci/source-home
+            !target/ci/native-inputs.bin
+            !target/ci/reports
+            !target/ci/*evidence*
+            !target/ci/*diagnostic*
+            !target/ci/release-bundle
+            !target/ci/release-inputs
+          key: managed-v2-cargo-target-v1-${{ runner.os }}-${{ runner.arch }}-supply-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'tools/**', 'ci/**', '.github/**') }}
+      - name: Run supply-chain suite
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite supply-chain
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - name: Save supply target
+        if: always() && steps.supply-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.supply-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci
+            !target/ci/control-bootstrap
+            !target/ci/source-home
+            !target/ci/native-inputs.bin
+            !target/ci/reports
+            !target/ci/*evidence*
+            !target/ci/*diagnostic*
+            !target/ci/release-bundle
+            !target/ci/release-inputs
+          key: ${{ steps.supply-target.outputs.cache-primary-key }}
+      - name: Save pinned tools
+        if: always() && steps.supply-tools.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.supply-tools.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: target/ci-tools
+          key: ${{ steps.supply-tools.outputs.cache-primary-key }}
+      - name: Save Cargo sources
+        if: always() && steps.supply-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: ${{ steps.supply-deps.outputs.cache-primary-key }}
+
+  native:
+    name: native / ${{ matrix.id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x64
+            runner: ubuntu-24.04
+          - id: linux-arm64
+            runner: ubuntu-24.04-arm
+          - id: macos-arm64
+            runner: macos-15
+          - id: macos-x64
+            runner: macos-15-intel
+          - id: windows-x64
+            runner: windows-2025
+          - id: windows-arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Restore Cargo sources
+        id: native-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml') }}
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - name: Restore native target
+        id: native-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci
+            !target/ci/control-bootstrap
+            !target/ci/source-home
+            !target/ci/native-inputs.bin
+            !target/ci/reports
+            !target/ci/*evidence*
+            !target/ci/*diagnostic*
+            !target/ci/release-bundle
+            !target/ci/release-inputs
+          key: managed-v2-cargo-target-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**') }}
+      - name: Run native suite
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite native
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - name: Save native target
+        if: always() && steps.native-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.native-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci
+            !target/ci/control-bootstrap
+            !target/ci/source-home
+            !target/ci/native-inputs.bin
+            !target/ci/reports
+            !target/ci/*evidence*
+            !target/ci/*diagnostic*
+            !target/ci/release-bundle
+            !target/ci/release-inputs
+          key: ${{ steps.native-target.outputs.cache-primary-key }}
+      - name: Save Cargo sources
+        if: always() && steps.native-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: ${{ steps.native-deps.outputs.cache-primary-key }}
+
+  macos-deadline:
+    name: macOS deadline / ${{ matrix.id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: arm64
+            runner: macos-15
+          - id: x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: deadline-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-deadline-sources-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', '.cargo/**', 'ci/toolchains.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: deadline-target
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/deadline-build
+            target/ci/deadline-oracle-build
+          key: managed-v2-deadline-target-v1-${{ matrix.id }}-${{ github.sha }}-${{ hashFiles('target/ci/native-inputs.bin') }}
+      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite macos-deadline
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: macos-deadline-${{ matrix.id }}
+          path: target/ci/deadline-evidence
+          if-no-files-found: error
+          retention-days: 14
+      - id: build-context-audit
+        if: always()
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.deadline-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.deadline-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/deadline-build
+            target/ci/deadline-oracle-build
+          key: ${{ steps.deadline-target.outputs.cache-primary-key }}
+      - if: always() && steps.deadline-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: ${{ steps.deadline-deps.outputs.cache-primary-key }}

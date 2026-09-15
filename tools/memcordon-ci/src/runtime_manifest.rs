@@ -3,5 +3,11 @@ pub use memcordon_core::runtime_manifest::{
 };
 
 pub fn fuzz_runtime_manifest(data: &[u8]) {
-    let _ = RuntimeManifestV2::parse(data);
+    if let Ok(manifest) = RuntimeManifestV2::parse(data) {
+        let encoded = serde_json::to_vec(&manifest).expect("accepted manifest serializes");
+        assert_eq!(
+            RuntimeManifestV2::parse(&encoded).expect("canonical manifest parses"),
+            manifest
+        );
+    }
 }

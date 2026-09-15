@@ -2173,7 +2173,22 @@ pub fn fuzz_linux_service_unit_policy(data: &[u8]) {
         return;
     }
     if let Ok(report) = serde_json::from_slice::<LinuxProviderPackageVerification>(data) {
-        std::hint::black_box(validate_linux_provider_package(&report));
+        let value: serde_json::Value = serde_json::from_slice(data).expect("typed JSON is JSON");
+        let encoded = serde_json::to_vec(&value).expect("JSON value serializes");
+        let mut decoded: LinuxProviderPackageVerification =
+            serde_json::from_slice(&encoded).expect("canonical package report parses");
+        assert_eq!(format!("{report:?}"), format!("{decoded:?}"));
+        assert_eq!(
+            validate_linux_provider_package(&report),
+            validate_linux_provider_package(&decoded)
+        );
+        if validate_linux_provider_package(&report) {
+            decoded.package_verified = false;
+            assert!(!validate_linux_provider_package(&decoded));
+            decoded.package_verified = true;
+            decoded.control.remove("User");
+            assert!(!validate_linux_provider_package(&decoded));
+        }
     }
 }
 
@@ -2183,14 +2198,17 @@ pub fn fuzz_linux_mount_context_manifest(data: &[u8]) {
         return;
     }
     if let Ok(report) = serde_json::from_slice::<LinuxMountContextEvidence>(data) {
-        std::hint::black_box(
-            report.schema_version == 2
-                && report.mechanism == "linux-pid-namespace-cgroup-v2"
-                && !report.commit.is_empty()
-                && report.result == "passed"
-                && report.scenario == "sealed_caller_mount_context_is_reproduced"
-                && report.caller_mount_namespace_reproduction_verified,
-        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(data).expect("typed JSON is JSON");
+        let encoded = serde_json::to_vec(&value).expect("JSON value serializes");
+        let decoded: LinuxMountContextEvidence =
+            serde_json::from_slice(&encoded).expect("canonical mount report parses");
+        assert_eq!(format!("{report:?}"), format!("{decoded:?}"));
+        value
+            .as_object_mut()
+            .expect("mount report is an object")
+            .remove("caller_mount_namespace_reproduction_verified");
+        assert!(serde_json::from_value::<LinuxMountContextEvidence>(value).is_err());
     }
 }
 

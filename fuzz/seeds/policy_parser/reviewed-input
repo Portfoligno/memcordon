@@ -1,0 +1,168 @@
+[workspace]
+production_packages = [
+  "memcordon-core",
+  "memcordon-windows-launch-core",
+  "memcordon-platform",
+  "memcordon",
+  "memcordon-testkit",
+]
+ci_packages = ["memcordon-ci", "memcordon-windows-loader-lab", "memcordon-deadline-oracle", "memcordon-native-inspect"]
+ci_package_rust_versions = { memcordon-ci = "1.88.0", memcordon-windows-loader-lab = "1.85.0", memcordon-deadline-oracle = "1.85.0", memcordon-native-inspect = "1.85.0" }
+publish_packages = ["memcordon-core", "memcordon-platform", "memcordon-windows-launch-core", "memcordon"]
+non_publish_packages = ["memcordon-testkit", "memcordon-ci", "memcordon-windows-loader-lab", "memcordon-deadline-oracle", "memcordon-native-inspect"]
+
+[workflow]
+required_public_matrix = [
+  "linux-x64",
+  "linux-arm64",
+  "macos-arm64",
+  "macos-x64",
+  "windows-x64",
+  "windows-arm64",
+]
+self_extracting_shell_allowlist = []
+allowed_run_commands = [
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin",
+  "rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe",
+  "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite macos-deadline",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-cgroup",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-job",
+  "rustup toolchain install 1.97.1 --profile minimal",
+  "rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt",
+  "rustup toolchain install 1.85.0 --profile minimal",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite policy",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite quality",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite msrv",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite native",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite supply-chain",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite miri",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-first",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-second",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite stress",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-sealed-v2",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-lab",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite package-windows-sealed",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite channel-parity-windows-sealed",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-macos-watchdog",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-preflight",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-native",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-macos",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release assemble",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release stage-github",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 1",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 1",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 1",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 2",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 2",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 2",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 3",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 3",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 3",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release attempt-oidc --publication-slot 4",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release authorize-new-crate-fallback --publication-slot 4",
+  "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 4",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release verify-crates",
+  "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public",
+]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/backend-certification.yml"
+variable = "CARGO_TARGET_DIR"
+source = "target/ci/windows-sealed-cargo/build"
+steps = ["Certify packaged Cargo channel"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_TARGET_DIR"
+source = "target/ci/windows-sealed-cargo/build"
+steps = ["Certify packaged Cargo channel"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "GITHUB_TOKEN"
+source = "${{ github.token }}"
+steps = ["Stage GitHub draft and assets", "Finalize GitHub release"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_HOME"
+source = "target/ci/cargo-publish-home/slot-1"
+steps = ["Attempt crates.io OIDC publication in slot 1", "Publish new crate with fallback credential in slot 1"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ steps.crates_auth_1.outputs.token }}"
+steps = ["Attempt crates.io OIDC publication in slot 1"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+steps = ["Publish new crate with fallback credential in slot 1"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_HOME"
+source = "target/ci/cargo-publish-home/slot-2"
+steps = ["Attempt crates.io OIDC publication in slot 2", "Publish new crate with fallback credential in slot 2"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ steps.crates_auth_2.outputs.token }}"
+steps = ["Attempt crates.io OIDC publication in slot 2"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+steps = ["Publish new crate with fallback credential in slot 2"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_HOME"
+source = "target/ci/cargo-publish-home/slot-3"
+steps = ["Attempt crates.io OIDC publication in slot 3", "Publish new crate with fallback credential in slot 3"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ steps.crates_auth_3.outputs.token }}"
+steps = ["Attempt crates.io OIDC publication in slot 3"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+steps = ["Publish new crate with fallback credential in slot 3"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_HOME"
+source = "target/ci/cargo-publish-home/slot-4"
+steps = ["Attempt crates.io OIDC publication in slot 4", "Publish new crate with fallback credential in slot 4"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ steps.crates_auth_4.outputs.token }}"
+steps = ["Attempt crates.io OIDC publication in slot 4"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "CARGO_REGISTRIES_CRATES_IO_TOKEN"
+source = "${{ secrets.MEMCORDON_CRATES_IO_NEW_CRATE_FALLBACK }}"
+steps = ["Publish new crate with fallback credential in slot 4"]
+
+[test]
+fast_short_child_iterations = 128
+deep_short_child_iterations = 4096
+release_short_child_iterations = 4096

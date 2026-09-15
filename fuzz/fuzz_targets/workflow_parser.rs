@@ -10,10 +10,23 @@ fuzz_target!(|data: &[u8]| {
         .expect("fuzz crate is inside repository root");
     let policy = memcordon_ci::config::parse_policy(include_bytes!("../../ci/policy.toml"))
         .expect("checked-in policy is valid");
-    let _ = memcordon_ci::policy::validate_workflow_bytes(
+    let accepted = memcordon_ci::policy::validate_workflow_bytes(
         root,
         Path::new(".github/workflows/ci.yml"),
         data,
         &policy,
     );
+    if accepted.is_ok() {
+        let mut normalized = vec![b'\n'];
+        normalized.extend_from_slice(data);
+        assert!(
+            memcordon_ci::policy::validate_workflow_bytes(
+                root,
+                Path::new(".github/workflows/ci.yml"),
+                &normalized,
+                &policy
+            )
+            .is_ok()
+        );
+    }
 });

@@ -1,0 +1,723 @@
+schema = 1
+
+[[source]]
+id = "tools.memcordon-windows-loader-lab.src.artifact"
+path = "tools/memcordon-windows-loader-lab/src/artifact.rs"
+owner = "loader-lab"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "harden"
+protected_invariants = ["artifact retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["module:tools/memcordon-windows-loader-lab/src/lib.rs:artifact:pub:[]"]
+routes = ["module:tools/memcordon-windows-loader-lab/src/lib.rs:artifact:pub:[]"]
+cfg = []
+item_visibility = [
+    "fn:copy_file_in#1:pub",
+    "fn:ensure_empty_directory#1:pub",
+    "fn:file_sha256#1:pub",
+    "fn:read_json#1:pub",
+    "fn:reference#1:private",
+    "fn:verify_reference#1:pub",
+    "fn:write_json#1:pub",
+    "fn:write_json_in#1:pub",
+    "fn:write_text_in#1:pub",
+    "use:memcordon_windows_launch_core :: { ArtifactRefV1 , RedactionClassV1 }#1:private",
+    "use:serde :: Serialize#1:private",
+    "use:sha2 :: { Digest , Sha256 }#1:private",
+    "use:std :: { fs , io , path :: Path }#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "WIN-03",
+]
+decision = "Keep only with a lab-specific owner, scenario/evidence contract, and execution parity; privatize or merge modules that lack a unique invariant."
+
+[[source]]
+id = "tools.memcordon-windows-loader-lab.src.bin.memcordon-loader-smoke-target"
+path = "tools/memcordon-windows-loader-lab/src/bin/memcordon-loader-smoke-target.rs"
+owner = "loader-lab"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "harden"
+protected_invariants = ["memcordon-loader-smoke-target retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-windows-loader-lab:bin:memcordon-loader-smoke-target:features=[]"]
+routes = ["cargo:memcordon-windows-loader-lab:bin:memcordon-loader-smoke-target:features=[]"]
+cfg = [
+    "fn:main#1:cfg(windows)",
+    "fn:main#2:cfg(not (windows))",
+]
+item_visibility = [
+    "fn:main#1:private",
+    "fn:main#2:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "WIN-03",
+]
+decision = "Keep only with a lab-specific owner, scenario/evidence contract, and execution parity; privatize or merge modules that lack a unique invariant."
+
+[[source]]
+id = "tools.memcordon-windows-loader-lab.src.controller"
+path = "tools/memcordon-windows-loader-lab/src/controller.rs"
+owner = "loader-lab"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "harden"
+protected_invariants = ["controller retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["module:tools/memcordon-windows-loader-lab/src/main.rs:controller:private:[]"]
+routes = ["module:tools/memcordon-windows-loader-lab/src/main.rs:controller:private:[]"]
+cfg = [
+    "fn:run_spawner#1/expression:1054#1:cfg(windows)",
+    "fn:run_spawner#1/expression:1064#1:cfg(not (windows))",
+    "fn:windows_build_identity#1:cfg(windows)",
+    "fn:windows_build_identity#2:cfg(not (windows))",
+    "mod:windows_service#1:cfg(windows)",
+]
+item_visibility = [
+    "fn:attach_external#1:pub",
+    "fn:comparison_pairs#1:private",
+    "fn:execute_scenario#1:private",
+    "fn:observer_scenarios#1:private",
+    "fn:run#1:pub",
+    "fn:run_id#1:private",
+    "fn:run_spawner#1:private",
+    "fn:scenario_succeeded#1:private",
+    "fn:sha256_text#1:private",
+    "fn:smoke_target_path#1:private",
+    "fn:staged_scenarios#1:private",
+    'fn:windows_build_identity#1/foreign:extern "system"#1/fn:RtlGetVersion#1:private',
+    "fn:windows_build_identity#1/struct:RtlOsVersionInfo#1/field:build_number#1:private",
+    "fn:windows_build_identity#1/struct:RtlOsVersionInfo#1/field:major_version#1:private",
+    "fn:windows_build_identity#1/struct:RtlOsVersionInfo#1/field:minor_version#1:private",
+    "fn:windows_build_identity#1/struct:RtlOsVersionInfo#1/field:platform_id#1:private",
+    "fn:windows_build_identity#1/struct:RtlOsVersionInfo#1/field:service_pack#1:private",
+    "fn:windows_build_identity#1/struct:RtlOsVersionInfo#1/field:size#1:private",
+    "fn:windows_build_identity#1/struct:RtlOsVersionInfo#1:private",
+    "fn:windows_build_identity#1:private",
+    "fn:windows_build_identity#2:private",
+    "mod:windows_service#1/fn:current_process_creation_time#1:private",
+    "mod:windows_service#1/fn:delete_and_verify#1:private",
+    "mod:windows_service#1/fn:run#1:pub",
+    "mod:windows_service#1/impl:OwnedService:#1/method:delete#1:private",
+    "mod:windows_service#1/impl:OwnedService:#1/method:new#1:private",
+    "mod:windows_service#1/impl:OwnedService:#1/method:stop_and_delete#1:private",
+    "mod:windows_service#1/impl:OwnedService:Drop#1/method:drop#1:private",
+    "mod:windows_service#1/impl:ServiceHandle:Drop#1/method:drop#1:private",
+    "mod:windows_service#1/impl:SourceToken:#1/method:current#1:private",
+    "mod:windows_service#1/impl:SourceToken:Drop#1/method:drop#1:private",
+    "mod:windows_service#1/struct:OwnedService#1/field:deleted#1:private",
+    "mod:windows_service#1/struct:OwnedService#1/field:handle#1:private",
+    "mod:windows_service#1/struct:OwnedService#1:private",
+    "mod:windows_service#1/struct:ServiceHandle#1/tuple:0#1/field:SC_HANDLE#1:private",
+    "mod:windows_service#1/struct:ServiceHandle#1:private",
+    "mod:windows_service#1/struct:SourceToken#1/tuple:0#1/field:HANDLE#1:private",
+    "mod:windows_service#1/struct:SourceToken#1:private",
+    "mod:windows_service#1/use:std :: { ffi :: OsStr , os :: windows :: ffi :: OsStrExt , path :: Path , ptr , time :: { Duration , Instant } , }#1:private",
+    "mod:windows_service#1/use:windows_sys :: Win32 :: System :: Services :: { CloseServiceHandle , ControlService , CreateServiceW , DeleteService , OpenSCManagerW , OpenServiceW , QueryServiceStatusEx , SC_HANDLE , SC_MANAGER_CREATE_SERVICE , SC_STATUS_PROCESS_INFO , SERVICE_ALL_ACCESS , SERVICE_CONTROL_STOP , SERVICE_DEMAND_START , SERVICE_ERROR_NORMAL , SERVICE_QUERY_STATUS , SERVICE_STATUS , SERVICE_STATUS_PROCESS , SERVICE_STOPPED , SERVICE_WIN32_OWN_PROCESS , StartServiceW , }#1:private",
+    "mod:windows_service#1/use:windows_sys :: Win32 :: { Foundation :: { CloseHandle , ERROR_SERVICE_DOES_NOT_EXIST , FILETIME , GetLastError , HANDLE } , Security :: { TOKEN_ADJUST_DEFAULT , TOKEN_ADJUST_SESSIONID , TOKEN_ASSIGN_PRIMARY , TOKEN_DUPLICATE , TOKEN_QUERY , } , System :: Threading :: { GetCurrentProcess , GetCurrentProcessId , GetProcessTimes , OpenProcessToken , } , }#1:private",
+    "mod:windows_service#1:private",
+    "use:crate :: { artifact , scenario :: { DiagnosticDesktopVariantV1 , DiagnosticEnvironmentVariantV1 , DiagnosticObserverV1 , DiagnosticParentVariantV1 , DiagnosticProfileVariantV1 , DiagnosticSecurityDescriptorVariantV1 , DiagnosticTokenVariantV1 , ExternalCaptureBindingV1 , ExternalCaptureSummaryV1 , ExternalCaptureToolV1 , HarnessStatusV1 , LoaderLabRunV1 , LoaderLabScenarioResultV1 , LoaderLabScenarioV1 , LoaderLabStageV1 , TargetVariantV1 , WindowsBuildIdentityV1 , } , }#1:private",
+    "use:memcordon_windows_launch_core :: { ProductionLoaderPlanV1 , RedactionClassV1 }#1:private",
+    "use:sha2 :: { Digest , Sha256 }#1:private",
+    "use:std :: { path :: Path , process :: Command , time :: { Duration , Instant , SystemTime } , }#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "WIN-03",
+]
+decision = "Keep only with a lab-specific owner, scenario/evidence contract, and execution parity; privatize or merge modules that lack a unique invariant."
+
+[[source]]
+id = "tools.memcordon-windows-loader-lab.src.lib"
+path = "tools/memcordon-windows-loader-lab/src/lib.rs"
+owner = "loader-lab"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "harden"
+protected_invariants = ["lib retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-windows-loader-lab:lib:memcordon_windows_loader_lab:features=[]"]
+routes = ["cargo:memcordon-windows-loader-lab:lib:memcordon_windows_loader_lab:features=[]"]
+cfg = []
+item_visibility = [
+    "mod:artifact#1:pub",
+    "mod:scenario#1:pub",
+    "mod:target#1:pub",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+    "WIN-03",
+]
+decision = "Keep the root/entry boundary thin, classify every export and route in the source registry, and move substantive policy into owned modules."
+
+[[source]]
+id = "tools.memcordon-windows-loader-lab.src.main"
+path = "tools/memcordon-windows-loader-lab/src/main.rs"
+owner = "loader-lab"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "harden"
+protected_invariants = ["main retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-windows-loader-lab:bin:memcordon-windows-loader-lab:features=[]"]
+routes = ["cargo:memcordon-windows-loader-lab:bin:memcordon-windows-loader-lab:features=[]"]
+cfg = ["mod:observer#1:cfg(windows)"]
+item_visibility = [
+    "enum:Role#1/variant:AttachExternal#1/field:external_summary#1:private",
+    "enum:Role#1/variant:AttachExternal#1/field:external_trace#1:private",
+    "enum:Role#1/variant:AttachExternal#1/field:run_directory#1:private",
+    "enum:Role#1/variant:AttachExternal#1:enum-member",
+    "enum:Role#1/variant:Run#1/field:bootstrap#1:private",
+    "enum:Role#1/variant:Run#1/field:output#1:private",
+    "enum:Role#1/variant:Run#1/field:production_plan#1:private",
+    "enum:Role#1/variant:Run#1:enum-member",
+    "enum:Role#1/variant:ServiceSpawner#1/field:result#1:private",
+    "enum:Role#1/variant:ServiceSpawner#1/field:scenario#1:private",
+    "enum:Role#1/variant:ServiceSpawner#1/field:service_run_id#1:private",
+    "enum:Role#1/variant:ServiceSpawner#1/field:service_scenario_id#1:private",
+    "enum:Role#1/variant:ServiceSpawner#1/field:source_creation_time#1:private",
+    "enum:Role#1/variant:ServiceSpawner#1/field:source_process_id#1:private",
+    "enum:Role#1/variant:ServiceSpawner#1/field:source_token#1:private",
+    "enum:Role#1/variant:ServiceSpawner#1:enum-member",
+    "enum:Role#1/variant:Spawner#1/field:result#1:private",
+    "enum:Role#1/variant:Spawner#1/field:scenario#1:private",
+    "enum:Role#1/variant:Spawner#1:enum-member",
+    "enum:Role#1/variant:Target#1/field:desktop#1:private",
+    "enum:Role#1/variant:Target#1/field:nonce#1:private",
+    "enum:Role#1/variant:Target#1/field:pipe#1:private",
+    "enum:Role#1/variant:Target#1:enum-member",
+    "enum:Role#1:private",
+    "fn:main#1:private",
+    "mod:controller#1:private",
+    "mod:observer#1:private",
+    "mod:spawner#1:private",
+    "struct:Cli#1/field:role#1:private",
+    "struct:Cli#1:private",
+    "use:clap :: { Parser , Subcommand }#1:private",
+    "use:memcordon_windows_loader_lab :: { artifact , scenario , target }#1:private",
+    "use:std :: path :: PathBuf#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+    "WIN-03",
+]
+decision = "Keep the root/entry boundary thin, classify every export and route in the source registry, and move substantive policy into owned modules."
+
+[[source]]
+id = "tools.memcordon-windows-loader-lab.src.observer"
+path = "tools/memcordon-windows-loader-lab/src/observer.rs"
+owner = "loader-lab"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "harden"
+protected_invariants = ["observer retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ['module:tools/memcordon-windows-loader-lab/src/main.rs:observer:private:["cfg(windows)"]']
+routes = ['module:tools/memcordon-windows-loader-lab/src/main.rs:observer:private:["cfg(windows)"]']
+cfg = [
+    'fn:enable_loader_snaps#1/local:722#1:cfg(target_pointer_width = "64")',
+    'fn:enable_loader_snaps#1/local:724#1:cfg(target_pointer_width = "32")',
+]
+item_visibility = [
+    "const:DEBUG_WAIT_MILLIS#1:private",
+    "const:FULL_DEBUG_EVENT_CAPACITY#1:private",
+    "const:SESSION_NAME_CAPACITY#1:private",
+    "enum:ObserverLease#1/variant:Debug#1/tuple:0#1/field:DebugObserver#1:private",
+    "enum:ObserverLease#1/variant:Debug#1:enum-member",
+    "enum:ObserverLease#1/variant:Etw#1/tuple:0#1/field:Box < EtwObserver >#1:private",
+    "enum:ObserverLease#1/variant:Etw#1:enum-member",
+    "enum:ObserverLease#1:pub(crate)",
+    'fn:enable_loader_snaps#1/foreign:extern "system"#1/fn:NtQueryInformationProcess#1:private',
+    "fn:enable_loader_snaps#1:private",
+    "fn:etw_event#1:private",
+    "impl:DebugObserver:#1/method:finish#1:private",
+    "impl:DebugObserver:#1/method:start#1:private",
+    "impl:EtwObserver:#1/method:finish#1:private",
+    "impl:EtwObserver:#1/method:start#1:private",
+    "impl:ObserverLease:#1/method:finish#1:pub(crate)",
+    "impl:ObserverLease:#1/method:start#1:pub(crate)",
+    "static:KERNEL_PROCESS_PROVIDER#1:private",
+    "struct:DebugEvidence#1/field:event_codes#1:private",
+    "struct:DebugEvidence#1/field:event_count#1:private",
+    "struct:DebugEvidence#1/field:exception_event_count#1:private",
+    "struct:DebugEvidence#1/field:module_event_count#1:private",
+    "struct:DebugEvidence#1/field:output_debug_string_count#1:private",
+    "struct:DebugEvidence#1:private",
+    "struct:DebugObserver#1/field:kind#1:private",
+    "struct:DebugObserver#1/field:worker#1:private",
+    "struct:DebugObserver#1:pub(crate)",
+    "struct:EtwContext#1/field:events#1:private",
+    "struct:EtwContext#1/field:process_id#1:private",
+    "struct:EtwContext#1:private",
+    "struct:EtwObserver#1/field:context#1:private",
+    "struct:EtwObserver#1/field:handle#1:private",
+    "struct:EtwObserver#1/field:processing#1:private",
+    "struct:EtwObserver#1/field:properties#1:private",
+    "struct:EtwObserver#1/field:worker#1:private",
+    "struct:EtwObserver#1:pub(crate)",
+    "struct:ProcessBasicInformation#1/field:peb_base_address#1:private",
+    "struct:ProcessBasicInformation#1/field:reserved1#1:private",
+    "struct:ProcessBasicInformation#1/field:reserved2#1:private",
+    "struct:ProcessBasicInformation#1/field:reserved3#1:private",
+    "struct:ProcessBasicInformation#1/field:unique_process_id#1:private",
+    "struct:ProcessBasicInformation#1:private",
+    "struct:TracePropertiesBuffer#1/field:logger_name#1:private",
+    "struct:TracePropertiesBuffer#1/field:properties#1:private",
+    "struct:TracePropertiesBuffer#1:private",
+    "use:memcordon_windows_loader_lab :: scenario :: { DiagnosticObserverV1 , ObserverEvidenceV1 }#1:private",
+    "use:std :: { ffi :: c_void , mem :: offset_of , ptr , sync :: { Arc , atomic :: { AtomicU64 , Ordering } , } , thread :: JoinHandle , }#1:private",
+    "use:windows_sys :: { Win32 :: { Foundation :: { DBG_CONTINUE , ERROR_SEM_TIMEOUT , HANDLE } , System :: Diagnostics :: { Debug :: { ContinueDebugEvent , DEBUG_EVENT , DebugActiveProcess , DebugActiveProcessStop , DebugSetProcessKillOnExit , EXCEPTION_DEBUG_EVENT , EXIT_PROCESS_DEBUG_EVENT , LOAD_DLL_DEBUG_EVENT , OUTPUT_DEBUG_STRING_EVENT , ReadProcessMemory , UNLOAD_DLL_DEBUG_EVENT , WaitForDebugEventEx , WriteProcessMemory , } , Etw :: { CONTROLTRACE_HANDLE , CloseTrace , ControlTraceW , EVENT_CONTROL_CODE_DISABLE_PROVIDER , EVENT_CONTROL_CODE_ENABLE_PROVIDER , EVENT_RECORD , EVENT_TRACE_CONTROL_STOP , EVENT_TRACE_LOGFILEW , EVENT_TRACE_PROPERTIES , EVENT_TRACE_REAL_TIME_MODE , EnableTraceEx2 , OpenTraceW , PROCESS_TRACE_MODE_EVENT_RECORD , PROCESS_TRACE_MODE_REAL_TIME , PROCESSTRACE_HANDLE , ProcessTrace , StartTraceW , TRACE_LEVEL_VERBOSE , WNODE_FLAG_TRACED_GUID , } , } , } , core :: GUID , }#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "WIN-03",
+]
+decision = "Keep only with a lab-specific owner, scenario/evidence contract, and execution parity; privatize or merge modules that lack a unique invariant."
+
+[[source]]
+id = "tools.memcordon-windows-loader-lab.src.scenario"
+path = "tools/memcordon-windows-loader-lab/src/scenario.rs"
+owner = "loader-lab"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "harden"
+protected_invariants = ["scenario retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["module:tools/memcordon-windows-loader-lab/src/lib.rs:scenario:pub:[]"]
+routes = ["module:tools/memcordon-windows-loader-lab/src/lib.rs:scenario:pub:[]"]
+cfg = []
+item_visibility = [
+    "enum:DiagnosticDesktopVariantV1#1/variant:ControlledTest#1:enum-member",
+    "enum:DiagnosticDesktopVariantV1#1/variant:ProductionPrivate#1:enum-member",
+    "enum:DiagnosticDesktopVariantV1#1:pub",
+    "enum:DiagnosticEnvironmentVariantV1#1/variant:ProductionPrepared#1:enum-member",
+    "enum:DiagnosticEnvironmentVariantV1#1/variant:QualificationCaller#1:enum-member",
+    "enum:DiagnosticEnvironmentVariantV1#1/variant:TargetDerived#1:enum-member",
+    "enum:DiagnosticEnvironmentVariantV1#1:pub",
+    "enum:DiagnosticObserverV1#1/variant:DebugEventPump#1:enum-member",
+    "enum:DiagnosticObserverV1#1/variant:ExternalProcmon#1:enum-member",
+    "enum:DiagnosticObserverV1#1/variant:ExternalWpr#1:enum-member",
+    "enum:DiagnosticObserverV1#1/variant:FullDebugger#1:enum-member",
+    "enum:DiagnosticObserverV1#1/variant:LoaderSnaps#1:enum-member",
+    "enum:DiagnosticObserverV1#1/variant:None#1:enum-member",
+    "enum:DiagnosticObserverV1#1/variant:PassiveEtw#1:enum-member",
+    "enum:DiagnosticObserverV1#1:pub",
+    "enum:DiagnosticParentVariantV1#1/variant:InteractiveShell#1:enum-member",
+    "enum:DiagnosticParentVariantV1#1/variant:ProductionLauncher#1:enum-member",
+    "enum:DiagnosticParentVariantV1#1:pub",
+    "enum:DiagnosticProfileVariantV1#1/variant:LoadedForTarget#1:enum-member",
+    "enum:DiagnosticProfileVariantV1#1/variant:ProductionUnloaded#1:enum-member",
+    "enum:DiagnosticProfileVariantV1#1:pub",
+    "enum:DiagnosticSecurityDescriptorVariantV1#1/variant:ProcessAndThreadDefaults#1:enum-member",
+    "enum:DiagnosticSecurityDescriptorVariantV1#1/variant:ProductionExact#1:enum-member",
+    "enum:DiagnosticSecurityDescriptorVariantV1#1:pub",
+    "enum:DiagnosticTokenVariantV1#1/variant:CallerPrimary#1:enum-member",
+    "enum:DiagnosticTokenVariantV1#1/variant:FullyRestrictedRestrictedCode#1:enum-member",
+    "enum:DiagnosticTokenVariantV1#1/variant:PrivilegeDisabled#1:enum-member",
+    "enum:DiagnosticTokenVariantV1#1/variant:ProductionTarget#1:enum-member",
+    "enum:DiagnosticTokenVariantV1#1/variant:WriteRestrictedRestrictedCode#1:enum-member",
+    "enum:DiagnosticTokenVariantV1#1/variant:WriteRestrictedWriteRestrictedCode#1:enum-member",
+    "enum:DiagnosticTokenVariantV1#1:pub",
+    "enum:ExternalCaptureToolV1#1/variant:Procmon#1:enum-member",
+    "enum:ExternalCaptureToolV1#1/variant:Wpr#1:enum-member",
+    "enum:ExternalCaptureToolV1#1:pub",
+    "enum:HarnessStatusV1#1/variant:CleanupFailed#1:enum-member",
+    "enum:HarnessStatusV1#1/variant:Complete#1:enum-member",
+    "enum:HarnessStatusV1#1/variant:Incomplete#1:enum-member",
+    "enum:HarnessStatusV1#1:pub",
+    "enum:LoaderLabStageV1#1/variant:AProductionReplica#1:enum-member",
+    "enum:LoaderLabStageV1#1/variant:BTargetBoundary#1:enum-member",
+    "enum:LoaderLabStageV1#1/variant:COneFactor#1:enum-member",
+    "enum:LoaderLabStageV1#1/variant:DObserver#1:enum-member",
+    "enum:LoaderLabStageV1#1:pub",
+    "enum:TargetVariantV1#1/variant:MinimalSmoke#1:enum-member",
+    "enum:TargetVariantV1#1/variant:PackagedBootstrap#1:enum-member",
+    "enum:TargetVariantV1#1:pub",
+    "fn:is_digest#1:private",
+    "impl:ExternalCaptureSummaryV1:#1/method:validate#1:pub",
+    "impl:LoaderLabRunV1:#1/method:validate#1:pub",
+    "impl:LoaderLabScenarioResultV1:#1/method:validate_against#1:pub",
+    "impl:LoaderLabScenarioV1:#1/method:validate#1:pub",
+    "struct:ExternalCaptureBindingV1#1/field:package_sha256#1:pub",
+    "struct:ExternalCaptureBindingV1#1/field:production_plan_sha256#1:pub",
+    "struct:ExternalCaptureBindingV1#1/field:run_id#1:pub",
+    "struct:ExternalCaptureBindingV1#1/field:side#1:pub",
+    "struct:ExternalCaptureBindingV1#1/field:source_result_sha256#1:pub",
+    "struct:ExternalCaptureBindingV1#1/field:source_scenario_id#1:pub",
+    "struct:ExternalCaptureBindingV1#1/field:target_process_id#1:pub",
+    "struct:ExternalCaptureBindingV1#1/field:trace_sha256#1:pub",
+    "struct:ExternalCaptureBindingV1#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:capture_ended_unix_millis#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:capture_profile#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:capture_started_unix_millis#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:collector_cleanup_complete#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:collector_session_started#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:descendant_process_ids#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:event_count#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:first_divergence#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:package_sha256#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:production_plan_sha256#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:provider_enabled#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:raw_trace_restricted#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:result_filter#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:run_id#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:schema_version#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:side#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:source_result_sha256#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:source_scenario_id#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:summary_redacted#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:symbol_identity_sha256#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:target_process_id#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:tool#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:tool_build_sha256#1:pub",
+    "struct:ExternalCaptureSummaryV1#1/field:trace_sha256#1:pub",
+    "struct:ExternalCaptureSummaryV1#1:pub",
+    "struct:ExternalFirstDivergenceV1#1/field:object_identity_sha256#1:pub",
+    "struct:ExternalFirstDivergenceV1#1/field:operation#1:pub",
+    "struct:ExternalFirstDivergenceV1#1/field:requested_rights#1:pub",
+    "struct:ExternalFirstDivergenceV1#1/field:result#1:pub",
+    "struct:ExternalFirstDivergenceV1#1/field:stack_module_sha256#1:pub",
+    "struct:ExternalFirstDivergenceV1#1:pub",
+    "struct:LoaderLabRunV1#1/field:artifacts#1:pub",
+    "struct:LoaderLabRunV1#1/field:harness_status#1:pub",
+    "struct:LoaderLabRunV1#1/field:os#1:pub",
+    "struct:LoaderLabRunV1#1/field:package_sha256#1:pub",
+    "struct:LoaderLabRunV1#1/field:run_id#1:pub",
+    "struct:LoaderLabRunV1#1/field:scenarios#1:pub",
+    "struct:LoaderLabRunV1#1/field:schema_version#1:pub",
+    "struct:LoaderLabRunV1#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:attachments#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:cleanup#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:desktop_variant#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:environment_variant#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:failure_stage#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:failure_status#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:handshake#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:launch_plan_sha256#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:loader_ready_process_identity#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:loader_ready_process_snapshot#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:loader_ready_token_envelope_sha256#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:observer#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:observer_evidence#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:parent_variant#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:perturbed#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:prepared_inputs#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:process_create#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:production_equivalent#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:profile_variant#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:scenario_id#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:security_descriptor_variant#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:suspended_process#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:target_exit_code#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:target_token_envelope_sha256#1:pub",
+    "struct:LoaderLabScenarioResultV1#1/field:token_variant#1:pub",
+    "struct:LoaderLabScenarioResultV1#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:current_directory#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:desktop_variant#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:environment_variant#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:namespace#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:observer#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:parent_variant#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:perturbed#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:plan#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:production_equivalent#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:production_plan_sha256#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:profile_variant#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:scenario_id#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:schema_version#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:security_descriptor_variant#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:stage#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:target#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:target_path#1:pub",
+    "struct:LoaderLabScenarioV1#1/field:token_variant#1:pub",
+    "struct:LoaderLabScenarioV1#1:pub",
+    "struct:LoaderReadyTokenBehaviorV1#1/field:default_dacl_sha256#1:pub",
+    "struct:LoaderReadyTokenBehaviorV1#1/field:enabled_sensitive_privilege_count#1:pub",
+    "struct:LoaderReadyTokenBehaviorV1#1/field:envelope#1:pub",
+    "struct:LoaderReadyTokenBehaviorV1#1/field:groups#1:pub",
+    "struct:LoaderReadyTokenBehaviorV1#1/field:privileges#1:pub",
+    "struct:LoaderReadyTokenBehaviorV1#1/field:restricting_sids#1:pub",
+    "struct:LoaderReadyTokenBehaviorV1#1/field:token_is_restricted#1:pub",
+    "struct:LoaderReadyTokenBehaviorV1#1:pub",
+    "struct:LoaderReadyTokenInstanceV1#1/field:modified_id#1:pub",
+    "struct:LoaderReadyTokenInstanceV1#1/field:token_id#1:pub",
+    "struct:LoaderReadyTokenInstanceV1#1:pub",
+    "struct:LoaderReadyTokenLineageV1#1/field:authentication_id#1:pub",
+    "struct:LoaderReadyTokenLineageV1#1/field:originating_logon_session#1:pub",
+    "struct:LoaderReadyTokenLineageV1#1/field:session_id#1:pub",
+    "struct:LoaderReadyTokenLineageV1#1/field:user_sid#1:pub",
+    "struct:LoaderReadyTokenLineageV1#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:authentication_id#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:default_dacl_sha256#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:enabled_sensitive_privilege_count#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:envelope_sha256#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:group_count#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:modified_id#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:originating_logon_session#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:privilege_count#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:restricting_sid_count#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:session_id#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:snapshot_sha256#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:token_id#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1/field:token_is_restricted#1:pub",
+    "struct:LoaderReadyTokenSnapshotEvidenceV1#1:pub",
+    "struct:LoaderReadyTokenSnapshotV1#1/field:behavior#1:pub",
+    "struct:LoaderReadyTokenSnapshotV1#1/field:instance#1:pub",
+    "struct:LoaderReadyTokenSnapshotV1#1/field:lineage#1:pub",
+    "struct:LoaderReadyTokenSnapshotV1#1:pub",
+    "struct:ObserverEvidenceV1#1/field:cleanup_complete#1:pub",
+    "struct:ObserverEvidenceV1#1/field:completed#1:pub",
+    "struct:ObserverEvidenceV1#1/field:event_codes#1:pub",
+    "struct:ObserverEvidenceV1#1/field:event_count#1:pub",
+    "struct:ObserverEvidenceV1#1/field:exception_event_count#1:pub",
+    "struct:ObserverEvidenceV1#1/field:kind#1:pub",
+    "struct:ObserverEvidenceV1#1/field:module_event_count#1:pub",
+    "struct:ObserverEvidenceV1#1/field:output_debug_string_count#1:pub",
+    "struct:ObserverEvidenceV1#1/field:provider_enabled#1:pub",
+    "struct:ObserverEvidenceV1#1/field:session_started#1:pub",
+    "struct:ObserverEvidenceV1#1/field:stable_code#1:pub",
+    "struct:ObserverEvidenceV1#1:pub",
+    "struct:PreparedInputEvidenceV1#1/field:command_line_sha256#1:pub",
+    "struct:PreparedInputEvidenceV1#1/field:command_line_units#1:pub",
+    "struct:PreparedInputEvidenceV1#1/field:current_directory_sha256#1:pub",
+    "struct:PreparedInputEvidenceV1#1/field:current_directory_units#1:pub",
+    "struct:PreparedInputEvidenceV1#1/field:environment_sha256#1:pub",
+    "struct:PreparedInputEvidenceV1#1/field:environment_units#1:pub",
+    "struct:PreparedInputEvidenceV1#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1/field:desktop_binding_name_sha256#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1/field:desktop_descriptor_sha256#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1/field:empty_inherited_handle_list#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1/field:image_matches_plan#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1/field:image_path_sha256#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1/field:job_membership_at_creation#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1/field:parent_process_identity#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1/field:parent_token_envelope_sha256#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1/field:process_identity#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1/field:token_envelope_sha256#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1/field:window_station_descriptor_sha256#1:pub",
+    "struct:SuspendedProcessEvidenceV1#1:pub",
+    "struct:WindowsBuildIdentityV1#1/field:architecture#1:pub",
+    "struct:WindowsBuildIdentityV1#1/field:build_number#1:pub",
+    "struct:WindowsBuildIdentityV1#1/field:major_version#1:pub",
+    "struct:WindowsBuildIdentityV1#1/field:minor_version#1:pub",
+    "struct:WindowsBuildIdentityV1#1/field:os#1:pub",
+    "struct:WindowsBuildIdentityV1#1:pub",
+    "use:memcordon_windows_launch_core :: { ArtifactRefV1 , CleanupOutcomeV1 , HandshakeOutcomeV1 , NativeCallOutcomeV1 , NativeStatusV1 , ProductionLoaderPlanV1 , WindowsLoaderQualificationStageV2 , }#1:private",
+    "use:serde :: { Deserialize , Serialize }#1:private",
+    "use:sha2 :: Digest#1:private",
+    "use:std :: path :: PathBuf#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "WIN-03",
+]
+decision = "Keep only with a lab-specific owner, scenario/evidence contract, and execution parity; privatize or merge modules that lack a unique invariant."
+
+[[source]]
+id = "tools.memcordon-windows-loader-lab.src.spawner"
+path = "tools/memcordon-windows-loader-lab/src/spawner.rs"
+owner = "loader-lab"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "extract"
+protected_invariants = ["spawner retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["module:tools/memcordon-windows-loader-lab/src/main.rs:spawner:private:[]"]
+routes = ["module:tools/memcordon-windows-loader-lab/src/main.rs:spawner:private:[]"]
+cfg = [
+    "fn:run#1:cfg(windows)",
+    "fn:run#2:cfg(not (windows))",
+    "fn:run_as_service#1/expression:42#1:cfg(windows)",
+    "fn:run_as_service#1/expression:51#1:cfg(not (windows))",
+    "mod:windows#1:cfg(windows)",
+    "use:crate :: { artifact , scenario :: LoaderLabScenarioV1 }#1:cfg(windows)",
+]
+item_visibility = [
+    "fn:lab_service_name#1:pub",
+    "fn:run#1:pub",
+    "fn:run#2:pub",
+    "fn:run_as_service#1:pub",
+    "mod:windows#1/const:BOOTSTRAP_SCHEMA_VERSION#1:private",
+    "mod:windows#1/const:FRAME_LIMIT_BYTES#1:private",
+    "mod:windows#1/fn:caller_environment#1:private",
+    "mod:windows#1/fn:canonical_environment#1:private",
+    "mod:windows#1/fn:cleanup_after_create_failure#1:private",
+    "mod:windows#1/fn:current_username#1:private",
+    "mod:windows#1/fn:duplicate_remote_token#1:private",
+    "mod:windows#1/fn:envelope_digest#1:private",
+    "mod:windows#1/fn:executable_units#1:private",
+    "mod:windows#1/fn:failed_after_create#1:private",
+    "mod:windows#1/fn:finish_observer#1:private",
+    "mod:windows#1/fn:ignore_service_control#1:private",
+    "mod:windows#1/fn:loader_lab_service_main#1:private",
+    "mod:windows#1/fn:merge_cleanup#1:private",
+    "mod:windows#1/fn:native_status#1:private",
+    "mod:windows#1/fn:nul_terminated#1:private",
+    "mod:windows#1/fn:os_units#1:private",
+    "mod:windows#1/fn:preparation_failure#1:private",
+    "mod:windows#1/fn:preparation_failure_after_plan#1:private",
+    "mod:windows#1/fn:process_identity#1:private",
+    "mod:windows#1/fn:process_image_path#1:private",
+    "mod:windows#1/fn:random_nonce#1:private",
+    "mod:windows#1/fn:read_exact#1:private",
+    "mod:windows#1/fn:read_frame#1:private",
+    "mod:windows#1/fn:redact_ready_snapshot#1:private",
+    "mod:windows#1/fn:render_native_error#1:private",
+    "mod:windows#1/fn:result#1:private",
+    "mod:windows#1/fn:run_as_service#1:pub",
+    "mod:windows#1/fn:run_scenario#1:pub",
+    "mod:windows#1/fn:scenario_desktop_name#1:private",
+    "mod:windows#1/fn:scenario_environment#1:private",
+    "mod:windows#1/fn:scenario_plan#1:private",
+    "mod:windows#1/fn:sha256_utf16#1:private",
+    "mod:windows#1/fn:suspended_process_evidence#1:private",
+    "mod:windows#1/fn:target_aware_pipe_sddl#1:private",
+    'mod:windows#1/fn:target_environment#1/foreign:extern "system"#1/fn:CreateEnvironmentBlock#1:private',
+    'mod:windows#1/fn:target_environment#1/foreign:extern "system"#1/fn:DestroyEnvironmentBlock#1:private',
+    "mod:windows#1/fn:target_environment#1/use:std :: ffi :: c_void#1:private",
+    "mod:windows#1/fn:target_environment#1:private",
+    "mod:windows#1/fn:thread_desktop_name#1:private",
+    "mod:windows#1/fn:token_identity_for_plan#1:private",
+    "mod:windows#1/fn:user_object_security_sha256#1:private",
+    "mod:windows#1/fn:write_all#1:private",
+    "mod:windows#1/fn:write_frame#1:private",
+    "mod:windows#1/impl:DesktopLease:#1/method:create#1:private",
+    "mod:windows#1/impl:DesktopLease:#1/method:retire#1:private",
+    "mod:windows#1/impl:DesktopLease:Drop#1/method:drop#1:private",
+    "mod:windows#1/impl:ParentProcessLease:#1/method:for_variant#1:private",
+    "mod:windows#1/impl:ParentProcessLease:#1/method:open_attested#1:private",
+    "mod:windows#1/impl:ParentProcessLease:#1/method:raw#1:private",
+    "mod:windows#1/impl:ParentProcessLease:Drop#1/method:drop#1:private",
+    "mod:windows#1/impl:Pipe:#1/method:authenticate#1:private",
+    "mod:windows#1/impl:Pipe:#1/method:create#1:private",
+    "mod:windows#1/impl:Pipe:Drop#1/method:drop#1:private",
+    "mod:windows#1/impl:ProfileLease:#1/method:for_variant#1:private",
+    "mod:windows#1/impl:ProfileLease:#1/method:retire#1:private",
+    "mod:windows#1/impl:ProfileLease:Drop#1/method:drop#1:private",
+    "mod:windows#1/impl:TokenHandle:#1/method:current_query#1:private",
+    "mod:windows#1/impl:TokenHandle:#1/method:for_variant#1:private",
+    "mod:windows#1/impl:TokenHandle:#1/method:process_query#1:private",
+    "mod:windows#1/impl:TokenHandle:#1/method:raw#1:private",
+    "mod:windows#1/impl:TokenHandle:#1/method:restricted#1:private",
+    "mod:windows#1/impl:TokenHandle:Drop#1/method:drop#1:private",
+    "mod:windows#1/static:SERVICE_ARGUMENTS#1:private",
+    "mod:windows#1/struct:DesktopLease#1/field:desktop#1:private",
+    "mod:windows#1/struct:DesktopLease#1/field:desktop_descriptor_sha256#1:private",
+    "mod:windows#1/struct:DesktopLease#1/field:original_station#1:private",
+    "mod:windows#1/struct:DesktopLease#1/field:retired#1:private",
+    "mod:windows#1/struct:DesktopLease#1/field:station#1:private",
+    "mod:windows#1/struct:DesktopLease#1/field:window_station_descriptor_sha256#1:private",
+    "mod:windows#1/struct:DesktopLease#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameEvidenceV1#1/field:bootstrap_identity#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameEvidenceV1#1/field:process_envelope#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameEvidenceV1#1/field:process_snapshot#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameEvidenceV1#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameV1#1/field:bootstrap_identity#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameV1#1/field:expected_desktop#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameV1#1/field:kind#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameV1#1/field:nonce#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameV1#1/field:process_envelope#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameV1#1/field:process_snapshot#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameV1#1/field:schema_version#1:private",
+    "mod:windows#1/struct:LoaderReadyFrameV1#1:private",
+    "mod:windows#1/struct:ParentProcessLease#1/field:handle#1:private",
+    "mod:windows#1/struct:ParentProcessLease#1/field:identity#1:private",
+    "mod:windows#1/struct:ParentProcessLease#1/field:token_envelope_sha256#1:private",
+    "mod:windows#1/struct:ParentProcessLease#1:private",
+    "mod:windows#1/struct:Pipe#1/tuple:0#1/field:HANDLE#1:private",
+    "mod:windows#1/struct:Pipe#1:private",
+    "mod:windows#1/struct:ProfileLease#1/field:loaded#1:private",
+    "mod:windows#1/struct:ProfileLease#1/field:profile#1:private",
+    "mod:windows#1/struct:ProfileLease#1/field:token#1:private",
+    "mod:windows#1/struct:ProfileLease#1:private",
+    "mod:windows#1/struct:ServiceArguments#1/field:name#1:private",
+    "mod:windows#1/struct:ServiceArguments#1/field:result#1:private",
+    "mod:windows#1/struct:ServiceArguments#1/field:scenario#1:private",
+    "mod:windows#1/struct:ServiceArguments#1/field:source_token#1:private",
+    "mod:windows#1/struct:ServiceArguments#1:private",
+    "mod:windows#1/struct:TokenHandle#1/tuple:0#1/field:HANDLE#1:private",
+    "mod:windows#1/struct:TokenHandle#1:private",
+    "mod:windows#1/use:crate :: observer :: ObserverLease#1:private",
+    "mod:windows#1/use:crate :: { artifact , scenario :: { DiagnosticDesktopVariantV1 , DiagnosticEnvironmentVariantV1 , DiagnosticSecurityDescriptorVariantV1 , DiagnosticTokenVariantV1 , LoaderLabScenarioResultV1 , LoaderLabScenarioV1 , LoaderReadyTokenSnapshotEvidenceV1 , LoaderReadyTokenSnapshotV1 , ObserverEvidenceV1 , PreparedInputEvidenceV1 , SuspendedProcessEvidenceV1 , } , }#1:private",
+    "mod:windows#1/use:memcordon_windows_launch_core :: { CleanupOutcomeV1 , DesktopBindingV1 , ExactHandleListV1 , HandshakeOutcomeV1 , LoaderReadyEndpointV1 , NativeCallOutcomeV1 , NativeSecurityDescriptorV1 , NativeStatusV1 , PreparedCurrentDirectoryV1 , PreparedLoaderCommandV1 , PreparedLoaderEnvironmentV1 , ProductionJobV1 , ProductionLoaderPlanInputV1 , ProductionLoaderPlanV1 , ProductionNativeCreateRequestV1 , TargetTokenIdentityV1 , WindowsLoaderQualificationStageV2 , create_suspended_in_job , }#1:private",
+    "mod:windows#1/use:serde :: Deserialize#1:private",
+    "mod:windows#1/use:sha2 :: { Digest , Sha256 }#1:private",
+    "mod:windows#1/use:std :: { ffi :: OsStr , os :: windows :: ffi :: OsStrExt , path :: { Path , PathBuf } , ptr , sync :: OnceLock , time :: Duration , }#1:private",
+    "mod:windows#1/use:windows_sys :: Win32 :: { Foundation :: { CloseHandle , DUPLICATE_SAME_ACCESS , DuplicateHandle , ERROR_NO_DATA , ERROR_PIPE_CONNECTED , ERROR_PIPE_LISTENING , FILETIME , HANDLE , HLOCAL , INVALID_HANDLE_VALUE , LocalFree , } , Security :: { Authorization :: ConvertStringSidToSidW , CreateRestrictedToken , Cryptography :: { BCRYPT_USE_SYSTEM_PREFERRED_RNG , BCryptGenRandom } , DISABLE_MAX_PRIVILEGE , GetUserObjectSecurity , SID_AND_ATTRIBUTES , TOKEN_ADJUST_DEFAULT , TOKEN_ADJUST_SESSIONID , TOKEN_ASSIGN_PRIMARY , TOKEN_DUPLICATE , TOKEN_QUERY , WRITE_RESTRICTED , } , Storage :: FileSystem :: { FILE_FLAG_FIRST_PIPE_INSTANCE , FlushFileBuffers , PIPE_ACCESS_DUPLEX , ReadFile , WriteFile , } , System :: { Pipes :: { ConnectNamedPipe , CreateNamedPipeW , GetNamedPipeClientProcessId , PIPE_NOWAIT , PIPE_READMODE_BYTE , PIPE_REJECT_REMOTE_CLIENTS , PIPE_TYPE_BYTE , } , Services :: { RegisterServiceCtrlHandlerW , SERVICE_RUNNING , SERVICE_STATUS , SERVICE_STOPPED , SERVICE_TABLE_ENTRYW , SERVICE_WIN32_OWN_PROCESS , SetServiceStatus , StartServiceCtrlDispatcherW , } , StationsAndDesktops :: { CloseDesktop , CloseWindowStation , CreateDesktopW , CreateWindowStationW , DESKTOP_CREATEMENU , DESKTOP_CREATEWINDOW , DESKTOP_ENUMERATE , DESKTOP_HOOKCONTROL , DESKTOP_JOURNALPLAYBACK , DESKTOP_JOURNALRECORD , DESKTOP_READOBJECTS , DESKTOP_SWITCHDESKTOP , DESKTOP_WRITEOBJECTS , GetProcessWindowStation , GetThreadDesktop , GetUserObjectInformationW , SetProcessWindowStation , UOI_NAME , } , Threading :: { ExitProcess , GetCurrentProcess , GetExitCodeProcess , GetProcessTimes , OpenProcess , OpenProcessToken , PROCESS_CREATE_PROCESS , PROCESS_DUP_HANDLE , PROCESS_QUERY_LIMITED_INFORMATION , QueryFullProcessImageNameW , WaitForSingleObject , } , WindowsProgramming :: GetUserNameW , } , UI :: { Shell :: { LoadUserProfileW , PROFILEINFOW , UnloadUserProfile } , WindowsAndMessaging :: WINSTA_ALL_ACCESS , } , }#1:private",
+    "mod:windows#1:private",
+    "use:crate :: { artifact , scenario :: LoaderLabScenarioV1 }#1:private",
+    "use:std :: path :: Path#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "GOV-06",
+    "WIN-03",
+]
+decision = "Split SCM setup, process variants, observation, and cleanup behind one lab-run owner."
+
+[[source]]
+id = "tools.memcordon-windows-loader-lab.src.target"
+path = "tools/memcordon-windows-loader-lab/src/target.rs"
+owner = "loader-lab"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "harden"
+protected_invariants = ["target retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["module:tools/memcordon-windows-loader-lab/src/lib.rs:target:pub:[]"]
+routes = ["module:tools/memcordon-windows-loader-lab/src/lib.rs:target:pub:[]"]
+cfg = [
+    "fn:run#1/expression:16#1:cfg(windows)",
+    "fn:run#1/expression:22#1:cfg(not (windows))",
+    "mod:windows#1:cfg(windows)",
+]
+item_visibility = [
+    "fn:run#1:pub",
+    "mod:windows#1/const:BOOTSTRAP_SCHEMA_VERSION#1:private",
+    "mod:windows#1/fn:exchange_ready#1:pub",
+    "mod:windows#1/fn:read_exact#1:private",
+    "mod:windows#1/fn:read_frame#1:private",
+    "mod:windows#1/fn:wide_null#1:private",
+    "mod:windows#1/fn:write_all#1:private",
+    "mod:windows#1/fn:write_frame#1:private",
+    "mod:windows#1/use:std :: { ffi :: OsStr , os :: windows :: ffi :: OsStrExt }#1:private",
+    "mod:windows#1/use:windows_sys :: Win32 :: { Foundation :: { CloseHandle , INVALID_HANDLE_VALUE } , Storage :: FileSystem :: { CreateFileW , FILE_GENERIC_READ , FILE_GENERIC_WRITE , OPEN_EXISTING , ReadFile , WriteFile , } , }#1:private",
+    "mod:windows#1:private",
+]
+platforms = [
+    "windows-x64",
+    "windows-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "WIN-03",
+]
+decision = "Keep only with a lab-specific owner, scenario/evidence contract, and execution parity; privatize or merge modules that lack a unique invariant."

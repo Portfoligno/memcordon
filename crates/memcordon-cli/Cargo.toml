@@ -37,12 +37,12 @@ doc = false
 
 [[bin]]
 name = "memcordon-test-fixture"
-path = "src/bin/memcordon-test-fixture.rs"
+path = "src/bin/memcordon-test-fixture/main.rs"
 required-features = ["test-fixtures"]
 
 [[bin]]
 name = "memcordon-sealed-test-fixture"
-path = "src/bin/memcordon-sealed-test-fixture.rs"
+path = "src/bin/memcordon-sealed-test-fixture/main.rs"
 required-features = ["test-support"]
 
 [[bin]]

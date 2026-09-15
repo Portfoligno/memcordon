@@ -67,13 +67,13 @@ pub const REVIEWED_CARGO_BINARIES: &[ReviewedCargoBinary] = &[
     },
     ReviewedCargoBinary {
         name: "memcordon-test-fixture",
-        path: "src/bin/memcordon-test-fixture.rs",
+        path: "src/bin/memcordon-test-fixture/main.rs",
         doc: None,
         required_features: Some(&["test-fixtures"]),
     },
     ReviewedCargoBinary {
         name: "memcordon-sealed-test-fixture",
-        path: "src/bin/memcordon-sealed-test-fixture.rs",
+        path: "src/bin/memcordon-sealed-test-fixture/main.rs",
         doc: None,
         required_features: Some(&["test-support"]),
     },

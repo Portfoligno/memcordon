@@ -212,10 +212,31 @@ fn fuzz(
     nightly: &str,
     shard: Option<memcordon_ci::fuzz_targets::FuzzShard>,
 ) -> Result<()> {
-    let targets = memcordon_ci::fuzz_targets::targets(
-        &std::fs::read_to_string(root.join("fuzz").join("Cargo.toml"))?,
-        shard,
-    )?;
+    use memcordon_ci::fuzz_targets::{
+        CharterRegistry, TargetEvidence, finish_target, prepare_corpus, write_evidence,
+    };
+    let registry = CharterRegistry::load(root)?;
+    let host = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("macos", "x86_64") => "macos-x64",
+        ("macos", "aarch64") => "macos-arm64",
+        _ => return Err(CiError::Message("unsupported fuzz host".into())),
+    };
+    let targets = registry.selected(shard, host)?;
+    for charter in &targets {
+        write_evidence(
+            root,
+            &TargetEvidence {
+                schema: 1,
+                charter,
+                phase: "planned",
+                corpus: &[],
+                artifacts: &[],
+                failure: None,
+            },
+        )?;
+    }
     cargo(
         root,
         stable,
@@ -242,17 +263,58 @@ fn fuzz(
         .join("ci-tools")
         .join("bin")
         .join("cargo-fuzz");
-    for target in &targets {
-        CommandSpec::toolchain_program("rustup", root, nightly, &cargo_fuzz, CARGO_DEADLINE)
-            .args([
-                OsString::from("fuzz"),
-                OsString::from("build"),
-                OsString::from(target),
-            ])
-            .run()?;
+    for charter in &targets {
+        let corpus = prepare_corpus(root, charter)?;
+        write_evidence(
+            root,
+            &TargetEvidence {
+                schema: 1,
+                charter,
+                phase: "building",
+                corpus: &corpus,
+                artifacts: &[],
+                failure: None,
+            },
+        )?;
+        let build =
+            CommandSpec::toolchain_program("rustup", root, nightly, &cargo_fuzz, CARGO_DEADLINE)
+                .args([
+                    OsString::from("fuzz"),
+                    OsString::from("build"),
+                    OsString::from(&charter.bin),
+                ])
+                .run();
+        write_evidence(
+            root,
+            &TargetEvidence {
+                schema: 1,
+                charter,
+                phase: if build.is_ok() {
+                    "built"
+                } else {
+                    "build-failed"
+                },
+                corpus: &corpus,
+                artifacts: &[],
+                failure: build.as_ref().err().map(ToString::to_string),
+            },
+        )?;
+        build?;
     }
-    for target in &targets {
-        CommandSpec::toolchain_program(
+    for charter in &targets {
+        let corpus = prepare_corpus(root, charter)?;
+        write_evidence(
+            root,
+            &TargetEvidence {
+                schema: 1,
+                charter,
+                phase: "running",
+                corpus: &corpus,
+                artifacts: &[],
+                failure: None,
+            },
+        )?;
+        let result = CommandSpec::toolchain_program(
             "rustup",
             root,
             nightly,
@@ -262,16 +324,14 @@ fn fuzz(
         .args([
             OsString::from("fuzz"),
             OsString::from("run"),
-            OsString::from(target),
+            OsString::from(&charter.bin),
+            charter.corpus_directory(root).into_os_string(),
             OsString::from("--"),
             OsString::from("-max_total_time=30"),
-            OsString::from(if target.starts_with("workload-") {
-                "-max_len=1048576"
-            } else {
-                "-max_len=4096"
-            }),
+            OsString::from(charter.max_length_argument()?),
         ])
-        .run()?;
+        .run();
+        finish_target(root, charter, &corpus, result.map(|_| ()))?;
     }
     Ok(())
 }

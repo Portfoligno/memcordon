@@ -684,6 +684,7 @@ dependencies = [
  "memcordon-native-inspect",
  "memcordon-testkit",
  "memcordon-windows-launch-core",
+ "quote",
  "semver",
  "serde",
  "serde_json",
