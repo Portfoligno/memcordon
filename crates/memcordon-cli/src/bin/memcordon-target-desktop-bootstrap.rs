@@ -9,8 +9,7 @@ use std::ffi::{OsStr, OsString};
 #[path = "memcordon-sealed-agent/admission.rs"]
 mod admission;
 #[cfg(target_os = "windows")]
-#[path = "memcordon-sealed-agent/inspection_schema.rs"]
-mod inspection_schema;
+use memcordon_core::sealed_provider::inspection as inspection_schema;
 #[cfg(target_os = "windows")]
 #[path = "memcordon-sealed-agent/package.rs"]
 mod package;
@@ -18,8 +17,7 @@ mod package;
 #[path = "memcordon-sealed-agent/policy_registry.rs"]
 mod policy_registry;
 #[cfg(target_os = "windows")]
-#[path = "memcordon-sealed-agent/protocol.rs"]
-mod protocol;
+use memcordon_core::sealed_provider::protocol;
 #[cfg(target_os = "windows")]
 #[path = "memcordon-sealed-agent/windows/mod.rs"]
 mod windows;

@@ -71,16 +71,8 @@ kind = "production"
 visibility = "binary-private"
 disposition = "extract"
 protected_invariants = ["Compatibility route for the published provider contract."]
-consumers = [
-    "module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:inspection_schema:private:[]",
-    'path-module:crates/memcordon-cli/src/bin/memcordon-session-broker.rs:inspection_schema:private:["cfg(target_os = \"windows\")"]',
-    'path-module:crates/memcordon-cli/src/bin/memcordon-target-desktop-bootstrap.rs:inspection_schema:private:["cfg(target_os = \"windows\")"]',
-]
-routes = [
-    "module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:inspection_schema:private:[]",
-    'path-module:crates/memcordon-cli/src/bin/memcordon-session-broker.rs:inspection_schema:private:["cfg(target_os = \"windows\")"]',
-    'path-module:crates/memcordon-cli/src/bin/memcordon-target-desktop-bootstrap.rs:inspection_schema:private:["cfg(target_os = \"windows\")"]',
-]
+consumers = ["module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:inspection_schema:private:[]"]
+routes = ["module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:inspection_schema:private:[]"]
 cfg = []
 item_visibility = ["use:memcordon_core :: sealed_provider :: inspection :: *#1:pub"]
 platforms = ["portable"]
@@ -1467,16 +1459,8 @@ kind = "production"
 visibility = "binary-private"
 disposition = "extract"
 protected_invariants = ["Compatibility route for the published provider contract."]
-consumers = [
-    'module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:protocol:private:["cfg_attr(not (target_os = \"linux\") , allow (dead_code))"]',
-    'path-module:crates/memcordon-cli/src/bin/memcordon-session-broker.rs:protocol:private:["cfg(target_os = \"windows\")"]',
-    'path-module:crates/memcordon-cli/src/bin/memcordon-target-desktop-bootstrap.rs:protocol:private:["cfg(target_os = \"windows\")"]',
-]
-routes = [
-    'module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:protocol:private:["cfg_attr(not (target_os = \"linux\") , allow (dead_code))"]',
-    'path-module:crates/memcordon-cli/src/bin/memcordon-session-broker.rs:protocol:private:["cfg(target_os = \"windows\")"]',
-    'path-module:crates/memcordon-cli/src/bin/memcordon-target-desktop-bootstrap.rs:protocol:private:["cfg(target_os = \"windows\")"]',
-]
+consumers = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:protocol:private:["cfg_attr(not (target_os = \"linux\") , allow (dead_code))"]']
+routes = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:protocol:private:["cfg_attr(not (target_os = \"linux\") , allow (dead_code))"]']
 cfg = []
 item_visibility = ["use:memcordon_core :: sealed_provider :: protocol :: *#1:pub"]
 platforms = ["portable"]

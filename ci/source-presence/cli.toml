@@ -331,25 +331,25 @@ protected_invariants = ["memcordon-session-broker retains the behavior and failu
 consumers = ["cargo:memcordon:bin:memcordon-session-broker:features=[]"]
 routes = ["cargo:memcordon:bin:memcordon-session-broker:features=[]"]
 cfg = [
-    'fn:main#1/expression:31#1:cfg(target_os = "windows")',
-    'fn:main#1/expression:45#1:cfg(not (target_os = "windows"))',
-    'fn:main#1/expression:7#1:cfg(feature = "test-support")',
+    'fn:main#1/expression:29#1:cfg(target_os = "windows")',
+    'fn:main#1/expression:43#1:cfg(not (target_os = "windows"))',
+    'fn:main#1/expression:5#1:cfg(feature = "test-support")',
     'macro:include#1:cfg(target_os = "windows")',
     'mod:admission#1:cfg(target_os = "windows")',
-    'mod:inspection_schema#1:cfg(target_os = "windows")',
     'mod:package#1:cfg(target_os = "windows")',
     'mod:policy_registry#1:cfg(target_os = "windows")',
-    'mod:protocol#1:cfg(target_os = "windows")',
     'mod:windows#1:cfg(target_os = "windows")',
+    'use:memcordon_core :: sealed_provider :: inspection as inspection_schema#1:cfg(target_os = "windows")',
+    'use:memcordon_core :: sealed_provider :: protocol#1:cfg(target_os = "windows")',
 ]
 item_visibility = [
     "fn:main#1:private",
     "mod:admission#1:private",
-    "mod:inspection_schema#1:private",
     "mod:package#1:private",
     "mod:policy_registry#1:private",
-    "mod:protocol#1:private",
     "mod:windows#1:private",
+    "use:memcordon_core :: sealed_provider :: inspection as inspection_schema#1:private",
+    "use:memcordon_core :: sealed_provider :: protocol#1:private",
 ]
 platforms = ["portable"]
 work_packages = [
@@ -371,26 +371,26 @@ consumers = ["cargo:memcordon:bin:memcordon-target-desktop-bootstrap:features=[]
 routes = ["cargo:memcordon:bin:memcordon-target-desktop-bootstrap:features=[]"]
 cfg = [
     ':cfg_attr(feature = "test-support" , allow (dead_code))',
-    'fn:main#1/expression:39#1:cfg(target_os = "windows")',
-    'fn:main#1/expression:7#1:cfg(feature = "test-support")',
-    'fn:main#1/expression:87#1:cfg(not (target_os = "windows"))',
+    'fn:main#1/expression:37#1:cfg(target_os = "windows")',
+    'fn:main#1/expression:5#1:cfg(feature = "test-support")',
+    'fn:main#1/expression:85#1:cfg(not (target_os = "windows"))',
     'macro:compile_error#1:cfg(all (target_os = "windows" , not (memcordon_static_vcruntime)))',
     'macro:include#1:cfg(target_os = "windows")',
     'mod:admission#1:cfg(target_os = "windows")',
-    'mod:inspection_schema#1:cfg(target_os = "windows")',
     'mod:package#1:cfg(target_os = "windows")',
     'mod:policy_registry#1:cfg(target_os = "windows")',
-    'mod:protocol#1:cfg(target_os = "windows")',
     'mod:windows#1:cfg(target_os = "windows")',
+    'use:memcordon_core :: sealed_provider :: inspection as inspection_schema#1:cfg(target_os = "windows")',
+    'use:memcordon_core :: sealed_provider :: protocol#1:cfg(target_os = "windows")',
 ]
 item_visibility = [
     "fn:main#1:private",
     "mod:admission#1:private",
-    "mod:inspection_schema#1:private",
     "mod:package#1:private",
     "mod:policy_registry#1:private",
-    "mod:protocol#1:private",
     "mod:windows#1:private",
+    "use:memcordon_core :: sealed_provider :: inspection as inspection_schema#1:private",
+    "use:memcordon_core :: sealed_provider :: protocol#1:private",
     "use:std :: ffi :: { OsStr , OsString }#1:private",
 ]
 platforms = ["portable"]
