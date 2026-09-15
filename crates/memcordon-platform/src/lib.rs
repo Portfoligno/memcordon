@@ -23,6 +23,7 @@ mod macos_launch;
 #[cfg(target_os = "macos")]
 mod macos_watchdog;
 #[cfg(target_os = "macos")]
+#[doc(hidden)]
 pub use macos_launch::enveloped_helper as macos_enveloped_helper;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
@@ -81,11 +82,14 @@ pub use backend::{
     ProbeReport, SealedAvailability, cleanup_stale, probe, run,
 };
 #[cfg(target_os = "macos")]
+#[doc(hidden)]
 pub use signal::{CallerSignalSnapshot, CancellationHandle};
 #[cfg(target_os = "windows")]
+#[doc(hidden)]
 pub use supervisor::certify_windows_platform_mutant;
 pub use supervisor::{
     AttemptContext, AttemptExecution, SupervisorRequest, capabilities, capabilities_for, supervise,
 };
 #[cfg(target_os = "macos")]
+#[doc(hidden)]
 pub use supervisor::{MacosExecutionContext, macos_supervise_from};

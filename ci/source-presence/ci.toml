@@ -303,6 +303,70 @@ work_packages = [
 decision = "Retain with an explicit source-registry owner, consumer, invariant, visibility tier, and acceptance evidence; make no structural change unless the boundary review fails."
 
 [[source]]
+id = "tools.memcordon-ci.src.api_surface"
+path = "tools/memcordon-ci/src/api_surface.rs"
+owner = "ci"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "retain"
+protected_invariants = ["Owner: API governance. Authority: declaration drift checks, not native admission."]
+consumers = ["module:tools/memcordon-ci/src/lib.rs:api_surface:pub:[]"]
+routes = ["module:tools/memcordon-ci/src/lib.rs:api_surface:pub:[]"]
+cfg = []
+item_visibility = [
+    "enum:Tier#1/variant:HiddenNativeHook#1:enum-member",
+    "enum:Tier#1/variant:StablePublic#1:enum-member",
+    "enum:Tier#1/variant:TestOnly#1:enum-member",
+    "enum:Tier#1/variant:ToolingOnly#1:enum-member",
+    "enum:Tier#1/variant:VersionedProviderContract#1:enum-member",
+    "enum:Tier#1:pub",
+    "fn:attributes#1:private",
+    "fn:error#1:private",
+    "fn:imports#1:private",
+    "fn:inspect_root#1:pub",
+    "fn:inspect_source#1:pub",
+    "fn:requires_test_support#1/fn:without_feature#1:private",
+    "fn:requires_test_support#1:private",
+    "fn:safe_relative#1:private",
+    "fn:validate#1:pub",
+    "fn:validate_surface#1:pub",
+    "struct:Catalog#1/field:schema#1:pub",
+    "struct:Catalog#1/field:surface#1:pub",
+    "struct:Catalog#1:pub",
+    "struct:Export#1/field:fact#1:pub",
+    "struct:Export#1/field:tier#1:pub",
+    "struct:Export#1:pub",
+    "struct:ExportFact#1/field:cfg#1:pub",
+    "struct:ExportFact#1/field:glob_source_sha256#1:pub",
+    "struct:ExportFact#1/field:hidden#1:pub",
+    "struct:ExportFact#1/field:kind#1:pub",
+    "struct:ExportFact#1/field:name#1:pub",
+    "struct:ExportFact#1/field:origin#1:pub",
+    "struct:ExportFact#1:pub",
+    "struct:Surface#1/field:exports#1:pub",
+    "struct:Surface#1/field:fixtures#1:pub",
+    "struct:Surface#1/field:package#1:pub",
+    "struct:Surface#1/field:root#1:pub",
+    "struct:Surface#1:pub",
+    "use:crate :: { CiError , Result }#1:private",
+    "use:quote :: ToTokens#1:private",
+    "use:serde :: { Deserialize , Serialize }#1:private",
+    "use:sha2 :: { Digest , Sha256 }#1:private",
+    "use:std :: collections :: { BTreeMap , BTreeSet }#1:private",
+    "use:std :: path :: { Component , Path }#1:private",
+    "use:syn :: parse :: Parser#1:private",
+    "use:syn :: { Attribute , Item , UseTree , Visibility }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+    "CI-08",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "tools.memcordon-ci.src.bin.memcordon-native-input-digest"
 path = "tools/memcordon-ci/src/bin/memcordon-native-input-digest.rs"
 owner = "ci"
@@ -1224,6 +1288,7 @@ item_visibility = [
     "enum:CiError#1/variant:Zip#1/tuple:0#1/field:zip :: result :: ZipError#1:private",
     "enum:CiError#1/variant:Zip#1:enum-member",
     "enum:CiError#1:pub",
+    "mod:api_surface#1:pub",
     "mod:boundary_metrics#1:pub",
     "mod:boundary_report#1:pub",
     "mod:build_context#1:pub",
@@ -1245,7 +1310,6 @@ item_visibility = [
     "mod:release_archive#1:pub",
     "mod:release_evidence#1:pub",
     "mod:reparse_diagnostic#1:pub",
-    "mod:runtime_manifest#1:pub",
     "mod:scenario_diagnostic#1:pub",
     "mod:sealed_identity#1:pub",
     "mod:sealed_selector#1:pub",
@@ -2228,9 +2292,9 @@ item_visibility = [
     "use:memcordon_ci :: capability#1:private",
     "use:memcordon_ci :: release_archive :: { NATIVE_ARCHIVE_STATIC_PATHS , RUNTIME_MANIFEST , cargo_install_inventory , configured_default_cargo_binaries , validate_markdown_documents , validate_memcordon_crate_distribution as validate_reviewed_memcordon_distribution , }#1:private",
     "use:memcordon_ci :: release_evidence :: { CertificationRecord , collect_certification }#1:private",
-    "use:memcordon_ci :: runtime_manifest :: { RuntimeComponentRecord , RuntimeManifestV2 , SealedRuntimeV2 }#1:private",
     "use:memcordon_ci :: sealed_identity :: frontend_identity#1:private",
     "use:memcordon_ci :: sealed_identity :: { FrontendIdentity , setpriv_sudo_arguments }#1:private",
+    "use:memcordon_core :: runtime_manifest :: { RuntimeComponentRecord , RuntimeManifestV2 , SealedRuntimeV2 , }#1:private",
     "use:memcordon_testkit :: ObservedOutput#1:private",
     "use:semver :: Version#1:private",
     "use:serde :: de :: Error as _#1:private",
@@ -2769,29 +2833,6 @@ work_packages = [
     "GOV-01",
 ]
 decision = "Retain with an explicit source-registry owner, consumer, invariant, visibility tier, and acceptance evidence; make no structural change unless the boundary review fails."
-
-[[source]]
-id = "tools.memcordon-ci.src.runtime_manifest"
-path = "tools/memcordon-ci/src/runtime_manifest.rs"
-owner = "ci"
-kind = "tooling"
-visibility = "tooling-only"
-disposition = "harden"
-protected_invariants = ["runtime_manifest retains the behavior and failure assertions reviewed in its source-boundary decision."]
-consumers = ["module:tools/memcordon-ci/src/lib.rs:runtime_manifest:pub:[]"]
-routes = ["module:tools/memcordon-ci/src/lib.rs:runtime_manifest:pub:[]"]
-cfg = []
-item_visibility = [
-    "fn:fuzz_runtime_manifest#1:pub",
-    "use:memcordon_core :: runtime_manifest :: { RuntimeComponentRecord , RuntimeManifestV2 , SealedRuntimeV2 , }#1:pub",
-]
-platforms = ["portable"]
-work_packages = [
-    "CI-08",
-    "GOV-01",
-    "GOV-04",
-]
-decision = "Delete the façade. Import runtime-manifest types directly from `memcordon-core` and move the fuzz helper to the target or core test support."
 
 [[source]]
 id = "tools.memcordon-ci.src.scenario_diagnostic"
@@ -3404,12 +3445,12 @@ item_visibility = [
     "struct:WindowsRuntimeEvidence#1:private",
     "use:crate :: release :: { create_package_archives , extract_crate_source }#1:private",
     "use:memcordon_ci :: command :: { CommandSpec , git , rustup_cargo }#1:private",
-    "use:memcordon_ci :: runtime_manifest :: { RuntimeManifestV2 , SealedRuntimeV2 }#1:private",
     "use:memcordon_ci :: scenario_diagnostic :: BoundedStream#1:private",
     "use:memcordon_ci :: windows_package_cleanup :: { ActivePackageMutation , certify_active_package_mutation , complete_optional_install_cleanup , }#1:private",
     "use:memcordon_ci :: windows_package_staging :: { ExternalWindowsPackageSources , WINDOWS_PACKAGE_NAMES , WindowsPackageSourceLayout , }#1:private",
     "use:memcordon_ci :: windows_qualification_artifacts :: { prepare_windows_qualification_artifact_directory , read_ready_windows_qualification_artifacts , windows_ephemeral_install_arguments , }#1:private",
     "use:memcordon_ci :: { CiError , Result }#1:private",
+    "use:memcordon_core :: runtime_manifest :: { RuntimeManifestV2 , SealedRuntimeV2 }#1:private",
     "use:memcordon_core :: { BoundaryClass , BoundaryMechanismEvidence , CredentialTransitionDisposition , MemcordonReport , WINDOWS_QUALIFICATION_SCHEMA_VERSION , WINDOWS_RELEASE_MUTANT_VARIANTS , WINDOWS_RELEASE_MUTANTS , WindowsAuthorityLossEvidenceV1 , WindowsCertificationObservationsV1 , WindowsMutantKillEvidenceV1 , WindowsMutantObservationV1 , WindowsQualificationReceiptV1 , WindowsSealedMutant , WindowsTokenMatrixEvidenceV1 , }#1:private",
     "use:serde :: { Deserialize , Serialize }#1:private",
     "use:serde_json :: Value#1:private",

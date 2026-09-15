@@ -10,6 +10,27 @@ fn wire(frame: &[u8]) -> Vec<u8> {
     bytes
 }
 
+#[test]
+fn delayed_observation_retains_request_and_routes_late_reply() {
+    for case in [0, 1, 2, 5, 6] {
+        memcordon_platform::test_support::macos_observation_poll_fixture(case).unwrap();
+    }
+}
+
+#[test]
+fn pending_observation_does_not_hide_disconnect_or_binding_failure() {
+    for case in [3, 4] {
+        assert!(memcordon_platform::test_support::macos_observation_poll_fixture(case).is_err());
+    }
+}
+
+#[test]
+fn retirement_uses_existing_absolute_budget_and_keeps_expired_custody() {
+    for case in [7, 8] {
+        memcordon_platform::test_support::macos_observation_poll_fixture(case).unwrap();
+    }
+}
+
 fn vectors() -> serde_json::Value {
     serde_json::from_str(include_str!("../../../spec/vectors/macos-launch-v2.json")).unwrap()
 }

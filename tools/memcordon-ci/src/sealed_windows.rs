@@ -6,7 +6,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use memcordon_ci::command::{CommandSpec, git, rustup_cargo};
-use memcordon_ci::runtime_manifest::{RuntimeManifestV2, SealedRuntimeV2};
 use memcordon_ci::scenario_diagnostic::BoundedStream;
 use memcordon_ci::windows_package_cleanup::{
     ActivePackageMutation, certify_active_package_mutation, complete_optional_install_cleanup,
@@ -19,6 +18,7 @@ use memcordon_ci::windows_qualification_artifacts::{
     windows_ephemeral_install_arguments,
 };
 use memcordon_ci::{CiError, Result};
+use memcordon_core::runtime_manifest::{RuntimeManifestV2, SealedRuntimeV2};
 use memcordon_core::{
     BoundaryClass, BoundaryMechanismEvidence, CredentialTransitionDisposition, MemcordonReport,
     WINDOWS_QUALIFICATION_SCHEMA_VERSION, WINDOWS_RELEASE_MUTANT_VARIANTS, WINDOWS_RELEASE_MUTANTS,

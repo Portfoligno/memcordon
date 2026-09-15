@@ -1204,7 +1204,7 @@ fn retire_workload(
         });
     }
     while stored.is_none() && Instant::now() < deadline {
-        match child.observe() {
+        match child.observe_until(deadline.min(Instant::now() + Duration::from_millis(100))) {
             Ok(Some(status)) => *stored = Some(termination_from_status(status)),
             Ok(None) => bounded_pause(
                 Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),

@@ -5,6 +5,50 @@ use std::process::Command;
 use std::time::Duration;
 
 #[test]
+fn native_seed_debug_sidecar_is_generated_without_hiding_unrelated_inputs() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    fs::copy(repository.join(".gitignore"), root.join(".gitignore")).unwrap();
+    let initialized = Command::new("git")
+        .current_dir(root)
+        .args(["init", "--quiet"])
+        .output()
+        .unwrap();
+    assert!(initialized.status.success());
+    fs::create_dir(root.join("nested")).unwrap();
+    for path in [
+        "ci-native-fingerprint.exe",
+        "ci-native-fingerprint.pdb",
+        "unrelated.pdb",
+        "nested/ci-native-fingerprint.pdb",
+    ] {
+        fs::write(root.join(path), b"inert compiler output fixture\n").unwrap();
+    }
+    let status = Command::new("git")
+        .current_dir(root)
+        .args([
+            "-c",
+            "core.excludesFile=",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            "ci-native-fingerprint.exe",
+            "ci-native-fingerprint.pdb",
+            "unrelated.pdb",
+            "nested/ci-native-fingerprint.pdb",
+        ])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert_eq!(
+        String::from_utf8(status.stdout).unwrap(),
+        "?? nested/ci-native-fingerprint.pdb\n?? unrelated.pdb\n"
+    );
+}
+
+#[test]
 fn optimized_bootstrap_profile_retains_runtime_checks_and_cache_identity() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let manifest: toml::Value =

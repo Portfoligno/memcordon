@@ -679,7 +679,10 @@ protected_invariants = ["runtime_manifest retains the behavior and failure asser
 consumers = ["cargo:memcordon-fuzz:bin:runtime-manifest"]
 routes = ["cargo:memcordon-fuzz:bin:runtime-manifest"]
 cfg = []
-item_visibility = ["use:libfuzzer_sys :: fuzz_target#1:private"]
+item_visibility = [
+    "use:libfuzzer_sys :: fuzz_target#1:private",
+    "use:memcordon_core :: runtime_manifest :: RuntimeManifestV2#1:private",
+]
 platforms = ["portable"]
 work_packages = [
     "GOV-01",

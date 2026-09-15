@@ -481,7 +481,7 @@ parity_required = false
 [[targets]]
 id = "fuzz-29"
 bin = "runtime-manifest"
-production_unit = "ci::runtime_manifest::fuzz_runtime_manifest"
+production_unit = "core::runtime_manifest::RuntimeManifestV2::parse"
 class = "policy"
 invariants = ["Accepted runtime manifests preserve all validated values under canonical JSON"]
 max_input_bytes = 4096

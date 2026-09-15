@@ -6,6 +6,11 @@ use serde_json::{Value, json};
 const WIRE: &[u8] = br#"{"version":1,"run":71,"destinations":[0,1,2],"settings":{"mask":8,"ignored":[2,15],"limits":[[4,32,64]]}}"#;
 
 #[test]
+fn ancillary_bounds_preserve_sentinel_and_reclaim_received_rights() {
+    memcordon_platform::test_support::macos_envelope_ancillary_custody_fixture().unwrap();
+}
+
+#[test]
 fn native_envelope_transport_preserves_settings_and_exact_destinations() {
     assert_eq!(receive(WIRE, 71, 4).unwrap(), WIRE);
     let mut empty: Value = serde_json::from_slice(WIRE).unwrap();

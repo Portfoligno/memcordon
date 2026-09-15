@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod api_surface;
 pub mod boundary_metrics;
 pub mod boundary_report;
 pub mod build_context;
@@ -21,7 +22,6 @@ pub mod producer_metadata;
 pub mod release_archive;
 pub mod release_evidence;
 pub mod reparse_diagnostic;
-pub mod runtime_manifest;
 pub mod scenario_diagnostic;
 pub mod sealed_identity;
 pub mod sealed_selector;

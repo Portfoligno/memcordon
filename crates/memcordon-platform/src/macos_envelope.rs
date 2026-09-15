@@ -8,6 +8,15 @@ use std::time::Instant;
 
 const MAX_FDS: usize = 128;
 const MAX_MANIFEST: usize = 4096;
+// Darwin sockargs(MT_CONTROL) rejects an allocation larger than MCLBYTES
+// (2048 on both supported architectures). Reserve the entire kernel transport
+// bound, independently of the 128-destination protocol limit: XNU externalizes
+// rights before copyout_control truncates them, so undisclosed suffix rights
+// cannot be reclaimed from a deliberately undersized receive buffer.
+// https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_syscalls.c
+// https://github.com/apple-oss-distributions/xnu/blob/main/bsd/i386/param.h
+// https://github.com/apple-oss-distributions/xnu/blob/main/bsd/arm/param.h
+const DARWIN_MAX_CONTROL_BYTES: usize = 2048;
 type CaptureRequest = (
     crate::signal::CallerSignalSnapshot,
     Instant,
@@ -49,6 +58,115 @@ pub(crate) fn duplicate(fd: RawFd, floor: RawFd) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+}
+
+/// Adopt only complete descriptor words actually returned by recvmsg. Darwin
+/// may retain the original cmsg_len after truncating the copied control bytes.
+///
+/// SAFETY: each distinct nonnegative SCM_RIGHTS word within `returned` must be
+/// a descriptor newly transferred to this process, with no other Rust owner.
+/// Negative and repeated words are rejected; bytes outside the returned extent
+/// are never interpreted as descriptors.
+unsafe fn receive_rights(
+    ancillary: &[usize],
+    returned: usize,
+    flags: libc::c_int,
+) -> io::Result<Vec<OwnedFd>> {
+    let capacity = std::mem::size_of_val(ancillary);
+    let extent = returned.min(capacity);
+    let mut invalid = returned > capacity || flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0;
+    let mut rights = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut offset = 0usize;
+    let header_length = unsafe { libc::CMSG_LEN(0) } as usize;
+    while offset < extent {
+        if extent - offset < std::mem::size_of::<libc::cmsghdr>() {
+            invalid = true;
+            break;
+        }
+        // SAFETY: the complete header is inside the returned and allocated extent.
+        let header = unsafe {
+            std::ptr::read_unaligned(
+                ancillary
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(offset)
+                    .cast::<libc::cmsghdr>(),
+            )
+        };
+        let length = header.cmsg_len as usize;
+        if length < header_length {
+            invalid = true;
+            break;
+        }
+        let available = extent - offset;
+        invalid |= length > available;
+        let payload_length = length - header_length;
+        let copied_payload = length.min(available).saturating_sub(header_length);
+        if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
+            invalid |= payload_length % std::mem::size_of::<RawFd>() != 0
+                || copied_payload % std::mem::size_of::<RawFd>() != 0;
+            for index in 0..copied_payload / std::mem::size_of::<RawFd>() {
+                let word = offset + header_length + index * std::mem::size_of::<RawFd>();
+                // SAFETY: only full words inside the returned extent are read.
+                let fd = unsafe {
+                    std::ptr::read_unaligned(
+                        ancillary.as_ptr().cast::<u8>().add(word).cast::<RawFd>(),
+                    )
+                };
+                if fd < 0 || !seen.insert(fd) {
+                    invalid = true;
+                    continue;
+                }
+                // SAFETY: caller transfers ownership of the returned SCM_RIGHTS
+                // descriptors. Duplicate words are never adopted a second time.
+                rights.push(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        } else {
+            invalid = true;
+        }
+        if length > available {
+            break;
+        }
+        let advance = unsafe { libc::CMSG_SPACE(payload_length as u32) } as usize;
+        if advance > available {
+            break;
+        }
+        offset += advance;
+    }
+    if invalid { Err(error()) } else { Ok(rights) }
+}
+
+fn receive_packet(socket: &UnixDatagram) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+    let mut payload = [0u8; MAX_MANIFEST];
+    let space = DARWIN_MAX_CONTROL_BYTES;
+    let mut ancillary = vec![0usize; space.div_ceil(std::mem::size_of::<usize>())];
+    let mut vector = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    };
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut vector;
+    message.msg_iovlen = 1;
+    message.msg_control = ancillary.as_mut_ptr().cast();
+    message.msg_controllen = space as _;
+    let count = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_DONTWAIT) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: recvmsg installs independent owned descriptors in the returned
+    // SCM_RIGHTS extent. The parser bounds every header and word by both
+    // msg_controllen and this allocation before adopting it.
+    let rights = unsafe {
+        receive_rights(
+            &ancillary,
+            message.msg_controllen as usize,
+            message.msg_flags,
+        )?
+    };
+    let count = usize::try_from(count).map_err(|_| error())?;
+    let payload = payload.get(..count).ok_or_else(error)?.to_vec();
+    Ok((payload, rights))
 }
 
 impl Envelope {
@@ -253,55 +371,8 @@ impl Envelope {
     }
 
     pub(crate) fn receive(socket: &UnixDatagram, run: u64, floor: RawFd) -> io::Result<Self> {
-        let mut payload = [0u8; MAX_MANIFEST];
-        let space =
-            unsafe { libc::CMSG_SPACE(((MAX_FDS + 1) * std::mem::size_of::<RawFd>()) as u32) }
-                as usize;
-        let mut ancillary = vec![0usize; space.div_ceil(std::mem::size_of::<usize>())];
-        let mut vector = libc::iovec {
-            iov_base: payload.as_mut_ptr().cast(),
-            iov_len: payload.len(),
-        };
-        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-        message.msg_iov = &mut vector;
-        message.msg_iovlen = 1;
-        message.msg_control = ancillary.as_mut_ptr().cast();
-        message.msg_controllen = space as _;
-        let count = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, libc::MSG_DONTWAIT) };
-        if count < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut rights = Vec::new();
-        let mut invalid = message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0;
-        unsafe {
-            let mut header = libc::CMSG_FIRSTHDR(&message);
-            while !header.is_null() {
-                if (*header).cmsg_level != libc::SOL_SOCKET
-                    || (*header).cmsg_type != libc::SCM_RIGHTS
-                {
-                    invalid = true;
-                    break;
-                }
-                let bytes = ((*header).cmsg_len as usize)
-                    .checked_sub(libc::CMSG_LEN(0) as usize)
-                    .ok_or_else(error)?;
-                if bytes % std::mem::size_of::<RawFd>() != 0 {
-                    invalid = true;
-                    break;
-                }
-                for index in 0..bytes / std::mem::size_of::<RawFd>() {
-                    rights.push(OwnedFd::from_raw_fd(
-                        *libc::CMSG_DATA(header).cast::<RawFd>().add(index),
-                    ));
-                }
-                header = libc::CMSG_NXTHDR(&message, header);
-            }
-        }
-        if invalid {
-            return Err(error());
-        }
-        let manifest: Manifest =
-            serde_json::from_slice(&payload[..usize::try_from(count).map_err(|_| error())?])?;
+        let (payload, rights) = receive_packet(socket)?;
+        let manifest: Manifest = serde_json::from_slice(&payload)?;
         if manifest.version != 1
             || manifest.run != run
             || manifest.destinations.len() > MAX_FDS
@@ -392,11 +463,27 @@ pub fn receive_manifest_fixture(
     }
     let directory = std::fs::File::open(".")?;
     let rights = vec![directory.as_raw_fd(); rights_count];
+    let receiver = send_packet_fixture(payload, &rights)?;
+    let envelope = Envelope::receive(&receiver, run, 3)?;
+    Ok(serde_json::to_vec(&Manifest {
+        version: 1,
+        run,
+        destinations: envelope
+            .descriptors
+            .iter()
+            .map(|(destination, _)| *destination)
+            .collect(),
+        settings: envelope.settings,
+    })?)
+}
+
+#[cfg(feature = "test-support")]
+fn send_packet_fixture(payload: &[u8], rights: &[RawFd]) -> io::Result<UnixDatagram> {
     let (sender, receiver) = UnixDatagram::pair()?;
     if rights.is_empty() {
         sender.send(payload)?;
     } else {
-        let size = u32::try_from(std::mem::size_of_val(rights.as_slice())).map_err(|_| error())?;
+        let size = u32::try_from(std::mem::size_of_val(rights)).map_err(|_| error())?;
         // SAFETY: the aligned storage is sized for exactly the typed fd array;
         // all descriptors remain owned until sendmsg completes.
         let space = unsafe { libc::CMSG_SPACE(size) } as usize;
@@ -429,18 +516,14 @@ pub fn receive_manifest_fixture(
             }
         }
     }
-    let envelope = Envelope::receive(&receiver, run, 3)?;
-    Ok(serde_json::to_vec(&Manifest {
-        version: 1,
-        run,
-        destinations: envelope
-            .descriptors
-            .iter()
-            .map(|(destination, _)| *destination)
-            .collect(),
-        settings: envelope.settings,
-    })?)
+    Ok(receiver)
 }
+
+#[cfg(feature = "test-support")]
+#[path = "../tests/support/macos_ancillary_custody.rs"]
+mod custody_fixture;
+#[cfg(feature = "test-support")]
+pub use custody_fixture::ancillary_custody_fixture;
 
 fn check(status: i32) -> io::Result<()> {
     if status == 0 {

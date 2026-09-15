@@ -1,0 +1,4143 @@
+schema = 1
+
+[[surface]]
+package = "memcordon-core"
+root = "crates/memcordon-core/src/lib.rs"
+fixtures = ["crates/memcordon-core/tests/stable_api.rs"]
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "*"
+origin = "diagnostics::*"
+kind = "reexport"
+cfg = []
+hidden = false
+glob_source_sha256 = "576bc7782ff5c59975ed8d9e8b676a5bd5bdc60d020db56ff5dc470eb6a0f554"
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "*"
+origin = "runtime_evidence::*"
+kind = "reexport"
+cfg = []
+hidden = false
+glob_source_sha256 = "acbb7edf73ca5da5273710822e331881698e9db6330d30c0a020cd8dba7eee90"
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "AttemptEventKind"
+origin = "outcome::AttemptEventKind"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "AttemptHistory"
+origin = "supervision::AttemptHistory"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "AttemptHistoryReport"
+origin = "report::AttemptHistoryReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "AttemptKind"
+origin = "supervision::AttemptKind"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "AttemptPhase"
+origin = "supervision::AttemptPhase"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "AttemptRecord"
+origin = "supervision::AttemptRecord"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BackendCapabilityReport"
+origin = "supervision::BackendCapabilityReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BackendSelectionDriftEvidence"
+origin = "supervision::BackendSelectionDriftEvidence"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BackoffMultiplier"
+origin = "restart::BackoffMultiplier"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BackoffPolicyReport"
+origin = "report::BackoffPolicyReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BoundaryCapability"
+origin = "supervision::BoundaryCapability"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BoundaryClass"
+origin = "supervision::BoundaryClass"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BoundaryMechanismEvidence"
+origin = "supervision::BoundaryMechanismEvidence"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BoundaryQualificationReport"
+origin = "supervision::BoundaryQualificationReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BoundaryRequirement"
+origin = "policy::BoundaryRequirement"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BoundarySetupFailure"
+origin = "error::BoundarySetupFailure"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BoundarySetupPhase"
+origin = "error::BoundarySetupPhase"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BudgetKindReport"
+origin = "report::BudgetKindReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BudgetTokenReport"
+origin = "report::BudgetTokenReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ByteSize"
+origin = "policy::ByteSize"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ByteSizeParseError"
+origin = "policy::ByteSizeParseError"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CLEAN_REPORT_SCHEMA_VERSION"
+origin = "report::CLEAN_REPORT_SCHEMA_VERSION"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CapabilityStatusReport"
+origin = "supervision::CapabilityStatusReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ChildTermination"
+origin = "outcome::ChildTermination"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CircuitBreakerPolicy"
+origin = "restart::CircuitBreakerPolicy"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CircuitBreakerPolicyReport"
+origin = "report::CircuitBreakerPolicyReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CircuitState"
+origin = "restart::CircuitState"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CleanReport"
+origin = "report::CleanReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CleanupErrorRecord"
+origin = "outcome::CleanupErrorRecord"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CleanupSummary"
+origin = "outcome::CleanupSummary"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CommandSpec"
+origin = "policy::CommandSpec"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CredentialTransitionDisposition"
+origin = "supervision::CredentialTransitionDisposition"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "DETAILED_ATTEMPT_CAPACITY"
+origin = "supervision::DETAILED_ATTEMPT_CAPACITY"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "DOCTOR_REPORT_SCHEMA_VERSION"
+origin = "report::DOCTOR_REPORT_SCHEMA_VERSION"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "DeadlineEvidence"
+origin = "outcome::DeadlineEvidence"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "DeadlinePolicy"
+origin = "policy::DeadlinePolicy"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "DeadlinePolicyError"
+origin = "policy::DeadlinePolicyError"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "DeadlinePolicyReport"
+origin = "report::DeadlinePolicyReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "DeadlineScope"
+origin = "policy::DeadlineScope"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "DoctorReport"
+origin = "report::DoctorReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "DormantRestartCondition"
+origin = "restart::DormantRestartCondition"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "EXECUTION_REPORT_SCHEMA_VERSION"
+origin = "report::EXECUTION_REPORT_SCHEMA_VERSION"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "EffectiveMemoryPolicyReport"
+origin = "report::EffectiveMemoryPolicyReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "EffectivePolicyReport"
+origin = "report::EffectivePolicyReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "EffectiveRestartPolicyReport"
+origin = "report::EffectiveRestartPolicyReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Enforcement"
+origin = "policy::Enforcement"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Error"
+origin = "error::Error"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ErrorCategory"
+origin = "error::ErrorCategory"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ExecutionErrorReport"
+origin = "report::ExecutionErrorReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "HALF_LIFE_LOGISTIC_MODEL"
+origin = "restart::HALF_LIFE_LOGISTIC_MODEL"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "HalfLifeLogisticBackoffPolicy"
+origin = "restart::HalfLifeLogisticBackoffPolicy"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "HalfLifeLogisticBackoffState"
+origin = "restart::HalfLifeLogisticBackoffState"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "HostReport"
+origin = "report::HostReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "InitialSpawnFailure"
+origin = "error::InitialSpawnFailure"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Interruption"
+origin = "outcome::Interruption"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "InvocationReport"
+origin = "report::InvocationReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "LaunchEvidence"
+origin = "supervision::LaunchEvidence"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Lifetime"
+origin = "policy::Lifetime"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "LimitEvidence"
+origin = "outcome::LimitEvidence"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "LinuxSealedEvidenceV2"
+origin = "supervision::LinuxSealedEvidenceV2"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "MacosSealedEvidence"
+origin = "supervision::MacosSealedEvidence"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "MemcordonReport"
+origin = "report::MemcordonReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "MemoryCapabilityReport"
+origin = "supervision::MemoryCapabilityReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Metric"
+origin = "policy::Metric"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "NativeArgument"
+origin = "report::NativeArgument"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "NativeArgumentRaw"
+origin = "report::NativeArgumentRaw"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeHelperIdentityV1"
+origin = "error::NativeHelperIdentityV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeStartupCleanupErrorV1"
+origin = "error::NativeStartupCleanupErrorV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeStartupCleanupStateV1"
+origin = "error::NativeStartupCleanupStateV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeStartupCleanupV1"
+origin = "error::NativeStartupCleanupV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeStartupDiagnosticV1"
+origin = "error::NativeStartupDiagnosticV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeStartupOperationV1"
+origin = "error::NativeStartupOperationV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeStartupPhaseV1"
+origin = "error::NativeStartupPhaseV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeWindowsCommandV1"
+origin = "windows_sealed::NativeWindowsCommandV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "OptionEffectReport"
+origin = "report::OptionEffectReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "PLAN_REPORT_SCHEMA_VERSION"
+origin = "report::PLAN_REPORT_SCHEMA_VERSION"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "PROVIDER_REJECTION_MAX_DETAIL_BYTES"
+origin = "error::PROVIDER_REJECTION_MAX_DETAIL_BYTES"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "PlanReport"
+origin = "report::PlanReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "PlanResolutionReport"
+origin = "report::PlanResolutionReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Policy"
+origin = "policy::Policy"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "PolicyEnvelopeReport"
+origin = "report::PolicyEnvelopeReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ProviderRejectionEvidence"
+origin = "error::ProviderRejectionEvidence"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ReportModelError"
+origin = "report::ReportModelError"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ReportWritePhase"
+origin = "report::ReportWritePhase"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RequestedMemoryPolicyReport"
+origin = "report::RequestedMemoryPolicyReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RequestedPolicyReport"
+origin = "report::RequestedPolicyReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RequestedRestartPolicyReport"
+origin = "report::RequestedRestartPolicyReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RequirementReport"
+origin = "report::RequirementReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartAction"
+origin = "restart::RestartAction"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartCondition"
+origin = "restart::RestartCondition"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartConditions"
+origin = "restart::RestartConditions"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartControllerError"
+origin = "restart::RestartControllerError"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartCoordinator"
+origin = "restart::RestartCoordinator"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartDecisionKind"
+origin = "supervision::RestartDecisionKind"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartDecisionRecord"
+origin = "supervision::RestartDecisionRecord"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartLimit"
+origin = "restart::RestartLimit"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartPolicy"
+origin = "restart::RestartPolicy"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartSafetyProof"
+origin = "supervision::RestartSafetyProof"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartSettings"
+origin = "restart::RestartSettings"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartSummary"
+origin = "supervision::RestartSummary"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartWaitKind"
+origin = "restart::RestartWaitKind"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RunOutcome"
+origin = "outcome::RunOutcome"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RunState"
+origin = "state_machine::RunState"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SealedUnavailableReport"
+origin = "supervision::SealedUnavailableReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "StateMachine"
+origin = "state_machine::StateMachine"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "StateTransitionError"
+origin = "state_machine::StateTransitionError"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SupervisionAggregates"
+origin = "supervision::SupervisionAggregates"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SupervisionDeadlineEvidence"
+origin = "supervision::SupervisionDeadlineEvidence"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SupervisionErrorRecord"
+origin = "supervision::SupervisionErrorRecord"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SupervisionExecution"
+origin = "supervision::SupervisionExecution"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SupervisionModelError"
+origin = "supervision::SupervisionModelError"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SupervisionPhase"
+origin = "supervision::SupervisionPhase"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SupervisionReport"
+origin = "report::SupervisionReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SupervisionTerminal"
+origin = "supervision::SupervisionTerminal"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SwapPolicy"
+origin = "policy::SwapPolicy"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SwapReport"
+origin = "report::SwapReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ToolReport"
+origin = "report::ToolReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "UnavailableCapabilityReport"
+origin = "report::UnavailableCapabilityReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_CERTIFICATION_FRONTEND_CANARY_COUNT"
+origin = "windows_sealed::WINDOWS_CERTIFICATION_FRONTEND_CANARY_COUNT"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_CONTROL_PIPE"
+origin = "windows_sealed::WINDOWS_CONTROL_PIPE"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_CONTROL_REQUIRED_PRIVILEGES"
+origin = "windows_sealed::WINDOWS_CONTROL_REQUIRED_PRIVILEGES"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_CONTROL_SERVICE_NAME"
+origin = "windows_sealed::WINDOWS_CONTROL_SERVICE_NAME"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_GUARDIAN_PIPE_PREFIX"
+origin = "windows_sealed::WINDOWS_GUARDIAN_PIPE_PREFIX"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_GUARDIAN_SERVICE_PREFIX"
+origin = "windows_sealed::WINDOWS_GUARDIAN_SERVICE_PREFIX"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_GUARDIAN_SLOT_COUNT"
+origin = "windows_sealed::WINDOWS_GUARDIAN_SLOT_COUNT"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_LAUNCHER_PIPE"
+origin = "windows_sealed::WINDOWS_LAUNCHER_PIPE"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_LAUNCHER_REQUIRED_PRIVILEGES"
+origin = "windows_sealed::WINDOWS_LAUNCHER_REQUIRED_PRIVILEGES"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_LAUNCHER_SERVICE_NAME"
+origin = "windows_sealed::WINDOWS_LAUNCHER_SERVICE_NAME"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_MAX_FRAME_BYTES"
+origin = "windows_sealed::WINDOWS_MAX_FRAME_BYTES"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_MAX_JOB_PROCESS_IDENTITIES"
+origin = "windows_sealed::WINDOWS_MAX_JOB_PROCESS_IDENTITIES"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS"
+origin = "windows_sealed::WINDOWS_MAX_TERMINALIZATION_SECONDARY_ERRORS"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_PE_MACHINE_AMD64"
+origin = "windows_pe::WINDOWS_PE_MACHINE_AMD64"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_PE_MACHINE_ARM64"
+origin = "windows_pe::WINDOWS_PE_MACHINE_ARM64"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_PREAUTHORIZATION_FAULTS"
+origin = "windows_sealed::WINDOWS_PREAUTHORIZATION_FAULTS"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_PRIVATE_PROTOCOL_VERSION"
+origin = "windows_sealed::WINDOWS_PRIVATE_PROTOCOL_VERSION"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_PUBLIC_PROTOCOL_VERSION"
+origin = "windows_sealed::WINDOWS_PUBLIC_PROTOCOL_VERSION"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_QUALIFICATION_SCHEMA_VERSION"
+origin = "windows_sealed::WINDOWS_QUALIFICATION_SCHEMA_VERSION"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_RELEASE_MUTANTS"
+origin = "windows_sealed::WINDOWS_RELEASE_MUTANTS"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_RELEASE_MUTANT_VARIANTS"
+origin = "windows_sealed::WINDOWS_RELEASE_MUTANT_VARIANTS"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_RETIREMENT_FAULTS"
+origin = "windows_sealed::WINDOWS_RETIREMENT_FAULTS"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_SESSION_BROKER_PIPE"
+origin = "windows_sealed::WINDOWS_SESSION_BROKER_PIPE"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_SESSION_BROKER_REQUIRED_PRIVILEGES"
+origin = "windows_sealed::WINDOWS_SESSION_BROKER_REQUIRED_PRIVILEGES"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_SESSION_BROKER_SERVICE_NAME"
+origin = "windows_sealed::WINDOWS_SESSION_BROKER_SERVICE_NAME"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "WaitCompletion"
+origin = "restart::WaitCompletion"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsAttemptRetainedV1"
+origin = "windows_sealed::WindowsAttemptRetainedV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsAttemptStateV1"
+origin = "windows_sealed::WindowsAttemptStateV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsAttemptTerminalDispositionV1"
+origin = "windows_sealed::WindowsAttemptTerminalDispositionV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsAuthorityLossEvidenceV1"
+origin = "windows_sealed::WindowsAuthorityLossEvidenceV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsCallerTokenEnvelopeV1"
+origin = "windows_sealed::WindowsCallerTokenEnvelopeV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsCertificationObservationsV1"
+origin = "windows_sealed::WindowsCertificationObservationsV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsCertificationPhaseV1"
+origin = "windows_sealed::WindowsCertificationPhaseV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsCleanupProcessCreationEvidenceV1"
+origin = "windows_sealed::WindowsCleanupProcessCreationEvidenceV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsControlRequestStatusV1"
+origin = "windows_sealed::WindowsControlRequestStatusV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsDurableAttemptRecordV1"
+origin = "windows_sealed::WindowsDurableAttemptRecordV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsDurableCleanupStateV1"
+origin = "windows_sealed::WindowsDurableCleanupStateV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsEnvironmentEntryV1"
+origin = "windows_sealed::WindowsEnvironmentEntryV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsFaultRejectionObservationV1"
+origin = "windows_sealed::WindowsFaultRejectionObservationV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLaunchBrokerRequestV1"
+origin = "windows_sealed::WindowsLaunchBrokerRequestV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLaunchPolicyV1"
+origin = "windows_sealed::WindowsLaunchPolicyV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLaunchRequestV1"
+origin = "windows_sealed::WindowsLaunchRequestV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLauncherRequestV1"
+origin = "windows_sealed::WindowsLauncherRequestV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLauncherResponseV1"
+origin = "windows_sealed::WindowsLauncherResponseV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLifetimeV1"
+origin = "windows_sealed::WindowsLifetimeV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLoaderCleanupOutcomeV1"
+origin = "supervision::WindowsLoaderCleanupOutcomeV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLoaderCleanupStatusV1"
+origin = "supervision::WindowsLoaderCleanupStatusV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLoaderNativeStatusV1"
+origin = "supervision::WindowsLoaderNativeStatusV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLoaderQualificationFailureV2"
+origin = "supervision::WindowsLoaderQualificationFailureV2"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLoaderQualificationOutcomeV2"
+origin = "supervision::WindowsLoaderQualificationOutcomeV2"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLoaderQualificationStageV2"
+origin = "supervision::WindowsLoaderQualificationStageV2"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLoaderReadyEvidenceV1"
+origin = "supervision::WindowsLoaderReadyEvidenceV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsMutantHookObservationV1"
+origin = "windows_sealed::WindowsMutantHookObservationV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsMutantKillEvidenceV1"
+origin = "windows_sealed::WindowsMutantKillEvidenceV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsMutantNativeObservationV1"
+origin = "windows_sealed::WindowsMutantNativeObservationV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsMutantNativeReceiptV1"
+origin = "windows_sealed::WindowsMutantNativeReceiptV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsMutantObservationV1"
+origin = "windows_sealed::WindowsMutantObservationV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsPackageCleanupOutcomeV1"
+origin = "windows_sealed::WindowsPackageCleanupOutcomeV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsPeExport"
+origin = "windows_pe::WindowsPeExport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsPeExportTarget"
+origin = "windows_pe::WindowsPeExportTarget"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsPeImportDescriptor"
+origin = "windows_pe::WindowsPeImportDescriptor"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsPeImportSymbol"
+origin = "windows_pe::WindowsPeImportSymbol"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsPeImports"
+origin = "windows_pe::WindowsPeImports"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsPeLoaderContract"
+origin = "windows_pe::WindowsPeLoaderContract"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsPreauthorizationFaultMatrixEvidenceV1"
+origin = "windows_sealed::WindowsPreauthorizationFaultMatrixEvidenceV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsProcessIdentityV1"
+origin = "windows_sealed::WindowsProcessIdentityV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsProviderReplacementQuiescenceV1"
+origin = "windows_sealed::WindowsProviderReplacementQuiescenceV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsProviderRequestV1"
+origin = "windows_sealed::WindowsProviderRequestV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsProviderResponseV1"
+origin = "windows_sealed::WindowsProviderResponseV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsPublicFrameFailureV1"
+origin = "windows_sealed::WindowsPublicFrameFailureV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsPublicFramePhaseV1"
+origin = "windows_sealed::WindowsPublicFramePhaseV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsPublicTerminalRecoveryV1"
+origin = "windows_sealed::WindowsPublicTerminalRecoveryV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsQualificationReceiptV1"
+origin = "windows_sealed::WindowsQualificationReceiptV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsQualificationRejectionV1"
+origin = "windows_sealed::WindowsQualificationRejectionV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsRelayEventV1"
+origin = "windows_sealed::WindowsRelayEventV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsRelayPhaseV1"
+origin = "windows_sealed::WindowsRelayPhaseV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsRemoteStreamV1"
+origin = "windows_sealed::WindowsRemoteStreamV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsReplayOutboxStageV1"
+origin = "windows_sealed::WindowsReplayOutboxStageV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsReplayPendingV1"
+origin = "windows_sealed::WindowsReplayPendingV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsRetirementFaultMatrixEvidenceV1"
+origin = "windows_sealed::WindowsRetirementFaultMatrixEvidenceV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsSealedEvidenceV2"
+origin = "supervision::WindowsSealedEvidenceV2"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsSealedFault"
+origin = "windows_sealed::WindowsSealedFault"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsSealedMutant"
+origin = "windows_sealed::WindowsSealedMutant"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsServiceSelfAttestationV1"
+origin = "windows_sealed::WindowsServiceSelfAttestationV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsStreamRoleV1"
+origin = "windows_sealed::WindowsStreamRoleV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsTerminalReceiptV1"
+origin = "windows_sealed::WindowsTerminalReceiptV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsTerminalReplayDecisionV1"
+origin = "windows_sealed::WindowsTerminalReplayDecisionV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsTerminalRetiredV1"
+origin = "windows_sealed::WindowsTerminalRetiredV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsTerminalizationCheckpointV1"
+origin = "windows_sealed::WindowsTerminalizationCheckpointV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsTerminalizationErrorStageV1"
+origin = "windows_sealed::WindowsTerminalizationErrorStageV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsTerminalizationErrorV1"
+origin = "windows_sealed::WindowsTerminalizationErrorV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsTerminalizationOwnerV1"
+origin = "windows_sealed::WindowsTerminalizationOwnerV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsTerminalizationStatusV1"
+origin = "windows_sealed::WindowsTerminalizationStatusV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsTokenMatrixEvidenceV1"
+origin = "windows_sealed::WindowsTokenMatrixEvidenceV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsTokenScenarioEvidenceV1"
+origin = "windows_sealed::WindowsTokenScenarioEvidenceV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "authenticate_decoded_windows_attempt_record"
+origin = "windows_sealed::authenticate_decoded_windows_attempt_record"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "boundary_evidence_is_consistent"
+origin = "supervision::boundary_evidence_is_consistent"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "decode_windows_command_line"
+origin = "windows_sealed::decode_windows_command_line"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "diagnostics"
+origin = "diagnostics"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "encode_windows_command_line"
+origin = "windows_sealed::encode_windows_command_line"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "encode_windows_environment_block"
+origin = "windows_sealed::encode_windows_environment_block"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "half_life_logistic_next_millis"
+origin = "restart::half_life_logistic_next_millis"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "linux_fault_contract"
+origin = "linux_fault_contract"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "parse_and_authenticate_windows_attempt_record"
+origin = "windows_sealed::parse_and_authenticate_windows_attempt_record"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "parse_windows_certification_frontend_handle_values"
+origin = "windows_sealed::parse_windows_certification_frontend_handle_values"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "parse_windows_pe_imports"
+origin = "windows_pe::parse_windows_pe_imports"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "parse_windows_pe_loader_contract"
+origin = "windows_pe::parse_windows_pe_loader_contract"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "parse_windows_pe_mapped_loader_contract"
+origin = "windows_pe::parse_windows_pe_mapped_loader_contract"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "runtime_evidence"
+origin = "runtime_evidence"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "runtime_manifest"
+origin = "runtime_manifest"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "sealed_provider"
+origin = "sealed_provider"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "test-only"
+
+[surface.exports.fact]
+name = "test_support"
+origin = "test_support"
+kind = "module"
+cfg = ['cfg (feature = "test-support")']
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "validate_windows_security_descriptor_text"
+origin = "windows_sealed::validate_windows_security_descriptor_text"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "validate_windows_stream_manifest"
+origin = "windows_sealed::validate_windows_stream_manifest"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "verify_session_broker_pe"
+origin = "windows_pe::verify_session_broker_pe"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "verify_target_desktop_bootstrap_imports"
+origin = "windows_pe::verify_target_desktop_bootstrap_imports"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "verify_target_desktop_bootstrap_pe"
+origin = "windows_pe::verify_target_desktop_bootstrap_pe"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "windows_attempt_transition_allowed"
+origin = "windows_sealed::windows_attempt_transition_allowed"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "windows_certification_argument_prelude_len"
+origin = "windows_sealed::windows_certification_argument_prelude_len"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "windows_certification_transition_allowed"
+origin = "windows_sealed::windows_certification_transition_allowed"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "windows_provider_replacement_quiescence"
+origin = "windows_sealed::windows_provider_replacement_quiescence"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "windows_service_attestation_challenge_is_valid"
+origin = "windows_sealed::windows_service_attestation_challenge_is_valid"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "windows_terminal_outbox_is_bound"
+origin = "windows_sealed::windows_terminal_outbox_is_bound"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "workload_codec"
+origin = "workload_codec"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "workload_contract"
+origin = "workload_contract"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "workload_discovery"
+origin = "workload_discovery"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "workload_evidence"
+origin = "workload_evidence"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "workload_limits"
+origin = "workload_limits"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "workload_registry"
+origin = "workload_registry"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "write_report_atomic"
+origin = "report::write_report_atomic"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "test-only"
+
+[surface.exports.fact]
+name = "write_report_atomic_with_test_barrier"
+origin = "report::write_report_atomic_with_test_barrier"
+kind = "reexport"
+cfg = ['cfg (feature = "test-support")']
+hidden = false
+
+[[surface]]
+package = "memcordon-platform"
+root = "crates/memcordon-platform/src/lib.rs"
+fixtures = ["crates/memcordon-platform/tests/stable_api.rs"]
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "AttemptContext"
+origin = "supervisor::AttemptContext"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "AttemptExecution"
+origin = "supervisor::AttemptExecution"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BackendCleanupFacts"
+origin = "backend::BackendCleanupFacts"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BackendInfo"
+origin = "backend::BackendInfo"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BoundaryQualification"
+origin = "backend::BoundaryQualification"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BoundarySupport"
+origin = "backend::BoundarySupport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "CallerSignalSnapshot"
+origin = "signal::CallerSignalSnapshot"
+kind = "reexport"
+cfg = ['cfg (target_os = "macos")']
+hidden = true
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "CancellationHandle"
+origin = "signal::CancellationHandle"
+kind = "reexport"
+cfg = ['cfg (target_os = "macos")']
+hidden = true
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Execution"
+origin = "backend::Execution"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "MacosExecutionContext"
+origin = "supervisor::MacosExecutionContext"
+kind = "reexport"
+cfg = ['cfg (target_os = "macos")']
+hidden = true
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ProbeReport"
+origin = "backend::ProbeReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SealedAvailability"
+origin = "backend::SealedAvailability"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SupervisorRequest"
+origin = "supervisor::SupervisorRequest"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "capabilities"
+origin = "supervisor::capabilities"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "capabilities_for"
+origin = "supervisor::capabilities_for"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "certify_windows_platform_mutant"
+origin = "supervisor::certify_windows_platform_mutant"
+kind = "reexport"
+cfg = ['cfg (target_os = "windows")']
+hidden = true
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "cleanup_stale"
+origin = "backend::cleanup_stale"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "macos_continuous_nanos"
+origin = "macos_deadline::continuous_nanos"
+kind = "reexport"
+cfg = ['cfg (target_os = "macos")']
+hidden = true
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "macos_enveloped_helper"
+origin = "macos_launch::enveloped_helper"
+kind = "reexport"
+cfg = ['cfg (target_os = "macos")']
+hidden = true
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "macos_helper"
+origin = "macos_launch::helper"
+kind = "reexport"
+cfg = ['cfg (target_os = "macos")']
+hidden = true
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "macos_inspector"
+origin = "macos_launch::inspector_helper"
+kind = "reexport"
+cfg = ['cfg (target_os = "macos")']
+hidden = true
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "macos_supervise_from"
+origin = "supervisor::macos_supervise_from"
+kind = "reexport"
+cfg = ['cfg (target_os = "macos")']
+hidden = true
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "probe"
+origin = "backend::probe"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "run"
+origin = "backend::run"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "supervise"
+origin = "supervisor::supervise"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "test-only"
+
+[surface.exports.fact]
+name = "test_support"
+origin = "test_support"
+kind = "module"
+cfg = ['cfg (feature = "test-support")']
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "workload_discovery"
+origin = "workload_discovery"
+kind = "function"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "workload_plan"
+origin = "workload_plan"
+kind = "function"
+cfg = []
+hidden = false
+
+[[surface]]
+package = "memcordon"
+root = "crates/memcordon-cli/src/lib.rs"
+fixtures = ["crates/memcordon-cli/tests/stable_api.rs"]
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BackendInfo"
+origin = "memcordon_platform::BackendInfo"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "BoundaryRequirement"
+origin = "memcordon_core::BoundaryRequirement"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ByteSize"
+origin = "memcordon_core::ByteSize"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ChildTermination"
+origin = "memcordon_core::ChildTermination"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CircuitBreakerPolicy"
+origin = "memcordon_core::CircuitBreakerPolicy"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CleanupSummary"
+origin = "memcordon_core::CleanupSummary"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "CommandSpec"
+origin = "memcordon_core::CommandSpec"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Enforcement"
+origin = "memcordon_core::Enforcement"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Error"
+origin = "memcordon_core::Error"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ExecutablePathError"
+origin = "ExecutablePathError"
+kind = "struct"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "HalfLifeLogisticBackoffPolicy"
+origin = "memcordon_core::HalfLifeLogisticBackoffPolicy"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Lifetime"
+origin = "memcordon_core::Lifetime"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Limiter"
+origin = "Limiter"
+kind = "struct"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "MemcordonExecutable"
+origin = "MemcordonExecutable"
+kind = "struct"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Metric"
+origin = "memcordon_core::Metric"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Policy"
+origin = "memcordon_core::Policy"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "ProbeReport"
+origin = "memcordon_platform::ProbeReport"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartConditions"
+origin = "memcordon_core::RestartConditions"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartLimit"
+origin = "memcordon_core::RestartLimit"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartPolicy"
+origin = "memcordon_core::RestartPolicy"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RestartSettings"
+origin = "memcordon_core::RestartSettings"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "RunOutcome"
+origin = "memcordon_core::RunOutcome"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "SupervisionExecution"
+origin = "memcordon_core::SupervisionExecution"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "Supervisor"
+origin = "Supervisor"
+kind = "struct"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "exit_mapping"
+origin = "exit_mapping"
+kind = "module"
+cfg = []
+hidden = true
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "invocation"
+origin = "invocation"
+kind = "module"
+cfg = []
+hidden = true
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "parse_duration"
+origin = "parse_duration"
+kind = "function"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "stable-public"
+
+[surface.exports.fact]
+name = "probe"
+origin = "memcordon_platform::probe"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "hidden-native-hook"
+
+[surface.exports.fact]
+name = "resolve_restart_policy"
+origin = "resolve_restart_policy"
+kind = "function"
+cfg = []
+hidden = true
+
+[[surface]]
+package = "memcordon-windows-launch-core"
+root = "crates/memcordon-windows-launch-core/src/lib.rs"
+fixtures = []
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "ArtifactRefError"
+origin = "artifact::ArtifactRefError"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "ArtifactRefV1"
+origin = "artifact::ArtifactRefV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "CREATE_SUSPENDED"
+origin = "plan::CREATE_SUSPENDED"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "CREATE_UNICODE_ENVIRONMENT"
+origin = "plan::CREATE_UNICODE_ENVIRONMENT"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "CleanupOutcomeV1"
+origin = "evidence::CleanupOutcomeV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "CleanupStatusV1"
+origin = "evidence::CleanupStatusV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "DesktopBindingV1"
+origin = "desktop::DesktopBindingV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "EXTENDED_STARTUPINFO_PRESENT"
+origin = "plan::EXTENDED_STARTUPINFO_PRESENT"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "ExactHandleListV1"
+origin = "attributes::ExactHandleListV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "HandleRoleV1"
+origin = "attributes::HandleRoleV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "HandshakeOutcomeV1"
+origin = "handshake::HandshakeOutcomeV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "LoaderReadyChannel"
+origin = "create::LoaderReadyChannel"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "LoaderReadyEndpointV1"
+origin = "handshake::LoaderReadyEndpointV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "LoaderReadyEvidenceV1"
+origin = "evidence::LoaderReadyEvidenceV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "MAX_FAILURE_DETAIL_BYTES"
+origin = "evidence::MAX_FAILURE_DETAIL_BYTES"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeCallOutcomeV1"
+origin = "evidence::NativeCallOutcomeV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeCreateErrorV1"
+origin = "native::NativeCreateErrorV1"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeKernelObjectKindV1"
+origin = "native::NativeKernelObjectKindV1"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeSecurityDescriptorV1"
+origin = "native::NativeSecurityDescriptorV1"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "NativeStatusV1"
+origin = "evidence::NativeStatusV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "PRODUCTION_LOADER_READY_SCHEMA_VERSION"
+origin = "handshake::PRODUCTION_LOADER_READY_SCHEMA_VERSION"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "PackageLoaderProbeError"
+origin = "create::PackageLoaderProbeError"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "PreparedCurrentDirectoryV1"
+origin = "prepared::PreparedCurrentDirectoryV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "PreparedEnvironmentIdentityV1"
+origin = "environment_identity::PreparedEnvironmentIdentityV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "PreparedLoaderCommandV1"
+origin = "prepared::PreparedLoaderCommandV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "PreparedLoaderEnvironmentV1"
+origin = "prepared::PreparedLoaderEnvironmentV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "ProcessCreateFailure"
+origin = "create::ProcessCreateFailure"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "ProductionJobV1"
+origin = "native::ProductionJobV1"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "ProductionLoaderPlanInputV1"
+origin = "plan::ProductionLoaderPlanInputV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "ProductionLoaderPlanV1"
+origin = "plan::ProductionLoaderPlanV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "ProductionNativeCreateRequestV1"
+origin = "native::ProductionNativeCreateRequestV1"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "ProductionPlanError"
+origin = "plan::ProductionPlanError"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "ProductionQualificationDriver"
+origin = "create::ProductionQualificationDriver"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "RedactionClassV1"
+origin = "artifact::RedactionClassV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "SuspendedNativeProcessV1"
+origin = "native::SuspendedNativeProcessV1"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "SuspendedProcessAttestor"
+origin = "create::SuspendedProcessAttestor"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "SuspendedProcessEvidenceV1"
+origin = "create::SuspendedProcessEvidenceV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "SuspendedProcessFactory"
+origin = "create::SuspendedProcessFactory"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "TargetTokenIdentityV1"
+origin = "token_snapshot::TargetTokenIdentityV1"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WINDOWS_DEFAULT_SECURITY_DESCRIPTOR_V1"
+origin = "WINDOWS_DEFAULT_SECURITY_DESCRIPTOR_V1"
+kind = "constant"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLoaderQualificationFailureV2"
+origin = "evidence::WindowsLoaderQualificationFailureV2"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLoaderQualificationOutcomeV2"
+origin = "evidence::WindowsLoaderQualificationOutcomeV2"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "WindowsLoaderQualificationStageV2"
+origin = "evidence::WindowsLoaderQualificationStageV2"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "build_package_loader_plan"
+origin = "plan::build_package_loader_plan"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "create_package_loader_probe"
+origin = "create::create_package_loader_probe"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "create_process_as_user_native"
+origin = "native::create_process_as_user_native"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "create_process_native"
+origin = "native::create_process_native"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "create_suspended_in_job"
+origin = "native::create_suspended_in_job"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "query_process_handle_count"
+origin = "native::query_process_handle_count"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "query_token_envelope"
+origin = "token::query_token_envelope"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "versioned-provider-contract"
+
+[surface.exports.fact]
+name = "token_envelope_sha256"
+origin = "token_snapshot::token_envelope_sha256"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface]]
+package = "memcordon-testkit"
+root = "crates/memcordon-testkit/src/lib.rs"
+fixtures = []
+
+[[surface.exports]]
+tier = "test-only"
+
+[surface.exports.fact]
+name = "ObservedOutput"
+origin = "ObservedOutput"
+kind = "struct"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "test-only"
+
+[surface.exports.fact]
+name = "ProcessTestError"
+origin = "ProcessTestError"
+kind = "enum"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "test-only"
+
+[surface.exports.fact]
+name = "assert_stdout_empty"
+origin = "assert_stdout_empty"
+kind = "function"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "test-only"
+
+[surface.exports.fact]
+name = "run_with_deadline"
+origin = "run_with_deadline"
+kind = "function"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "test-only"
+
+[surface.exports.fact]
+name = "run_with_deadline_after"
+origin = "run_with_deadline_after"
+kind = "function"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "test-only"
+
+[surface.exports.fact]
+name = "run_with_deadline_output_limit"
+origin = "run_with_deadline_output_limit"
+kind = "function"
+cfg = []
+hidden = false
+
+[[surface]]
+package = "memcordon-ci"
+root = "tools/memcordon-ci/src/lib.rs"
+fixtures = []
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "CiError"
+origin = "CiError"
+kind = "enum"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "Result"
+origin = "Result"
+kind = "type"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "api_surface"
+origin = "api_surface"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "boundary_metrics"
+origin = "boundary_metrics"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "boundary_report"
+origin = "boundary_report"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "build_context"
+origin = "build_context"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "capability"
+origin = "capability"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "certification_context"
+origin = "certification_context"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "command"
+origin = "command"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "config"
+origin = "config"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "fuzz_migration"
+origin = "fuzz_migration"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "fuzz_targets"
+origin = "fuzz_targets"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "inventory_progress"
+origin = "inventory_progress"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "inventory_reader"
+origin = "inventory_reader"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "inventory_workers"
+origin = "inventory_workers"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "line_evidence"
+origin = "line_evidence"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "managed_workflow"
+origin = "managed_workflow"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "miri_targets"
+origin = "miri_targets"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "native_file_digest"
+origin = "native_file_digest"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "policy"
+origin = "policy"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "producer_metadata"
+origin = "producer_metadata"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "release_archive"
+origin = "release_archive"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "release_evidence"
+origin = "release_evidence"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "reparse_diagnostic"
+origin = "reparse_diagnostic"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "scenario_diagnostic"
+origin = "scenario_diagnostic"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "sealed_identity"
+origin = "sealed_identity"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "sealed_selector"
+origin = "sealed_selector"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "source_identity"
+origin = "source_identity"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "source_registry"
+origin = "source_registry"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "standard_contract"
+origin = "standard_contract"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "standard_runner"
+origin = "standard_runner"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "windows_channel_identity"
+origin = "windows_channel_identity"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "windows_package_cleanup"
+origin = "windows_package_cleanup"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "windows_package_staging"
+origin = "windows_package_staging"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "windows_qualification_artifacts"
+origin = "windows_qualification_artifacts"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "workload_qualification"
+origin = "workload_qualification"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface]]
+package = "memcordon-native-inspect"
+root = "tools/memcordon-native-inspect/src/lib.rs"
+fixtures = []
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "UnsearchableDirectory"
+origin = "native_access::UnsearchableDirectory"
+kind = "reexport"
+cfg = ['cfg (any (target_os = "linux" , target_os = "macos"))']
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "initialized_reparse_bytes"
+origin = "reparse_reply::initialized_reparse_bytes"
+kind = "reexport"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "macos_read_only_descriptor_path"
+origin = "system_input::macos_read_only_descriptor_path"
+kind = "reexport"
+cfg = ['cfg (target_os = "macos")']
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "unsearchable_directory"
+origin = "native_access::unsearchable_directory"
+kind = "reexport"
+cfg = ['cfg (any (target_os = "linux" , target_os = "macos"))']
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "windows_file_identity"
+origin = "windows_file_identity::windows_file_identity"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "windows_reparse_data"
+origin = "windows_reparse::windows_reparse_data"
+kind = "reexport"
+cfg = ["cfg (windows)"]
+hidden = false
+
+[[surface]]
+package = "memcordon-windows-loader-lab"
+root = "tools/memcordon-windows-loader-lab/src/lib.rs"
+fixtures = []
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "artifact"
+origin = "artifact"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "scenario"
+origin = "scenario"
+kind = "module"
+cfg = []
+hidden = false
+
+[[surface.exports]]
+tier = "tooling-only"
+
+[surface.exports.fact]
+name = "target"
+origin = "target"
+kind = "module"
+cfg = []
+hidden = false

@@ -617,6 +617,10 @@ id = "crates.memcordon-cli.tests.sealed_agent_distribution"
 original_path = "crates/memcordon-cli/tests/sealed_agent_distribution.rs"
 
 [[identity]]
+id = "crates.memcordon-cli.tests.stable_api"
+original_path = "crates/memcordon-cli/tests/stable_api.rs"
+
+[[identity]]
 id = "crates.memcordon-cli.tests.stress"
 original_path = "crates/memcordon-cli/tests/stress.rs"
 
@@ -785,6 +789,10 @@ id = "crates.memcordon-core.tests.runtime_evidence_vectors"
 original_path = "crates/memcordon-core/tests/runtime_evidence_vectors.rs"
 
 [[identity]]
+id = "crates.memcordon-core.tests.stable_api"
+original_path = "crates/memcordon-core/tests/stable_api.rs"
+
+[[identity]]
 id = "crates.memcordon-core.tests.windows_package_cleanup"
 original_path = "crates/memcordon-core/tests/windows_package_cleanup.rs"
 
@@ -929,8 +937,20 @@ id = "crates.memcordon-platform.tests.sealed_exec"
 original_path = "crates/memcordon-platform/tests/sealed_exec.rs"
 
 [[identity]]
+id = "crates.memcordon-platform.tests.stable_api"
+original_path = "crates/memcordon-platform/tests/stable_api.rs"
+
+[[identity]]
 id = "crates.memcordon-platform.tests.supervisor"
 original_path = "crates/memcordon-platform/tests/supervisor.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.tests.support.macos_ancillary_custody"
+original_path = "crates/memcordon-platform/tests/support/macos_ancillary_custody.rs"
+
+[[identity]]
+id = "crates.memcordon-platform.tests.support.macos_observation_poll"
+original_path = "crates/memcordon-platform/tests/support/macos_observation_poll.rs"
 
 [[identity]]
 id = "crates.memcordon-platform.tests.test_support"
@@ -1253,6 +1273,10 @@ id = "tools.ci-windows-compiler"
 original_path = "tools/ci-windows-compiler.rs"
 
 [[identity]]
+id = "tools.memcordon-ci.src.api_surface"
+original_path = "tools/memcordon-ci/src/api_surface.rs"
+
+[[identity]]
 id = "tools.memcordon-ci.src.bin.memcordon-native-input-digest"
 original_path = "tools/memcordon-ci/src/bin/memcordon-native-input-digest.rs"
 
@@ -1459,6 +1483,10 @@ original_path = "tools/memcordon-ci/src/windows_qualification_artifacts.rs"
 [[identity]]
 id = "tools.memcordon-ci.src.workload_qualification"
 original_path = "tools/memcordon-ci/src/workload_qualification.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.api_surface"
+original_path = "tools/memcordon-ci/tests/api_surface.rs"
 
 [[identity]]
 id = "tools.memcordon-ci.tests.bootstrap_profile"
@@ -1791,3 +1819,7 @@ reason = "PROV-01: empty compatibility adapter retired after production, helper,
 [[retired]]
 id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.state"
 reason = "PROV-02: unused abstract state model removed; production Linux fault and Windows record transitions remain authoritative."
+
+[[retired]]
+id = "tools.memcordon-ci.src.runtime_manifest"
+reason = "CI-08: redundant core runtime manifest reexport removed; release consumers use core directly and the unchanged fuzz roundtrip property remains in its harness."

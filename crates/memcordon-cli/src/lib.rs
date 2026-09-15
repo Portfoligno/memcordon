@@ -25,7 +25,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[doc(hidden)]
 pub mod exit_mapping;
+#[doc(hidden)]
 pub mod invocation;
 
 pub use memcordon_core::{

@@ -3098,6 +3098,30 @@ work_packages = [
 decision = "Keep the regression only with a registry entry naming the unique invariant, owning Cargo target, exact suite, applicable runners, and skip policy; merge overlapping cases after equivalence is proven."
 
 [[source]]
+id = "crates.memcordon-cli.tests.stable_api"
+path = "crates/memcordon-cli/tests/stable_api.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Downstream facade consumer; building a request never executes its command."]
+consumers = ["cargo:memcordon:test:stable_api:features=[]"]
+routes = ["cargo:memcordon:test:stable_api:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:stable_facade_builders_and_result_types_remain_source_compatible#1:private",
+    "use:memcordon :: { ByteSize , CommandSpec , Error , Limiter , MemcordonExecutable , Policy , RunOutcome , SupervisionExecution , Supervisor , }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+    "CI-08",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "crates.memcordon-cli.tests.stress"
 path = "crates/memcordon-cli/tests/stress.rs"
 owner = "tests"
@@ -3735,6 +3759,30 @@ skip_policy = "forbidden"
 evidence = "behavior"
 
 [[source]]
+id = "crates.memcordon-core.tests.stable_api"
+path = "crates/memcordon-core/tests/stable_api.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Downstream consumer crate: only stable root exports are imported."]
+consumers = ["cargo:memcordon-core:test:stable_api:features=[]"]
+routes = ["cargo:memcordon-core:test:stable_api:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:root_policy_and_typed_arguments_remain_source_compatible#1:private",
+    "use:memcordon_core :: { BoundaryRequirement , ByteSize , CommandSpec , DeadlineScope , Policy }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+    "CI-08",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "crates.memcordon-core.tests.windows_package_cleanup"
 path = "crates/memcordon-core/tests/windows_package_cleanup.rs"
 owner = "tests"
@@ -4114,11 +4162,13 @@ cfg = [
     "struct:WindowsTestToken#1:cfg(windows)",
     'use:crate :: macos_deadline :: retirement_mutation_probe as macos_retirement_mutation_probe#1:cfg(target_os = "macos")',
     'use:crate :: macos_deadline :: { deadline_add_fixture as macos_deadline_add_fixture , retirement_remaining_fixture as macos_retirement_remaining_fixture , timebase_conversion_fixture as macos_timebase_conversion_fixture , }#1:cfg(target_os = "macos")',
+    'use:crate :: macos_envelope :: ancillary_custody_fixture as macos_envelope_ancillary_custody_fixture#1:cfg(target_os = "macos")',
     'use:crate :: macos_envelope :: receive_manifest_fixture as macos_envelope_receive_manifest_fixture#1:cfg(target_os = "macos")',
     'use:crate :: macos_envelope :: transfer_fixture as macos_envelope_transfer_fixture#1:cfg(target_os = "macos")',
     'use:crate :: macos_launch :: clock_jump as macos_clock_jump#1:cfg(target_os = "macos")',
     'use:crate :: macos_launch :: control_flood as macos_control_flood#1:cfg(target_os = "macos")',
     'use:crate :: macos_launch :: expired_control_request_preserves_retirement as macos_expired_control_request_preserves_retirement#1:cfg(target_os = "macos")',
+    'use:crate :: macos_launch :: observation_poll_fixture as macos_observation_poll_fixture#1:cfg(target_os = "macos")',
     'use:crate :: macos_launch :: partial_control_frame_invalidates_retirement as macos_partial_control_frame_invalidates_retirement#1:cfg(target_os = "macos")',
     'use:crate :: macos_launch :: protocol_expectation_fixture as macos_protocol_expectation_fixture#1:cfg(target_os = "macos")',
     'use:crate :: macos_launch :: repeated_stop as macos_repeated_stop#1:cfg(target_os = "macos")',
@@ -4266,11 +4316,13 @@ item_visibility = [
     "struct:WindowsTestToken#1:private",
     "use:crate :: macos_deadline :: retirement_mutation_probe as macos_retirement_mutation_probe#1:pub",
     "use:crate :: macos_deadline :: { deadline_add_fixture as macos_deadline_add_fixture , retirement_remaining_fixture as macos_retirement_remaining_fixture , timebase_conversion_fixture as macos_timebase_conversion_fixture , }#1:pub",
+    "use:crate :: macos_envelope :: ancillary_custody_fixture as macos_envelope_ancillary_custody_fixture#1:pub",
     "use:crate :: macos_envelope :: receive_manifest_fixture as macos_envelope_receive_manifest_fixture#1:pub",
     "use:crate :: macos_envelope :: transfer_fixture as macos_envelope_transfer_fixture#1:pub",
     "use:crate :: macos_launch :: clock_jump as macos_clock_jump#1:pub",
     "use:crate :: macos_launch :: control_flood as macos_control_flood#1:pub",
     "use:crate :: macos_launch :: expired_control_request_preserves_retirement as macos_expired_control_request_preserves_retirement#1:pub",
+    "use:crate :: macos_launch :: observation_poll_fixture as macos_observation_poll_fixture#1:pub",
     "use:crate :: macos_launch :: partial_control_frame_invalidates_retirement as macos_partial_control_frame_invalidates_retirement#1:pub",
     "use:crate :: macos_launch :: protocol_expectation_fixture as macos_protocol_expectation_fixture#1:pub",
     "use:crate :: macos_launch :: repeated_stop as macos_repeated_stop#1:pub",
@@ -4415,6 +4467,7 @@ routes = ["cargo:memcordon-platform:test:macos_envelope_vectors:features=[]"]
 cfg = [':cfg(all (target_os = "macos" , feature = "test-support"))']
 item_visibility = [
     "const:WIRE#1:private",
+    "fn:ancillary_bounds_preserve_sentinel_and_reclaim_received_rights#1:private",
     "fn:native_envelope_rejects_binding_count_and_destination_ambiguity#1:private",
     "fn:native_envelope_rejects_excess_descriptor_rights_at_the_wire_boundary#1/const:VERSION_ONE_DESTINATIONS#1:private",
     "fn:native_envelope_rejects_excess_descriptor_rights_at_the_wire_boundary#1:private",
@@ -4485,7 +4538,10 @@ consumers = ["cargo:memcordon-platform:test:macos_protocol_vectors:features=[]"]
 routes = ["cargo:memcordon-platform:test:macos_protocol_vectors:features=[]"]
 cfg = [':cfg(all (target_os = "macos" , feature = "test-support"))']
 item_visibility = [
+    "fn:delayed_observation_retains_request_and_routes_late_reply#1:private",
     "fn:every_reviewed_message_preserves_exact_version_two_wire_bytes#1:private",
+    "fn:pending_observation_does_not_hide_disconnect_or_binding_failure#1:private",
+    "fn:retirement_uses_existing_absolute_budget_and_keeps_expired_custody#1:private",
     "fn:strict_message_keys_preserve_optional_omission_and_reject_duplicate_typed_fields#1:private",
     "fn:transcript_sequence_binding_and_failure_shapes_are_preserved#1:private",
     "fn:vectors#1:private",
@@ -4545,6 +4601,31 @@ work_packages = [
 decision = "Keep the regression only with a registry entry naming the unique invariant, owning Cargo target, exact suite, applicable runners, and skip policy; merge overlapping cases after equivalence is proven."
 
 [[source]]
+id = "crates.memcordon-platform.tests.stable_api"
+path = "crates/memcordon-platform/tests/stable_api.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Downstream consumer crate: compile public backend signatures without launching work."]
+consumers = ["cargo:memcordon-platform:test:stable_api:features=[]"]
+routes = ["cargo:memcordon-platform:test:stable_api:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:stable_backend_entrypoints_keep_their_public_types#1:private",
+    "use:memcordon_core :: { BackendCapabilityReport , BoundaryRequirement , Error , SupervisionExecution }#1:private",
+    "use:memcordon_platform :: { BackendInfo , ProbeReport , SupervisorRequest }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+    "CI-08",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "crates.memcordon-platform.tests.supervisor"
 path = "crates/memcordon-platform/tests/supervisor.rs"
 owner = "tests"
@@ -4590,6 +4671,58 @@ work_packages = [
     "TEST-02",
 ]
 decision = "Keep the regression only with a registry entry naming the unique invariant, owning Cargo target, exact suite, applicable runners, and skip policy; merge overlapping cases after equivalence is proven."
+
+[[source]]
+id = "crates.memcordon-platform.tests.support.macos_ancillary_custody"
+path = "crates/memcordon-platform/tests/support/macos_ancillary_custody.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Feature-gated characterization of the production ancillary ownership parser."]
+consumers = ['path-module:crates/memcordon-platform/src/macos_envelope.rs:custody_fixture:private:["cfg(feature = \"test-support\")"]']
+routes = ['path-module:crates/memcordon-platform/src/macos_envelope.rs:custody_fixture:private:["cfg(feature = \"test-support\")"]']
+cfg = []
+item_visibility = [
+    "fn:ancillary_custody_fixture#1:pub",
+    "fn:identity#1:private",
+    "fn:released#1:private",
+    "use:std :: os :: fd :: IntoRawFd#1:private",
+    "use:super :: *#1:private",
+]
+platforms = [
+    "macos-x64",
+    "macos-arm64",
+]
+work_packages = [
+    "GOV-01",
+    "MAC-06",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "crates.memcordon-platform.tests.support.macos_observation_poll"
+path = "crates/memcordon-platform/tests/support/macos_observation_poll.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["macos_observation_poll retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ['path-module:crates/memcordon-platform/src/macos_launch.rs:observation_poll:private:["cfg(feature = \"test-support\")"]']
+routes = ['path-module:crates/memcordon-platform/src/macos_launch.rs:observation_poll:private:["cfg(feature = \"test-support\")"]']
+cfg = []
+item_visibility = [
+    "fn:observation_poll_fixture#1:pub",
+    "fn:retirement_poll_fixture#1:private",
+    "use:super :: *#1:private",
+]
+platforms = [
+    "macos-x64",
+    "macos-arm64",
+]
+work_packages = ["GOV-01"]
+decision = "Maintain explicit ownership and validate source inventory changes."
 
 [[source]]
 id = "crates.memcordon-platform.tests.test_support"
@@ -4973,6 +5106,35 @@ work_packages = [
 decision = "Register the exact protected invariant and execution route; retain or split according to the owning subsystem, with zero-skip and platform evidence."
 
 [[source]]
+id = "tools.memcordon-ci.tests.api_surface"
+path = "tools/memcordon-ci/tests/api_surface.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["api_surface retains the behavior and failure assertions reviewed in its source-boundary decision."]
+consumers = ["cargo:memcordon-ci:test:api_surface:features=[]"]
+routes = ["cargo:memcordon-ci:test:api_surface:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:checked_in_catalog_matches_all_cargo_library_roots_and_consumer_crates#1:private",
+    "fn:duplicate_exports_and_unknown_tiers_fail_closed#1:private",
+    "fn:local_glob_sources_are_bound_even_when_root_use_is_unchanged#1:private",
+    "fn:root_aliases_cfg_and_hidden_boundaries_are_distinct#1:private",
+    "fn:surface#1:private",
+    "fn:tier_changes_cannot_expose_tooling_or_ungated_tests_in_published_libraries#1:private",
+    "use:memcordon_ci :: api_surface :: { Export , Surface , Tier , inspect_root , inspect_source , validate_surface , }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-04",
+    "CI-08",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "tools.memcordon-ci.tests.bootstrap_profile"
 path = "tools/memcordon-ci/tests/bootstrap_profile.rs"
 owner = "tests"
@@ -4984,6 +5146,7 @@ consumers = ["cargo:memcordon-ci:test:bootstrap_profile:features=[]"]
 routes = ["cargo:memcordon-ci:test:bootstrap_profile:features=[]"]
 cfg = []
 item_visibility = [
+    "fn:native_seed_debug_sidecar_is_generated_without_hiding_unrelated_inputs#1:private",
     "fn:optimized_bootstrap_profile_retains_runtime_checks_and_cache_identity#1:private",
     "use:memcordon_ci :: build_context :: BuildInputSnapshot#1:private",
     "use:std :: fs#1:private",

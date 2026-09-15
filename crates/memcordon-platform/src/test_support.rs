@@ -1,5 +1,7 @@
 //! Native containment used only by black-box process tests.
 #[cfg(target_os = "macos")]
+pub use crate::macos_launch::observation_poll_fixture as macos_observation_poll_fixture;
+#[cfg(target_os = "macos")]
 pub use crate::macos_launch::protocol_expectation_fixture as macos_protocol_expectation_fixture;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::{
@@ -91,6 +93,8 @@ pub use crate::macos_launch::{
     nonempty_inventory_query_transition as macos_nonempty_inventory_query_transition,
 };
 
+#[cfg(target_os = "macos")]
+pub use crate::macos_envelope::ancillary_custody_fixture as macos_envelope_ancillary_custody_fixture;
 #[cfg(target_os = "macos")]
 pub use crate::macos_envelope::receive_manifest_fixture as macos_envelope_receive_manifest_fixture;
 #[cfg(target_os = "macos")]

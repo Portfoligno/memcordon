@@ -25,11 +25,13 @@ use memcordon_ci::release_archive::{
     validate_memcordon_crate_distribution as validate_reviewed_memcordon_distribution,
 };
 use memcordon_ci::release_evidence::{CertificationRecord, collect_certification};
-use memcordon_ci::runtime_manifest::{RuntimeComponentRecord, RuntimeManifestV2, SealedRuntimeV2};
 #[cfg(target_os = "linux")]
 use memcordon_ci::sealed_identity::frontend_identity;
 #[cfg(any(target_os = "linux", test))]
 use memcordon_ci::sealed_identity::{FrontendIdentity, setpriv_sudo_arguments};
+use memcordon_core::runtime_manifest::{
+    RuntimeComponentRecord, RuntimeManifestV2, SealedRuntimeV2,
+};
 use memcordon_testkit::ObservedOutput;
 
 use crate::command::{CommandSpec, git, rustup_cargo};

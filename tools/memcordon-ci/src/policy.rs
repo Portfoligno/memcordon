@@ -3600,6 +3600,7 @@ pub fn workspace_metadata(root: &Path) -> Result<cargo_metadata::Metadata> {
 
 fn check_manifests(root: &Path, policy: &config::Policy) -> Result<()> {
     let metadata = workspace_metadata(root)?;
+    crate::api_surface::validate(root, &metadata)?;
     let release = config::release(root)?;
     if release.publish_packages != policy.workspace.publish_packages {
         return Err(failure(

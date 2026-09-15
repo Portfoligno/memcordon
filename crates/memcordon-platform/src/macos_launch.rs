@@ -96,6 +96,9 @@ impl Child {
         self.pid as u32
     }
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.try_wait_until(Instant::now() + Duration::from_millis(100))
+    }
+    fn try_wait_until(&mut self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         if self.status.is_some() {
             return Ok(self.status);
         }
@@ -103,7 +106,6 @@ impl Child {
             let mut channel = remote
                 .lock()
                 .map_err(|_| io::Error::other("guardian channel poisoned"))?;
-            let deadline = Instant::now() + Duration::from_millis(100);
             channel.send(Message::Reap, deadline)?;
             return match channel.receive(deadline)? {
                 Some(Message::Status { raw, reaped: true }) => {
@@ -130,6 +132,9 @@ impl Child {
         Ok(self.status)
     }
     pub(crate) fn observe(&self) -> io::Result<Option<ExitStatus>> {
+        self.observe_until(Instant::now() + Duration::from_millis(100))
+    }
+    pub(crate) fn observe_until(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         if self.status.is_some() {
             return Ok(self.status);
         }
@@ -137,12 +142,9 @@ impl Child {
             let mut channel = remote
                 .lock()
                 .map_err(|_| io::Error::other("guardian channel poisoned"))?;
-            let deadline = Instant::now() + Duration::from_millis(100);
-            channel.send(Message::Observe, deadline)?;
-            return match channel.receive(deadline)? {
-                Some(Message::Status { raw, .. }) => Ok(raw.map(ExitStatus::from_raw)),
-                _ => Err(io::Error::other("guardian target observation unavailable")),
-            };
+            return channel
+                .observe(deadline)
+                .map(|raw| raw.map(ExitStatus::from_raw));
         }
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
         // SAFETY: WNOWAIT pins the child's identity until workload signalling ends.
@@ -193,7 +195,7 @@ impl Child {
     }
     pub(crate) fn retire(&mut self, deadline: Instant) -> io::Result<()> {
         loop {
-            if self.try_wait()?.is_some() {
+            if self.status.is_some() {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -201,6 +203,9 @@ impl Child {
                     io::ErrorKind::TimedOut,
                     "child remains an owned reaping obligation",
                 ));
+            }
+            if self.try_wait_until(deadline)?.is_some() {
+                return Ok(());
             }
             std::thread::sleep(
                 Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
@@ -346,7 +351,14 @@ struct Channel {
     received: u64,
     input: Vec<u8>,
     inventory_query: Option<u64>,
+    observation_pending: bool,
+    observation_result: Option<Option<i32>>,
     force_receipt: Arc<std::sync::atomic::AtomicU64>,
+}
+
+enum ControlReceive {
+    Message(Option<Message>),
+    PollExpired,
 }
 
 fn private_pair() -> io::Result<(UnixStream, UnixStream)> {
@@ -469,6 +481,8 @@ impl Channel {
             received: 0,
             input: Vec::new(),
             inventory_query: None,
+            observation_pending: false,
+            observation_result: None,
             force_receipt: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -595,13 +609,47 @@ impl Channel {
         Ok(())
     }
     fn receive(&mut self, deadline: Instant) -> io::Result<Option<Message>> {
+        match self.receive_for(deadline, false)? {
+            ControlReceive::Message(message) => Ok(message),
+            ControlReceive::PollExpired => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "private protocol deadline expired",
+            )),
+        }
+    }
+    fn observe(&mut self, deadline: Instant) -> io::Result<Option<i32>> {
+        if let Some(result) = self.observation_result.take() {
+            return Ok(result);
+        }
+        self.request_observation(deadline)?;
+        match self.receive_for(deadline, true)? {
+            ControlReceive::Message(Some(Message::Status { raw, .. })) => Ok(raw),
+            // Expiration of this polling turn is not an execution deadline. Keep
+            // the request in flight so a later caller cannot misattribute its reply.
+            ControlReceive::PollExpired => Ok(None),
+            _ => Err(io::Error::other("guardian target observation unavailable")),
+        }
+    }
+    fn request_observation(&mut self, deadline: Instant) -> io::Result<()> {
+        if !self.observation_pending {
+            self.send(Message::Observe, deadline)?;
+            self.observation_pending = true;
+        }
+        Ok(())
+    }
+    fn receive_for(&mut self, deadline: Instant, observing: bool) -> io::Result<ControlReceive> {
         loop {
             if let Some(admission) = &self.admission {
-                if let Err(error) = admission.check() {
-                    return Err(error);
-                }
+                admission.check()?;
             }
             match self.receive_available()? {
+                Some(Some(message @ Message::Status { raw, .. })) if self.observation_pending => {
+                    self.observation_pending = false;
+                    if observing {
+                        return Ok(ControlReceive::Message(Some(message)));
+                    }
+                    self.observation_result = Some(raw);
+                }
                 Some(Some(Message::ForceRequested { at })) => {
                     self.force_receipt
                         .compare_exchange(0, at, Ordering::AcqRel, Ordering::Acquire)
@@ -618,14 +666,11 @@ impl Channel {
                     }
                     continue;
                 }
-                Some(message) => return Ok(message),
+                Some(message) => return Ok(ControlReceive::Message(message)),
                 None => {}
             }
             if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "private protocol deadline expired",
-                ));
+                return Ok(ControlReceive::PollExpired);
             }
             let mut poll = libc::pollfd {
                 fd: self.stream.as_raw_fd(),
@@ -803,6 +848,12 @@ impl Message {
         }
     }
 }
+
+#[cfg(feature = "test-support")]
+#[path = "../tests/support/macos_observation_poll.rs"]
+mod observation_poll;
+#[cfg(feature = "test-support")]
+pub use observation_poll::observation_poll_fixture;
 
 #[cfg(feature = "test-support")]
 pub fn protocol_expectation_fixture(case: u8) -> io::Result<()> {
