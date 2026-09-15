@@ -1558,7 +1558,8 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
     fs::create_dir_all(&durable_sources)?;
     let version = env!("CARGO_PKG_VERSION");
     let packages = WINDOWS_PACKAGE_NAMES.map(str::to_owned);
-    let archives = create_package_archives(root, stable, &packages)?;
+    let target_root = channel.join("build");
+    let archives = create_package_archives(root, stable, &packages, Some(&target_root))?;
     let durable_layout = WindowsPackageSourceLayout::new(durable_sources);
     let execution_sources = ExternalWindowsPackageSources::new(root)?;
     for layout in [&durable_layout, execution_sources.layout()] {
@@ -1570,7 +1571,6 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
         }
     }
     execution_sources.layout().write_cargo_configuration()?;
-    let target_root = channel.join("build");
     memcordon_ci::build_context::run_isolated_cargo(
         execution_sources.layout().root(),
         stable,

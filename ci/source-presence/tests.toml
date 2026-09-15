@@ -7528,6 +7528,7 @@ item_visibility = [
     "fn:macos_deadline_rejects_missing_native_fingerprint_and_failure_evidence#1:private",
     "fn:miri_output_cache_cannot_overwrite_the_independently_enrolled_sysroot#1:private",
     "fn:named_github_environments_are_rejected#1:private",
+    "fn:package_channel_rejects_ambient_cargo_target_override#1:private",
     "fn:public_windows_release_smoke_is_structurally_required#1:private",
     "fn:release_preflight_binds_provisioning_and_cache_to_toolchain_config#1:private",
     "fn:repository_root#1:private",

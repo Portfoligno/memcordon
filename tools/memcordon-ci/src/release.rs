@@ -724,7 +724,8 @@ pub fn validate_packages(root: &Path) -> Result<()> {
     let release = config::release(root)?;
     let default_cargo_binaries = configured_default_cargo_binaries(&release)?;
     let toolchains = config::toolchains(root)?;
-    let archives = create_package_archives(root, &toolchains.stable, &release.publish_packages)?;
+    let archives =
+        create_package_archives(root, &toolchains.stable, &release.publish_packages, None)?;
     for package in &release.publish_packages {
         let record = package_crate(
             root,
@@ -1155,9 +1156,9 @@ pub(crate) fn create_package_archives(
     root: &Path,
     stable: &str,
     packages: &[String],
+    target: Option<&Path>,
 ) -> Result<PathBuf> {
-    let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
-    let output = crate::command::PackageOutput::new(root, target.as_deref())?;
+    let output = crate::command::PackageOutput::new(root, target)?;
     output.command(root, stable, packages).run()?;
     Ok(output.archive_directory())
 }
@@ -2861,7 +2862,8 @@ fn assemble(root: &Path) -> Result<()> {
         checksums.push('\n');
     }
     fs::write(output.join(&release.assets.checksums), checksums)?;
-    let archives = create_package_archives(root, &toolchains.stable, &release.publish_packages)?;
+    let archives =
+        create_package_archives(root, &toolchains.stable, &release.publish_packages, None)?;
     let mut crates = Vec::new();
     for package in &release.publish_packages {
         crates.push(package_crate(

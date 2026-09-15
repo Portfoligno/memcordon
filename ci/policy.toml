@@ -76,12 +76,6 @@ allowed_run_commands = [
 ]
 
 [[workflow.environment_allowlist]]
-file = ".github/workflows/backend-certification.yml"
-variable = "CARGO_TARGET_DIR"
-source = "target/ci/windows-sealed-cargo/build"
-steps = ["Certify packaged Cargo channel"]
-
-[[workflow.environment_allowlist]]
 file = ".github/workflows/ci.yml"
 variable = "GITHUB_TOKEN"
 source = "${{ github.token }}"
@@ -98,12 +92,6 @@ file = ".github/workflows/deep-ci.yml"
 variable = "GITHUB_TOKEN"
 source = "${{ github.token }}"
 steps = ["Collect and verify source execution"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_TARGET_DIR"
-source = "target/ci/windows-sealed-cargo/build"
-steps = ["Certify packaged Cargo channel"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"

@@ -25,6 +25,7 @@ fn package_producer_and_consumer_share_explicit_target_under_closed_environment(
     for target in [
         None,
         Some(Path::new("target/channel output")),
+        Some(Path::new("target/ci/windows-sealed-cargo/build")),
         Some(absolute.as_path()),
     ] {
         let output = PackageOutput::new(&root, target).unwrap();

@@ -8,6 +8,50 @@ fn repository_root() -> PathBuf {
 }
 
 #[test]
+fn package_channel_rejects_ambient_cargo_target_override() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).unwrap();
+    for (path, fixture) in [
+        (
+            ".github/workflows/backend-certification.yml",
+            include_str!("../../../.github/workflows/backend-certification.yml"),
+        ),
+        (
+            ".github/workflows/release.yml",
+            include_str!("../../../.github/workflows/release.yml"),
+        ),
+    ] {
+        policy::validate_workflow_bytes(
+            &root,
+            Path::new(path),
+            fixture.as_bytes(),
+            &repository_policy,
+        )
+        .unwrap();
+        let mut document: Value = serde_yaml::from_str(fixture).unwrap();
+        let steps = document["jobs"]["windows-package-channel"]["steps"]
+            .as_sequence_mut()
+            .unwrap();
+        let step = steps
+            .iter_mut()
+            .find(|step| step["name"].as_str() == Some("Certify packaged Cargo channel"))
+            .unwrap();
+        assert!(step.get("env").is_none());
+        step["env"] =
+            serde_yaml::from_str("CARGO_TARGET_DIR: target/ci/windows-sealed-cargo/build\n")
+                .unwrap();
+        let error = policy::validate_workflow_bytes(
+            &root,
+            Path::new(path),
+            serde_yaml::to_string(&document).unwrap().as_bytes(),
+            &repository_policy,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("CARGO_TARGET_DIR"), "{error}");
+    }
+}
+
+#[test]
 fn miri_output_cache_cannot_overwrite_the_independently_enrolled_sysroot() {
     let root = repository_root();
     let repository_policy = config::policy(&root).unwrap();
