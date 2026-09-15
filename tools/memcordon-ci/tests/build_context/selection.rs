@@ -184,6 +184,50 @@ fn omitted_selector_is_rejected_before_the_discovery_command_runs() {
 }
 
 #[test]
+fn windows_discovery_rejects_omitted_or_changed_vswhere_before_execution() {
+    let (_temporary, mut selected) = fixture();
+    let program_files = selected.input_roots[0].clone();
+    let query = program_files.join("Microsoft Visual Studio/Installer/vswhere.exe");
+    std::fs::create_dir_all(query.parent().unwrap()).unwrap();
+    std::fs::write(&query, b"non-executable selector fixture\n").unwrap();
+    selected.inputs = selected.measure_inputs().unwrap();
+    selected.require_recorded_selector(&query).unwrap();
+    let mut omitted = copy(&selected);
+    omitted.input_roots.remove(0);
+    omitted.inputs = omitted.measure_inputs().unwrap();
+    require_same_inputs(&omitted.measure_inputs().unwrap(), &omitted.inputs).unwrap();
+    for (changed, recorded) in [(false, &omitted), (true, &selected)] {
+        if changed {
+            std::fs::write(&query, b"changed selector fixture\n").unwrap();
+        }
+        let mut env = BTreeMap::from([(
+            "ProgramFiles(x86)".into(),
+            program_files.as_os_str().to_owned(),
+        )]);
+        let original = env.clone();
+        let error = super::enroll_windows_compiler(
+            &selected.root,
+            &mut env,
+            &BTreeMap::new(),
+            super::environment::msvc::Architecture::Arm64,
+            Some(recorded),
+        )
+        .err()
+        .expect("unrecorded or changed discovery must fail before spawning");
+        assert!(
+            error
+                .to_string()
+                .contains("discovery selector is absent from or differs from recorded inputs"),
+            "must reject the measured selector before native spawning: {error}"
+        );
+        assert_eq!(
+            env, original,
+            "failed discovery must not partially configure compilation"
+        );
+    }
+}
+
+#[test]
 fn miri_sysroot_is_independently_selected_forwarded_and_never_repaired_by_audit() {
     let (_temporary, mut selected) = fixture();
     let expected = selected.root.join("target/ci/miri-sysroot");

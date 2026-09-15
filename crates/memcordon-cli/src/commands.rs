@@ -1,5 +1,9 @@
 mod application;
 #[cfg(target_os = "macos")]
+mod delivery_observation;
+#[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+pub(crate) use delivery_observation::initialize as initialize_delivery_observer;
+#[cfg(target_os = "macos")]
 mod result_delivery;
 pub(crate) use application::{clean, doctor, execute, plan};
 

@@ -3,6 +3,44 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/delivery_observation.rs"]
+mod delivery_observation;
+
+fn fill_observer(observer: &delivery_observation::Observer) {
+    let sender = std::os::unix::net::UnixDatagram::unbound().unwrap();
+    sender.set_nonblocking(true).unwrap();
+    sender
+        .connect(
+            observer
+                .as_ref()
+                .local_addr()
+                .unwrap()
+                .as_pathname()
+                .unwrap(),
+        )
+        .unwrap();
+    for queued in 0..1024 {
+        // Exhaust even the minimum datagram, not merely the capacity needed
+        // for a large record that could leave room for a smaller observation.
+        match sender.send(&[0_u8]) {
+            Ok(_) => {}
+            // Darwin reports ENOBUFS when the receiving datagram queue fills.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(libc::ENOBUFS) =>
+            {
+                assert!(
+                    queued > 0,
+                    "native queue must accept data before saturation"
+                );
+                return;
+            }
+            Err(error) => panic!("fill observer queue: {error}"),
+        }
+    }
+    panic!("observer queue did not reach the bounded pressure fixture");
+}
+
 fn bounded(mut command: Command) -> std::process::ExitStatus {
     let started = Instant::now();
     let (sender, receiver) = std::sync::mpsc::sync_channel(0);
@@ -60,6 +98,8 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
         let output = phase_directory.join("output.json");
         let marker = phase_directory.join("barrier.json");
         let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+        let observer = delivery_observation::Observer::new();
+        observer.prefix(&mut command);
         command
             .args(["__result-writer-fault", phase])
             .arg(&input)
@@ -75,6 +115,20 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
             &std::fs::read(marker).expect("actual native persistence barrier reached"),
         )
         .expect("typed barrier marker");
+        let observations = observer.collect().expect("bounded delivery observation");
+        assert_eq!(observations.len(), 1, "{phase}: {observations:?}");
+        let delivery = &observations[0];
+        assert_eq!(delivery["kind"], "delivery");
+        assert_eq!(delivery["delivered"], false);
+        assert_eq!(delivery["stage"], "writer-exit");
+        assert_eq!(delivery["reason"], "writer-exit-deadline");
+        assert_eq!(delivery["writer_pid"], marker.0);
+        assert_eq!(delivery["retirement"], "reaped");
+        assert_eq!(delivery["writer_signal"], libc::SIGKILL);
+        assert_eq!(
+            delivery["transferred_bytes"].as_u64().unwrap(),
+            delivery["payload_bytes"].as_u64().unwrap() + u64::try_from(size_of::<u64>()).unwrap()
+        );
         // A surviving or unreaped child retains its PID. The parent must reap
         // before the fixture completes; ESRCH corroborates that observation.
         assert_eq!(
@@ -97,6 +151,73 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
             assert!(!output.exists(), "pre-rename barrier committed report");
         }
     }
+}
+
+#[test]
+fn observed_execution_preserves_report_and_exit_with_a_full_diagnostic_receiver() {
+    for full in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let report = directory.path().join("report.json");
+        let observer = delivery_observation::Observer::new();
+        if full {
+            fill_observer(&observer);
+        }
+        let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+        observer.prefix(&mut command);
+        command
+            .args(["+0ms", "--report"])
+            .arg(&report)
+            .args(["--", "/usr/bin/true"]);
+        let started = Instant::now();
+        assert_eq!(bounded(command).code(), Some(123));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _: memcordon_core::MemcordonReport =
+            serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        if !full {
+            let records = observer.collect().unwrap();
+            assert_eq!(records.len(), 2, "{records:?}");
+            assert_eq!(records[0]["kind"], "execution");
+            assert_eq!(records[0]["wrapper_exit_code"], 123);
+            assert_eq!(records[1]["kind"], "delivery");
+            assert_eq!(records[1]["delivered"], true);
+            assert_eq!(records[1]["reason"], "writer-success");
+            assert_eq!(records[1]["retirement"], "reaped");
+        }
+    }
+}
+
+#[test]
+fn failed_report_delivery_preserves_the_pre_delivery_target_and_cleanup_observation() {
+    let directory = tempfile::tempdir().unwrap();
+    let report = directory.path().join("missing").join("report.json");
+    let observer = delivery_observation::Observer::new();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    observer.prefix(&mut command);
+    command
+        .args(["--enforcement", "watchdog", "+8GiB", "--report"])
+        .arg(&report)
+        .args([
+            "--",
+            env!("CARGO_BIN_EXE_memcordon-test-fixture"),
+            "exit",
+            "--code",
+            "37",
+        ]);
+    assert_eq!(bounded(command).code(), Some(125));
+    assert!(!report.exists());
+    let records = observer.collect().unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0]["kind"], "execution");
+    assert_eq!(records[0]["outcome"], "exited");
+    assert_eq!(records[0]["wrapper_exit_code"], 37);
+    assert_eq!(records[0]["direct_child_reaped"], true);
+    assert_eq!(records[0]["cleanup_errors"], 0);
+    assert_eq!(records[1]["kind"], "delivery");
+    assert_eq!(records[1]["delivered"], false);
+    assert_eq!(records[1]["stage"], "writer-exit");
+    assert_eq!(records[1]["reason"], "writer-failed");
+    assert_eq!(records[1]["writer_code"], 125);
+    assert_eq!(records[1]["retirement"], "reaped");
 }
 
 #[test]

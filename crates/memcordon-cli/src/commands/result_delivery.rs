@@ -76,16 +76,31 @@ fn deliver_inner(
     return_deadline: Option<u64>,
     #[cfg(feature = "test-fixtures")] barrier: Option<(memcordon_core::ReportWritePhase, Vec<u8>)>,
 ) -> bool {
+    let mut observation = super::delivery_observation::Delivery::new(return_deadline);
     if diagnostics.is_empty() && report.is_none() {
+        observation.stage = "empty";
+        observation.reason = "nothing-to-deliver";
+        observation.delivered = true;
         return true;
     }
-    let Ok(started) = now() else { return false };
+    let started = match now() {
+        Ok(value) => value,
+        Err(error) => {
+            observation.error(&error);
+            return false;
+        }
+    };
+    observation.started = Some(started);
     let Some(local_deadline) = started.checked_add(DELIVERY_NANOS) else {
+        observation.reason = "deadline-overflow";
         return false;
     };
     let deadline = return_deadline.map_or(local_deadline, |value| value.min(local_deadline));
     let write_deadline = deadline.saturating_sub(REAP_RESERVE_NANOS);
+    observation.return_deadline = Some(deadline);
+    observation.write_deadline = Some(write_deadline);
     if started >= write_deadline {
+        observation.reason = "deadline-before-start";
         return false;
     }
     let payload = Payload {
@@ -100,28 +115,37 @@ fn deliver_inner(
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
+        observation.stage = "owner-reservation";
+        observation.reason = "owner-already-reserved";
         return false;
     }
     // Native creation can stall. Its reserved owner retains late creation and
     // cancels it if the frontend has already stopped receiving. No write occurs
     // until the frontend transfers the complete, bounded payload.
     let (sender, receiver) = mpsc::sync_channel(0);
-    if std::thread::Builder::new()
+    observation.stage = "spawn-owner-thread";
+    if let Err(error) = std::thread::Builder::new()
         .name("result-spawn-owner".into())
         .spawn(move || {
-            let result = (|| -> io::Result<(Child, BoundedBytes)> {
+            let result = (|| -> Result<(Child, BoundedBytes), (&'static str, io::Error)> {
                 let mut bytes = BoundedBytes(Vec::new());
-                serde_json::to_writer(&mut bytes, &payload)?;
-                if now()? >= write_deadline {
-                    return Err(io::Error::other("result preparation deadline"));
+                serde_json::to_writer(&mut bytes, &payload)
+                    .map_err(|error| ("serialize", io::Error::from(error)))?;
+                if now().map_err(|error| ("creation-clock", error))? >= write_deadline {
+                    return Err((
+                        "preparation-deadline",
+                        io::Error::other("result preparation deadline"),
+                    ));
                 }
-                let executable = std::env::current_exe()?;
+                let executable =
+                    std::env::current_exe().map_err(|error| ("current-executable", error))?;
                 let child = Command::new(executable)
                     .arg("__result-writer-v1")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::null())
                     .stderr(Stdio::inherit())
-                    .spawn()?;
+                    .spawn()
+                    .map_err(|error| ("writer-spawn", error))?;
                 Ok((child, bytes))
             })();
             if let Err(mpsc::SendError(result)) = sender.send(result) {
@@ -132,26 +156,45 @@ fn deliver_inner(
                 OWNER_RESERVED.store(false, Ordering::Release);
             }
         })
-        .is_err()
     {
+        observation.error(&error);
         OWNER_RESERVED.store(false, Ordering::Release);
         return false;
     }
+    observation.stage = "owner-handoff";
     let (mut child, bytes) = loop {
-        if now().unwrap_or(write_deadline) >= write_deadline {
+        let tick = match now() {
+            Ok(value) => value,
+            Err(error) => {
+                observation.error(&error);
+                return false;
+            }
+        };
+        if tick >= write_deadline {
+            // The owner may be serializing or creating the writer. No specific
+            // creation failure is inferred without receiving its result.
+            observation.reason = "deadline-awaiting-owner";
             return false;
         }
         match receiver.recv_timeout(Duration::from_millis(2)) {
             Ok(Ok(value)) => break value,
-            Ok(Err(_)) => {
+            Ok(Err((stage, error))) => {
+                observation.stage = stage;
+                observation.error(&error);
                 OWNER_RESERVED.store(false, Ordering::Release);
                 return false;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                observation.reason = "owner-disconnected";
+                return false;
+            }
         }
     };
+    observation.writer_pid = Some(child.id());
+    observation.payload_bytes = Some(bytes.0.len());
     let delivered = (|| -> io::Result<bool> {
+        observation.stage = "writer-pipe";
         let mut input = child
             .stdin
             .take()
@@ -165,14 +208,25 @@ fn deliver_inner(
         let length = u64::try_from(bytes.0.len())
             .map_err(io::Error::other)?
             .to_le_bytes();
-        for mut pending in [length.as_slice(), bytes.0.as_slice()] {
+        for (stage, mut pending) in [
+            ("write-length", length.as_slice()),
+            ("write-payload", bytes.0.as_slice()),
+        ] {
+            observation.stage = stage;
             while !pending.is_empty() {
                 if now()? >= write_deadline {
+                    observation.reason = "write-deadline";
                     return Ok(false);
                 }
                 match input.write(pending) {
-                    Ok(0) => return Ok(false),
-                    Ok(count) => pending = &pending[count..],
+                    Ok(0) => {
+                        observation.reason = "write-zero";
+                        return Ok(false);
+                    }
+                    Ok(count) => {
+                        observation.transferred_bytes += count;
+                        pending = &pending[count..];
+                    }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));
@@ -182,30 +236,56 @@ fn deliver_inner(
             }
         }
         drop(input);
+        observation.stage = "writer-exit";
         loop {
             if now()? >= write_deadline {
+                observation.reason = "writer-exit-deadline";
                 return Ok(false);
             }
             if let Some(status) = child.try_wait()? {
+                observation.status(status);
+                observation.reason = if status.success() {
+                    "writer-success"
+                } else {
+                    "writer-failed"
+                };
                 return Ok(status.success());
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-    })()
-    .unwrap_or(false);
+    })();
+    let delivered = match delivered {
+        Ok(value) => value,
+        Err(error) => {
+            observation.error(&error);
+            false
+        }
+    };
     if delivered {
+        observation.delivered = true;
         OWNER_RESERVED.store(false, Ordering::Release);
         return true;
     }
-    retire_writer(child, deadline);
+    retire_writer(child, deadline, &mut observation);
     false
 }
 
-fn retire_writer(mut child: Child, deadline: u64) {
-    let _ = child.kill();
+fn retire_writer(
+    mut child: Child,
+    deadline: u64,
+    observation: &mut super::delivery_observation::Delivery,
+) {
+    if let Err(error) = child.kill() {
+        observation.retirement_os_error = error.raw_os_error();
+    }
     while now().is_ok_and(|value| value < deadline) {
         match child.try_wait() {
-            Ok(Some(_)) => {
+            Ok(Some(status)) => {
+                // Preserve an already observed writer failure before recording
+                // forced termination used only for retirement.
+                if observation.retirement != "reaped" {
+                    observation.status(status);
+                }
                 OWNER_RESERVED.store(false, Ordering::Release);
                 return;
             }
@@ -216,13 +296,18 @@ fn retire_writer(mut child: Child, deadline: u64) {
     // No success or cleanup assertion is made for this unresolved I/O owner.
     // In a library host the bounded slot stays reserved until its reap completes;
     // CLI process exit is not claimed to preserve this in-process reaper.
-    let _ = std::thread::Builder::new()
+    observation.retirement = "reaper-pending";
+    if let Err(error) = std::thread::Builder::new()
         .name("result-reap-owner".into())
         .spawn(move || {
             if child.wait().is_ok() {
                 OWNER_RESERVED.store(false, Ordering::Release);
             }
-        });
+        })
+    {
+        observation.retirement = "reaper-spawn-failed";
+        observation.retirement_os_error = error.raw_os_error();
+    }
 }
 
 pub(super) fn writer() -> i32 {

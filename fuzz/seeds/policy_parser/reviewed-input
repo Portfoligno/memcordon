@@ -22,6 +22,7 @@ required_public_matrix = [
 ]
 self_extracting_shell_allowlist = []
 allowed_run_commands = [
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin source collect --workflow .github/workflows/ci.yml --output target/ci/reports/source-coverage/ci.json",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin",
   "rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe",
   "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin",
@@ -71,6 +72,12 @@ allowed_run_commands = [
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public",
 ]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/ci.yml"
+variable = "GITHUB_TOKEN"
+source = "${{ github.token }}"
+steps = ["Collect and verify source execution"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/backend-certification.yml"

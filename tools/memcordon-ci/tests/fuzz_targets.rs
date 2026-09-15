@@ -91,6 +91,24 @@ fn realistic_seed_records_fit_their_declared_input_classes() {
         &policy,
     )
     .unwrap();
+    // Retain the exact formerly reviewed workflow as a rejection regression.
+    // Updating the positive seed must not weaken the collector requirement.
+    let historical_workflow =
+        std::fs::read(root.join("fuzz/seeds/workflow_parser/historical-missing-source-collector"))
+            .unwrap();
+    let rejected = memcordon_ci::policy::validate_workflow_bytes(
+        root,
+        std::path::Path::new(".github/workflows/ci.yml"),
+        &historical_workflow,
+        &policy,
+    )
+    .unwrap_err();
+    assert!(
+        rejected
+            .to_string()
+            .contains("source evidence collection job is absent"),
+        "{rejected}"
+    );
     for bin in ["policy_parser", "workflow_parser"] {
         let charter = registry
             .targets

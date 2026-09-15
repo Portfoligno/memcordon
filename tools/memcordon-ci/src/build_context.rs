@@ -21,6 +21,26 @@ use crate::{CiError, Result};
 
 static ACTIVE: OnceLock<ValidatedBuildContext> = OnceLock::new();
 
+#[cfg(any(windows, test))]
+fn enroll_windows_compiler(
+    root: &Path,
+    env: &mut BTreeMap<OsString, OsString>,
+    discovery: &BTreeMap<OsString, OsString>,
+    arch: environment::msvc::Architecture,
+    recorded: Option<&ValidatedBuildContext>,
+) -> Result<environment::windows_compiler::Selection> {
+    Ok(environment::windows_compiler::configure(
+        env,
+        discovery,
+        arch,
+        |query, arguments, discovery| {
+            let arguments: Vec<_> = arguments.iter().map(OsStr::new).collect();
+            enrollment_output(recorded, query, &arguments, discovery, root)
+                .map_err(std::io::Error::other)
+        },
+    )?)
+}
+
 #[cfg(test)]
 #[path = "../tests/build_context/selection.rs"]
 mod selection_tests;
@@ -947,25 +967,18 @@ impl ValidatedBuildContext {
         let ambient: BTreeMap<_, _> = std::env::vars_os().collect();
         let mut env = environment::closed_environment(&ambient)?;
         #[cfg(windows)]
-        let native_linker = {
-            let installation =
-                environment::msvc::selected_installation(&env)?.ok_or_else(|| {
-                    CiError::Message(
-                        "MSVC installation must be selected by the cold bootstrap".into(),
-                    )
-                })?;
-            environment::msvc::configure(
+        let admitted = {
+            let discovery = environment::windows_discovery_environment(&ambient)?;
+            enroll_windows_compiler(
+                &root,
                 &mut env,
-                &installation,
+                &discovery,
                 environment::msvc::Architecture::native()?,
+                recorded,
             )?
         };
         #[cfg(windows)]
-        let admitted = environment::windows_compiler::admit(
-            &mut env,
-            &native_linker,
-            environment::msvc::Architecture::native()?,
-        )?;
+        let native_linker = environment::resolve_tool(OsStr::new("link.exe"), &env)?;
         #[cfg(windows)]
         if env
             .iter()

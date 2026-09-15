@@ -54,7 +54,6 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
-            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: managed-v2-cargo-target-v1-${{ runner.os }}-${{ runner.arch }}-policy-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'tools/**', 'ci/**', '.github/**') }}
@@ -63,13 +62,6 @@ jobs:
       - id: build-context-audit
         if: always()
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - name: Upload source execution observations
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: source-observations-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: target/ci/source-observations
-          if-no-files-found: warn
       - name: Save policy target
         if: always() && steps.policy-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.policy-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -82,7 +74,6 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
-            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: ${{ steps.policy-target.outputs.cache-primary-key }}
@@ -130,7 +121,6 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
-            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: managed-v2-cargo-target-v1-${{ runner.os }}-${{ runner.arch }}-quality-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', '.github/workflows/**') }}
@@ -139,13 +129,6 @@ jobs:
       - id: build-context-audit
         if: always()
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - name: Upload source execution observations
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: source-observations-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: target/ci/source-observations
-          if-no-files-found: warn
       - name: Save quality target
         if: always() && steps.quality-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.quality-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -158,7 +141,6 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
-            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: ${{ steps.quality-target.outputs.cache-primary-key }}
@@ -208,7 +190,6 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
-            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: managed-v2-cargo-target-v1-${{ runner.os }}-${{ runner.arch }}-msrv-1.85.0-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'ci/**') }}
@@ -217,13 +198,6 @@ jobs:
       - id: build-context-audit
         if: always()
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - name: Upload source execution observations
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: source-observations-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: target/ci/source-observations
-          if-no-files-found: warn
       - name: Save MSRV target
         if: always() && steps.msrv-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.msrv-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -236,7 +210,6 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
-            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: ${{ steps.msrv-target.outputs.cache-primary-key }}
@@ -290,7 +263,6 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
-            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: managed-v2-cargo-target-v1-${{ runner.os }}-${{ runner.arch }}-supply-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'tools/**', 'ci/**', '.github/**') }}
@@ -299,13 +271,6 @@ jobs:
       - id: build-context-audit
         if: always()
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - name: Upload source execution observations
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: source-observations-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: target/ci/source-observations
-          if-no-files-found: warn
       - name: Save supply target
         if: always() && steps.supply-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.supply-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -318,7 +283,6 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
-            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: ${{ steps.supply-target.outputs.cache-primary-key }}
@@ -388,7 +352,6 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
-            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: managed-v2-cargo-target-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**') }}
@@ -397,13 +360,6 @@ jobs:
       - id: build-context-audit
         if: always()
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - name: Upload source execution observations
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: source-observations-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: target/ci/source-observations
-          if-no-files-found: warn
       - name: Save native target
         if: always() && steps.native-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.native-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -416,7 +372,6 @@ jobs:
             !target/ci/reports
             !target/ci/*evidence*
             !target/ci/*diagnostic*
-            !target/ci/source-observations
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: ${{ steps.native-target.outputs.cache-primary-key }}
@@ -476,13 +431,6 @@ jobs:
       - id: build-context-audit
         if: always()
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - name: Upload source execution observations
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: source-observations-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
-          path: target/ci/source-observations
-          if-no-files-found: warn
       - if: always() && steps.deadline-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.deadline-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
@@ -499,86 +447,3 @@ jobs:
             target/ci/source-home/registry/cache
             target/ci/source-home/git/db
           key: ${{ steps.deadline-deps.outputs.cache-primary-key }}
-
-  source-evidence:
-    name: source-evidence
-    runs-on: ubuntu-24.04
-    needs: native
-    if: always()
-    permissions:
-      contents: read
-      actions: read
-    timeout-minutes: 30
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Restore Cargo sources
-        id: source-evidence-deps
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
-      - name: Install pinned Rust
-        run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
-      - name: Restore source-evidence target
-        id: source-evidence-target
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci
-            !target/ci/control-bootstrap
-            !target/ci/source-home
-            !target/ci/native-inputs.bin
-            !target/ci/reports
-            !target/ci/*evidence*
-            !target/ci/*diagnostic*
-            !target/ci/source-observations
-            !target/ci/release-bundle
-            !target/ci/release-inputs
-          key: managed-v2-cargo-target-v1-${{ runner.os }}-${{ runner.arch }}-source-evidence-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'tools/**', 'ci/**', '.github/**') }}
-      - name: Collect and verify source execution
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin source collect --workflow .github/workflows/ci.yml --output target/ci/reports/source-coverage/ci.json
-      - id: build-context-audit
-        if: always()
-        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - name: Upload verified source coverage
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: source-coverage-ci
-          path: target/ci/reports/source-coverage/ci.json
-          if-no-files-found: error
-      - name: Save source-evidence target
-        if: always() && steps.source-evidence-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.source-evidence-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci
-            !target/ci/control-bootstrap
-            !target/ci/source-home
-            !target/ci/native-inputs.bin
-            !target/ci/reports
-            !target/ci/*evidence*
-            !target/ci/*diagnostic*
-            !target/ci/source-observations
-            !target/ci/release-bundle
-            !target/ci/release-inputs
-          key: ${{ steps.source-evidence-target.outputs.cache-primary-key }}
-      - name: Save Cargo sources
-        if: always() && steps.source-evidence-deps.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            target/ci/source-home/registry/index
-            target/ci/source-home/registry/cache
-            target/ci/source-home/git/db
-          key: ${{ steps.source-evidence-deps.outputs.cache-primary-key }}

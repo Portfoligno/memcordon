@@ -756,7 +756,9 @@ cfg = [
     'fn:route_internal#1/expression:245#1:cfg(target_os = "macos")',
     'fn:route_internal#1/expression:30#1:cfg(target_os = "macos")',
     "fn:write_launcher_status#1:cfg(unix)",
+    'mod:delivery_observation#1:cfg(target_os = "macos")',
     'mod:result_delivery#1:cfg(target_os = "macos")',
+    'use:delivery_observation :: initialize as initialize_delivery_observer#1:cfg(all (target_os = "macos" , feature = "test-fixtures"))',
 ]
 item_visibility = [
     "const:LAUNCHER_STATUS_ERROR#1:private",
@@ -804,8 +806,10 @@ item_visibility = [
     "fn:route_internal#1:pub(crate)",
     "fn:write_launcher_status#1:private",
     "mod:application#1:private",
+    "mod:delivery_observation#1:private",
     "mod:result_delivery#1:private",
     "use:application :: { clean , doctor , execute , plan }#1:pub(crate)",
+    "use:delivery_observation :: initialize as initialize_delivery_observer#1:pub(crate)",
 ]
 platforms = ["portable"]
 work_packages = ["GOV-01"]
@@ -824,8 +828,8 @@ routes = ["module:crates/memcordon-cli/src/commands.rs:application:private:[]"]
 cfg = [
     'fn:bounded_helper_path#1:cfg(target_os = "macos")',
     'fn:deferred_warnings#1:cfg(target_os = "macos")',
-    'fn:doctor_execution_probe#1/local:2405#1:cfg(target_os = "macos")',
-    'fn:doctor_execution_probe#1/local:2522#1:cfg(not (target_os = "macos"))',
+    'fn:doctor_execution_probe#1/local:2409#1:cfg(target_os = "macos")',
+    'fn:doctor_execution_probe#1/local:2526#1:cfg(not (target_os = "macos"))',
     'fn:execute#1/expression:1#1:cfg(not (target_os = "macos"))',
     'fn:execute#1/expression:115#1:cfg(not (target_os = "macos"))',
     'fn:execute#1/local:135#1:cfg(target_os = "macos")',
@@ -839,6 +843,7 @@ cfg = [
     'fn:finish_error#1:cfg(not (target_os = "macos"))',
     'fn:finish_error#2:cfg(target_os = "macos")',
     'fn:finish_execution#1:cfg(not (target_os = "macos"))',
+    'fn:finish_execution#2/expression:629#1:cfg(feature = "test-fixtures")',
     'fn:finish_execution#2:cfg(target_os = "macos")',
     'fn:helper_path#1:cfg(any (target_os = "linux" , target_os = "macos"))',
     'fn:helper_path#2:cfg(not (any (target_os = "linux" , target_os = "macos")))',
@@ -864,11 +869,11 @@ item_visibility = [
     "fn:doctor#1/use:memcordon_core :: workload_discovery :: DiscoveryReportV1#1:private",
     "fn:doctor#1/use:memcordon_core :: workload_evidence :: { AdmissionAvailabilityFailure , AuthorizationKnowledge , RequestBindingV1 , WorkloadResolutionReportV1 , }#1:private",
     "fn:doctor#1:pub(crate)",
-    "fn:doctor_execution_probe#1/expression:2633#1/struct:ProbeReport#1/field:doctor#1:private",
-    "fn:doctor_execution_probe#1/expression:2633#1/struct:ProbeReport#1/field:execution#1:private",
-    "fn:doctor_execution_probe#1/expression:2633#1/struct:ProbeReport#1/field:kind#1:private",
-    "fn:doctor_execution_probe#1/expression:2633#1/struct:ProbeReport#1/field:schema_version#1:private",
-    "fn:doctor_execution_probe#1/expression:2633#1/struct:ProbeReport#1:private",
+    "fn:doctor_execution_probe#1/expression:2637#1/struct:ProbeReport#1/field:doctor#1:private",
+    "fn:doctor_execution_probe#1/expression:2637#1/struct:ProbeReport#1/field:execution#1:private",
+    "fn:doctor_execution_probe#1/expression:2637#1/struct:ProbeReport#1/field:kind#1:private",
+    "fn:doctor_execution_probe#1/expression:2637#1/struct:ProbeReport#1/field:schema_version#1:private",
+    "fn:doctor_execution_probe#1/expression:2637#1/struct:ProbeReport#1:private",
     "fn:doctor_execution_probe#1:private",
     "fn:enforcement_name#1:private",
     "fn:execute#1:pub(crate)",
@@ -933,6 +938,76 @@ work_packages = [
 decision = "Keep command orchestration in a thin façade; extract report construction, terminal/error precedence, and delivery settlement into typed modules."
 
 [[source]]
+id = "crates.memcordon-cli.src.commands.delivery_observation"
+path = "crates/memcordon-cli/src/commands/delivery_observation.rs"
+owner = "cli"
+kind = "production"
+visibility = "binary-private"
+disposition = "retain"
+protected_invariants = ["Test-only datagram observation has no report, exit, or cleanup authority."]
+consumers = ['module:crates/memcordon-cli/src/commands.rs:delivery_observation:private:["cfg(target_os = \"macos\")"]']
+routes = ['module:crates/memcordon-cli/src/commands.rs:delivery_observation:private:["cfg(target_os = \"macos\")"]']
+cfg = [
+    'fn:emit#1:cfg(feature = "test-fixtures")',
+    'fn:execution#1:cfg(feature = "test-fixtures")',
+    'fn:initialize#1:cfg(feature = "test-fixtures")',
+    'impl:Delivery:Drop#1/method:drop#1/expression:48#1:cfg(feature = "test-fixtures")',
+    'static:OBSERVER#1:cfg(feature = "test-fixtures")',
+]
+item_visibility = [
+    "fn:emit#1:private",
+    "fn:execution#1/struct:Execution#1/field:cleanup_errors#1:private",
+    "fn:execution#1/struct:Execution#1/field:direct_child_reaped#1:private",
+    "fn:execution#1/struct:Execution#1/field:force_attempted#1:private",
+    "fn:execution#1/struct:Execution#1/field:graceful_attempted#1:private",
+    "fn:execution#1/struct:Execution#1/field:kind#1:private",
+    "fn:execution#1/struct:Execution#1/field:outcome#1:private",
+    "fn:execution#1/struct:Execution#1/field:schema#1:private",
+    "fn:execution#1/struct:Execution#1/field:workload_empty#1:private",
+    "fn:execution#1/struct:Execution#1/field:wrapper_exit_code#1:private",
+    "fn:execution#1/struct:Execution#1:private",
+    "fn:execution#1/use:memcordon_core :: { RunOutcome , SupervisionTerminal }#1:private",
+    "fn:execution#1:pub(super)",
+    "fn:initialize#1:pub(crate)",
+    "impl:Delivery:#1/method:error#1:pub",
+    "impl:Delivery:#1/method:new#1:pub",
+    "impl:Delivery:#1/method:status#1/use:std :: os :: unix :: process :: ExitStatusExt as _#1:private",
+    "impl:Delivery:#1/method:status#1:pub",
+    "impl:Delivery:Drop#1/method:drop#1:private",
+    "static:OBSERVER#1:private",
+    "struct:Delivery#1/field:delivered#1:pub",
+    "struct:Delivery#1/field:error_kind#1:pub",
+    "struct:Delivery#1/field:finished#1:pub",
+    "struct:Delivery#1/field:kind#1:private",
+    "struct:Delivery#1/field:native_return_deadline#1:pub",
+    "struct:Delivery#1/field:os_error#1:pub",
+    "struct:Delivery#1/field:payload_bytes#1:pub",
+    "struct:Delivery#1/field:reason#1:pub",
+    "struct:Delivery#1/field:retirement#1:pub",
+    "struct:Delivery#1/field:retirement_os_error#1:pub",
+    "struct:Delivery#1/field:return_deadline#1:pub",
+    "struct:Delivery#1/field:schema#1:private",
+    "struct:Delivery#1/field:stage#1:pub",
+    "struct:Delivery#1/field:started#1:pub",
+    "struct:Delivery#1/field:transferred_bytes#1:pub",
+    "struct:Delivery#1/field:write_deadline#1:pub",
+    "struct:Delivery#1/field:writer_code#1:pub",
+    "struct:Delivery#1/field:writer_pid#1:pub",
+    "struct:Delivery#1/field:writer_signal#1:pub",
+    "struct:Delivery#1:pub(super)",
+    "use:serde :: Serialize#1:private",
+    "use:std :: io#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "MAC-04",
+    "GOV-02",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "crates.memcordon-cli.src.commands.result_delivery"
 path = "crates/memcordon-cli/src/commands/result_delivery.rs"
 owner = "cli"
@@ -944,11 +1019,11 @@ consumers = ['module:crates/memcordon-cli/src/commands.rs:result_delivery:privat
 routes = ['module:crates/memcordon-cli/src/commands.rs:result_delivery:private:["cfg(target_os = \"macos\")"]']
 cfg = [
     'fn:deliver#1/expression:45#1/expression:51#1:cfg(feature = "test-fixtures")',
-    'fn:deliver_inner#1/local:91#1/expression:92#1:cfg(feature = "test-fixtures")',
+    'fn:deliver_inner#1/local:139#1/expression:140#1:cfg(feature = "test-fixtures")',
     'fn:deliver_inner#1:cfg(feature = "test-fixtures")',
     'fn:fault_test#1:cfg(feature = "test-fixtures")',
     'fn:synchronous_stderr_mutant#1:cfg(feature = "test-fixtures")',
-    'fn:writer#1/local:432#1/expression:433#1/expression:434#1/expression:435#1/expression:436#1/expression:537#1/expression:550#1:cfg(feature = "test-fixtures")',
+    'fn:writer#1/local:653#1/expression:654#1/expression:655#1/expression:656#1/expression:657#1/expression:758#1/expression:771#1:cfg(feature = "test-fixtures")',
     'struct:Payload#1/field:barrier#1:cfg(feature = "test-fixtures")',
 ]
 item_visibility = [
@@ -1244,7 +1319,7 @@ disposition = "harden"
 protected_invariants = ["main retains the behavior and failure assertions reviewed in its source-boundary decision."]
 consumers = ["cargo:memcordon:bin:memcordon:features=[]"]
 routes = ["cargo:memcordon:bin:memcordon:features=[]"]
-cfg = []
+cfg = ['fn:main#1/local:7#1:cfg(all (target_os = "macos" , feature = "test-fixtures"))']
 item_visibility = [
     "fn:main#1:private",
     "mod:commands#1:private",

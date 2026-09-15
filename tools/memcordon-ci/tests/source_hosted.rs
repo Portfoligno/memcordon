@@ -12,7 +12,7 @@ const COMMIT: &str = "4ed12cd5b7c476797b7b324b13b116c113db56e6";
 fn collection_workflows_require_origin_jobs_and_fail_closed_execution() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let policy = memcordon_ci::config::policy(&root).unwrap();
-    for workflow in ["ci.yml", "backend-certification.yml"] {
+    for workflow in ["ci.yml", "backend-certification.yml", "deep-ci.yml"] {
         let path = std::path::Path::new(".github/workflows").join(workflow);
         let bytes = std::fs::read(root.join(&path)).unwrap();
         memcordon_ci::policy::validate_workflow_bytes(&root, &path, &bytes, &policy).unwrap();
@@ -51,9 +51,14 @@ fn collection_workflows_require_origin_jobs_and_fail_closed_execution() {
                 "{workflow} accepted collection mutation {mutation}"
             );
         }
-        if workflow == "backend-certification.yml" {
+        if workflow != "ci.yml" {
             let mut document = original;
-            let upload = document["jobs"]["windows-package-channel"]["steps"]
+            let job = if workflow == "deep-ci.yml" {
+                "stress"
+            } else {
+                "windows-package-channel"
+            };
+            let upload = document["jobs"][job]["steps"]
                 .as_sequence_mut()
                 .unwrap()
                 .iter_mut()

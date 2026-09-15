@@ -141,12 +141,15 @@ pub fn configure(
     capture: impl FnOnce(&Path, &[&str], &Environment) -> io::Result<Vec<u8>>,
 ) -> io::Result<Selection> {
     let mut configured = env.clone();
+    let query = super::msvc::find_vswhere(&configured)?;
     let installation = match super::msvc::selected_installation(&configured)? {
         Some(path) => path,
         None => {
-            let query = super::msvc::vswhere(&configured)?;
+            let query = query.as_ref().ok_or_else(|| {
+                io::Error::other("MSVC installation discovery requires installed vswhere.exe")
+            })?;
             let arguments = arch.discovery_arguments();
-            let value = String::from_utf8(capture(&query, &arguments, discovery)?)
+            let value = String::from_utf8(capture(query, &arguments, discovery)?)
                 .map_err(io::Error::other)?;
             let mut lines = value.lines().filter(|line| !line.trim().is_empty());
             let installation = lines.next().ok_or_else(|| io::Error::other(format!("vswhere found no matching native MSVC installation: program={query:?} arguments={arguments:?}")))?;
@@ -159,7 +162,12 @@ pub fn configure(
         }
     };
     let linker = super::msvc::configure(&mut configured, &installation, arch)?;
-    let selection = admit(&mut configured, &linker, arch)?;
+    let mut selection = admit(&mut configured, &linker, arch)?;
+    if let Some(query) = query {
+        selection.input_roots.push(query);
+        selection.input_roots.sort();
+        selection.input_roots.dedup();
+    }
     *env = configured;
     Ok(selection)
 }

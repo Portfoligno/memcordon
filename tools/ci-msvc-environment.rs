@@ -53,7 +53,9 @@ impl Architecture {
     }
 }
 
-pub fn vswhere(environment: &BTreeMap<OsString, OsString>) -> io::Result<PathBuf> {
+/// Also enrolled when the bootstrap has already populated VSINSTALLDIR: later
+/// workflow steps start with their original environment and must rediscover it.
+pub fn find_vswhere(environment: &BTreeMap<OsString, OsString>) -> io::Result<Option<PathBuf>> {
     for name in ["ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"] {
         if let Some(base) = environment.get(OsStr::new(name)) {
             let candidate = Path::new(base)
@@ -61,13 +63,11 @@ pub fn vswhere(environment: &BTreeMap<OsString, OsString>) -> io::Result<PathBuf
                 .join("Installer")
                 .join("vswhere.exe");
             if candidate.is_file() {
-                return absolute(&candidate);
+                return absolute(&candidate).map(Some);
             }
         }
     }
-    Err(io::Error::other(
-        "MSVC installation discovery requires installed vswhere.exe",
-    ))
+    Ok(None)
 }
 
 pub fn selected_installation(

@@ -783,8 +783,12 @@ routes = ["cargo:memcordon:test:result_delivery:features=[]"]
 cfg = [':cfg(all (target_os = "macos" , feature = "test-fixtures"))']
 item_visibility = [
     "fn:bounded#1:private",
+    "fn:failed_report_delivery_preserves_the_pre_delivery_target_and_cleanup_observation#1:private",
+    "fn:fill_observer#1:private",
     "fn:mutation_synchronous_final_stderr_is_detected#1:private",
+    "fn:observed_execution_preserves_report_and_exit_with_a_full_diagnostic_receiver#1:private",
     "fn:result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped#1:private",
+    "mod:delivery_observation#1:private",
     "use:std :: process :: { Command , Stdio }#1:private",
     "use:std :: time :: { Duration , Instant }#1:private",
 ]
@@ -3103,7 +3107,14 @@ disposition = "harden"
 protected_invariants = ["stress retains the behavior and failure assertions reviewed in its source-boundary decision."]
 consumers = ["cargo:memcordon:test:stress:features=[]"]
 routes = ["cargo:memcordon:test:stress:features=[]"]
-cfg = [':cfg(feature = "test-fixtures")']
+cfg = [
+    ':cfg(feature = "test-fixtures")',
+    'fn:short_child_iteration#1/expression:105#1:cfg(target_os = "macos")',
+    'fn:short_child_iteration#1/local:102#1:cfg(target_os = "macos")',
+    'fn:short_child_iteration#1/local:139#1:cfg(target_os = "macos")',
+    'fn:short_child_iteration#1/local:142#1:cfg(not (target_os = "macos"))',
+    'mod:delivery_observation#1:cfg(target_os = "macos")',
+]
 item_visibility = [
     "fn:backend_available#1:private",
     "fn:configured_iterations#1:private",
@@ -3115,6 +3126,7 @@ item_visibility = [
     "fn:short_child_iteration#1:private",
     "fn:short_child_iteration_captures_report_without_stdout#1:private",
     "fn:short_child_stress#1:private",
+    "mod:delivery_observation#1:private",
     "use:memcordon_testkit :: { assert_stdout_empty , run_with_deadline }#1:private",
     "use:std :: fs#1:private",
     "use:std :: path :: Path#1:private",
@@ -3128,6 +3140,59 @@ work_packages = [
     "TEST-01",
 ]
 decision = "Register the exact protected invariant and execution route; retain or split according to the owning subsystem, with zero-skip and platform evidence."
+
+[[source.coverage]]
+suite = "stress"
+cargo_package = "memcordon"
+cargo_target = "test:stress"
+test_binary = "stress"
+tests = ["deep_short_children_are_bounded_reaped_and_observed"]
+runner = [
+    "macos-arm64",
+    "macos-x64",
+    "windows-x64",
+    "windows-arm64",
+]
+skip_policy = "explicitly-ignored"
+evidence = "behavior"
+
+[[source]]
+id = "crates.memcordon-cli.tests.support.delivery_observation"
+path = "crates/memcordon-cli/tests/support/delivery_observation.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Bounded test receiver; its records are diagnostic, never result authority."]
+consumers = [
+    "path-module:crates/memcordon-cli/tests/result_delivery.rs:delivery_observation:private:[]",
+    'path-module:crates/memcordon-cli/tests/stress.rs:delivery_observation:private:["cfg(target_os = \"macos\")"]',
+]
+routes = [
+    "path-module:crates/memcordon-cli/tests/result_delivery.rs:delivery_observation:private:[]",
+    'path-module:crates/memcordon-cli/tests/stress.rs:delivery_observation:private:["cfg(target_os = \"macos\")"]',
+]
+cfg = []
+item_visibility = [
+    "impl:Observer:#1/method:collect#1:pub",
+    "impl:Observer:#1/method:new#1:pub",
+    "impl:Observer:#1/method:prefix#1:pub",
+    "impl:Observer:AsRef < UnixDatagram >#1/method:as_ref#1:private",
+    "struct:Observer#1/field:directory#1:private",
+    "struct:Observer#1/field:socket#1:private",
+    "struct:Observer#1:pub",
+    "use:std :: io#1:private",
+    "use:std :: os :: unix :: net :: UnixDatagram#1:private",
+    "use:std :: process :: Command#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "MAC-04",
+    "GOV-02",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
 
 [[source]]
 id = "crates.memcordon-cli.tests.windows_settlement"
@@ -3647,6 +3712,27 @@ work_packages = [
     "TEST-02",
 ]
 decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source.coverage]]
+suite = "stress"
+cargo_package = "memcordon-core"
+cargo_target = "test:runtime_evidence_vectors"
+test_binary = "runtime_evidence_vectors"
+tests = [
+    "canonical_runtime_evidence_vectors_preserve_exact_json",
+    "delivery_variants_preserve_grammar_without_claiming_persistence",
+    "runtime_evidence_rejects_unknown_fields_at_each_authority_boundary",
+    "runtime_evidence_vectors_reject_cross_field_contradictions",
+]
+runner = [
+    "linux-x64",
+    "macos-arm64",
+    "macos-x64",
+    "windows-x64",
+    "windows-arm64",
+]
+skip_policy = "forbidden"
+evidence = "behavior"
 
 [[source]]
 id = "crates.memcordon-core.tests.windows_package_cleanup"
@@ -5006,6 +5092,7 @@ item_visibility = [
     "fn:independent_enrollment_rejects_self_consistent_root_and_record_omissions#1:private",
     "fn:miri_sysroot_is_independently_selected_forwarded_and_never_repaired_by_audit#1:private",
     "fn:omitted_selector_is_rejected_before_the_discovery_command_runs#1:private",
+    "fn:windows_discovery_rejects_omitted_or_changed_vswhere_before_execution#1:private",
     "use:std :: cell :: Cell#1:private",
     "use:std :: collections :: BTreeMap#1:private",
     "use:std :: ffi :: OsStr#1:private",
@@ -7060,12 +7147,14 @@ routes = ["cargo:memcordon-ci:test:windows_path_admission:features=[]"]
 cfg = ["fn:tool#1/expression:12#1:cfg(unix)"]
 item_visibility = [
     "fn:enrolled_support_content_remains_subject_to_full_snapshot_audit#1:private",
+    "fn:fresh_workflow_step_and_bootstrap_selection_enroll_the_same_compiler_and_selector#1:private",
     "fn:missing_enrolled_executables_fail_without_freezing_a_partial_recipe#1:private",
     "fn:missing_git_or_llvm_support_roots_fail_before_freezing_paths#1:private",
     "fn:missing_selected_sdk_helper_fails_without_ambient_fallback_or_partial_mutation#1:private",
     "fn:positive_paths_are_complete_repeatable_and_exclude_unselected_directories#1:private",
     "fn:tool#1/expression:12#1/use:std :: os :: unix :: fs :: PermissionsExt#1:private",
     "fn:tool#1:private",
+    "impl:Fixture:#1/method:installation#1:private",
     "impl:Fixture:#1/method:new#1:private",
     "struct:Fixture#1/field:_temporary#1:private",
     "struct:Fixture#1/field:ambient#1:private",

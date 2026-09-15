@@ -342,6 +342,8 @@ fn finish_execution(
     execution: SupervisionExecution,
     _presentation: &Presentation,
 ) -> i32 {
+    #[cfg(feature = "test-fixtures")]
+    super::delivery_observation::execution(&execution);
     let exit_code = execution.wrapper_exit_code();
     let mut diagnostics = Vec::new();
     let return_deadline = execution

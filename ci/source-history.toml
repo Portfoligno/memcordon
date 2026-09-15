@@ -325,6 +325,10 @@ id = "crates.memcordon-cli.src.commands.application"
 original_path = "crates/memcordon-cli/src/commands/application.rs"
 
 [[identity]]
+id = "crates.memcordon-cli.src.commands.delivery_observation"
+original_path = "crates/memcordon-cli/src/commands/delivery_observation.rs"
+
+[[identity]]
 id = "crates.memcordon-cli.src.commands.result_delivery"
 original_path = "crates/memcordon-cli/src/commands/result_delivery.rs"
 
@@ -615,6 +619,10 @@ original_path = "crates/memcordon-cli/tests/sealed_agent_distribution.rs"
 [[identity]]
 id = "crates.memcordon-cli.tests.stress"
 original_path = "crates/memcordon-cli/tests/stress.rs"
+
+[[identity]]
+id = "crates.memcordon-cli.tests.support.delivery_observation"
+original_path = "crates/memcordon-cli/tests/support/delivery_observation.rs"
 
 [[identity]]
 id = "crates.memcordon-cli.tests.windows_settlement"

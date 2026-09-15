@@ -7,6 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memcordon_testkit::{assert_stdout_empty, run_with_deadline};
 
+#[cfg(target_os = "macos")]
+#[path = "support/delivery_observation.rs"]
+mod delivery_observation;
+
 fn backend_available() -> bool {
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args(["doctor", "--json"])
@@ -59,6 +63,10 @@ fn selected_seed() -> u64 {
 
 fn short_child_iteration(seed: u64, iteration: u32, code: i32, report_path: &Path) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    #[cfg(target_os = "macos")]
+    let observer = delivery_observation::Observer::new();
+    #[cfg(target_os = "macos")]
+    observer.prefix(&mut command);
     command
         .args([
             "--enforcement",
@@ -79,16 +87,20 @@ fn short_child_iteration(seed: u64, iteration: u32, code: i32, report_path: &Pat
             &code.to_string(),
         ]);
     let result = run_with_deadline(&mut command, Duration::from_secs(3));
+    #[cfg(target_os = "macos")]
+    let observations = observer.collect();
+    #[cfg(not(target_os = "macos"))]
+    let observations = "macOS delivery observer is not applicable";
     let report = fs::read_to_string(report_path);
     let output = result.unwrap_or_else(|error| {
         panic!(
-            "stress seed {seed}, iteration {iteration}, expected {code}: {error}; report={report:?}"
+            "stress seed {seed}, iteration {iteration}, expected {code}: {error}; report={report:?}; delivery-observations={observations:?}"
         )
     });
     assert_eq!(
         output.status.code(),
         Some(code),
-        "stress seed {seed}, iteration {iteration}; stdout={:?}; stderr={:?}; report={report:?}",
+        "stress seed {seed}, iteration {iteration}; stdout={:?}; stderr={:?}; report={report:?}; delivery-observations={observations:?}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );

@@ -601,6 +601,11 @@ pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
 }
 
 fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
+    check_source_collection_job(
+        jobs,
+        "stress",
+        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin source collect --workflow .github/workflows/deep-ci.yml --output target/ci/reports/source-coverage/deep.json",
+    )?;
     check_push_and_dispatch_events(workflow, "deep CI")?;
     check_top_level_permissions(workflow)?;
     let concurrency = mapping(
@@ -638,6 +643,52 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
     }
     check_fuzz_shards(fuzz)?;
     check_runner_matrix(jobs, "stress", &STRESS_MATRIX, "deep CI stress")?;
+    let stress = mapping(
+        jobs.get(key("stress"))
+            .ok_or_else(|| failure("deep CI stress job absent"))?,
+        "deep CI stress",
+    )?;
+    let uploads = stress
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("deep CI stress steps absent"))?
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter(|step| scalar(step, "name") == Some("Upload source execution observations"))
+        .collect::<Vec<_>>();
+    let [upload] = uploads.as_slice() else {
+        return Err(failure(
+            "deep CI source observation upload missing or duplicated",
+        ));
+    };
+    exact_mapping_keys(
+        upload,
+        &["name", "if", "uses", "with"],
+        "deep source upload",
+    )?;
+    let inputs = mapping(
+        upload
+            .get(key("with"))
+            .ok_or_else(|| failure("deep source upload inputs absent"))?,
+        "deep source upload",
+    )?;
+    exact_mapping_keys(
+        inputs,
+        &["name", "path", "if-no-files-found"],
+        "deep source upload",
+    )?;
+    if scalar(upload, "if") != Some("always()")
+        || scalar(upload, "uses")
+            != Some("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a")
+        || scalar(inputs, "name")
+            != Some(
+                "source-observations-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}",
+            )
+        || scalar(inputs, "path") != Some("target/ci/source-observations")
+        || scalar(inputs, "if-no-files-found") != Some("warn")
+    {
+        return Err(failure("deep CI source observation upload differs"));
+    }
     Ok(())
 }
 

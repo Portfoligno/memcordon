@@ -89,6 +89,104 @@ impl Fixture {
             system,
         }
     }
+
+    fn installation(&self, host: &str, target: &str) -> PathBuf {
+        let installation = self.linker.parent().unwrap().join("Visual Studio");
+        let defaults = installation.join("VC/Auxiliary/Build");
+        fs::create_dir_all(&defaults).unwrap();
+        fs::write(
+            defaults.join("Microsoft.VCToolsVersion.default.txt"),
+            b"14.40.12345\n",
+        )
+        .unwrap();
+        let vc = installation.join("VC/Tools/MSVC/14.40.12345");
+        fs::create_dir_all(vc.join("include")).unwrap();
+        fs::create_dir_all(vc.join("lib").join(target)).unwrap();
+        for name in ["link.exe", "cl.exe", "lib.exe"] {
+            tool(&vc.join("bin").join(host).join(target).join(name));
+        }
+        let sdk = Path::new(self.env.get(OsStr::new("WindowsSdkDir")).unwrap());
+        for category in ["ucrt", "um", "shared"] {
+            fs::create_dir_all(sdk.join("Include/10.0.26100.0").join(category)).unwrap();
+        }
+        for (category, name) in [("ucrt", "ucrt.lib"), ("um", "kernel32.lib")] {
+            tool(
+                &sdk.join("Lib/10.0.26100.0")
+                    .join(category)
+                    .join(target)
+                    .join(name),
+            );
+        }
+        installation
+    }
+}
+
+#[test]
+fn fresh_workflow_step_and_bootstrap_selection_enroll_the_same_compiler_and_selector() {
+    for (target, host, arch) in [
+        ("x64", "Hostx64", Architecture::X64),
+        ("arm64", "Hostarm64", Architecture::Arm64),
+    ] {
+        let fixture = Fixture::new(target);
+        let installation = fixture.installation(host, target);
+        let program_files = fixture.linker.parent().unwrap().join("Program Files");
+        let query = program_files.join("Microsoft Visual Studio/Installer/vswhere.exe");
+        tool(&query);
+        let mut fresh = fixture.env.clone();
+        fresh.insert("ProgramFiles(x86)".into(), program_files.into_os_string());
+        assert!(
+            environment::msvc::selected_installation(&fresh)
+                .unwrap()
+                .is_none()
+        );
+        let discovery = BTreeMap::from([("ProgramData".into(), "installer-state".into())]);
+        let mut bootstrap = fresh.clone();
+        let bootstrap_selection = environment::windows_compiler::configure(
+            &mut bootstrap,
+            &discovery,
+            arch,
+            |selected, arguments, actual_discovery| {
+                assert_eq!(
+                    selected.canonicalize().unwrap(),
+                    query.canonicalize().unwrap()
+                );
+                assert_eq!(arguments, arch.discovery_arguments());
+                assert_eq!(actual_discovery, &discovery);
+                Ok(installation.to_str().unwrap().as_bytes().to_vec())
+            },
+        )
+        .unwrap();
+        let prepared_selection = environment::windows_compiler::configure(
+            &mut bootstrap,
+            &discovery,
+            arch,
+            |_, _, _| panic!("bootstrap child already has the selected installation"),
+        )
+        .unwrap();
+        let prepared_environment = bootstrap.clone();
+        let audited_selection =
+            environment::windows_compiler::configure(&mut fresh, &discovery, arch, |_, _, _| {
+                Ok(installation.to_str().unwrap().as_bytes().to_vec())
+            })
+            .unwrap();
+        assert_eq!(fresh, prepared_environment);
+        assert_eq!(
+            bootstrap_selection.input_roots,
+            prepared_selection.input_roots
+        );
+        assert_eq!(
+            audited_selection.input_roots,
+            prepared_selection.input_roots
+        );
+        let selector = prepared_selection
+            .input_roots
+            .iter()
+            .find(|path| path.canonicalize().unwrap() == query.canonicalize().unwrap())
+            .expect("selector must be enrolled even when prepare did not execute it");
+        let snapshot = BuildInputSnapshot::capture(selector).unwrap();
+        fs::write(&query, b"changed discovery executable\n").unwrap();
+        assert!(snapshot.audit().is_err(), "selector drift must be measured");
+    }
 }
 
 #[test]
