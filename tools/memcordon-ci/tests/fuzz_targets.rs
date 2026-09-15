@@ -54,7 +54,6 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
         ("shard: [first, second]", "shard: [first, first]"),
         ("matrix.shard == 'second'", "matrix.shard == 'first'"),
         ("suite fuzz-second", "suite fuzz-first"),
-        ("timeout-minutes: 45", "timeout-minutes: 90"),
         ("fail-fast: false", "fail-fast: true"),
         ("${{ matrix.shard }}-nightly", "nightly"),
         ("'Cargo.toml', 'Cargo.lock', '.cargo/**'", "'Cargo.lock'"),
@@ -73,6 +72,7 @@ fn workflow_requires_complete_static_shards_and_cache_inputs() {
     memcordon_ci::managed_workflow::validate_and_project(&mut yaml).unwrap();
     let baseline = yaml["jobs"]["fuzz"].as_mapping().unwrap();
     for (name, value) in [
+        ("timeout-minutes", serde_yaml::Value::Number(90.into())),
         ("if", serde_yaml::Value::Bool(false)),
         ("continue-on-error", serde_yaml::Value::Bool(true)),
     ] {

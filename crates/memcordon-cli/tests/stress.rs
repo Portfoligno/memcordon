@@ -7,17 +7,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use memcordon_testkit::{assert_stdout_empty, run_with_deadline};
 
-fn require_backend() {
+fn backend_available() -> bool {
     let output = Command::new(env!("CARGO_BIN_EXE_memcordon"))
         .args(["doctor", "--json"])
         .output()
         .expect("probe should run");
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("probe should return JSON");
+    value
+        .get("selected")
+        .is_some_and(|selected| !selected.is_null())
+}
+
+fn require_backend() {
     assert!(
-        value
-            .get("selected")
-            .is_some_and(|selected| !selected.is_null()),
+        backend_available(),
         "stress suite requires a supported backend"
     );
 }
@@ -53,13 +57,78 @@ fn selected_seed() -> u64 {
         ^ u64::from(std::process::id())
 }
 
+fn short_child_iteration(seed: u64, iteration: u32, code: i32, report_path: &Path) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    command
+        .args([
+            "--enforcement",
+            if cfg!(target_os = "macos") {
+                "watchdog"
+            } else {
+                "hard"
+            },
+            "+8GiB",
+            "--report",
+        ])
+        .arg(report_path)
+        .args([
+            "--",
+            env!("CARGO_BIN_EXE_memcordon-test-fixture"),
+            "exit",
+            "--code",
+            &code.to_string(),
+        ]);
+    let result = run_with_deadline(&mut command, Duration::from_secs(3));
+    let report = fs::read_to_string(report_path);
+    let output = result.unwrap_or_else(|error| {
+        panic!(
+            "stress seed {seed}, iteration {iteration}, expected {code}: {error}; report={report:?}"
+        )
+    });
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "stress seed {seed}, iteration {iteration}; stdout={:?}; stderr={:?}; report={report:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_stdout_empty(&output);
+    let report = report.expect("successful stress iteration should write its report");
+    let _: serde_json::Value = serde_json::from_str(&report)
+        .expect("successful stress iteration report should be valid JSON");
+    fs::remove_file(report_path).expect("successful iteration report should be removable");
+}
+
+#[test]
+fn short_child_iteration_captures_report_without_stdout() {
+    if !backend_available() {
+        return;
+    }
+    let temporary = tempfile::tempdir().unwrap();
+    let report = temporary.path().join("attempt.json");
+    short_child_iteration(0, 0, 0, &report);
+    assert!(
+        !report.exists(),
+        "successful iteration should remove its report"
+    );
+}
+
 fn short_child_stress(iteration_key: &str) {
     require_backend();
     let iterations = configured_iterations(iteration_key);
     let started = Instant::now();
     let seed = selected_seed();
     let mut state = seed;
+    let reports = reports_directory();
+    fs::create_dir_all(&reports).expect("stress report directory should be creatable");
+    let report_path = reports.join(format!("stress-{iteration_key}-attempt.json"));
+    match fs::remove_file(&report_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("stale stress report could not be removed: {error}"),
+    }
     eprintln!("stress seed: {seed}");
+    eprintln!("stress progress: seed={seed} phase=short-children completed=0/{iterations}");
     for iteration in 0..iterations {
         state = state
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -69,26 +138,19 @@ fn short_child_stress(iteration_key: &str) {
             1 => 1,
             _ => 37,
         };
-        let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
-        command.args([
-            "--enforcement",
-            if cfg!(target_os = "macos") {
-                "watchdog"
-            } else {
-                "hard"
-            },
-            "+8GiB",
-            "--",
-            env!("CARGO_BIN_EXE_memcordon-test-fixture"),
-            "exit",
-            "--code",
-            &code.to_string(),
-        ]);
-        let output = run_with_deadline(&mut command, Duration::from_secs(3))
-            .unwrap_or_else(|error| panic!("iteration {iteration} failed: {error}"));
-        assert_eq!(output.status.code(), Some(code), "iteration {iteration}");
-        assert_stdout_empty(&output);
+        short_child_iteration(seed, iteration, code, &report_path);
+        let completed = iteration + 1;
+        if completed % 128 == 0 || completed == iterations {
+            eprintln!(
+                "stress progress: seed={seed} phase=short-children completed={completed}/{iterations} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+        }
     }
+    eprintln!(
+        "stress progress: seed={seed} phase=tree-start elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     let mut tree = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     tree.args([
         "+96MiB",
@@ -106,7 +168,15 @@ fn short_child_stress(iteration_key: &str) {
         .unwrap_or_else(|error| panic!("aggregate tree stress failed: {error}"));
     assert_eq!(tree_output.status.code(), Some(124));
     assert_stdout_empty(&tree_output);
+    eprintln!(
+        "stress progress: seed={seed} phase=tree-complete elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
 
+    eprintln!(
+        "stress progress: seed={seed} phase=burst-start elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     let mut burst = Command::new(env!("CARGO_BIN_EXE_memcordon"));
     burst.args([
         "+256MiB",
@@ -122,9 +192,11 @@ fn short_child_stress(iteration_key: &str) {
         .unwrap_or_else(|error| panic!("burst stress failed: {error}"));
     assert_eq!(burst_output.status.code(), Some(0));
     assert_stdout_empty(&burst_output);
+    eprintln!(
+        "stress progress: seed={seed} phase=burst-complete elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
     let elapsed = started.elapsed();
-    let reports = reports_directory();
-    fs::create_dir_all(&reports).expect("stress report directory should be creatable");
     let report = serde_json::json!({
         "schema": 1,
         "iteration_key": iteration_key,

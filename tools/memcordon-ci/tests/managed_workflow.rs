@@ -87,3 +87,33 @@ fn bootstrap_binary_and_context_cannot_be_restored_from_broad_targets() {
     restore["with"]["path"] = Value::from("target/ci");
     assert!(validate_and_project(&mut document).is_err());
 }
+
+#[test]
+fn extensionless_bootstrap_cannot_authorize_windows_compiled_cache() {
+    for mutation in ["compile", "invoke", "both"] {
+        let mut document: Value =
+            serde_yaml::from_str(include_str!("../../../.github/workflows/ci.yml")).unwrap();
+        let steps = document["jobs"]["native"]["steps"]
+            .as_sequence_mut()
+            .unwrap();
+        for step in steps {
+            let Some(run) = step.get_mut("run") else {
+                continue;
+            };
+            let Some(command) = run.as_str() else {
+                continue;
+            };
+            if (mutation != "invoke" && command.contains(" -o ci-native-fingerprint.exe"))
+                || (mutation != "compile" && command.starts_with("./ci-native-fingerprint.exe "))
+            {
+                *run = Value::from(
+                    command.replace("ci-native-fingerprint.exe", "ci-native-fingerprint"),
+                );
+            }
+        }
+        assert!(
+            validate_and_project(&mut document).is_err(),
+            "{mutation} must not authorize reuse before Windows executes the bootstrap"
+        );
+    }
+}

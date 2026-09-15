@@ -30,6 +30,24 @@ candidate compilation is offline after dependency acquisition. Both Cargo
 configuration filenames are rejected in the working-directory ancestry and
 unapproved Cargo homes.
 
+Windows compilation admits a positive native-tool PATH before seed compilation,
+controller measurement and standalone generated-package compilation. It retains
+the selected MSVC tools, rustup, Git, LLVM and versioned Windows SDK tools; managed
+Cargo invocations also prepend their enrolled compiler sysroot. Discovery selects
+explicit executables, and their installation/support trees are measured alongside
+the existing SDK and compiler roots. Other ambient PATH directories are not
+inherited, and missing required tools fail admission without an ambient fallback.
+Unsupported entries in an admitted input tree still fail measurement.
+
+This tool selection includes ARM Clang for the current ring build recipe and
+rustup for compilation tests. Windows implicit executable search and system DLL
+loading remain part of the declared native platform baseline, including the
+enrolled system tools used by tests. PATH admission is not a general process
+sandbox and does not prevent absolute-path execution or package activation APIs.
+New build recipes or generated consumers that need another external helper must
+enroll it and its inputs before entering this profile. Non-compilation workload
+and publication commands retain their separate environment policy.
+
 Generated consumer crates and extracted package sources use a separate measured
 route with fresh Cargo homes and compilation directories. Their source snapshots
 are audited, install destinations are explicitly declared, and recorded evidence

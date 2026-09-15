@@ -739,8 +739,10 @@ pub fn run_attempt(
                             .unwrap_or_else(|| deadline.duration()))
                     .min(Instant::now() + Duration::from_millis(250))
                 });
-        match guardian.inventory(inspection_deadline) {
-            Ok((snapshots, identities)) => {
+        match guardian
+            .inventory_with_metric(policy.memory.map(|_| policy.metric), inspection_deadline)
+        {
+            Ok((snapshots, identities, sample)) => {
                 known = identities;
                 workload_empty = snapshots.is_empty();
                 if policy.lifetime == Lifetime::Workload
@@ -754,7 +756,10 @@ pub fn run_attempt(
                     );
                 }
                 if let Some(limit) = policy.memory.filter(|_| !workload_empty) {
-                    match guardian.sample(policy.metric, inspection_deadline) {
+                    match sample
+                        .ok_or_else(|| "guardian sample response missing".to_owned())
+                        .and_then(|sample| sample)
+                    {
                         Ok(usage) => {
                             peak = peak.max(usage);
                             if usage >= limit.bytes() {

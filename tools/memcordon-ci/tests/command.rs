@@ -35,7 +35,7 @@ fn explicit_toolchain_invocations_preserve_native_argv_without_a_context() {
 
 #[cfg(unix)]
 #[test]
-fn absolute_rustup_and_fuzz_use_closed_toolchain_context_but_workloads_keep_their_environment() {
+fn enrolled_auxiliaries_use_closed_toolchain_context_but_workloads_keep_their_environment() {
     use memcordon_ci::{build_context::ValidatedBuildContext, command::CommandSpec};
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
@@ -48,6 +48,11 @@ fn absolute_rustup_and_fuzz_use_closed_toolchain_context_but_workloads_keep_thei
     let fuzz = root.join("target/ci-tools/bin/cargo-fuzz");
     fs::create_dir_all(fuzz.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("/usr/bin/env", &fuzz).unwrap();
+    let audit = fuzz.with_file_name("cargo-audit");
+    let deny = fuzz.with_file_name("cargo-deny");
+    for tool in [&audit, &deny] {
+        std::os::unix::fs::symlink("/usr/bin/env", tool).unwrap();
+    }
     let hex = |value: &OsStr| {
         value
             .as_bytes()
@@ -57,17 +62,41 @@ fn absolute_rustup_and_fuzz_use_closed_toolchain_context_but_workloads_keep_thei
     };
     let manifest = root.join("context.json");
     fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
-        "schema_version": 2, "root": root,
+        "schema_version": 3, "root": root,
         "environment": [[hex(OsStr::new("PATH")), hex(OsStr::new("/usr/bin"))]],
-        "toolchains": {"nightly": cargo}, "input_roots": [root],
-        "inputs": [{"path": hex(cargo.as_os_str()), "kind": "file", "mode": 0, "digest": "fixture"}],
+        "toolchains": {"nightly": cargo}, "input_roots": [root], "discovery_roots": [],
+        "inputs": ([&cargo, &fuzz, &audit, &deny].map(|tool| serde_json::json!({"path": hex(tool.as_os_str()), "kind": "symlink", "mode": 0, "digest": "fixture"}))),
         "worker": {}
     })).unwrap()).unwrap();
     let context = ValidatedBuildContext::read(&manifest).unwrap();
+    for (spec, (tool, arguments)) in memcordon_ci::command::supply_chain_commands(&root, "nightly")
+        .into_iter()
+        .zip([
+            (&audit, ["audit", "--deny", "warnings"]),
+            (&deny, ["--config", "ci/deny.toml", "check"]),
+        ])
+    {
+        let command = spec.materialize(Some(&context)).unwrap();
+        assert_eq!(command.get_program(), tool);
+        assert_eq!(command.get_args().collect::<Vec<_>>(), arguments);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "RUSTUP_TOOLCHAIN"
+                    && value == Some(OsStr::new("nightly")))
+        );
+        let standalone = spec.materialize(None).unwrap();
+        assert_eq!(
+            standalone.get_args().take(3).collect::<Vec<_>>(),
+            [OsStr::new("run"), OsStr::new("nightly"), tool.as_os_str()]
+        );
+    }
     let deadline = std::time::Duration::from_secs(1);
     for spec in [
         CommandSpec::cargo(root.join("absolute/rustup"), &root, "nightly", deadline),
         CommandSpec::toolchain_program("rustup", &root, "nightly", &fuzz, deadline),
+        CommandSpec::toolchain_program("rustup", &root, "nightly", &audit, deadline),
+        CommandSpec::toolchain_program("rustup", &root, "nightly", &deny, deadline),
     ] {
         let mut command = spec.materialize(Some(&context)).unwrap();
         assert_eq!(command.get_current_dir(), Some(root.as_path()));
@@ -101,6 +130,32 @@ fn absolute_rustup_and_fuzz_use_closed_toolchain_context_but_workloads_keep_thei
             environment.len(),
             5,
             "ambient variables must not reach a managed compiler"
+        );
+    }
+    let unknown = fuzz.with_file_name("cargo-other");
+    std::os::unix::fs::symlink("/usr/bin/env", &unknown).unwrap();
+    let mut data: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    data["inputs"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "path": hex(unknown.as_os_str()), "kind": "symlink", "mode": 0, "digest": "fixture"
+        }));
+    data["inputs"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|input| input["path"] != hex(audit.as_os_str()));
+    fs::write(&manifest, serde_json::to_vec(&data).unwrap()).unwrap();
+    let restricted = ValidatedBuildContext::read(&manifest).unwrap();
+    for tool in [&unknown, &audit] {
+        let error = CommandSpec::toolchain_program("rustup", &root, "nightly", tool, deadline)
+            .materialize(Some(&restricted))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unenrolled toolchain executable")
         );
     }
     let workload = CommandSpec::new("workload", &root, deadline)

@@ -926,23 +926,22 @@ fn run_unix_attempt(
         )?);
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let helper = request
-        .memcordon_executable
-        .as_deref()
-        .or_else(|| {
-            #[cfg(target_os = "macos")]
-            if signal.take().is_some() {
-                return Some(std::path::Path::new(""));
-            }
-            None
-        })
-        .ok_or_else(|| {
-            Error::new(
-                ErrorCategory::Usage,
-                "MCUSAGE-MEMCORDON-EXECUTABLE",
-                "Unix execution requires an explicit MemCordon helper path",
-            )
-        })?;
+    let helper = request.memcordon_executable.as_deref();
+    #[cfg(target_os = "macos")]
+    let helper = helper.or_else(|| {
+        if signal.take().is_some() {
+            return Some(std::path::Path::new(""));
+        }
+        None
+    });
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let helper = helper.ok_or_else(|| {
+        Error::new(
+            ErrorCategory::Usage,
+            "MCUSAGE-MEMCORDON-EXECUTABLE",
+            "Unix execution requires an explicit MemCordon helper path",
+        )
+    })?;
     #[cfg(target_os = "linux")]
     let execution = crate::linux_cgroup::run_attempt(
         request.policy.clone(),

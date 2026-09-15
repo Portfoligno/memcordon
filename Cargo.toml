@@ -51,3 +51,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(miri)'] }
 
 [workspace.lints.clippy]
 all = "warn"
+
+# Native inventory hashes complete toolchains and SDKs before cache restoration.
+# Optimize the controller and its runtime dependencies without removing checks.
+[profile.ci-bootstrap]
+inherits = "dev"
+opt-level = 2
+debug = 1
+debug-assertions = true
+overflow-checks = true
+lto = false

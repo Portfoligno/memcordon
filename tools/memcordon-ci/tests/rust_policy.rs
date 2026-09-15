@@ -3,6 +3,46 @@ use std::path::Path;
 use memcordon_ci::policy::validate_rust_policy_bytes;
 
 #[test]
+fn compiler_selector_removal_is_confined_to_the_generated_fixture_child() {
+    let fixture = Path::new("tools/memcordon-ci/tests/build_context.rs");
+    let allowed = br#"fn generated_fixture_child(child: &mut std::process::Command) {
+        child.env_remove("RUSTC").env_remove("RUSTDOC");
+    }"#;
+    validate_rust_policy_bytes(fixture, allowed).unwrap();
+    validate_rust_policy_bytes(fixture, include_bytes!("build_context.rs")).unwrap();
+    for path in [
+        "tools/memcordon-ci/tests/other.rs",
+        "crates/example/src/lib.rs",
+    ] {
+        assert!(validate_rust_policy_bytes(Path::new(path), allowed).is_err());
+    }
+    // Assemble the obsolete credential name only in synthetic negative-test source;
+    // repository policy forbids retaining its literal interface in tracked fixtures.
+    let obsolete_credential = [
+        "fn generated_fixture_child(child: &mut Command) { child.env_remove(\"CARGO_",
+        "REGISTRY_TOKEN\"); }",
+    ]
+    .concat();
+    for denied in [
+        br#"fn generated_fixture_child(child: &mut Command) { child.env_remove("GH_TOKEN"); }"#.as_slice(),
+        obsolete_credential.as_bytes(),
+        br#"fn generated_fixture_child(child: &mut Command, key: &str) { child.env_remove(key); }"#,
+        br#"fn generated_fixture_child(child: &mut Command) { child.env_remove("RUSTC", "RUSTDOC"); }"#,
+        br#"fn unrelated(child: &mut Command) { child.env_remove("RUSTC"); }"#,
+        br#"fn generated_fixture_child(child: &mut Command) { child.env_remove("RUSTC"); fn nested(child: &mut Command) { child.env_remove("RUSTDOC"); } }"#,
+    ] {
+        assert!(validate_rust_policy_bytes(fixture, denied).is_err());
+    }
+    let credential = br#"fn remove(child: &mut Command) { child.env_remove("GH_TOKEN"); }"#;
+    for path in [
+        "tools/memcordon-ci/src/command.rs",
+        "tools/memcordon-ci/src/release.rs",
+    ] {
+        validate_rust_policy_bytes(Path::new(path), credential).unwrap();
+    }
+}
+
+#[test]
 fn deadline_helpers_preserve_typed_spawning_and_environment_boundaries() {
     for (path, source) in [
         (

@@ -95,8 +95,6 @@ impl WindowsPackageSourceLayout {
         target_root: &Path,
     ) -> Vec<OsString> {
         vec![
-            OsString::from("--config"),
-            self.cargo_config.clone().into_os_string(),
             OsString::from("install"),
             OsString::from("--locked"),
             OsString::from("--path"),

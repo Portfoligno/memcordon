@@ -467,14 +467,31 @@ fn requested_deadline_expires_during_unacknowledged_startup() {
     let command = CommandSpec::new(fixture()).args(["exit", "--code", "0"]);
     let started = Instant::now();
     let execution = memcordon_platform::run(policy, &command, fixture()).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(matches!(
-        execution.outcome,
-        memcordon_core::RunOutcome::DeadlineExceeded { .. }
-    ));
-    assert!(execution.outcome.cleanup().direct_child_reaped);
-    assert_eq!(execution.outcome.cleanup().workload_empty, Some(true));
-    assert!(!execution.launch.target_released);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "elapsed={elapsed:?}; execution={execution:#?}"
+    );
+    assert!(
+        matches!(
+            execution.outcome,
+            memcordon_core::RunOutcome::DeadlineExceeded { .. }
+        ),
+        "elapsed={elapsed:?}; execution={execution:#?}"
+    );
+    assert!(
+        execution.outcome.cleanup().direct_child_reaped,
+        "elapsed={elapsed:?}; execution={execution:#?}"
+    );
+    assert_eq!(
+        execution.outcome.cleanup().workload_empty,
+        Some(true),
+        "elapsed={elapsed:?}; execution={execution:#?}"
+    );
+    assert!(
+        !execution.launch.target_released,
+        "elapsed={elapsed:?}; execution={execution:#?}"
+    );
 }
 
 #[test]

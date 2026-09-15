@@ -356,6 +356,7 @@ mod unix {
                 Err(io::Error::other(failures.join("; ")))
             }
         }
+        #[cfg(target_os = "macos")]
         pub fn finish(mut self) -> io::Result<()> {
             self.restore()
         }

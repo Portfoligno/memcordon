@@ -1,4 +1,6 @@
 //! Rebuilt with rustc before any native compiled-target cache is restored.
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
@@ -6,14 +8,21 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+pub const CONTROL_PROFILE: &str = "ci-bootstrap";
+
 #[path = "ci-build-environment.rs"]
 mod environment;
 
-fn capture(program: &str, arguments: &[&str]) -> io::Result<Vec<u8>> {
+pub fn capture(
+    program: &str,
+    arguments: &[&str],
+    environment: &BTreeMap<OsString, OsString>,
+) -> io::Result<Vec<u8>> {
+    let description = format!("program={program:?} arguments={arguments:?}");
     let deadline = Instant::now() + Duration::from_secs(15);
     let program = program.to_owned();
     let arguments: Vec<String> = arguments.iter().map(|value| (*value).to_owned()).collect();
-    let environment = environment::closed_environment(&std::env::vars_os().collect())?;
+    let environment = environment.clone();
     let (sender, receiver) = mpsc::sync_channel(0);
     std::thread::spawn(move || {
         let result = Command::new(program)
@@ -22,7 +31,7 @@ fn capture(program: &str, arguments: &[&str]) -> io::Result<Vec<u8>> {
             .envs(environment)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn();
         if let Err(mpsc::SendError(Ok(mut child))) = sender.send(result) {
             let _ = child.kill();
@@ -49,11 +58,15 @@ fn capture(program: &str, arguments: &[&str]) -> io::Result<Vec<u8>> {
     loop {
         if Instant::now() >= deadline {
             let _ = child.kill();
-            return Err(io::Error::other("native fingerprint command timeout"));
+            return Err(io::Error::other(format!(
+                "native fingerprint command timeout: {description}"
+            )));
         }
         if let Some(status) = child.try_wait()? {
             if !status.success() {
-                return Err(io::Error::other("native fingerprint command failed"));
+                return Err(io::Error::other(format!(
+                    "native fingerprint command failed: {description}, status={status}"
+                )));
             }
             let bytes = receiver
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -74,9 +87,31 @@ fn run() -> io::Result<()> {
             "usage: ci-native-fingerprint --output PATH",
         ));
     }
-    let root = std::env::current_dir()?.canonicalize()?;
+    let root = environment::command_path(&std::env::current_dir()?)?;
     let path = root.join(&arguments[1]);
-    let env = environment::closed_environment(&std::env::vars_os().collect())?;
+    let ambient = std::env::vars_os().collect();
+    let env = environment::closed_environment(&ambient)?;
+    #[cfg(windows)]
+    let env = {
+        let mut env = env;
+        let arch = environment::msvc::Architecture::native()?;
+        let discovery = environment::windows_discovery_environment(&ambient)?;
+        environment::windows_compiler::configure(
+            &mut env,
+            &discovery,
+            arch,
+            |query, arguments, discovery| {
+                capture(
+                    query
+                        .to_str()
+                        .ok_or_else(|| io::Error::other("non-Unicode vswhere path"))?,
+                    arguments,
+                    discovery,
+                )
+            },
+        )?;
+        env
+    };
     let home = env
         .get(std::ffi::OsStr::new(if cfg!(windows) {
             "USERPROFILE"
@@ -116,7 +151,7 @@ fn run() -> io::Result<()> {
             ])
             .env_clear()
             .envs(&env);
-        run_bounded(&mut install)?;
+        run_bounded("install nightly toolchain", &mut install)?;
         if job.contains("miri") {
             let mut setup = Command::new(&rustup);
             setup
@@ -125,7 +160,7 @@ fn run() -> io::Result<()> {
                 .env_clear()
                 .envs(&env)
                 .env("CARGO_HOME", &cargo_home);
-            run_bounded(&mut setup)?;
+            run_bounded("prepare Miri sysroot", &mut setup)?;
         }
     }
     let cargo_path = capture(
@@ -133,12 +168,14 @@ fn run() -> io::Result<()> {
             .to_str()
             .ok_or_else(|| io::Error::other("non-Unicode rustup path"))?,
         &["which", "--toolchain", "1.97.1", "cargo"],
+        &env,
     )?;
     let cargo = std::path::PathBuf::from(
         String::from_utf8(cargo_path)
             .map_err(io::Error::other)?
             .trim(),
     );
+    let cargo = environment::paths::command_program(&cargo)?;
     let bin = cargo
         .parent()
         .ok_or_else(|| io::Error::other("invalid Cargo path"))?;
@@ -154,7 +191,7 @@ fn run() -> io::Result<()> {
             "RUSTC",
             bin.join(if cfg!(windows) { "rustc.exe" } else { "rustc" }),
         );
-    run_bounded(&mut fetch)?;
+    run_bounded("fetch workspace sources", &mut fetch)?;
     if job.contains("fuzz") {
         let mut fetch = Command::new(&cargo);
         fetch
@@ -168,7 +205,7 @@ fn run() -> io::Result<()> {
                 "RUSTC",
                 bin.join(if cfg!(windows) { "rustc.exe" } else { "rustc" }),
             );
-        run_bounded(&mut fetch)?;
+        run_bounded("fetch fuzz sources", &mut fetch)?;
     }
     let mut build = Command::new(&cargo);
     build
@@ -177,6 +214,7 @@ fn run() -> io::Result<()> {
         .args(["--target-dir"])
         .arg(root.join("target/ci/control-bootstrap"))
         .args(["--package", "memcordon-ci"])
+        .args(["--profile", CONTROL_PROFILE])
         .current_dir(&work)
         .env_clear()
         .envs(&env)
@@ -193,7 +231,7 @@ fn run() -> io::Result<()> {
                 "rustdoc"
             }),
         );
-    run_bounded(&mut build)?;
+    run_bounded("compile fingerprint controller", &mut build)?;
     // Auxiliary packages have their own published lockfiles. Acquire and build
     // them before measuring source trees, so later compilation cannot introduce
     // an unmeasured resolver or toolchain input into a shared cache identity.
@@ -241,10 +279,11 @@ fn run() -> io::Result<()> {
                 "RUSTC",
                 bin.join(if cfg!(windows) { "rustc.exe" } else { "rustc" }),
             );
-        run_bounded(&mut install)?;
+        run_bounded("install managed native tool", &mut install)?;
     }
     let controller = root
-        .join("target/ci/control-bootstrap/debug")
+        .join("target/ci/control-bootstrap")
+        .join(CONTROL_PROFILE)
         .join(if cfg!(windows) {
             "memcordon-ci.exe"
         } else {
@@ -269,10 +308,14 @@ fn run() -> io::Result<()> {
             plan.env(key, value);
         }
     }
-    run_bounded(&mut plan)
+    run_bounded("prepare fingerprint context", &mut plan)
 }
 
-fn run_bounded(command: &mut Command) -> io::Result<()> {
+fn run_bounded(label: &str, command: &mut Command) -> io::Result<()> {
+    environment::progress::phase(label, || run_bounded_command(command))
+}
+
+fn run_bounded_command(command: &mut Command) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(1800);
     let mut child = command.spawn()?;
     loop {

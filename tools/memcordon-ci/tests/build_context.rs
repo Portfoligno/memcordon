@@ -155,6 +155,80 @@ fn executable_modes_and_symlink_targets_enter_identity() {
     assert!(original.audit().is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn dangling_native_links_are_stable_until_the_target_appears() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let target = external.path().join("optional-library");
+    symlink(&target, root.path().join("library")).unwrap();
+    let missing = BuildInputSnapshot::capture(root.path()).unwrap();
+    missing.audit().unwrap();
+    fs::write(&target, b"installed library\n").unwrap();
+    assert!(missing.audit().is_err());
+    let present = BuildInputSnapshot::capture(root.path()).unwrap();
+    present.audit().unwrap();
+    fs::write(&target, b"updated library\n").unwrap();
+    assert!(present.audit().is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_native_link_retargeting_changes_identity() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let link = root.path().join("library");
+    symlink("missing-first", &link).unwrap();
+    let before = BuildInputSnapshot::capture(root.path()).unwrap();
+    fs::remove_file(&link).unwrap();
+    symlink("missing-second", &link).unwrap();
+    assert!(before.audit().is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn overlapping_native_aliases_and_ancestor_cycles_remain_auditable() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let sdk = root.path().join("sdk");
+    fs::create_dir(&sdk).unwrap();
+    let header = sdk.join("header.h");
+    fs::write(&header, b"header\n").unwrap();
+    symlink(root.path(), sdk.join("parent")).unwrap();
+    symlink(&sdk, root.path().join("alias-a")).unwrap();
+    symlink(&sdk, root.path().join("alias-b")).unwrap();
+    let before = BuildInputSnapshot::capture(root.path()).unwrap();
+    before.audit().unwrap();
+    fs::write(header, b"changed header\n").unwrap();
+    assert!(before.audit().is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn unresolvable_native_links_report_the_path_and_operation() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let link = root.path().join("self-reference");
+    symlink("self-reference", &link).unwrap();
+    let error = BuildInputSnapshot::capture(root.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("self-reference"), "{error}");
+    assert!(error.contains("resolving symlink"), "{error}");
+}
+
+#[test]
+fn missing_declared_native_root_is_an_error_with_path_context() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("required-sdk");
+    let error = BuildInputSnapshot::capture(&missing)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("required-sdk"), "{error}");
+    assert!(error.contains("resolving build input root"), "{error}");
+}
+
 #[test]
 fn failed_test_with_unchanged_inputs_remains_auditable_without_a_cached_pass() {
     let root = tempfile::tempdir().unwrap();
@@ -220,6 +294,80 @@ fn external_sdk_and_native_path_lists_are_content_inputs() {
 }
 
 #[test]
+fn windows_native_discovery_uses_all_canonical_environment_names() {
+    use environment::{EnvironmentNames, closed_environment_with_names};
+    use memcordon_ci::build_context::{native_environment_roots, windows_native_roots};
+
+    let root = tempfile::tempdir().unwrap();
+    let windows = root.path().join("Windows");
+    let selected_sdk = root.path().join("SelectedSdk");
+    let selected_compiler = root.path().join("SelectedCompiler");
+    fs::create_dir(&selected_sdk).unwrap();
+    fs::create_dir(&selected_compiler).unwrap();
+    let mut env = BTreeMap::from([
+        (OsString::from("pAtH"), root.path().as_os_str().to_owned()),
+        (
+            OsString::from("sYsTeMrOoT"),
+            windows.clone().into_os_string(),
+        ),
+        (
+            OsString::from("wInDoWsSdKdIr"),
+            selected_sdk.clone().into_os_string(),
+        ),
+        (
+            OsString::from("vCtOoLsInStAlLdIr"),
+            selected_compiler.clone().into_os_string(),
+        ),
+    ]);
+    let mut expected = Vec::new();
+    for name in ["pRoGrAmFiLeS", "pRoGrAmFiLeS(x86)", "pRoGrAmW6432"] {
+        let base = root.path().join(name);
+        for child in ["Windows Kits", "Microsoft Visual Studio"] {
+            let directory = base.join(child);
+            fs::create_dir_all(&directory).unwrap();
+            expected.push(directory);
+        }
+        env.insert(name.into(), base.into_os_string());
+    }
+    for library in ["kernel32.dll", "ntdll.dll", "ucrtbase.dll", "msvcp_win.dll"] {
+        expected.push(windows.join("System32").join(library));
+    }
+    let closed = closed_environment_with_names(&env, EnvironmentNames::Windows).unwrap();
+    let mut actual = windows_native_roots(&closed).unwrap();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+    let selected = native_environment_roots(&closed).unwrap();
+    assert!(selected.contains(&selected_sdk.canonicalize().unwrap()));
+    assert!(selected.contains(&selected_compiler.canonicalize().unwrap()));
+}
+
+#[test]
+fn windows_native_discovery_requires_sdk_compiler_and_system_root() {
+    use memcordon_ci::build_context::windows_native_roots;
+    let root = tempfile::tempdir().unwrap();
+    let mut env = BTreeMap::from([(
+        OsString::from("ProgramFiles"),
+        root.path().as_os_str().to_owned(),
+    )]);
+    assert!(windows_native_roots(&env).is_err());
+    fs::create_dir(root.path().join("Windows Kits")).unwrap();
+    assert!(windows_native_roots(&env).is_err());
+    fs::create_dir(root.path().join("Microsoft Visual Studio")).unwrap();
+    assert!(
+        windows_native_roots(&env)
+            .unwrap_err()
+            .to_string()
+            .contains("system root")
+    );
+    env.insert(
+        "SystemRoot".into(),
+        root.path().join("Windows").into_os_string(),
+    );
+    assert!(windows_native_roots(&env).is_ok());
+}
+
+#[test]
 fn cold_seed_compiles_without_cargo_dependencies_and_rejects_override_before_bootstrap() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = tempfile::tempdir().unwrap();
@@ -254,6 +402,107 @@ fn cold_seed_compiles_without_cargo_dependencies_and_rejects_override_before_boo
 
 #[test]
 fn generated_package_builds_use_fresh_uncached_outputs_and_reject_configuration_overrides() {
+    // This fixture exercises the unmanaged API. Cargo's managed parent may
+    // supply compiler routing, but its in-process context is not inherited.
+    let mut child = generated_fixture_child("generated_package_unmanaged_child");
+    let output =
+        memcordon_testkit::run_with_deadline(&mut child, std::time::Duration::from_secs(90))
+            .unwrap();
+    assert!(
+        output.status.success(),
+        "generated-package child failed: stdout={:?} stderr={:?}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("1 passed;")
+    );
+}
+
+fn generated_fixture_child(name: &str) -> Command {
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["--exact", name, "--ignored", "--nocapture"])
+        .env_remove("RUSTC")
+        .env_remove("RUSTDOC");
+    child
+}
+
+#[test]
+fn unmanaged_generated_packages_reject_each_ambient_compiler_override() {
+    for variable in ["RUSTC", "RUSTDOC"] {
+        let mut child = generated_fixture_child("generated_package_rejected_override_child");
+        child.env(variable, "unapproved-compiler-fixture");
+        let output =
+            memcordon_testkit::run_with_deadline(&mut child, std::time::Duration::from_secs(10))
+                .unwrap();
+        assert!(
+            output.status.success(),
+            "override {variable} was not rejected: stdout={:?} stderr={:?}",
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("1 passed;")
+        );
+    }
+}
+
+#[test]
+fn generated_package_regression_isolated_from_parent_compiler_routing() {
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child.args(["--exact", "generated_package_builds_use_fresh_uncached_outputs_and_reject_configuration_overrides", "--nocapture"])
+        .env("RUSTC", "parent-compiler-routing-fixture")
+        .env("RUSTDOC", "parent-rustdoc-routing-fixture");
+    let output =
+        memcordon_testkit::run_with_deadline(&mut child, std::time::Duration::from_secs(100))
+            .unwrap();
+    assert!(
+        output.status.success(),
+        "inherited compiler routing contaminated the unmanaged fixture: stdout={:?} stderr={:?}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("1 passed;")
+    );
+}
+
+#[test]
+#[ignore = "invoked explicitly by the generated-package environment boundary regression"]
+fn generated_package_rejected_override_child() {
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("src")).unwrap();
+    fs::write(source.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(
+        source.path().join("Cargo.toml"),
+        "[package]\nname = \"rejected-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let error = memcordon_ci::build_context::run_isolated_cargo(
+        source.path(),
+        "1.97.1",
+        ["generate-lockfile"],
+        std::time::Duration::from_secs(5),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("rejects ambient override"),
+        "{error}"
+    );
+    assert!(!source.path().join("Cargo.lock").exists());
+}
+
+#[test]
+#[ignore = "invoked explicitly in a child with unmanaged compiler environment"]
+fn generated_package_unmanaged_child() {
     use memcordon_ci::build_context::run_isolated_cargo;
     use std::time::Duration;
     let source = tempfile::tempdir().unwrap();
@@ -305,13 +554,39 @@ fn generated_package_builds_use_fresh_uncached_outputs_and_reject_configuration_
     assert!(run_isolated_cargo(source.path(), "1.97.1", ["check"], deadline, None).is_err());
     fs::write(
         source.path().join(".cargo/config.toml"),
-        "[patch.crates-io]\n",
+        "[patch.crates-io]\nisolated-local-dependency = { path = 'local-dependency' }\n",
+    )
+    .unwrap();
+    let dependency = source.path().join("local-dependency");
+    fs::create_dir_all(dependency.join("src")).unwrap();
+    fs::write(
+        dependency.join("Cargo.toml"),
+        "[package]\nname = 'isolated-local-dependency'\nversion = '0.0.0'\nedition = '2021'\n",
+    )
+    .unwrap();
+    fs::write(
+        dependency.join("src/lib.rs"),
+        "pub fn value() -> u32 { 7 }\n",
+    )
+    .unwrap();
+    fs::write(source.path().join("Cargo.toml"), "[package]\nname = 'isolated-fixture'\nversion = '0.0.0'\nedition = '2021'\n[dependencies]\nisolated-local-dependency = '=0.0.0'\n").unwrap();
+    fs::write(
+        source.path().join("src/main.rs"),
+        "fn main() { assert_eq!(isolated_local_dependency::value(), 7); }\n",
     )
     .unwrap();
     run_isolated_cargo(
         source.path(),
         "1.97.1",
-        ["check", "--locked"],
+        ["generate-lockfile", "--offline"],
+        deadline,
+        None,
+    )
+    .unwrap();
+    run_isolated_cargo(
+        source.path(),
+        "1.97.1",
+        ["check", "--locked", "--offline"],
         deadline,
         None,
     )

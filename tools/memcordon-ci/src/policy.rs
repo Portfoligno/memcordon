@@ -322,7 +322,7 @@ const STRESS_MATRIX: [(&str, &str); 5] = [
     ("windows-x64", "windows-2025"),
     ("windows-arm64", "windows-11-arm"),
 ];
-const DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES: u64 = 45;
+const DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES: u64 = 60;
 
 fn check_runner_matrix(
     jobs: &Mapping,
@@ -402,7 +402,8 @@ pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
     ]);
     if strategy.get(key("fail-fast")).and_then(Value::as_bool) != Some(false)
         || matrix.get(key("shard")) != Some(&expected_shards)
-        || fuzz.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(45)
+        || fuzz.get(key("timeout-minutes")).and_then(Value::as_u64)
+            != Some(DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES)
         || scalar(fuzz, "runs-on") != Some("ubuntu-24.04")
     {
         return Err(failure("fuzz shard coverage or execution bounds differ"));
@@ -559,11 +560,11 @@ pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
         != [
             ("rustup toolchain install 1.97.1 --profile minimal", None),
             (
-                "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-first",
+                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-first",
                 Some("matrix.shard == 'first'"),
             ),
             (
-                "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-second",
+                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-second",
                 Some("matrix.shard == 'second'"),
             ),
         ]
@@ -722,7 +723,7 @@ fn check_macos_deadline_job(jobs: &Mapping, name: &str) -> Result<()> {
             ));
         }
         if scalar(step, "run")
-            == Some("./ci-native-fingerprint --output target/ci/native-inputs.bin")
+            == Some("./ci-native-fingerprint.exe --output target/ci/native-inputs.bin")
         {
             fingerprint = true;
         }
@@ -901,10 +902,10 @@ fn check_standard_certification_job(
     }
     let expected_suite = match contract.target {
         crate::standard_contract::StandardTarget::LinuxX64 => {
-            "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-cgroup"
+            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-cgroup"
         }
         crate::standard_contract::StandardTarget::WindowsX64 => {
-            "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-job"
+            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-job"
         }
     };
     let commands: Vec<_> = steps
@@ -1308,8 +1309,8 @@ fn check_certification_job(
     ];
     if windows {
         expected_run_commands.extend([
-            "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
-            "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
+            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
+            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
         ]);
     }
     if run_commands != expected_run_commands {
@@ -1447,7 +1448,7 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         1,
         linux_dependency_key,
         linux_target_key,
-        "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2",
+        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2",
         "backend-linux-sealed-v2",
         "target/ci/reports/linux-sealed-v2",
         "backend certification linux job",
@@ -1497,7 +1498,7 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         SplitWindowsJobContract {
             name: "windows-loader-production",
             suite: concat!(
-                "./target/ci/control-bootstrap/debug/memcordon-ci ",
+                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci ",
                 "--build-context target/ci/native-inputs.bin suite windows-loader-production"
             ),
             artifact_name: "windows-loader-production-${{ matrix.id }}",
@@ -1514,7 +1515,7 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         SplitWindowsJobContract {
             name: "windows-provider-lifecycle",
             suite: concat!(
-                "./target/ci/control-bootstrap/debug/memcordon-ci ",
+                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci ",
                 "--build-context target/ci/native-inputs.bin suite windows-provider-lifecycle"
             ),
             artifact_name: "windows-provider-lifecycle-${{ matrix.id }}",
@@ -1534,7 +1535,7 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         SplitWindowsJobContract {
             name: "windows-package-channel",
             suite: concat!(
-                "./target/ci/control-bootstrap/debug/memcordon-ci ",
+                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci ",
                 "--build-context target/ci/native-inputs.bin suite windows-package-channel"
             ),
             artifact_name: "windows-package-channel-${{ matrix.id }}",
@@ -1549,12 +1550,12 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
             target_cache_id: "package-target",
             target_cache_path: "target/ci/bootstrap\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n",
             checkout_count: 1,
-            timeout_minutes: 45,
+            timeout_minutes: 75,
         },
         SplitWindowsJobContract {
             name: "windows-loader-lab",
             suite: concat!(
-                "./target/ci/control-bootstrap/debug/memcordon-ci ",
+                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci ",
                 "--build-context target/ci/native-inputs.bin suite windows-loader-lab"
             ),
             artifact_name: "windows-loader-lab-${{ matrix.id }}",
@@ -2161,7 +2162,7 @@ fn check_release_structure(
             "rustup toolchain install {} --profile minimal",
             toolchains.msrv
         ),
-        "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite release-preflight".into(),
+        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-preflight".into(),
     ];
     if actual_run_commands.len() != expected_run_commands.len()
         || !actual_run_commands
@@ -2214,7 +2215,7 @@ fn check_release_structure(
         2,
         linux_dependency_key,
         linux_target_key,
-        "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2",
+        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2",
         "release-certification-linux",
         "target/ci/reports/linux-sealed-v2",
         &linux_context,
@@ -2234,7 +2235,7 @@ fn check_release_structure(
     for contract in [
         SplitWindowsJobContract {
             name: "windows-loader-production",
-            suite: "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production",
+            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production",
             artifact_name: "release-windows-loader-production-${{ matrix.id }}",
             artifact_path: "target/ci/reports/windows-sealed-v2/loader-production",
             dependency: Some("native"),
@@ -2251,7 +2252,7 @@ fn check_release_structure(
         },
         SplitWindowsJobContract {
             name: "windows-provider-lifecycle",
-            suite: "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
+            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
             artifact_name: "release-windows-provider-lifecycle-${{ matrix.id }}",
             artifact_path: "target/ci/reports/windows-sealed-v2/provider-lifecycle",
             dependency: Some("windows-loader-production"),
@@ -2274,7 +2275,7 @@ fn check_release_structure(
         },
         SplitWindowsJobContract {
             name: "windows-package-channel",
-            suite: "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
+            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
             artifact_name: "release-windows-package-channel-${{ matrix.id }}",
             artifact_path: "target/ci/windows-sealed-cargo",
             dependency: Some("windows-provider-lifecycle"),
@@ -2346,7 +2347,7 @@ fn check_release_structure(
         ("run", "rustup toolchain install 1.97.1 --profile minimal"),
         (
             "run",
-            "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin release assemble",
+            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release assemble",
         ),
         (
             "uses",
@@ -2505,7 +2506,7 @@ fn check_verify_public_job(
             "rustup toolchain install {} --profile minimal",
             toolchains.stable
         ),
-        "./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public".into(),
+        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public".into(),
     ];
     if run_commands.len() != expected.len()
         || !run_commands
@@ -2950,6 +2951,8 @@ struct RustPolicy {
     calls_current_exe: bool,
     names_proc_self_exe: bool,
     calls_env_remove: bool,
+    unreviewed_fixture_env_remove: bool,
+    in_generated_fixture_child: bool,
     subprocess_env_mutations: usize,
     standard_path_mutations: usize,
     pre_exec_calls: usize,
@@ -2957,6 +2960,13 @@ struct RustPolicy {
 }
 
 impl<'ast> Visit<'ast> for RustPolicy {
+    fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+        let previous = self.in_generated_fixture_child;
+        self.in_generated_fixture_child = function.sig.ident == "generated_fixture_child";
+        syn::visit::visit_item_fn(self, function);
+        self.in_generated_fixture_child = previous;
+    }
+
     fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
         if let syn::Expr::Path(path) = expression.func.as_ref() {
             let segments: Vec<String> = path
@@ -3016,6 +3026,11 @@ impl<'ast> Visit<'ast> for RustPolicy {
     fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
         if expression.method == "env_remove" {
             self.calls_env_remove = true;
+            let compiler_selector = expression.args.len() == 1
+                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if matches!(key.value().as_str(), "RUSTC" | "RUSTDOC"));
+            if !self.in_generated_fixture_child || !compiler_selector {
+                self.unreviewed_fixture_env_remove = true;
+            }
         }
         if expression.method == "pre_exec" {
             self.pre_exec_calls += 1;
@@ -3058,6 +3073,14 @@ fn managed_compilation_environment_boundary(relative: &Path) -> bool {
 }
 
 /// Parses untrusted Rust source and applies the repository's semantic subprocess policy.
+fn reviewed_environment_removal(relative: &Path, visitor: &RustPolicy) -> bool {
+    !visitor.calls_env_remove
+        || relative == Path::new("tools/memcordon-ci/src/command.rs")
+        || relative == Path::new("tools/memcordon-ci/src/release.rs")
+        || (relative == Path::new("tools/memcordon-ci/tests/build_context.rs")
+            && !visitor.unreviewed_fixture_env_remove)
+}
+
 pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     let source = std::str::from_utf8(bytes)
         .map_err(|_| failure(format!("Rust source is not UTF-8: {relative:?}")))?;
@@ -3103,10 +3126,7 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
             .violations
             .push("platform helper self-execution is forbidden".to_owned());
     }
-    if visitor.calls_env_remove
-        && relative != Path::new("tools/memcordon-ci/src/command.rs")
-        && relative != Path::new("tools/memcordon-ci/src/release.rs")
-    {
+    if !reviewed_environment_removal(relative, &visitor) {
         visitor
             .violations
             .push("credential removal is allowed only in exact CI tooling".to_owned());
@@ -3203,10 +3223,7 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
                 .violations
                 .push("platform helper self-execution is forbidden".to_owned());
         }
-        if visitor.calls_env_remove
-            && relative != Path::new("tools/memcordon-ci/src/command.rs")
-            && relative != Path::new("tools/memcordon-ci/src/release.rs")
-        {
+        if !reviewed_environment_removal(relative, &visitor) {
             visitor
                 .violations
                 .push("credential removal is allowed only in exact CI tooling".to_owned());
@@ -3243,11 +3260,37 @@ fn is_reviewed_raw_fork_boundary(relative: &Path) -> bool {
     )
 }
 
+pub fn workspace_metadata_command(root: &Path) -> Result<command::CommandSpec> {
+    let toolchains = config::toolchains(root)?;
+    Ok(command::rustup_cargo(
+        root,
+        &toolchains.stable,
+        [
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--locked",
+            "--offline",
+        ],
+        std::time::Duration::from_secs(120),
+    ))
+}
+
+pub fn workspace_metadata(root: &Path) -> Result<cargo_metadata::Metadata> {
+    let output = workspace_metadata_command(root)?.output()?;
+    if !output.status.success() {
+        return Err(failure(format!(
+            "workspace metadata failed with {}; stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
 fn check_manifests(root: &Path, policy: &config::Policy) -> Result<()> {
-    let metadata = cargo_metadata::MetadataCommand::new()
-        .current_dir(root)
-        .no_deps()
-        .exec()?;
+    let metadata = workspace_metadata(root)?;
     let release = config::release(root)?;
     if release.publish_packages != policy.workspace.publish_packages {
         return Err(failure(

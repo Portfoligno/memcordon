@@ -332,9 +332,13 @@ struct Frame {
 
 struct Channel {
     invalidated: bool,
+    invalidation_reason: Option<String>,
+    frame_started: bool,
     write_attempted: bool,
     #[cfg(feature = "test-support")]
     cancel_release_prefix: Option<i32>,
+    #[cfg(feature = "test-support")]
+    expire_send_after_prefix: bool,
     admission: Option<crate::signal::LaunchAdmission>,
     stream: UnixStream,
     run: u64,
@@ -452,9 +456,13 @@ impl Channel {
         Ok(Self {
             stream,
             invalidated: false,
+            invalidation_reason: None,
+            frame_started: false,
             write_attempted: false,
             #[cfg(feature = "test-support")]
             cancel_release_prefix: None,
+            #[cfg(feature = "test-support")]
+            expire_send_after_prefix: false,
             admission: None,
             run,
             sent: 0,
@@ -496,7 +504,12 @@ impl Channel {
                         "partial private launch frame",
                     ));
                 }
-                Ok(count) => offset += count,
+                Ok(count) => {
+                    offset += count;
+                    if write {
+                        self.frame_started = true;
+                    }
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     let mut poll = libc::pollfd {
@@ -520,7 +533,32 @@ impl Channel {
         }
         Ok(true)
     }
+    fn record_send_failure(&mut self, error: &io::Error) {
+        // An expired sampling budget must not destroy the retirement channel
+        // when no frame byte reached its peer. Cancellation still invalidates
+        // in transfer(), and any partial prefix/payload remains unrecoverable.
+        if error.kind() == io::ErrorKind::TimedOut && !self.frame_started && !self.invalidated {
+            return;
+        }
+        self.invalidated = true;
+        self.invalidation_reason
+            .get_or_insert_with(|| error.to_string());
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
     fn send(&mut self, message: Message, deadline: Instant) -> io::Result<()> {
+        if self.invalidated {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!(
+                    "private channel invalidated: {}",
+                    self.invalidation_reason
+                        .as_deref()
+                        .unwrap_or("launch admission cancelled")
+                ),
+            ));
+        }
+        self.frame_started = false;
         #[cfg(feature = "test-support")]
         let releasing = message == Message::Release;
         let mut bytes = serde_json::to_vec(&Frame {
@@ -533,10 +571,7 @@ impl Channel {
             return Err(io::Error::other("private launch frame exceeds bound"));
         }
         self.transfer(&mut (bytes.len() as u16).to_be_bytes(), true, deadline)
-            .inspect_err(|_| {
-                self.invalidated = true;
-                let _ = self.stream.shutdown(std::net::Shutdown::Both);
-            })?;
+            .inspect_err(|error| self.record_send_failure(error))?;
         #[cfg(feature = "test-support")]
         if releasing {
             if let (Some(signal), Some(admission)) =
@@ -545,10 +580,14 @@ impl Channel {
                 admission.record_for_test(signal);
             }
         }
-        self.transfer(&mut bytes, true, deadline).inspect_err(|_| {
-            self.invalidated = true;
-            let _ = self.stream.shutdown(std::net::Shutdown::Both);
-        })?;
+        #[cfg(feature = "test-support")]
+        let deadline = if self.expire_send_after_prefix {
+            Instant::now()
+        } else {
+            deadline
+        };
+        self.transfer(&mut bytes, true, deadline)
+            .inspect_err(|error| self.record_send_failure(error))?;
         self.sent = self
             .sent
             .checked_add(1)
@@ -666,11 +705,104 @@ impl Channel {
         match self.receive(deadline)? {
             Some(message) if message == expected => Ok(()),
             Some(Message::Failure { errno }) => Err(io::Error::from_raw_os_error(errno)),
-            _ => Err(io::Error::other(
-                "unexpected private launch protocol transition",
+            Some(Message::FailureDetail { message }) => Err(io::Error::other(format!(
+                "private launch protocol expected {}, received FailureDetail: {message}",
+                expected.tag()
+            ))),
+            Some(message) => Err(io::Error::other(format!(
+                "private launch protocol expected {}, received {}",
+                expected.tag(),
+                message.tag()
+            ))),
+            None => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "private launch protocol expected {}, received EOF",
+                    expected.tag()
+                ),
             )),
         }
     }
+}
+
+impl Message {
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Hello => "Hello",
+            Self::Ready => "Ready",
+            Self::Bind { .. } => "Bind",
+            Self::Armed { .. } => "Armed",
+            Self::Release => "Release",
+            Self::Disarm => "Disarm",
+            Self::Retired => "Retired",
+            Self::Failure { .. } => "Failure",
+            Self::FailureDetail { .. } => "FailureDetail",
+            Self::Configure { .. } => "Configure",
+            Self::Prepared { .. } => "Prepared",
+            Self::Released => "Released",
+            Self::ReleaseIssued { .. } => "ReleaseIssued",
+            Self::ForceRequested { .. } => "ForceRequested",
+            Self::Observe => "Observe",
+            Self::Reap => "Reap",
+            Self::Stop => "Stop",
+            Self::Heartbeat => "Heartbeat",
+            Self::StopAt { .. } => "StopAt",
+            Self::SignalStop { .. } => "SignalStop",
+            Self::RestoreSignal { .. } => "RestoreSignal",
+            Self::InventoryQuery { .. } => "InventoryQuery",
+            Self::InventoryChunk { .. } => "InventoryChunk",
+            Self::Status { .. } => "Status",
+            #[cfg(feature = "test-support")]
+            Self::HoldSpawn => "HoldSpawn",
+            #[cfg(feature = "test-support")]
+            Self::HoldSpawnReleaseAfterCancel => "HoldSpawnReleaseAfterCancel",
+            #[cfg(feature = "test-support")]
+            Self::SpawnHeld { .. } => "SpawnHeld",
+            #[cfg(feature = "test-support")]
+            Self::ResumeSpawn => "ResumeSpawn",
+            #[cfg(feature = "test-support")]
+            Self::InterruptClock => "InterruptClock",
+            #[cfg(feature = "test-support")]
+            Self::ClockInterruptible => "ClockInterruptible",
+            #[cfg(feature = "test-support")]
+            Self::AdvanceClock { .. } => "AdvanceClock",
+            #[cfg(feature = "test-support")]
+            Self::DisableWorkTimer => "DisableWorkTimer",
+            #[cfg(feature = "test-support")]
+            Self::StallInspectors { .. } => "StallInspectors",
+            #[cfg(feature = "test-support")]
+            Self::InspectorsStalled { .. } => "InspectorsStalled",
+            #[cfg(feature = "test-support")]
+            Self::Snapshot { .. } => "Snapshot",
+            #[cfg(feature = "test-support")]
+            Self::Observed { .. } => "Observed",
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub fn protocol_expectation_fixture(case: u8) -> io::Result<()> {
+    let (sender, receiver) = UnixStream::pair()?;
+    let mut sender = Channel::new(sender, 1)?;
+    let mut receiver = Channel::new(receiver, 1)?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let message = match case {
+        0 => Some(Message::Released),
+        1 => Some(Message::Failure {
+            errno: libc::ENOENT,
+        }),
+        2 => Some(Message::FailureDetail {
+            message: "confirm target exec witness: fixture evidence".into(),
+        }),
+        3 => Some(Message::Retired),
+        4 => None,
+        _ => return Err(io::Error::other("unknown expectation fixture")),
+    };
+    if let Some(message) = message {
+        sender.send(message, deadline)?;
+    }
+    drop(sender);
+    receiver.expect(Message::Released, deadline)
 }
 
 fn native_spawn(
@@ -1068,13 +1200,13 @@ impl Guardian {
         let (snapshots, known, _) = self.query(None, deadline)?;
         snapshots.map(|snapshots| (snapshots, known))
     }
-    pub(crate) fn sample(
+    pub(crate) fn inventory_with_metric(
         &self,
-        metric: memcordon_core::Metric,
+        metric: Option<memcordon_core::Metric>,
         deadline: Instant,
-    ) -> Result<u64, String> {
-        let (_, _, sample) = self.query(Some(metric), deadline)?;
-        sample.ok_or_else(|| "guardian sample response missing".to_owned())?
+    ) -> Result<ObservedInventory, String> {
+        let (snapshots, known, sample) = self.query(metric, deadline)?;
+        snapshots.map(|snapshots| (snapshots, known, sample))
     }
     pub(crate) fn pid(&self) -> u32 {
         self.child.id()
@@ -1671,6 +1803,11 @@ fn exec_native(program: &std::ffi::OsStr, arguments: &[OsString]) -> io::Error {
 }
 
 type InventoryIdentities = std::collections::HashSet<crate::macos_watchdog::ProcessIdentity>;
+type ObservedInventory = (
+    Vec<crate::macos_watchdog::ProcessSnapshot>,
+    InventoryIdentities,
+    Option<Result<u64, String>>,
+);
 type InventoryReply = (
     Result<Vec<crate::macos_watchdog::ProcessSnapshot>, String>,
     InventoryIdentities,
@@ -2500,20 +2637,25 @@ fn guardian_main(
                         )?;
                     }
                     Ok(Some(None)) if released && !confirmed => {
-                        if witness
+                        let confirmation = witness
                             .as_ref()
                             .expect("exec witness reserved")
-                            .confirm(Instant::now() + Duration::from_millis(20))
-                            .is_ok()
-                        {
+                            .confirm(Instant::now() + Duration::from_millis(20));
+                        if let Err(error) = confirmation {
+                            terminal.get_or_insert(now);
+                            force_at.get_or_insert(now);
+                            let _ = control.send(
+                                Message::FailureDetail {
+                                    message: format!("confirm target exec witness: {error}"),
+                                },
+                                Instant::now() + Duration::from_millis(20),
+                            );
+                        } else {
                             confirmed = true;
                             control.send(
                                 Message::Released,
                                 Instant::now() + Duration::from_millis(20),
                             )?;
-                        } else {
-                            terminal.get_or_insert(now);
-                            force_at.get_or_insert(now);
                         }
                         launcher = None;
                     }
@@ -3156,6 +3298,79 @@ pub fn disarm_timeout(image: &Path) -> Result<(), String> {
         return Err("runtime did not discharge abandoned guardian reaping".into());
     }
     Ok(())
+}
+
+#[cfg(feature = "test-support")]
+pub fn expired_control_request_preserves_retirement() -> Result<(), String> {
+    let exercise = || -> io::Result<()> {
+        let (left, right) = private_pair()?;
+        let mut sender = Channel::new(left, 7)?;
+        let mut receiver = Channel::new(right, 7)?;
+        let error = sender
+            .send(
+                Message::InventoryQuery {
+                    query: 0,
+                    metric: None,
+                },
+                Instant::now(),
+            )
+            .expect_err("expired inventory request must fail");
+        if error.kind() != io::ErrorKind::TimedOut || sender.sent != 0 {
+            return Err(io::Error::other("expired query advanced protocol state"));
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let stop = || Message::SignalStop {
+            signal: libc::SIGKILL,
+            force: 0,
+        };
+        sender.send(stop(), deadline)?;
+        receiver.expect(stop(), deadline)?;
+        let query = || Message::InventoryQuery {
+            query: 1,
+            metric: None,
+        };
+        sender.send(query(), deadline)?;
+        receiver.expect(query(), deadline)?;
+        Ok(())
+    };
+    exercise().map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "test-support")]
+pub fn partial_control_frame_invalidates_retirement() -> Result<(), String> {
+    let exercise = || -> io::Result<()> {
+        let (left, right) = private_pair()?;
+        let mut sender = Channel::new(left, 7)?;
+        let mut receiver = Channel::new(right, 7)?;
+        sender.expire_send_after_prefix = true;
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let error = sender
+            .send(Message::Heartbeat, deadline)
+            .expect_err("partial frame expires");
+        if error.kind() != io::ErrorKind::TimedOut || !sender.invalidated || sender.sent != 0 {
+            return Err(io::Error::other(
+                "partial frame did not invalidate the channel",
+            ));
+        }
+        let later = sender
+            .send(Message::Heartbeat, deadline)
+            .expect_err("partial frame cannot be reused");
+        if !later.to_string().contains(&error.to_string()) {
+            return Err(io::Error::other("original channel failure was lost"));
+        }
+        loop {
+            match receiver.receive_available() {
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Ok(None) if Instant::now() < deadline => {}
+                other => {
+                    return Err(io::Error::other(format!(
+                        "partial frame was not rejected: {other:?}"
+                    )));
+                }
+            }
+        }
+    };
+    exercise().map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "test-support")]

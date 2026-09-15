@@ -712,10 +712,11 @@ pub fn validate_packages(root: &Path) -> Result<()> {
     let release = config::release(root)?;
     let default_cargo_binaries = configured_default_cargo_binaries(&release)?;
     let toolchains = config::toolchains(root)?;
-    create_package_archives(root, &toolchains.stable, &release.publish_packages)?;
+    let archives = create_package_archives(root, &toolchains.stable, &release.publish_packages)?;
     for package in &release.publish_packages {
         let record = package_crate(
             root,
+            &archives,
             &toolchains.stable,
             package,
             &identity.version,
@@ -732,6 +733,7 @@ pub fn validate_packages(root: &Path) -> Result<()> {
     }
     smoke_packaged_memcordon_install(
         root,
+        &archives,
         &toolchains.stable,
         &identity.version,
         &identity.commit,
@@ -1072,8 +1074,10 @@ fn relocated_manifest_source<const N: usize>(
     Ok(resolved)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn package_crate(
     root: &Path,
+    archives: &Path,
     stable: &str,
     package: &str,
     version: &Version,
@@ -1092,7 +1096,7 @@ fn package_crate(
     let inventory = utf8(inventory, "Cargo package inventory")?;
     let canonical_tree_sha256 = canonical_source_tree(root, package, &inventory)?;
     let filename = format!("{package}-{version}.crate");
-    let archive = package_archive_directory(root).join(filename);
+    let archive = archives.join(filename);
     if !archive.is_file() {
         return Err(failure(format!(
             "Cargo did not produce package archive for {package}"
@@ -1138,33 +1142,18 @@ pub(crate) fn create_package_archives(
     root: &Path,
     stable: &str,
     packages: &[String],
-) -> Result<()> {
-    let mut arguments = vec![
-        OsString::from("package"),
-        OsString::from("--locked"),
-        OsString::from("--no-verify"),
-    ];
-    for package in packages {
-        arguments.push(OsString::from("--package"));
-        arguments.push(OsString::from(package));
-    }
-    rustup_cargo(root, stable, arguments, RELEASE_DEADLINE).run()?;
-    Ok(())
-}
-
-pub(crate) fn package_archive_directory(root: &Path) -> PathBuf {
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target"));
-    if target.is_absolute() {
-        target.join("package")
-    } else {
-        root.join(target).join("package")
-    }
+) -> Result<PathBuf> {
+    let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    let output = crate::command::PackageOutput::new(root, target.as_deref())?;
+    output.command(root, stable, packages).run()?;
+    Ok(output.archive_directory())
 }
 
 pub(crate) fn extract_crate_source(archive_path: &Path, destination: &Path) -> Result<()> {
-    let decoder = GzDecoder::new(File::open(archive_path)?);
+    let decoder =
+        GzDecoder::new(File::open(archive_path).map_err(|error| {
+            failure(format!("opening package archive {archive_path:?}: {error}"))
+        })?);
     let mut archive = tar::Archive::new(decoder);
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -1390,6 +1379,7 @@ fn installed_binary_name(name: &str) -> OsString {
 
 fn smoke_packaged_memcordon_install(
     root: &Path,
+    archives: &Path,
     stable: &str,
     version: &Version,
     source_commit: &str,
@@ -1407,7 +1397,7 @@ fn smoke_packaged_memcordon_install(
         ("memcordon-windows-launch-core", &launch_core),
         ("memcordon", &cli),
     ] {
-        let archive = package_archive_directory(root).join(format!("{package}-{version}.crate"));
+        let archive = archives.join(format!("{package}-{version}.crate"));
         extract_crate_source(&archive, destination)?;
     }
     let cargo_configuration = temporary.path().join(".cargo");
@@ -2857,11 +2847,12 @@ fn assemble(root: &Path) -> Result<()> {
         checksums.push('\n');
     }
     fs::write(output.join(&release.assets.checksums), checksums)?;
-    create_package_archives(root, &toolchains.stable, &release.publish_packages)?;
+    let archives = create_package_archives(root, &toolchains.stable, &release.publish_packages)?;
     let mut crates = Vec::new();
     for package in &release.publish_packages {
         crates.push(package_crate(
             root,
+            &archives,
             &toolchains.stable,
             package,
             &identity.version,
@@ -2869,8 +2860,7 @@ fn assemble(root: &Path) -> Result<()> {
             release.maximum_package_bytes,
             &default_cargo_binaries,
         )?);
-        let archive =
-            package_archive_directory(root).join(format!("{package}-{}.crate", identity.version));
+        let archive = archives.join(format!("{package}-{}.crate", identity.version));
         let package_output = output.join("packages");
         fs::create_dir_all(&package_output)?;
         fs::copy(

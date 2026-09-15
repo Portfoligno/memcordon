@@ -1440,6 +1440,24 @@ fn removed_run_binary_path_never_launches() {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+fn asserted_spawn_failure_report(
+    output: &std::process::Output,
+    report: &std::path::Path,
+    expected_status: i32,
+) -> serde_json::Value {
+    let report_contents = std::fs::read_to_string(report);
+    assert_eq!(
+        output.status.code(),
+        Some(expected_status),
+        "stdout={:?}; stderr={:?}; report={report_contents:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    serde_json::from_str(&report_contents.expect("failure report should be written"))
+        .expect("failure report should be JSON")
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
 fn command_not_found_maps_to_127_and_produces_schema_five_failure_report() {
     let temporary = tempfile::tempdir().expect("temporary directory should exist");
@@ -1452,10 +1470,7 @@ fn command_not_found_maps_to_127_and_produces_schema_five_failure_report() {
         .arg(&missing)
         .output()
         .expect("wrapper should run");
-    assert_eq!(output.status.code(), Some(127));
-    let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(report).expect("failure report should be written"))
-            .expect("failure report should be JSON");
+    let value = asserted_spawn_failure_report(&output, &report, 127);
     assert_eq!(value["schema_version"], EXECUTION_REPORT_SCHEMA_VERSION);
     assert_eq!(value["supervision"]["wrapper_exit_code"], 127);
     assert_eq!(value["attempts"][0]["error"]["code"], "MCSPAWN-NOT-FOUND");
@@ -1482,10 +1497,7 @@ fn command_not_executable_maps_to_126_in_aggregate_report() {
         .arg(&target)
         .output()
         .expect("wrapper should run");
-    assert_eq!(output.status.code(), Some(126));
-    let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(report).expect("failure report should be written"))
-            .expect("failure report should be JSON");
+    let value = asserted_spawn_failure_report(&output, &report, 126);
     assert_eq!(value["supervision"]["wrapper_exit_code"], 126);
     assert_eq!(
         value["attempts"][0]["error"]["initial_spawn_failure"],

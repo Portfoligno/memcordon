@@ -460,17 +460,29 @@ fn assert_natural_workload_completion(child_duration: &str, outer_deadline: Dura
     }
     let pid_file = temporary_pid_file();
     let completion_marker = pid_file.with_extension("completed");
-    let mut invocation = wrapped_with_options(
-        &["--wait-for", "workload"],
-        fixture(),
-        &[
-            "spawn-background",
-            "--child-duration",
-            child_duration,
-            "--exit-code",
-            "37",
-        ],
-    );
+    let report_file = pid_file.with_extension("json");
+    let mut invocation = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    invocation.args([
+        "--enforcement",
+        if cfg!(target_os = "macos") {
+            "watchdog"
+        } else {
+            "hard"
+        },
+        "--wait-for",
+        "workload",
+        "--report",
+    ]);
+    invocation.arg(&report_file);
+    invocation.args(["+8GiB", "--"]);
+    invocation.arg(fixture());
+    invocation.args([
+        "spawn-background",
+        "--child-duration",
+        child_duration,
+        "--exit-code",
+        "37",
+    ]);
     invocation
         .arg("--pid-file")
         .arg(&pid_file)
@@ -478,12 +490,17 @@ fn assert_natural_workload_completion(child_duration: &str, outer_deadline: Dura
         .arg(&completion_marker);
 
     let output = completed(&mut invocation, outer_deadline);
+    let report = fs::read_to_string(&report_file);
     assert_eq!(
         output.status.code(),
         Some(37),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        "stderr={}; natural_completion_marker={}; report={report:?}",
+        String::from_utf8_lossy(&output.stderr),
+        completion_marker.exists(),
     );
+    let _: serde_json::Value =
+        serde_json::from_str(&report.expect("natural completion report should be readable"))
+            .expect("natural completion report should be valid JSON");
     assert_stdout_empty(&output);
     assert!(
         completion_marker.exists(),
@@ -493,6 +510,7 @@ fn assert_natural_workload_completion(child_duration: &str, outer_deadline: Dura
     assert_process_gone(identity);
     fs::remove_file(pid_file).expect("temporary PID file should be removable");
     fs::remove_file(completion_marker).expect("completion marker should be removable");
+    fs::remove_file(report_file).expect("temporary report should be removable");
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

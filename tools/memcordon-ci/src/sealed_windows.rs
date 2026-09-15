@@ -31,7 +31,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
-use crate::release::{create_package_archives, extract_crate_source, package_archive_directory};
+use crate::release::{create_package_archives, extract_crate_source};
 
 const DEADLINE: Duration = Duration::from_secs(30 * 60);
 const REPORT_DIRECTORY: &str = "target/ci/reports/windows-sealed-v2";
@@ -1558,13 +1558,13 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
     fs::create_dir_all(&durable_sources)?;
     let version = env!("CARGO_PKG_VERSION");
     let packages = WINDOWS_PACKAGE_NAMES.map(str::to_owned);
-    create_package_archives(root, stable, &packages)?;
+    let archives = create_package_archives(root, stable, &packages)?;
     let durable_layout = WindowsPackageSourceLayout::new(durable_sources);
     let execution_sources = ExternalWindowsPackageSources::new(root)?;
     for layout in [&durable_layout, execution_sources.layout()] {
         for (package, destination) in layout.package_destinations() {
             extract_crate_source(
-                &package_archive_directory(root).join(format!("{package}-{version}.crate")),
+                &archives.join(format!("{package}-{version}.crate")),
                 destination,
             )?;
         }

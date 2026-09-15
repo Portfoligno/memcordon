@@ -8,11 +8,14 @@ use serde::Serialize;
 use memcordon_ci::capability;
 use memcordon_ci::standard_contract::{CargoTestTarget, HardBackendScenario};
 
-use crate::command::{CommandSpec, git, rustup_cargo};
+use crate::command::{CommandSpec, git, rustup_cargo, supply_chain_commands};
 use crate::config;
 use crate::{CiError, Result, Suite, policy, release};
 
 const CARGO_DEADLINE: Duration = Duration::from_secs(15 * 60);
+// The deep child loop retains its 30-minute runtime budget; allow a bounded
+// five minutes for Cargo compilation and launch outside that measured loop.
+const DEEP_CHILD_STRESS_DEADLINE: Duration = Duration::from_secs(35 * 60);
 const CERTIFICATION_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
 fn cargo(
@@ -156,15 +159,9 @@ fn supply_chain(root: &Path, stable: &str) -> Result<()> {
     let tools = config::tools(root)?;
     install_tool(root, stable, "cargo-audit", &tools.cargo_audit)?;
     install_tool(root, stable, "cargo-deny", &tools.cargo_deny)?;
-    let bin = root.join("target").join("ci-tools").join("bin");
-    CommandSpec::new(bin.join("cargo-audit"), root, Duration::from_secs(10 * 60))
-        .arg("audit")
-        .arg("--deny")
-        .arg("warnings")
-        .run()?;
-    CommandSpec::new(bin.join("cargo-deny"), root, Duration::from_secs(10 * 60))
-        .args(["--config", "ci/deny.toml", "check"])
-        .run()?;
+    for command in supply_chain_commands(root, stable) {
+        command.run()?;
+    }
     if fs::read(lockfile)? != lock_before {
         return Err(CiError::Message(
             "supply-chain operations changed Cargo.lock".to_owned(),
@@ -334,7 +331,7 @@ fn stress(root: &Path, stable: &str) -> Result<()> {
         return Ok(());
     }
     capability::require_selected(&probe)?;
-    cargo(
+    cargo_with_deadline(
         root,
         stable,
         "test",
@@ -355,6 +352,7 @@ fn stress(root: &Path, stable: &str) -> Result<()> {
             "--nocapture",
             "--test-threads=1",
         ],
+        DEEP_CHILD_STRESS_DEADLINE,
     )?;
     let report: serde_json::Value = serde_json::from_slice(&fs::read(
         reports.join("stress-deep_short_child_iterations.json"),

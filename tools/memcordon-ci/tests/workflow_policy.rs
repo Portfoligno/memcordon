@@ -20,7 +20,7 @@ fn macos_deadline_rejects_missing_native_fingerprint_and_failure_evidence() {
     )
     .expect("complete independent deadline lane");
     for missing in [
-        "./ci-native-fingerprint --output target/ci/native-inputs.bin",
+        "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin",
         "target/ci/deadline-evidence",
     ] {
         let invalid = fixture.replace(missing, "missing-deadline-proof");
@@ -71,7 +71,7 @@ fn deep_ci_fuzz_timeout_covers_the_complete_target_set() {
     )
     .expect("the exact deep CI workflow should pass");
 
-    for timeout_minutes in [30, 44, 60] {
+    for timeout_minutes in [30, 45, 59, 61] {
         let invalid = workflow_with_job_timeout(fixture, "fuzz", timeout_minutes);
         let error = policy::validate_workflow_bytes(
             &root,
@@ -345,7 +345,7 @@ fn public_windows_release_smoke_is_structurally_required() {
         ),
         (
             "public verification command",
-            "      - run: ./target/ci/control-bootstrap/debug/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public\n",
+            "      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public\n",
             "",
             "verify-public step count differs",
         ),

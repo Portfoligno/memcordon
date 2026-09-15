@@ -32,7 +32,7 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
             };
             if text(step, "run")
                 == Some(
-                    "rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint",
+                    "rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe",
                 )
             {
                 if step.len() != 1 {
@@ -43,7 +43,7 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                 seed_compiled = true;
             }
             if text(step, "run")
-                == Some("./ci-native-fingerprint --output target/ci/native-inputs.bin")
+                == Some("./ci-native-fingerprint.exe --output target/ci/native-inputs.bin")
             {
                 if !seed_compiled || step.len() != 1 {
                     return Err(fail(
@@ -54,7 +54,7 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
             }
             if text(step, "run")
                 == Some(
-                    "./target/ci/control-bootstrap/debug/memcordon-ci audit-build-context --input target/ci/native-inputs.bin",
+                    "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin",
                 )
             {
                 if !planned
@@ -68,7 +68,9 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                 audited = true;
             }
             if text(step, "run").is_some_and(|run| {
-                run.starts_with("./target/ci/control-bootstrap/debug/memcordon-ci --build-context")
+                run.starts_with(
+                    "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context",
+                )
             }) && text(step, "if").is_some_and(|condition| condition.contains("cache-hit"))
             {
                 return Err(fail("cache hits must not skip fresh suite execution"));
@@ -142,12 +144,11 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                     key.replace("hashFiles('target/ci/native-inputs.bin', ", "hashFiles(")
                 };
                 with.insert(Value::from("key"), Value::from(payload));
-            } else if action.starts_with("actions/cache/save@") {
-                if !audited || !condition.contains("steps.build-context-audit.outcome == 'success'")
+            } else if action.starts_with("actions/cache/save@")
+                && (!audited || !condition.contains("steps.build-context-audit.outcome == 'success'")
                     || !condition.contains(".outputs.cache-primary-key != ''")
-                    || !condition.contains("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)") {
+                    || !condition.contains("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)")) {
                     return Err(fail("compiled cache publication requires a successful audit, nonempty primary key and trusted default branch"));
-                }
             }
             if paths.lines().any(|path| path.starts_with('!')) {
                 let mut payload = paths
@@ -173,10 +174,10 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
         // only projected-away operations are the three fixed managed controls.
         steps.retain(|value| {
             let Some(run) = value.get("run").and_then(Value::as_str) else { return true; };
-            run != "./target/ci/control-bootstrap/debug/memcordon-ci audit-build-context --input target/ci/native-inputs.bin"
+            run != "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin"
                 && (macos_gate || !matches!(run,
-                    "rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint" |
-                    "./ci-native-fingerprint --output target/ci/native-inputs.bin"))
+                    "rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe" |
+                    "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin"))
         });
         if planned && !macos_gate {
             let installers: Vec<_> = steps

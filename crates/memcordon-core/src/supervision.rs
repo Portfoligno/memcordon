@@ -1357,8 +1357,85 @@ impl SupervisionExecution {
         duration_ms: u64,
         targets_authorized: u64,
     ) -> Result<Self, SupervisionModelError> {
+        let rejected = |invariant| {
+            let terminal_summary = match &terminal {
+                SupervisionTerminal::AttemptOutcome {
+                    attempt_number,
+                    outcome,
+                } => (
+                    "attempt-outcome",
+                    Some(*attempt_number),
+                    outcome_status(outcome),
+                ),
+                SupervisionTerminal::Error {
+                    attempt_number,
+                    error,
+                } => ("error", *attempt_number, error.terminal_status()),
+                SupervisionTerminal::DeadlineOutsideAttempt { .. } => {
+                    ("outside-deadline", None, 123)
+                }
+            };
+            let summarize = |record: &AttemptRecord| {
+                format!(
+                    "number={} kind={:?} phase={:?} consistent={} pid={:?} times={:?} outcome_status={:?} error_status={:?} launch={:?} safety={:?}",
+                    record.number,
+                    record.kind,
+                    record.phase,
+                    record.is_consistent(),
+                    record.target_pid,
+                    (
+                        record.started_offset_ms,
+                        record.authorized_offset_ms,
+                        record.terminal_offset_ms,
+                        record.finished_offset_ms
+                    ),
+                    record.outcome.as_ref().map(outcome_status),
+                    record
+                        .error
+                        .as_ref()
+                        .map(SupervisionErrorRecord::terminal_status),
+                    (
+                        record.launch.target_released,
+                        record.launch.boundary_requested,
+                        record.launch.boundary_effective,
+                        record.launch.boundary_assignment_verified,
+                        record.launch.boundary_reconfiguration_denied,
+                        record.launch.inherited_resources_restricted,
+                        record.launch.frontend_loss_cleanup_authority_verified
+                    ),
+                    (
+                        record.restart_safety.direct_child_reaped,
+                        record.restart_safety.workload_empty,
+                        record.restart_safety.helpers_reaped,
+                        record.restart_safety.containment_removed,
+                        record.restart_safety.containment_incapable_of_live_members,
+                        record.restart_safety.sealed_boundary_retired,
+                        record.restart_safety.errors.len()
+                    )
+                )
+            };
+            SupervisionModelError::RejectedExecution {
+                invariant,
+                candidate: format!(
+                    "backend_class={:?}; backend_consistent={}; terminal={terminal_summary:?}; attempts_total={}; retained={}; omitted={}; first={:?}; latest={:?}; first_invalid={:?}; aggregates={aggregates:?}; restarts_launched={}; deadline_present={}; duration_ms={duration_ms}; targets_authorized={targets_authorized}",
+                    backend.boundary.class,
+                    backend.boundary.is_consistent(),
+                    attempts.total,
+                    attempts.retained(),
+                    attempts.omitted,
+                    attempts.records().next().map(summarize),
+                    attempts.records().last().map(summarize),
+                    attempts
+                        .records()
+                        .find(|record| !record.is_consistent())
+                        .map(summarize),
+                    restart.restarts_launched,
+                    deadline.is_some()
+                ),
+            }
+        };
         if !backend.boundary.is_consistent() {
-            return Err(SupervisionModelError::InconsistentExecution);
+            return Err(rejected("backend boundary consistency"));
         }
         let aggregate_total = aggregates
             .child_exits
@@ -1368,19 +1445,26 @@ impl SupervisionExecution {
             .and_then(|v| v.checked_add(aggregates.monitor_failures))
             .and_then(|v| v.checked_add(aggregates.setup_failures))
             .ok_or(SupervisionModelError::CounterRange)?;
-        if aggregate_total != attempts.total
-            || !attempts.validate()
-            || attempts.retained() > DETAILED_ATTEMPT_CAPACITY
-            || attempts.omitted != attempts.total.saturating_sub(attempts.retained() as u64)
-            || restart.restarts_launched > targets_authorized
-            || targets_authorized != aggregates.confirmed_authorizations
-            || !aggregates.authorizations_match(
-                attempts.records(),
-                attempts.total,
-                attempts.omitted,
-            )
-        {
-            return Err(SupervisionModelError::InconsistentExecution);
+        if aggregate_total != attempts.total {
+            return Err(rejected("aggregate outcome total matches attempt total"));
+        }
+        if !attempts.validate() {
+            return Err(rejected("attempt history validation"));
+        }
+        if attempts.retained() > DETAILED_ATTEMPT_CAPACITY {
+            return Err(rejected("retained attempt capacity"));
+        }
+        if attempts.omitted != attempts.total.saturating_sub(attempts.retained() as u64) {
+            return Err(rejected("omitted attempt count"));
+        }
+        if restart.restarts_launched > targets_authorized {
+            return Err(rejected("restarts do not exceed authorizations"));
+        }
+        if targets_authorized != aggregates.confirmed_authorizations {
+            return Err(rejected("target and aggregate authorizations agree"));
+        }
+        if !aggregates.authorizations_match(attempts.records(), attempts.total, attempts.omitted) {
+            return Err(rejected("aggregate authorizations match retained attempts"));
         }
         let (wrapper_exit_code, outside_deadline, terminal_attempt) = match &terminal {
             SupervisionTerminal::AttemptOutcome {
@@ -1389,7 +1473,7 @@ impl SupervisionExecution {
             } => (outcome_status(outcome), false, Some(*attempt_number)),
             SupervisionTerminal::DeadlineOutsideAttempt { evidence } => {
                 if evidence.evidence.scope() != crate::DeadlineScope::Supervision {
-                    return Err(SupervisionModelError::InconsistentExecution);
+                    return Err(rejected("outside deadline has supervision scope"));
                 }
                 (123, true, None)
             }
@@ -1423,31 +1507,39 @@ impl SupervisionExecution {
             } => error.provenance_is_consistent() && error.attempt_number.is_none(),
             SupervisionTerminal::DeadlineOutsideAttempt { .. } => true,
         };
-        if terminal_attempt.is_some_and(|number| number == 0 || number != attempts.total)
-            || !terminal_matches_latest
-            || outside_deadline != deadline.is_some()
-            || attempts.records().any(|record| {
-                let sealed = record.launch.boundary_requested == BoundaryRequirement::Sealed;
-                (record.launch.boundary_effective == BoundaryClass::Sealed
-                    && backend.boundary.class != BoundaryClass::Sealed)
-                    || (record.launch.target_released
-                        && sealed
-                        && (record.launch.boundary_effective != BoundaryClass::Sealed
-                            || !record.launch.boundary_assignment_verified
-                            || !record.launch.boundary_reconfiguration_denied
-                            || !record.launch.inherited_resources_restricted
-                            || !record.launch.frontend_loss_cleanup_authority_verified))
-                    || (sealed
-                        && record.restart_safety.is_safe()
-                        && !record.restart_safety.sealed_boundary_retired)
+        if terminal_attempt.is_some_and(|number| number == 0 || number != attempts.total) {
+            return Err(rejected("terminal attempt is latest nonzero attempt"));
+        }
+        if !terminal_matches_latest {
+            return Err(rejected("terminal matches latest attempt and provenance"));
+        }
+        if outside_deadline != deadline.is_some() {
+            return Err(rejected("outside deadline presence agrees with terminal"));
+        }
+        if attempts.records().any(|record| {
+            let sealed = record.launch.boundary_requested == BoundaryRequirement::Sealed;
+            (record.launch.boundary_effective == BoundaryClass::Sealed
+                && backend.boundary.class != BoundaryClass::Sealed)
+                || (record.launch.target_released
+                    && sealed
+                    && (record.launch.boundary_effective != BoundaryClass::Sealed
+                        || !record.launch.boundary_assignment_verified
+                        || !record.launch.boundary_reconfiguration_denied
+                        || !record.launch.inherited_resources_restricted
+                        || !record.launch.frontend_loss_cleanup_authority_verified))
+                || (sealed
+                    && record.restart_safety.is_safe()
+                    && !record.restart_safety.sealed_boundary_retired)
+        }) {
+            return Err(rejected("sealed attempt launch and retirement proof"));
+        }
+        if backend.boundary.class != BoundaryClass::Sealed
+            && attempts.records().any(|record| {
+                record.launch.boundary_requested == BoundaryRequirement::Sealed
+                    && record.launch.target_released
             })
-            || (backend.boundary.class != BoundaryClass::Sealed
-                && attempts.records().any(|record| {
-                    record.launch.boundary_requested == BoundaryRequirement::Sealed
-                        && record.launch.target_released
-                }))
         {
-            return Err(SupervisionModelError::InconsistentExecution);
+            return Err(rejected("released sealed request has sealed backend"));
         }
         Ok(Self {
             backend,
@@ -1598,21 +1690,36 @@ pub struct SealedUnavailableReport {
     pub prerequisites: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SupervisionModelError {
     CounterRange,
     AttemptNumber,
     InconsistentExecution,
+    RejectedExecution {
+        invariant: &'static str,
+        candidate: String,
+    },
 }
 
 impl std::fmt::Display for SupervisionModelError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::RejectedExecution {
+            invariant,
+            candidate,
+        } = self
+        {
+            return write!(
+                formatter,
+                "supervision invariant failed: {invariant}; rejected candidate: {candidate}"
+            );
+        }
         formatter.write_str(match self {
             Self::CounterRange => "supervision counter is out of range",
             Self::AttemptNumber => "attempt numbers must be nonzero and strictly consecutive",
             Self::InconsistentExecution => {
                 "supervision terminal, attempts, aggregates, or counters are inconsistent"
             }
+            Self::RejectedExecution { .. } => unreachable!("handled rejected execution"),
         })
     }
 }

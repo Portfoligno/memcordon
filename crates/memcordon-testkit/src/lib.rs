@@ -1,5 +1,11 @@
 #![forbid(unsafe_code)]
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use memcordon_platform::test_support::unsearchable_directory;
+
+#[cfg(target_os = "macos")]
+pub use memcordon_platform::test_support::macos_read_only_descriptor_path;
+
 use std::fmt;
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
@@ -76,7 +82,7 @@ impl OutputReader {
     }
 }
 
-fn reader(mut stream: impl Read + Send + 'static) -> OutputReader {
+fn reader(mut stream: impl Read + Send + 'static, limit: Option<usize>) -> OutputReader {
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&bytes);
     let worker = thread::spawn(move || {
@@ -88,10 +94,11 @@ fn reader(mut stream: impl Read + Send + 'static) -> OutputReader {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             };
-            captured
-                .lock()
-                .expect("output reader buffer poisoned")
-                .extend_from_slice(&chunk[..length]);
+            let mut captured = captured.lock().expect("output reader buffer poisoned");
+            if limit.is_some_and(|limit| captured.len().saturating_add(length) > limit) {
+                return Err(io::Error::other("subprocess output exceeds byte limit"));
+            }
+            captured.extend_from_slice(&chunk[..length]);
         }
     });
     OutputReader { bytes, worker }
@@ -109,6 +116,24 @@ pub fn run_with_deadline_after(
     deadline: Duration,
     after_spawn: impl FnOnce(u32) -> io::Result<()> + Send + 'static,
 ) -> Result<ObservedOutput, ProcessTestError> {
+    run_with_deadline_after_limit(command, deadline, after_spawn, None)
+}
+
+/// Limit each captured stream as well as the process lifetime.
+pub fn run_with_deadline_output_limit(
+    command: &mut Command,
+    deadline: Duration,
+    limit: usize,
+) -> Result<ObservedOutput, ProcessTestError> {
+    run_with_deadline_after_limit(command, deadline, |_| Ok(()), Some(limit))
+}
+
+fn run_with_deadline_after_limit(
+    command: &mut Command,
+    deadline: Duration,
+    after_spawn: impl FnOnce(u32) -> io::Result<()> + Send + 'static,
+    output_limit: Option<usize>,
+) -> Result<ObservedOutput, ProcessTestError> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     OuterTestBoundary::configure(command).map_err(ProcessTestError::Spawn)?;
     let started = Instant::now();
@@ -121,8 +146,14 @@ pub fn run_with_deadline_after(
             return Err(ProcessTestError::Spawn(error));
         }
     };
-    let stdout_reader = reader(child.stdout.take().expect("stdout was configured as piped"));
-    let stderr_reader = reader(child.stderr.take().expect("stderr was configured as piped"));
+    let stdout_reader = reader(
+        child.stdout.take().expect("stdout was configured as piped"),
+        output_limit,
+    );
+    let stderr_reader = reader(
+        child.stderr.take().expect("stderr was configured as piped"),
+        output_limit,
+    );
     let (callback_sender, callback_receiver) = mpsc::sync_channel(1);
     let child_id = child.id();
     let callback = thread::spawn(move || {
@@ -242,3 +273,5 @@ pub fn assert_stdout_empty(output: &ObservedOutput) {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+#[cfg(windows)]
+pub use memcordon_platform::test_support::{windows_file_identity, windows_reparse_data};

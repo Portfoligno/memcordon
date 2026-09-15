@@ -78,8 +78,6 @@ fn configuration_and_install_arguments_bind_the_isolated_layout() {
     assert_eq!(
         layout.cargo_install_arguments(&install_root, &target_root),
         vec![
-            OsString::from("--config"),
-            layout.cargo_config().as_os_str().to_os_string(),
             OsString::from("install"),
             OsString::from("--locked"),
             OsString::from("--path"),

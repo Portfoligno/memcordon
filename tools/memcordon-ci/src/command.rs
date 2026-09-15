@@ -189,6 +189,72 @@ pub fn rustup_cargo(
     spec
 }
 
+pub struct PackageOutput {
+    target: PathBuf,
+}
+
+impl PackageOutput {
+    pub fn new(root: &Path, target: Option<&Path>) -> Result<Self> {
+        let target = target.unwrap_or_else(|| Path::new("target"));
+        let target = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            root.join(target)
+        };
+        Ok(Self {
+            target: crate::build_context::environment::paths::command_output_path(&target)?,
+        })
+    }
+
+    pub fn archive_directory(&self) -> PathBuf {
+        self.target.join("package")
+    }
+
+    pub fn command(&self, root: &Path, stable: &str, packages: &[String]) -> CommandSpec {
+        let mut command = rustup_cargo(
+            root,
+            stable,
+            ["package", "--locked", "--no-verify", "--target-dir"],
+            Duration::from_secs(30 * 60),
+        )
+        .arg(&self.target);
+        for package in packages {
+            command = command.args(["--package", package]);
+        }
+        command
+    }
+}
+
+pub fn supply_chain_commands(root: &Path, stable: &str) -> [CommandSpec; 2] {
+    let bin = root.join("target").join("ci-tools").join("bin");
+    [
+        CommandSpec::toolchain_program(
+            "rustup",
+            root,
+            stable,
+            bin.join(if cfg!(windows) {
+                "cargo-audit.exe"
+            } else {
+                "cargo-audit"
+            }),
+            Duration::from_secs(10 * 60),
+        )
+        .args(["audit", "--deny", "warnings"]),
+        CommandSpec::toolchain_program(
+            "rustup",
+            root,
+            stable,
+            bin.join(if cfg!(windows) {
+                "cargo-deny.exe"
+            } else {
+                "cargo-deny"
+            }),
+            Duration::from_secs(10 * 60),
+        )
+        .args(["--config", "ci/deny.toml", "check"]),
+    ]
+}
+
 pub fn git(root: &Path, arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Result<Vec<u8>> {
     CommandSpec::new("git", root, Duration::from_secs(120))
         .args(

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 #[path = "../../ci-build-environment.rs"]
 pub mod environment;
 
+use crate::inventory_progress::{InventoryProgress, Operation};
+use crate::inventory_reader::{BUFFER_SIZE, digest_reader, open_sequential};
 use crate::{CiError, Result};
 
 static ACTIVE: OnceLock<ValidatedBuildContext> = OnceLock::new();
@@ -25,15 +27,40 @@ static ACTIVE: OnceLock<ValidatedBuildContext> = OnceLock::new();
 pub struct BuildInputSnapshot {
     root: PathBuf,
     inputs: Vec<Input>,
+    native_discovery: bool,
 }
 
 impl BuildInputSnapshot {
     pub fn capture(root: &Path) -> Result<Self> {
-        let root = root.canonicalize()?;
+        Self::capture_with_policy(root, false)
+    }
+
+    /// Measure a required native root, recording inaccessible descendants only
+    /// when the build principal also lacks directory search permission.
+    pub fn capture_native_tree(root: &Path) -> Result<Self> {
+        Self::capture_with_policy(root, true)
+    }
+
+    fn capture_with_policy(root: &Path, native_discovery: bool) -> Result<Self> {
+        let root = root.canonicalize().map_err(|error| {
+            CiError::Message(format!(
+                "resolving build input root {}: {error}",
+                root.display()
+            ))
+        })?;
         let mut inputs = Vec::new();
-        measure(&root, None, &mut inputs, &mut BTreeSet::new())?;
+        let scope = if native_discovery {
+            MeasurementScope::NativeRoot
+        } else {
+            MeasurementScope::Required
+        };
+        measure_root(&root, scope, &mut inputs, &mut BTreeSet::new())?;
         inputs.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(Self { root, inputs })
+        Ok(Self {
+            root,
+            inputs,
+            native_discovery,
+        })
     }
     pub fn digest(&self) -> Result<String> {
         Ok(hex::encode(Sha256::digest(serde_json::to_vec(
@@ -41,7 +68,7 @@ impl BuildInputSnapshot {
         )?)))
     }
     pub fn audit(&self) -> Result<()> {
-        if Self::capture(&self.root)?.inputs != self.inputs {
+        if Self::capture_with_policy(&self.root, self.native_discovery)?.inputs != self.inputs {
             return Err(CiError::Message("declared build inputs changed".into()));
         }
         Ok(())
@@ -65,6 +92,7 @@ pub struct ValidatedBuildContext {
     environment: Vec<(String, String)>,
     toolchains: BTreeMap<String, PathBuf>,
     input_roots: Vec<PathBuf>,
+    discovery_roots: Vec<PathBuf>,
     inputs: Vec<Input>,
     worker: BTreeMap<String, String>,
 }
@@ -91,18 +119,56 @@ fn decode(value: &str) -> Result<OsString> {
     }
 }
 
-fn file_digest(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0; 65536];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
+fn file_digest(
+    path: &Path,
+    native: bool,
+    progress: &InventoryProgress,
+    buffer: &mut [u8],
+) -> Result<String> {
+    let mut file = match progress.run(Operation::Open, path, || open_sequential(path)) {
+        Ok(file) => file,
+        Err(error) => {
+            #[cfg(target_os = "macos")]
+            if native && error.kind() == io::ErrorKind::PermissionDenied {
+                return progress.run(Operation::Access, path, || protected_native_digest(path));
+            }
+            let _ = native;
+            return Err(error.into());
         }
-        digest.update(&buffer[..count]);
+    };
+    progress.run(Operation::ReadHash, path, || {
+        digest_reader(&mut file, buffer, progress).map_err(CiError::from)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn protected_native_digest(path: &Path) -> Result<String> {
+    let canonical = crate::native_file_digest::validate_system_path(path)?;
+    let helper = std::env::current_exe()?.with_file_name("memcordon-native-input-digest");
+    let mut command = Command::new("/usr/bin/sudo");
+    command
+        .args(["-n", "--"])
+        .arg(&helper)
+        .arg("--path")
+        .arg(&canonical)
+        .current_dir("/")
+        .env_clear()
+        .envs(environment::closed_environment(
+            &std::env::vars_os().collect(),
+        )?);
+    let output = memcordon_testkit::run_with_deadline_output_limit(
+        &mut command,
+        Duration::from_secs(30),
+        8192,
+    )?;
+    if !output.status.success() {
+        return Err(CiError::Message(format!(
+            "protected system digest failed for {}: {}",
+            canonical.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
-    Ok(hex::encode(digest.finalize()))
+    crate::native_file_digest::parse_digest_output(&output.stdout).map_err(Into::into)
 }
 
 /// Every permitted environment-selected native input is an explicit tree root.
@@ -115,6 +181,8 @@ pub fn native_environment_roots(
         "SDKROOT",
         "VCToolsInstallDir",
         "WindowsSdkDir",
+        "VCINSTALLDIR",
+        "VSINSTALLDIR",
         "INCLUDE",
         "LIB",
         "LIBPATH",
@@ -143,6 +211,42 @@ pub fn native_environment_roots(
     Ok(roots)
 }
 
+/// Discover Windows platform inputs from the canonical closed environment.
+/// Keep selection separate from measurement so Windows name semantics can be
+/// checked with a small fixture without traversing an installed SDK.
+pub fn windows_native_roots(environment: &BTreeMap<OsString, OsString>) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    let mut sdk_found = false;
+    let mut compiler_found = false;
+    for name in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        if let Some(base) = environment.get(OsStr::new(name)) {
+            let base = PathBuf::from(base);
+            let sdk = base.join("Windows Kits");
+            if sdk.is_dir() {
+                sdk_found = true;
+                roots.push(sdk);
+            }
+            let compiler = base.join("Microsoft Visual Studio");
+            if compiler.is_dir() {
+                compiler_found = true;
+                roots.push(compiler);
+            }
+        }
+    }
+    if !sdk_found || !compiler_found {
+        return Err(CiError::Message(
+            "native Windows SDK/MSVC input roots unavailable".into(),
+        ));
+    }
+    let windows = environment
+        .get(OsStr::new("SystemRoot"))
+        .ok_or_else(|| CiError::Message("Windows system root unavailable".into()))?;
+    for name in ["kernel32.dll", "ntdll.dll", "ucrtbase.dll", "msvcp_win.dll"] {
+        roots.push(PathBuf::from(windows).join("System32").join(name));
+    }
+    Ok(roots)
+}
+
 fn mode(metadata: &fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
@@ -155,12 +259,325 @@ fn mode(metadata: &fs::Metadata) -> u32 {
     }
 }
 
-fn measure(
+#[derive(Clone, Copy)]
+enum MeasurementScope<'a> {
+    Source(&'a Path),
+    Required,
+    NativeRoot,
+    NativeDescendant,
+}
+
+impl<'a> MeasurementScope<'a> {
+    fn child(self) -> Self {
+        match self {
+            Self::NativeRoot => Self::NativeDescendant,
+            other => other,
+        }
+    }
+
+    fn source(self) -> Option<&'a Path> {
+        match self {
+            Self::Source(root) => Some(root),
+            _ => None,
+        }
+    }
+}
+
+// Use the kernel's effective-credential check on supported platforms,
+// including ACLs, rather than access(2) or a mode-bit approximation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn inaccessible_directory_identity(path: &Path, metadata: &fs::Metadata) -> Result<Option<String>> {
+    let Some(identity) = memcordon_testkit::unsearchable_directory(path, metadata)? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::to_string(&(
+        identity.owner_uid,
+        identity.owner_gid,
+        (identity.effective_uid, identity.effective_gid),
+        identity.supplementary_groups,
+    ))?))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn inaccessible_directory_identity(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<Option<String>> {
+    Ok(None)
+}
+
+// Linux defines the null character device as major 1, minor 3. Its input
+// behavior is EOF, so discovery can identify it without opening a device
+// stream. Other devices remain unsupported, regardless of their pathname.
+#[cfg(target_os = "linux")]
+fn native_null_device_identity(metadata: &fs::Metadata) -> Result<Option<String>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let device = metadata.rdev();
+    if !metadata.file_type().is_char_device()
+        || libc::major(device) != 1
+        || libc::minor(device) != 3
+    {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(&(
+        device,
+        metadata.uid(),
+        metadata.gid(),
+    ))?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn native_null_device_identity(_metadata: &fs::Metadata) -> Result<Option<String>> {
+    Ok(None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn inaccessible_symlink_identity(path: &Path) -> Result<Option<String>> {
+    use std::collections::VecDeque;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let components = |path: &Path| {
+        path.components()
+            .map(|component| component.as_os_str().to_os_string())
+            .collect::<VecDeque<_>>()
+    };
+    if !path.is_absolute() {
+        return Err(CiError::Message(
+            "native symlink route must be absolute".into(),
+        ));
+    }
+    let mut pending = components(path);
+    let mut current = PathBuf::from("/");
+    let mut route = Vec::new();
+    let mut expansions = 0;
+    const MAX_SYMLINK_EXPANSIONS: usize = 32;
+    while let Some(part) = pending.pop_front() {
+        let part_path = Path::new(&part);
+        let component = part_path
+            .components()
+            .next()
+            .ok_or_else(|| CiError::Message("empty native symlink component".into()))?;
+        if matches!(component, Component::RootDir) {
+            current = PathBuf::from("/");
+            continue;
+        }
+        current = current.canonicalize()?;
+        let metadata = fs::symlink_metadata(&current)?;
+        if !metadata.is_dir() {
+            return Err(CiError::Message(
+                "native symlink route traverses non-directory".into(),
+            ));
+        }
+        let denial = inaccessible_directory_identity(&current, &metadata)?;
+        route.push(Input {
+            path: native(current.as_os_str()),
+            kind: if denial.is_some() {
+                "inaccessible-directory"
+            } else {
+                "route-directory"
+            }
+            .into(),
+            mode: mode(&metadata),
+            digest: match denial {
+                Some(ref evidence) => evidence.clone(),
+                None => serde_json::to_string(&(metadata.uid(), metadata.gid()))?,
+            },
+        });
+        if denial.is_some() {
+            return Ok(Some(serde_json::to_string(&route)?));
+        }
+        match component {
+            Component::ParentDir => {
+                current.pop();
+            }
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                let next = current.join(name);
+                let metadata = fs::symlink_metadata(&next)?;
+                if metadata.file_type().is_symlink() {
+                    expansions += 1;
+                    if expansions > MAX_SYMLINK_EXPANSIONS {
+                        return Err(CiError::Message(
+                            "native symlink route expansion limit exceeded".into(),
+                        ));
+                    }
+                    let target = fs::read_link(&next)?;
+                    route.push(Input {
+                        path: native(next.as_os_str()),
+                        kind: "route-symlink".into(),
+                        mode: mode(&metadata),
+                        digest: serde_json::to_string(&(
+                            native(target.as_os_str()),
+                            metadata.uid(),
+                            metadata.gid(),
+                        ))?,
+                    });
+                    let mut expanded = components(&target);
+                    expanded.append(&mut pending);
+                    pending = expanded;
+                } else {
+                    current = next;
+                }
+            }
+            _ => {
+                return Err(CiError::Message(
+                    "unsupported native symlink component".into(),
+                ));
+            }
+        }
+    }
+    // An EACCES without independently observed search denial is never admitted.
+    Ok(None)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn inaccessible_symlink_identity(_path: &Path) -> Result<Option<String>> {
+    Ok(None)
+}
+
+fn measure_root(
     path: &Path,
-    source: Option<&Path>,
+    scope: MeasurementScope<'_>,
     inputs: &mut Vec<Input>,
     visited: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
+    let kind = match scope {
+        MeasurementScope::Source(_) => "source",
+        MeasurementScope::Required => "required",
+        MeasurementScope::NativeRoot | MeasurementScope::NativeDescendant => "native",
+    };
+    environment::progress::phase(&format!("inventory {kind} root {path:?}"), || {
+        let mut progress = InventoryProgress::new(path);
+        let mut reader = ContentReader::new(scope.source().is_none(), &progress)?;
+        let result = measure(path, scope, inputs, visited, &progress, &mut reader)
+            .and_then(|()| reader.finish(inputs));
+        drop(reader);
+        progress.finish(result.is_ok());
+        result
+    })
+}
+
+struct ContentReader {
+    buffer: Vec<u8>,
+    #[cfg(windows)]
+    workers: Option<
+        crate::inventory_workers::InventoryWorkers<
+            (PathBuf, fs::File, fs::Metadata),
+            Result<String>,
+        >,
+    >,
+}
+
+impl ContentReader {
+    fn new(native: bool, progress: &InventoryProgress) -> Result<Self> {
+        #[cfg(windows)]
+        let workers = if native {
+            let progress = progress.worker();
+            Some(crate::inventory_workers::InventoryWorkers::new(
+                move |(path, mut file, expected): (PathBuf, fs::File, fs::Metadata), buffer| {
+                    let identity = memcordon_testkit::windows_file_identity(&file)?;
+                    let digest = progress.run(Operation::ReadHash, &path, || {
+                        digest_reader(&mut file, buffer, &progress)
+                    })?;
+                    let after = file.metadata()?;
+                    let current = open_sequential(&path)?;
+                    if windows_file_stamp(&expected) != windows_file_stamp(&after)
+                        || windows_file_stamp(&expected)
+                            != windows_file_stamp(&fs::symlink_metadata(&path)?)
+                        || identity != memcordon_testkit::windows_file_identity(&current)?
+                    {
+                        return Err(CiError::Message(format!(
+                            "native input changed during read: {path:?}"
+                        )));
+                    }
+                    Ok(digest)
+                },
+            )?)
+        } else {
+            None
+        };
+        let _ = (native, progress);
+        Ok(Self {
+            buffer: vec![0; BUFFER_SIZE],
+            #[cfg(windows)]
+            workers,
+        })
+    }
+
+    fn finish(&mut self, inputs: &mut [Input]) -> Result<()> {
+        #[cfg(windows)]
+        if let Some(workers) = &mut self.workers {
+            for (index, digest) in workers.drain()? {
+                inputs[index].digest = digest?;
+            }
+        }
+        let _ = inputs;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_stamp(metadata: &fs::Metadata) -> (u32, u64, u64, u64) {
+    use std::os::windows::fs::MetadataExt;
+    (
+        metadata.file_attributes(),
+        metadata.creation_time(),
+        metadata.last_write_time(),
+        metadata.file_size(),
+    )
+}
+
+fn measure(
+    path: &Path,
+    scope: MeasurementScope<'_>,
+    inputs: &mut Vec<Input>,
+    visited: &mut BTreeSet<PathBuf>,
+    progress: &InventoryProgress,
+    reader: &mut ContentReader,
+) -> Result<()> {
+    measure_path(path, scope, inputs, visited, progress, reader).map_err(|error| {
+        CiError::Message(format!("measuring build input {}: {error}", path.display()))
+    })
+}
+
+fn resolution_error(
+    path: &Path,
+    metadata: &fs::Metadata,
+    error: io::Error,
+    progress: &InventoryProgress,
+) -> CiError {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            let evidence = progress.run(Operation::Access, path, || {
+                memcordon_testkit::windows_reparse_data(path)
+            });
+            let diagnostic = match evidence {
+                Ok(data) => crate::reparse_diagnostic::describe(&data)
+                    .unwrap_or_else(|failure| format!("{failure}; raw_hex={}", hex::encode(data))),
+                Err(failure) => format!("no-follow reparse probe failed: {failure}"),
+            };
+            return CiError::Message(format!(
+                "resolving path: {error}; unresolved native reparse input (not admitted): {diagnostic}"
+            ));
+        }
+    }
+    let _ = (path, metadata, progress);
+    CiError::Message(format!("resolving path: {error}"))
+}
+
+fn measure_path(
+    path: &Path,
+    scope: MeasurementScope<'_>,
+    inputs: &mut Vec<Input>,
+    visited: &mut BTreeSet<PathBuf>,
+    progress: &InventoryProgress,
+    reader: &mut ContentReader,
+) -> Result<()> {
+    let source = scope.source();
     if let Some(root) = source {
         let relative = path
             .strip_prefix(root)
@@ -180,28 +597,166 @@ fn measure(
             return Ok(());
         }
     }
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = progress
+        .run(Operation::Metadata, path, || fs::symlink_metadata(path))
+        .map_err(|error| CiError::Message(format!("reading metadata: {error}")))?;
+    // Validate every declared discovery root even if a previous overlapping
+    // traversal recorded that path as an inaccessible descendant.
+    if matches!(scope, MeasurementScope::NativeRoot) && metadata.is_dir() {
+        progress
+            .run(Operation::Directory, path, || fs::read_dir(path))
+            .map_err(|error| CiError::Message(format!("reading required native root: {error}")))?;
+    }
+    // Every ordinary path, not only symlink targets, enters the visited set.
+    // Resolve ordinary aliases before descent so overlapping roots share work.
+    // Symlinks retain their own path and identity even when a target was visited.
+    let identity = if metadata.file_type().is_symlink() {
+        path.to_path_buf()
+    } else {
+        progress
+            .run(Operation::Canonicalize, path, || path.canonicalize())
+            .map_err(|error| resolution_error(path, &metadata, error, progress))?
+    };
+    if !visited.insert(identity.clone()) {
+        return Ok(());
+    }
     let (kind, digest) = if metadata.file_type().is_symlink() {
-        let target = fs::read_link(path)?;
-        let resolved = path.canonicalize()?;
-        if source.is_some_and(|root| !resolved.starts_with(root)) {
-            return Err(CiError::Message(
-                "source symlink escapes declared root".into(),
-            ));
+        let target = progress
+            .run(Operation::Symlink, path, || fs::read_link(path))
+            .map_err(|error| CiError::Message(format!("reading symlink: {error}")))?;
+        match progress.run(Operation::Canonicalize, path, || path.canonicalize()) {
+            Ok(resolved) => {
+                if source.is_some_and(|root| !resolved.starts_with(root)) {
+                    return Err(CiError::Message(
+                        "source symlink escapes declared root".into(),
+                    ));
+                }
+                if source.is_none() {
+                    measure(&resolved, scope, inputs, visited, progress, reader)?;
+                }
+                (
+                    "symlink",
+                    serde_json::to_string(&[
+                        native(target.as_os_str()),
+                        native(resolved.as_os_str()),
+                    ])?,
+                )
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && matches!(scope, MeasurementScope::NativeDescendant) =>
+            {
+                let route = progress
+                    .run(Operation::Access, path, || {
+                        inaccessible_symlink_identity(path)
+                    })?
+                    .ok_or_else(|| {
+                        CiError::Message(format!(
+                            "resolving symlink without proven search denial: {error}"
+                        ))
+                    })?;
+                (
+                    "inaccessible-symlink",
+                    serde_json::to_string(&(native(target.as_os_str()), route))?,
+                )
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && source.is_none() => {
+                // Missing native link targets are a measured state, not an
+                // ignored input. Appearance or retargeting changes the audit.
+                ("dangling-symlink", native(target.as_os_str()))
+            }
+            Err(error) => {
+                return Err(CiError::Message(format!("resolving symlink: {error}")));
+            }
         }
-        if source.is_none() && visited.insert(resolved.clone()) {
-            measure(&resolved, None, inputs, visited)?;
-        }
-        ("symlink", native(target.as_os_str()))
     } else if metadata.is_dir() {
-        let mut children: Vec<_> = fs::read_dir(path)?.collect::<io::Result<_>>()?;
-        children.sort_by_key(|entry| entry.file_name());
+        let entries =
+            match progress.run(Operation::Directory, &identity, || fs::read_dir(&identity)) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    if error.kind() == io::ErrorKind::PermissionDenied
+                        && matches!(scope, MeasurementScope::NativeDescendant)
+                        && let Some(digest) = progress.run(Operation::Access, &identity, || {
+                            inaccessible_directory_identity(&identity, &metadata)
+                        })?
+                    {
+                        inputs.push(Input {
+                            path: native(identity.as_os_str()),
+                            kind: "inaccessible-directory".into(),
+                            mode: mode(&metadata),
+                            digest,
+                        });
+                        return Ok(());
+                    }
+                    return Err(CiError::Message(format!("reading directory: {error}")));
+                }
+            };
+        let children = progress.run(Operation::Directory, &identity, || {
+            let mut children: Vec<_> = entries
+                .collect::<io::Result<_>>()
+                .map_err(|error| CiError::Message(format!("enumerating directory: {error}")))?;
+            children.sort_by_key(|entry| entry.file_name());
+            Ok::<_, CiError>(children)
+        })?;
         for child in children {
-            measure(&child.path(), source, inputs, visited)?;
+            measure(
+                &child.path(),
+                scope.child(),
+                inputs,
+                visited,
+                progress,
+                reader,
+            )?;
         }
         ("directory", String::new())
     } else if metadata.is_file() {
-        ("file", file_digest(path)?)
+        #[cfg(windows)]
+        if let Some(workers) = &mut reader.workers {
+            let file = progress.run(Operation::Open, &identity, || open_sequential(&identity))?;
+            if windows_file_stamp(&metadata) != windows_file_stamp(&file.metadata()?) {
+                return Err(CiError::Message(format!(
+                    "native input changed before read: {identity:?}"
+                )));
+            }
+            let index = inputs.len();
+            inputs.push(Input {
+                path: native(identity.as_os_str()),
+                kind: "file".into(),
+                mode: mode(&metadata),
+                digest: String::new(),
+            });
+            for (index, digest) in workers.submit(index, (identity, file, metadata))? {
+                match digest {
+                    Ok(digest) => inputs[index].digest = digest,
+                    Err(error) => {
+                        // Completion order is independent of traversal order.
+                        // Stop admission, settle the bounded tail, and preserve
+                        // the earliest file error among all admitted inputs.
+                        let mut completed = workers.drain()?;
+                        completed.push((index, Err(error)));
+                        completed.sort_by_key(|entry| entry.0);
+                        for (index, digest) in completed {
+                            inputs[index].digest = digest?;
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+        (
+            "file",
+            file_digest(
+                &identity,
+                scope.source().is_none(),
+                progress,
+                &mut reader.buffer,
+            )
+            .map_err(|error| CiError::Message(format!("reading file contents: {error}")))?,
+        )
+    } else if matches!(scope, MeasurementScope::NativeDescendant)
+        && let Some(digest) = native_null_device_identity(&metadata)?
+    {
+        ("linux-null-device", digest)
     } else {
         return Err(CiError::Message(format!(
             "unsupported build input: {}",
@@ -209,7 +764,7 @@ fn measure(
         )));
     };
     inputs.push(Input {
-        path: native(path.as_os_str()),
+        path: native(identity.as_os_str()),
         kind: kind.into(),
         mode: mode(&metadata),
         digest,
@@ -224,19 +779,86 @@ fn output(
     cwd: &Path,
 ) -> Result<Vec<u8>> {
     let mut command = Command::new(program);
-    command.args(args).current_dir(cwd).env_clear().envs(env);
-    let result = memcordon_testkit::run_with_deadline(&mut command, Duration::from_secs(30))?;
+    command
+        .args(args)
+        .current_dir(environment::command_path(cwd)?)
+        .env_clear()
+        .envs(env);
+    identity_output(&mut command)
+}
+
+/// Discover installed toolchains without activating the repository's component
+/// override or allowing a missing selected toolchain to be installed implicitly.
+pub fn installed_toolchains_command(
+    program: &Path,
+    pinned: &str,
+    env: &BTreeMap<OsString, OsString>,
+    cwd: &Path,
+) -> Result<Command> {
+    let mut command = Command::new(program);
+    command
+        .args(["toolchain", "list"])
+        .current_dir(environment::command_path(cwd)?)
+        .env_clear()
+        .envs(env)
+        .env("RUSTUP_TOOLCHAIN", pinned)
+        .env("RUSTUP_AUTO_INSTALL", "0");
+    Ok(command)
+}
+
+fn identity_output(command: &mut Command) -> Result<Vec<u8>> {
+    let description = format!(
+        "program={:?} arguments={:?}",
+        command.get_program(),
+        command.get_args().collect::<Vec<_>>()
+    );
+    let result = memcordon_testkit::run_with_deadline(command, Duration::from_secs(30)).map_err(
+        |error| {
+            CiError::Message(format!(
+                "build identity command failed: {description}; {error}"
+            ))
+        },
+    )?;
     if !result.status.success() {
-        return Err(CiError::Message("build identity command failed".into()));
+        return Err(CiError::Message(format!(
+            "build identity command failed: {description}; status={}; stderr={:?}",
+            result.status,
+            String::from_utf8_lossy(&result.stderr)
+        )));
     }
     Ok(result.stdout)
 }
 
 impl ValidatedBuildContext {
     pub fn prepare(root: &Path) -> Result<Self> {
+        environment::progress::phase("prepare build context", || Self::prepare_inner(root))
+    }
+
+    fn prepare_inner(root: &Path) -> Result<Self> {
         let root = root.canonicalize()?;
+        let command_root = environment::command_path(&root)?;
         let ambient: BTreeMap<_, _> = std::env::vars_os().collect();
         let mut env = environment::closed_environment(&ambient)?;
+        #[cfg(windows)]
+        let native_linker = {
+            let installation =
+                environment::msvc::selected_installation(&env)?.ok_or_else(|| {
+                    CiError::Message(
+                        "MSVC installation must be selected by the cold bootstrap".into(),
+                    )
+                })?;
+            environment::msvc::configure(
+                &mut env,
+                &installation,
+                environment::msvc::Architecture::native()?,
+            )?
+        };
+        #[cfg(windows)]
+        let admitted = environment::windows_compiler::admit(
+            &mut env,
+            &native_linker,
+            environment::msvc::Architecture::native()?,
+        )?;
         #[cfg(windows)]
         if env
             .iter()
@@ -254,7 +876,7 @@ impl ValidatedBuildContext {
             }))
             .ok_or_else(|| CiError::Message("managed home missing".into()))?;
         environment::reject_cargo_configuration(&root, &PathBuf::from(home).join(".cargo"))?;
-        let cargo_home = root.join("target/ci/source-home");
+        let cargo_home = command_root.join("target/ci/source-home");
         environment::reject_cargo_configuration(&root, &cargo_home)?;
         fs::create_dir_all(&cargo_home)?;
         env.insert("CARGO_HOME".into(), cargo_home.into_os_string());
@@ -262,6 +884,11 @@ impl ValidatedBuildContext {
         let config = crate::config::toolchains(&root)?;
         let mut toolchains = BTreeMap::new();
         let mut input_roots = vec![rustup.clone()];
+        #[cfg(windows)]
+        input_roots.push(native_linker);
+        #[cfg(windows)]
+        input_roots.extend(admitted.input_roots);
+        let mut discovery_roots = Vec::new();
         input_roots.extend(native_environment_roots(&env)?);
         let tools = root.join("target/ci-tools/bin");
         if tools.exists() {
@@ -276,16 +903,21 @@ impl ValidatedBuildContext {
                 input_roots.push(source);
             }
         }
-        let installed = output(
+        let installed = identity_output(&mut installed_toolchains_command(
             &rustup,
-            &[OsStr::new("toolchain"), OsStr::new("list")],
+            &config.stable,
             &env,
             &root,
-        )?;
+        )?)?;
         for toolchain in [&config.stable, &config.msrv, &config.miri] {
             if !String::from_utf8_lossy(&installed)
                 .lines()
-                .any(|line| line.starts_with(toolchain))
+                .filter_map(|line| line.split_whitespace().next())
+                .any(|installed| {
+                    installed
+                        .strip_prefix(toolchain)
+                        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
+                })
             {
                 continue;
             }
@@ -355,51 +987,21 @@ impl ValidatedBuildContext {
                     .map_err(|error| CiError::Message(error.to_string()))?
                     .trim(),
             ));
-            input_roots.extend([
+            discovery_roots.extend([
                 PathBuf::from("/usr/lib"),
                 PathBuf::from("/usr/bin"),
                 PathBuf::from("/bin"),
             ]);
         }
         #[cfg(target_os = "linux")]
-        input_roots.extend([
+        discovery_roots.extend([
             PathBuf::from("/usr/include"),
             PathBuf::from("/usr/lib"),
             PathBuf::from("/usr/bin"),
             PathBuf::from("/bin"),
         ]);
         #[cfg(windows)]
-        {
-            let mut sdk_found = false;
-            let mut compiler_found = false;
-            for name in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
-                if let Some(base) = ambient.get(OsStr::new(name)) {
-                    let base = PathBuf::from(base);
-                    let sdk = base.join("Windows Kits");
-                    if sdk.is_dir() {
-                        sdk_found = true;
-                        input_roots.push(sdk);
-                    }
-                    let compiler = base.join("Microsoft Visual Studio");
-                    if compiler.is_dir() {
-                        compiler_found = true;
-                        input_roots.push(compiler);
-                    }
-                }
-            }
-            if !sdk_found || !compiler_found {
-                return Err(CiError::Message(
-                    "native Windows SDK/MSVC input roots unavailable".into(),
-                ));
-            }
-            let windows = env
-                .get(OsStr::new("SystemRoot"))
-                .or_else(|| env.get(OsStr::new("SYSTEMROOT")))
-                .ok_or_else(|| CiError::Message("Windows system root unavailable".into()))?;
-            for name in ["kernel32.dll", "ntdll.dll", "ucrtbase.dll", "msvcp_win.dll"] {
-                input_roots.push(PathBuf::from(windows).join("System32").join(name));
-            }
-        }
+        input_roots.extend(windows_native_roots(&env)?);
         for path in std::env::split_paths(env.get(OsStr::new("PATH")).expect("validated PATH")) {
             if path.is_dir() && !path.starts_with(&root) {
                 #[cfg(windows)]
@@ -410,11 +1012,13 @@ impl ValidatedBuildContext {
                 }) {
                     continue;
                 }
-                input_roots.push(path.canonicalize()?);
+                discovery_roots.push(path.canonicalize()?);
             }
         }
         input_roots.sort();
         input_roots.dedup();
+        discovery_roots.sort();
+        discovery_roots.dedup();
         let worker = [
             "ImageOS",
             "ImageVersion",
@@ -432,7 +1036,7 @@ impl ValidatedBuildContext {
         })
         .collect();
         let mut context = Self {
-            schema_version: 2,
+            schema_version: 3,
             root,
             environment: env
                 .iter()
@@ -440,6 +1044,7 @@ impl ValidatedBuildContext {
                 .collect(),
             toolchains,
             input_roots,
+            discovery_roots,
             inputs: Vec::new(),
             worker,
         };
@@ -450,9 +1055,25 @@ impl ValidatedBuildContext {
     fn measure_inputs(&self) -> Result<Vec<Input>> {
         let mut inputs = Vec::new();
         let mut visited = BTreeSet::new();
-        measure(&self.root, Some(&self.root), &mut inputs, &mut visited)?;
+        measure_root(
+            &self.root,
+            MeasurementScope::Source(&self.root),
+            &mut inputs,
+            &mut visited,
+        )?;
+        // Native inputs have no source-output exclusions. A native link back
+        // into the checkout must not inherit the source traversal's exclusions.
+        visited.clear();
         for root in &self.input_roots {
-            measure(root, None, &mut inputs, &mut visited)?;
+            measure_root(root, MeasurementScope::Required, &mut inputs, &mut visited)?;
+        }
+        for root in &self.discovery_roots {
+            measure_root(
+                root,
+                MeasurementScope::NativeRoot,
+                &mut inputs,
+                &mut visited,
+            )?;
         }
         inputs.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(inputs)
@@ -474,7 +1095,7 @@ impl ValidatedBuildContext {
 
     pub fn read(path: &Path) -> Result<Self> {
         let context: Self = serde_json::from_slice(&fs::read(path)?)?;
-        if context.schema_version != 2 || context.inputs.is_empty() || context.toolchains.is_empty()
+        if context.schema_version != 3 || context.inputs.is_empty() || context.toolchains.is_empty()
         {
             return Err(CiError::Message("incomplete managed build context".into()));
         }
@@ -482,6 +1103,10 @@ impl ValidatedBuildContext {
     }
 
     pub fn audit(&self) -> Result<()> {
+        environment::progress::phase("audit build context", || self.audit_inner())
+    }
+
+    fn audit_inner(&self) -> Result<()> {
         let env = self.environment()?;
         let cargo_home = env
             .get(OsStr::new("CARGO_HOME"))
@@ -543,19 +1168,25 @@ impl ValidatedBuildContext {
                 "unapproved toolchain working directory".into(),
             ));
         }
-        let approved_tool = self
-            .root
-            .join("target/ci-tools/bin")
-            .join(if cfg!(windows) {
-                "cargo-fuzz.exe"
-            } else {
-                "cargo-fuzz"
+        let tool_names = if cfg!(windows) {
+            ["cargo-fuzz.exe", "cargo-audit.exe", "cargo-deny.exe"]
+        } else {
+            ["cargo-fuzz", "cargo-audit", "cargo-deny"]
+        };
+        let tool_directory = self.root.join("target/ci-tools/bin");
+        let approved_tool = tool_names
+            .iter()
+            .any(|name| executable == tool_directory.join(name))
+            && self.inputs.iter().any(|input| {
+                input.path == native(executable.as_os_str())
+                    && matches!(input.kind.as_str(), "file" | "symlink")
             });
-        if executable != cargo && executable != approved_tool {
+        if executable != cargo && !approved_tool {
             return Err(CiError::Message("unenrolled toolchain executable".into()));
         }
-        let mut command = Command::new(executable);
-        let bin = cargo.parent().expect("validated Cargo directory");
+        let mut command = Command::new(environment::paths::command_program(executable)?);
+        let command_cargo = environment::paths::command_program(cargo)?;
+        let bin = command_cargo.parent().expect("validated Cargo directory");
         let mut environment = self.environment()?;
         let mut paths = vec![bin.to_path_buf()];
         paths.extend(std::env::split_paths(
@@ -576,7 +1207,7 @@ impl ValidatedBuildContext {
         }
         command
             .args(arguments)
-            .current_dir(&self.root)
+            .current_dir(environment::command_path(&self.root)?)
             .env_clear()
             .envs(environment)
             .env(
@@ -658,7 +1289,12 @@ pub fn run_isolated_cargo(
                 ));
             }
             outputs.push(output.clone());
-            rewritten.push(output.into_os_string());
+            rewritten.push(environment::paths::command_output_path(&output)?.into_os_string());
+        } else if argument == "--manifest-path" || argument == "--path" {
+            let input = iterator
+                .next()
+                .ok_or_else(|| CiError::Message("Cargo input path missing".into()))?;
+            rewritten.push(environment::command_path(&directory.join(input))?.into_os_string());
         }
     }
     let acquisition = rewritten
@@ -687,11 +1323,25 @@ pub fn run_isolated_cargo(
             .ok_or_else(|| CiError::Message("isolated toolchain not enrolled".into()))?;
         context.toolchain_command(toolchain, cargo, &rewritten, &context.root)?
     } else {
-        let environment = environment::closed_environment(
-            &std::env::vars_os()
-                .filter(|(key, _)| key != "RUSTUP_TOOLCHAIN" && key != "CARGO_HOME")
-                .collect(),
-        )?;
+        let ambient = std::env::vars_os()
+            .filter(|(key, _)| key != "RUSTUP_TOOLCHAIN" && key != "CARGO_HOME")
+            .collect();
+        let environment = environment::closed_environment(&ambient)?;
+        #[cfg(windows)]
+        let environment = {
+            let mut environment = environment;
+            let discovery = environment::windows_discovery_environment(&ambient)?;
+            environment::windows_compiler::configure(
+                &mut environment,
+                &discovery,
+                environment::msvc::Architecture::native()?,
+                |program, arguments, discovery| {
+                    let arguments: Vec<_> = arguments.iter().map(OsStr::new).collect();
+                    output(program, &arguments, discovery, &directory).map_err(io::Error::other)
+                },
+            )?;
+            environment
+        };
         let rustup = environment::resolve_tool(OsStr::new("rustup"), &environment)?;
         let mut command = Command::new(rustup);
         command
@@ -701,10 +1351,11 @@ pub fn run_isolated_cargo(
             .envs(environment);
         command
     };
+    let command_temporary = environment::command_path(temporary.path())?;
     command
-        .current_dir(&directory)
-        .env("CARGO_HOME", temporary.path().join("cargo-home"))
-        .env("CARGO_TARGET_DIR", temporary.path().join("target"))
+        .current_dir(environment::command_path(&directory)?)
+        .env("CARGO_HOME", command_temporary.join("cargo-home"))
+        .env("CARGO_TARGET_DIR", command_temporary.join("target"))
         .env("CARGO_NET_OFFLINE", "false");
     let output = memcordon_testkit::run_with_deadline(&mut command, deadline)?;
     let unchanged = snapshot(&directory)?.inputs == before.inputs;

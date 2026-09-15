@@ -1863,6 +1863,84 @@ fn request_validation_provider_rejection_round_trips_in_schema_eight() {
 }
 
 #[test]
+fn supervision_rejection_identifies_the_failed_invariant() {
+    let sensitive = "private diagnostic sentinel".repeat(4096);
+    let backend = BackendCapabilityReport {
+        name: sensitive.clone(),
+        limitations: vec![sensitive.clone()],
+        ..BackendCapabilityReport::default()
+    };
+    let outcome = RunOutcome::Exited {
+        child: ChildTermination::ExitCode { code: 0 },
+        peak: None,
+        cleanup: cleanup(),
+    };
+    let mut history = AttemptHistory::default();
+    let mut aggregates = SupervisionAggregates::default();
+    history
+        .append(
+            attempt_record(1, Some(outcome.clone()), None),
+            &mut aggregates,
+        )
+        .unwrap();
+    let construct = |aggregates, authorized, number, outcome| {
+        SupervisionExecution::new(
+            backend.clone(),
+            SupervisionTerminal::AttemptOutcome {
+                attempt_number: number,
+                outcome,
+            },
+            history.clone(),
+            aggregates,
+            RestartSummary::default(),
+            None,
+            4,
+            authorized,
+        )
+    };
+    assert!(construct(aggregates.clone(), 1, 1, outcome.clone()).is_ok());
+    let mut wrong_total = aggregates.clone();
+    wrong_total.child_exits += 1;
+    let wrong_outcome = RunOutcome::Exited {
+        child: ChildTermination::ExitCode { code: 37 },
+        peak: None,
+        cleanup: cleanup(),
+    };
+    for (result, expected) in [
+        (
+            construct(wrong_total, 1, 1, outcome.clone()),
+            "aggregate outcome total matches attempt total",
+        ),
+        (
+            construct(aggregates.clone(), 0, 1, outcome.clone()),
+            "target and aggregate authorizations agree",
+        ),
+        (
+            construct(aggregates.clone(), 1, 2, outcome),
+            "terminal attempt is latest nonzero attempt",
+        ),
+        (
+            construct(aggregates, 1, 1, wrong_outcome),
+            "terminal matches latest attempt and provenance",
+        ),
+    ] {
+        let error = result.unwrap_err();
+        let memcordon_core::SupervisionModelError::RejectedExecution {
+            invariant,
+            ref candidate,
+        } = error
+        else {
+            panic!("missing precise rejection: {error}");
+        };
+        assert_eq!(invariant, expected);
+        assert!(!candidate.is_empty());
+        assert!(!candidate.contains("private diagnostic sentinel"));
+        assert!(candidate.len() < sensitive.len());
+        assert!(error.to_string().contains(expected));
+    }
+}
+
+#[test]
 fn supervision_constructor_rejects_mismatched_or_misclassified_error_terminal() {
     let mut error = SupervisionErrorRecord {
         native_startup: None,
