@@ -5001,6 +5001,71 @@ work_packages = [
 decision = "Register the exact protected invariant and execution route; retain or split according to the owning subsystem, with zero-skip and platform evidence."
 
 [[source]]
+id = "tools.memcordon-ci.tests.boundary_metrics"
+path = "tools/memcordon-ci/tests/boundary_metrics.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Qualified syntax metrics distinguish declaration ownership and report lexical uncertainty without automatically authorizing a split."]
+consumers = ["cargo:memcordon-ci:test:boundary_metrics:features=[]"]
+routes = ["cargo:memcordon-ci:test:boundary_metrics:features=[]"]
+cfg = []
+item_visibility = [
+    "fn:cfg_alternatives_remain_distinct_and_never_form_a_false_call_bridge#1:private",
+    "fn:coupling_is_deterministic_and_ambiguous_names_do_not_create_edges#1:private",
+    "fn:nested_helpers_keep_their_enclosing_impl_method_and_calls#1:private",
+    "fn:syntax_distinguishes_visibility_cfg_and_real_unsafe_from_comments#1:private",
+    "fn:unsafe_signatures_include_trait_and_foreign_declarations#1:private",
+    "use:memcordon_ci :: boundary_metrics :: { analyze_files , analyze_source }#1:private",
+    "use:std :: collections :: { BTreeMap , BTreeSet }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-06",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "tools.memcordon-ci.tests.boundary_report"
+path = "tools/memcordon-ci/tests/boundary_report.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Boundary reports bind collector identity, tracked source bytes and bounded unmodified Git history; source inputs and linked aliases cannot be overwritten as report output."]
+consumers = ["cargo:memcordon-ci:test:boundary_report:features=[]"]
+routes = ["cargo:memcordon-ci:test:boundary_report:features=[]"]
+cfg = ["fn:tracked_symlink_sources_are_rejected#1:cfg(unix)"]
+item_visibility = [
+    "fn:atomic_output_replaces_a_hardlink_without_changing_source_content#1:private",
+    "fn:commit#1:private",
+    "fn:deleted_context_sources_are_disclosed_but_missing_candidates_fail#1:private",
+    "fn:fixture#1:private",
+    "fn:git#1:private",
+    "fn:output_cannot_overwrite_tracked_inputs#1:private",
+    "fn:replacement_history_is_ignored_and_graft_metadata_is_rejected#1:private",
+    "fn:report_binds_real_git_history_and_ignores_untracked_content#1:private",
+    "fn:shallow_history_is_disclosed#1:private",
+    "fn:tracked_symlink_sources_are_rejected#1:private",
+    "fn:tracked_unregistered_content_is_reported_without_parsing_and_history_is_bounded#1:private",
+    "use:memcordon_ci :: boundary_report :: collect#1:private",
+    "use:memcordon_ci :: command :: CommandSpec#1:private",
+    "use:std :: fs#1:private",
+    "use:std :: path :: Path#1:private",
+    "use:std :: time :: Duration#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-06",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "tools.memcordon-ci.tests.build_context"
 path = "tools/memcordon-ci/tests/build_context.rs"
 owner = "tests"
@@ -6673,6 +6738,40 @@ work_packages = [
 decision = "Maintain explicit ownership and validate source inventory changes."
 
 [[source]]
+id = "tools.memcordon-ci.tests.source_release"
+path = "tools/memcordon-ci/tests/source_release.rs"
+owner = "tests"
+kind = "test"
+visibility = "test-only"
+disposition = "retain"
+protected_invariants = ["Exact-commit release admission rejects stale or failed runs, changed checkout inputs, incomplete workflow coverage and bypassable trigger or token policy."]
+consumers = ["cargo:memcordon-ci:test:source_release:features=[]"]
+routes = ["cargo:memcordon-ci:test:source_release:features=[]"]
+cfg = []
+item_visibility = [
+    "const:COMMIT#1:private",
+    "const:REPOSITORY#1:private",
+    "fn:git#1:private",
+    "fn:release_checkout_rejects_dirty_configuration_and_changed_head#1:private",
+    "fn:release_preflight_requires_read_only_authenticated_unconditional_admission#1:private",
+    "fn:release_rejects_wrong_identity_and_ambiguous_inventory#1:private",
+    "fn:release_requires_all_three_workflow_families#1:private",
+    "fn:release_selection_cannot_change_during_archive_collection#1:private",
+    "fn:release_selects_newest_run_without_falling_back_to_green#1:private",
+    "fn:run#1:private",
+    "use:memcordon_ci :: source_registry :: hosted :: WorkflowRun#1:private",
+    "use:memcordon_ci :: source_registry :: hosted_client :: { Lane , RELEASE_WORKFLOWS , select_release_run , validate_release_checkout , validate_release_workflows , validate_selected_run , }#1:private",
+    "use:serde_json :: json#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-02",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "tools.memcordon-ci.tests.standard_certification"
 path = "tools/memcordon-ci/tests/standard_certification.rs"
 owner = "tests"
@@ -7258,7 +7357,7 @@ item_visibility = [
     "fn:action_input_boolean_value_selection_is_rejected#1:private",
     "fn:certification_runner_regressions_are_rejected_structurally#1:private",
     "fn:ci_concurrency_separates_trigger_methods#1:private",
-    "fn:deep_and_backend_workflows_require_unfiltered_push_and_manual_dispatch#1:private",
+    "fn:deep_and_backend_workflows_require_every_branch_and_manual_dispatch_before_tags#1:private",
     "fn:deep_ci_fuzz_timeout_covers_the_complete_target_set#1:private",
     "fn:dependabot_requires_each_independent_dependency_surface#1:private",
     "fn:fuzz_dependency_cache_keys_require_the_fuzz_lockfile#1:private",

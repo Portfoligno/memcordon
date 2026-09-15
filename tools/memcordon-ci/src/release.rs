@@ -601,6 +601,15 @@ fn validate_fallback_remote_tags(output: &[u8], release_version: &Version) -> Re
     Ok(())
 }
 
+pub fn source_evidence_preflight(root: &Path) -> Result<()> {
+    let identity = preflight(root)?;
+    memcordon_ci::source_registry::hosted_client::admit_release(
+        root,
+        &identity.commit,
+        &root.join("target/ci/reports/source-coverage/release.json"),
+    )
+}
+
 pub fn preflight(root: &Path) -> Result<ReleaseIdentity> {
     let release = config::release(root)?;
     config::validate_release_configuration_identity(&release)?;

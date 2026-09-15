@@ -72,6 +72,12 @@ enum TopLevel {
 #[derive(Subcommand)]
 enum SourceCommand {
     Validate,
+    Boundaries {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 32)]
+        history_limit: usize,
+    },
     Collect {
         #[arg(long)]
         workflow: String,
@@ -200,6 +206,10 @@ fn run() -> Result<()> {
         ),
         (false, Some(TopLevel::Source { command })) => match command {
             SourceCommand::Validate => memcordon_ci::source_registry::run(&root),
+            SourceCommand::Boundaries {
+                output,
+                history_limit,
+            } => memcordon_ci::boundary_report::write(&root, &output, history_limit),
             SourceCommand::Collect { workflow, output } => {
                 memcordon_ci::source_registry::hosted_client::collect_current(
                     &root, &workflow, &output,

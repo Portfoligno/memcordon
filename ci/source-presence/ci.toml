@@ -325,6 +325,148 @@ work_packages = [
 decision = "Retain with an explicit source-registry owner, consumer, invariant, visibility tier, and acceptance evidence; make no structural change unless the boundary review fails."
 
 [[source]]
+id = "tools.memcordon-ci.src.boundary_metrics"
+path = "tools/memcordon-ci/src/boundary_metrics.rs"
+owner = "ci"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "retain"
+protected_invariants = ["Qualified syntax metrics distinguish declaration ownership and report lexical uncertainty without automatically authorizing a split."]
+consumers = ["module:tools/memcordon-ci/src/lib.rs:boundary_metrics:pub:[]"]
+routes = ["module:tools/memcordon-ci/src/lib.rs:boundary_metrics:pub:[]"]
+cfg = []
+item_visibility = [
+    "fn:analyze_files#1:pub",
+    "fn:analyze_source#1:pub",
+    "impl:Collector:#1/method:function#1:private",
+    "impl:Collector:#1/method:visibility#1:private",
+    "impl:Collector:Visit < 'ast >#1/method:visit_attribute#1:private",
+    "impl:Collector:Visit < 'ast >#1/method:visit_expr_call#1:private",
+    "impl:Collector:Visit < 'ast >#1/method:visit_expr_unsafe#1:private",
+    "impl:Collector:Visit < 'ast >#1/method:visit_impl_item_fn#1:private",
+    "impl:Collector:Visit < 'ast >#1/method:visit_item#1:private",
+    "impl:Collector:Visit < 'ast >#1/method:visit_item_fn#1:private",
+    "impl:Collector:Visit < 'ast >#1/method:visit_item_impl#1:private",
+    "impl:Collector:Visit < 'ast >#1/method:visit_item_mod#1:private",
+    "impl:Collector:Visit < 'ast >#1/method:visit_item_use#1/fn:flatten#1:private",
+    "impl:Collector:Visit < 'ast >#1/method:visit_item_use#1:private",
+    "impl:Collector:Visit < 'ast >#1/method:visit_signature#1:private",
+    "struct:Collector#1/field:caller#1:private",
+    "struct:Collector#1/field:metrics#1:private",
+    "struct:Collector#1/field:scope#1:private",
+    "struct:Collector#1:private",
+    "struct:FileMetrics#1/field:approximate_call_clusters#1:pub",
+    "struct:FileMetrics#1/field:approximate_importers#1:pub",
+    "struct:FileMetrics#1/field:approximate_imports#1:pub",
+    "struct:FileMetrics#1/field:approximate_test_references#1:pub",
+    "struct:FileMetrics#1/field:cochanges#1:pub",
+    "struct:FileMetrics#1/field:path#1:pub",
+    "struct:FileMetrics#1/field:syntax#1:pub",
+    "struct:FileMetrics#1:pub",
+    "struct:SyntaxMetrics#1/field:calls#1:pub",
+    "struct:SyntaxMetrics#1/field:cfg_regions#1:pub",
+    "struct:SyntaxMetrics#1/field:function_names#1:pub",
+    "struct:SyntaxMetrics#1/field:functions#1:pub",
+    "struct:SyntaxMetrics#1/field:imports#1:pub",
+    "struct:SyntaxMetrics#1/field:items#1:pub",
+    "struct:SyntaxMetrics#1/field:private_items#1:pub",
+    "struct:SyntaxMetrics#1/field:public_items#1:pub",
+    "struct:SyntaxMetrics#1/field:restricted_items#1:pub",
+    "struct:SyntaxMetrics#1/field:test_functions#1:pub",
+    "struct:SyntaxMetrics#1/field:unsafe_blocks#1:pub",
+    "struct:SyntaxMetrics#1/field:unsafe_functions#1:pub",
+    "struct:SyntaxMetrics#1:pub",
+    "use:quote :: ToTokens#1:private",
+    "use:serde :: Serialize#1:private",
+    "use:std :: collections :: { BTreeMap , BTreeSet }#1:private",
+    "use:syn :: visit :: { self , Visit }#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-06",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
+id = "tools.memcordon-ci.src.boundary_report"
+path = "tools/memcordon-ci/src/boundary_report.rs"
+owner = "ci"
+kind = "tooling"
+visibility = "tooling-only"
+disposition = "retain"
+protected_invariants = ["Boundary reports bind collector identity, tracked source bytes and bounded unmodified Git history; source inputs and linked aliases cannot be overwritten as report output."]
+consumers = ["module:tools/memcordon-ci/src/lib.rs:boundary_report:pub:[]"]
+routes = ["module:tools/memcordon-ci/src/lib.rs:boundary_report:pub:[]"]
+cfg = []
+item_visibility = [
+    "const:MAX_HISTORY_COMMITS#1:private",
+    "fn:collect#1:pub",
+    "fn:digest#1:private",
+    "fn:git#1:private",
+    "fn:paths#1:private",
+    "fn:read_regular#1:private",
+    "fn:reject_grafts#1:private",
+    "fn:shallow_state#1:private",
+    "fn:source_path#1:private",
+    "fn:utf8#1:private",
+    "fn:validate_relative#1:private",
+    "fn:write#1:pub",
+    "struct:BoundaryReport#1/field:candidates#1:pub",
+    "struct:BoundaryReport#1/field:excluded_deleted_registry_sources#1:pub",
+    "struct:BoundaryReport#1/field:excluded_untracked_registry_sources#1:pub",
+    "struct:BoundaryReport#1/field:head#1:pub",
+    "struct:BoundaryReport#1/field:history#1:pub",
+    "struct:BoundaryReport#1/field:history_limit#1:pub",
+    "struct:BoundaryReport#1/field:history_truncated#1:pub",
+    "struct:BoundaryReport#1/field:limitations#1:pub",
+    "struct:BoundaryReport#1/field:producer#1:pub",
+    "struct:BoundaryReport#1/field:registry_sha256#1:pub",
+    "struct:BoundaryReport#1/field:schema#1:pub",
+    "struct:BoundaryReport#1/field:shallow_boundary_commits#1:pub",
+    "struct:BoundaryReport#1/field:shallow_repository#1:pub",
+    "struct:BoundaryReport#1/field:source_sha256#1:pub",
+    "struct:BoundaryReport#1/field:tracked_dirty#1:pub",
+    "struct:BoundaryReport#1/field:tracked_inventory_sha256#1:pub",
+    "struct:BoundaryReport#1/field:tracked_status_sha256#1:pub",
+    "struct:BoundaryReport#1/field:unregistered_tracked_sources#1:pub",
+    "struct:BoundaryReport#1:pub",
+    "struct:CandidateReport#1/field:id#1:pub",
+    "struct:CandidateReport#1/field:metrics#1:pub",
+    "struct:CandidateReport#1/field:owner#1:pub",
+    "struct:CandidateReport#1:pub",
+    "struct:HistoryCommit#1/field:commit#1:pub",
+    "struct:HistoryCommit#1/field:parent_comparison_available#1:pub",
+    "struct:HistoryCommit#1/field:registered_paths#1:pub",
+    "struct:HistoryCommit#1:pub",
+    "struct:ProducerIdentity#1/field:algorithm#1:pub",
+    "struct:ProducerIdentity#1/field:build_lock_sha256#1:pub",
+    "struct:ProducerIdentity#1/field:collector_source_sha256#1:pub",
+    "struct:ProducerIdentity#1/field:metrics_source_sha256#1:pub",
+    "struct:ProducerIdentity#1/field:package_version#1:pub",
+    "struct:ProducerIdentity#1:pub",
+    "use:crate :: boundary_metrics :: { FileMetrics , analyze_files }#1:private",
+    "use:crate :: command :: CommandSpec#1:private",
+    "use:crate :: source_registry :: { Domain , Source }#1:private",
+    "use:crate :: { CiError , Result }#1:private",
+    "use:serde :: Serialize#1:private",
+    "use:sha2 :: { Digest , Sha256 }#1:private",
+    "use:std :: collections :: { BTreeMap , BTreeSet }#1:private",
+    "use:std :: fs#1:private",
+    "use:std :: io :: Write#1:private",
+    "use:std :: path :: { Component , Path }#1:private",
+    "use:std :: time :: Duration#1:private",
+]
+platforms = ["portable"]
+work_packages = [
+    "GOV-01",
+    "GOV-06",
+    "TEST-02",
+]
+decision = "Maintain explicit ownership and validate source inventory changes."
+
+[[source]]
 id = "tools.memcordon-ci.src.build_context"
 path = "tools/memcordon-ci/src/build_context.rs"
 owner = "ci"
@@ -1082,6 +1224,8 @@ item_visibility = [
     "enum:CiError#1/variant:Zip#1/tuple:0#1/field:zip :: result :: ZipError#1:private",
     "enum:CiError#1/variant:Zip#1:enum-member",
     "enum:CiError#1:pub",
+    "mod:boundary_metrics#1:pub",
+    "mod:boundary_report#1:pub",
     "mod:build_context#1:pub",
     "mod:capability#1:pub",
     "mod:certification_context#1:pub",
@@ -1180,6 +1324,9 @@ item_visibility = [
     "enum:SourceCommand#1/variant:Attest#1/field:output#1:private",
     "enum:SourceCommand#1/variant:Attest#1/field:plan#1:private",
     "enum:SourceCommand#1/variant:Attest#1:enum-member",
+    "enum:SourceCommand#1/variant:Boundaries#1/field:history_limit#1:private",
+    "enum:SourceCommand#1/variant:Boundaries#1/field:output#1:private",
+    "enum:SourceCommand#1/variant:Boundaries#1:enum-member",
     "enum:SourceCommand#1/variant:Collect#1/field:output#1:private",
     "enum:SourceCommand#1/variant:Collect#1/field:workflow#1:private",
     "enum:SourceCommand#1/variant:Collect#1:enum-member",
@@ -1577,19 +1724,19 @@ cfg = [
     'const:LINUX_PROVIDER_QUALIFICATION_ARGUMENTS#1:cfg(any (target_os = "linux" , test))',
     'enum:LinuxProviderFrontendStage#1:cfg(any (target_os = "linux" , test))',
     "fn:existing_or_create#1:cfg(test)",
-    "fn:inspect_extract_and_smoke#1/expression:3866#1:cfg(unix)",
-    "fn:inspect_extract_and_smoke#1/expression:3894#1/expression:3931#1/expression:3952#1:cfg(unix)",
-    'fn:inspect_extract_and_smoke#1/expression:3894#1/expression:3931#1/expression:4017#1:cfg(target_os = "linux")',
-    'fn:inspect_extract_and_smoke#1/expression:3894#1/expression:3931#1/expression:4027#1:cfg(target_os = "windows")',
+    "fn:inspect_extract_and_smoke#1/expression:3881#1:cfg(unix)",
+    "fn:inspect_extract_and_smoke#1/expression:3909#1/expression:3946#1/expression:3967#1:cfg(unix)",
+    'fn:inspect_extract_and_smoke#1/expression:3909#1/expression:3946#1/expression:4032#1:cfg(target_os = "linux")',
+    'fn:inspect_extract_and_smoke#1/expression:3909#1/expression:3946#1/expression:4042#1:cfg(target_os = "windows")',
     'fn:linux_provider_frontend_arguments#1:cfg(any (target_os = "linux" , test))',
     'fn:smoke_linux_provider#1:cfg(target_os = "linux")',
-    'fn:smoke_packaged_memcordon_install#1/expression:2712#1:cfg(target_os = "linux")',
-    'fn:smoke_packaged_memcordon_install#1/expression:2738#1:cfg(target_os = "windows")',
+    'fn:smoke_packaged_memcordon_install#1/expression:2727#1:cfg(target_os = "linux")',
+    'fn:smoke_packaged_memcordon_install#1/expression:2753#1:cfg(target_os = "windows")',
     'fn:smoke_windows_provider#1:cfg(target_os = "windows")',
     'fn:validate_linux_provider_qualification#1:cfg(any (target_os = "linux" , test))',
     'fn:verify_absent_paths#1:cfg(any (target_os = "linux" , test))',
-    'fn:verify_crate_consumer#1/expression:8740#1/expression:8922#1:cfg(target_os = "linux")',
-    'fn:verify_crate_consumer#1/expression:8740#1/expression:8948#1:cfg(target_os = "windows")',
+    'fn:verify_crate_consumer#1/expression:8755#1/expression:8937#1:cfg(target_os = "linux")',
+    'fn:verify_crate_consumer#1/expression:8755#1/expression:8963#1:cfg(target_os = "windows")',
     'fn:verify_linux_provider_absent#1:cfg(target_os = "linux")',
     'fn:verify_windows_provider_absent#1:cfg(target_os = "windows")',
     "impl:HttpEndpoints:#1/method:fixed_test_server#1:cfg(test)",
@@ -1775,8 +1922,8 @@ item_visibility = [
     "fn:github_token#1:private",
     "fn:host_target#1:private",
     "fn:http_status#1:private",
-    "fn:inspect_extract_and_smoke#1/expression:3866#1/use:std :: os :: unix :: fs :: PermissionsExt#1:private",
-    "fn:inspect_extract_and_smoke#1/expression:3894#1/expression:3931#1/expression:3952#1/use:std :: os :: unix :: fs :: PermissionsExt#1:private",
+    "fn:inspect_extract_and_smoke#1/expression:3881#1/use:std :: os :: unix :: fs :: PermissionsExt#1:private",
+    "fn:inspect_extract_and_smoke#1/expression:3909#1/expression:3946#1/expression:3967#1/use:std :: os :: unix :: fs :: PermissionsExt#1:private",
     "fn:inspect_extract_and_smoke#1:private",
     "fn:installed_binary_name#1:private",
     "fn:is_lowercase_hex_digest#1:private",
@@ -1832,6 +1979,7 @@ item_visibility = [
     "fn:smoke_linux_provider#1:private",
     "fn:smoke_packaged_memcordon_install#1:private",
     "fn:smoke_windows_provider#1:private",
+    "fn:source_evidence_preflight#1:pub",
     "fn:sparse_crate_version_state#1:private",
     "fn:sparse_index_path#1:private",
     "fn:stage_github#1:private",
@@ -3473,6 +3621,7 @@ item_visibility = [
     "struct:WorkflowRun#1/field:path#1:pub",
     "struct:WorkflowRun#1/field:repository#1:pub",
     "struct:WorkflowRun#1/field:run_attempt#1:pub",
+    "struct:WorkflowRun#1/field:run_number#1:pub",
     "struct:WorkflowRun#1/field:status#1:pub",
     "struct:WorkflowRun#1:pub",
     "use:crate :: { CiError , Result }#1:private",
@@ -3503,13 +3652,23 @@ consumers = ["module:tools/memcordon-ci/src/source_registry/mod.rs:hosted_client
 routes = ["module:tools/memcordon-ci/src/source_registry/mod.rs:hosted_client:pub:[]"]
 cfg = []
 item_visibility = [
+    "const:RELEASE_WORKFLOWS#1:pub",
+    "fn:admit_release#1:pub",
     "fn:collect_current#1:pub",
+    "fn:collect_run#1:private",
     "fn:resolve_lane#1:pub",
+    "fn:select_release_run#1:pub",
     "fn:validate_lane_coverage#1:pub",
+    "fn:validate_release_checkout#1:pub",
+    "fn:validate_release_workflows#1:pub",
+    "fn:validate_selected_run#1:pub",
+    "fn:write_collection#1:private",
     "impl:Client:#1/method:bytes#1:private",
     "impl:Client:#1/method:inventory#1:private",
     "impl:Client:#1/method:json#1:private",
     "impl:Client:#1/method:new#1:private",
+    "impl:CollectionInputs:#1/method:digest#1:private",
+    "impl:CollectionInputs:#1/method:read#1:private",
     "struct:Client#1/field:agent#1:private",
     "struct:Client#1/field:api_version#1:private",
     "struct:Client#1/field:maximum_bytes#1:private",
@@ -3526,6 +3685,10 @@ item_visibility = [
     "struct:Collected#1/field:schema#1:private",
     "struct:Collected#1/field:workflow#1:private",
     "struct:Collected#1:private",
+    "struct:CollectionInputs#1/field:lanes#1:private",
+    "struct:CollectionInputs#1/field:sources#1:private",
+    "struct:CollectionInputs#1/field:workflows#1:private",
+    "struct:CollectionInputs#1:private",
     "struct:Lane#1/field:job#1:pub",
     "struct:Lane#1/field:matrix#1:pub",
     "struct:Lane#1/field:runner#1:pub",
@@ -3541,7 +3704,8 @@ item_visibility = [
     "struct:Lanes#1:private",
     "use:crate :: { CiError , Result }#1:private",
     "use:serde :: { Deserialize , Serialize }#1:private",
-    "use:std :: collections :: BTreeSet#1:private",
+    "use:sha2 :: { Digest , Sha256 }#1:private",
+    "use:std :: collections :: { BTreeMap , BTreeSet }#1:private",
     "use:std :: io :: Read#1:private",
     "use:std :: path :: Path#1:private",
     "use:std :: time :: Duration#1:private",

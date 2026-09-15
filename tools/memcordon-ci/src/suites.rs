@@ -1211,7 +1211,7 @@ pub fn run(root: &Path, suite: Suite) -> Result<()> {
         Suite::BackendMacosWatchdog => macos_acceptance(root, &toolchains.stable),
         Suite::MacosDeadline => macos_deadline(root, &toolchains.stable),
         Suite::ReleasePreflight => {
-            release::preflight(root)?;
+            release::source_evidence_preflight(root)?;
             policy::run(root)?;
             quality(root, &toolchains.stable)?;
             msrv(root, &toolchains.msrv)?;

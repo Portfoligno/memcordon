@@ -586,10 +586,11 @@ fn linux_certification_uploads_retain_hidden_failure_diagnostics() {
 }
 
 #[test]
-fn deep_and_backend_workflows_require_unfiltered_push_and_manual_dispatch() {
+fn deep_and_backend_workflows_require_every_branch_and_manual_dispatch_before_tags() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");
-    let expected_trigger = "on:\n  push:\n  workflow_dispatch:\n";
+    let expected_trigger = "on:\n  push:\n    branches:\n      - \"**\"\n  workflow_dispatch:\n";
+    let duplicate_tag_push = "on:\n  push:\n  workflow_dispatch:\n";
     let branch_filtered_push = "on:\n  push:\n    branches:\n      - main\n  workflow_dispatch:\n";
     let tag_filtered_push = "on:\n  push:\n    tags:\n      - release\n  workflow_dispatch:\n";
     let path_filtered_push = "on:\n  push:\n    paths:\n      - crates/**\n  workflow_dispatch:\n";
@@ -616,6 +617,7 @@ fn deep_and_backend_workflows_require_unfiltered_push_and_manual_dispatch() {
         policy::validate_workflow_bytes(&root, path, exact.as_bytes(), &repository_policy)
             .expect("exact push and manual workflow triggers should pass");
         for replacement in [
+            duplicate_tag_push,
             scheduled_trigger,
             branch_filtered_push,
             tag_filtered_push,

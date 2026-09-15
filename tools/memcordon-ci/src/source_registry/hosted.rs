@@ -19,6 +19,8 @@ pub struct Repository {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct WorkflowRun {
     pub id: u64,
+    #[serde(default)]
+    pub run_number: u64,
     pub run_attempt: u64,
     pub head_sha: String,
     pub path: String,

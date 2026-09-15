@@ -284,7 +284,22 @@ fn check_push_and_dispatch_events(workflow: &Mapping, context: &str) -> Result<(
         &["push", "workflow_dispatch"],
         &format!("{context} events"),
     )?;
-    for event in ["push", "workflow_dispatch"] {
+    let push = events
+        .get(key("push"))
+        .and_then(Value::as_mapping)
+        .ok_or_else(|| failure(format!("{context} must run on every branch before tagging")))?;
+    exact_mapping_keys(push, &["branches"], &format!("{context} push"))?;
+    if push
+        .get(key("branches"))
+        .and_then(Value::as_sequence)
+        .is_none_or(|branches| branches.len() != 1 || branches[0].as_str() != Some("**"))
+    {
+        return Err(failure(format!(
+            "{context} push must cover every branch and exclude tag-trigger duplication"
+        )));
+    }
+    {
+        let event = "workflow_dispatch";
         let configuration = events
             .get(key(event))
             .ok_or_else(|| failure(format!("{context} {event} is absent")))?;
@@ -2373,6 +2388,42 @@ fn check_release_structure(
         .get(key("steps"))
         .and_then(Value::as_sequence)
         .ok_or_else(|| failure("release preflight steps are absent"))?;
+    let permissions = preflight
+        .get(key("permissions"))
+        .and_then(Value::as_mapping)
+        .ok_or_else(|| failure("release evidence permissions are absent"))?;
+    if permissions.len() != 2
+        || scalar(permissions, "contents") != Some("read")
+        || scalar(permissions, "actions") != Some("read")
+    {
+        return Err(failure("release evidence permissions must be read-only"));
+    }
+    let evidence = preflight_steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter(|step| scalar(step, "name") == Some("Verify release source evidence and preflight"))
+        .collect::<Vec<_>>();
+    let [evidence] = evidence.as_slice() else {
+        return Err(failure(
+            "release evidence preflight step is absent or duplicated",
+        ));
+    };
+    let environment = evidence
+        .get(key("env"))
+        .and_then(Value::as_mapping)
+        .ok_or_else(|| failure("release evidence token is absent"))?;
+    if scalar(environment, "GITHUB_TOKEN") != Some("${{ github.token }}")
+        || scalar(evidence, "run")
+            != Some(
+                "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-preflight",
+            )
+        || evidence.contains_key(key("if"))
+        || evidence.contains_key(key("continue-on-error"))
+    {
+        return Err(failure(
+            "release evidence admission must execute and fail closed",
+        ));
+    }
     let actual_run_commands: Vec<&str> = preflight_steps
         .iter()
         .filter_map(Value::as_mapping)

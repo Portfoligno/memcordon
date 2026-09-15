@@ -173,6 +173,9 @@ jobs:
     name: Release / preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Check out pushed tag
         if: github.event_name == 'push'
@@ -214,7 +217,10 @@ jobs:
             !target/ci/release-bundle
             !target/ci/release-inputs
           key: managed-v2-cargo-target-release-v3-preflight-1.97.1-msrv-1.85.0-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-preflight
+      - name: Verify release source evidence and preflight
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-preflight
       - id: build-context-audit
         if: always()
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin

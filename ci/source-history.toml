@@ -1257,6 +1257,14 @@ id = "tools.memcordon-ci.src.bin.memcordon-native-input-digest"
 original_path = "tools/memcordon-ci/src/bin/memcordon-native-input-digest.rs"
 
 [[identity]]
+id = "tools.memcordon-ci.src.boundary_metrics"
+original_path = "tools/memcordon-ci/src/boundary_metrics.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.src.boundary_report"
+original_path = "tools/memcordon-ci/src/boundary_report.rs"
+
+[[identity]]
 id = "tools.memcordon-ci.src.build_context"
 original_path = "tools/memcordon-ci/src/build_context.rs"
 
@@ -1457,6 +1465,14 @@ id = "tools.memcordon-ci.tests.bootstrap_profile"
 original_path = "tools/memcordon-ci/tests/bootstrap_profile.rs"
 
 [[identity]]
+id = "tools.memcordon-ci.tests.boundary_metrics"
+original_path = "tools/memcordon-ci/tests/boundary_metrics.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.boundary_report"
+original_path = "tools/memcordon-ci/tests/boundary_report.rs"
+
+[[identity]]
 id = "tools.memcordon-ci.tests.build_context"
 original_path = "tools/memcordon-ci/tests/build_context.rs"
 
@@ -1623,6 +1639,10 @@ original_path = "tools/memcordon-ci/tests/source_identity.rs"
 [[identity]]
 id = "tools.memcordon-ci.tests.source_registry"
 original_path = "tools/memcordon-ci/tests/source_registry.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.source_release"
+original_path = "tools/memcordon-ci/tests/source_release.rs"
 
 [[identity]]
 id = "tools.memcordon-ci.tests.standard_certification"

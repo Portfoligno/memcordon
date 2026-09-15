@@ -1,11 +1,12 @@
 //! Read-only GitHub collection. Metadata comes from the API, never the ZIP payload.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::coverage::Plan;
 use super::hosted::{
@@ -215,8 +216,9 @@ impl Client {
         let mut expected = None;
         let mut ids = BTreeSet::new();
         for page in 1..=100 {
+            let separator = if endpoint.contains('?') { '&' } else { '?' };
             let value: serde_json::Value =
-                self.json(&format!("{endpoint}?per_page=100&page={page}"))?;
+                self.json(&format!("{endpoint}{separator}per_page=100&page={page}"))?;
             let total = value["total_count"]
                 .as_u64()
                 .ok_or_else(|| CiError::Message("GitHub inventory lacks total_count".into()))?;
@@ -263,6 +265,46 @@ struct Collected {
     conclusion: &'static str,
 }
 
+#[derive(Serialize)]
+struct CollectionInputs {
+    sources: Vec<super::Source>,
+    lanes: Vec<Lane>,
+    workflows: BTreeMap<String, String>,
+}
+
+impl CollectionInputs {
+    fn read(root: &Path) -> Result<Self> {
+        let configured: Lanes = toml::from_str(&std::fs::read_to_string(
+            root.join("ci/source-execution.toml"),
+        )?)?;
+        if configured.schema != 1 {
+            return Err(CiError::Message(
+                "unsupported source execution configuration".into(),
+            ));
+        }
+        let sources = super::validate(root)?;
+        validate_lane_coverage(&configured.lane, &sources)?;
+        let mut workflows = BTreeMap::new();
+        for lane in &configured.lane {
+            if !workflows.contains_key(&lane.workflow) {
+                workflows.insert(
+                    lane.workflow.clone(),
+                    std::fs::read_to_string(root.join(&lane.workflow))?,
+                );
+            }
+        }
+        Ok(Self {
+            sources,
+            lanes: configured.lane,
+            workflows,
+        })
+    }
+
+    fn digest(&self) -> Result<Vec<u8>> {
+        Ok(Sha256::digest(serde_json::to_vec(self)?).to_vec())
+    }
+}
+
 pub fn collect_current(root: &Path, workflow: &str, output: &Path) -> Result<()> {
     let commit = String::from_utf8(crate::command::git(root, ["rev-parse", "HEAD"])?)
         .map_err(|error| CiError::Message(error.to_string()))?
@@ -303,24 +345,33 @@ pub fn collect_current(root: &Path, workflow: &str, output: &Path) -> Result<()>
         &commit,
         expected.admission,
     )?;
+    let inputs = CollectionInputs::read(root)?;
+    let result = collect_run(&inputs, &client, workflow, commit, run, expected.admission)?;
+    write_collection(output, &result)
+}
+
+fn collect_run(
+    inputs: &CollectionInputs,
+    client: &Client,
+    workflow: &str,
+    commit: String,
+    run: WorkflowRun,
+    admission: Admission<'_>,
+) -> Result<Collected> {
+    let run_id = run.id;
+    let expected = ExpectedRun {
+        repository: &client.repository,
+        workflow_path: workflow,
+        admission,
+    };
     let jobs = client.inventory::<Job>(
         &format!("runs/{run_id}/attempts/{}/jobs", run.run_attempt),
         "jobs",
     )?;
     let artifacts =
         client.inventory::<Artifact>(&format!("runs/{run_id}/artifacts"), "artifacts")?;
-    let configured: Lanes = toml::from_str(&std::fs::read_to_string(
-        root.join("ci/source-execution.toml"),
-    )?)?;
-    if configured.schema != 1 {
-        return Err(CiError::Message(
-            "unsupported source execution configuration".into(),
-        ));
-    }
-    let sources = super::validate(root)?;
-    validate_lane_coverage(&configured.lane, &sources)?;
-    let lanes = configured
-        .lane
+    let lanes = inputs
+        .lanes
         .iter()
         .filter(|lane| lane.workflow == workflow)
         .collect::<Vec<_>>();
@@ -335,13 +386,16 @@ pub fn collect_current(root: &Path, workflow: &str, output: &Path) -> Result<()>
         .collect::<BTreeSet<_>>();
     let plans = suites
         .into_iter()
-        .map(|suite| Plan::from_sources(commit.clone(), suite.to_owned(), &sources))
+        .map(|suite| Plan::from_sources(commit.clone(), suite.to_owned(), &inputs.sources))
         .collect::<Result<Vec<_>>>()?;
-    let workflow_bytes = std::fs::read_to_string(root.join(workflow))?;
+    let workflow_bytes = inputs
+        .workflows
+        .get(workflow)
+        .ok_or_else(|| CiError::Message("collected workflow input is absent".into()))?;
     let mut attestations = Vec::new();
     let mut used = BTreeSet::new();
     for lane in lanes {
-        let identity = resolve_lane(lane, &workflow_bytes)?;
+        let identity = resolve_lane(lane, workflow_bytes)?;
         let artifact_name = format!("{}-{}", identity.artifact_name, run.run_attempt);
         let matching = artifacts
             .iter()
@@ -382,7 +436,7 @@ pub fn collect_current(root: &Path, workflow: &str, output: &Path) -> Result<()>
         )?);
     }
     super::observation::validate_merge(&commit, &plans, &attestations)?;
-    let result = Collected {
+    Ok(Collected {
         schema: 1,
         commit,
         workflow: workflow.to_owned(),
@@ -395,12 +449,176 @@ pub fn collect_current(root: &Path, workflow: &str, output: &Path) -> Result<()>
         plans,
         attestations,
         conclusion: "success",
-    };
-    let mut bytes = serde_json::to_vec_pretty(&result)?;
+    })
+}
+
+fn write_collection(output: &Path, value: &impl Serialize) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(output, bytes)?;
+    Ok(())
+}
+
+pub const RELEASE_WORKFLOWS: [&str; 3] = [
+    ".github/workflows/ci.yml",
+    ".github/workflows/deep-ci.yml",
+    ".github/workflows/backend-certification.yml",
+];
+
+/// Select the newest run, not the newest successful run. A later failure or
+/// unfinished run must not silently fall back to an earlier green result.
+pub fn select_release_run<'a>(
+    runs: &'a [WorkflowRun],
+    repository: &str,
+    workflow: &str,
+    commit: &str,
+) -> Result<&'a WorkflowRun> {
+    crate::source_identity::validate(commit)?;
+    let mut numbers = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    for run in runs {
+        if run.path != workflow
+            || run.head_sha != commit
+            || run.repository.full_name != repository
+            || run.run_number == 0
+            || !numbers.insert(run.run_number)
+            || !ids.insert(run.id)
+        {
+            return Err(CiError::Message(
+                "release workflow inventory has inconsistent or ambiguous identity".into(),
+            ));
+        }
+    }
+    let selected = runs
+        .iter()
+        .max_by_key(|run| run.run_number)
+        .ok_or_else(|| {
+            CiError::Message(format!(
+                "release commit has no workflow evidence: {workflow}"
+            ))
+        })?;
+    hosted::validate_run(selected, repository, workflow, commit, Admission::Completed)?;
+    Ok(selected)
+}
+
+pub fn validate_release_workflows(lanes: &[Lane]) -> Result<()> {
+    let actual = lanes
+        .iter()
+        .map(|lane| lane.workflow.as_str())
+        .collect::<BTreeSet<_>>();
+    if actual != RELEASE_WORKFLOWS.into_iter().collect() {
+        return Err(CiError::Message(
+            "release source evidence must cover CI, Deep CI and Backend Certification".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Authenticate completed runs and revalidate their original bounded archives.
+/// A local report is an output only: it is never accepted as admission authority.
+pub fn admit_release(root: &Path, commit: &str, output: &Path) -> Result<()> {
+    validate_release_checkout(root, commit)?;
+    write_collection(
+        output,
+        &serde_json::json!({
+            "schema": 1, "commit": commit, "conclusion": "in-progress"
+        }),
+    )?;
+    let client = Client::new(root)?;
+    let inputs = CollectionInputs::read(root)?;
+    let input_digest = inputs.digest()?;
+    validate_release_checkout(root, commit)?;
+    validate_release_workflows(&inputs.lanes)?;
+    let mut collected = Vec::new();
+    for workflow in RELEASE_WORKFLOWS {
+        let filename = Path::new(workflow)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| CiError::Message("release workflow filename is absent".into()))?;
+        let endpoint = format!("workflows/{filename}/runs?head_sha={commit}");
+        let runs = client.inventory::<WorkflowRun>(&endpoint, "workflow_runs")?;
+        let selected = select_release_run(&runs, &client.repository, workflow, commit)?;
+        let run: WorkflowRun = client.json(&format!("runs/{}", selected.id))?;
+        validate_selected_run(selected, &run)?;
+        hosted::validate_run(
+            &run,
+            &client.repository,
+            workflow,
+            commit,
+            Admission::Completed,
+        )?;
+        collected.push(collect_run(
+            &inputs,
+            &client,
+            workflow,
+            commit.to_owned(),
+            run,
+            Admission::Completed,
+        )?);
+    }
+    // Re-read selection after downloads. A rerun or a newer run invalidates this
+    // admission snapshot rather than mixing evidence from different attempts.
+    for collection in &collected {
+        let filename = Path::new(&collection.workflow)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| CiError::Message("release workflow filename is absent".into()))?;
+        let endpoint = format!("workflows/{filename}/runs?head_sha={commit}");
+        let runs = client.inventory::<WorkflowRun>(&endpoint, "workflow_runs")?;
+        let latest = select_release_run(&runs, &client.repository, &collection.workflow, commit)?;
+        validate_selected_run(&collection.run, latest)?;
+    }
+    validate_release_checkout(root, commit)?;
+    if CollectionInputs::read(root)?.digest()? != input_digest {
+        return Err(CiError::Message(
+            "release source configuration changed during collection".into(),
+        ));
+    }
+    validate_release_checkout(root, commit)?;
+    write_collection(
+        output,
+        &serde_json::json!({
+            "schema": 1, "commit": commit, "configuration_sha256": input_digest,
+            "workflows": collected, "conclusion": "success"
+        }),
+    )
+}
+
+pub fn validate_release_checkout(root: &Path, commit: &str) -> Result<()> {
+    crate::source_identity::validate(commit)?;
+    let checkout = String::from_utf8(crate::command::git(root, ["rev-parse", "HEAD"])?)
+        .map_err(|error| CiError::Message(error.to_string()))?;
+    if checkout.trim() != commit {
+        return Err(CiError::Message(
+            "release evidence commit differs from checkout".into(),
+        ));
+    }
+    let status = crate::command::git(root, ["status", "--porcelain", "--untracked-files=normal"])?;
+    if !status.is_empty() {
+        return Err(CiError::Message(
+            "release evidence requires an unchanged clean checkout".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_selected_run(before: &WorkflowRun, after: &WorkflowRun) -> Result<()> {
+    if before.id != after.id
+        || before.run_number != after.run_number
+        || before.run_attempt != after.run_attempt
+        || before.head_sha != after.head_sha
+        || before.path != after.path
+        || before.repository.id != after.repository.id
+        || before.repository.full_name != after.repository.full_name
+        || before.status != after.status
+        || before.conclusion != after.conclusion
+    {
+        return Err(CiError::Message(
+            "release workflow selection changed during collection".into(),
+        ));
+    }
     Ok(())
 }

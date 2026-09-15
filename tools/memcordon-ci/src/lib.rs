@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod boundary_metrics;
+pub mod boundary_report;
 pub mod build_context;
 pub mod capability;
 pub mod certification_context;

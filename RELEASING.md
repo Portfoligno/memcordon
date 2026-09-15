@@ -63,6 +63,19 @@ one dated changelog section. Push the release commit without a tag and require
 its CI, Deep CI, and Backend Certification workflows to pass. CI runs the
 repository policy, quality, MSRV, and supply-chain suites on that exact commit.
 
+The release-version commit itself must be pushed to a branch and finish all
+three evidence workflows before the tag is created. A green development-version
+parent is insufficient. Evidence workflows cover every branch push and retain
+manual dispatch, but do not start duplicate runs for the subsequent tag push.
+Release preflight authenticates the latest run of each workflow for the exact
+tagged commit, then verifies its original source-execution archives. A newer
+pending, failed, cancelled, or skipped run blocks admission; preflight never
+falls back to an older green run or waits for a pending run to become green.
+If an evidence workflow is dispatched manually, select the branch containing
+the release commit and complete it before tagging. Manual release dispatch from
+an existing tag performs the same exact-commit admission again; it does not
+reuse a local receipt or waive missing or expired evidence.
+
 From the release commit, create the public crate archives locally:
 
 ```console

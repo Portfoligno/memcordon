@@ -109,7 +109,7 @@ steps = ["Certify packaged Cargo channel"]
 file = ".github/workflows/release.yml"
 variable = "GITHUB_TOKEN"
 source = "${{ github.token }}"
-steps = ["Stage GitHub draft and assets", "Finalize GitHub release"]
+steps = ["Stage GitHub draft and assets", "Finalize GitHub release", "Verify release source evidence and preflight"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
