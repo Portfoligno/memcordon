@@ -215,7 +215,6 @@ pub fn validate_memcordon_crate_distribution(
         "src/main.rs",
         "src/bin/memcordon-sealed-agent/main.rs",
         "src/bin/memcordon-sealed-agent/package.rs",
-        "src/bin/memcordon-sealed-agent/protocol.rs",
         "src/bin/memcordon-sealed-agent/linux/mod.rs",
         "src/bin/memcordon-sealed-agent/windows/mod.rs",
         "src/bin/memcordon-sealed-agent/windows/control_service.rs",

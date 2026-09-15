@@ -64,25 +64,6 @@ work_packages = [
 decision = "Keep privileged runtime behavior binary-private, extract shared pure schemas/parsers into production-consumed contract modules, remove test/fuzz path inclusion where possible, and add compilation-context parity for retained sharing."
 
 [[source]]
-id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.inspection_schema"
-path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/inspection_schema.rs"
-owner = "sealed-provider"
-kind = "production"
-visibility = "binary-private"
-disposition = "extract"
-protected_invariants = ["Compatibility route for the published provider contract."]
-consumers = ["module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:inspection_schema:private:[]"]
-routes = ["module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:inspection_schema:private:[]"]
-cfg = []
-item_visibility = ["use:memcordon_core :: sealed_provider :: inspection :: *#1:pub"]
-platforms = ["portable"]
-work_packages = [
-    "GOV-01",
-    "PROV-01",
-]
-decision = "Keep privileged runtime behavior binary-private, extract shared pure schemas/parsers into production-consumed contract modules, remove test/fuzz path inclusion where possible, and add compilation-context parity for retained sharing."
-
-[[source]]
 id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.linux.attempt"
 path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/linux/attempt.rs"
 owner = "sealed-provider"
@@ -1167,10 +1148,10 @@ cfg = [
     'fn:serve#1/expression:432#1:cfg(not (any (target_os = "linux" , target_os = "windows")))',
     'fn:windows_recovery_status#1:cfg(target_os = "windows")',
     'mod:linux#1:cfg(target_os = "linux")',
-    'mod:protocol#1:cfg_attr(not (target_os = "linux") , allow (dead_code))',
     'mod:rejection#1:cfg(target_os = "linux")',
-    'mod:request#1:cfg(target_os = "linux")',
     'mod:windows#1:cfg(target_os = "windows")',
+    'use:memcordon_core :: sealed_provider :: protocol#1:cfg_attr(not (target_os = "linux") , allow (unused_imports))',
+    'use:memcordon_core :: sealed_provider :: request#1:cfg(target_os = "linux")',
 ]
 item_visibility = [
     "const:HELP#1:private",
@@ -1182,14 +1163,14 @@ item_visibility = [
     "fn:serve#1:private",
     "fn:windows_recovery_status#1:private",
     "mod:admission#1:private",
-    "mod:inspection_schema#1:private",
     "mod:linux#1:private",
     "mod:package#1:private",
     "mod:policy_registry#1:private",
-    "mod:protocol#1:private",
     "mod:rejection#1:private",
-    "mod:request#1:private",
     "mod:windows#1:private",
+    "use:memcordon_core :: sealed_provider :: inspection as inspection_schema#1:private",
+    "use:memcordon_core :: sealed_provider :: protocol#1:private",
+    "use:memcordon_core :: sealed_provider :: request#1:private",
     "use:std :: ffi :: OsString#1:private",
 ]
 platforms = ["portable"]
@@ -1452,25 +1433,6 @@ work_packages = [
 decision = "Keep privileged runtime behavior binary-private, extract shared pure schemas/parsers into production-consumed contract modules, remove test/fuzz path inclusion where possible, and add compilation-context parity for retained sharing."
 
 [[source]]
-id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.protocol"
-path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/protocol.rs"
-owner = "sealed-provider"
-kind = "production"
-visibility = "binary-private"
-disposition = "extract"
-protected_invariants = ["Compatibility route for the published provider contract."]
-consumers = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:protocol:private:["cfg_attr(not (target_os = \"linux\") , allow (dead_code))"]']
-routes = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:protocol:private:["cfg_attr(not (target_os = \"linux\") , allow (dead_code))"]']
-cfg = []
-item_visibility = ["use:memcordon_core :: sealed_provider :: protocol :: *#1:pub"]
-platforms = ["portable"]
-work_packages = [
-    "GOV-01",
-    "PROV-01",
-]
-decision = "Keep privileged runtime behavior binary-private, extract shared pure schemas/parsers into production-consumed contract modules, remove test/fuzz path inclusion where possible, and add compilation-context parity for retained sharing."
-
-[[source]]
 id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.rejection"
 path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/rejection.rs"
 owner = "sealed-provider"
@@ -1545,25 +1507,6 @@ item_visibility = [
     "struct:RejectionV1#1:pub",
     "use:serde :: { Deserialize , Serialize }#1:private",
 ]
-platforms = ["portable"]
-work_packages = [
-    "GOV-01",
-    "PROV-01",
-]
-decision = "Keep privileged runtime behavior binary-private, extract shared pure schemas/parsers into production-consumed contract modules, remove test/fuzz path inclusion where possible, and add compilation-context parity for retained sharing."
-
-[[source]]
-id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.request"
-path = "crates/memcordon-cli/src/bin/memcordon-sealed-agent/request.rs"
-owner = "sealed-provider"
-kind = "production"
-visibility = "binary-private"
-disposition = "extract"
-protected_invariants = ["Compatibility route for the published provider contract."]
-consumers = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:request:private:["cfg(target_os = \"linux\")"]']
-routes = ['module:crates/memcordon-cli/src/bin/memcordon-sealed-agent/main.rs:request:private:["cfg(target_os = \"linux\")"]']
-cfg = []
-item_visibility = ["use:memcordon_core :: sealed_provider :: request :: *#1:pub"]
 platforms = ["portable"]
 work_packages = [
     "GOV-01",

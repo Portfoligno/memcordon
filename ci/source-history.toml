@@ -1757,5 +1757,17 @@ id = "tools.memcordon-windows-loader-lab.tests.versioned_contract"
 original_path = "tools/memcordon-windows-loader-lab/tests/versioned_contract.rs"
 
 [[retired]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.inspection_schema"
+reason = "PROV-01: empty compatibility adapter retired after production, helper, test and fuzz consumers moved to the published memcordon-core::sealed_provider contract; packaged CLI installation retains its validated core dependency."
+
+[[retired]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.protocol"
+reason = "PROV-01: empty compatibility adapter retired after production, helper, test and fuzz consumers moved to the published memcordon-core::sealed_provider contract; packaged CLI installation retains its validated core dependency."
+
+[[retired]]
+id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.request"
+reason = "PROV-01: empty compatibility adapter retired after production, helper, test and fuzz consumers moved to the published memcordon-core::sealed_provider contract; packaged CLI installation retains its validated core dependency."
+
+[[retired]]
 id = "crates.memcordon-cli.src.bin.memcordon-sealed-agent.state"
 reason = "PROV-02: unused abstract state model removed; production Linux fault and Windows record transitions remain authoritative."

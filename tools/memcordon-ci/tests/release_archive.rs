@@ -89,7 +89,6 @@ fn write_crate_fixture(manifest: &str, path: &Path) {
         ("src/main.rs", Vec::new()),
         ("src/bin/memcordon-sealed-agent/main.rs", Vec::new()),
         ("src/bin/memcordon-sealed-agent/package.rs", Vec::new()),
-        ("src/bin/memcordon-sealed-agent/protocol.rs", Vec::new()),
         ("src/bin/memcordon-sealed-agent/linux/mod.rs", Vec::new()),
         ("src/bin/memcordon-sealed-agent/windows/mod.rs", Vec::new()),
         (

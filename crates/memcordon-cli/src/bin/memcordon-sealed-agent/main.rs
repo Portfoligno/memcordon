@@ -3,17 +3,17 @@
 use std::ffi::OsString;
 
 mod admission;
-mod inspection_schema;
+use memcordon_core::sealed_provider::inspection as inspection_schema;
 #[cfg(target_os = "linux")]
 mod linux;
 mod package;
 mod policy_registry;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-mod protocol;
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+use memcordon_core::sealed_provider::protocol;
 #[cfg(target_os = "linux")]
 mod rejection;
 #[cfg(target_os = "linux")]
-mod request;
+use memcordon_core::sealed_provider::request;
 #[cfg(target_os = "windows")]
 mod windows;
 
