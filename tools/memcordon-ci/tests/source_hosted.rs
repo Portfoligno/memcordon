@@ -254,6 +254,38 @@ fn native_emitter_requires_unique_successful_job_from_current_attempt() {
     assert!(validate_emitter(&run(), &[job()], &other_artifact, &attestation()).is_err());
 }
 
+#[test]
+fn unassigned_jobs_deserialize_without_authorizing_an_emitter() {
+    let mut skipped = serde_json::to_value(job()).unwrap();
+    skipped["id"] = json!(1000);
+    skipped["name"] = json!("Optional loader lab");
+    skipped["conclusion"] = json!("skipped");
+    skipped["runner_name"] = json!(null);
+    skipped["runner_id"] = json!(null);
+    skipped["labels"] = json!([]);
+    let inventory: Vec<Job> =
+        serde_json::from_value(json!([serde_json::to_value(job()).unwrap(), skipped])).unwrap();
+    assert_eq!(
+        validate_emitter(&run(), &inventory, &artifact(b"archive"), &attestation()).unwrap(),
+        999
+    );
+    for (field, values) in [
+        ("runner_id", vec![json!(null), json!(0)]),
+        ("runner_name", vec![json!(null), json!("")]),
+    ] {
+        for value in values {
+            let mut selected = serde_json::to_value(job()).unwrap();
+            selected[field] = value;
+            let selected: Job = serde_json::from_value(selected).unwrap();
+            assert!(
+                validate_emitter(&run(), &[selected], &artifact(b"archive"), &attestation())
+                    .is_err(),
+                "{field}"
+            );
+        }
+    }
+}
+
 fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for (name, bytes) in entries {

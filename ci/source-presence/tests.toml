@@ -6822,6 +6822,7 @@ item_visibility = [
     "fn:native_emitter_requires_unique_successful_job_from_current_attempt#1:private",
     "fn:release_requires_successful_exact_repository_workflow_and_commit#1:private",
     "fn:run#1:private",
+    "fn:unassigned_jobs_deserialize_without_authorizing_an_emitter#1:private",
     "fn:workflow_lane_identity_comes_from_exact_matrix_not_runner_claim#1/use:memcordon_ci :: source_registry :: hosted_client :: { Lane , resolve_lane }#1:private",
     "fn:workflow_lane_identity_comes_from_exact_matrix_not_runner_claim#1:private",
     "fn:zip_reader_rejects_traversal_size_limits_and_absent_journals#1/use:memcordon_ci :: source_registry :: hosted :: read_journals#1:private",

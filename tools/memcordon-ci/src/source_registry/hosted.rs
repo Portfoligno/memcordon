@@ -40,8 +40,8 @@ pub struct Job {
     pub name: String,
     pub status: String,
     pub conclusion: Option<String>,
-    pub runner_name: String,
-    pub runner_id: u64,
+    pub runner_name: Option<String>,
+    pub runner_id: Option<u64>,
     pub labels: Vec<String>,
 }
 
@@ -155,7 +155,7 @@ pub fn validate_emitter(
             job.run_id == run.id
                 && job.run_attempt == run.run_attempt
                 && job.head_sha == run.head_sha
-                && job.runner_name == attestation.runner_name
+                && job.runner_name.as_deref() == Some(attestation.runner_name.as_str())
         })
         .collect::<Vec<_>>();
     let [job] = matches.as_slice() else {
@@ -164,7 +164,7 @@ pub fn validate_emitter(
         ));
     };
     if job.id == 0
-        || job.runner_id == 0
+        || !job.runner_id.is_some_and(|id| id != 0)
         || job.status != "completed"
         || job.conclusion.as_deref() != Some("success")
     {
