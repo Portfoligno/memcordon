@@ -81,7 +81,7 @@ fn package_inspection_fixture() -> serde_json::Value {
     serde_json::json!({
         "schema_version": 5,
         "version": "1.2.3",
-        "source_commit": "source-commit",
+        "source_commit": "0123456789abcdef0123456789abcdef01234567",
         "executable_sha256": digest,
         "provider_protocol": provider_wire_protocol(&native_protocols),
         "native_protocols": native_protocols,
@@ -133,7 +133,10 @@ fn windows_package_inspection_fixture() -> serde_json::Value {
     for (field, value) in [
         ("schema_version", serde_json::json!(5)),
         ("version", serde_json::json!("1.2.3")),
-        ("source_commit", serde_json::json!("source-commit")),
+        (
+            "source_commit",
+            serde_json::json!("0123456789abcdef0123456789abcdef01234567"),
+        ),
         (
             "provider_protocol",
             serde_json::json!(provider_wire_protocol(&native_protocols)),
@@ -447,17 +450,17 @@ fn package_inspection_binds_version_source_commit_and_sha256_fields() {
     validate_agent_package_inspection(
         &serde_json::to_vec(&canonical).unwrap(),
         "1.2.3",
-        "source-commit",
+        "0123456789abcdef0123456789abcdef01234567",
     )
     .expect("canonical package inspection should validate");
 
     let mut wrong_commit = canonical.clone();
-    wrong_commit["source_commit"] = serde_json::json!("different-commit");
+    wrong_commit["source_commit"] = serde_json::json!("fedcba9876543210fedcba9876543210fedcba98");
     assert!(
         validate_agent_package_inspection(
             &serde_json::to_vec(&wrong_commit).unwrap(),
             "1.2.3",
-            "source-commit",
+            "0123456789abcdef0123456789abcdef01234567",
         )
         .is_err()
     );
@@ -468,7 +471,7 @@ fn package_inspection_binds_version_source_commit_and_sha256_fields() {
         validate_agent_package_inspection(
             &serde_json::to_vec(&invalid_digest).unwrap(),
             "1.2.3",
-            "source-commit",
+            "0123456789abcdef0123456789abcdef01234567",
         )
         .is_err()
     );
@@ -479,7 +482,7 @@ fn package_inspection_binds_version_source_commit_and_sha256_fields() {
         validate_agent_package_inspection(
             &serde_json::to_vec(&unknown_field).unwrap(),
             "1.2.3",
-            "source-commit",
+            "0123456789abcdef0123456789abcdef01234567",
         )
         .is_err()
     );
@@ -494,7 +497,7 @@ fn package_inspection_accepts_current_native_provider_wire_identity() {
         validate_agent_package_inspection(
             &serde_json::to_vec(&canonical).unwrap(),
             "1.2.3",
-            "source-commit",
+            "0123456789abcdef0123456789abcdef01234567",
         )
         .expect("the package inspection provider protocol should match the native wire identity");
 
@@ -504,7 +507,7 @@ fn package_inspection_accepts_current_native_provider_wire_identity() {
             validate_agent_package_inspection(
                 &serde_json::to_vec(&stale_provider_identity).unwrap(),
                 "1.2.3",
-                "source-commit",
+                "0123456789abcdef0123456789abcdef01234567",
             )
             .is_err(),
             "a provider protocol that differs from the native wire identity should fail"
@@ -570,7 +573,7 @@ fn windows_package_inspection_requires_complete_session_broker_privileges() {
     validate_agent_package_inspection(
         &serde_json::to_vec(&canonical).unwrap(),
         "1.2.3",
-        "source-commit",
+        "0123456789abcdef0123456789abcdef01234567",
     )
     .expect("canonical Windows package inspection should validate");
 
@@ -583,7 +586,7 @@ fn windows_package_inspection_requires_complete_session_broker_privileges() {
     let error = validate_agent_package_inspection(
         &serde_json::to_vec(&stale_validator_identity).unwrap(),
         "1.2.3",
-        "source-commit",
+        "0123456789abcdef0123456789abcdef01234567",
     )
     .expect_err("the stale session-broker privilege identity should fail");
     assert!(
@@ -601,7 +604,7 @@ fn windows_package_inspection_binds_bootstrap_runtime_contract() {
     validate_agent_package_inspection(
         &serde_json::to_vec(&canonical).unwrap(),
         "1.2.3",
-        "source-commit",
+        "0123456789abcdef0123456789abcdef01234567",
     )
     .expect("OS-provided UCRT API sets must remain valid bootstrap imports");
 
@@ -612,7 +615,7 @@ fn windows_package_inspection_binds_bootstrap_runtime_contract() {
         validate_agent_package_inspection(
             &serde_json::to_vec(&redistributable).unwrap(),
             "1.2.3",
-            "source-commit",
+            "0123456789abcdef0123456789abcdef01234567",
         )
         .is_err()
     );
@@ -623,7 +626,7 @@ fn windows_package_inspection_binds_bootstrap_runtime_contract() {
         validate_agent_package_inspection(
             &serde_json::to_vec(&runtime).unwrap(),
             "1.2.3",
-            "source-commit",
+            "0123456789abcdef0123456789abcdef01234567",
         )
         .is_err()
     );

@@ -361,7 +361,10 @@ pub fn run(directory: &Path, deadline: Duration, arguments: &[OsString]) -> Resu
         .stdin(std::process::Stdio::inherit())
         .output()?;
     use std::io::Write;
-    std::io::stdout().write_all(&output.stdout)?;
+    // Cargo multiplexes compiler protocol messages and runner stdout. Encode
+    // native bytes before entering that stream so JSON-shaped test output can
+    // never be mistaken for (and removed as) a compiler artifact message.
+    std::io::stdout().write_all(&encode_native_stdout(directory, &output.stdout)?)?;
     std::io::stderr().write_all(&output.stderr)?;
     let executed_tests = if output.status.success() {
         verify_successful_execution(&output.stdout, &selected_tests, &ignored_tests, arguments)?
@@ -406,4 +409,67 @@ pub fn run(directory: &Path, deadline: Duration, arguments: &[OsString]) -> Resu
         )));
     }
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeStdout {
+    native_stdout_schema: u32,
+    native_stdout_token: String,
+    bytes: Vec<u8>,
+}
+
+fn stdout_token(directory: &Path) -> Result<String> {
+    Ok(digest(&serde_json::to_vec(&NativeArgument::from_os(
+        directory.as_os_str(),
+    ))?))
+}
+
+pub fn encode_native_stdout(directory: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut frame = serde_json::to_vec(&NativeStdout {
+        native_stdout_schema: 1,
+        native_stdout_token: stdout_token(directory)?,
+        bytes: bytes.to_vec(),
+    })?;
+    frame.push(b'\n');
+    Ok(frame)
+}
+
+/// Decode only the adapter's framed native bytes; ordinary Cargo text (including
+/// doctest output) remains intact. Compiler protocol messages stay in the raw
+/// observation used for artifact binding and never enter a libtest transcript.
+pub fn decode_cargo_stdout(directory: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
+    let token = stdout_token(directory)?;
+    let mut decoded = Vec::new();
+    let mut build_finished = false;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            decoded.extend_from_slice(line);
+            continue;
+        };
+        if value
+            .get("native_stdout_token")
+            .and_then(serde_json::Value::as_str)
+            == Some(token.as_str())
+        {
+            let frame: NativeStdout = serde_json::from_value(value)?;
+            if frame.native_stdout_schema != 1 {
+                return Err(CiError::Message("unsupported native stdout frame".into()));
+            }
+            decoded.extend_from_slice(&frame.bytes);
+        } else if !build_finished {
+            match serde_json::from_value::<cargo_metadata::Message>(value) {
+                Ok(cargo_metadata::Message::BuildFinished(_)) => build_finished = true,
+                Ok(
+                    cargo_metadata::Message::CompilerArtifact(_)
+                    | cargo_metadata::Message::CompilerMessage(_)
+                    | cargo_metadata::Message::BuildScriptExecuted(_),
+                ) => {}
+                _ => decoded.extend_from_slice(line),
+            }
+        } else {
+            decoded.extend_from_slice(line);
+        }
+    }
+    Ok(decoded)
 }

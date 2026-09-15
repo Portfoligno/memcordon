@@ -519,6 +519,69 @@ fn requested_deadline_expires_during_unacknowledged_startup() {
         !execution.launch.target_released,
         "elapsed={elapsed:?}; execution={execution:#?}"
     );
+    let runtime = execution
+        .runtime
+        .as_ref()
+        .expect("platform must retain pre-release evidence");
+    assert!(matches!(
+        runtime.release,
+        memcordon_core::runtime_evidence::ReleaseEvidence::NotIssued
+    ));
+    assert_runtime_core_parity(runtime);
+}
+
+fn assert_runtime_core_parity(runtime: &memcordon_core::RuntimeEvidenceV1) {
+    assert!(runtime.is_consistent(), "{runtime:?}");
+    let encoded = serde_json::to_vec(runtime).unwrap();
+    let decoded: memcordon_core::RuntimeEvidenceV1 = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(&decoded, runtime);
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+    let mut unknown = serde_json::to_value(runtime).unwrap();
+    unknown["unknown-authority"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<memcordon_core::RuntimeEvidenceV1>(unknown).is_err());
+}
+
+#[test]
+fn cli_emitted_runtime_evidence_obeys_core_release_retirement_and_delivery_contract() {
+    let _runtime = native_runtime();
+    for (code, expected) in [("0", 0), ("7", 7)] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.json");
+        let mut command = Command::new(image());
+        command
+            .args(["+2s", "--report"])
+            .arg(&path)
+            .arg("--")
+            .arg(fixture())
+            .args(["exit", "--code", code]);
+        let output = run_with_deadline(&mut command, Duration::from_secs(6)).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: memcordon_core::MemcordonReport =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(report.attempts.len(), 1);
+        let runtime = report.attempts[0]
+            .runtime
+            .as_ref()
+            .expect("CLI report retains native runtime evidence");
+        assert_runtime_core_parity(runtime);
+        assert!(matches!(
+            runtime.release,
+            memcordon_core::runtime_evidence::ReleaseEvidence::Issued {
+                exec_confirmed: true,
+                ..
+            }
+        ));
+        assert!(runtime.retirement.is_complete());
+        assert!(matches!(
+            runtime.delivery,
+            memcordon_core::runtime_evidence::DeliveryEvidence::PreparedBy { .. }
+        ));
+    }
 }
 
 #[test]

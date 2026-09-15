@@ -138,6 +138,8 @@ fn cargo_runner_records_the_actual_selected_test_artifact() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let transcript = native_runner::decode_cargo_stdout(&directory, &output.stdout).unwrap();
+    memcordon_ci::capability::require_exact_standard_test_success(&transcript, "observed").unwrap();
     let evidence = native_runner::bind_artifacts(&directory, &output.stdout, true).unwrap();
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0].package_name, "native-evidence-fixture");
@@ -167,6 +169,35 @@ fn cargo_runner_records_the_actual_selected_test_artifact() {
     record["binary_sha256"] = serde_json::json!("stale-binary-digest");
     std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
     assert!(native_runner::bind_artifacts(&directory, &output.stdout, true).is_err());
+}
+
+#[test]
+fn framed_native_stdout_preserves_protocol_shaped_and_non_utf8_test_output() {
+    let directory = std::path::Path::new("unique-command-directory");
+    let native = b"{\"reason\":\"build-finished\",\"success\":true}\n\xff\n";
+    let mut stream = b"{\"reason\":\"build-finished\",\"success\":true}\n".to_vec();
+    let frame = native_runner::encode_native_stdout(directory, native).unwrap();
+    stream.extend_from_slice(&frame);
+    let doctest = b"ordinary doctest text\n{\"reason\":\"build-finished\",\"success\":true}\n{\"native_stdout_schema\":1,\"native_stdout_token\":\"unrelated\",\"bytes\":[]}\n";
+    stream.extend_from_slice(doctest);
+    let mut expected = native.to_vec();
+    expected.extend_from_slice(doctest);
+    assert_eq!(
+        native_runner::decode_cargo_stdout(directory, &stream).unwrap(),
+        expected
+    );
+    let mut invalid: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+    invalid["native_stdout_schema"] = serde_json::json!(2);
+    assert!(
+        native_runner::decode_cargo_stdout(directory, &serde_json::to_vec(&invalid).unwrap())
+            .is_err()
+    );
+    invalid["native_stdout_schema"] = serde_json::json!(1);
+    invalid["extra"] = serde_json::json!(1);
+    assert!(
+        native_runner::decode_cargo_stdout(directory, &serde_json::to_vec(&invalid).unwrap())
+            .is_err()
+    );
 }
 
 #[test]

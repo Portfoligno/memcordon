@@ -67,6 +67,12 @@ impl BuildInputSnapshot {
             &self.inputs,
         )?)))
     }
+
+    /// Diagnostic V3 input records for characterization and comparison. This
+    /// exports bytes, not an input constructor or cache-authorization token.
+    pub fn serialized_inputs(&self) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&self.inputs)?)
+    }
     pub fn audit(&self) -> Result<()> {
         if Self::capture_with_policy(&self.root, self.native_discovery)?.inputs != self.inputs {
             return Err(CiError::Message("declared build inputs changed".into()));

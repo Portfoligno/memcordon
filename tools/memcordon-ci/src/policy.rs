@@ -2977,7 +2977,9 @@ struct RustPolicy {
     calls_env_remove: bool,
     unreviewed_fixture_env_remove: bool,
     in_generated_fixture_child: bool,
+    in_identity_metadata_fixture: bool,
     subprocess_env_mutations: usize,
+    identity_metadata_mutations: usize,
     standard_path_mutations: usize,
     pre_exec_calls: usize,
     fork_calls: usize,
@@ -2986,9 +2988,13 @@ struct RustPolicy {
 impl<'ast> Visit<'ast> for RustPolicy {
     fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
         let previous = self.in_generated_fixture_child;
+        let previous_identity = self.in_identity_metadata_fixture;
         self.in_generated_fixture_child = function.sig.ident == "generated_fixture_child";
+        self.in_identity_metadata_fixture =
+            function.sig.ident == "inherited_workflow_commit_cannot_override_checkout_files";
         syn::visit::visit_item_fn(self, function);
         self.in_generated_fixture_child = previous;
+        self.in_identity_metadata_fixture = previous_identity;
     }
 
     fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
@@ -3061,6 +3067,14 @@ impl<'ast> Visit<'ast> for RustPolicy {
         }
         if matches!(expression.method.to_string().as_str(), "env" | "envs") {
             self.subprocess_env_mutations += 1;
+            if self.in_identity_metadata_fixture
+                && expression.method == "env"
+                && expression.args.len() == 2
+                && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "GITHUB_SHA")
+                && matches!(expression.args.last(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(value), .. })) if value.value() == "unrelated-workflow-metadata")
+            {
+                self.identity_metadata_mutations += 1;
+            }
             if expression.method == "env"
                 && matches!(expression.args.first(), Some(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(key), .. })) if key.value() == "PATH")
             {
@@ -3096,7 +3110,14 @@ fn managed_compilation_environment_boundary(relative: &Path) -> bool {
     .contains(&relative)
 }
 
-/// Parses untrusted Rust source and applies the repository's semantic subprocess policy.
+// The identity regression injects one inert, mismatched workflow value into its
+// child. This does not authorize another variable, call, function, or file.
+fn reviewed_identity_metadata_fixture(relative: &Path, visitor: &RustPolicy) -> bool {
+    relative == Path::new("crates/memcordon-cli/tests/build_identity.rs")
+        && visitor.subprocess_env_mutations == 1
+        && visitor.identity_metadata_mutations == 1
+}
+
 fn reviewed_environment_removal(relative: &Path, visitor: &RustPolicy) -> bool {
     !visitor.calls_env_remove
         || relative == Path::new("tools/memcordon-ci/src/command.rs")
@@ -3128,6 +3149,7 @@ pub fn validate_rust_policy_bytes(relative: &Path, bytes: &[u8]) -> Result<()> {
     if visitor.subprocess_env_mutations != 0
         && relative != sealed_launch
         && !native_path_fixture
+        && !reviewed_identity_metadata_fixture(relative, &visitor)
         && !managed_compilation_environment_boundary(relative)
     {
         visitor
@@ -3222,6 +3244,7 @@ fn check_rust(root: &Path, files: &[PathBuf]) -> Result<()> {
         if visitor.subprocess_env_mutations != 0
             && relative != sealed_launch
             && !native_path_fixture
+            && !reviewed_identity_metadata_fixture(relative, &visitor)
             && !managed_compilation_environment_boundary(relative)
         {
             visitor

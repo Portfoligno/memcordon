@@ -206,9 +206,10 @@ impl CommandSpec {
                     "native evidence owns Cargo's artifact message format".into(),
                 ));
             }
-            observed
-                .arguments
-                .insert(1, OsString::from("--message-format=json"));
+            observed.arguments.insert(
+                1,
+                OsString::from("--message-format=json-render-diagnostics"),
+            );
             runner = Some(configuration);
         }
         let mut command =
@@ -218,7 +219,7 @@ impl CommandSpec {
             eprintln!("ci subprocess argument: {argument:?}");
         }
         eprintln!("ci subprocess deadline: {:?}", self.deadline);
-        let result = run_with_deadline(&mut command, self.deadline);
+        let mut result = run_with_deadline(&mut command, self.deadline);
         let toolchain = match &self.toolchain {
             Some(
                 ToolchainInvocation::Cargo { toolchain }
@@ -243,7 +244,15 @@ impl CommandSpec {
         let runner_checked = runner
             .as_ref()
             .map_or(Ok(()), |runner| runner.verify(&self.current_dir));
-        let evidence_failures: Vec<_> = [recorded, runner_checked]
+        let decoded = if let Some(directory) = native_directory.as_deref()
+            && let Ok(output) = &mut result
+        {
+            crate::source_registry::native_runner::decode_cargo_stdout(directory, &output.stdout)
+                .map(|stdout| output.stdout = stdout)
+        } else {
+            Ok(())
+        };
+        let evidence_failures: Vec<_> = [recorded, runner_checked, decoded]
             .into_iter()
             .filter_map(std::result::Result::err)
             .map(|error| error.to_string())

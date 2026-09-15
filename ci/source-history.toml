@@ -905,6 +905,10 @@ id = "crates.memcordon-platform.tests.macos_deadline"
 original_path = "crates/memcordon-platform/tests/macos_deadline.rs"
 
 [[identity]]
+id = "crates.memcordon-platform.tests.macos_envelope_vectors"
+original_path = "crates/memcordon-platform/tests/macos_envelope_vectors.rs"
+
+[[identity]]
 id = "crates.memcordon-platform.tests.macos_inventory"
 original_path = "crates/memcordon-platform/tests/macos_inventory.rs"
 
@@ -1439,6 +1443,10 @@ original_path = "tools/memcordon-ci/tests/bootstrap_profile.rs"
 [[identity]]
 id = "tools.memcordon-ci.tests.build_context"
 original_path = "tools/memcordon-ci/tests/build_context.rs"
+
+[[identity]]
+id = "tools.memcordon-ci.tests.build_context_vectors"
+original_path = "tools/memcordon-ci/tests/build_context_vectors.rs"
 
 [[identity]]
 id = "tools.memcordon-ci.tests.capability"

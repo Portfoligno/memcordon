@@ -1,0 +1,36 @@
+{
+  "schema_version": 3,
+  "root": "$root",
+  "environment": [
+    [
+      "434152474f5f484f4d45",
+      "$cargo_home_hex"
+    ]
+  ],
+  "toolchains": {
+    "fixture": "$cargo"
+  },
+  "input_roots": [],
+  "discovery_roots": [],
+  "inputs": [
+    {
+      "path": "$root_hex",
+      "kind": "directory",
+      "mode": 16877,
+      "digest": ""
+    },
+    {
+      "path": "$cargo_hex",
+      "kind": "file",
+      "mode": 33188,
+      "digest": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    },
+    {
+      "path": "$source_hex",
+      "kind": "file",
+      "mode": 33188,
+      "digest": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    }
+  ],
+  "worker": {}
+}

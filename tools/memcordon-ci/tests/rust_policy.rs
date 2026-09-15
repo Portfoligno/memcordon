@@ -3,6 +3,45 @@ use std::path::Path;
 use memcordon_ci::policy::validate_rust_policy_bytes;
 
 #[test]
+fn workflow_metadata_injection_is_confined_to_exact_identity_regression() {
+    let path = Path::new("crates/memcordon-cli/tests/build_identity.rs");
+    let allowed = r#"fn inherited_workflow_commit_cannot_override_checkout_files(child: &mut Command) {
+        child.env("GITHUB_SHA", "unrelated-workflow-metadata");
+    }"#;
+    validate_rust_policy_bytes(path, allowed.as_bytes()).unwrap();
+    validate_rust_policy_bytes(
+        path,
+        include_bytes!("../../../crates/memcordon-cli/tests/build_identity.rs"),
+    )
+    .unwrap();
+    assert!(
+        validate_rust_policy_bytes(
+            Path::new("crates/memcordon-cli/tests/other.rs"),
+            allowed.as_bytes()
+        )
+        .is_err()
+    );
+    for denied in [
+        allowed.replace("GITHUB_SHA", "RUSTC"),
+        allowed.replace("unrelated-workflow-metadata", "other-value"),
+        allowed.replace(
+            "inherited_workflow_commit_cannot_override_checkout_files",
+            "other_function",
+        ),
+        allowed
+            .replace("child.env", "fn nested(child: &mut Command) { child.env")
+            .replace(";", "; }"),
+        allowed.replace("child.env(\"GITHUB_SHA\"", "child.env(key"),
+        allowed.replace("child.env", "child.env(\"RUSTC\", \"override\"); child.env"),
+    ] {
+        assert!(
+            validate_rust_policy_bytes(path, denied.as_bytes()).is_err(),
+            "{denied}"
+        );
+    }
+}
+
+#[test]
 fn qualification_schema_policy_binds_native_constructor_to_shared_version() {
     use memcordon_ci::policy::validate_qualification_schema_binding;
     let contract = "pub const QUALIFICATION_SCHEMA_VERSION: u32 = 3;";

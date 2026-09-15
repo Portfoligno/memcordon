@@ -92,6 +92,8 @@ pub use crate::macos_launch::{
 };
 
 #[cfg(target_os = "macos")]
+pub use crate::macos_envelope::receive_manifest_fixture as macos_envelope_receive_manifest_fixture;
+#[cfg(target_os = "macos")]
 pub use crate::macos_envelope::transfer_fixture as macos_envelope_transfer_fixture;
 use std::io::{self, Write};
 use std::path::Path;

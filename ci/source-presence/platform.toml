@@ -395,6 +395,7 @@ protected_invariants = ["Owned caller state and counted, run-bound SCM_RIGHTS tr
 consumers = ['module:crates/memcordon-platform/src/lib.rs:macos_envelope:private:["cfg(target_os = \"macos\")"]']
 routes = ['module:crates/memcordon-platform/src/lib.rs:macos_envelope:private:["cfg(target_os = \"macos\")"]']
 cfg = [
+    'fn:receive_manifest_fixture#1:cfg(feature = "test-support")',
     'fn:transfer_fixture#1:cfg(feature = "test-support")',
     'impl:Envelope:#1/method:capture#1:cfg(feature = "test-support")',
 ]
@@ -404,6 +405,7 @@ item_visibility = [
     "fn:check#1:private",
     "fn:duplicate#1:pub(crate)",
     "fn:error#1:private",
+    "fn:receive_manifest_fixture#1:pub",
     "fn:transfer_fixture#1/use:std :: io :: Read#1:private",
     "fn:transfer_fixture#1/use:std :: os :: unix :: fs :: MetadataExt#1:private",
     "fn:transfer_fixture#1:pub",

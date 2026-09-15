@@ -379,6 +379,69 @@ impl Envelope {
     }
 }
 
+/// Independently construct a bounded SCM_RIGHTS packet for native receiver
+/// characterization. No caller signal, limit, descriptor, or cwd is changed.
+#[cfg(feature = "test-support")]
+pub fn receive_manifest_fixture(
+    payload: &[u8],
+    run: u64,
+    rights_count: usize,
+) -> io::Result<Vec<u8>> {
+    if payload.len() > MAX_MANIFEST + 1 || rights_count > MAX_FDS + 2 {
+        return Err(error());
+    }
+    let directory = std::fs::File::open(".")?;
+    let rights = vec![directory.as_raw_fd(); rights_count];
+    let (sender, receiver) = UnixDatagram::pair()?;
+    if rights.is_empty() {
+        sender.send(payload)?;
+    } else {
+        let size = u32::try_from(std::mem::size_of_val(rights.as_slice())).map_err(|_| error())?;
+        // SAFETY: the aligned storage is sized for exactly the typed fd array;
+        // all descriptors remain owned until sendmsg completes.
+        let space = unsafe { libc::CMSG_SPACE(size) } as usize;
+        let mut ancillary = vec![0usize; space.div_ceil(std::mem::size_of::<usize>())];
+        let mut vector = libc::iovec {
+            iov_base: payload.as_ptr().cast_mut().cast(),
+            iov_len: payload.len(),
+        };
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut vector;
+        message.msg_iovlen = 1;
+        message.msg_control = ancillary.as_mut_ptr().cast();
+        message.msg_controllen = space as _;
+        unsafe {
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = libc::SCM_RIGHTS;
+            (*header).cmsg_len = libc::CMSG_LEN(size);
+            std::ptr::copy_nonoverlapping(
+                rights.as_ptr(),
+                libc::CMSG_DATA(header).cast::<RawFd>(),
+                rights.len(),
+            );
+            let sent = libc::sendmsg(sender.as_raw_fd(), &message, libc::MSG_DONTWAIT);
+            if sent < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if usize::try_from(sent).ok() != Some(payload.len()) {
+                return Err(error());
+            }
+        }
+    }
+    let envelope = Envelope::receive(&receiver, run, 3)?;
+    Ok(serde_json::to_vec(&Manifest {
+        version: 1,
+        run,
+        destinations: envelope
+            .descriptors
+            .iter()
+            .map(|(destination, _)| *destination)
+            .collect(),
+        settings: envelope.settings,
+    })?)
+}
+
 fn check(status: i32) -> io::Result<()> {
     if status == 0 {
         Ok(())
