@@ -6,18 +6,22 @@ All notable user-visible changes to MemCordon are documented here.
 
 ### Fixed
 
-- macOS commands preserve the caller's ignored `SIGINT`, `SIGTERM` and `SIGHUP`
-  dispositions. Signals delivered to the supervisor still interrupt supervision.
-- macOS startup observes interruption before command admission. Interrupted
-  startup preserves uncertain release and cleanup evidence and cannot restart.
-- Reports reject a successful child result when runtime evidence states that
-  command release was not issued.
+- On macOS, launched commands continue to ignore `SIGINT`, `SIGTERM` and
+  `SIGHUP` when the caller ignored them. Sending these signals to MemCordon
+  still interrupts supervision.
+- On macOS, interruption detected before a command is authorized to start
+  prevents that authorization. Interrupted startup never triggers a restart,
+  and reports retain uncertainty about whether the command started or cleanup
+  finished instead of claiming success.
+- Reports no longer accept a successful command result when the recorded
+  execution details show that the command was never authorized to start.
 
 ### Added
 
-- macOS embedders can use an execution context with a caller signal snapshot
-  and host-managed cancellation. Owned signal contexts require exclusive
-  handler management and reject overlapping owned sessions.
+- Applications embedding MemCordon on macOS can keep their own signal handlers
+  and cancel runs explicitly while preserving the caller's signal settings for
+  launched commands. When MemCordon manages signal handlers itself, it requires
+  exclusive access and rejects overlapping sessions that also manage them.
 
 ## [0.5.5-rc.1] - 2026-09-13
 
