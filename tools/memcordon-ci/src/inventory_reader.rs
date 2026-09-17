@@ -23,6 +23,86 @@ pub fn open_sequential(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
+/// Rendezvous points in the native file validation protocol. Callbacks are
+/// synchronous observations; they do not replace any filesystem validation.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeFilePhase {
+    BeforeOpen,
+    Prechecked,
+    ReadComplete,
+    BeforeReopen,
+}
+
+/// Read and validate the original enumerated file, including the current path's
+/// stamp and file id. The callback permits deterministic mutation/cancel tests.
+#[cfg(windows)]
+pub fn digest_native_file(
+    path: &Path,
+    expected: &std::fs::Metadata,
+    buffer: &mut [u8],
+    progress: &InventoryProgress,
+    mut observe: impl FnMut(NativeFilePhase) -> crate::Result<()>,
+) -> crate::Result<crate::inventory_pipeline::ValidatedDigest> {
+    use crate::inventory_progress::Operation;
+    use std::os::windows::fs::MetadataExt;
+    let stamp = |metadata: &std::fs::Metadata| {
+        (
+            metadata.file_attributes(),
+            metadata.creation_time(),
+            metadata.last_write_time(),
+            metadata.file_size(),
+        )
+    };
+    let cancellation = progress.cancellation();
+    cancellation.check()?;
+    observe(NativeFilePhase::BeforeOpen)?;
+    cancellation.check()?;
+    let mut file = progress.run(Operation::Open, path, || open_sequential(path))?;
+    cancellation.check()?;
+    let before = progress.run(Operation::Precheck, path, || file.metadata())?;
+    if stamp(expected) != stamp(&before) {
+        return Err(crate::CiError::Message(format!(
+            "native input changed before read: {path:?}"
+        )));
+    }
+    observe(NativeFilePhase::Prechecked)?;
+    cancellation.check()?;
+    let identity = progress.run(Operation::Identity, path, || {
+        memcordon_testkit::windows_file_identity(&file)
+    })?;
+    let digest = progress.run(Operation::ReadHash, path, || {
+        digest_reader_exact(&mut file, buffer, progress, expected.len())
+    })?;
+    observe(NativeFilePhase::ReadComplete)?;
+    cancellation.check()?;
+    let after = progress.run(Operation::PostMetadata, path, || file.metadata())?;
+    observe(NativeFilePhase::BeforeReopen)?;
+    cancellation.check()?;
+    let current = progress.run(Operation::Reopen, path, || open_sequential(path))?;
+    cancellation.check()?;
+    if stamp(expected) != stamp(&after)
+        || stamp(expected)
+            != stamp(&progress.run(Operation::PathMetadata, path, || {
+                std::fs::symlink_metadata(path)
+            })?)
+        || identity
+            != progress.run(Operation::PathIdentity, path, || {
+                memcordon_testkit::windows_file_identity(&current)
+            })?
+    {
+        return Err(crate::CiError::Message(format!(
+            "native input changed during read: {path:?}"
+        )));
+    }
+    cancellation.check()?;
+    progress.file_validated(expected.len());
+    Ok(crate::inventory_pipeline::ValidatedDigest {
+        digest,
+        bytes: expected.len(),
+    })
+}
+
 /// Hash until EOF, including short reads, and preserve the original read error.
 pub fn digest_reader(
     reader: &mut impl Read,
@@ -55,7 +135,9 @@ fn digest_reader_with_length(
         "inventory read buffer must not be empty"
     );
     let mut digest = Sha256::new();
+    let cancellation = progress.cancellation();
     loop {
+        cancellation.check()?;
         if remaining == Some(0) {
             break;
         }
@@ -88,5 +170,6 @@ fn digest_reader_with_length(
             *remaining -= count as u64;
         }
     }
+    cancellation.check()?;
     Ok(hex::encode(digest.finalize()))
 }

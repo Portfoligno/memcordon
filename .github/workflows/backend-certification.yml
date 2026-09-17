@@ -31,8 +31,22 @@ jobs:
           key: managed-sources-v2-cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: inventory-observation
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
       - id: standard-target
+        if: steps.build-context-prepare.outcome == 'success'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -56,9 +70,9 @@ jobs:
           retention-days: 14
           compression-level: 0
       - id: build-context-audit
-        if: always()
+        if: always() && steps.build-context-prepare.outcome == 'success'
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.standard-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.standard-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      - if: always() && steps.standard-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.standard-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -93,8 +107,22 @@ jobs:
           key: managed-sources-v2-cargo-deps-backend-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'ci/**', '.cargo/**', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: inventory-observation
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
       - id: standard-target
+        if: steps.build-context-prepare.outcome == 'success'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -118,9 +146,9 @@ jobs:
           retention-days: 14
           compression-level: 0
       - id: build-context-audit
-        if: always()
+        if: always() && steps.build-context-prepare.outcome == 'success'
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.standard-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.standard-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      - if: always() && steps.standard-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.standard-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -154,8 +182,22 @@ jobs:
           key: managed-sources-v2-cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: inventory-observation
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
       - id: certification-target
+        if: steps.build-context-prepare.outcome == 'success'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -174,9 +216,9 @@ jobs:
           compression-level: 0
           include-hidden-files: true
       - id: build-context-audit
-        if: always()
+        if: always() && steps.build-context-prepare.outcome == 'success'
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.certification-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.certification-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      - if: always() && steps.certification-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.certification-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -224,8 +266,22 @@ jobs:
           key: managed-sources-v2-cargo-deps-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: inventory-observation
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
       - id: lifecycle-target
+        if: steps.build-context-prepare.outcome == 'success'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -243,9 +299,9 @@ jobs:
           retention-days: 14
           compression-level: 0
       - id: build-context-audit
-        if: always()
+        if: always() && steps.build-context-prepare.outcome == 'success'
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.lifecycle-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.lifecycle-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      - if: always() && steps.lifecycle-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.lifecycle-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -293,8 +349,22 @@ jobs:
           key: managed-sources-v2-cargo-deps-windows-package-channel-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: inventory-observation
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
       - id: package-target
+        if: steps.build-context-prepare.outcome == 'success'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -315,9 +385,9 @@ jobs:
           retention-days: 14
           compression-level: 0
       - id: build-context-audit
-        if: always()
+        if: always() && steps.build-context-prepare.outcome == 'success'
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.package-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.package-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      - if: always() && steps.package-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.package-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -366,8 +436,22 @@ jobs:
           key: managed-sources-v2-cargo-deps-windows-loader-lab-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: inventory-observation
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
       - id: lab-target
+        if: steps.build-context-prepare.outcome == 'success'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -385,9 +469,9 @@ jobs:
           retention-days: 14
           compression-level: 0
       - id: build-context-audit
-        if: always()
+        if: always() && steps.build-context-prepare.outcome == 'success'
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.lab-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.lab-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      - if: always() && steps.lab-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.lab-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -430,8 +514,22 @@ jobs:
           key: managed-sources-v2-cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: inventory-observation
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
       - id: certification-target
+        if: steps.build-context-prepare.outcome == 'success'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -450,9 +548,9 @@ jobs:
           retention-days: 14
           compression-level: 0
       - id: build-context-audit
-        if: always()
+        if: always() && steps.build-context-prepare.outcome == 'success'
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
-      - if: always() && steps.certification-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.certification-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+      - if: always() && steps.certification-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.certification-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |

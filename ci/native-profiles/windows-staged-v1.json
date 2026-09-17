@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "contract": "windows-staged-native-qualification-v1",
+  "qualification_only": true,
+  "recipes": [
+    "controller",
+    "release-native",
+    "backend-windows-job",
+    "windows-loader-production",
+    "windows-provider-lifecycle",
+    "windows-package-channel"
+  ]
+}

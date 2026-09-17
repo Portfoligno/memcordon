@@ -71,3 +71,34 @@ configuration discovery, native byte preservation, managed commands, seed
 compilation and unsafe cache-route mutations. Cold/warm hosted workflow execution
 and native Windows SDK discovery still require CI qualification; local macOS
 tests do not establish those results or downstream installed-package acceptance.
+
+The separate [native profile qualification tool](native-profile-qualification.md)
+can construct and audit a staged candidate with complete selected support trees.
+It does not admit that candidate to this production contract or emit a cache key;
+full installation enrollment remains in place pending native closure and
+relocation qualification.
+
+The seed now owns final context admission. It revokes the old context and its
+`native-inputs.admission.json` sidecar before journal creation, supervises each
+child under the existing 1800-second ceiling, and requires successful, timely,
+observed termination before publishing. A suspended Windows child joins a
+kill-on-close Job Object before it can execute; surviving descendants prevent
+success. Termination gets a separate bounded five-second observation window.
+Failure to observe cleanup remains failure, even if the child wrote a complete
+candidate. Progress never extends the deadline.
+
+The parent synchronizes a provisional admission record, publishes the candidate,
+then atomically links the sidecar as its last fallible publication operation.
+Admission binds the context SHA-256, a unique parent journal nonce, and the current
+GitHub run, attempt and job. Restore and audit require successful preparation;
+save additionally requires the existing successful audit and trusted-key gates.
+Both context and sidecar are excluded from compiled caches. Failed revocation
+cannot physically invalidate an unwritable old pair: the explicit preparation
+outcome gates therefore remain authoritative. A sidecar alone is not proof that
+the current invocation succeeded, especially locally where GitHub identifiers
+are absent. This remains a trusted-worker boundary, not protection against a
+process authorized to rewrite the context and admission together.
+
+Bounded failure journals are uploaded even when preparation fails. See
+[inventory observations and experiments](inventory-observation.md) for schemas,
+storage bounds, command interfaces and Windows qualification limits.

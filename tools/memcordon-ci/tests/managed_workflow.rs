@@ -117,3 +117,46 @@ fn extensionless_bootstrap_cannot_authorize_windows_compiled_cache() {
         );
     }
 }
+
+#[test]
+fn parent_admission_cannot_be_restored_or_bypassed_after_failed_preparation() {
+    for mutation in [
+        "restore-guard",
+        "audit-guard",
+        "admission-exclusion",
+        "admission-only",
+    ] {
+        let mut document: Value =
+            serde_yaml::from_str(include_str!("../../../.github/workflows/ci.yml")).unwrap();
+        let steps = document["jobs"]["quality"]["steps"]
+            .as_sequence_mut()
+            .unwrap();
+        let restore = steps
+            .iter()
+            .position(|step| step["id"] == "quality-target")
+            .unwrap();
+        match mutation {
+            "restore-guard" => steps[restore]["if"] = Value::from("always()"),
+            "audit-guard" => {
+                let audit = steps
+                    .iter_mut()
+                    .find(|step| step["id"] == "build-context-audit")
+                    .unwrap();
+                audit["if"] = Value::from("always()");
+            }
+            "admission-exclusion" => {
+                steps[restore]["with"]["path"] = Value::from(
+                    steps[restore]["with"]["path"]
+                        .as_str()
+                        .unwrap()
+                        .replace("!target/ci/native-inputs.admission.json\n", ""),
+                )
+            }
+            _ => {
+                steps[restore]["with"]["path"] =
+                    Value::from("target/ci/native-inputs.admission.json")
+            }
+        }
+        assert!(validate_and_project(&mut document).is_err(), "{mutation}");
+    }
+}

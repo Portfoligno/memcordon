@@ -11,7 +11,7 @@ pub const WORKERS: usize = 8;
 // can prepare the next file, leaving readers idle during metadata and opens.
 pub const CAPACITY: usize = WORKERS * 2;
 
-type Task = Box<dyn FnOnce(&mut [u8]) + Send>;
+pub(crate) type Task = Box<dyn FnOnce(&mut [u8]) + Send>;
 type Action<T, R> = dyn Fn(T, &mut [u8]) -> R + Send + Sync;
 
 /// One execution budget shared by preparation and reading. Logical queues keep
@@ -22,6 +22,14 @@ pub struct InventoryExecutor {
 }
 
 impl InventoryExecutor {
+    pub(crate) fn submit(&self, task: Task) -> io::Result<()> {
+        self.sender
+            .as_ref()
+            .expect("live inventory executor")
+            .send(task)
+            .map_err(|_| io::Error::other("inventory task queue disconnected"))
+    }
+
     /// Reuse the existing two-stage thread, buffer, and admission budget. Either
     /// stage can use idle capacity belonging to the other; totals do not grow.
     pub fn native_pipeline() -> io::Result<Arc<Self>> {

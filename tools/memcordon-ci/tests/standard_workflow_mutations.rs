@@ -41,9 +41,10 @@ fn action_index(steps: &[Value], action: &str) -> usize {
     steps
         .iter()
         .position(|step| {
-            step["uses"]
-                .as_str()
-                .is_some_and(|uses| uses.starts_with(action))
+            step["id"].as_str() != Some("inventory-observation")
+                && step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with(action))
         })
         .unwrap()
 }

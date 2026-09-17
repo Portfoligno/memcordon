@@ -19,6 +19,10 @@ use crate::inventory_progress::{InventoryProgress, Operation};
 use crate::inventory_reader::{BUFFER_SIZE, digest_reader, open_sequential};
 use crate::{CiError, Result};
 
+#[cfg(windows)]
+#[path = "inventory_native.rs"]
+mod native_pipeline;
+
 static ACTIVE: OnceLock<ValidatedBuildContext> = OnceLock::new();
 
 /// A content snapshot of a declared input tree, including modes and links.
@@ -54,7 +58,7 @@ impl BuildInputSnapshot {
         } else {
             MeasurementScope::Required
         };
-        measure_root(&root, scope, &mut inputs, &mut BTreeSet::new())?;
+        measure_root(&root, scope, &mut inputs, &mut BTreeSet::new(), &mut None)?;
         inputs.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(Self {
             root,
@@ -67,6 +71,11 @@ impl BuildInputSnapshot {
             &self.inputs,
         )?)))
     }
+    /// Complete canonical records for qualification comparisons. Consumers must
+    /// not normalize these records when constructing runtime cache identities.
+    pub(crate) fn inputs(&self) -> &[Input] {
+        &self.inputs
+    }
     pub fn audit(&self) -> Result<()> {
         if Self::capture_with_policy(&self.root, self.native_discovery)?.inputs != self.inputs {
             return Err(CiError::Message("declared build inputs changed".into()));
@@ -77,11 +86,11 @@ impl BuildInputSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct Input {
-    path: String,
-    kind: String,
-    mode: u32,
-    digest: String,
+pub(crate) struct Input {
+    pub(crate) path: String,
+    pub(crate) kind: String,
+    pub(crate) mode: u32,
+    pub(crate) digest: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -441,6 +450,7 @@ fn measure_root(
     scope: MeasurementScope<'_>,
     inputs: &mut Vec<Input>,
     visited: &mut BTreeSet<PathBuf>,
+    session: &mut Option<crate::inventory_pipeline::InventorySession>,
 ) -> Result<()> {
     let kind = match scope {
         MeasurementScope::Source(_) => "source",
@@ -449,123 +459,48 @@ fn measure_root(
     };
     environment::progress::phase(&format!("inventory {kind} root {path:?}"), || {
         let mut progress = InventoryProgress::new(path);
-        let mut reader = ContentReader::new(scope.source().is_none(), &progress)?;
-        let result = measure(path, None, scope, inputs, visited, &progress, &mut reader)
-            .and_then(|()| reader.finish(inputs));
-        drop(reader);
+        #[cfg(windows)]
+        if scope.source().is_none() {
+            if session.is_none() {
+                *session = Some(crate::inventory_pipeline::InventorySession::new()?);
+            }
+            let result = session.as_ref().expect("native inventory session").measure(
+                native_pipeline::Backend::new(&progress, path),
+                native_pipeline::Entry::root(path, scope),
+                visited,
+            );
+            let successful = result.is_ok();
+            if let Ok(records) = &result {
+                assert!(
+                    records
+                        .iter()
+                        .all(|input| input.kind != "file" || !input.digest.is_empty())
+                );
+            }
+            progress.finish(successful);
+            inputs.extend(result?);
+            return Ok(());
+        }
+        let _ = session;
+        let mut reader = ContentReader::new();
+        let result = measure(path, None, scope, inputs, visited, &progress, &mut reader);
         progress.finish(result.is_ok());
         result
     })
 }
 
 type PreparedInput = (fs::Metadata, PathBuf);
-type NativePathResolvers =
-    crate::inventory_workers::InventoryWorkers<fs::DirEntry, (PathBuf, Result<PreparedInput>)>;
 
 struct ContentReader {
     buffer: Vec<u8>,
-    resolvers: Option<NativePathResolvers>,
-    #[cfg(windows)]
-    workers: Option<
-        crate::inventory_workers::InventoryWorkers<
-            (PathBuf, fs::File, fs::Metadata),
-            Result<String>,
-        >,
-    >,
 }
 
 impl ContentReader {
-    fn new(native: bool, progress: &InventoryProgress) -> Result<Self> {
-        let executor = if cfg!(windows) && native {
-            Some(crate::inventory_workers::InventoryExecutor::native_pipeline()?)
-        } else {
-            None
-        };
-        let resolvers = if cfg!(windows) && native {
-            let progress = progress.worker();
-            Some(crate::inventory_workers::InventoryWorkers::with_executor(
-                std::sync::Arc::clone(executor.as_ref().expect("native executor")),
-                move |entry: fs::DirEntry, _buffer| {
-                    let path = entry.path();
-                    let resolved = (|| {
-                        // Windows enumeration already supplies non-following
-                        // metadata; preserve it through canonical preparation.
-                        let metadata = progress
-                            .run(Operation::Metadata, &path, || entry.metadata())
-                            .map_err(|error| {
-                                CiError::Message(format!("reading metadata: {error}"))
-                            })?;
-                        let identity = resolve_identity(&path, &metadata, &progress)?;
-                        Ok((metadata, identity))
-                    })();
-                    (path, resolved)
-                },
-            ))
-        } else {
-            None
-        };
-        #[cfg(windows)]
-        let workers = if native {
-            let progress = progress.worker();
-            Some(crate::inventory_workers::InventoryWorkers::with_executor(
-                std::sync::Arc::clone(executor.as_ref().expect("native executor")),
-                move |(path, mut file, expected): (PathBuf, fs::File, fs::Metadata), buffer| {
-                    let identity = memcordon_testkit::windows_file_identity(&file)?;
-                    let digest = progress.run(Operation::ReadHash, &path, || {
-                        crate::inventory_reader::digest_reader_exact(
-                            &mut file,
-                            buffer,
-                            &progress,
-                            expected.len(),
-                        )
-                    })?;
-                    let after = file.metadata()?;
-                    let current = open_sequential(&path)?;
-                    if windows_file_stamp(&expected) != windows_file_stamp(&after)
-                        || windows_file_stamp(&expected)
-                            != windows_file_stamp(&fs::symlink_metadata(&path)?)
-                        || identity != memcordon_testkit::windows_file_identity(&current)?
-                    {
-                        return Err(CiError::Message(format!(
-                            "native input changed during read: {path:?}"
-                        )));
-                    }
-                    Ok(digest)
-                },
-            ))
-        } else {
-            None
-        };
-        let _ = (native, progress);
-        Ok(Self {
+    fn new() -> Self {
+        Self {
             buffer: vec![0; BUFFER_SIZE],
-            resolvers,
-            #[cfg(windows)]
-            workers,
-        })
-    }
-
-    fn finish(&mut self, inputs: &mut [Input]) -> Result<()> {
-        #[cfg(windows)]
-        if let Some(workers) = &mut self.workers {
-            for (index, digest) in workers.drain()? {
-                inputs[index].digest = digest?;
-            }
         }
-        let _ = inputs;
-        Ok(())
     }
-}
-
-#[cfg(windows)]
-fn windows_file_stamp(metadata: &fs::Metadata) -> (u32, u64, u64, u64) {
-    use std::os::windows::fs::MetadataExt;
-    (
-        metadata.file_attributes(),
-        metadata.creation_time(),
-        metadata.last_write_time(),
-        metadata.file_size(),
-    )
 }
 
 fn measure(
@@ -763,71 +698,19 @@ fn measure_path(
             children.sort_by_key(|entry| entry.file_name());
             Ok::<_, CiError>(children)
         })?;
-        if let Some(resolvers) = &mut reader.resolvers {
-            // Settle the bounded batch before descending. Visited decisions and
-            // failures still follow sorted traversal order, not worker timing.
-            for (path, prepared) in resolvers.map_ordered(children)? {
-                let prepared = prepared.map_err(|error| {
-                    CiError::Message(format!("measuring build input {}: {error}", path.display()))
-                })?;
-                measure(
-                    &path,
-                    Some(prepared),
-                    scope.child(),
-                    inputs,
-                    visited,
-                    progress,
-                    reader,
-                )?;
-            }
-        } else {
-            for child in children {
-                measure(
-                    &child.path(),
-                    None,
-                    scope.child(),
-                    inputs,
-                    visited,
-                    progress,
-                    reader,
-                )?;
-            }
+        for child in children {
+            measure(
+                &child.path(),
+                None,
+                scope.child(),
+                inputs,
+                visited,
+                progress,
+                reader,
+            )?;
         }
         ("directory", String::new())
     } else if metadata.is_file() {
-        #[cfg(windows)]
-        if let Some(workers) = &mut reader.workers {
-            let file = progress.run(Operation::Open, &identity, || open_sequential(&identity))?;
-            if windows_file_stamp(&metadata) != windows_file_stamp(&file.metadata()?) {
-                return Err(CiError::Message(format!(
-                    "native input changed before read: {identity:?}"
-                )));
-            }
-            let index = inputs.len();
-            inputs.push(Input {
-                path: native(identity.as_os_str()),
-                kind: "file".into(),
-                mode: mode(&metadata),
-                digest: String::new(),
-            });
-            for (index, digest) in workers.submit(index, (identity, file, metadata))? {
-                match digest {
-                    Ok(digest) => inputs[index].digest = digest,
-                    Err(error) => {
-                        // Completion order is independent of traversal order.
-                        // Stop admission, settle the bounded tail, and preserve
-                        // the earliest file error among all admitted inputs.
-                        let mut completed = workers.drain()?;
-                        completed.push((index, Err(error)));
-                        completed.sort_by_key(|entry| entry.0);
-                        for (index, digest) in completed {
-                            inputs[index].digest = digest?;
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
         (
             "file",
             file_digest(
@@ -1140,17 +1023,24 @@ impl ValidatedBuildContext {
     fn measure_inputs(&self) -> Result<Vec<Input>> {
         let mut inputs = Vec::new();
         let mut visited = BTreeSet::new();
+        let mut session = None;
         measure_root(
             &self.root,
             MeasurementScope::Source(&self.root),
             &mut inputs,
             &mut visited,
+            &mut session,
         )?;
-        // Native inputs have no source-output exclusions. A native link back
-        // into the checkout must not inherit the source traversal's exclusions.
+        // Native inputs must not inherit source-output exclusions.
         visited.clear();
         for root in &self.input_roots {
-            measure_root(root, MeasurementScope::Required, &mut inputs, &mut visited)?;
+            measure_root(
+                root,
+                MeasurementScope::Required,
+                &mut inputs,
+                &mut visited,
+                &mut session,
+            )?;
         }
         for root in &self.discovery_roots {
             measure_root(
@@ -1158,8 +1048,12 @@ impl ValidatedBuildContext {
                 MeasurementScope::NativeRoot,
                 &mut inputs,
                 &mut visited,
+                &mut session,
             )?;
         }
+        // Every root has fenced its completions; close/join the shared pool before
+        // accepting or serializing the complete measurement.
+        drop(session);
         inputs.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(inputs)
     }

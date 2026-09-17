@@ -13,6 +13,10 @@ mod windows_file_identity;
 #[cfg(windows)]
 pub use windows_file_identity::windows_file_identity;
 #[cfg(windows)]
+mod windows_trace_volume;
+#[cfg(windows)]
+pub use windows_trace_volume::windows_trace_volume;
+#[cfg(windows)]
 mod windows_reparse;
 #[cfg(windows)]
 pub use windows_reparse::windows_reparse_data;

@@ -13,6 +13,9 @@ pub const CONTROL_PROFILE: &str = "ci-bootstrap";
 #[path = "ci-build-environment.rs"]
 mod environment;
 
+#[path = "ci-bounded-command.rs"]
+mod bounded;
+
 pub fn capture(
     program: &str,
     arguments: &[&str],
@@ -89,6 +92,10 @@ fn run() -> io::Result<()> {
     }
     let root = environment::command_path(&std::env::current_dir()?)?;
     let path = root.join(&arguments[1]);
+    bounded::revoke(&path)?;
+    let mut journal =
+        bounded::Journal::create(&root.join("target/ci/reports/inventory-observation/v1"))?;
+    let candidate = journal.directory().join("candidate-context.json");
     let ambient = std::env::vars_os().collect();
     let env = environment::closed_environment(&ambient)?;
     #[cfg(windows)]
@@ -151,7 +158,7 @@ fn run() -> io::Result<()> {
             ])
             .env_clear()
             .envs(&env);
-        run_bounded("install nightly toolchain", &mut install)?;
+        run_bounded("install nightly toolchain", &mut install, &mut journal)?;
         if job.contains("miri") {
             let mut setup = Command::new(&rustup);
             setup
@@ -160,7 +167,7 @@ fn run() -> io::Result<()> {
                 .env_clear()
                 .envs(&env)
                 .env("CARGO_HOME", &cargo_home);
-            run_bounded("prepare Miri sysroot", &mut setup)?;
+            run_bounded("prepare Miri sysroot", &mut setup, &mut journal)?;
         }
     }
     let cargo_path = capture(
@@ -191,7 +198,7 @@ fn run() -> io::Result<()> {
             "RUSTC",
             bin.join(if cfg!(windows) { "rustc.exe" } else { "rustc" }),
         );
-    run_bounded("fetch workspace sources", &mut fetch)?;
+    run_bounded("fetch workspace sources", &mut fetch, &mut journal)?;
     if job.contains("fuzz") {
         let mut fetch = Command::new(&cargo);
         fetch
@@ -205,7 +212,7 @@ fn run() -> io::Result<()> {
                 "RUSTC",
                 bin.join(if cfg!(windows) { "rustc.exe" } else { "rustc" }),
             );
-        run_bounded("fetch fuzz sources", &mut fetch)?;
+        run_bounded("fetch fuzz sources", &mut fetch, &mut journal)?;
     }
     let mut build = Command::new(&cargo);
     build
@@ -231,7 +238,7 @@ fn run() -> io::Result<()> {
                 "rustdoc"
             }),
         );
-    run_bounded("compile fingerprint controller", &mut build)?;
+    run_bounded("compile fingerprint controller", &mut build, &mut journal)?;
     // Auxiliary packages have their own published lockfiles. Acquire and build
     // them before measuring source trees, so later compilation cannot introduce
     // an unmeasured resolver or toolchain input into a shared cache identity.
@@ -279,7 +286,7 @@ fn run() -> io::Result<()> {
                 "RUSTC",
                 bin.join(if cfg!(windows) { "rustc.exe" } else { "rustc" }),
             );
-        run_bounded("install managed native tool", &mut install)?;
+        run_bounded("install managed native tool", &mut install, &mut journal)?;
     }
     let controller = root
         .join("target/ci/control-bootstrap")
@@ -291,7 +298,9 @@ fn run() -> io::Result<()> {
         });
     let mut plan = Command::new(controller);
     plan.args(["build-context", "--output"])
-        .arg(path)
+        .arg(&candidate)
+        .arg("--observation-dir")
+        .arg(journal.directory())
         .current_dir(&root)
         .env_clear()
         .envs(env);
@@ -308,30 +317,16 @@ fn run() -> io::Result<()> {
             plan.env(key, value);
         }
     }
-    run_bounded("prepare fingerprint context", &mut plan)
+    let completion = run_bounded("prepare fingerprint context", &mut plan, &mut journal)?;
+    bounded::publish(&candidate, &path, &journal, &completion)
 }
 
-fn run_bounded(label: &str, command: &mut Command) -> io::Result<()> {
-    environment::progress::phase(label, || run_bounded_command(command))
-}
-
-fn run_bounded_command(command: &mut Command) -> io::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(1800);
-    let mut child = command.spawn()?;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(io::Error::other("managed bootstrap command failed"))
-            };
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            return Err(io::Error::other("managed bootstrap deadline exceeded"));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+fn run_bounded(
+    label: &str,
+    command: &mut Command,
+    journal: &mut bounded::Journal,
+) -> io::Result<bounded::Completion> {
+    environment::progress::phase(label, || bounded::run(command, label, journal))
 }
 
 fn main() {

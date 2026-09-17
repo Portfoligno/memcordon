@@ -45,12 +45,16 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
             if text(step, "run")
                 == Some("./ci-native-fingerprint.exe --output target/ci/native-inputs.bin")
             {
-                if !seed_compiled || step.len() != 1 {
+                if !seed_compiled
+                    || step.len() != 2
+                    || text(step, "id") != Some("build-context-prepare")
+                {
                     return Err(fail(
                         "build context requires an unconditional freshly compiled seed",
                     ));
                 }
                 planned = true;
+                step.remove(Value::from("id"));
             }
             if text(step, "run")
                 == Some(
@@ -59,10 +63,11 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
             {
                 if !planned
                     || text(step, "id") != Some("build-context-audit")
-                    || text(step, "if") != Some("always()")
+                    || text(step, "if")
+                        != Some("always() && steps.build-context-prepare.outcome == 'success'")
                 {
                     return Err(fail(
-                        "managed cache audit must follow planning and always run",
+                        "managed cache audit must follow successful parent preparation",
                     ));
                 }
                 audited = true;
@@ -78,6 +83,24 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
             let Some(action) = text(step, "uses").map(str::to_owned) else {
                 continue;
             };
+            if text(step, "id") == Some("inventory-observation") {
+                let with = step
+                    .get(Value::from("with"))
+                    .and_then(Value::as_mapping)
+                    .ok_or_else(|| fail("inventory observation upload settings missing"))?;
+                if action != "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+                    || text(step, "if") != Some("always()")
+                    || text(with, "path")
+                        != Some(
+                            "target/ci/reports/inventory-observation/v1/**/run-start.json\ntarget/ci/reports/inventory-observation/v1/**/phase-*.json\ntarget/ci/reports/inventory-observation/v1/**/inventory-*.json\n",
+                        )
+                {
+                    return Err(fail(
+                        "inventory evidence upload must preserve bounded bootstrap records only",
+                    ));
+                }
+                continue;
+            }
             if !action.starts_with("actions/cache/") {
                 continue;
             }
@@ -121,6 +144,19 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                     "compiled cache must exclude the running control bootstrap",
                 ));
             }
+            if paths.lines().any(|path| path == "target/ci")
+                && !paths
+                    .lines()
+                    .any(|path| path == "!target/ci/native-inputs.admission.json")
+            {
+                return Err(fail("compiled cache must exclude parent admission"));
+            }
+            if paths
+                .lines()
+                .any(|path| path == "target/ci/native-inputs.admission.json")
+            {
+                return Err(fail("parent admission must never be cached"));
+            }
             if paths.lines().any(|path| {
                 path == "target/ci/control-bootstrap"
                     || path.starts_with("target/ci/control-bootstrap/")
@@ -131,6 +167,7 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                 return Err(fail("managed compilation requires exact cache keys"));
             }
             if action.starts_with("actions/cache/restore@") {
+                if condition!="steps.build-context-prepare.outcome == 'success'" {return Err(fail("compiled cache restore requires successful parent preparation"));}
                 let key = text(with, "key").ok_or_else(|| fail("managed cache key missing"))?;
                 let key = key
                     .strip_prefix("managed-v2-")
@@ -146,6 +183,7 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                 with.insert(Value::from("key"), Value::from(payload));
             } else if action.starts_with("actions/cache/save@")
                 && (!audited || !condition.contains("steps.build-context-audit.outcome == 'success'")
+                    || !condition.contains("steps.build-context-prepare.outcome == 'success'")
                     || !condition.contains(".outputs.cache-primary-key != ''")
                     || !condition.contains("github.ref == format('refs/heads/{0}', github.event.repository.default_branch)")) {
                     return Err(fail("compiled cache publication requires a successful audit, nonempty primary key and trusted default branch"));
@@ -167,12 +205,15 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                     .next()
                     .expect("split always has first");
                 step.insert(Value::from("if"), Value::from(payload));
+            } else if action.starts_with("actions/cache/restore@") {
+                step.remove(Value::from("if"));
             }
         }
         // Existing suite policies describe the payload inside the independently
         // validated bootstrap envelope. Keep their exact inventory checks: the
         // only projected-away operations are the three fixed managed controls.
         steps.retain(|value| {
+            if value.get("id").and_then(Value::as_str)==Some("inventory-observation") {return false;}
             let Some(run) = value.get("run").and_then(Value::as_str) else { return true; };
             run != "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin"
                 && (macos_gate || !matches!(run,

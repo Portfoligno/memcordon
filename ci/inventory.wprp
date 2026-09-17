@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0" Author="MemCordon">
+  <Profiles>
+    <SystemCollector Id="InventorySystem" Name="MemCordon Inventory Kernel">
+      <BufferSize Value="1024" />
+      <Buffers Value="32" />
+    </SystemCollector>
+    <EventCollector Id="InventoryFilters" Name="MemCordon Inventory Filters">
+      <BufferSize Value="1024" />
+      <Buffers Value="16" />
+    </EventCollector>
+    <SystemProvider Id="InventorySystemProvider">
+      <Keywords>
+        <Keyword Value="ProcessThread" />
+        <Keyword Value="Loader" />
+        <Keyword Value="CSwitch" />
+        <Keyword Value="SampledProfile" />
+        <Keyword Value="DiskIO" />
+        <Keyword Value="FileIO" />
+        <Keyword Value="FileIOInit" />
+      </Keywords>
+      <Stacks>
+        <Stack Value="SampledProfile" />
+        <Stack Value="CSwitch" />
+        <Stack Value="DiskReadInit" />
+        <Stack Value="DiskWriteInit" />
+      </Stacks>
+    </SystemProvider>
+    <EventProvider Id="InventoryFilterProvider" Name="Microsoft-Windows-FilterManager" Level="5">
+      <Keywords><Keyword Value="0xffffffffffffffff" /></Keywords>
+    </EventProvider>
+    <Profile Id="Inventory.Verbose.Memory" Name="Inventory" Description="Bounded inventory CPU, file, disk and filter evidence" LoggingMode="Memory" DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="InventorySystem"><SystemProviderId Value="InventorySystemProvider" /></SystemCollectorId>
+        <EventCollectorId Value="InventoryFilters"><EventProviders><EventProviderId Value="InventoryFilterProvider" /></EventProviders></EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

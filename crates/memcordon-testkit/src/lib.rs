@@ -274,4 +274,6 @@ pub fn assert_stdout_empty(output: &ObservedOutput) {
     );
 }
 #[cfg(windows)]
+pub use memcordon_platform::test_support::windows_trace_volume;
+#[cfg(windows)]
 pub use memcordon_platform::test_support::{windows_file_identity, windows_reparse_data};

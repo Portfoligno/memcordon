@@ -218,3 +218,35 @@ fn sequential_file_open_preserves_content_identity_and_tail_drift_detection() {
         io::ErrorKind::NotFound
     );
 }
+
+#[test]
+fn cancellation_is_checked_even_for_an_empty_verified_file() {
+    let progress = InventoryProgress::new(std::path::Path::new("cancelled-empty"));
+    progress.cancellation().cancel();
+    let error = digest_reader_exact(&mut &b""[..], &mut [0; 1], &progress, 0).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+}
+
+#[test]
+fn cancellation_between_chunks_does_not_return_a_partial_digest() {
+    struct CancelAfterRead {
+        token: memcordon_ci::inventory_progress::CancellationToken,
+        calls: usize,
+    }
+    impl std::io::Read for CancelAfterRead {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            buffer[0] = 42;
+            self.token.cancel();
+            Ok(1)
+        }
+    }
+    let progress = InventoryProgress::new(std::path::Path::new("cancelled-chunk"));
+    let mut reader = CancelAfterRead {
+        token: progress.cancellation(),
+        calls: 0,
+    };
+    let error = digest_reader_exact(&mut reader, &mut [0; 1], &progress, 2).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(reader.calls, 1);
+}

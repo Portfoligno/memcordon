@@ -29,9 +29,41 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopLevel {
+    InventoryProfile {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    InventoryScan {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        report_dir: PathBuf,
+    },
+    InventoryBenchmark {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    QualifyNativeProfile {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        selection: PathBuf,
+        #[arg(long)]
+        destination: PathBuf,
+    },
+    AuditNativeProfile {
+        #[arg(long)]
+        specification: PathBuf,
+    },
     BuildContext {
         #[arg(long)]
         output: PathBuf,
+        #[arg(long)]
+        observation_dir: Option<PathBuf>,
     },
     AuditBuildContext {
         #[arg(long)]
@@ -123,15 +155,48 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let root = workspace_root(&std::env::current_dir()?)?;
     if let Some(path) = cli.build_context {
+        memcordon_ci::inventory_benchmark::require_admission(&path)?;
         memcordon_ci::build_context::activate(
             memcordon_ci::build_context::ValidatedBuildContext::read(&path)?,
         )?;
     }
     let result = match (cli.cargo_plugin, cli.command) {
-        (false, Some(TopLevel::BuildContext { output })) => {
+        (false, Some(TopLevel::InventoryProfile { plan, output })) => {
+            memcordon_ci::inventory_profile::profile(&plan, &output, &root)
+        }
+        (
+            false,
+            Some(TopLevel::InventoryScan {
+                request,
+                report_dir,
+            }),
+        ) => memcordon_ci::inventory_benchmark::scan(&request, &report_dir),
+        (false, Some(TopLevel::InventoryBenchmark { plan, output })) => {
+            memcordon_ci::inventory_benchmark::benchmark(&plan, &output)
+        }
+        (
+            false,
+            Some(TopLevel::QualifyNativeProfile {
+                policy,
+                selection,
+                destination,
+            }),
+        ) => memcordon_ci::native_profile::qualify(&policy, &selection, &destination),
+        (false, Some(TopLevel::AuditNativeProfile { specification })) => {
+            memcordon_ci::native_profile::audit(&specification)
+        }
+        (
+            false,
+            Some(TopLevel::BuildContext {
+                output,
+                observation_dir,
+            }),
+        ) => {
+            memcordon_ci::inventory_progress::set_report_directory(observation_dir)?;
             memcordon_ci::build_context::ValidatedBuildContext::prepare(&root)?.write(&output)
         }
         (false, Some(TopLevel::AuditBuildContext { input })) => {
+            memcordon_ci::inventory_benchmark::require_admission(&input)?;
             memcordon_ci::build_context::ValidatedBuildContext::read(&input)?.audit()
         }
         (true, None) => release::cargo_credential_provider(&root),

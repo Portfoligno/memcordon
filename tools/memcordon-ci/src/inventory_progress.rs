@@ -1,11 +1,16 @@
-//! Low-frequency inventory cost evidence; never part of the input identity.
-//! Costs sum across workers and may exceed wall time; active entries include
-//! traversal plus at most four native readers in the production inventory.
+//! Bounded inventory evidence, excluded from content identities.
+//! Inclusive envelopes and exclusive actor time are separate cumulative times.
+#[path = "inventory_observation.rs"]
+mod observation;
+#[path = "inventory_report.rs"]
+mod report;
+use observation::Observer;
+pub use observation::{CancellationToken, Snapshot, TaskClass, TaskState};
+pub use report::set_report_directory;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Operation {
@@ -16,9 +21,26 @@ pub enum Operation {
     Access,
     Open,
     ReadHash,
+    DirectoryOpen,
+    DirectoryNext,
+    DirectorySort,
+    Precheck,
+    Identity,
+    PostMetadata,
+    Reopen,
+    PathMetadata,
+    PathIdentity,
+    Read,
+    HashUpdate,
+    HashFinalize,
+    QueueWait,
+    RootDrain,
+    Join,
+    DirectoryBarrier,
+    Serialize,
+    Write,
 }
-
-const OPERATIONS: [Operation; 7] = [
+const OPERATIONS: [Operation; observation::OPERATION_COUNT] = [
     Operation::Metadata,
     Operation::Canonicalize,
     Operation::Directory,
@@ -26,78 +48,120 @@ const OPERATIONS: [Operation; 7] = [
     Operation::Access,
     Operation::Open,
     Operation::ReadHash,
+    Operation::DirectoryOpen,
+    Operation::DirectoryNext,
+    Operation::DirectorySort,
+    Operation::Precheck,
+    Operation::Identity,
+    Operation::PostMetadata,
+    Operation::Reopen,
+    Operation::PathMetadata,
+    Operation::PathIdentity,
+    Operation::Read,
+    Operation::HashUpdate,
+    Operation::HashFinalize,
+    Operation::QueueWait,
+    Operation::RootDrain,
+    Operation::Join,
+    Operation::DirectoryBarrier,
+    Operation::Serialize,
+    Operation::Write,
 ];
-
-#[derive(Default)]
-struct State {
-    stopped: bool,
-    active: Vec<(thread::ThreadId, Operation, PathBuf, Instant)>,
-    counts: [u64; OPERATIONS.len()],
-    costs: [Duration; OPERATIONS.len()],
-}
-
 struct Shared {
     root: PathBuf,
-    started: Instant,
-    state: Mutex<State>,
+    observation: Observer,
+    stop: Mutex<bool>,
     wake: Condvar,
-    bytes: AtomicU64,
-    read_calls: AtomicU64,
-    read_ns: AtomicU64,
-    hash_ns: AtomicU64,
 }
 
+// One bounded writer for the process, not one blocked stderr writer per root.
+fn emit(line: String, wait: bool) {
+    type Message = (String, mpsc::SyncSender<()>);
+    static OUTPUT: OnceLock<mpsc::SyncSender<Message>> = OnceLock::new();
+    let sender = OUTPUT.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<Message>(16);
+        thread::spawn(move || {
+            for (line, ack) in receiver {
+                eprintln!("{line}");
+                let _ = ack.try_send(());
+            }
+        });
+        sender
+    });
+    let (ack, done) = mpsc::sync_channel(1);
+    if sender.try_send((line, ack)).is_ok() && wait {
+        let _ = done.recv_timeout(Duration::from_millis(100));
+    }
+}
 impl Shared {
     fn snapshot(&self) -> String {
-        let state = self
-            .state
-            .lock()
-            .expect("inventory progress state poisoned");
+        let snapshot = self.observation.snapshot();
+        let mut counts = [0_u64; OPERATIONS.len()];
+        let mut costs = [0_u64; OPERATIONS.len()];
+        let (mut bytes, mut reads, mut read_ns, mut hash_ns) = (0, 0, 0, 0);
+        let mut active = Vec::new();
+        for actor in &snapshot.actors {
+            if let Some(counters) = &actor.counters {
+                for i in 0..OPERATIONS.len() {
+                    counts[i] += counters.counts[i];
+                    costs[i] += counters.inclusive_ns[i];
+                }
+                bytes += counters.bytes;
+                reads += counters.read_calls;
+                read_ns += counters.read_ns;
+                hash_ns += counters.hash_ns;
+            }
+            if let Some(operation) = actor.operation {
+                active.push(format!(
+                    "operation={:?} path={:?} operation_ms={}",
+                    OPERATIONS[operation],
+                    actor.path,
+                    snapshot.elapsed_ns.saturating_sub(actor.started_ns) / 1_000_000
+                ));
+            }
+        }
         let costs = OPERATIONS
             .iter()
             .enumerate()
-            .map(|(index, operation)| {
+            .map(|(i, op)| {
                 format!(
-                    "{operation:?}_count={} {operation:?}_ms={}",
-                    state.counts[index],
-                    state.costs[index].as_millis()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        let active = state
-            .active
-            .iter()
-            .map(|(_, operation, path, started)| {
-                format!(
-                    "operation={operation:?} path={path:?} operation_ms={}",
-                    started.elapsed().as_millis()
+                    "{op:?}_count={} {op:?}_ms={}",
+                    counts[i],
+                    costs[i] / 1_000_000
                 )
             })
             .collect::<Vec<_>>()
             .join(" ");
         let active = if active.is_empty() {
-            "operation=idle"
+            "operation=idle".to_owned()
         } else {
-            &active
+            active.join(" ")
         };
+        let root: String = self
+            .root
+            .as_os_str()
+            .to_string_lossy()
+            .chars()
+            .take(256)
+            .collect();
         format!(
-            "root={:?} elapsed_ms={} {costs} bytes={} read_calls={} read_ms={} hash_ms={} {active}",
-            self.root,
-            self.started.elapsed().as_millis(),
-            self.bytes.load(Ordering::Relaxed),
-            self.read_calls.load(Ordering::Relaxed),
-            self.read_ns.load(Ordering::Relaxed) / 1_000_000,
-            self.hash_ns.load(Ordering::Relaxed) / 1_000_000
+            "root={root:?} elapsed_ms={} {costs} bytes={bytes} read_calls={reads} read_ms={} hash_ms={} files_attempted={} files_completed={} files_validated={} files_committed={} manifest_bytes_committed={} outstanding={} sample=actor_publication_vector {active}",
+            snapshot.elapsed_ns / 1_000_000,
+            read_ns / 1_000_000,
+            hash_ns / 1_000_000,
+            snapshot.tasks.files_attempted,
+            snapshot.tasks.files_completed,
+            snapshot.tasks.files_validated,
+            snapshot.tasks.files_committed,
+            snapshot.tasks.committed_bytes,
+            snapshot.outstanding
         )
     }
 }
-
 pub struct InventoryProgress {
     shared: Arc<Shared>,
     observer: Option<JoinHandle<()>>,
 }
-
 impl InventoryProgress {
     pub fn worker(&self) -> Self {
         Self {
@@ -106,41 +170,43 @@ impl InventoryProgress {
         }
     }
     pub fn new(root: &Path) -> Self {
-        Self::new_with_interval(root, Duration::from_secs(30))
+        Self::with_intervals(root, Duration::from_secs(1), Duration::from_secs(30))
     }
-
-    /// Explicit cadence permits bounded observer tests without environment controls.
     pub fn new_with_interval(root: &Path, interval: Duration) -> Self {
+        Self::with_intervals(root, interval, interval)
+    }
+    fn with_intervals(root: &Path, interval: Duration, human_interval: Duration) -> Self {
         assert!(
             !interval.is_zero(),
             "inventory progress interval must be positive"
         );
         let shared = Arc::new(Shared {
             root: root.to_path_buf(),
-            started: Instant::now(),
-            state: Mutex::new(State::default()),
+            observation: Observer::new(),
+            stop: Mutex::new(false),
             wake: Condvar::new(),
-            bytes: AtomicU64::new(0),
-            read_calls: AtomicU64::new(0),
-            read_ns: AtomicU64::new(0),
-            hash_ns: AtomicU64::new(0),
         });
-        let observer_state = Arc::clone(&shared);
+        let state = Arc::clone(&shared);
         let observer = thread::spawn(move || {
+            let mut last_human = std::time::Instant::now();
             loop {
-                let state = observer_state
-                    .state
-                    .lock()
-                    .expect("inventory progress state poisoned");
-                let (state, _) = observer_state
+                let stop = state.stop.lock().expect("progress stop poisoned");
+                let (stop, _) = state
                     .wake
-                    .wait_timeout_while(state, interval, |state| !state.stopped)
-                    .expect("inventory progress state poisoned");
-                if state.stopped {
+                    .wait_timeout_while(stop, interval, |s| !*s)
+                    .expect("progress stop poisoned");
+                if *stop {
                     break;
                 }
-                drop(state);
-                eprintln!("[native inventory] progress {}", observer_state.snapshot());
+                drop(stop);
+                report::persist(&state, None, false);
+                if last_human.elapsed() >= human_interval {
+                    emit(
+                        format!("[native inventory] progress {}", state.snapshot()),
+                        false,
+                    );
+                    last_human = std::time::Instant::now();
+                }
             }
         });
         Self {
@@ -148,88 +214,71 @@ impl InventoryProgress {
             observer: Some(observer),
         }
     }
-
     pub fn run<T, E>(
         &self,
         operation: Operation,
         path: &Path,
         action: impl FnOnce() -> Result<T, E>,
     ) -> Result<T, E> {
-        let started = Instant::now();
-        {
-            let mut state = self
-                .shared
-                .state
-                .lock()
-                .expect("inventory progress state poisoned");
-            let id = thread::current().id();
-            assert!(
-                !state.active.iter().any(|entry| entry.0 == id),
-                "inventory operations must not nest"
-            );
-            state
-                .active
-                .push((id, operation, path.to_path_buf(), started));
-        }
-        let result = action();
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .expect("inventory progress state poisoned");
-        state.counts[operation as usize] += 1;
-        state.costs[operation as usize] += started.elapsed();
-        state
-            .active
-            .retain(|entry| entry.0 != thread::current().id());
-        result
+        let _span = self.shared.observation.span(operation as usize, path);
+        action()
     }
-
-    /// Chunk counters use atomics, never the observer mutex or filesystem calls.
     pub fn record_chunk(&self, read: Duration, hash: Duration, bytes: u64) {
-        self.shared.read_calls.fetch_add(1, Ordering::Relaxed);
-        self.shared.bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.shared.read_ns.fetch_add(
-            read.as_nanos().try_into().unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        self.shared.hash_ns.fetch_add(
-            hash.as_nanos().try_into().unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        self.shared.observation.record_chunk(read, hash, bytes);
     }
-
+    pub fn cancellation(&self) -> CancellationToken {
+        self.shared.observation.cancellation()
+    }
+    pub fn task_transition(
+        &self,
+        task_id: u64,
+        class: TaskClass,
+        state: TaskState,
+    ) -> std::io::Result<()> {
+        self.shared
+            .observation
+            .task_transition(task_id, class, state)
+    }
+    pub fn file_validated(&self, bytes: u64) {
+        self.shared.observation.file_validated(bytes);
+    }
+    pub fn task_dependency(
+        &self,
+        id: u64,
+        parent: Option<u64>,
+        ordinal: Option<u64>,
+    ) -> std::io::Result<()> {
+        self.shared.observation.task_dependency(id, parent, ordinal)
+    }
+    pub fn file_committed(&self, bytes: u64) {
+        self.shared.observation.file_committed(bytes);
+    }
+    pub fn structured_snapshot(&self) -> Snapshot {
+        self.shared.observation.snapshot()
+    }
     pub fn snapshot(&self) -> String {
         self.shared.snapshot()
     }
-
     pub fn finish(&mut self, success: bool) {
         self.stop();
-        eprintln!(
-            "[native inventory] {} {}",
-            if success { "complete" } else { "failed" },
-            self.snapshot()
+        report::persist(&self.shared, Some(success), true);
+        emit(
+            format!(
+                "[native inventory] {} {}",
+                if success { "complete" } else { "failed" },
+                self.snapshot()
+            ),
+            true,
         );
     }
-
     fn stop(&mut self) {
-        if self.observer.is_none() {
-            return;
-        }
-        self.shared
-            .state
-            .lock()
-            .expect("inventory progress state poisoned")
-            .stopped = true;
-        self.shared.wake.notify_all();
         if let Some(observer) = self.observer.take() {
-            observer
-                .join()
-                .expect("inventory progress observer panicked");
+            *self.shared.stop.lock().expect("progress stop poisoned") = true;
+            self.shared.wake.notify_all();
+            observer.join().expect("inventory observer panicked");
         }
     }
 }
-
 impl Drop for InventoryProgress {
     fn drop(&mut self) {
         self.stop();
