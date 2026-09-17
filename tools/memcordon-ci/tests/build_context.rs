@@ -371,6 +371,20 @@ fn windows_native_discovery_requires_sdk_compiler_and_system_root() {
 fn cold_seed_compiles_without_cargo_dependencies_and_rejects_override_before_bootstrap() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = tempfile::tempdir().unwrap();
+    let source_journals =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ci/reports/inventory-observation/v1");
+    let source_entries = || match std::fs::read_dir(&source_journals) {
+        Ok(entries) => {
+            let mut paths = entries
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            paths.sort();
+            Some(paths)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("reading source journal directory: {error}"),
+    };
+    let before = source_entries();
     let executable = output
         .path()
         .join(if cfg!(windows) { "seed.exe" } else { "seed" });
@@ -386,6 +400,7 @@ fn cold_seed_compiles_without_cargo_dependencies_and_rejects_override_before_boo
         "the seed must compile freshly using only std"
     );
     let result = Command::new(&executable)
+        .current_dir(output.path())
         .args(["--output"])
         .arg(output.path().join("manifest"))
         .env("RUSTC_WRAPPER", "unapproved")
@@ -398,6 +413,30 @@ fn cold_seed_compiles_without_cargo_dependencies_and_rejects_override_before_boo
             .contains("rejects ambient override")
     );
     assert!(!output.path().join("manifest").exists());
+    assert!(!output.path().join("manifest.admission.json").exists());
+    let journals = std::fs::read_dir(
+        output
+            .path()
+            .join("target/ci/reports/inventory-observation/v1"),
+    )
+    .unwrap()
+    .map(|entry| entry.unwrap().path())
+    .collect::<Vec<_>>();
+    assert_eq!(
+        journals.len(),
+        1,
+        "retain the isolated early-failure journal"
+    );
+    let start: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(journals[0].join("run-start.json")).unwrap())
+            .unwrap();
+    assert_eq!(start["schema"], 1);
+    assert_eq!(start["outcome"], "incomplete_unknown_termination");
+    assert_eq!(
+        source_entries(),
+        before,
+        "the test must not mutate measured source"
+    );
 }
 
 #[test]

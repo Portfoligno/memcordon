@@ -25,6 +25,9 @@ mod native_pipeline;
 
 static ACTIVE: OnceLock<ValidatedBuildContext> = OnceLock::new();
 
+#[path = "inventory_difference.rs"]
+mod difference;
+
 /// A content snapshot of a declared input tree, including modes and links.
 /// Output paths are excluded only by the full managed profile, not this API.
 #[derive(Clone, Debug)]
@@ -77,8 +80,12 @@ impl BuildInputSnapshot {
         &self.inputs
     }
     pub fn audit(&self) -> Result<()> {
-        if Self::capture_with_policy(&self.root, self.native_discovery)?.inputs != self.inputs {
-            return Err(CiError::Message("declared build inputs changed".into()));
+        let measured = Self::capture_with_policy(&self.root, self.native_discovery)?.inputs;
+        if measured != self.inputs {
+            return Err(CiError::Message(format!(
+                "declared build inputs changed; {}",
+                difference::describe(&self.inputs, &measured)
+            )));
         }
         Ok(())
     }
@@ -1091,10 +1098,12 @@ impl ValidatedBuildContext {
             .get(OsStr::new("CARGO_HOME"))
             .ok_or_else(|| CiError::Message("missing managed Cargo home".into()))?;
         environment::reject_cargo_configuration(&self.root, Path::new(cargo_home))?;
-        if self.measure_inputs()? != self.inputs {
-            return Err(CiError::Message(
-                "managed build inputs changed; cache publication and qualification rejected".into(),
-            ));
+        let measured = self.measure_inputs()?;
+        if measured != self.inputs {
+            return Err(CiError::Message(format!(
+                "managed build inputs changed; cache publication and qualification rejected; {}",
+                difference::describe(&self.inputs, &measured)
+            )));
         }
         Ok(())
     }
