@@ -1,5 +1,6 @@
 /target
 /fuzz/target
+/tools/memcordon-ci/target
 /fuzz/corpus
 /.serena
 /ci-native-fingerprint
