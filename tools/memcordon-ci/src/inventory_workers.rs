@@ -3,31 +3,40 @@ use std::io;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-pub const WORKERS: usize = 4;
+// Native inventory is dominated by filesystem latency, not hashing. Keep a
+// bounded set of concurrent reads (and one reusable MiB buffer per reader).
+pub const WORKERS: usize = 8;
+// Allow traversal to prepare another wave while all readers are busy. Sharing
+// the worker count as the admission limit otherwise stalls traversal before it
+// can prepare the next file, leaving readers idle during metadata and opens.
+pub const CAPACITY: usize = WORKERS * 2;
 
-pub struct InventoryWorkers<T, R> {
-    sender: Option<mpsc::SyncSender<(usize, T)>>,
-    results: mpsc::Receiver<(usize, Result<R, String>)>,
+type Task = Box<dyn FnOnce(&mut [u8]) + Send>;
+type Action<T, R> = dyn Fn(T, &mut [u8]) -> R + Send + Sync;
+
+/// One execution budget shared by preparation and reading. Logical queues keep
+/// their own admission limits and ordered results without reserving idle threads.
+pub struct InventoryExecutor {
+    sender: Option<mpsc::SyncSender<Task>>,
     workers: Vec<JoinHandle<()>>,
-    pending: usize,
 }
 
-impl<T: Send + 'static, R: Send + 'static> InventoryWorkers<T, R> {
-    pub fn new(action: impl Fn(T, &mut [u8]) -> R + Send + Sync + 'static) -> io::Result<Self> {
-        let (sender, receiver) = mpsc::sync_channel::<(usize, T)>(WORKERS);
-        let (results, received) = mpsc::sync_channel(WORKERS);
+impl InventoryExecutor {
+    /// Reuse the existing two-stage thread, buffer, and admission budget. Either
+    /// stage can use idle capacity belonging to the other; totals do not grow.
+    pub fn native_pipeline() -> io::Result<Arc<Self>> {
+        Self::new(WORKERS * 2, CAPACITY * 2).map(Arc::new)
+    }
+
+    fn new(workers: usize, capacity: usize) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<Task>(capacity);
         let receiver = Arc::new(Mutex::new(receiver));
-        let action = Arc::new(action);
         let mut pool = Self {
             sender: Some(sender),
-            results: received,
             workers: Vec::new(),
-            pending: 0,
         };
-        for _ in 0..WORKERS {
+        for _ in 0..workers {
             let receiver = Arc::clone(&receiver);
-            let action = Arc::clone(&action);
-            let results = results.clone();
             pool.workers.push(thread::Builder::new().spawn(move || {
                 let mut buffer = vec![0; crate::inventory_reader::BUFFER_SIZE];
                 loop {
@@ -35,36 +44,78 @@ impl<T: Send + 'static, R: Send + 'static> InventoryWorkers<T, R> {
                         .lock()
                         .expect("inventory task queue poisoned")
                         .recv();
-                    let Ok((index, task)) = task else {
+                    let Ok(task) = task else {
                         break;
                     };
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        action(task, &mut buffer)
-                    }))
-                    .map_err(|_| "native inventory worker panicked".to_owned());
-                    if results.send((index, result)).is_err() {
-                        break;
-                    }
+                    task(&mut buffer);
                 }
             })?);
         }
         Ok(pool)
+    }
+}
+
+impl Drop for InventoryExecutor {
+    fn drop(&mut self) {
+        self.sender.take();
+        for worker in self.workers.drain(..) {
+            worker
+                .join()
+                .expect("inventory worker terminated outside its task");
+        }
+    }
+}
+
+pub struct InventoryWorkers<T, R> {
+    executor: Arc<InventoryExecutor>,
+    action: Arc<Action<T, R>>,
+    sender: mpsc::SyncSender<(usize, Result<R, String>)>,
+    results: mpsc::Receiver<(usize, Result<R, String>)>,
+    pending: usize,
+}
+
+impl<T: Send + 'static, R: Send + 'static> InventoryWorkers<T, R> {
+    pub fn new(action: impl Fn(T, &mut [u8]) -> R + Send + Sync + 'static) -> io::Result<Self> {
+        let executor = Arc::new(InventoryExecutor::new(WORKERS, CAPACITY)?);
+        Ok(Self::with_executor(executor, action))
+    }
+
+    pub fn with_executor(
+        executor: Arc<InventoryExecutor>,
+        action: impl Fn(T, &mut [u8]) -> R + Send + Sync + 'static,
+    ) -> Self {
+        let (sender, results) = mpsc::sync_channel(CAPACITY);
+        Self {
+            executor,
+            action: Arc::new(action),
+            sender,
+            results,
+            pending: 0,
+        }
     }
 
     /// Return one completion at capacity, leaving room to refill the freed slot.
     /// Callers place results by index; completion order is intentionally independent.
     pub fn submit(&mut self, index: usize, task: T) -> io::Result<Vec<(usize, R)>> {
         assert!(
-            self.pending < WORKERS,
-            "inventory batch exceeds worker bound"
+            self.pending < CAPACITY,
+            "inventory admission exceeds capacity"
         );
-        self.sender
+        let action = Arc::clone(&self.action);
+        let results = self.sender.clone();
+        self.executor
+            .sender
             .as_ref()
             .expect("live inventory workers")
-            .send((index, task))
+            .send(Box::new(move |buffer| {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(task, buffer)))
+                        .map_err(|_| "native inventory worker panicked".to_owned());
+                let _ = results.send((index, result));
+            }))
             .map_err(|_| io::Error::other("inventory task queue disconnected"))?;
         self.pending += 1;
-        if self.pending == WORKERS {
+        if self.pending == CAPACITY {
             let (index, result) = self
                 .results
                 .recv()
@@ -76,6 +127,19 @@ impl<T: Send + 'static, R: Send + 'static> InventoryWorkers<T, R> {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    /// Prepare an ordered batch with bounded admission, settling it completely
+    /// before callers recurse into another batch using the same pool.
+    pub fn map_ordered(&mut self, tasks: impl IntoIterator<Item = T>) -> io::Result<Vec<R>> {
+        assert_eq!(self.pending, 0, "ordered batch requires an idle pool");
+        let mut completed = Vec::new();
+        for (index, task) in tasks.into_iter().enumerate() {
+            completed.extend(self.submit(index, task)?);
+        }
+        completed.extend(self.drain()?);
+        completed.sort_by_key(|entry| entry.0);
+        Ok(completed.into_iter().map(|(_, result)| result).collect())
     }
 
     pub fn drain(&mut self) -> io::Result<Vec<(usize, R)>> {
@@ -98,13 +162,14 @@ impl<T: Send + 'static, R: Send + 'static> InventoryWorkers<T, R> {
 
 impl<T, R> Drop for InventoryWorkers<T, R> {
     fn drop(&mut self) {
-        self.sender.take();
-        // At most WORKERS results exist; the result queue holds all of them even
-        // when traversal exits early. Joining cannot wait on an undrained queue.
-        for worker in self.workers.drain(..) {
-            worker
-                .join()
-                .expect("inventory worker terminated outside its task");
+        // Settle only this logical queue. Another stage may still own the shared
+        // executor; the last owner shuts down and joins its threads.
+        while self.pending != 0 {
+            let _ = self
+                .results
+                .recv()
+                .expect("inventory result queue disconnected");
+            self.pending -= 1;
         }
     }
 }

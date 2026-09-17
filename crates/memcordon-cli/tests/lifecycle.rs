@@ -154,17 +154,29 @@ fn immediate_success_failure_and_status_are_reaped_and_preserved() {
     let iterations = configured_iterations("fast_short_child_iterations");
     for iteration in 0..iterations {
         let code = [0, 1, 37][iteration as usize % 3];
-        let output = completed(
-            &mut wrapped(fixture(), &["exit", "--code", &code.to_string()]),
-            Duration::from_secs(2),
-        );
+        let report_path = temporary_pid_file().with_extension("json");
+        let target = wrapped(fixture(), &["exit", "--code", &code.to_string()]);
+        let mut command = Command::new(target.get_program());
+        command
+            .arg("--report")
+            .arg(&report_path)
+            .args(target.get_args());
+        let result = run_with_deadline(&mut command, Duration::from_secs(2));
+        let report = fs::read_to_string(&report_path);
+        let output = result
+            .unwrap_or_else(|error| panic!("iteration {iteration}: {error}; report={report:?}"));
         assert_eq!(
             output.status.code(),
             Some(code),
-            "iteration {iteration}: {}",
+            "iteration {iteration}: {}; report={report:?}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert_stdout_empty(&output);
+        let _: memcordon_core::MemcordonReport = serde_json::from_str(
+            &report.expect("successful iteration must retain its execution report"),
+        )
+        .expect("lifecycle report must remain valid");
+        fs::remove_file(report_path).expect("successful lifecycle report should be removable");
     }
 }
 

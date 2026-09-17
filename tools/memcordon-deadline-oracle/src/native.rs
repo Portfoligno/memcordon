@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+#[cfg(test)]
+#[path = "../tests/native/scenarios.rs"]
+mod tests;
+
 struct FrontendOwner {
     child: Child,
     known: Vec<Identity>,
@@ -207,6 +211,42 @@ fn create_before_deadline(mut command: Command, deadline: u64) -> Result<Child> 
     Ok(receiver.recv_timeout(Duration::from_nanos(deadline.saturating_sub(clock()?)))??)
 }
 
+fn scenario_command(
+    executable: &Path,
+    fixture: &str,
+    report: &Path,
+    marker: &Path,
+) -> Result<Command> {
+    let mut command = Command::new(executable);
+    // Loss must be injected into a running workload. An unrelated work deadline
+    // can expire during startup and prevent this scenario from exercising loss.
+    // The independent outer and cleanup deadlines still bound the scenario.
+    if fixture != "frontend-loss" {
+        command.arg(if fixture == "zero-budget" {
+            "+0ms"
+        } else {
+            "+250ms"
+        });
+    }
+    command
+        .args(["--summary", "--report"])
+        .arg(report)
+        .arg("--")
+        .arg(std::env::current_exe()?)
+        .arg("--fixture")
+        .arg(if fixture == "blocked-stderr" {
+            fixture
+        } else {
+            "sleep"
+        })
+        .arg(marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    Ok(command)
+}
+
 fn scenario(
     executable: &Path,
     evidence: &Path,
@@ -222,30 +262,10 @@ fn scenario(
     let deadline = started
         .checked_add(8_000_000_000)
         .ok_or("oracle clock overflow")?;
-    let mut command = Command::new(executable);
     let zero_budget = fixture == "zero-budget";
     let loss = fixture == "frontend-loss";
     let stopped = fixture == "frontend-stopped";
-    command
-        .args([
-            if zero_budget { "+0ms" } else { "+250ms" },
-            "--summary",
-            "--report",
-        ])
-        .arg(&report)
-        .arg("--")
-        .arg(std::env::current_exe()?)
-        .arg("--fixture")
-        .arg(if fixture == "blocked-stderr" {
-            fixture
-        } else {
-            "sleep"
-        })
-        .arg(&marker)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+    let command = scenario_command(executable, fixture, &report, &marker)?;
     let mut child = FrontendOwner {
         child: create_before_deadline(command, deadline)?,
         known: Vec::new(),

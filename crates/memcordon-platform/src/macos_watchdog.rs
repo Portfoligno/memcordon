@@ -277,6 +277,9 @@ pub fn run_attempt(
     let started = Instant::now();
     let current_tick = crate::macos_deadline::continuous_nanos()
         .map_err(|error| Error::new(ErrorCategory::Setup, "MCSETUP-CLOCK", error.to_string()))?;
+    // Relative execution offsets start here, alongside `started`. The first
+    // deadline/runtime origin can predate this call; using it for authorization
+    // would count caller preparation twice when the supervisor adds its offset.
     let attempt_origin = if context.restart_attempt == 0 {
         context.macos_run_origin_ns.unwrap_or(current_tick)
     } else {
@@ -536,7 +539,7 @@ pub fn run_attempt(
                 duration: started.elapsed(),
                 authorization_offset: match startup.release {
                     memcordon_core::ReleaseEvidence::Issued { at, .. } => {
-                        Some(Duration::from_nanos(at.saturating_sub(attempt_origin)))
+                        Some(Duration::from_nanos(at.saturating_sub(current_tick)))
                     }
                     _ => None,
                 },
@@ -564,7 +567,7 @@ pub fn run_attempt(
             != memcordon_core::NativeStartupCleanupStateV1::Complete;
         failure.authorization_offset = match startup.release {
             memcordon_core::ReleaseEvidence::Issued { at, .. } => {
-                Some(Duration::from_nanos(at.saturating_sub(attempt_origin)))
+                Some(Duration::from_nanos(at.saturating_sub(current_tick)))
             }
             _ => None,
         };
@@ -1112,7 +1115,7 @@ pub fn run_attempt(
         runtime: Some(runtime),
         duration: started.elapsed(),
         authorization_offset: Some(Duration::from_nanos(
-            release_tick.saturating_sub(attempt_origin),
+            release_tick.saturating_sub(current_tick),
         )),
         launch,
         restart_safety,

@@ -11,6 +11,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "test-support")]
+#[path = "../tests/macos_control/fixture.rs"]
+pub(crate) mod control_fixture;
+
 use memcordon_core::CommandSpec;
 use serde::{Deserialize, Serialize};
 
@@ -103,18 +107,8 @@ impl Child {
             let mut channel = remote
                 .lock()
                 .map_err(|_| io::Error::other("guardian channel poisoned"))?;
-            let deadline = Instant::now() + Duration::from_millis(100);
-            channel.send(Message::Reap, deadline)?;
-            return match channel.receive(deadline)? {
-                Some(Message::Status { raw, reaped: true }) => {
-                    self.status = raw.map(ExitStatus::from_raw);
-                    Ok(self.status)
-                }
-                Some(Message::Status { reaped: false, .. }) => Ok(None),
-                message => Err(io::Error::other(format!(
-                    "guardian did not confirm target retirement: {message:?}"
-                ))),
-            };
+            self.status = channel.poll_child_status(true)?.map(ExitStatus::from_raw);
+            return Ok(self.status);
         }
         let mut status = 0;
         // SAFETY: this handle owns the unreaped child and never waits synchronously.
@@ -137,12 +131,9 @@ impl Child {
             let mut channel = remote
                 .lock()
                 .map_err(|_| io::Error::other("guardian channel poisoned"))?;
-            let deadline = Instant::now() + Duration::from_millis(100);
-            channel.send(Message::Observe, deadline)?;
-            return match channel.receive(deadline)? {
-                Some(Message::Status { raw, .. }) => Ok(raw.map(ExitStatus::from_raw)),
-                _ => Err(io::Error::other("guardian target observation unavailable")),
-            };
+            return channel
+                .poll_child_status(false)
+                .map(|raw| raw.map(ExitStatus::from_raw));
         }
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
         // SAFETY: WNOWAIT pins the child's identity until workload signalling ends.
@@ -339,6 +330,8 @@ struct Channel {
     cancel_release_prefix: Option<i32>,
     #[cfg(feature = "test-support")]
     expire_send_after_prefix: bool,
+    #[cfg(feature = "test-support")]
+    expire_send_after_write: bool,
     admission: Option<crate::signal::LaunchAdmission>,
     stream: UnixStream,
     run: u64,
@@ -346,6 +339,11 @@ struct Channel {
     received: u64,
     input: Vec<u8>,
     inventory_query: Option<u64>,
+    child_status_pending: bool,
+    observed_status: Option<i32>,
+    reaped_status: Option<i32>,
+    #[cfg(feature = "test-support")]
+    receive_waits: usize,
     force_receipt: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -463,15 +461,69 @@ impl Channel {
             cancel_release_prefix: None,
             #[cfg(feature = "test-support")]
             expire_send_after_prefix: false,
+            #[cfg(feature = "test-support")]
+            expire_send_after_write: false,
             admission: None,
             run,
             sent: 0,
             received: 0,
             input: Vec::new(),
             inventory_query: None,
+            child_status_pending: false,
+            observed_status: None,
+            reaped_status: None,
+            #[cfg(feature = "test-support")]
+            receive_waits: 0,
             force_receipt: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
+    /// Poll one response frame without making scheduling latency a child failure.
+    /// A pending request stays owned across inventory and retirement operations.
+    fn poll_child_status(&mut self, reap: bool) -> io::Result<Option<i32>> {
+        let cached = if reap {
+            self.reaped_status
+        } else {
+            self.observed_status
+        };
+        if cached.is_some() {
+            return Ok(cached);
+        }
+        if !self.child_status_pending {
+            self.send(
+                if reap {
+                    Message::Reap
+                } else {
+                    Message::Observe
+                },
+                Instant::now() + Duration::from_millis(100),
+            )?;
+            self.child_status_pending = true;
+        }
+        match self.receive_available()? {
+            None => {}
+            Some(Some(Message::ForceRequested { at })) => {
+                self.force_receipt
+                    .compare_exchange(0, at, Ordering::AcqRel, Ordering::Acquire)
+                    .ok();
+            }
+            Some(Some(Message::InventoryChunk { query, .. }))
+                if self.inventory_query != Some(query) => {}
+            Some(Some(Message::FailureDetail { message })) => {
+                return Err(io::Error::other(message));
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "guardian child status unavailable: {other:?}"
+                )));
+            }
+        }
+        Ok(if reap {
+            self.reaped_status
+        } else {
+            self.observed_status
+        })
+    }
+
     fn transfer(&mut self, bytes: &mut [u8], write: bool, deadline: Instant) -> io::Result<bool> {
         let mut offset = 0;
         while offset < bytes.len() {
@@ -484,7 +536,10 @@ impl Channel {
                     return Err(error);
                 }
             }
-            if Instant::now() >= deadline {
+            let expired = Instant::now() >= deadline;
+            #[cfg(feature = "test-support")]
+            let expired = expired || (write && self.expire_send_after_write && self.frame_started);
+            if expired {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "private launch protocol deadline expired",
@@ -561,30 +616,44 @@ impl Channel {
         self.frame_started = false;
         #[cfg(feature = "test-support")]
         let releasing = message == Message::Release;
-        let mut bytes = serde_json::to_vec(&Frame {
+        let payload = serde_json::to_vec(&Frame {
             version: 2,
             run: self.run,
             sequence: self.sent,
             message,
         })?;
-        if bytes.len() > FRAME_LIMIT {
+        if payload.len() > FRAME_LIMIT {
             return Err(io::Error::other("private launch frame exceeds bound"));
         }
-        self.transfer(&mut (bytes.len() as u16).to_be_bytes(), true, deadline)
-            .inspect_err(|error| self.record_send_failure(error))?;
+        // Offer the entire frame in one write. A separate prefix write would
+        // leave an otherwise writable receipt truncated if the sender resumes
+        // after its deadline between the prefix and payload system calls.
+        let prefix = (payload.len() as u16).to_be_bytes();
+        let mut bytes = Vec::with_capacity(prefix.len() + payload.len());
+        bytes.extend_from_slice(&prefix);
+        bytes.extend_from_slice(&payload);
         #[cfg(feature = "test-support")]
-        if releasing {
-            if let (Some(signal), Some(admission)) =
-                (self.cancel_release_prefix.take(), &self.admission)
+        let deadline = {
+            // Explicitly force a short write for partial-frame fault tests;
+            // normal sends, including the deadline regression, stay assembled.
+            if self.expire_send_after_prefix || (releasing && self.cancel_release_prefix.is_some())
             {
-                admission.record_for_test(signal);
+                self.transfer(&mut bytes[..prefix.len()], true, deadline)
+                    .inspect_err(|error| self.record_send_failure(error))?;
+                bytes.drain(..prefix.len());
+                if releasing {
+                    if let (Some(signal), Some(admission)) =
+                        (self.cancel_release_prefix.take(), &self.admission)
+                    {
+                        admission.record_for_test(signal);
+                    }
+                }
             }
-        }
-        #[cfg(feature = "test-support")]
-        let deadline = if self.expire_send_after_prefix {
-            Instant::now()
-        } else {
-            deadline
+            if self.expire_send_after_prefix {
+                Instant::now()
+            } else {
+                deadline
+            }
         };
         self.transfer(&mut bytes, true, deadline)
             .inspect_err(|error| self.record_send_failure(error))?;
@@ -601,6 +670,7 @@ impl Channel {
                     return Err(error);
                 }
             }
+            let received_before = self.received;
             match self.receive_available()? {
                 Some(Some(Message::ForceRequested { at })) => {
                     self.force_receipt
@@ -627,6 +697,12 @@ impl Channel {
                     "private protocol deadline expired",
                 ));
             }
+            // An owned status receipt is consumed internally, but that still
+            // advances the parser. Service the remaining buffered frames before
+            // waiting for new socket readiness, retaining the deadline above.
+            if self.received != received_before {
+                continue;
+            }
             let mut poll = libc::pollfd {
                 fd: self.stream.as_raw_fd(),
                 events: libc::POLLIN,
@@ -637,6 +713,10 @@ impl Channel {
                 .as_millis()
                 .clamp(1, 10) as i32;
             // SAFETY: one owned socket and finite wait.
+            #[cfg(feature = "test-support")]
+            {
+                self.receive_waits += 1;
+            }
             if unsafe { libc::poll(&mut poll, 1, wait) } < 0
                 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
             {
@@ -699,6 +779,18 @@ impl Channel {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("protocol sequence exhausted"))?;
         self.input.drain(..prefix + length);
+        if let Message::Status { raw, reaped } = &frame.message {
+            if self.child_status_pending {
+                self.child_status_pending = false;
+                if raw.is_some() {
+                    self.observed_status = *raw;
+                }
+                if *reaped {
+                    self.reaped_status = *raw;
+                }
+                return Ok(None);
+            }
+        }
         Ok(Some(Some(frame.message)))
     }
     fn expect(&mut self, expected: Message, deadline: Instant) -> io::Result<()> {

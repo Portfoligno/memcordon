@@ -1,6 +1,8 @@
 use memcordon_ci::build_context::BuildInputSnapshot;
 use memcordon_ci::inventory_progress::InventoryProgress;
-use memcordon_ci::inventory_reader::{BUFFER_SIZE, digest_reader, open_sequential};
+use memcordon_ci::inventory_reader::{
+    BUFFER_SIZE, digest_reader, digest_reader_exact, open_sequential,
+};
 use sha2::{Digest, Sha256};
 use std::io::{self, Cursor, Read};
 use std::path::Path;
@@ -16,6 +18,77 @@ fn counter(progress: &InventoryProgress, name: &str) -> u64 {
 
 fn bytes(length: usize) -> Vec<u8> {
     (u8::MIN..=u8::MAX).cycle().take(length).collect()
+}
+
+#[test]
+fn verified_lengths_hash_every_byte_without_a_trailing_read() {
+    for length in [0, BUFFER_SIZE - 1, BUFFER_SIZE, BUFFER_SIZE + 1] {
+        let input = bytes(length);
+        let progress = InventoryProgress::new(Path::new("verified length"));
+        let mut reader = ShortReader {
+            data: Cursor::new(input.clone()),
+            maximum: BUFFER_SIZE,
+            calls: 0,
+            failure: None,
+            requested: Vec::new(),
+        };
+        let mut buffer = vec![u8::MAX; BUFFER_SIZE];
+        assert_eq!(
+            digest_reader_exact(&mut reader, &mut buffer, &progress, length as u64).unwrap(),
+            hex::encode(Sha256::digest(&input))
+        );
+        assert_eq!(reader.calls, length.div_ceil(BUFFER_SIZE));
+        assert_eq!(counter(&progress, "read_calls"), reader.calls as u64);
+        assert_eq!(counter(&progress, "bytes"), length as u64);
+        assert_eq!(reader.data.position(), length as u64);
+    }
+}
+
+#[test]
+fn verified_length_handles_short_reads_and_rejects_early_eof() {
+    for length in [257, 258] {
+        let input = bytes(257);
+        let progress = InventoryProgress::new(Path::new("verified short reads"));
+        let mut reader = ShortReader {
+            data: Cursor::new(input.clone()),
+            maximum: 7,
+            calls: 0,
+            failure: None,
+            requested: Vec::new(),
+        };
+        let mut buffer = vec![u8::MAX; BUFFER_SIZE];
+        let result = digest_reader_exact(&mut reader, &mut buffer, &progress, length);
+        if length == input.len() as u64 {
+            assert_eq!(result.unwrap(), hex::encode(Sha256::digest(&input)));
+            assert_eq!(reader.calls, input.len().div_ceil(reader.maximum));
+        } else {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(reader.calls, input.len().div_ceil(reader.maximum) + 1);
+        }
+        assert_eq!(counter(&progress, "bytes"), input.len() as u64);
+        assert_eq!(counter(&progress, "read_calls"), reader.calls as u64);
+    }
+}
+
+#[test]
+fn verified_length_preserves_original_partial_read_errors() {
+    for kind in [io::ErrorKind::Interrupted, io::ErrorKind::PermissionDenied] {
+        let progress = InventoryProgress::new(Path::new("verified read failure"));
+        let mut reader = ShortReader {
+            data: Cursor::new(bytes(257)),
+            maximum: 7,
+            calls: 0,
+            failure: Some(kind),
+            requested: Vec::new(),
+        };
+        let mut buffer = vec![0; BUFFER_SIZE];
+        let error = digest_reader_exact(&mut reader, &mut buffer, &progress, 257).unwrap_err();
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.to_string(), "original read failure");
+        assert_eq!(reader.calls, 3);
+        assert_eq!(counter(&progress, "read_calls"), 3);
+        assert_eq!(counter(&progress, "bytes"), 14);
+    }
 }
 
 #[test]

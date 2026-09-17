@@ -3278,7 +3278,7 @@ pub fn workspace_metadata_command(root: &Path) -> Result<command::CommandSpec> {
 }
 
 pub fn workspace_metadata(root: &Path) -> Result<cargo_metadata::Metadata> {
-    let output = workspace_metadata_command(root)?.output()?;
+    let output = workspace_metadata_command(root)?.output_quiet()?;
     if !output.status.success() {
         return Err(failure(format!(
             "workspace metadata failed with {}; stderr={:?}",

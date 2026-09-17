@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cargo_metadata::{Metadata, MetadataCommand};
+use cargo_metadata::Metadata;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -513,12 +513,11 @@ fn git_text_os(root: &Path, arguments: impl IntoIterator<Item = OsString>) -> Re
 }
 
 fn metadata(root: &Path) -> Result<Metadata> {
-    let mut command = MetadataCommand::new();
-    command
-        .current_dir(root)
-        .env_remove("CARGO_REGISTRY_TOKEN")
-        .env_remove(CRATES_IO_TOKEN_VARIABLE);
-    Ok(command.exec()?)
+    // Release identity and publication ordering need workspace package fields,
+    // not a resolved registry graph. Keep this query in the same measured,
+    // pinned Cargo context as compilation; ambient Cargo can install toolchain
+    // components from rust-toolchain.toml after the input snapshot was taken.
+    memcordon_ci::policy::workspace_metadata(root)
 }
 
 fn parse_changelog(root: &Path, version: &Version) -> Result<(String, String)> {

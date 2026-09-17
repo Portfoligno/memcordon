@@ -174,6 +174,14 @@ impl CommandSpec {
         eprintln!("ci subprocess deadline: {:?}", self.deadline);
         run_with_deadline(&mut command, self.deadline).map_err(Into::into)
     }
+
+    /// Capture a subprocess for callers that own a machine-readable protocol.
+    /// Materialization, credential removal, and the deadline remain identical
+    /// to `output`; only invocation diagnostics are suppressed.
+    pub fn output_quiet(&self) -> Result<ObservedOutput> {
+        let mut command = self.materialize(crate::build_context::active())?;
+        run_with_deadline(&mut command, self.deadline).map_err(Into::into)
+    }
 }
 
 pub fn rustup_cargo(

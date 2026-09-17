@@ -4,6 +4,35 @@ use std::io::{BufRead, BufReader, Cursor};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+#[test]
+fn release_metadata_uses_the_pinned_workspace_only_query_without_mutating_sources() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    fs::create_dir(root.join("ci")).unwrap();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(
+        root.join("ci/toolchains.toml"),
+        "stable = \"1.97.1\"\nmsrv = \"1.85.0\"\nmiri = \"nightly-2026-07-31\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("Cargo.toml"),
+        "[package]\nname = \"release-metadata-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n").unwrap();
+    fs::write(
+        root.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"release-metadata-fixture\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+    fs::write(root.join("rust-toolchain.toml"),
+        "[toolchain]\nchannel = \"uninstalled-release-override\"\ncomponents = [\"unavailable-component\"]\n").unwrap();
+    let before = memcordon_ci::build_context::BuildInputSnapshot::capture(root).unwrap();
+    let result = metadata(root).unwrap();
+    assert_eq!(result.packages.len(), 1);
+    assert_eq!(result.packages[0].name.as_str(), "release-metadata-fixture");
+    assert!(result.resolve.is_none());
+    before.audit().unwrap();
+}
+
 fn provider_wire_protocol(
     protocols: &memcordon_core::runtime_manifest::NativeProviderProtocols,
 ) -> u32 {
@@ -773,6 +802,17 @@ fn provider_uninstall_proof_does_not_mask_inaccessible_state() {
 fn canonical_source_tree_resolves_relocated_manifest_readme() {
     let temporary = TempDir::new().expect("temporary workspace should exist");
     let root = temporary.path();
+    fs::create_dir(root.join("ci")).unwrap();
+    fs::write(
+        root.join("ci/toolchains.toml"),
+        "stable = \"1.97.1\"\nmsrv = \"1.85.0\"\nmiri = \"nightly-2026-07-31\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"example\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
     let package_root = root.join("crates/example");
     let manifest = b"[package]\nname = \"example\"\nversion = \"0.1.0\"\nedition = \"2024\"\nreadme = \"../../docs/package-readme.md\"\n";
     let readme = b"# Example package\n";
@@ -994,6 +1034,11 @@ fn release_fixture() -> (TempDir, config::Release) {
     let root = temporary.path();
     write_canonical_publication_fixture(root);
     fs::create_dir_all(root.join("ci")).expect("CI directory should exist");
+    fs::write(
+        root.join("ci/toolchains.toml"),
+        include_bytes!("../../../../ci/toolchains.toml"),
+    )
+    .expect("toolchain recipe should be copied");
     fs::write(
         root.join("ci/release.toml"),
         include_bytes!("../../../../ci/release.toml"),

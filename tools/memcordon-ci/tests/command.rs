@@ -2,6 +2,54 @@ use std::ffi::OsStr;
 use std::process::Command;
 
 #[test]
+fn workspace_metadata_removes_registry_credentials_with_and_without_a_context() {
+    use memcordon_ci::{build_context::ValidatedBuildContext, policy::workspace_metadata_command};
+    use std::fs;
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    fs::create_dir(root.join("ci")).unwrap();
+    fs::write(
+        root.join("ci/toolchains.toml"),
+        include_bytes!("../../../ci/toolchains.toml"),
+    )
+    .unwrap();
+    let toolchains = memcordon_ci::config::toolchains(&root).unwrap();
+    let bin = root.join("sysroot/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join(if cfg!(windows) { "cargo.exe" } else { "cargo" });
+    fs::write(&cargo, b"fixture tool\n").unwrap();
+    let encode = |value: &OsStr| hex::encode(value.as_encoded_bytes());
+    let manifest = root.join("context.json");
+    fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
+        "schema_version": 3, "root": root,
+        "environment": [[encode(OsStr::new("PATH")), encode(bin.as_os_str())]],
+        "toolchains": {toolchains.stable: cargo}, "input_roots": [bin], "discovery_roots": [],
+        "inputs": [{"path": encode(cargo.as_os_str()), "kind": "file", "mode": 0, "digest": "fixture"}],
+        "worker": {}
+    })).unwrap()).unwrap();
+    let context = ValidatedBuildContext::read(&manifest).unwrap();
+    let spec = workspace_metadata_command(&root).unwrap();
+    for context in [Some(&context), None] {
+        let command = spec.materialize(context).unwrap();
+        let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        for credential in ["CARGO_REGISTRY_TOKEN", "CARGO_REGISTRIES_CRATES_IO_TOKEN"] {
+            if context.is_some() {
+                assert!(
+                    !environment.contains_key(OsStr::new(credential)),
+                    "managed metadata must omit credentials from its closed environment"
+                );
+            } else {
+                assert_eq!(
+                    environment.get(OsStr::new(credential)),
+                    Some(&None),
+                    "standalone metadata must explicitly remove inherited credentials"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn explicit_toolchain_invocations_preserve_native_argv_without_a_context() {
     use memcordon_ci::command::CommandSpec;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

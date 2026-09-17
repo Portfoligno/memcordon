@@ -22,6 +22,11 @@ fn provider_fixture() -> (TempDir, config::Release, Value) {
     write_canonical_publication_fixture(root);
     fs::create_dir_all(root.join("ci")).expect("fixture CI directory should exist");
     fs::write(
+        root.join("ci/toolchains.toml"),
+        include_str!("../../../ci/toolchains.toml"),
+    )
+    .expect("toolchain recipe should write");
+    fs::write(
         root.join("ci/release.toml"),
         include_str!("../../../ci/release.toml"),
     )

@@ -450,7 +450,7 @@ fn measure_root(
     environment::progress::phase(&format!("inventory {kind} root {path:?}"), || {
         let mut progress = InventoryProgress::new(path);
         let mut reader = ContentReader::new(scope.source().is_none(), &progress)?;
-        let result = measure(path, scope, inputs, visited, &progress, &mut reader)
+        let result = measure(path, None, scope, inputs, visited, &progress, &mut reader)
             .and_then(|()| reader.finish(inputs));
         drop(reader);
         progress.finish(result.is_ok());
@@ -458,8 +458,13 @@ fn measure_root(
     })
 }
 
+type PreparedInput = (fs::Metadata, PathBuf);
+type NativePathResolvers =
+    crate::inventory_workers::InventoryWorkers<fs::DirEntry, (PathBuf, Result<PreparedInput>)>;
+
 struct ContentReader {
     buffer: Vec<u8>,
+    resolvers: Option<NativePathResolvers>,
     #[cfg(windows)]
     workers: Option<
         crate::inventory_workers::InventoryWorkers<
@@ -471,14 +476,48 @@ struct ContentReader {
 
 impl ContentReader {
     fn new(native: bool, progress: &InventoryProgress) -> Result<Self> {
+        let executor = if cfg!(windows) && native {
+            Some(crate::inventory_workers::InventoryExecutor::native_pipeline()?)
+        } else {
+            None
+        };
+        let resolvers = if cfg!(windows) && native {
+            let progress = progress.worker();
+            Some(crate::inventory_workers::InventoryWorkers::with_executor(
+                std::sync::Arc::clone(executor.as_ref().expect("native executor")),
+                move |entry: fs::DirEntry, _buffer| {
+                    let path = entry.path();
+                    let resolved = (|| {
+                        // Windows enumeration already supplies non-following
+                        // metadata; preserve it through canonical preparation.
+                        let metadata = progress
+                            .run(Operation::Metadata, &path, || entry.metadata())
+                            .map_err(|error| {
+                                CiError::Message(format!("reading metadata: {error}"))
+                            })?;
+                        let identity = resolve_identity(&path, &metadata, &progress)?;
+                        Ok((metadata, identity))
+                    })();
+                    (path, resolved)
+                },
+            ))
+        } else {
+            None
+        };
         #[cfg(windows)]
         let workers = if native {
             let progress = progress.worker();
-            Some(crate::inventory_workers::InventoryWorkers::new(
+            Some(crate::inventory_workers::InventoryWorkers::with_executor(
+                std::sync::Arc::clone(executor.as_ref().expect("native executor")),
                 move |(path, mut file, expected): (PathBuf, fs::File, fs::Metadata), buffer| {
                     let identity = memcordon_testkit::windows_file_identity(&file)?;
                     let digest = progress.run(Operation::ReadHash, &path, || {
-                        digest_reader(&mut file, buffer, &progress)
+                        crate::inventory_reader::digest_reader_exact(
+                            &mut file,
+                            buffer,
+                            &progress,
+                            expected.len(),
+                        )
                     })?;
                     let after = file.metadata()?;
                     let current = open_sequential(&path)?;
@@ -493,13 +532,14 @@ impl ContentReader {
                     }
                     Ok(digest)
                 },
-            )?)
+            ))
         } else {
             None
         };
         let _ = (native, progress);
         Ok(Self {
             buffer: vec![0; BUFFER_SIZE],
+            resolvers,
             #[cfg(windows)]
             workers,
         })
@@ -530,13 +570,14 @@ fn windows_file_stamp(metadata: &fs::Metadata) -> (u32, u64, u64, u64) {
 
 fn measure(
     path: &Path,
+    prepared: Option<PreparedInput>,
     scope: MeasurementScope<'_>,
     inputs: &mut Vec<Input>,
     visited: &mut BTreeSet<PathBuf>,
     progress: &InventoryProgress,
     reader: &mut ContentReader,
 ) -> Result<()> {
-    measure_path(path, scope, inputs, visited, progress, reader).map_err(|error| {
+    measure_path(path, prepared, scope, inputs, visited, progress, reader).map_err(|error| {
         CiError::Message(format!("measuring build input {}: {error}", path.display()))
     })
 }
@@ -569,8 +610,23 @@ fn resolution_error(
     CiError::Message(format!("resolving path: {error}"))
 }
 
+fn resolve_identity(
+    path: &Path,
+    metadata: &fs::Metadata,
+    progress: &InventoryProgress,
+) -> Result<PathBuf> {
+    if metadata.file_type().is_symlink() {
+        Ok(path.to_path_buf())
+    } else {
+        progress
+            .run(Operation::Canonicalize, path, || path.canonicalize())
+            .map_err(|error| resolution_error(path, metadata, error, progress))
+    }
+}
+
 fn measure_path(
     path: &Path,
+    prepared: Option<PreparedInput>,
     scope: MeasurementScope<'_>,
     inputs: &mut Vec<Input>,
     visited: &mut BTreeSet<PathBuf>,
@@ -591,15 +647,27 @@ fn measure_path(
         if relative.components().next().is_some_and(|part| {
             matches!(
                 part.as_os_str().to_str(),
-                Some("target" | ".git" | "ci-native-fingerprint" | "ci-native-fingerprint.exe")
+                Some(
+                    "target"
+                        | ".git"
+                        | "ci-native-fingerprint"
+                        | "ci-native-fingerprint.exe"
+                        | "ci-native-fingerprint.pdb"
+                )
             )
         }) {
             return Ok(());
         }
     }
-    let metadata = progress
-        .run(Operation::Metadata, path, || fs::symlink_metadata(path))
-        .map_err(|error| CiError::Message(format!("reading metadata: {error}")))?;
+    let (metadata, prepared_identity) = match prepared {
+        Some((metadata, identity)) => (metadata, Some(identity)),
+        None => (
+            progress
+                .run(Operation::Metadata, path, || fs::symlink_metadata(path))
+                .map_err(|error| CiError::Message(format!("reading metadata: {error}")))?,
+            None,
+        ),
+    };
     // Validate every declared discovery root even if a previous overlapping
     // traversal recorded that path as an inaccessible descendant.
     if matches!(scope, MeasurementScope::NativeRoot) && metadata.is_dir() {
@@ -610,12 +678,9 @@ fn measure_path(
     // Every ordinary path, not only symlink targets, enters the visited set.
     // Resolve ordinary aliases before descent so overlapping roots share work.
     // Symlinks retain their own path and identity even when a target was visited.
-    let identity = if metadata.file_type().is_symlink() {
-        path.to_path_buf()
-    } else {
-        progress
-            .run(Operation::Canonicalize, path, || path.canonicalize())
-            .map_err(|error| resolution_error(path, &metadata, error, progress))?
+    let identity = match prepared_identity {
+        Some(identity) => identity,
+        None => resolve_identity(path, &metadata, progress)?,
     };
     if !visited.insert(identity.clone()) {
         return Ok(());
@@ -632,7 +697,7 @@ fn measure_path(
                     ));
                 }
                 if source.is_none() {
-                    measure(&resolved, scope, inputs, visited, progress, reader)?;
+                    measure(&resolved, None, scope, inputs, visited, progress, reader)?;
                 }
                 (
                     "symlink",
@@ -698,15 +763,35 @@ fn measure_path(
             children.sort_by_key(|entry| entry.file_name());
             Ok::<_, CiError>(children)
         })?;
-        for child in children {
-            measure(
-                &child.path(),
-                scope.child(),
-                inputs,
-                visited,
-                progress,
-                reader,
-            )?;
+        if let Some(resolvers) = &mut reader.resolvers {
+            // Settle the bounded batch before descending. Visited decisions and
+            // failures still follow sorted traversal order, not worker timing.
+            for (path, prepared) in resolvers.map_ordered(children)? {
+                let prepared = prepared.map_err(|error| {
+                    CiError::Message(format!("measuring build input {}: {error}", path.display()))
+                })?;
+                measure(
+                    &path,
+                    Some(prepared),
+                    scope.child(),
+                    inputs,
+                    visited,
+                    progress,
+                    reader,
+                )?;
+            }
+        } else {
+            for child in children {
+                measure(
+                    &child.path(),
+                    None,
+                    scope.child(),
+                    inputs,
+                    visited,
+                    progress,
+                    reader,
+                )?;
+            }
         }
         ("directory", String::new())
     } else if metadata.is_file() {

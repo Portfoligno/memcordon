@@ -1,5 +1,12 @@
 //! Native containment used only by black-box process tests.
 #[cfg(target_os = "macos")]
+pub use crate::macos_launch::control_fixture::{
+    buffered_child_status_does_not_delay_inventory,
+    complete_exec_receipt_survives_post_write_deadline,
+    delayed_child_status_cannot_be_confused_with_inventory,
+    delayed_child_status_retains_observation_and_reaping,
+};
+#[cfg(target_os = "macos")]
 pub use crate::macos_launch::protocol_expectation_fixture as macos_protocol_expectation_fixture;
 #[cfg(windows)]
 mod windows_file_identity;

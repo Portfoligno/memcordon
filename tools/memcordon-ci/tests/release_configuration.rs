@@ -28,11 +28,7 @@ fn windows_bootstrap_runtime_linking_is_package_owned() {
 #[test]
 fn workspace_publication_order_matches_the_dependency_graph() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let metadata = cargo_metadata::MetadataCommand::new()
-        .current_dir(&root)
-        .no_deps()
-        .other_options(vec!["--locked".to_owned(), "--offline".to_owned()])
-        .exec()
+    let metadata = memcordon_ci::policy::workspace_metadata(&root)
         .expect("workspace metadata should be available");
     let release = canonical_release();
     let policy = config::policy(&root).expect("workspace policy should parse");
@@ -61,11 +57,7 @@ fn workspace_publication_order_matches_the_dependency_graph() {
 
 fn workspace_version() -> semver::Version {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let metadata = cargo_metadata::MetadataCommand::new()
-        .current_dir(&root)
-        .no_deps()
-        .other_options(vec!["--locked".to_owned(), "--offline".to_owned()])
-        .exec()
+    let metadata = memcordon_ci::policy::workspace_metadata(&root)
         .expect("workspace metadata should be available");
     metadata
         .packages
