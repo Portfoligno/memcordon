@@ -19,6 +19,14 @@ fn heartbeat_retains_the_inspection_deadline() {
 }
 
 #[test]
+fn observed_status_retains_the_retirement_reserve() {
+    memcordon_platform::test_support::macos_delayed_observed_status(Path::new(env!(
+        "CARGO_BIN_EXE_memcordon"
+    )))
+    .unwrap();
+}
+
+#[test]
 fn retired_receipt_retains_the_cleanup_deadline() {
     memcordon_platform::test_support::macos_delayed_retired_receipt(Path::new(env!(
         "CARGO_BIN_EXE_memcordon"

@@ -78,6 +78,8 @@ pub use crate::macos_launch::control_flood as macos_control_flood;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::delayed_heartbeat as macos_delayed_heartbeat;
 #[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_observed_status as macos_delayed_observed_status;
+#[cfg(target_os = "macos")]
 pub use crate::macos_launch::delayed_reaped_status as macos_delayed_reaped_status;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::delayed_released_receipt as macos_delayed_released_receipt;

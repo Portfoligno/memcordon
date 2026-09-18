@@ -264,6 +264,8 @@ enum Message {
     DelayRetiredReceipt,
     #[cfg(feature = "test-support")]
     DelayReapedStatus,
+    #[cfg(feature = "test-support")]
+    DelayObservedStatus,
     Configure {
         image: Vec<u8>,
         boot_identity: String,
@@ -906,6 +908,8 @@ impl Message {
             #[cfg(feature = "test-support")]
             Self::DelayReapedStatus => "DelayReapedStatus",
             #[cfg(feature = "test-support")]
+            Self::DelayObservedStatus => "DelayObservedStatus",
+            #[cfg(feature = "test-support")]
             Self::StallInspectors { .. } => "StallInspectors",
             #[cfg(feature = "test-support")]
             Self::InspectorsStalled { .. } => "InspectorsStalled",
@@ -1438,6 +1442,8 @@ pub enum LaunchFault {
     DelayRetiredReceipt,
     #[cfg(feature = "test-support")]
     DelayReapedStatus,
+    #[cfg(feature = "test-support")]
+    DelayObservedStatus,
 }
 
 pub(crate) fn launch(
@@ -1660,6 +1666,10 @@ fn launch_configured(
         #[cfg(feature = "test-support")]
         if fault == Some(LaunchFault::DelayReapedStatus) {
             control.send(Message::DelayReapedStatus, deadline)?;
+        }
+        #[cfg(feature = "test-support")]
+        if fault == Some(LaunchFault::DelayObservedStatus) {
+            control.send(Message::DelayObservedStatus, deadline)?;
         }
         // A failed partial Configure may still reach the guardian. Preserve its
         // custody from before the first write, rather than killing it on error.
@@ -2548,12 +2558,18 @@ fn guardian_main(
     #[cfg(feature = "test-support")]
     let mut delay_reaped_status = configuration == Some(Message::DelayReapedStatus);
     #[cfg(feature = "test-support")]
-    let configuration =
-        if hold_spawn || delay_released_receipt || delay_retired_receipt || delay_reaped_status {
-            control.receive(initial)?
-        } else {
-            configuration
-        };
+    let mut delay_observed_status = configuration == Some(Message::DelayObservedStatus);
+    #[cfg(feature = "test-support")]
+    let configuration = if hold_spawn
+        || delay_released_receipt
+        || delay_retired_receipt
+        || delay_reaped_status
+        || delay_observed_status
+    {
+        control.receive(initial)?
+    } else {
+        configuration
+    };
     let (startup, work, grace, image, boot_identity) = match configuration {
         Some(Message::Configure {
             image,
@@ -3091,6 +3107,32 @@ fn guardian_main(
                                 let child = target
                                     .as_ref()
                                     .ok_or_else(|| io::Error::other("target not prepared"))?;
+                                #[cfg(feature = "test-support")]
+                                if delay_observed_status {
+                                    control.delay_send_after_deadline = true;
+                                    delay_observed_status = false;
+                                }
+                                // Observation is a nonblocking, asynchronously cached
+                                // request. Its receipt remains useful after the sampling
+                                // turn ends, and must not make the guardian abandon its
+                                // workload when scheduler latency crosses that boundary.
+                                // Retain a bounded response through the cleanup reserve,
+                                // without extending a configured attempt past retirement.
+                                let response = crate::macos_deadline::add(
+                                    response,
+                                    crate::macos_watchdog::CLEANUP_DEADLINE,
+                                )?;
+                                let response = if let Some(work) = work {
+                                    response.min(crate::macos_deadline::add(
+                                        crate::macos_deadline::add(
+                                            work,
+                                            Duration::from_nanos(grace),
+                                        )?,
+                                        crate::macos_watchdog::CLEANUP_DEADLINE,
+                                    )?)
+                                } else {
+                                    response
+                                };
                                 control.send(
                                     Message::Status {
                                         raw: child.observe()?.map(ExitStatus::into_raw),
@@ -3494,6 +3536,37 @@ pub fn delayed_reaped_status(image: &Path) -> Result<(), String> {
     launch
         .guardian
         .disarm(Instant::now() + Duration::from_secs(1))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "test-support")]
+pub fn delayed_observed_status(image: &Path) -> Result<(), String> {
+    let command = CommandSpec::new(image.as_os_str()).args(["__execution-probe"]);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut launch = launch_inner(
+        &command,
+        image,
+        deadline,
+        deadline + Duration::from_secs(1),
+        Some(LaunchFault::DelayObservedStatus),
+    )
+    .map_err(|error| error.error.to_string())?;
+    launch
+        .child
+        .observe_until(Instant::now() + Duration::from_millis(20))
+        .map_err(|error| error.to_string())?;
+    let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+    launch
+        .guardian
+        .inventory(cleanup_deadline)
+        .map_err(|error| error.to_string())?;
+    launch
+        .child
+        .retire(cleanup_deadline)
+        .map_err(|error| error.to_string())?;
+    launch
+        .guardian
+        .disarm(cleanup_deadline)
         .map_err(|error| error.to_string())
 }
 
