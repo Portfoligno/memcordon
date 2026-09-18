@@ -11,6 +11,14 @@ fn confirmed_exec_receipt_retains_the_startup_deadline() {
 }
 
 #[test]
+fn heartbeat_retains_the_inspection_deadline() {
+    memcordon_platform::test_support::macos_delayed_heartbeat(Path::new(env!(
+        "CARGO_BIN_EXE_memcordon"
+    )))
+    .unwrap();
+}
+
+#[test]
 fn retired_receipt_retains_the_cleanup_deadline() {
     memcordon_platform::test_support::macos_delayed_retired_receipt(Path::new(env!(
         "CARGO_BIN_EXE_memcordon"

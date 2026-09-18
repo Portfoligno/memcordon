@@ -129,6 +129,9 @@ impl Child {
         Ok(self.status)
     }
     pub(crate) fn observe(&self) -> io::Result<Option<ExitStatus>> {
+        self.observe_until(Instant::now() + Duration::from_millis(100))
+    }
+    pub(crate) fn observe_until(&self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         if self.status.is_some() {
             return Ok(self.status);
         }
@@ -137,7 +140,7 @@ impl Child {
                 .lock()
                 .map_err(|_| io::Error::other("guardian channel poisoned"))?;
             return channel
-                .poll_child_status(false)
+                .poll_child_status_until(false, deadline)
                 .map(|raw| raw.map(ExitStatus::from_raw));
         }
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
@@ -1273,17 +1276,19 @@ impl Guardian {
             .force_receipt
             .clone())
     }
-    pub(crate) fn signal_stop(&self, signal: i32, grace: Duration) -> io::Result<()> {
+    pub(crate) fn signal_stop(
+        &self,
+        signal: i32,
+        grace: Duration,
+        deadline: Instant,
+    ) -> io::Result<()> {
         let force = crate::macos_deadline::add(crate::macos_deadline::continuous_nanos()?, grace)?;
         self.channel
             .as_ref()
             .ok_or_else(|| io::Error::other("guardian lease unavailable"))?
             .lock()
             .map_err(|_| io::Error::other("guardian channel poisoned"))?
-            .send(
-                Message::SignalStop { signal, force },
-                Instant::now() + Duration::from_millis(20),
-            )
+            .send(Message::SignalStop { signal, force }, deadline)
     }
     fn query(
         &self,
@@ -1364,15 +1369,12 @@ impl Guardian {
     pub(crate) fn pid(&self) -> u32 {
         self.child.id()
     }
-    pub(crate) fn alive(&self) -> io::Result<()> {
+    pub(crate) fn alive(&self, deadline: Instant) -> io::Result<()> {
         if let Some(channel) = &self.channel {
             channel
                 .lock()
                 .map_err(|_| io::Error::other("guardian channel poisoned"))?
-                .send(
-                    Message::Heartbeat,
-                    Instant::now() + Duration::from_millis(20),
-                )?;
+                .send(Message::Heartbeat, deadline)?;
         }
         if self.child.observe()?.is_none() {
             Ok(())
@@ -2973,10 +2975,14 @@ fn guardian_main(
             }
             if connected && inventory_output.is_none() {
                 if let Some(at) = force_requested.filter(|_| !force_receipt_sent) {
-                    control.send(
-                        Message::ForceRequested { at },
-                        Instant::now() + Duration::from_millis(20),
-                    )?;
+                    // This proof belongs to the fixed retirement phase. A fresh
+                    // scheduling slice must not turn a completed force request into
+                    // a guardian failure.
+                    let receipt_deadline = instant_deadline(crate::macos_deadline::add(
+                        force_at.expect("force request has a scheduled boundary"),
+                        crate::macos_watchdog::CLEANUP_DEADLINE,
+                    )?)?;
+                    control.send(Message::ForceRequested { at }, receipt_deadline)?;
                     force_receipt_sent = true;
                 }
                 match control.receive_available() {
@@ -3488,6 +3494,36 @@ pub fn delayed_reaped_status(image: &Path) -> Result<(), String> {
     launch
         .guardian
         .disarm(Instant::now() + Duration::from_secs(1))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "test-support")]
+pub fn delayed_heartbeat(image: &Path) -> Result<(), String> {
+    let command = CommandSpec::new(image.as_os_str()).args(["__execution-probe"]);
+    let startup_deadline = Instant::now() + Duration::from_secs(1);
+    let mut launch = launch(&command, image, startup_deadline, startup_deadline)
+        .map_err(|error| error.error.to_string())?;
+    launch
+        .guardian
+        .channel
+        .as_ref()
+        .expect("live guardian")
+        .lock()
+        .map_err(|_| "guardian channel poisoned")?
+        .delay_send_after_deadline = true;
+    let inspection_deadline = Instant::now() + Duration::from_secs(1);
+    launch
+        .guardian
+        .alive(inspection_deadline)
+        .map_err(|error| error.to_string())?;
+    let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+    launch
+        .child
+        .retire(cleanup_deadline)
+        .map_err(|error| error.to_string())?;
+    launch
+        .guardian
+        .disarm(cleanup_deadline)
         .map_err(|error| error.to_string())
 }
 
@@ -4046,7 +4082,7 @@ pub fn repeated_stop(image: &Path, fixture: &Path, marker: &Path) -> Result<(), 
     let first = Instant::now();
     attempt
         .guardian
-        .signal_stop(libc::SIGTERM, Duration::from_millis(200))
+        .signal_stop(libc::SIGTERM, Duration::from_millis(200), end)
         .map_err(|error| error.to_string())?;
     let shared = attempt
         .guardian

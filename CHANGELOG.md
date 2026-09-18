@@ -17,8 +17,8 @@ All notable user-visible changes to MemCordon are documented here.
   execution details show that the command was never authorized to start.
 - Durable macOS report writes can use the unused portion of the bounded cleanup
   reserve instead of failing after a separate shorter scheduling window.
-- macOS launch, status and cleanup receipts retain their existing operation
-  deadlines instead of failing under brief scheduler delays.
+- macOS launch, monitoring, status and cleanup receipts retain their existing
+  operation deadlines instead of failing under brief scheduler delays.
 
 ### Added
 

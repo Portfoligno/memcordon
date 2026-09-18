@@ -163,8 +163,16 @@ fn short_child_stress(iteration_key: &str) {
         "stress progress: seed={seed} phase=tree-start elapsed_ms={}",
         started.elapsed().as_millis()
     );
+    let tree_report_path = reports.join(format!("stress-{iteration_key}-tree.json"));
+    match fs::remove_file(&tree_report_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("stale aggregate tree report could not be removed: {error}"),
+    }
     let mut tree = Command::new(env!("CARGO_BIN_EXE_memcordon"));
-    tree.args([
+    #[cfg(target_os = "macos")]
+    let tree_delivery = delivery_evidence::Evidence::attach(&mut tree);
+    tree.args(["--report"]).arg(&tree_report_path).args([
         "+96MiB",
         "--",
         env!("CARGO_BIN_EXE_memcordon-test-fixture"),
@@ -176,10 +184,35 @@ fn short_child_stress(iteration_key: &str) {
         "--leaf-mode",
         "allocate",
     ]);
-    let tree_output = run_with_deadline(&mut tree, Duration::from_secs(15))
-        .unwrap_or_else(|error| panic!("aggregate tree stress failed: {error}"));
-    assert_eq!(tree_output.status.code(), Some(124));
+    let tree_result = run_with_deadline(&mut tree, Duration::from_secs(15));
+    #[cfg(target_os = "macos")]
+    let tree_delivery = tree_delivery.finish();
+    #[cfg(not(target_os = "macos"))]
+    let tree_delivery = "not applicable";
+    let tree_report = fs::read_to_string(&tree_report_path);
+    let tree_output = tree_result.unwrap_or_else(|error| {
+        panic!(
+            "aggregate tree stress failed: seed={seed}: {error}; report={tree_report:?}; delivery={tree_delivery:?}"
+        )
+    });
+    assert_eq!(
+        tree_output.status.code(),
+        Some(124),
+        "aggregate tree stress mismatch: seed={seed}; stdout={:?}; stderr={:?}; report={tree_report:?}; delivery={tree_delivery:?}",
+        String::from_utf8_lossy(&tree_output.stdout),
+        String::from_utf8_lossy(&tree_output.stderr),
+    );
     assert_stdout_empty(&tree_output);
+    let tree_report = tree_report.expect("successful aggregate tree should write its report");
+    let _: memcordon_core::MemcordonReport = serde_json::from_str(&tree_report)
+        .expect("successful aggregate tree report should be valid JSON");
+    #[cfg(target_os = "macos")]
+    assert!(
+        tree_delivery.is_empty(),
+        "successful aggregate tree should not emit delivery failure evidence: {tree_delivery:?}"
+    );
+    fs::remove_file(&tree_report_path)
+        .expect("successful aggregate tree report should be removable");
     eprintln!(
         "stress progress: seed={seed} phase=tree-complete elapsed_ms={}",
         started.elapsed().as_millis()

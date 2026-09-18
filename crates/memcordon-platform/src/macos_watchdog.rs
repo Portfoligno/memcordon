@@ -18,7 +18,7 @@ use crate::signal::SignalSource;
 const PROC_PIDTBSDINFO: i32 = 3;
 const PROC_PIDTASKINFO: i32 = 4;
 const RUSAGE_INFO_V2: i32 = 2;
-const CLEANUP_DEADLINE: Duration = Duration::from_secs(3);
+pub(crate) const CLEANUP_DEADLINE: Duration = Duration::from_secs(3);
 
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
@@ -717,21 +717,6 @@ pub fn run_attempt(
     };
     let mut command_exit_grace_started = None;
     let mut outcome = loop {
-        let mut cycle_error = guardian.alive().err().map(|error| error.to_string());
-        let mut completion = None;
-        let mut workload_empty = false;
-        match try_reap(&mut child, &mut stored_status) {
-            Ok(Some(status)) => {
-                if policy.lifetime == Lifetime::Command {
-                    completion = Some(status);
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                cycle_error = Some(error);
-            }
-        }
-
         let inspection_deadline =
             policy
                 .deadline
@@ -742,6 +727,23 @@ pub fn run_attempt(
                             .unwrap_or_else(|| deadline.duration()))
                     .min(Instant::now() + Duration::from_millis(250))
                 });
+        let mut cycle_error = guardian
+            .alive(inspection_deadline)
+            .err()
+            .map(|error| error.to_string());
+        let mut completion = None;
+        let mut workload_empty = false;
+        match try_reap(&mut child, &mut stored_status, inspection_deadline) {
+            Ok(Some(status)) => {
+                if policy.lifetime == Lifetime::Command {
+                    completion = Some(status);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                cycle_error = Some(error);
+            }
+        }
         match guardian
             .inventory_with_metric(policy.memory.map(|_| policy.metric), inspection_deadline)
         {
@@ -1126,11 +1128,12 @@ pub fn run_attempt(
 fn try_reap(
     child: &mut Child,
     stored: &mut Option<ChildTermination>,
+    deadline: Instant,
 ) -> Result<Option<ChildTermination>, String> {
     if let Some(status) = stored.clone() {
         return Ok(Some(status));
     }
-    match child.observe() {
+    match child.observe_until(deadline) {
         Ok(Some(status)) => {
             let termination = termination_from_status(status);
             *stored = Some(termination.clone());
@@ -1166,14 +1169,14 @@ fn retire_workload(
         force_attempted: initial_signal == libc::SIGKILL,
         ..CleanupSummary::default()
     };
-    if let Err(error) = guardian.signal_stop(initial_signal, grace) {
+    let started = Instant::now();
+    let deadline = retirement_deadline.unwrap_or_else(|| started + grace + CLEANUP_DEADLINE);
+    if let Err(error) = guardian.signal_stop(initial_signal, grace, deadline) {
         summary.errors.push(CleanupErrorRecord {
             operation: "guardian-stop".into(),
             message: error.to_string(),
         });
     }
-    let started = Instant::now();
-    let deadline = retirement_deadline.unwrap_or_else(|| started + grace + CLEANUP_DEADLINE);
     let mut empty = false;
     while Instant::now() < deadline {
         match guardian.inventory(deadline) {
@@ -1207,7 +1210,7 @@ fn retire_workload(
         });
     }
     while stored.is_none() && Instant::now() < deadline {
-        match child.observe() {
+        match child.observe_until(deadline) {
             Ok(Some(status)) => *stored = Some(termination_from_status(status)),
             Ok(None) => bounded_pause(
                 Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
