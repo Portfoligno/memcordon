@@ -215,7 +215,7 @@ checked before formatting and before removing the assignment. A GUID path
 accepted by native volume APIs is not assumed to be accepted by format.com.
 
 This records the same prepare child, without a second scan or deadline extension.
-A contained recorder sibling owns a fresh 256 MiB virtual disk, its verified
+A contained recorder sibling owns a fresh 512 MiB virtual disk, its verified
 single-partition mount, and the WPR instance. Native disk operations execute only
 inside that helper: the parent limits readiness to 30 seconds and export/cleanup
 to 120 seconds, with the existing five-second termination observation allowance.
