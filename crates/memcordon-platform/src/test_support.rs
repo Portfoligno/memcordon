@@ -347,6 +347,11 @@ pub fn windows_assignment_failure() -> io::Result<bool> {
 }
 
 #[cfg(windows)]
+pub fn windows_empty_accounting_survives_consumed_zero_notification() -> io::Result<bool> {
+    crate::windows_job::test_empty_accounting_survives_consumed_zero_notification()
+}
+
+#[cfg(windows)]
 pub fn windows_token_group_entries_range(
     byte_length: usize,
     entry_count: usize,

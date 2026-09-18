@@ -6,9 +6,11 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use memcordon_platform::test_support::{
     windows_assignment_failure, windows_current_token_contains_world_sid,
-    windows_current_token_user_sid_string, windows_encode_command_line, windows_kill_on_job_close,
-    windows_nested_assignment, windows_target_remains_suspended_until_assignment,
-    windows_token_group_entries, windows_token_group_entries_range, windows_token_group_sid_range,
+    windows_current_token_user_sid_string,
+    windows_empty_accounting_survives_consumed_zero_notification, windows_encode_command_line,
+    windows_kill_on_job_close, windows_nested_assignment,
+    windows_target_remains_suspended_until_assignment, windows_token_group_entries,
+    windows_token_group_entries_range, windows_token_group_sid_range,
     windows_token_group_storage_contains, windows_token_user_sid_range,
     windows_token_user_storage_matches,
 };
@@ -221,6 +223,14 @@ fn nested_assignment_is_accounted_by_the_memcordon_job() {
 #[test]
 fn assignment_failure_terminates_suspended_target_before_execution() {
     assert!(windows_assignment_failure().expect("assignment failure scenario should complete"));
+}
+
+#[test]
+fn empty_accounting_closes_a_consumed_zero_notification_race() {
+    assert!(
+        windows_empty_accounting_survives_consumed_zero_notification()
+            .expect("empty accounting transition should complete")
+    );
 }
 
 #[test]

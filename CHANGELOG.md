@@ -19,6 +19,8 @@ All notable user-visible changes to MemCordon are documented here.
   reserve instead of failing after a separate shorter scheduling window.
 - macOS launch, monitoring, status and cleanup receipts retain their existing
   operation deadlines instead of failing under brief scheduler delays.
+- Windows supervision no longer waits for the cleanup deadline when Job Object
+  accounting confirms that a short-lived workload is already empty.
 
 ### Added
 

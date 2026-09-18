@@ -59,6 +59,28 @@ fn bounded_wait(
             duration.min(deadline.saturating_duration_since(Instant::now()))
         })
 }
+
+fn wait_until_job_empty(
+    deadline: Instant,
+    mut active_processes: impl FnMut() -> io::Result<u32>,
+    mut wait_message: impl FnMut(Duration) -> io::Result<Option<u32>>,
+) -> io::Result<bool> {
+    loop {
+        if active_processes()? == 0 {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        if wait_message(Duration::from_millis(10).min(remaining))?
+            == Some(JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO)
+        {
+            return Ok(true);
+        }
+    }
+}
+
 static CONSOLE_EVENT: AtomicU32 = AtomicU32::new(NO_CONSOLE_EVENT);
 static CONSOLE_WAKE: AtomicIsize = AtomicIsize::new(0);
 
@@ -751,23 +773,14 @@ impl Job {
     }
 
     fn wait_empty(&self, deadline: Instant) -> io::Result<bool> {
-        if self.active_processes()? == 0 {
-            return Ok(true);
-        }
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(false);
-            }
-            if let Some(message) = self.wait_message(Duration::from_millis(10).min(remaining))? {
-                if message == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO {
-                    return Ok(true);
-                }
-            }
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-        }
+        // Completion-port delivery and accounting publication are independent.
+        // Re-query accounting so a zero notification drained immediately before
+        // a stale nonzero query cannot strand an already-empty job until deadline.
+        wait_until_job_empty(
+            deadline,
+            || self.active_processes(),
+            |timeout| self.wait_message(timeout),
+        )
     }
 
     fn terminate(&self, status: u32) -> io::Result<()> {
@@ -1081,4 +1094,22 @@ pub(crate) fn test_assignment_failure() -> io::Result<bool> {
     // SAFETY: assignment failure synchronously terminates and waits for the suspended target.
     let terminated = unsafe { WaitForSingleObject(process.process, 0) } == WAIT_OBJECT_0;
     Ok(failed && terminated)
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn test_empty_accounting_survives_consumed_zero_notification() -> io::Result<bool> {
+    let mut queries = 0_u32;
+    let mut waits = 0_u32;
+    let empty = wait_until_job_empty(
+        Instant::now() + Duration::from_secs(1),
+        || {
+            queries += 1;
+            Ok(u32::from(queries == 1))
+        },
+        |_| {
+            waits += 1;
+            Ok(None)
+        },
+    )?;
+    Ok(empty && queries == 2 && waits == 1)
 }
