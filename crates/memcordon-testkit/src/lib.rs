@@ -25,6 +25,19 @@ pub struct ObservedOutput {
 }
 
 #[derive(Debug)]
+pub struct TimeoutObservation {
+    pub child_id: u32,
+    /// Status observed before timeout cleanup; never the forced termination status.
+    pub observed_status: Option<ExitStatus>,
+    pub callback_completed: bool,
+    pub spawn_returned: Duration,
+    pub boundary_admitted: Duration,
+    pub timeout_observed: Duration,
+    pub stdout_reader_finished: bool,
+    pub stderr_reader_finished: bool,
+}
+
+#[derive(Debug)]
 pub enum ProcessTestError {
     Spawn(io::Error),
     Wait(io::Error),
@@ -34,6 +47,7 @@ pub enum ProcessTestError {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
         cleanup: Result<(), String>,
+        observation: Box<TimeoutObservation>,
     },
 }
 
@@ -48,9 +62,10 @@ impl fmt::Display for ProcessTestError {
                 stdout,
                 stderr,
                 cleanup,
+                observation,
             } => write!(
                 formatter,
-                "test command exceeded {deadline:?}; cleanup={cleanup:?}; stdout={:?}; stderr={:?}",
+                "test command exceeded {deadline:?}; cleanup={cleanup:?}; observation={observation:?}; stdout={:?}; stderr={:?}",
                 String::from_utf8_lossy(stdout),
                 String::from_utf8_lossy(stderr)
             ),
@@ -138,6 +153,7 @@ fn run_with_deadline_after_limit(
     OuterTestBoundary::configure(command).map_err(ProcessTestError::Spawn)?;
     let started = Instant::now();
     let mut child = command.spawn().map_err(ProcessTestError::Spawn)?;
+    let spawn_returned = started.elapsed();
     let boundary = match OuterTestBoundary::after_spawn(&child) {
         Ok(boundary) => boundary,
         Err(error) => {
@@ -146,6 +162,7 @@ fn run_with_deadline_after_limit(
             return Err(ProcessTestError::Spawn(error));
         }
     };
+    let boundary_admitted = started.elapsed();
     let stdout_reader = reader(
         child.stdout.take().expect("stdout was configured as piped"),
         output_limit,
@@ -211,6 +228,18 @@ fn run_with_deadline_after_limit(
             break status;
         }
         if started.elapsed() >= deadline {
+            // Snapshot existing observations before cleanup changes process state. No extra
+            // process queries or output reads may delay retirement for diagnostic collection.
+            let observation = TimeoutObservation {
+                child_id,
+                observed_status,
+                callback_completed: callback_result.is_some(),
+                spawn_returned,
+                boundary_admitted,
+                timeout_observed: started.elapsed(),
+                stdout_reader_finished: stdout_reader.worker.is_finished(),
+                stderr_reader_finished: stderr_reader.worker.is_finished(),
+            };
             let cleanup = boundary
                 .terminate_and_reap(&mut child)
                 .map_err(|error| error.to_string());
@@ -224,6 +253,7 @@ fn run_with_deadline_after_limit(
                     stdout: stdout_reader.snapshot(),
                     stderr: stderr_reader.snapshot(),
                     cleanup: Err(error),
+                    observation: Box::new(observation),
                 });
             }
             let stdout = stdout_reader
@@ -240,6 +270,7 @@ fn run_with_deadline_after_limit(
                 stdout,
                 stderr,
                 cleanup,
+                observation: Box::new(observation),
             });
         }
         thread::sleep(Duration::from_millis(5));

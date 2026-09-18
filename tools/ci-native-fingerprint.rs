@@ -16,6 +16,10 @@ mod environment;
 #[path = "ci-bounded-command.rs"]
 mod bounded;
 
+#[cfg(windows)]
+#[path = "ci-inventory-trace.rs"]
+mod inventory_trace;
+
 pub fn capture(
     program: &str,
     arguments: &[&str],
@@ -83,12 +87,91 @@ pub fn capture(
     }
 }
 
+#[cfg(windows)]
+fn configure_recording_environment(
+    command: &mut Command,
+    environment: &BTreeMap<OsString, OsString>,
+    temporary: Option<&Path>,
+) {
+    command.env_clear().envs(environment);
+    if let Some(directory) = temporary {
+        command.env("TEMP", directory).env("TMP", directory);
+    }
+}
+
 fn run() -> io::Result<()> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
-    if arguments.len() != 2 || arguments[0] != "--output" {
+    #[cfg(windows)]
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--internal-trace-volume-qualification")
+    {
+        if arguments.len() != 3 {
+            return Err(io::Error::other(
+                "invalid volume qualification worker arguments",
+            ));
+        }
+        return inventory_trace::qualify_volume_worker(
+            Path::new(&arguments[1]),
+            Path::new(&arguments[2]),
+            configure_recording_environment,
+        );
+    }
+    #[cfg(windows)]
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--qualify-trace-volume")
+    {
+        if arguments.len() != 1 {
+            return Err(io::Error::other(
+                "volume qualification takes no extra arguments",
+            ));
+        }
+        let root = environment::command_path(&std::env::current_dir()?)?;
+        let journal =
+            bounded::Journal::create(&root.join("target/ci/reports/inventory-observation/v1"))?;
+        let env = environment::closed_environment(&std::env::vars_os().collect())?;
+        return inventory_trace::qualify_volume(
+            &root,
+            journal.directory(),
+            &env,
+            configure_recording_environment,
+        );
+    }
+    #[cfg(windows)]
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--internal-inventory-trace-worker")
+    {
+        if arguments.len() != 4 {
+            return Err(io::Error::other("invalid recorder worker arguments"));
+        }
+        return inventory_trace::worker(
+            Path::new(&arguments[1]),
+            Path::new(&arguments[2]),
+            &arguments[3],
+            configure_recording_environment,
+        );
+    }
+    if !matches!(arguments.len(), 2 | 4) || arguments[0] != "--output" {
         return Err(io::Error::other(
-            "usage: ci-native-fingerprint --output PATH",
+            "usage: ci-native-fingerprint --output PATH [--trace-inventory true|false]",
         ));
+    }
+    let trace_inventory = if arguments.len() == 4 {
+        if arguments[2] != "--trace-inventory" {
+            return Err(io::Error::other("unknown native fingerprint option"));
+        }
+        match arguments[3].to_str() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Err(io::Error::other("trace-inventory must be true or false")),
+        }
+    } else {
+        false
+    };
+    if trace_inventory && !cfg!(windows) {
+        return Err(io::Error::other("inventory tracing requires Windows"));
     }
     let root = environment::command_path(&std::env::current_dir()?)?;
     let path = root.join(&arguments[1]);
@@ -303,7 +386,7 @@ fn run() -> io::Result<()> {
         .arg(journal.directory())
         .current_dir(&root)
         .env_clear()
-        .envs(env);
+        .envs(&env);
     for key in [
         "GITHUB_JOB",
         "GITHUB_WORKFLOW",
@@ -317,6 +400,21 @@ fn run() -> io::Result<()> {
             plan.env(key, value);
         }
     }
+    #[cfg(windows)]
+    let completion = if trace_inventory {
+        let mut recording = inventory_trace::Session::new(
+            &root,
+            journal.directory(),
+            &env,
+            configure_recording_environment,
+        );
+        inventory_trace::around(&mut recording, || {
+            run_bounded("prepare fingerprint context", &mut plan, &mut journal)
+        })?
+    } else {
+        run_bounded("prepare fingerprint context", &mut plan, &mut journal)?
+    };
+    #[cfg(not(windows))]
     let completion = run_bounded("prepare fingerprint context", &mut plan, &mut journal)?;
     bounded::publish(&candidate, &path, &journal, &completion)
 }

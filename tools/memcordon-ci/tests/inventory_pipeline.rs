@@ -54,6 +54,10 @@ impl InventoryBackend for Backend {
     type File = usize;
     type Record = (usize, Option<String>);
 
+    fn is_leaf_hint(&self, entry: &usize) -> bool {
+        matches!(self.tree[entry], Kind::File)
+    }
+
     fn prepare(&self, id: usize) -> Result<usize> {
         (self.hook)(Event::Prepare, id)?;
         Ok(id)

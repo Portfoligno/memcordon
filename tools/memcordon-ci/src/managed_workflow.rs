@@ -10,16 +10,66 @@ fn fail(message: &str) -> CiError {
     CiError::Message(message.into())
 }
 
+const TRACED_PREPARE: &str = "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin --trace-inventory ${{ matrix.inventory-trace }}";
+const QUALIFY_VOLUME: &str = "./ci-native-fingerprint.exe --qualify-trace-volume";
+
+fn project_trace_configuration(job: &mut Value) -> Result<bool> {
+    let traced = job
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .is_some_and(|steps| {
+            steps
+                .iter()
+                .any(|step| step.get("run").and_then(Value::as_str) == Some(TRACED_PREPARE))
+        });
+    if !traced {
+        return Ok(false);
+    }
+    let rows = job
+        .get_mut("strategy")
+        .and_then(|value| value.get_mut("matrix"))
+        .and_then(|value| value.get_mut("include"))
+        .and_then(Value::as_sequence_mut)
+        .ok_or_else(|| {
+            fail("inventory tracing requires the reviewed Windows architecture matrix")
+        })?;
+    if rows.len() != 2 {
+        return Err(fail("inventory tracing matrix must contain x64 and arm64"));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for row in rows {
+        let id = row
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if !matches!(id.as_str(), "x64" | "arm64")
+            || !ids.insert(id.clone())
+            || row.get("inventory-trace").and_then(Value::as_bool) != Some(id == "arm64")
+        {
+            return Err(fail(
+                "inventory tracing is enabled only for the ARM64 matrix entry",
+            ));
+        }
+        row.as_mapping_mut()
+            .expect("matrix entry has named fields")
+            .remove(Value::from("inventory-trace"));
+    }
+    Ok(true)
+}
+
 pub fn validate_and_project(document: &mut Value) -> Result<()> {
     let Some(jobs) = document.get_mut("jobs").and_then(Value::as_mapping_mut) else {
         return Ok(());
     };
     for job in jobs.values_mut() {
+        let traced = project_trace_configuration(job)?;
         let Some(steps) = job.get_mut("steps").and_then(Value::as_sequence_mut) else {
             continue;
         };
         let mut planned = false;
         let mut seed_compiled = false;
+        let mut volume_qualified = false;
         let mut audited = false;
         let macos_gate = steps.iter().any(|value| {
             value.get("run").and_then(Value::as_str).is_some_and(|run| {
@@ -44,8 +94,10 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
             }
             if text(step, "run")
                 == Some("./ci-native-fingerprint.exe --output target/ci/native-inputs.bin")
+                || (traced && text(step, "run") == Some(TRACED_PREPARE))
             {
                 if !seed_compiled
+                    || (traced && !volume_qualified)
                     || step.len() != 2
                     || text(step, "id") != Some("build-context-prepare")
                 {
@@ -55,6 +107,29 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                 }
                 planned = true;
                 step.remove(Value::from("id"));
+                if traced {
+                    step.insert(
+                        Value::from("run"),
+                        Value::from(
+                            "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin",
+                        ),
+                    );
+                }
+            }
+            if text(step, "run") == Some(QUALIFY_VOLUME) {
+                if !traced
+                    || !seed_compiled
+                    || planned
+                    || volume_qualified
+                    || step.len() != 3
+                    || text(step, "id") != Some("trace-volume-qualification")
+                    || text(step, "if") != Some("matrix.inventory-trace")
+                {
+                    return Err(fail(
+                        "trace volume qualification must fail closed after seed compilation and before preparation",
+                    ));
+                }
+                volume_qualified = true;
             }
             if text(step, "run")
                 == Some(
@@ -91,9 +166,11 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                 if action != "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
                     || text(step, "if") != Some("always()")
                     || text(with, "path")
-                        != Some(
-                            "target/ci/reports/inventory-observation/v1/**/run-start.json\ntarget/ci/reports/inventory-observation/v1/**/phase-*.json\ntarget/ci/reports/inventory-observation/v1/**/inventory-*.json\n",
-                        )
+                        != Some(if traced {
+                            "target/ci/reports/inventory-observation/v1/**/run-start.json\ntarget/ci/reports/inventory-observation/v1/**/phase-*.json\ntarget/ci/reports/inventory-observation/v1/**/inventory-*.json\ntarget/ci/reports/inventory-observation/v1/**/inventory-trace.etl\ntarget/ci/reports/inventory-observation/v1/**/inventory-wpr-*.log\n"
+                        } else {
+                            "target/ci/reports/inventory-observation/v1/**/run-start.json\ntarget/ci/reports/inventory-observation/v1/**/phase-*.json\ntarget/ci/reports/inventory-observation/v1/**/inventory-*.json\n"
+                        })
                 {
                     return Err(fail(
                         "inventory evidence upload must preserve bounded bootstrap records only",
@@ -215,7 +292,7 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
         steps.retain(|value| {
             if value.get("id").and_then(Value::as_str)==Some("inventory-observation") {return false;}
             let Some(run) = value.get("run").and_then(Value::as_str) else { return true; };
-            run != "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin"
+            run != QUALIFY_VOLUME && run != "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin"
                 && (macos_gate || !matches!(run,
                     "rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe" |
                     "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin"))

@@ -8,6 +8,25 @@ use presentation::Presentation;
 
 fn main() {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+    let argv = if argv
+        .first()
+        .is_some_and(|arg| arg == "__delivery-observed-v1")
+    {
+        let descriptor = argv
+            .get(1)
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse().ok());
+        if descriptor
+            .and_then(|fd| commands::observe_failures(fd).ok())
+            .is_none()
+        {
+            std::process::exit(126);
+        }
+        argv.into_iter().skip(2).collect()
+    } else {
+        argv
+    };
     if let Some(internal) = commands::route_internal(&argv) {
         let code = match internal {
             Ok(internal) => commands::execute_internal(internal),

@@ -19,6 +19,61 @@ fn every_workflow_enrolls_compiled_caches_in_fresh_contexts() {
 }
 
 #[test]
+fn trace_opt_in_cannot_expand_architectures_or_upload_unbounded_working_volume() {
+    for mutation in ["x64", "arm64", "upload"] {
+        let mut document: Value = serde_yaml::from_str(include_str!(
+            "../../../.github/workflows/backend-certification.yml"
+        ))
+        .unwrap();
+        let job = &mut document["jobs"]["windows-loader-production"];
+        match mutation {
+            "x64" => job["strategy"]["matrix"]["include"][0]["inventory-trace"] = true.into(),
+            "arm64" => job["strategy"]["matrix"]["include"][1]["inventory-trace"] = false.into(),
+            "upload" => {
+                let observation = job["steps"]
+                    .as_sequence_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|step| step["id"] == "inventory-observation")
+                    .unwrap();
+                observation["with"]["path"] =
+                    "target/ci/reports/inventory-observation/v1/**\n".into();
+            }
+            _ => unreachable!(),
+        }
+        assert!(validate_and_project(&mut document).is_err(), "{mutation}");
+    }
+}
+
+#[test]
+fn trace_volume_qualification_is_required_before_prepare_and_cannot_ignore_failure() {
+    for mutation in ["missing", "late", "early", "condition", "ignore"] {
+        let mut document: Value = serde_yaml::from_str(include_str!(
+            "../../../.github/workflows/backend-certification.yml"
+        ))
+        .unwrap();
+        let steps = document["jobs"]["windows-loader-production"]["steps"]
+            .as_sequence_mut()
+            .unwrap();
+        let index = steps
+            .iter()
+            .position(|step| step["id"] == "trace-volume-qualification")
+            .unwrap();
+        match mutation {
+            "missing" => {
+                steps.remove(index);
+            }
+            "late" => steps.swap(index, index + 1),
+            "early" => steps.swap(index, index - 1),
+            "condition" => steps[index]["if"] = "always()".into(),
+            "ignore" => steps[index]["continue-on-error"] = true.into(),
+            _ => unreachable!(),
+        }
+        assert!(validate_and_project(&mut document).is_err(), "{mutation}");
+    }
+}
+
+#[test]
 fn release_fuzz_cache_cannot_escape_context_order_or_identity() {
     for mutation in [
         "old-key",

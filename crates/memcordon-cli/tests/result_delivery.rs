@@ -3,6 +3,79 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/delivery_evidence.rs"]
+mod delivery_evidence;
+
+#[test]
+fn inherited_evidence_endpoint_is_owned_and_parent_remains_cloexec() {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args([
+        "--exact",
+        "isolated_evidence_endpoint_ownership",
+        "--ignored",
+        "--test-threads=1",
+    ]);
+    let output = memcordon_testkit::run_with_deadline(&mut command, Duration::from_secs(5))
+        .expect("isolated ownership fixture must finish within the existing fixture bound");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("test isolated_evidence_endpoint_ownership ... ok"),
+        "ownership assertions must execute: {output:?}"
+    );
+}
+
+#[test]
+#[ignore = "invoked by inherited_evidence_endpoint_is_owned_and_parent_remains_cloexec"]
+fn isolated_evidence_endpoint_ownership() {
+    // Create endpoints after exec in a process running only this fixture.
+    // Parallel sibling forks can otherwise retain CLOEXEC endpoints until exec,
+    // making immediate EOF an observation of unrelated child preparation.
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    let (mut reader, writer) = UnixStream::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    let mut command = Command::new("/usr/bin/true");
+    let descriptor =
+        memcordon_platform::test_support::inherit_test_descriptor(&mut command, writer.into())
+            .unwrap();
+    // SAFETY: the command owns the live endpoint until it is dropped below.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+    let mut byte = [0_u8];
+    assert_eq!(
+        reader.read(&mut byte).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(command);
+    assert_eq!(reader.read(&mut byte).unwrap(), 0);
+}
+
+#[test]
+fn failed_report_sink_has_separate_evidence_and_full_evidence_pipe_never_blocks() {
+    let directory = tempfile::tempdir().unwrap();
+    for full in [false, true] {
+        let output = directory.path().join("absent-parent/report.json");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+        let mut evidence = delivery_evidence::Evidence::attach(&mut command);
+        if full {
+            evidence.fill();
+        }
+        command
+            .args(["+0ms", "--report"])
+            .arg(&output)
+            .args(["--", "/usr/bin/true"]);
+        assert_eq!(bounded(command).code(), Some(125));
+        assert!(!output.exists());
+        let text = evidence.finish();
+        if !full {
+            let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(record["stage"], "writer_exit");
+            assert_eq!(record["writer_exit_code"], 125);
+        }
+    }
+}
+
 fn bounded(mut command: Command) -> std::process::ExitStatus {
     let started = Instant::now();
     let (sender, receiver) = std::sync::mpsc::sync_channel(0);
@@ -60,6 +133,7 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
         let output = phase_directory.join("output.json");
         let marker = phase_directory.join("barrier.json");
         let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+        let evidence = delivery_evidence::Evidence::attach(&mut command);
         command
             .args(["__result-writer-fault", phase])
             .arg(&input)
@@ -67,6 +141,18 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
             .arg(&marker);
         let started = Instant::now();
         assert_eq!(bounded(command).code(), Some(125), "{phase}");
+        let evidence: serde_json::Value = serde_json::from_str(&evidence.finish()).unwrap();
+        assert_eq!(evidence["schema"], 1);
+        assert_eq!(evidence["stage"], "writer_deadline");
+        let phases = evidence["writer"]["phases"].as_array().unwrap();
+        assert_eq!(phases.first().unwrap(), "entered");
+        assert_eq!(
+            phases.last().unwrap().as_str(),
+            Some(phase.replace('-', "_").as_str())
+        );
+        assert_eq!(evidence["writer"]["malformed"], false);
+        assert_eq!(evidence["writer"]["truncated"], false);
+        assert!(evidence["writer"]["os_error"].is_null());
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "{phase} exceeded delivery reserve and tolerance"

@@ -738,16 +738,7 @@ pub struct OuterTestBoundary {
 #[cfg(unix)]
 impl OuterTestBoundary {
     pub fn configure(command: &mut Command) -> io::Result<()> {
-        // SAFETY: the callback invokes only the async-signal-safe setsid operation.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            });
-        }
+        configure_child_setup(command, ChildSetup::Session);
         Ok(())
     }
 
@@ -759,6 +750,61 @@ impl OuterTestBoundary {
 
     pub fn terminate(&self) -> io::Result<()> {
         terminate_unix_session(self.session, || Ok(()))
+    }
+}
+
+#[cfg(unix)]
+enum ChildSetup {
+    Session,
+    InheritDescriptor(std::os::fd::OwnedFd),
+}
+
+/// Retain an owned CLOEXEC endpoint and inherit it only in this command's child.
+/// This does not create a session; it composes with `OuterTestBoundary::configure`.
+#[cfg(unix)]
+pub fn inherit_test_descriptor(
+    command: &mut Command,
+    descriptor: std::os::fd::OwnedFd,
+) -> io::Result<std::os::fd::RawFd> {
+    use std::os::fd::AsRawFd;
+    let raw = descriptor.as_raw_fd();
+    // SAFETY: the descriptor remains owned and live throughout this inspection.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if raw < 3 || flags & libc::FD_CLOEXEC == 0 {
+        return Err(io::Error::other(
+            "test endpoint must be nonstandard and CLOEXEC",
+        ));
+    }
+    configure_child_setup(command, ChildSetup::InheritDescriptor(descriptor));
+    Ok(raw)
+}
+
+#[cfg(unix)]
+fn configure_child_setup(command: &mut Command, setup: ChildSetup) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the callback performs only async-signal-safe setsid/fcntl calls.
+    // The captured OwnedFd retains endpoint ownership for the Command lifetime.
+    unsafe {
+        command.pre_exec(move || {
+            match &setup {
+                ChildSetup::Session => {
+                    if libc::setsid() == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                ChildSetup::InheritDescriptor(descriptor) => {
+                    let raw = descriptor.as_raw_fd();
+                    let flags = libc::fcntl(raw, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+            }
+            Ok(())
+        });
     }
 }
 
