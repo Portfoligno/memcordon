@@ -26,7 +26,10 @@ pub fn buffered_child_status_does_not_delay_inventory() {
     let mut guardian = Channel::new(right, 13).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     assert_eq!(frontend.poll_child_status(false).unwrap(), None);
-    guardian.expect(Message::Observe, deadline).unwrap();
+    assert!(matches!(
+        guardian.receive(deadline).unwrap(),
+        Some(Message::Observe { .. })
+    ));
     frontend.inventory_query = Some(1);
 
     // Model one socket read that has already buffered a delayed status reply
@@ -98,7 +101,10 @@ pub fn delayed_child_status_retains_observation_and_reaping() {
     let mut guardian = Channel::new(right, 7).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     assert_eq!(frontend.poll_child_status(false).unwrap(), None);
-    guardian.expect(Message::Observe, deadline).unwrap();
+    assert!(matches!(
+        guardian.receive(deadline).unwrap(),
+        Some(Message::Observe { .. })
+    ));
     assert_eq!(frontend.poll_child_status(false).unwrap(), None);
     assert_eq!(guardian.receive_available().unwrap(), None);
 
@@ -117,7 +123,10 @@ pub fn delayed_child_status_retains_observation_and_reaping() {
         .unwrap();
     assert_eq!(frontend.poll_child_status(false).unwrap(), Some(status));
     assert_eq!(frontend.poll_child_status(true).unwrap(), None);
-    guardian.expect(Message::Reap, deadline).unwrap();
+    assert!(matches!(
+        guardian.receive(deadline).unwrap(),
+        Some(Message::Reap { .. })
+    ));
     guardian
         .send(
             Message::Status {
@@ -130,7 +139,10 @@ pub fn delayed_child_status_retains_observation_and_reaping() {
     assert_eq!(frontend.poll_child_status(true).unwrap(), None);
     assert_eq!(frontend.poll_child_status(false).unwrap(), Some(status));
     assert_eq!(frontend.poll_child_status(true).unwrap(), None);
-    guardian.expect(Message::Reap, deadline).unwrap();
+    assert!(matches!(
+        guardian.receive(deadline).unwrap(),
+        Some(Message::Reap { .. })
+    ));
     guardian
         .send(
             Message::Status {
@@ -151,7 +163,10 @@ pub fn delayed_child_status_cannot_be_confused_with_inventory() {
     let mut guardian = Channel::new(right, 11).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     assert_eq!(frontend.poll_child_status(false).unwrap(), None);
-    guardian.expect(Message::Observe, deadline).unwrap();
+    assert!(matches!(
+        guardian.receive(deadline).unwrap(),
+        Some(Message::Observe { .. })
+    ));
     frontend
         .send(
             Message::InventoryQuery {
@@ -193,7 +208,10 @@ pub fn delayed_child_status_cannot_be_confused_with_inventory() {
     assert_eq!(frontend.force_receipt.load(Ordering::Acquire), 42);
     assert_eq!(frontend.poll_child_status(false).unwrap(), Some(0));
     assert_eq!(frontend.poll_child_status(true).unwrap(), None);
-    guardian.expect(Message::Reap, deadline).unwrap();
+    assert!(matches!(
+        guardian.receive(deadline).unwrap(),
+        Some(Message::Reap { .. })
+    ));
     drop(guardian);
     assert!(frontend.poll_child_status(true).is_err());
 }

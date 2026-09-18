@@ -76,7 +76,11 @@ pub use crate::macos_launch::clock_jump as macos_clock_jump;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::control_flood as macos_control_flood;
 #[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_reaped_status as macos_delayed_reaped_status;
+#[cfg(target_os = "macos")]
 pub use crate::macos_launch::delayed_released_receipt as macos_delayed_released_receipt;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_retired_receipt as macos_delayed_retired_receipt;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::expired_control_request_preserves_retirement as macos_expired_control_request_preserves_retirement;
 #[cfg(target_os = "macos")]

@@ -161,7 +161,14 @@ fn immediate_success_failure_and_status_are_reaped_and_preserved() {
             .arg("--report")
             .arg(&report_path)
             .args(target.get_args());
-        let result = run_with_deadline(&mut command, Duration::from_secs(2));
+        let timeout = if cfg!(target_os = "macos") {
+            // Native retirement and result delivery retain a bounded four-second
+            // window after the terminal status is observed.
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(2)
+        };
+        let result = run_with_deadline(&mut command, timeout);
         let report = fs::read_to_string(&report_path);
         let output = result
             .unwrap_or_else(|error| panic!("iteration {iteration}: {error}; report={report:?}"));

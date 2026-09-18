@@ -100,6 +100,9 @@ impl Child {
         self.pid as u32
     }
     pub(crate) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.try_wait_until(Instant::now() + Duration::from_millis(100))
+    }
+    fn try_wait_until(&mut self, deadline: Instant) -> io::Result<Option<ExitStatus>> {
         if self.status.is_some() {
             return Ok(self.status);
         }
@@ -107,7 +110,9 @@ impl Child {
             let mut channel = remote
                 .lock()
                 .map_err(|_| io::Error::other("guardian channel poisoned"))?;
-            self.status = channel.poll_child_status(true)?.map(ExitStatus::from_raw);
+            self.status = channel
+                .poll_child_status_until(true, deadline)?
+                .map(ExitStatus::from_raw);
             return Ok(self.status);
         }
         let mut status = 0;
@@ -184,7 +189,7 @@ impl Child {
     }
     pub(crate) fn retire(&mut self, deadline: Instant) -> io::Result<()> {
         loop {
-            if self.try_wait()?.is_some() {
+            if self.try_wait_until(deadline)?.is_some() {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -220,7 +225,9 @@ enum Message {
         group: i32,
     },
     Release,
-    Disarm,
+    Disarm {
+        retirement: u64,
+    },
     Retired,
     Failure {
         errno: i32,
@@ -250,6 +257,10 @@ enum Message {
     DisableWorkTimer,
     #[cfg(feature = "test-support")]
     DelayReleasedReceipt,
+    #[cfg(feature = "test-support")]
+    DelayRetiredReceipt,
+    #[cfg(feature = "test-support")]
+    DelayReapedStatus,
     Configure {
         image: Vec<u8>,
         boot_identity: String,
@@ -267,8 +278,12 @@ enum Message {
     ForceRequested {
         at: u64,
     },
-    Observe,
-    Reap,
+    Observe {
+        response: u64,
+    },
+    Reap {
+        retirement: u64,
+    },
     Stop,
     Heartbeat,
     StopAt {
@@ -486,6 +501,13 @@ impl Channel {
     /// Poll one response frame without making scheduling latency a child failure.
     /// A pending request stays owned across inventory and retirement operations.
     fn poll_child_status(&mut self, reap: bool) -> io::Result<Option<i32>> {
+        self.poll_child_status_until(reap, Instant::now() + Duration::from_millis(100))
+    }
+    fn poll_child_status_until(
+        &mut self,
+        reap: bool,
+        deadline: Instant,
+    ) -> io::Result<Option<i32>> {
         let cached = if reap {
             self.reaped_status
         } else {
@@ -495,13 +517,16 @@ impl Channel {
             return Ok(cached);
         }
         if !self.child_status_pending {
+            let response = continuous_deadline(deadline)?;
             self.send(
                 if reap {
-                    Message::Reap
+                    Message::Reap {
+                        retirement: response,
+                    }
                 } else {
-                    Message::Observe
+                    Message::Observe { response }
                 },
-                Instant::now() + Duration::from_millis(100),
+                deadline,
             )?;
             self.child_status_pending = true;
         }
@@ -836,7 +861,7 @@ impl Message {
             Self::Bind { .. } => "Bind",
             Self::Armed { .. } => "Armed",
             Self::Release => "Release",
-            Self::Disarm => "Disarm",
+            Self::Disarm { .. } => "Disarm",
             Self::Retired => "Retired",
             Self::Failure { .. } => "Failure",
             Self::FailureDetail { .. } => "FailureDetail",
@@ -845,8 +870,8 @@ impl Message {
             Self::Released => "Released",
             Self::ReleaseIssued { .. } => "ReleaseIssued",
             Self::ForceRequested { .. } => "ForceRequested",
-            Self::Observe => "Observe",
-            Self::Reap => "Reap",
+            Self::Observe { .. } => "Observe",
+            Self::Reap { .. } => "Reap",
             Self::Stop => "Stop",
             Self::Heartbeat => "Heartbeat",
             Self::StopAt { .. } => "StopAt",
@@ -873,6 +898,10 @@ impl Message {
             Self::DisableWorkTimer => "DisableWorkTimer",
             #[cfg(feature = "test-support")]
             Self::DelayReleasedReceipt => "DelayReleasedReceipt",
+            #[cfg(feature = "test-support")]
+            Self::DelayRetiredReceipt => "DelayRetiredReceipt",
+            #[cfg(feature = "test-support")]
+            Self::DelayReapedStatus => "DelayReapedStatus",
             #[cfg(feature = "test-support")]
             Self::StallInspectors { .. } => "StallInspectors",
             #[cfg(feature = "test-support")]
@@ -1210,6 +1239,25 @@ fn check(code: i32) -> io::Result<()> {
     }
 }
 
+fn continuous_deadline(deadline: Instant) -> io::Result<u64> {
+    let origin = crate::macos_deadline::continuous_nanos()?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    origin
+        .checked_add(
+            u64::try_from(remaining.as_nanos())
+                .map_err(|_| io::Error::other("private protocol deadline range"))?,
+        )
+        .ok_or_else(|| io::Error::other("private protocol deadline overflow"))
+}
+
+fn instant_deadline(deadline: u64) -> io::Result<Instant> {
+    let origin = Instant::now();
+    let now = crate::macos_deadline::continuous_nanos()?;
+    origin
+        .checked_add(Duration::from_nanos(deadline.saturating_sub(now)))
+        .ok_or_else(|| io::Error::other("private protocol deadline range"))
+}
+
 pub(crate) struct Guardian {
     channel: Option<Arc<Mutex<Channel>>>,
     child: Child,
@@ -1339,7 +1387,8 @@ impl Guardian {
         let mut channel = shared
             .lock()
             .map_err(|_| io::Error::other("guardian channel poisoned"))?;
-        channel.send(Message::Disarm, deadline)?;
+        let retirement = continuous_deadline(deadline)?;
+        channel.send(Message::Disarm { retirement }, deadline)?;
         channel.expect(Message::Retired, deadline)?;
         drop(channel);
         self.child.retire(deadline)
@@ -1383,6 +1432,10 @@ pub enum LaunchFault {
     NativeSpawnHeldReleaseAfterCancel,
     #[cfg(feature = "test-support")]
     DelayReleasedReceipt,
+    #[cfg(feature = "test-support")]
+    DelayRetiredReceipt,
+    #[cfg(feature = "test-support")]
+    DelayReapedStatus,
 }
 
 pub(crate) fn launch(
@@ -1597,6 +1650,14 @@ fn launch_configured(
         #[cfg(feature = "test-support")]
         if fault == Some(LaunchFault::DelayReleasedReceipt) {
             control.send(Message::DelayReleasedReceipt, deadline)?;
+        }
+        #[cfg(feature = "test-support")]
+        if fault == Some(LaunchFault::DelayRetiredReceipt) {
+            control.send(Message::DelayRetiredReceipt, deadline)?;
+        }
+        #[cfg(feature = "test-support")]
+        if fault == Some(LaunchFault::DelayReapedStatus) {
+            control.send(Message::DelayReapedStatus, deadline)?;
         }
         // A failed partial Configure may still reach the guardian. Preserve its
         // custody from before the first write, rather than killing it on error.
@@ -2481,11 +2542,16 @@ fn guardian_main(
     #[cfg(feature = "test-support")]
     let delay_released_receipt = configuration == Some(Message::DelayReleasedReceipt);
     #[cfg(feature = "test-support")]
-    let configuration = if hold_spawn || delay_released_receipt {
-        control.receive(initial)?
-    } else {
-        configuration
-    };
+    let delay_retired_receipt = configuration == Some(Message::DelayRetiredReceipt);
+    #[cfg(feature = "test-support")]
+    let mut delay_reaped_status = configuration == Some(Message::DelayReapedStatus);
+    #[cfg(feature = "test-support")]
+    let configuration =
+        if hold_spawn || delay_released_receipt || delay_retired_receipt || delay_reaped_status {
+            control.receive(initial)?
+        } else {
+            configuration
+        };
     let (startup, work, grace, image, boot_identity) = match configuration {
         Some(Message::Configure {
             image,
@@ -2746,14 +2812,14 @@ fn guardian_main(
                             Message::Prepared {
                                 pid: target.as_ref().expect("launcher owned").pid,
                             },
-                            Instant::now() + Duration::from_millis(20),
+                            inspector_deadline,
                         )?;
                     }
                     Ok(Some(None)) if released && !confirmed => {
                         let confirmation = witness
                             .as_ref()
                             .expect("exec witness reserved")
-                            .confirm(Instant::now() + Duration::from_millis(20));
+                            .confirm(inspector_deadline);
                         if let Err(error) = confirmation {
                             terminal.get_or_insert(now);
                             force_at.get_or_insert(now);
@@ -2916,6 +2982,7 @@ fn guardian_main(
                 match control.receive_available() {
                     Ok(Some(Some(message))) => {
                         last_control = now;
+                        #[cfg(feature = "test-support")]
                         let response_deadline = Instant::now() + Duration::from_millis(20);
                         match message {
                             #[cfg(feature = "test-support")]
@@ -3009,12 +3076,12 @@ fn guardian_main(
                                 launcher
                                     .as_mut()
                                     .expect("gated launcher")
-                                    .send(Message::Release, response_deadline)?;
+                                    .send(Message::Release, inspector_deadline)?;
                                 released = true;
                                 control
-                                    .send(Message::ReleaseIssued { at: now }, response_deadline)?;
+                                    .send(Message::ReleaseIssued { at: now }, inspector_deadline)?;
                             }
-                            Message::Observe => {
+                            Message::Observe { response } => {
                                 let child = target
                                     .as_ref()
                                     .ok_or_else(|| io::Error::other("target not prepared"))?;
@@ -3023,10 +3090,10 @@ fn guardian_main(
                                         raw: child.observe()?.map(ExitStatus::into_raw),
                                         reaped: child.status.is_some(),
                                     },
-                                    response_deadline,
+                                    instant_deadline(response)?,
                                 )?;
                             }
-                            Message::Reap => {
+                            Message::Reap { retirement } => {
                                 let child = target
                                     .as_mut()
                                     .ok_or_else(|| io::Error::other("target not prepared"))?;
@@ -3035,26 +3102,51 @@ fn guardian_main(
                                 } else {
                                     None
                                 };
-                                control.send(
+                                let fully_retired = empty
+                                    && inspection.is_none()
+                                    && status.is_some()
+                                    && child.status.is_some();
+                                #[cfg(feature = "test-support")]
+                                if delay_reaped_status {
+                                    control.delay_send_after_deadline = true;
+                                    delay_reaped_status = false;
+                                }
+                                if let Err(error) = control.send(
                                     Message::Status {
                                         raw: status.map(ExitStatus::into_raw),
                                         reaped: child.status.is_some(),
                                     },
-                                    response_deadline,
-                                )?;
+                                    instant_deadline(retirement)?,
+                                ) {
+                                    if fully_retired {
+                                        return Ok(0);
+                                    }
+                                    return Err(error);
+                                }
                             }
                             Message::Stop => {
                                 terminal.get_or_insert(now);
                                 force_at.get_or_insert(now);
                             }
-                            Message::Disarm
+                            Message::Disarm { retirement }
                                 if empty
                                     && target
                                         .as_ref()
                                         .is_some_and(|child| child.status.is_some())
                                     && inspection.is_none() =>
                             {
-                                control.send(Message::Retired, response_deadline)?;
+                                let receipt_deadline = instant_deadline(retirement)?;
+                                #[cfg(feature = "test-support")]
+                                if delay_retired_receipt {
+                                    control.delay_send_after_deadline = true;
+                                }
+                                // Retired is the mandatory completion receipt for the
+                                // caller's cleanup transaction. Preserve its immutable
+                                // deadline instead of replacing it with a 20 ms slice.
+                                // If the caller already expired or vanished, it observes
+                                // failure itself. This fully retired guardian has no live
+                                // workload or native helper obligation left to retain.
+                                let _ = control.send(Message::Retired, receipt_deadline);
                                 return Ok(0);
                             }
                             #[cfg(feature = "test-support")]
@@ -3343,6 +3435,50 @@ pub fn delayed_released_receipt(image: &Path) -> Result<(), String> {
         deadline,
         deadline + Duration::from_secs(1),
         Some(LaunchFault::DelayReleasedReceipt),
+    )
+    .map_err(|error| error.error.to_string())?;
+    launch
+        .child
+        .retire(Instant::now() + Duration::from_secs(1))
+        .map_err(|error| error.to_string())?;
+    launch
+        .guardian
+        .disarm(Instant::now() + Duration::from_secs(1))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "test-support")]
+pub fn delayed_retired_receipt(image: &Path) -> Result<(), String> {
+    let command = CommandSpec::new(image.as_os_str()).args(["__execution-probe"]);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut launch = launch_inner(
+        &command,
+        image,
+        deadline,
+        deadline + Duration::from_secs(1),
+        Some(LaunchFault::DelayRetiredReceipt),
+    )
+    .map_err(|error| error.error.to_string())?;
+    launch
+        .child
+        .retire(Instant::now() + Duration::from_secs(1))
+        .map_err(|error| error.to_string())?;
+    launch
+        .guardian
+        .disarm(Instant::now() + Duration::from_secs(1))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "test-support")]
+pub fn delayed_reaped_status(image: &Path) -> Result<(), String> {
+    let command = CommandSpec::new(image.as_os_str()).args(["__execution-probe"]);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut launch = launch_inner(
+        &command,
+        image,
+        deadline,
+        deadline + Duration::from_secs(1),
+        Some(LaunchFault::DelayReapedStatus),
     )
     .map_err(|error| error.error.to_string())?;
     launch

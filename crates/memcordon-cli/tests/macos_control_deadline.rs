@@ -11,6 +11,22 @@ fn confirmed_exec_receipt_retains_the_startup_deadline() {
 }
 
 #[test]
+fn retired_receipt_retains_the_cleanup_deadline() {
+    memcordon_platform::test_support::macos_delayed_retired_receipt(Path::new(env!(
+        "CARGO_BIN_EXE_memcordon"
+    )))
+    .unwrap();
+}
+
+#[test]
+fn reaped_status_retains_the_cleanup_deadline() {
+    memcordon_platform::test_support::macos_delayed_reaped_status(Path::new(env!(
+        "CARGO_BIN_EXE_memcordon"
+    )))
+    .unwrap();
+}
+
+#[test]
 fn complete_exec_receipt_survives_post_write_deadline() {
     memcordon_platform::test_support::complete_exec_receipt_survives_post_write_deadline();
 }
