@@ -894,8 +894,21 @@ pub fn write_report_atomic_with_test_barrier(
     barrier: ReportWritePhase,
     marker: &Path,
 ) -> Result<(), Error> {
+    write_report_atomic_with_test_observer(path, report, Some((barrier, marker)), |_| {})
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[allow(clippy::result_large_err)]
+pub fn write_report_atomic_with_test_observer(
+    path: &Path,
+    report: &MemcordonReport,
+    barrier: Option<(ReportWritePhase, &Path)>,
+    mut observer: impl FnMut(ReportWritePhase),
+) -> Result<(), Error> {
     write_report_atomic_observed(path, report, |phase| {
-        if phase == barrier {
+        observer(phase);
+        if let Some((_, marker)) = barrier.filter(|(barrier, _)| *barrier == phase) {
             let mut bytes =
                 serde_json::to_vec(&(std::process::id(), phase)).expect("bounded barrier marker");
             bytes.push(b'\n');

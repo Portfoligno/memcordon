@@ -25,13 +25,92 @@ pub fn open_sequential(path: &Path) -> io::Result<File> {
 
 /// Rendezvous points in the native file validation protocol. Callbacks are
 /// synchronous observations; they do not replace any filesystem validation.
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeFilePhase {
     BeforeOpen,
     Prechecked,
     ReadComplete,
     BeforeReopen,
+}
+
+/// Validate a regular Unix file around an EOF read. Device/inode bind
+/// the descriptor and path; content and permission stamps reject concurrent
+/// changes. Access time is excluded because this read can update it itself.
+#[cfg(unix)]
+pub fn digest_unix_file(
+    path: &Path,
+    expected: &std::fs::Metadata,
+    buffer: &mut [u8],
+    progress: &InventoryProgress,
+    mut observe: impl FnMut(NativeFilePhase) -> crate::Result<()>,
+) -> crate::Result<crate::inventory_pipeline::ValidatedDigest> {
+    use crate::inventory_progress::Operation;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // Do not follow a substituted link or wait for a substituted FIFO's writer.
+    // The metadata checks below still require the enumerated regular file.
+    let open = || {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+    };
+    let stamp = |metadata: &std::fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode(),
+            metadata.nlink(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.size(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    let cancellation = progress.cancellation();
+    cancellation.check()?;
+    observe(NativeFilePhase::BeforeOpen)?;
+    cancellation.check()?;
+    let mut file = progress.run(Operation::Open, path, open)?;
+    cancellation.check()?;
+    let before = progress.run(Operation::Precheck, path, || file.metadata())?;
+    if !expected.is_file() || stamp(expected) != stamp(&before) {
+        return Err(crate::CiError::Message(format!(
+            "native input changed before read: {path:?}"
+        )));
+    }
+    observe(NativeFilePhase::Prechecked)?;
+    cancellation.check()?;
+    // Unix virtual regular files can report length zero while exposing bytes.
+    // Preserve EOF reads instead of treating st_size as authoritative content.
+    let (digest, bytes) = progress.run(Operation::ReadHash, path, || {
+        digest_reader_with_length(&mut file, buffer, progress, None)
+    })?;
+    observe(NativeFilePhase::ReadComplete)?;
+    cancellation.check()?;
+    let after = progress.run(Operation::PostMetadata, path, || file.metadata())?;
+    observe(NativeFilePhase::BeforeReopen)?;
+    cancellation.check()?;
+    let current = progress.run(Operation::Reopen, path, open)?;
+    cancellation.check()?;
+    let path_metadata = progress.run(Operation::PathMetadata, path, || {
+        std::fs::symlink_metadata(path)
+    })?;
+    let current_metadata = progress.run(Operation::PathIdentity, path, || current.metadata())?;
+    if stamp(expected) != stamp(&after)
+        || stamp(expected) != stamp(&path_metadata)
+        || stamp(expected) != stamp(&current_metadata)
+    {
+        return Err(crate::CiError::Message(format!(
+            "native input changed during read: {path:?}"
+        )));
+    }
+    cancellation.check()?;
+    progress.file_validated(bytes);
+    Ok(crate::inventory_pipeline::ValidatedDigest { digest, bytes })
 }
 
 /// Read and validate the original enumerated file, including the current path's
@@ -109,7 +188,7 @@ pub fn digest_reader(
     buffer: &mut [u8],
     progress: &InventoryProgress,
 ) -> io::Result<String> {
-    digest_reader_with_length(reader, buffer, progress, None)
+    digest_reader_with_length(reader, buffer, progress, None).map(|(digest, _)| digest)
 }
 
 /// Hash exactly a verified file length without a redundant EOF read. Callers
@@ -121,7 +200,7 @@ pub fn digest_reader_exact(
     progress: &InventoryProgress,
     length: u64,
 ) -> io::Result<String> {
-    digest_reader_with_length(reader, buffer, progress, Some(length))
+    digest_reader_with_length(reader, buffer, progress, Some(length)).map(|(digest, _)| digest)
 }
 
 fn digest_reader_with_length(
@@ -129,12 +208,13 @@ fn digest_reader_with_length(
     buffer: &mut [u8],
     progress: &InventoryProgress,
     mut remaining: Option<u64>,
-) -> io::Result<String> {
+) -> io::Result<(String, u64)> {
     assert!(
         !buffer.is_empty(),
         "inventory read buffer must not be empty"
     );
     let mut digest = Sha256::new();
+    let mut bytes = 0_u64;
     let cancellation = progress.cancellation();
     loop {
         cancellation.check()?;
@@ -157,6 +237,9 @@ fn digest_reader_with_length(
         let hash_started = Instant::now();
         digest.update(&buffer[..count]);
         progress.record_chunk(read_elapsed, hash_started.elapsed(), count as u64);
+        bytes = bytes
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::other("native input byte count overflow"))?;
         if count == 0 {
             if remaining.is_some() {
                 return Err(io::Error::new(
@@ -171,5 +254,5 @@ fn digest_reader_with_length(
         }
     }
     cancellation.check()?;
-    Ok(hex::encode(digest.finalize()))
+    Ok((hex::encode(digest.finalize()), bytes))
 }

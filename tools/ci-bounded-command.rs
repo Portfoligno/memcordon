@@ -6,6 +6,8 @@ use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[path = "ci-content-sha256.rs"]
 pub mod sha256;
+#[path = "ci-process-usage.rs"]
+pub mod usage;
 #[cfg(windows)]
 #[path = "ci-bootstrap-windows.rs"]
 mod windows;
@@ -19,6 +21,9 @@ pub trait Clock {
 pub trait Process {
     fn status(&mut self) -> io::Result<Option<ExitStatus>>;
     fn terminate(&mut self) -> io::Result<()>;
+    fn usage(&mut self) -> Option<usage::Counters> {
+        None
+    }
 }
 struct WallClock(Instant);
 impl Clock for WallClock {
@@ -62,8 +67,12 @@ impl Completion {
             Ok(())
         } else {
             Err(io::Error::other(format!(
-                "managed bootstrap {:?}; termination_observed={} kill_error={:?}",
-                self.outcome, self.termination_observed, self.kill_error
+                "managed bootstrap {:?}; exit_code={:?} elapsed_ms={} termination_observed={} kill_error={:?}",
+                self.outcome,
+                self.exit_code,
+                self.elapsed.as_millis(),
+                self.termination_observed,
+                self.kill_error
             )))
         }
     }
@@ -73,6 +82,25 @@ pub fn supervise(
     clock: &mut impl Clock,
     budget: Duration,
     termination_budget: Duration,
+) -> Completion {
+    supervise_with_usage(process, clock, budget, termination_budget).0
+}
+pub fn supervise_with_usage(
+    process: &mut impl Process,
+    clock: &mut impl Clock,
+    budget: Duration,
+    termination_budget: Duration,
+) -> (Completion, usage::History) {
+    let mut history = usage::History::default();
+    let completion = supervise_inner(process, clock, budget, termination_budget, &mut history);
+    (completion, history)
+}
+fn supervise_inner(
+    process: &mut impl Process,
+    clock: &mut impl Clock,
+    budget: Duration,
+    termination_budget: Duration,
+    history: &mut usage::History,
 ) -> Completion {
     let failure = loop {
         if clock.elapsed() >= budget {
@@ -95,7 +123,17 @@ pub fn supervise(
                     termination_observed: true,
                 };
             }
-            Ok(None) => clock.tick(),
+            Ok(None) => {
+                let elapsed = clock.elapsed();
+                if elapsed < budget && history.due(elapsed) {
+                    let counters = process.usage();
+                    history.observe(elapsed, clock.elapsed(), counters);
+                }
+                if clock.elapsed() >= budget {
+                    break Outcome::Deadline;
+                }
+                clock.tick();
+            }
             Err(_) => break Outcome::PollFailure,
         }
     };
@@ -207,8 +245,26 @@ impl Journal {
         );
         self.write("phase-end.json", record.as_bytes())
     }
+    pub fn process_usage(&self, label: &str, history: &usage::History) -> io::Result<()> {
+        let record = format!(
+            "{{\"schema\":1,\"sequence\":{},\"phase\":{},\"process_usage\":{}}}\n",
+            self.sequence,
+            json_string(label),
+            history.json()
+        );
+        self.write("phase-process-usage.json", record.as_bytes())
+    }
+    fn process_usage_error(&self, label: &str, error: &io::Error) -> io::Result<()> {
+        let record = format!(
+            "{{\"schema\":1,\"sequence\":{},\"phase\":{},\"process_usage_error\":{}}}\n",
+            self.sequence,
+            json_string(label),
+            json_string(&error.to_string())
+        );
+        self.write("phase-process-usage-error.json", record.as_bytes())
+    }
 }
-fn json_string(value: &str) -> String {
+pub(crate) fn json_string(value: &str) -> String {
     let mut output = String::from("\"");
     for c in value.chars().take(4096) {
         match c {
@@ -228,8 +284,10 @@ pub fn run(command: &mut Command, label: &str, journal: &mut Journal) -> io::Res
     let spawned = windows::spawn(command);
     #[cfg(not(windows))]
     let spawned = command.spawn();
-    let completion = match spawned {
-        Ok(mut child) => supervise(&mut child, &mut clock, CHILD_BUDGET, TERMINATION_BUDGET),
+    let (completion, history) = match spawned {
+        Ok(mut child) => {
+            supervise_with_usage(&mut child, &mut clock, CHILD_BUDGET, TERMINATION_BUDGET)
+        }
         Err(error) => {
             let completion = Completion {
                 outcome: Outcome::SpawnFailure,
@@ -244,10 +302,188 @@ pub fn run(command: &mut Command, label: &str, journal: &mut Journal) -> io::Res
                 .expect_err("spawn failure cannot be admitted"));
         }
     };
+    // Preserve the authoritative outcome before attempting optional diagnostics.
     let journal_result = journal.complete(label, &completion);
+    if let Err(error) = journal.process_usage(label, &history) {
+        // Missing optional evidence is unavailable, never a zero measurement.
+        // Failure of both diagnostic destinations must not rewrite the outcome
+        // or introduce a blocking stderr fallback.
+        let _ = journal.process_usage_error(label, &error);
+    }
     completion.result()?;
     journal_result?;
     Ok(completion)
+}
+/// Execute an auxiliary diagnostic command without changing the managed phase
+/// journal. It uses the same process containment and finite termination policy.
+pub fn auxiliary(command: &mut Command, budget: Duration) -> io::Result<Completion> {
+    let mut clock = WallClock(Instant::now());
+    #[cfg(windows)]
+    let mut child = windows::spawn(command)?;
+    #[cfg(not(windows))]
+    let mut child = command.spawn()?;
+    Ok(supervise(
+        &mut child,
+        &mut clock,
+        budget,
+        TERMINATION_BUDGET,
+    ))
+}
+
+#[derive(Debug)]
+pub struct CapturedStream {
+    pub prefix: Vec<u8>,
+    pub bytes: u64,
+    pub truncated: bool,
+    pub error: Option<io::Error>,
+}
+
+/// Retain a bounded prefix while draining excess so observation does not cause
+/// the producer to fail with a full/closed pipe. The caller owns the lifetime
+/// boundary for a reader that never returns.
+pub fn drain_prefix(mut reader: impl io::Read, limit: usize) -> CapturedStream {
+    let mut result = CapturedStream {
+        prefix: Vec::new(),
+        bytes: 0,
+        truncated: false,
+        error: None,
+    };
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes) => {
+                result.bytes = result.bytes.saturating_add(bytes as u64);
+                let retained = bytes.min(limit.saturating_sub(result.prefix.len()));
+                result.prefix.extend_from_slice(&buffer[..retained]);
+                result.truncated |= retained != bytes;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                result.error = Some(error);
+                break;
+            }
+        }
+    }
+    result
+}
+
+pub struct CapturedCompletion {
+    pub completion: Completion,
+    pub stdout: CapturedStream,
+    pub stderr: CapturedStream,
+}
+
+/// Only called inside the separately contained recorder helper: its parent's
+/// deadline bounds synchronous reader joins even if OS termination is unknown.
+#[cfg(windows)]
+pub fn auxiliary_capture(
+    command: &mut Command,
+    budget: Duration,
+) -> io::Result<CapturedCompletion> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut clock = WallClock(Instant::now());
+    let mut child = windows::spawn(command)?;
+    let (stdout, stderr) = child.take_output();
+    Ok(std::thread::scope(|scope| {
+        let stdout = scope.spawn(|| drain_prefix(stdout, 65536));
+        let stderr = scope.spawn(|| drain_prefix(stderr, 65536));
+        let completion = supervise(&mut child, &mut clock, budget, TERMINATION_BUDGET);
+        CapturedCompletion {
+            completion,
+            stdout: stdout.join().expect("formatter stdout reader panicked"),
+            stderr: stderr.join().expect("formatter stderr reader panicked"),
+        }
+    }))
+}
+
+/// Stable diagnostic fields; unlike result(), this preserves the child code.
+pub fn completion_json(completion: &Completion) -> String {
+    format!(
+        "{{\"outcome\":{},\"elapsed_ms\":{},\"exit_code\":{},\"termination_observed\":{},\"kill_error\":{}}}",
+        json_string(&format!("{:?}", completion.outcome)),
+        completion.elapsed.as_millis(),
+        completion
+            .exit_code
+            .map_or("null".into(), |code| code.to_string()),
+        completion.termination_observed,
+        completion
+            .kill_error
+            .as_ref()
+            .map_or("null".into(), |error| json_string(error))
+    )
+}
+
+pub fn error_json(error: &io::Error) -> String {
+    format!(
+        "{{\"kind\":{},\"os_code\":{},\"message\":{}}}",
+        json_string(&format!("{:?}", error.kind())),
+        error
+            .raw_os_error()
+            .map_or("null".into(), |code| code.to_string()),
+        json_string(&error.to_string())
+    )
+}
+
+pub fn retain_capture(output: &Path, label: &str, capture: &CapturedCompletion) -> String {
+    let streams: Vec<_> = [("stdout", &capture.stdout), ("stderr", &capture.stderr)].into_iter().map(|(name, stream)| {
+        let path = output.join(format!("inventory-wpr-{label}-{name}.log"));
+        let retained = OpenOptions::new().create_new(true).write(true).open(&path).and_then(|mut file| file.write_all(&stream.prefix));
+        format!("{{\"stream\":{},\"bytes\":{},\"retained_bytes\":{},\"truncated\":{},\"read_error\":{},\"retention_error\":{}}}",
+            json_string(name), stream.bytes, stream.prefix.len(), stream.truncated,
+            stream.error.as_ref().map_or("null".into(), error_json),
+            retained.as_ref().err().map_or("null".into(), error_json))
+    }).collect();
+    format!(
+        "{{\"command\":{},\"completion\":{},\"streams\":[{}]}}",
+        json_string(label),
+        completion_json(&capture.completion),
+        streams.join(",")
+    )
+}
+#[cfg(windows)]
+pub struct AuxiliaryProcess {
+    child: windows::Contained,
+    settled: bool,
+}
+#[cfg(windows)]
+impl AuxiliaryProcess {
+    pub fn spawn(command: &mut Command) -> io::Result<Self> {
+        Ok(Self {
+            child: windows::spawn(command)?,
+            settled: false,
+        })
+    }
+    pub fn status(&mut self) -> io::Result<Option<ExitStatus>> {
+        let status = self.child.status()?;
+        self.settled = status.is_some();
+        Ok(status)
+    }
+    pub fn wait(&mut self, budget: Duration) -> Completion {
+        let completion = supervise(
+            &mut self.child,
+            &mut WallClock(Instant::now()),
+            budget,
+            TERMINATION_BUDGET,
+        );
+        self.settled = completion.termination_observed;
+        completion
+    }
+    pub fn terminate(&mut self) -> io::Result<()> {
+        if self.settled {
+            return Ok(());
+        }
+        let completion = self.wait(Duration::ZERO);
+        if completion.termination_observed && completion.kill_error.is_none() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "recorder cleanup unknown: {completion:?}"
+            )))
+        }
+    }
 }
 pub fn admission_path(output: &Path) -> PathBuf {
     output.with_extension("admission.json")

@@ -9,6 +9,17 @@ use std::process::{Child, Command, ExitStatus};
 type Handle = *mut c_void;
 #[repr(C)]
 #[derive(Default)]
+struct FileTime {
+    low: u32,
+    high: u32,
+}
+impl FileTime {
+    fn ticks(&self) -> u64 {
+        (u64::from(self.high) << 32) | u64::from(self.low)
+    }
+}
+#[repr(C)]
+#[derive(Default)]
 struct BasicLimits {
     process_time: i64,
     job_time: i64,
@@ -69,6 +80,14 @@ unsafe extern "system" {
     fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry) -> i32;
     fn OpenThread(access: u32, inherit: i32, id: u32) -> Handle;
     fn ResumeThread(thread: Handle) -> u32;
+    fn GetProcessTimes(
+        process: Handle,
+        creation: *mut FileTime,
+        exit: *mut FileTime,
+        kernel: *mut FileTime,
+        user: *mut FileTime,
+    ) -> i32;
+    fn GetProcessIoCounters(process: Handle, counters: *mut [u64; 6]) -> i32;
 }
 struct Owned(Handle);
 impl Drop for Owned {
@@ -82,7 +101,66 @@ pub struct Contained {
     child: Child,
     job: Owned,
 }
+impl Contained {
+    pub fn take_output(&mut self) -> (std::process::ChildStdout, std::process::ChildStderr) {
+        (
+            self.child.stdout.take().expect("configured stdout pipe"),
+            self.child.stderr.take().expect("configured stderr pipe"),
+        )
+    }
+}
 impl Process for Contained {
+    fn usage(&mut self) -> Option<super::usage::Counters> {
+        let mut creation = FileTime::default();
+        let mut exit = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        let handle = self.child.as_raw_handle();
+        let times = if unsafe {
+            GetProcessTimes(
+                handle,
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        } == 0
+        {
+            Err(io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+        } else {
+            Ok(super::usage::Times {
+                creation_100ns: creation.ticks(),
+                kernel_100ns: kernel.ticks(),
+                user_100ns: user.ticks(),
+            })
+        };
+        let mut counters = [0_u64; 6];
+        let io = if unsafe { GetProcessIoCounters(handle, &raw mut counters) } == 0 {
+            Err(io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+        } else {
+            let [
+                read_operations,
+                write_operations,
+                other_operations,
+                read_bytes,
+                write_bytes,
+                other_bytes,
+            ] = counters;
+            Ok(super::usage::Io {
+                read_operations,
+                write_operations,
+                other_operations,
+                read_bytes,
+                write_bytes,
+                other_bytes,
+            })
+        };
+        Some(super::usage::Counters {
+            pid: self.child.id(),
+            times,
+            io,
+        })
+    }
     fn status(&mut self) -> io::Result<Option<ExitStatus>> {
         let status = self.child.try_wait()?;
         if status.is_none() {

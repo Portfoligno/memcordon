@@ -496,8 +496,10 @@ jobs:
         include:
           - id: x64
             runner: windows-2025
+            inventory-trace: false
           - id: arm64
             runner: windows-11-arm
+            inventory-trace: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -514,8 +516,11 @@ jobs:
           key: managed-sources-v2-cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - id: trace-volume-qualification
+        if: matrix.inventory-trace
+        run: ./ci-native-fingerprint.exe --qualify-trace-volume
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin --trace-inventory ${{ matrix.inventory-trace }}
       - id: inventory-observation
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -525,6 +530,8 @@ jobs:
             target/ci/reports/inventory-observation/v1/**/run-start.json
             target/ci/reports/inventory-observation/v1/**/phase-*.json
             target/ci/reports/inventory-observation/v1/**/inventory-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-trace.etl
+            target/ci/reports/inventory-observation/v1/**/inventory-wpr-*.log
           if-no-files-found: warn
           retention-days: 14
           compression-level: 0

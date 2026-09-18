@@ -45,8 +45,6 @@ pub use policy::{
     Enforcement, Lifetime, Metric, Policy, SwapPolicy,
 };
 pub use policy::{DeadlinePolicy, DeadlineScope};
-#[cfg(feature = "test-support")]
-pub use report::write_report_atomic_with_test_barrier;
 pub use report::{
     AttemptHistoryReport, BackoffPolicyReport, BudgetKindReport, BudgetTokenReport,
     CLEAN_REPORT_SCHEMA_VERSION, CircuitBreakerPolicyReport, CleanReport,
@@ -59,6 +57,8 @@ pub use report::{
     RequestedRestartPolicyReport, RequirementReport, SupervisionReport, SwapReport, ToolReport,
     UnavailableCapabilityReport, write_report_atomic,
 };
+#[cfg(feature = "test-support")]
+pub use report::{write_report_atomic_with_test_barrier, write_report_atomic_with_test_observer};
 pub use restart::{
     BackoffMultiplier, CircuitBreakerPolicy, CircuitState, DormantRestartCondition,
     HALF_LIFE_LOGISTIC_MODEL, HalfLifeLogisticBackoffPolicy, HalfLifeLogisticBackoffState,

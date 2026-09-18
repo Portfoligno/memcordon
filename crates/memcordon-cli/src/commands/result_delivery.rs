@@ -20,6 +20,208 @@ const DELIVERY_NANOS: u64 = 1_000_000_000;
 const REAP_RESERVE_NANOS: u64 = 100_000_000;
 static OWNER_RESERVED: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureStage {
+    Clock,
+    Deadline,
+    OwnerReservation,
+    OwnerThread,
+    Serialization,
+    PreparationDeadline,
+    ExecutableResolution,
+    WriterSpawn,
+    OwnerChannel,
+    PipeConfiguration,
+    PipeWrite,
+    PipeDeadline,
+    WriterWait,
+    WriterDeadline,
+    WriterExit,
+}
+
+#[cfg(feature = "test-fixtures")]
+static EVIDENCE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(feature = "test-fixtures")]
+static WRITER_OBSERVED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "test-fixtures")]
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+enum WriterPhase {
+    Entered = 1,
+    PayloadRead,
+    PayloadDecoded,
+    BeforeWrite,
+    BeforeRename,
+    BeforeAck,
+    Diagnostics,
+    Complete,
+}
+
+#[cfg(feature = "test-fixtures")]
+fn writer_phase(phase: WriterPhase) {
+    if WRITER_OBSERVED.load(Ordering::Relaxed) {
+        let byte = phase as u8;
+        // Dedicated nonblocking helper stdout; one byte, never retry/flush.
+        unsafe {
+            libc::write(libc::STDOUT_FILENO, (&raw const byte).cast(), 1);
+        }
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+#[derive(Serialize)]
+struct WriterObservation {
+    // Best-effort prefix only: an unresolved writer or dropped nonblocking
+    // publication can have advanced beyond the last retained phase.
+    phases: Vec<WriterPhase>,
+    os_error: Option<i32>,
+    malformed: bool,
+    truncated: bool,
+}
+
+#[cfg(feature = "test-fixtures")]
+struct WriterTrace {
+    pipe: std::process::ChildStdout,
+    configuration_error: Option<io::Error>,
+}
+
+#[cfg(feature = "test-fixtures")]
+impl WriterTrace {
+    fn new(pipe: std::process::ChildStdout) -> Self {
+        let fd = pipe.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        let configuration_error = if flags < 0
+            || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+        {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        Self {
+            pipe,
+            configuration_error,
+        }
+    }
+    fn finish(mut self) -> WriterObservation {
+        let mut observation = WriterObservation {
+            phases: Vec::new(),
+            os_error: self
+                .configuration_error
+                .as_ref()
+                .and_then(io::Error::raw_os_error),
+            malformed: false,
+            truncated: false,
+        };
+        if self.configuration_error.is_some() {
+            return observation;
+        }
+        let mut bytes = [0_u8; 32];
+        match self.pipe.read(&mut bytes) {
+            Ok(count) => {
+                observation.truncated = count == bytes.len();
+                for byte in &bytes[..count] {
+                    let phase = match byte {
+                        1 => WriterPhase::Entered,
+                        2 => WriterPhase::PayloadRead,
+                        3 => WriterPhase::PayloadDecoded,
+                        4 => WriterPhase::BeforeWrite,
+                        5 => WriterPhase::BeforeRename,
+                        6 => WriterPhase::BeforeAck,
+                        7 => WriterPhase::Diagnostics,
+                        8 => WriterPhase::Complete,
+                        _ => {
+                            observation.malformed = true;
+                            continue;
+                        }
+                    };
+                    observation.phases.push(phase);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+            Err(error) => observation.os_error = error.raw_os_error(),
+        }
+        observation
+    }
+}
+
+/// Explicit test-only telemetry channel: never stderr or a filesystem sink.
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn observe_failures(descriptor: i32) -> io::Result<()> {
+    if descriptor < 3 {
+        return Err(io::Error::other("invalid delivery evidence descriptor"));
+    }
+    // SAFETY: fcntl/fstat inspect the supplied live inherited descriptor.
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let kind = unsafe { metadata.assume_init() }.st_mode & libc::S_IFMT;
+    if flags & libc::O_NONBLOCK == 0 || ![libc::S_IFIFO, libc::S_IFSOCK].contains(&kind) {
+        return Err(io::Error::other(
+            "delivery evidence requires a nonblocking pipe or socket",
+        ));
+    }
+    // Prevent descendants from retaining this frontend-only evidence channel.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    EVIDENCE_FD.store(descriptor, Ordering::Release);
+    Ok(())
+}
+
+fn failed(stage: FailureStage, error: Option<&io::Error>, exit_code: Option<i32>) -> bool {
+    failed_observed(
+        stage,
+        error,
+        exit_code,
+        #[cfg(feature = "test-fixtures")]
+        None,
+    )
+}
+
+fn failed_observed(
+    stage: FailureStage,
+    error: Option<&io::Error>,
+    exit_code: Option<i32>,
+    #[cfg(feature = "test-fixtures")] writer: Option<WriterObservation>,
+) -> bool {
+    #[cfg(feature = "test-fixtures")]
+    {
+        #[derive(Serialize)]
+        struct Evidence {
+            schema: u32,
+            stage: FailureStage,
+            os_error: Option<i32>,
+            writer_exit_code: Option<i32>,
+            writer: Option<WriterObservation>,
+        }
+        let descriptor = EVIDENCE_FD.load(Ordering::Acquire);
+        if descriptor >= 3 {
+            let evidence = Evidence {
+                schema: 1,
+                stage,
+                os_error: error.and_then(io::Error::raw_os_error),
+                writer_exit_code: exit_code,
+                writer,
+            };
+            if let Ok(mut bytes) = serde_json::to_vec(&evidence) {
+                bytes.push(b'\n');
+                // A single best-effort nonblocking write: no retry, flush or
+                // fallback to stderr. A full channel cannot delay CLI return.
+                unsafe { libc::write(descriptor, bytes.as_ptr().cast(), bytes.len()) };
+            }
+        }
+    }
+    #[cfg(not(feature = "test-fixtures"))]
+    let _ = (stage, error, exit_code);
+    false
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Payload {
@@ -79,14 +281,17 @@ fn deliver_inner(
     if diagnostics.is_empty() && report.is_none() {
         return true;
     }
-    let Ok(started) = now() else { return false };
+    let started = match now() {
+        Ok(value) => value,
+        Err(error) => return failed(FailureStage::Clock, Some(&error), None),
+    };
     let Some(local_deadline) = started.checked_add(DELIVERY_NANOS) else {
-        return false;
+        return failed(FailureStage::Deadline, None, None);
     };
     let deadline = return_deadline.map_or(local_deadline, |value| value.min(local_deadline));
     let write_deadline = deadline.saturating_sub(REAP_RESERVE_NANOS);
     if started >= write_deadline {
-        return false;
+        return failed(FailureStage::Deadline, None, None);
     }
     let payload = Payload {
         schema: 1,
@@ -100,28 +305,45 @@ fn deliver_inner(
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return false;
+        return failed(FailureStage::OwnerReservation, None, None);
     }
     // Native creation can stall. Its reserved owner retains late creation and
     // cancels it if the frontend has already stopped receiving. No write occurs
     // until the frontend transfers the complete, bounded payload.
     let (sender, receiver) = mpsc::sync_channel(0);
-    if std::thread::Builder::new()
+    #[cfg(feature = "test-fixtures")]
+    let observe_writer = EVIDENCE_FD.load(Ordering::Acquire) >= 3;
+    if let Err(error) = std::thread::Builder::new()
         .name("result-spawn-owner".into())
         .spawn(move || {
-            let result = (|| -> io::Result<(Child, BoundedBytes)> {
+            let result = (|| -> Result<(Child, BoundedBytes), (FailureStage, io::Error)> {
                 let mut bytes = BoundedBytes(Vec::new());
-                serde_json::to_writer(&mut bytes, &payload)?;
-                if now()? >= write_deadline {
-                    return Err(io::Error::other("result preparation deadline"));
+                serde_json::to_writer(&mut bytes, &payload)
+                    .map_err(|error| (FailureStage::Serialization, io::Error::other(error)))?;
+                if now().map_err(|error| (FailureStage::Clock, error))? >= write_deadline {
+                    return Err((
+                        FailureStage::PreparationDeadline,
+                        io::Error::other("result preparation deadline"),
+                    ));
                 }
-                let executable = std::env::current_exe()?;
-                let child = Command::new(executable)
-                    .arg("__result-writer-v1")
+                let executable = std::env::current_exe()
+                    .map_err(|error| (FailureStage::ExecutableResolution, error))?;
+                let mut command = Command::new(executable);
+                #[cfg(feature = "test-fixtures")]
+                if observe_writer {
+                    command
+                        .arg("__result-writer-observed-v1")
+                        .stdout(Stdio::piped());
+                } else {
+                    command.arg("__result-writer-v1").stdout(Stdio::null());
+                }
+                #[cfg(not(feature = "test-fixtures"))]
+                command.arg("__result-writer-v1").stdout(Stdio::null());
+                let child = command
                     .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
                     .stderr(Stdio::inherit())
-                    .spawn()?;
+                    .spawn()
+                    .map_err(|error| (FailureStage::WriterSpawn, error))?;
                 Ok((child, bytes))
             })();
             if let Err(mpsc::SendError(result)) = sender.send(result) {
@@ -132,26 +354,31 @@ fn deliver_inner(
                 OWNER_RESERVED.store(false, Ordering::Release);
             }
         })
-        .is_err()
     {
         OWNER_RESERVED.store(false, Ordering::Release);
-        return false;
+        return failed(FailureStage::OwnerThread, Some(&error), None);
     }
     let (mut child, bytes) = loop {
         if now().unwrap_or(write_deadline) >= write_deadline {
-            return false;
+            return failed(FailureStage::Deadline, None, None);
         }
         match receiver.recv_timeout(Duration::from_millis(2)) {
             Ok(Ok(value)) => break value,
-            Ok(Err(_)) => {
+            Ok(Err((stage, error))) => {
                 OWNER_RESERVED.store(false, Ordering::Release);
-                return false;
+                return failed(stage, Some(&error), None);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return failed(FailureStage::OwnerChannel, None, None);
+            }
         }
     };
-    let delivered = (|| -> io::Result<bool> {
+    let mut stage = FailureStage::PipeConfiguration;
+    #[cfg(feature = "test-fixtures")]
+    let writer_trace = child.stdout.take().map(WriterTrace::new);
+    let mut writer_exit_code = None;
+    let delivery = (|| -> io::Result<bool> {
         let mut input = child
             .stdin
             .take()
@@ -168,8 +395,10 @@ fn deliver_inner(
         for mut pending in [length.as_slice(), bytes.0.as_slice()] {
             while !pending.is_empty() {
                 if now()? >= write_deadline {
+                    stage = FailureStage::PipeDeadline;
                     return Ok(false);
                 }
+                stage = FailureStage::PipeWrite;
                 match input.write(pending) {
                     Ok(0) => return Ok(false),
                     Ok(count) => pending = &pending[count..],
@@ -182,23 +411,32 @@ fn deliver_inner(
             }
         }
         drop(input);
+        stage = FailureStage::WriterWait;
         loop {
             if now()? >= write_deadline {
+                stage = FailureStage::WriterDeadline;
                 return Ok(false);
             }
             if let Some(status) = child.try_wait()? {
+                stage = FailureStage::WriterExit;
+                writer_exit_code = status.code();
                 return Ok(status.success());
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-    })()
-    .unwrap_or(false);
-    if delivered {
+    })();
+    if matches!(delivery, Ok(true)) {
         OWNER_RESERVED.store(false, Ordering::Release);
         return true;
     }
     retire_writer(child, deadline);
-    false
+    failed_observed(
+        stage,
+        delivery.as_ref().err(),
+        writer_exit_code,
+        #[cfg(feature = "test-fixtures")]
+        writer_trace.map(WriterTrace::finish),
+    )
 }
 
 fn retire_writer(mut child: Child, deadline: u64) {
@@ -225,7 +463,21 @@ fn retire_writer(mut child: Child, deadline: u64) {
         });
 }
 
+#[cfg(feature = "test-fixtures")]
+pub(super) fn writer_observed() -> i32 {
+    let flags = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return 125;
+    }
+    WRITER_OBSERVED.store(true, Ordering::Relaxed);
+    writer()
+}
+
 pub(super) fn writer() -> i32 {
+    #[cfg(feature = "test-fixtures")]
+    writer_phase(WriterPhase::Entered);
     let result = (|| -> io::Result<()> {
         let mut input = io::stdin().lock();
         let mut length = [0_u8; size_of::<u64>()];
@@ -236,10 +488,14 @@ pub(super) fn writer() -> i32 {
         }
         let mut bytes = vec![0; length];
         input.read_exact(&mut bytes)?;
+        #[cfg(feature = "test-fixtures")]
+        writer_phase(WriterPhase::PayloadRead);
         let mut payload: Payload = serde_json::from_slice(&bytes)?;
         if payload.schema != 1 || payload.report_path.is_some() != payload.report.is_some() {
             return Err(io::Error::other("invalid result payload"));
         }
+        #[cfg(feature = "test-fixtures")]
+        writer_phase(WriterPhase::PayloadDecoded);
         if let Some(report) = &mut payload.report {
             let writer_pid =
                 std::num::NonZeroU32::new(std::process::id()).expect("native writer PID");
@@ -260,20 +516,43 @@ pub(super) fn writer() -> i32 {
         if let (Some(path), Some(report)) = (payload.report_path, payload.report) {
             let path = PathBuf::from(OsString::from_vec(path));
             #[cfg(feature = "test-fixtures")]
-            if let Some((phase, marker)) = payload.barrier {
-                let marker = PathBuf::from(OsString::from_vec(marker));
-                memcordon_core::write_report_atomic_with_test_barrier(
-                    &path, &report, phase, &marker,
+            {
+                let barrier = payload
+                    .barrier
+                    .map(|(phase, marker)| (phase, PathBuf::from(OsString::from_vec(marker))));
+                memcordon_core::write_report_atomic_with_test_observer(
+                    &path,
+                    &report,
+                    barrier
+                        .as_ref()
+                        .map(|(phase, marker)| (*phase, marker.as_path())),
+                    |phase| {
+                        writer_phase(match phase {
+                            memcordon_core::ReportWritePhase::BeforeWrite => {
+                                WriterPhase::BeforeWrite
+                            }
+                            memcordon_core::ReportWritePhase::BeforeRename => {
+                                WriterPhase::BeforeRename
+                            }
+                            memcordon_core::ReportWritePhase::BeforeAck => WriterPhase::BeforeAck,
+                        })
+                    },
                 )
                 .map_err(io::Error::other)?;
-                return Err(io::Error::other("writer barrier unexpectedly returned"));
             }
+            #[cfg(not(feature = "test-fixtures"))]
             memcordon_core::write_report_atomic(&path, &report).map_err(io::Error::other)?;
         }
+        #[cfg(feature = "test-fixtures")]
+        writer_phase(WriterPhase::Diagnostics);
         write_diagnostics(&payload.diagnostics)
     })();
     match result {
-        Ok(()) => 0,
+        Ok(()) => {
+            #[cfg(feature = "test-fixtures")]
+            writer_phase(WriterPhase::Complete);
+            0
+        }
         Err(error) => {
             let mut output = crate::presentation::Presentation::automatic().stderr();
             let _ = crate::presentation::write_runtime_error(&mut output, error);

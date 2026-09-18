@@ -122,6 +122,31 @@ fn subprocess_environment_is_confined_to_the_sealed_exec_boundary() {
 }
 
 #[test]
+fn delivery_evidence_uses_the_reviewed_process_boundary_without_new_authority() {
+    let fixture = Path::new("crates/memcordon-cli/tests/support/delivery_evidence.rs");
+    validate_rust_policy_bytes(
+        fixture,
+        include_bytes!("../../../crates/memcordon-cli/tests/support/delivery_evidence.rs"),
+    )
+    .expect("delivery evidence must use the existing reviewed process boundary");
+    let forbidden = br#"
+        #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+        fn attach(command: &mut std::process::Command) {
+            unsafe { command.pre_exec(|| Ok(())); }
+        }
+    "#;
+    let error = validate_rust_policy_bytes(fixture, forbidden)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("pre_exec is allowed only"), "{error}");
+    validate_rust_policy_bytes(
+        Path::new("crates/memcordon-platform/src/test_support.rs"),
+        forbidden,
+    )
+    .expect("the one reviewed process boundary retains its existing authority");
+}
+
+#[test]
 fn pre_exec_and_raw_fork_are_confined_to_exact_reviewed_boundaries() {
     let pre_exec =
         b"fn run(command: &mut std::process::Command) { unsafe { command.pre_exec(|| Ok(())); } }";

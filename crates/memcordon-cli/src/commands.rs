@@ -2,6 +2,8 @@ mod application;
 #[cfg(target_os = "macos")]
 mod result_delivery;
 pub(crate) use application::{clean, doctor, execute, plan};
+#[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+pub(crate) use result_delivery::observe_failures;
 
 #[cfg(unix)]
 const LAUNCHER_STATUS_MAGIC: &[u8; 4] = b"MCLS";
@@ -19,6 +21,8 @@ pub(crate) enum InternalInvocation {
     Probe,
     #[cfg(target_os = "macos")]
     ResultWriter,
+    #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+    ResultWriterObserved,
     #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
     SynchronousStderrMutant,
     #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
@@ -136,6 +140,14 @@ pub(crate) fn route_internal(
             Err("result writer accepts no arguments")
         });
     }
+    #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+    if name == "__result-writer-observed-v1" {
+        return Some(if argv.len() == 1 {
+            Ok(InternalInvocation::ResultWriterObserved)
+        } else {
+            Err("observed result writer accepts no arguments")
+        });
+    }
     if name == "__execution-probe" {
         return Some(if argv.len() == 1 {
             Ok(InternalInvocation::Probe)
@@ -229,6 +241,8 @@ pub(crate) fn execute_internal(invocation: InternalInvocation) -> i32 {
         InternalInvocation::Probe => 0,
         #[cfg(target_os = "macos")]
         InternalInvocation::ResultWriter => result_delivery::writer(),
+        #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+        InternalInvocation::ResultWriterObserved => result_delivery::writer_observed(),
         #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
         InternalInvocation::SynchronousStderrMutant => result_delivery::synchronous_stderr_mutant(),
         #[cfg(all(target_os = "macos", feature = "test-fixtures"))]

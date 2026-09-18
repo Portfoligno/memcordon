@@ -68,7 +68,7 @@ pub(super) fn persist(shared: &Shared, complete: Option<bool>, wait: bool) {
         .collect::<Vec<_>>()
         .join(",");
     let payload = format!(
-        "{{\"schema\":1,\"file_counters_scope\":\"windows_native_pipeline\",\"sequence\":{sequence},\"root_id\":{},\"root_sample\":{},\"root_complete\":{},\"elapsed_ns\":{},\"sample\":\"actor_publication_vector\",\"files_attempted\":{},\"files_completed\":{},\"files_validated\":{},\"files_committed\":{},\"manifest_bytes_committed\":{},\"outstanding\":{},\"lost_reports\":{},\"overwritten_events\":{},\"events\":[{events}],\"actors\":[{actors}]}}\n",
+        "{{\"schema\":1,\"file_counters_scope\":\"windows_linux_native_pipeline\",\"sequence\":{sequence},\"root_id\":{},\"root_sample\":{},\"root_complete\":{},\"elapsed_ns\":{},\"sample\":\"actor_publication_vector\",\"files_attempted\":{},\"files_completed\":{},\"files_validated\":{},\"files_committed\":{},\"manifest_bytes_committed\":{},\"outstanding\":{},\"lost_reports\":{},\"overwritten_events\":{},\"events\":[{events}],\"actors\":[{actors}]}}\n",
         sample.root_id,
         quoted(&root),
         complete.map_or("null", |ok| if ok { "true" } else { "false" }),

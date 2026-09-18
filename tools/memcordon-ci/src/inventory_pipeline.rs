@@ -34,6 +34,10 @@ pub trait InventoryBackend: Send + Sync + 'static {
     type Record: Send + 'static;
 
     fn prepare(&self, entry: Self::Entry) -> Result<Self::Prepared>;
+    /// Scheduling hint only; must not perform I/O or replace classification.
+    fn is_leaf_hint(&self, _entry: &Self::Entry) -> bool {
+        false
+    }
     fn classify(
         &self,
         prepared: Self::Prepared,
@@ -72,7 +76,7 @@ enum Frame<B: InventoryBackend> {
     Entry(B::Entry),
     Children {
         entries: VecDeque<B::Entry>,
-        prepared: VecDeque<usize>,
+        prepared: VecDeque<(usize, bool)>,
         parent: usize,
     },
     Finish(B::Record),
@@ -317,17 +321,23 @@ impl<B: InventoryBackend> Traversal<'_, B> {
                         let Some(entry) = entries.pop_front() else {
                             continue;
                         };
-                        prepared.push_back(self.prepare(entry, Some(parent))?);
+                        let leaf = self.backend.is_leaf_hint(&entry);
+                        prepared.push_back((self.prepare(entry, Some(parent))?, leaf));
                     }
                     // Reserve one slot globally for a descendant frontier, even
                     // when suspended ancestors retain all speculative results.
-                    while self.preparations < CAPACITY - 1 {
-                        let Some(entry) = entries.pop_front() else {
-                            break;
-                        };
-                        prepared.push_back(self.prepare(entry, Some(parent))?);
+                    // Do not retain speculative siblings across a possible
+                    // descent: that would consume the descendant's window.
+                    while prepared.front().is_some_and(|(_, leaf)| *leaf)
+                        && self.preparations < CAPACITY - 1
+                        && entries
+                            .front()
+                            .is_some_and(|entry| self.backend.is_leaf_hint(entry))
+                    {
+                        let entry = entries.pop_front().expect("hinted leaf entry");
+                        prepared.push_back((self.prepare(entry, Some(parent))?, true));
                     }
-                    let id = prepared.pop_front().expect("frontier preparation");
+                    let (id, _) = prepared.pop_front().expect("frontier preparation");
                     frames.push(Frame::Children {
                         entries,
                         prepared,

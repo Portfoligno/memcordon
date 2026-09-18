@@ -19,7 +19,7 @@ use crate::inventory_progress::{InventoryProgress, Operation};
 use crate::inventory_reader::{BUFFER_SIZE, digest_reader, open_sequential};
 use crate::{CiError, Result};
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[path = "inventory_native.rs"]
 mod native_pipeline;
 
@@ -466,7 +466,7 @@ fn measure_root(
     };
     environment::progress::phase(&format!("inventory {kind} root {path:?}"), || {
         let mut progress = InventoryProgress::new(path);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         if scope.source().is_none() {
             if session.is_none() {
                 *session = Some(crate::inventory_pipeline::InventorySession::new()?);

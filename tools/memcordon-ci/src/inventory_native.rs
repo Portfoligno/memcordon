@@ -1,4 +1,4 @@
-//! Windows native filesystem protocol used by the ordered inventory engine.
+//! Platform native filesystem protocol used by the ordered inventory engine.
 use super::*;
 use crate::inventory_pipeline::{InventoryBackend, Node, ValidatedDigest};
 use crate::inventory_progress::{TaskClass, TaskState};
@@ -7,6 +7,7 @@ pub(super) struct Entry {
     path: PathBuf,
     entry: Option<fs::DirEntry>,
     scope: MeasurementScope<'static>,
+    leaf_hint: bool,
 }
 
 impl Entry {
@@ -21,6 +22,7 @@ impl Entry {
             path: path.to_path_buf(),
             entry: None,
             scope,
+            leaf_hint: false,
         }
     }
 }
@@ -81,6 +83,7 @@ impl Backend {
                             path: resolved,
                             entry: None,
                             scope: prepared.scope,
+                            leaf_hint: false,
                         };
                         (vec![child], "symlink", digest)
                     }
@@ -145,21 +148,26 @@ impl Backend {
                     entries
                         .map(|entry| {
                             self.check_cancelled()?;
-                            entry.map_err(CiError::from)
+                            let entry = entry?;
+                            // Cache on this worker inside the enumeration span;
+                            // classification remains authoritative.
+                            let leaf_hint = entry.file_type().is_ok_and(|kind| kind.is_file());
+                            Ok((entry, leaf_hint))
                         })
                         .collect::<Result<Vec<_>>>()
                 })?;
         self.progress
             .run(Operation::DirectorySort, &prepared.identity, || {
-                entries.sort_by_key(|entry| entry.file_name());
+                entries.sort_by_key(|(entry, _)| entry.file_name());
                 Ok::<_, CiError>(())
             })?;
         let children = entries
             .into_iter()
-            .map(|entry| Entry {
+            .map(|(entry, leaf_hint)| Entry {
                 path: entry.path(),
                 entry: Some(entry),
                 scope: prepared.scope.child(),
+                leaf_hint,
             })
             .collect();
         Ok((
@@ -175,6 +183,10 @@ impl InventoryBackend for Backend {
     type Expansion = Prepared;
     type File = FileRequest;
     type Record = Input;
+
+    fn is_leaf_hint(&self, entry: &Entry) -> bool {
+        entry.leaf_hint
+    }
 
     fn prepare(&self, entry: Entry) -> Result<Prepared> {
         let result: Result<Prepared> = (|| {
@@ -233,6 +245,15 @@ impl InventoryBackend for Backend {
                 record,
             ));
         }
+        if matches!(prepared.scope, MeasurementScope::NativeDescendant)
+            && let Some(digest) = native_null_device_identity(&prepared.metadata)?
+        {
+            return Ok(Node::Record(Self::record(
+                &prepared,
+                "linux-null-device",
+                digest,
+            )));
+        }
         Err(CiError::Message(format!(
             "unsupported build input: {}",
             prepared.path.display()
@@ -247,7 +268,11 @@ impl InventoryBackend for Backend {
     }
 
     fn read(&self, request: FileRequest, buffer: &mut [u8]) -> Result<ValidatedDigest> {
-        crate::inventory_reader::digest_native_file(
+        #[cfg(windows)]
+        use crate::inventory_reader::digest_native_file as digest_file;
+        #[cfg(target_os = "linux")]
+        use crate::inventory_reader::digest_unix_file as digest_file;
+        digest_file(
             &request.path,
             &request.expected,
             buffer,
