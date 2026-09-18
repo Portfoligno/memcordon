@@ -248,6 +248,8 @@ enum Message {
     },
     #[cfg(feature = "test-support")]
     DisableWorkTimer,
+    #[cfg(feature = "test-support")]
+    DelayReleasedReceipt,
     Configure {
         image: Vec<u8>,
         boot_identity: String,
@@ -332,6 +334,8 @@ struct Channel {
     expire_send_after_prefix: bool,
     #[cfg(feature = "test-support")]
     expire_send_after_write: bool,
+    #[cfg(feature = "test-support")]
+    delay_send_after_deadline: bool,
     admission: Option<crate::signal::LaunchAdmission>,
     stream: UnixStream,
     run: u64,
@@ -463,6 +467,8 @@ impl Channel {
             expire_send_after_prefix: false,
             #[cfg(feature = "test-support")]
             expire_send_after_write: false,
+            #[cfg(feature = "test-support")]
+            delay_send_after_deadline: false,
             admission: None,
             run,
             sent: 0,
@@ -632,6 +638,11 @@ impl Channel {
         let mut bytes = Vec::with_capacity(prefix.len() + payload.len());
         bytes.extend_from_slice(&prefix);
         bytes.extend_from_slice(&payload);
+        #[cfg(feature = "test-support")]
+        if self.delay_send_after_deadline {
+            self.delay_send_after_deadline = false;
+            std::thread::sleep(Duration::from_millis(50));
+        }
         #[cfg(feature = "test-support")]
         let deadline = {
             // Explicitly force a short write for partial-frame fault tests;
@@ -860,6 +871,8 @@ impl Message {
             Self::AdvanceClock { .. } => "AdvanceClock",
             #[cfg(feature = "test-support")]
             Self::DisableWorkTimer => "DisableWorkTimer",
+            #[cfg(feature = "test-support")]
+            Self::DelayReleasedReceipt => "DelayReleasedReceipt",
             #[cfg(feature = "test-support")]
             Self::StallInspectors { .. } => "StallInspectors",
             #[cfg(feature = "test-support")]
@@ -1368,6 +1381,8 @@ pub enum LaunchFault {
     NativeSpawnHeld,
     #[cfg(feature = "test-support")]
     NativeSpawnHeldReleaseAfterCancel,
+    #[cfg(feature = "test-support")]
+    DelayReleasedReceipt,
 }
 
 pub(crate) fn launch(
@@ -1578,6 +1593,10 @@ fn launch_configured(
         #[cfg(feature = "test-support")]
         if fault == Some(LaunchFault::NativeSpawnHeldReleaseAfterCancel) {
             control.send(Message::HoldSpawnReleaseAfterCancel, deadline)?;
+        }
+        #[cfg(feature = "test-support")]
+        if fault == Some(LaunchFault::DelayReleasedReceipt) {
+            control.send(Message::DelayReleasedReceipt, deadline)?;
         }
         // A failed partial Configure may still reach the guardian. Preserve its
         // custody from before the first write, rather than killing it on error.
@@ -2460,7 +2479,9 @@ fn guardian_main(
     #[cfg(feature = "test-support")]
     let release_after_cancel = configuration == Some(Message::HoldSpawnReleaseAfterCancel);
     #[cfg(feature = "test-support")]
-    let configuration = if hold_spawn {
+    let delay_released_receipt = configuration == Some(Message::DelayReleasedReceipt);
+    #[cfg(feature = "test-support")]
+    let configuration = if hold_spawn || delay_released_receipt {
         control.receive(initial)?
     } else {
         configuration
@@ -2744,10 +2765,14 @@ fn guardian_main(
                             );
                         } else {
                             confirmed = true;
-                            control.send(
-                                Message::Released,
-                                Instant::now() + Duration::from_millis(20),
-                            )?;
+                            #[cfg(feature = "test-support")]
+                            if delay_released_receipt {
+                                control.delay_send_after_deadline = true;
+                            }
+                            // Exec confirmation is a mandatory startup receipt. Retain
+                            // the original startup deadline so scheduler latency cannot
+                            // replace confirmed execution with a 20 ms delivery failure.
+                            control.send(Message::Released, inspector_deadline)?;
                         }
                         launcher = None;
                     }
@@ -3306,6 +3331,28 @@ pub fn startup_fault(
             Err("injected startup fault unexpectedly released the target".into())
         }
     }
+}
+
+#[cfg(feature = "test-support")]
+pub fn delayed_released_receipt(image: &Path) -> Result<(), String> {
+    let command = CommandSpec::new(image.as_os_str()).args(["__execution-probe"]);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut launch = launch_inner(
+        &command,
+        image,
+        deadline,
+        deadline + Duration::from_secs(1),
+        Some(LaunchFault::DelayReleasedReceipt),
+    )
+    .map_err(|error| error.error.to_string())?;
+    launch
+        .child
+        .retire(Instant::now() + Duration::from_secs(1))
+        .map_err(|error| error.to_string())?;
+    launch
+        .guardian
+        .disarm(Instant::now() + Duration::from_secs(1))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "test-support")]
