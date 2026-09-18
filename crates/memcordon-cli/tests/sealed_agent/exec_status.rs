@@ -5,6 +5,7 @@ use std::io::Write;
 use crate::linux::launch::{
     ExecFailureClass, TargetExecStatus, TerminalFacts, control_socketpair_for_test,
     exec_armed_record_for_test, exec_failure_record_for_test, receive_exec_status_for_test,
+    receive_target_ready_for_test, target_ready_record_for_test,
 };
 
 fn terminal(exec_status: TargetExecStatus, child_status: i32) -> TerminalFacts {
@@ -157,5 +158,63 @@ fn malformed_trailing_or_unarmed_exec_status_fails_closed() {
         receive_exec_status_for_test(&mut provider)
             .unwrap_err()
             .contains("trailing record")
+    );
+}
+
+#[test]
+fn preauthorization_waits_for_exact_target_transition_readiness() {
+    let (mut target, provider) = control_socketpair_for_test().unwrap();
+    let (entered_sender, entered_receiver) = std::sync::mpsc::sync_channel(1);
+    let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+    let receiver = std::thread::spawn(move || {
+        entered_sender.send(()).unwrap();
+        result_sender
+            .send(receive_target_ready_for_test(
+                &provider,
+                std::time::Duration::from_secs(1),
+            ))
+            .unwrap();
+    });
+    entered_receiver.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(matches!(
+        result_receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    target.write_all(&target_ready_record_for_test()).unwrap();
+    assert_eq!(
+        result_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap(),
+        Ok(())
+    );
+    receiver.join().unwrap();
+}
+
+#[test]
+fn preauthorization_readiness_fails_closed_on_malformed_eof_or_timeout() {
+    let (mut target, provider) = control_socketpair_for_test().unwrap();
+    let mut malformed = target_ready_record_for_test();
+    malformed[2] ^= 1;
+    target.write_all(&malformed).unwrap();
+    assert!(
+        receive_target_ready_for_test(&provider, std::time::Duration::from_secs(1))
+            .unwrap_err()
+            .contains("invalid ready record")
+    );
+
+    let (target, provider) = control_socketpair_for_test().unwrap();
+    drop(target);
+    assert!(
+        receive_target_ready_for_test(&provider, std::time::Duration::from_secs(1))
+            .unwrap_err()
+            .contains("closed before ready record")
+    );
+
+    let (_target, provider) = control_socketpair_for_test().unwrap();
+    assert!(
+        receive_target_ready_for_test(&provider, std::time::Duration::from_millis(20))
+            .unwrap_err()
+            .contains("timed out")
     );
 }
