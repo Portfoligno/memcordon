@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 type Handle = *mut c_void;
-const CAPACITY: u64 = 256 * 1024 * 1024;
+const CAPACITY: u64 = 512 * 1024 * 1024;
 const OFFSET: i64 = 1024 * 1024;
 const LENGTH: i64 = CAPACITY as i64 - 2 * OFFSET;
 const INVALID: Handle = -1_isize as Handle;

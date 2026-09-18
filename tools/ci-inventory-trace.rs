@@ -48,6 +48,19 @@ pub enum WprOperation {
     Cancel,
 }
 
+pub struct WprInvocation {
+    arguments: Vec<OsString>,
+    working_directory: PathBuf,
+}
+impl WprInvocation {
+    pub fn arguments(&self) -> &[OsString] {
+        &self.arguments
+    }
+    pub fn working_directory(&self) -> &Path {
+        &self.working_directory
+    }
+}
+
 /// Present the OS-created, extent-verified temporary drive mapping to format.com.
 /// Syntax is not authority: the caller must establish native mapping ownership.
 pub fn formatter_arguments(volume: &OsStr) -> io::Result<Vec<OsString>> {
@@ -101,6 +114,22 @@ impl WprOperation {
         arguments.push("-instancename".into());
         arguments.push(instance.into());
         Ok(arguments)
+    }
+
+    pub fn invocation(
+        self,
+        instance: &OsStr,
+        working_directory: &Path,
+    ) -> io::Result<WprInvocation> {
+        if !working_directory.is_absolute() {
+            return Err(io::Error::other(
+                "WPR working directory must be an absolute contained path",
+            ));
+        }
+        Ok(WprInvocation {
+            arguments: self.arguments(instance)?,
+            working_directory: working_directory.into(),
+        })
     }
 }
 

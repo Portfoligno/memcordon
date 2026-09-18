@@ -201,8 +201,14 @@ impl Recording for Session {
                 .get(OsStr::new("SystemRoot"))
                 .ok_or_else(|| io::Error::other("SystemRoot unavailable"))?;
             let mut command = Command::new(Path::new(system).join("System32/wpr.exe"));
+            let invocation =
+                WprOperation::Cancel.invocation(OsStr::new(&self.instance), &self.output)?;
             command
-                .args(WprOperation::Cancel.arguments(OsStr::new(&self.instance))?)
+                .args(invocation.arguments())
+                // The helper's owned VHD is released when helper termination is
+                // observed. Keep fallback WPR artifacts in the bounded journal,
+                // never in the measured workspace.
+                .current_dir(invocation.working_directory())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
@@ -343,12 +349,12 @@ impl Worker {
     }
     fn invoke(&mut self, operation: WprOperation) -> io::Result<()> {
         let label = operation.label();
-        let arguments = operation.arguments(&self.instance)?;
         let directory = self
             .volume
             .as_ref()
             .ok_or_else(|| io::Error::other("trace volume absent"))?
             .directory();
+        let invocation = operation.invocation(&self.instance, directory)?;
         let log_path = directory.join(label).with_extension("log");
         let log = OpenOptions::new()
             .create_new(true)
@@ -360,8 +366,12 @@ impl Worker {
                 .ok_or_else(|| io::Error::other("WPR absent"))?,
         );
         command
-            .args(arguments)
-            .current_dir(&self.workspace)
+            .args(invocation.arguments())
+            // WPR can leave a partial `.etl` beside its current directory when
+            // export fails (for example, after exhausting the bounded volume).
+            // Keep every recorder-created path on the owned volume so optional
+            // diagnostics cannot mutate the measured workspace.
+            .current_dir(invocation.working_directory())
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);

@@ -291,4 +291,16 @@ fn every_wpr_operation_is_scoped_to_the_owned_instance_without_shell_arguments()
     assert_eq!(start[1], "ci/inventory.wprp!Inventory.Verbose");
     assert_eq!(start[3], directory.as_os_str());
     assert!(!start.iter().any(|argument| argument == "-filemode"));
+
+    let contained = std::env::current_dir().unwrap().join("owned trace volume");
+    let invocation = WprOperation::Stop(contained.join("inventory.etl"))
+        .invocation(instance, &contained)
+        .unwrap();
+    assert_eq!(invocation.working_directory(), contained);
+    assert_eq!(invocation.arguments()[0], "-stop");
+    assert!(
+        WprOperation::Cancel
+            .invocation(instance, std::path::Path::new("relative"))
+            .is_err()
+    );
 }
