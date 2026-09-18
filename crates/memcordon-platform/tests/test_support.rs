@@ -2,6 +2,9 @@ use std::fs;
 
 use memcordon_platform::test_support::ProcessIdentity;
 
+#[cfg(all(unix, not(target_os = "macos")))]
+use memcordon_platform::test_support::unix_session_member_from_stat;
+
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
@@ -35,6 +38,33 @@ fn process_identity_publication_atomically_replaces_destination() {
         .expect("temporary directory entries should read");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path(), path);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn unix_session_scan_continues_after_a_process_disappears() {
+    let session = 41;
+    assert_eq!(
+        unix_session_member_from_stat(
+            session,
+            90,
+            Err(std::io::Error::from_raw_os_error(libc::ESRCH)),
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        unix_session_member_from_stat(session, 91, Ok("91 (fixture) S 1 1 41".to_owned()),)
+            .unwrap(),
+        Some(91)
+    );
+    let error = unix_session_member_from_stat(
+        session,
+        92,
+        Err(std::io::Error::from_raw_os_error(libc::EACCES)),
+    )
+    .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EACCES));
 }
 
 #[cfg(target_os = "linux")]

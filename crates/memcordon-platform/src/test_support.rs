@@ -466,6 +466,20 @@ pub fn windows_current_token_user_sid_string() -> Result<String, String> {
     crate::sealed::windows::token_user_sid_string(token.0)
 }
 
+fn process_probe_is_absent(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 impl ProcessIdentity {
     pub fn current() -> io::Result<Self> {
         Self::for_pid(std::process::id())
@@ -478,7 +492,7 @@ impl ProcessIdentity {
     pub fn still_exists(self) -> io::Result<bool> {
         match Self::for_pid(self.pid) {
             Ok(current) => Ok(current == self),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) if process_probe_is_absent(&error) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -821,6 +835,31 @@ fn configure_child_setup(command: &mut Command, setup: ChildSetup) {
     }
 }
 
+/// Interpret one procfs stat result while scanning a Unix session.
+///
+/// Exposed only so the test-support crate can deterministically cover disappearing procfs entries.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[doc(hidden)]
+pub fn unix_session_member_from_stat(
+    session: i32,
+    pid: i32,
+    stat: io::Result<String>,
+) -> io::Result<Option<i32>> {
+    let stat = match stat {
+        Ok(stat) => stat,
+        Err(error) if process_probe_is_absent(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(after_name) = stat.rsplit_once(')').map(|(_, fields)| fields) else {
+        return Ok(None);
+    };
+    let member_session = after_name
+        .split_whitespace()
+        .nth(3)
+        .and_then(|field| field.parse::<i32>().ok());
+    Ok((member_session == Some(session)).then_some(pid))
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 fn unix_session_members(session: i32) -> io::Result<Vec<i32>> {
     let mut members = Vec::new();
@@ -833,22 +872,13 @@ fn unix_session_members(session: i32) -> io::Result<Vec<i32>> {
         else {
             continue;
         };
-        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        let Some(after_name) = stat.rsplit_once(')').map(|(_, fields)| fields) else {
-            continue;
-        };
-        let member_session = after_name
-            .split_whitespace()
-            .nth(3)
-            .and_then(|field| field.parse::<i32>().ok());
-        if member_session != Some(session) {
-            continue;
+        if let Some(pid) = unix_session_member_from_stat(
+            session,
+            pid,
+            std::fs::read_to_string(entry.path().join("stat")),
+        )? {
+            members.push(pid);
         }
-        members.push(pid);
     }
     Ok(members)
 }
@@ -912,7 +942,7 @@ fn terminate_unix_session(
             };
             match process_identity(pid_value) {
                 Ok(identity) => members.push((pid, identity)),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if process_probe_is_absent(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -928,7 +958,7 @@ fn terminate_unix_session(
             // SAFETY: kill accepts a process identity and does not dereference Rust memory.
             if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
                 let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) && first_error.is_none() {
+                if !process_probe_is_absent(&error) && first_error.is_none() {
                     first_error = Some(error);
                 }
             } else {
