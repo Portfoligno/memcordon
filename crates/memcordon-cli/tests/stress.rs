@@ -84,7 +84,9 @@ fn short_child_iteration(seed: u64, iteration: u32, code: i32, report_path: &Pat
             "--code",
             &code.to_string(),
         ]);
-    let result = run_with_deadline(&mut command, Duration::from_secs(3));
+    // Native execution retains an absolute four-second retirement and result
+    // delivery bound after terminal observation.
+    let result = run_with_deadline(&mut command, Duration::from_secs(5));
     #[cfg(target_os = "macos")]
     let delivery = delivery.finish();
     #[cfg(not(target_os = "macos"))]

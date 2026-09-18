@@ -15,6 +15,8 @@ All notable user-visible changes to MemCordon are documented here.
   finished instead of claiming success.
 - Reports no longer accept a successful command result when the recorded
   execution details show that the command was never authorized to start.
+- Durable macOS report writes can use the unused portion of the bounded cleanup
+  reserve instead of failing after a separate shorter scheduling window.
 
 ### Added
 
