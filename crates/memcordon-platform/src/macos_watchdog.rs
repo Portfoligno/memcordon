@@ -702,6 +702,7 @@ pub fn run_attempt(
                                  stored: &mut Option<ChildTermination>,
                                  root,
                                  known: &mut HashSet<ProcessIdentity>,
+                                 inventory_query: &mut Option<u64>,
                                  signal,
                                  grace,
                                  deadline| {
@@ -711,6 +712,7 @@ pub fn run_attempt(
             stored,
             root,
             known,
+            inventory_query,
             (signal, grace),
             deadline,
         )
@@ -846,6 +848,7 @@ pub fn run_attempt(
                                     &mut stored_status,
                                     root_pid,
                                     &mut known,
+                                    &mut inventory_query,
                                     if policy.limit_grace.is_zero() {
                                         libc::SIGKILL
                                     } else {
@@ -918,6 +921,7 @@ pub fn run_attempt(
                     &mut stored_status,
                     root_pid,
                     &mut known,
+                    &mut inventory_query,
                     if effective_grace.is_zero() {
                         libc::SIGKILL
                     } else {
@@ -958,6 +962,7 @@ pub fn run_attempt(
                 &mut stored_status,
                 root_pid,
                 &mut known,
+                &mut inventory_query,
                 libc::SIGKILL,
                 Duration::ZERO,
                 cleanup_budget(),
@@ -987,6 +992,7 @@ pub fn run_attempt(
                 &mut stored_status,
                 root_pid,
                 &mut known,
+                &mut inventory_query,
                 signal,
                 policy.signal_grace,
                 cleanup_budget(),
@@ -1024,6 +1030,7 @@ pub fn run_attempt(
                         &mut stored_status,
                         root_pid,
                         &mut known,
+                        &mut inventory_query,
                         completion_deadline,
                     )
                 };
@@ -1061,6 +1068,7 @@ pub fn run_attempt(
                     &mut stored_status,
                     root_pid,
                     &mut known,
+                    &mut inventory_query,
                     libc::SIGKILL,
                     Duration::ZERO,
                     cleanup_budget(),
@@ -1204,12 +1212,45 @@ fn termination_from_status(status: ExitStatus) -> ChildTermination {
     }
 }
 
+fn retirement_inventory(
+    guardian: &crate::macos_launch::Guardian,
+    inventory_query: &mut Option<u64>,
+    deadline: Instant,
+) -> Result<(Vec<ProcessSnapshot>, HashSet<ProcessIdentity>), String> {
+    if let Some(query) = *inventory_query {
+        loop {
+            match guardian.poll_inventory(query) {
+                Ok(Some((snapshots, identities, _))) => {
+                    *inventory_query = None;
+                    return Ok((snapshots, identities));
+                }
+                Ok(None) if Instant::now() < deadline => bounded_pause(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
+                Ok(None) => {
+                    return Err(
+                        "retirement deadline expired with an admitted inventory query pending"
+                            .into(),
+                    );
+                }
+                Err(error) => {
+                    *inventory_query = None;
+                    return Err(error);
+                }
+            }
+        }
+    }
+    guardian.inventory(deadline)
+}
+
 fn retire_workload(
     guardian: &crate::macos_launch::Guardian,
     child: &mut Child,
     stored: &mut Option<ChildTermination>,
     _root_pid: i32,
     known: &mut HashSet<ProcessIdentity>,
+    inventory_query: &mut Option<u64>,
     termination: (i32, Duration),
     retirement_deadline: Option<Instant>,
 ) -> CleanupSummary {
@@ -1221,15 +1262,19 @@ fn retire_workload(
     };
     let started = Instant::now();
     let deadline = retirement_deadline.unwrap_or_else(|| started + grace + CLEANUP_DEADLINE);
-    if let Err(error) = guardian.signal_stop(initial_signal, grace, deadline) {
-        summary.errors.push(CleanupErrorRecord {
-            operation: "guardian-stop".into(),
-            message: error.to_string(),
-        });
+    let abandon_inventory = *inventory_query;
+    match guardian.signal_stop_with_inventory(initial_signal, grace, deadline, abandon_inventory) {
+        Ok(()) => *inventory_query = None,
+        Err(error) => {
+            summary.errors.push(CleanupErrorRecord {
+                operation: "guardian-stop".into(),
+                message: error.to_string(),
+            });
+        }
     }
     let mut empty = false;
     while Instant::now() < deadline {
-        match guardian.inventory(deadline) {
+        match retirement_inventory(guardian, inventory_query, deadline) {
             Ok((snapshots, identities)) => {
                 *known = identities;
                 if snapshots.is_empty() {
@@ -1289,12 +1334,13 @@ fn cleanup_after_direct_exit(
     stored: &mut Option<ChildTermination>,
     root_pid: i32,
     known: &mut HashSet<ProcessIdentity>,
+    inventory_query: &mut Option<u64>,
     supervision_deadline: Option<Instant>,
 ) -> CleanupSummary {
     let deadline = supervision_deadline.map_or(Instant::now() + CLEANUP_DEADLINE, |deadline| {
         deadline.min(Instant::now() + CLEANUP_DEADLINE)
     });
-    match guardian.inventory(deadline) {
+    match retirement_inventory(guardian, inventory_query, deadline) {
         Ok((snapshots, _))
             if snapshots
                 .iter()
@@ -1312,6 +1358,7 @@ fn cleanup_after_direct_exit(
             stored,
             root_pid,
             known,
+            inventory_query,
             (libc::SIGKILL, Duration::ZERO),
             supervision_deadline,
         ),
@@ -1322,6 +1369,7 @@ fn cleanup_after_direct_exit(
                 stored,
                 root_pid,
                 known,
+                inventory_query,
                 (libc::SIGKILL, Duration::ZERO),
                 supervision_deadline,
             );

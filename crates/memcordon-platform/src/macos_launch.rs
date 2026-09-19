@@ -33,6 +33,8 @@ std::thread_local! {
     static RUNNING_GUARDIAN_LOSS_FAILURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static RUNNING_GUARDIAN_LOSS_AT: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
     static DELAY_NEXT_INVENTORY_RESPONSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ABANDONED_INVENTORY_QUERY: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static RETIREMENT_INVENTORY_QUERY: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Slots are reserved before spawn. Drop transfers an unreaped PID by one atomic
@@ -300,6 +302,7 @@ enum Message {
     SignalStop {
         signal: i32,
         force: u64,
+        abandon_inventory: Option<u64>,
     },
     RestoreSignal {
         settings: crate::macos_envelope::Settings,
@@ -1325,13 +1328,46 @@ impl Guardian {
         grace: Duration,
         deadline: Instant,
     ) -> io::Result<()> {
+        self.signal_stop_with_inventory(signal, grace, deadline, None)
+    }
+    pub(crate) fn signal_stop_with_inventory(
+        &self,
+        signal: i32,
+        grace: Duration,
+        deadline: Instant,
+        abandon_inventory: Option<u64>,
+    ) -> io::Result<()> {
         let force = crate::macos_deadline::add(crate::macos_deadline::continuous_nanos()?, grace)?;
-        self.channel
+        let mut channel = self
+            .channel
             .as_ref()
             .ok_or_else(|| io::Error::other("guardian lease unavailable"))?
             .lock()
-            .map_err(|_| io::Error::other("guardian channel poisoned"))?
-            .send(Message::SignalStop { signal, force }, deadline)
+            .map_err(|_| io::Error::other("guardian channel poisoned"))?;
+        if let Some(query) = abandon_inventory {
+            if channel.inventory_query != Some(query) {
+                return Err(io::Error::other(format!(
+                    "guardian inventory query {query} cannot be abandoned because it is not pending"
+                )));
+            }
+        }
+        channel.send(
+            Message::SignalStop {
+                signal,
+                force,
+                abandon_inventory,
+            },
+            deadline,
+        )?;
+        if abandon_inventory.is_some() && channel.inventory_query == abandon_inventory {
+            Self::clear_query(&mut channel);
+            #[cfg(feature = "test-support")]
+            {
+                ABANDONED_INVENTORY_QUERY.set(abandon_inventory);
+                RETIREMENT_INVENTORY_QUERY.set(None);
+            }
+        }
+        Ok(())
     }
     fn begin_query(
         &self,
@@ -1345,6 +1381,11 @@ impl Guardian {
             .ok_or("guardian lease unavailable")?
             .lock()
             .map_err(|_| "guardian channel poisoned")?;
+        if let Some(pending) = channel.inventory_query {
+            return Err(format!(
+                "guardian inventory query {pending} is already pending"
+            ));
+        }
         let query = channel.sent;
         channel
             .send(
@@ -1354,6 +1395,10 @@ impl Guardian {
             .map_err(|error| {
                 format!("send guardian inventory query {query} ({metric:?}): {error}")
             })?;
+        #[cfg(feature = "test-support")]
+        if ABANDONED_INVENTORY_QUERY.get().is_some() && RETIREMENT_INVENTORY_QUERY.get().is_none() {
+            RETIREMENT_INVENTORY_QUERY.set(Some(query));
+        }
         channel.inventory_query = Some(query);
         channel.inventory_metric = metric;
         channel.inventory_payload.clear();
@@ -1491,6 +1536,11 @@ impl Guardian {
         let mut channel = shared
             .lock()
             .map_err(|_| io::Error::other("guardian channel poisoned"))?;
+        if let Some(query) = channel.inventory_query {
+            return Err(io::Error::other(format!(
+                "guardian inventory query {query} remains pending at disarm"
+            )));
+        }
         let retirement = continuous_deadline(deadline)?;
         channel.send(Message::Disarm { retirement }, deadline)?;
         channel.expect(Message::Retired, deadline)?;
@@ -1989,8 +2039,14 @@ fn launch_configured(
                             if let (Some(signal), Some(force)) =
                                 (signal.and_then(|signal| signal.take()), cancellation_force)
                             {
-                                let _ = channel
-                                    .send(Message::SignalStop { signal, force }, cleanup_deadline);
+                                let _ = channel.send(
+                                    Message::SignalStop {
+                                        signal,
+                                        force,
+                                        abandon_inventory: None,
+                                    },
+                                    cleanup_deadline,
+                                );
                             }
                         }
                         if channel.invalidated {
@@ -2996,6 +3052,13 @@ fn guardian_main(
                 if !lane.pending {
                     continue;
                 }
+                #[cfg(feature = "test-support")]
+                if index == 0
+                    && frontend_inspection.is_some()
+                    && delay_inventory_until.is_some_and(|until| Instant::now() < until)
+                {
+                    continue;
+                }
                 match lane.poll() {
                     Ok(Some((mut result, identities, sample))) => {
                         if index == 1 {
@@ -3095,10 +3158,6 @@ fn guardian_main(
             if let Some(output) = &mut inventory_output {
                 #[cfg(feature = "test-support")]
                 let response_delayed = {
-                    if delay_inventory_response {
-                        delay_inventory_until = Some(Instant::now() + Duration::from_millis(300));
-                        delay_inventory_response = false;
-                    }
                     delay_inventory_until.is_some_and(|until| {
                         if Instant::now() < until {
                             true
@@ -3174,6 +3233,12 @@ fn guardian_main(
                             #[cfg(feature = "test-support")]
                             Message::DisableWorkTimer => timer_disabled = true,
                             Message::InventoryQuery { query, metric } => {
+                                #[cfg(feature = "test-support")]
+                                if delay_inventory_response {
+                                    delay_inventory_until =
+                                        Some(Instant::now() + Duration::from_millis(1200));
+                                    delay_inventory_response = false;
+                                }
                                 if empty {
                                     inventory_output = Some(InventoryOutput::new(
                                         query,
@@ -3184,16 +3249,30 @@ fn guardian_main(
                                 }
                             }
                             Message::Heartbeat => {}
-                            Message::SignalStop { signal, force }
-                                if matches!(
-                                    signal,
-                                    libc::SIGKILL
-                                        | libc::SIGTERM
-                                        | libc::SIGINT
-                                        | libc::SIGHUP
-                                        | libc::SIGQUIT
-                                ) =>
+                            Message::SignalStop {
+                                signal,
+                                force,
+                                abandon_inventory,
+                            } if matches!(
+                                signal,
+                                libc::SIGKILL
+                                    | libc::SIGTERM
+                                    | libc::SIGINT
+                                    | libc::SIGHUP
+                                    | libc::SIGQUIT
+                            ) =>
                             {
+                                if let Some(query) = abandon_inventory {
+                                    if frontend_inspection
+                                        .is_some_and(|(pending, _)| pending == query)
+                                    {
+                                        frontend_inspection = None;
+                                        #[cfg(feature = "test-support")]
+                                        {
+                                            delay_inventory_until = None;
+                                        }
+                                    }
+                                }
                                 if terminal.is_none() {
                                     terminal = Some(now);
                                     force_at = Some(work.map_or(force, |expiry| {
@@ -3746,7 +3825,7 @@ pub fn delayed_inventory_response(image: &Path) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    if delayed.elapsed() < Duration::from_millis(300) {
+    if delayed.elapsed() < Duration::from_millis(1200) {
         return Err("inventory delay hook did not fire".into());
     }
     let sent_after = launch
@@ -3775,18 +3854,48 @@ pub fn delayed_inventory_response(image: &Path) -> Result<(), String> {
 }
 
 #[cfg(feature = "test-support")]
-pub fn delayed_inventory_deadline(image: &Path, fixture: &Path) -> Result<(), String> {
+fn run_delayed_inventory(
+    policy: memcordon_core::Policy,
+    command: &CommandSpec,
+    image: &Path,
+) -> Result<crate::backend::Execution, String> {
     DELAY_NEXT_INVENTORY_RESPONSE.set(true);
+    let result = (|| {
+        let origin = crate::macos_continuous_nanos().map_err(|error| error.to_string())?;
+        let snapshot = crate::CallerSignalSnapshot::capture().map_err(|error| error.to_string())?;
+        let cancellation = crate::CancellationHandle::new();
+        crate::supervisor::MacosExecutionContext::host_managed(origin, snapshot, cancellation)
+            .map_err(|error| error.to_string())?
+            .run(policy, command, image)
+            .map_err(|error| error.to_string())
+    })();
+    DELAY_NEXT_INVENTORY_RESPONSE.set(false);
+    result
+}
+
+#[cfg(feature = "test-support")]
+pub fn delayed_inventory_deadline(image: &Path, fixture: &Path) -> Result<(), String> {
+    ABANDONED_INVENTORY_QUERY.set(None);
+    RETIREMENT_INVENTORY_QUERY.set(None);
     let started = Instant::now();
-    let result = crate::run(
+    let result = run_delayed_inventory(
         memcordon_core::Policy::unbounded()
-            .with_deadline(Duration::from_millis(100))
+            .with_deadline(Duration::from_millis(500))
             .map_err(|error| error.to_string())?,
         &CommandSpec::new(fixture).args(["hold", "--duration", "5s"]),
         image,
     );
-    DELAY_NEXT_INVENTORY_RESPONSE.set(false);
-    let execution = result.map_err(|error| error.to_string())?;
+    let abandoned = ABANDONED_INVENTORY_QUERY.replace(None);
+    let retirement = RETIREMENT_INVENTORY_QUERY.replace(None);
+    let execution = result?;
+    let (Some(abandoned), Some(retirement)) = (abandoned, retirement) else {
+        return Err("deadline cleanup did not hand off the pending inventory query".into());
+    };
+    if abandoned == retirement {
+        return Err(format!(
+            "deadline cleanup reused abandoned inventory query {abandoned}"
+        ));
+    }
     if started.elapsed() >= Duration::from_secs(2) {
         return Err(format!(
             "deadline handling waited for delayed inventory: {:?}",
@@ -3813,17 +3922,14 @@ pub fn delayed_inventory_deadline(image: &Path, fixture: &Path) -> Result<(), St
 
 #[cfg(feature = "test-support")]
 pub fn delayed_inventory_completion(image: &Path, fixture: &Path) -> Result<(), String> {
-    DELAY_NEXT_INVENTORY_RESPONSE.set(true);
     let started = Instant::now();
-    let result = crate::run(
+    let execution = run_delayed_inventory(
         memcordon_core::Policy::unbounded(),
         &CommandSpec::new(fixture).args(["hold", "--duration", "50ms"]),
         image,
-    );
-    DELAY_NEXT_INVENTORY_RESPONSE.set(false);
-    let execution = result.map_err(|error| error.to_string())?;
+    )?;
     let elapsed = started.elapsed();
-    if elapsed < Duration::from_millis(300) || elapsed >= Duration::from_secs(2) {
+    if elapsed < Duration::from_millis(1200) || elapsed >= Duration::from_secs(2) {
         return Err(format!(
             "completion did not cross the delayed inventory response: {elapsed:?}"
         ));
@@ -3985,6 +4091,7 @@ pub fn expired_control_request_preserves_retirement() -> Result<(), String> {
         let stop = || Message::SignalStop {
             signal: libc::SIGKILL,
             force: 0,
+            abandon_inventory: None,
         };
         sender.send(stop(), deadline)?;
         receiver.expect(stop(), deadline)?;
