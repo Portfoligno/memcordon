@@ -649,3 +649,74 @@ fn ci_concurrency_separates_trigger_methods() {
     )
     .expect_err("CI concurrency without the trigger method must be rejected");
 }
+
+#[test]
+fn artifact_upload_action_retries_exactly_and_fails_closed() {
+    let exact =
+        include_str!("../../../.github/actions/upload-artifact/action.yml").replace("\r\n", "\n");
+    policy::validate_upload_artifact_action_bytes(exact.as_bytes())
+        .expect("the bounded artifact upload action should pass");
+
+    let retry_two = exact
+        .find("    - id: retry-two\n")
+        .expect("final retry fixture must be present");
+    let missing_final = &exact[..retry_two];
+    policy::validate_upload_artifact_action_bytes(missing_final.as_bytes())
+        .expect_err("a missing final retry must be rejected");
+
+    for (name, source, replacement) in [
+        (
+            "pin",
+            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+            "actions/upload-artifact@0000000000000000000000000000000000000000",
+        ),
+        (
+            "retry condition",
+            "steps.initial.outcome == 'failure'",
+            "steps.initial.conclusion == 'failure'",
+        ),
+        (
+            "retry overwrite",
+            "        overwrite: true\n",
+            "        overwrite: false\n",
+        ),
+        (
+            "input forwarding",
+            "        path: ${{ inputs.path }}\n",
+            "        path: ${{ inputs.name }}\n",
+        ),
+        (
+            "final failure",
+            "    - id: retry-two\n      if:",
+            "    - id: retry-two\n      continue-on-error: true\n      if:",
+        ),
+    ] {
+        let invalid = exact.replacen(source, replacement, 1);
+        assert_ne!(invalid, exact, "{name} mutation must apply");
+        policy::validate_upload_artifact_action_bytes(invalid.as_bytes())
+            .expect_err("artifact upload retry mutation must be rejected");
+    }
+}
+
+#[test]
+fn every_workflow_upload_uses_the_bounded_action() {
+    let workflows = [
+        include_str!("../../../.github/workflows/ci.yml"),
+        include_str!("../../../.github/workflows/deep-ci.yml"),
+        include_str!("../../../.github/workflows/backend-certification.yml"),
+        include_str!("../../../.github/workflows/release.yml"),
+    ];
+    let local = "uses: ./.github/actions/upload-artifact";
+    let direct = "uses: actions/upload-artifact@";
+    let count: usize = workflows
+        .iter()
+        .map(|workflow| {
+            assert!(
+                !workflow.contains(direct),
+                "workflow bypasses the bounded artifact upload action"
+            );
+            workflow.matches(local).count()
+        })
+        .sum();
+    assert_eq!(count, 53, "workflow artifact upload inventory differs");
+}

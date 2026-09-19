@@ -13,6 +13,10 @@ use crate::{CiError, Result};
 
 pub const MAXIMUM_YAML_BYTES: usize = 1_048_576;
 pub const MAXIMUM_YAML_DEPTH: usize = 64;
+const UPLOAD_ARTIFACT_ACTION: &str = "./.github/actions/upload-artifact";
+const PINNED_UPLOAD_ARTIFACT_ACTION: &str =
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+const UPLOAD_ARTIFACT_ACTION_PATH: &str = ".github/actions/upload-artifact/action.yml";
 
 fn failure(message: impl Into<String>) -> CiError {
     CiError::Message(message.into())
@@ -166,6 +170,176 @@ fn exact_mapping_keys(mapping: &Mapping, expected: &[&str], context: &str) -> Re
         )));
     }
     Ok(())
+}
+
+pub fn validate_upload_artifact_action_bytes(bytes: &[u8]) -> Result<()> {
+    let action = parse_yaml(bytes)?;
+    let action = mapping(&action, "artifact upload action")?;
+    exact_mapping_keys(
+        action,
+        &["name", "description", "inputs", "runs"],
+        "artifact upload action",
+    )?;
+    if scalar(action, "name").is_none() || scalar(action, "description").is_none() {
+        return Err(failure("artifact upload action metadata is incomplete"));
+    }
+
+    let inputs = mapping(
+        action
+            .get(key("inputs"))
+            .ok_or_else(|| failure("artifact upload action inputs are absent"))?,
+        "artifact upload action inputs",
+    )?;
+    exact_mapping_keys(
+        inputs,
+        &[
+            "name",
+            "path",
+            "if-no-files-found",
+            "retention-days",
+            "compression-level",
+            "include-hidden-files",
+        ],
+        "artifact upload action inputs",
+    )?;
+    for (name, default) in [
+        ("name", "artifact"),
+        ("if-no-files-found", "warn"),
+        ("retention-days", "0"),
+        ("compression-level", "6"),
+        ("include-hidden-files", "false"),
+    ] {
+        let input = mapping(
+            inputs
+                .get(key(name))
+                .ok_or_else(|| failure(format!("artifact upload action {name} input absent")))?,
+            "artifact upload action input",
+        )?;
+        exact_mapping_keys(input, &["description", "default"], "artifact upload input")?;
+        if scalar(input, "description").is_none() || scalar(input, "default") != Some(default) {
+            return Err(failure(format!(
+                "artifact upload action {name} input differs"
+            )));
+        }
+    }
+    let path = mapping(
+        inputs
+            .get(key("path"))
+            .ok_or_else(|| failure("artifact upload action path input absent"))?,
+        "artifact upload path input",
+    )?;
+    exact_mapping_keys(
+        path,
+        &["description", "required"],
+        "artifact upload path input",
+    )?;
+    if scalar(path, "description").is_none()
+        || path.get(key("required")).and_then(Value::as_bool) != Some(true)
+    {
+        return Err(failure("artifact upload action path must be required"));
+    }
+
+    let runs = mapping(
+        action
+            .get(key("runs"))
+            .ok_or_else(|| failure("artifact upload action runs are absent"))?,
+        "artifact upload action runs",
+    )?;
+    exact_mapping_keys(runs, &["using", "steps"], "artifact upload action runs")?;
+    if scalar(runs, "using") != Some("composite") {
+        return Err(failure("artifact upload action must be composite"));
+    }
+    let steps = runs
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("artifact upload action steps are absent"))?;
+    if steps.len() != 3 {
+        return Err(failure(
+            "artifact upload action must make exactly three attempts",
+        ));
+    }
+    let attempts = [
+        ("initial", None, true, false),
+        (
+            "retry-one",
+            Some("${{ steps.initial.outcome == 'failure' }}"),
+            true,
+            true,
+        ),
+        (
+            "retry-two",
+            Some(
+                "${{ steps.initial.outcome == 'failure' && steps.retry-one.outcome == 'failure' }}",
+            ),
+            false,
+            true,
+        ),
+    ];
+    for (value, (id, condition, continue_on_error, overwrite)) in steps.iter().zip(attempts) {
+        let step = mapping(value, "artifact upload attempt")?;
+        let expected_keys = if condition.is_none() {
+            &["id", "continue-on-error", "uses", "with"][..]
+        } else if continue_on_error {
+            &["id", "if", "continue-on-error", "uses", "with"][..]
+        } else {
+            &["id", "if", "uses", "with"][..]
+        };
+        exact_mapping_keys(step, expected_keys, "artifact upload attempt")?;
+        if scalar(step, "id") != Some(id)
+            || scalar(step, "if") != condition
+            || scalar(step, "uses") != Some(PINNED_UPLOAD_ARTIFACT_ACTION)
+            || step
+                .get(key("continue-on-error"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                != continue_on_error
+        {
+            return Err(failure(format!("artifact upload {id} attempt differs")));
+        }
+        let with = mapping(
+            step.get(key("with"))
+                .ok_or_else(|| failure("artifact upload attempt inputs absent"))?,
+            "artifact upload attempt inputs",
+        )?;
+        exact_mapping_keys(
+            with,
+            &[
+                "name",
+                "path",
+                "if-no-files-found",
+                "retention-days",
+                "compression-level",
+                "include-hidden-files",
+                "overwrite",
+            ],
+            "artifact upload attempt inputs",
+        )?;
+        for input in [
+            "name",
+            "path",
+            "if-no-files-found",
+            "retention-days",
+            "compression-level",
+            "include-hidden-files",
+        ] {
+            let expected = format!("${{{{ inputs.{input} }}}}");
+            if scalar(with, input) != Some(expected.as_str()) {
+                return Err(failure(format!(
+                    "artifact upload {id} does not forward {input}"
+                )));
+            }
+        }
+        if with.get(key("overwrite")).and_then(Value::as_bool) != Some(overwrite) {
+            return Err(failure(format!(
+                "artifact upload {id} overwrite policy differs"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_upload_artifact_action(root: &Path) -> Result<()> {
+    validate_upload_artifact_action_bytes(&fs::read(root.join(UPLOAD_ARTIFACT_ACTION_PATH))?)
 }
 
 fn exact_string_sequence(value: &Value, expected: &[&str], context: &str) -> Result<()> {
@@ -752,8 +926,7 @@ fn check_macos_deadline_job(jobs: &Mapping, name: &str) -> Result<()> {
                 }
                 target_cache = true;
             }
-            if scalar(step, "uses")
-                .is_some_and(|value| value.starts_with("actions/upload-artifact@"))
+            if scalar(step, "uses") == Some(UPLOAD_ARTIFACT_ACTION)
                 && scalar(with, "path") == Some("target/ci/deadline-evidence")
                 && scalar(step, "if") == Some("always()")
             {
@@ -857,14 +1030,8 @@ fn check_standard_certification_job(
         ),
         ("run", "rustup toolchain install 1.97.1 --profile minimal"),
         ("run", ""),
-        (
-            "uses",
-            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-        ),
-        (
-            "uses",
-            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-        ),
+        ("uses", "./.github/actions/upload-artifact"),
+        ("uses", "./.github/actions/upload-artifact"),
         (
             "uses",
             "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
@@ -1063,10 +1230,7 @@ fn check_standard_certification_job(
             return Err(failure("standard cache save identity differs"));
         }
     }
-    let uploads = action_steps(
-        steps,
-        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-    )?;
+    let uploads = action_steps(steps, "./.github/actions/upload-artifact")?;
     if uploads.len() != 2 {
         return Err(failure("standard evidence upload inventory differs"));
     }
@@ -1247,7 +1411,7 @@ fn check_certification_job(
     let checkout_action = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
     let restore_action = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
     let save_action = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
-    let upload_action = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+    let upload_action = "./.github/actions/upload-artifact";
     let download_action = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
 
     let checkouts = action_steps(steps, checkout_action)?;
@@ -1635,7 +1799,7 @@ fn check_split_windows_job(job: &Mapping, contract: SplitWindowsJobContract<'_>)
     let checkout_action = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
     let restore_action = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
     let save_action = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
-    let upload_action = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+    let upload_action = "./.github/actions/upload-artifact";
     let download_action = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
     if action_steps(steps, checkout_action)?.len() != contract.checkout_count
         || action_steps(steps, restore_action)?.len() != 2
@@ -2349,10 +2513,7 @@ fn check_release_structure(
             "run",
             "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release assemble",
         ),
-        (
-            "uses",
-            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-        ),
+        ("uses", "./.github/actions/upload-artifact"),
     ];
     if assemble_steps.len() != expected_steps.len() {
         return Err(failure("release assemble step inventory differs"));
@@ -2378,7 +2539,7 @@ fn check_release_structure(
                 ));
             }
         }
-        if expected.starts_with("actions/upload-artifact@") {
+        if expected == UPLOAD_ARTIFACT_ACTION {
             let inputs = mapping(
                 step.get(key("with"))
                     .ok_or_else(|| failure("assemble upload inputs absent"))?,
@@ -2687,6 +2848,12 @@ fn validate_workflow_bytes_into(
             return Err(failure("action pin manifest contains an incomplete entry"));
         }
     }
+    check_upload_artifact_action(root)?;
+    if !allowed_actions.contains(PINNED_UPLOAD_ARTIFACT_ACTION) {
+        return Err(failure(
+            "artifact upload action pin is absent from the pin manifest",
+        ));
+    }
     let jobs = mapping(
         workflow
             .get(key("jobs"))
@@ -2765,7 +2932,8 @@ fn validate_workflow_bytes_into(
                 let uses = value
                     .as_str()
                     .ok_or_else(|| failure("workflow uses must be a scalar string"))?;
-                if !allowed_actions.contains(uses) {
+                let local_upload = uses == UPLOAD_ARTIFACT_ACTION;
+                if !local_upload && !allowed_actions.contains(uses) {
                     return Err(failure(format!(
                         "workflow action is not exactly pinned: {uses}"
                     )));
@@ -2786,7 +2954,14 @@ fn validate_workflow_bytes_into(
                         }
                     }
                 }
-                used_actions.insert(uses.to_owned());
+                used_actions.insert(
+                    if local_upload {
+                        PINNED_UPLOAD_ARTIFACT_ACTION
+                    } else {
+                        uses
+                    }
+                    .to_owned(),
+                );
                 if uses.starts_with("actions/cache/") {
                     let Some(with) = step
                         .get(key("with"))

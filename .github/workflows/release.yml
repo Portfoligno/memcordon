@@ -55,7 +55,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -74,7 +74,7 @@ jobs:
             target/ci/standard-backend
           key: managed-v2-cargo-target-release-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-push-${{ steps.source-push.outputs.commit }}-dispatch-${{ steps.source-dispatch.outputs.commit }}-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-cgroup
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: ./.github/actions/upload-artifact
         with:
           name: release-certification-standard-linux-x64
           path: target/ci/reports/standard/linux-x64/backend-linux-cgroup-v2.json
@@ -82,7 +82,7 @@ jobs:
           retention-days: 14
           compression-level: 0
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: diagnostics-standard-linux-x64
           path: target/ci/standard-diagnostics/linux-x64
@@ -144,7 +144,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -163,7 +163,7 @@ jobs:
             target/ci/standard-backend
           key: managed-v2-cargo-target-release-standard-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-push-${{ steps.source-push.outputs.commit }}-dispatch-${{ steps.source-dispatch.outputs.commit }}-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/**') }}
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-job
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: ./.github/actions/upload-artifact
         with:
           name: release-certification-standard-windows-x64
           path: target/ci/reports/standard/windows-x64/backend-windows-job-object.json
@@ -171,7 +171,7 @@ jobs:
           retention-days: 14
           compression-level: 0
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: diagnostics-standard-windows-x64
           path: target/ci/standard-diagnostics/windows-x64
@@ -231,7 +231,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -335,7 +335,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -352,7 +352,7 @@ jobs:
           path: target/ci/release-native
           key: managed-v2-cargo-target-release-v1-native-${{ matrix.id }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'rust-toolchain.toml', '.github/workflows/release.yml') }}
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-native
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: ./.github/actions/upload-artifact
         with:
           name: release-native-${{ matrix.id }}
           path: target/ci/release-output
@@ -402,7 +402,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -454,7 +454,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -525,7 +525,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -546,7 +546,7 @@ jobs:
           key: managed-v2-cargo-target-release-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: release-certification-linux
           path: target/ci/reports/linux-sealed-v2
@@ -620,7 +620,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -641,7 +641,7 @@ jobs:
           key: managed-v2-cargo-target-release-windows-loader-production-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'docs/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: release-windows-loader-production-${{ matrix.id }}
           path: target/ci/reports/windows-sealed-v2/loader-production
@@ -718,7 +718,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -739,7 +739,7 @@ jobs:
           key: managed-v2-cargo-target-release-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'docs/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: release-windows-provider-lifecycle-${{ matrix.id }}
           path: target/ci/reports/windows-sealed-v2/provider-lifecycle
@@ -820,7 +820,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -844,7 +844,7 @@ jobs:
           CARGO_TARGET_DIR: target/ci/windows-sealed-cargo/build
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: release-windows-package-channel-${{ matrix.id }}
           path: target/ci/windows-sealed-cargo
@@ -915,7 +915,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -938,14 +938,14 @@ jobs:
           key: managed-v2-cargo-target-release-macos-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-push-${{ steps.source-push.outputs.commit }}-dispatch-${{ steps.source-dispatch.outputs.commit }}-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'MAINTAINERS.md', 'rust-toolchain.toml', '.cargo/**', '.github/**') }}
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-macos
       - if: matrix.id == 'arm64'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: release-acceptance-macos-arm64
           path: target/ci/reports/backend-macos-watchdog.json
           if-no-files-found: error
           retention-days: 14
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: release-deadline-macos-${{ matrix.id }}
           path: target/ci/deadline-evidence
@@ -1012,7 +1012,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -1023,7 +1023,7 @@ jobs:
           retention-days: 14
           compression-level: 0
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release assemble
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: ./.github/actions/upload-artifact
         with:
           name: release-bundle
           path: target/ci/release-bundle
@@ -1146,7 +1146,7 @@ jobs:
         run: target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 4
       - name: Upload publication evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: release-publication-evidence
           path: target/ci/publication-evidence/publication-evidence.json
@@ -1158,7 +1158,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: ./.github/actions/upload-artifact
         with:
           name: release-publication-report
           path: target/ci/release-bundle/publication-report.json
@@ -1220,7 +1220,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
