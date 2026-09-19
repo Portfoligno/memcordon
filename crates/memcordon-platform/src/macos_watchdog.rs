@@ -831,16 +831,18 @@ pub fn run_attempt(
                 Err(error) => inventory_result = Some(Err(error)),
             }
         }
-        if !inventory_was_pending && let Some(query) = inventory_query {
-            match guardian.poll_inventory(query) {
-                Ok(Some(inventory)) => {
-                    inventory_query = None;
-                    inventory_result = Some(Ok(inventory));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    inventory_query = None;
-                    inventory_result = Some(Err(error));
+        if !inventory_was_pending {
+            if let Some(query) = inventory_query {
+                match guardian.poll_inventory(query) {
+                    Ok(Some(inventory)) => {
+                        inventory_query = None;
+                        inventory_result = Some(Ok(inventory));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        inventory_query = None;
+                        inventory_result = Some(Err(error));
+                    }
                 }
             }
         }
