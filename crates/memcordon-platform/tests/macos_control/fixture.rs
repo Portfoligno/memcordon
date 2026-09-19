@@ -66,26 +66,11 @@ pub fn buffered_child_status_does_not_delay_inventory() {
         frontend.input.extend_from_slice(&bytes);
     }
 
-    frontend
-        .expect(
-            Message::InventoryChunk {
-                query: 1,
-                bytes: vec![1, 2],
-                finished: false,
-            },
-            deadline,
-        )
-        .unwrap();
-    frontend
-        .expect(
-            Message::InventoryChunk {
-                query: 1,
-                bytes: vec![3, 4],
-                finished: true,
-            },
-            deadline,
-        )
-        .unwrap();
+    assert_eq!(frontend.receive_available().unwrap(), None);
+    assert_eq!(frontend.receive_available().unwrap(), None);
+    assert_eq!(frontend.receive_available().unwrap(), None);
+    assert_eq!(frontend.inventory_payload, vec![1, 2, 3, 4]);
+    assert!(frontend.inventory_finished);
     assert_eq!(frontend.poll_child_status(false).unwrap(), Some(37 << 8));
     assert_eq!(frontend.reaped_status, None);
     assert!(!frontend.child_status_pending);
@@ -204,7 +189,15 @@ pub fn delayed_child_status_cannot_be_confused_with_inventory() {
         finished: true,
     };
     guardian.send(reply(), deadline).unwrap();
-    frontend.expect(reply(), deadline).unwrap();
+    let Some(Some(Message::ForceRequested { at })) = frontend.receive_available().unwrap() else {
+        panic!("force receipt missing before delayed inventory response");
+    };
+    frontend
+        .force_receipt
+        .store(at, std::sync::atomic::Ordering::Release);
+    assert_eq!(frontend.receive_available().unwrap(), None);
+    assert_eq!(frontend.receive_available().unwrap(), None);
+    assert!(frontend.inventory_finished);
     assert_eq!(frontend.force_receipt.load(Ordering::Acquire), 42);
     assert_eq!(frontend.poll_child_status(false).unwrap(), Some(0));
     assert_eq!(frontend.poll_child_status(true).unwrap(), None);

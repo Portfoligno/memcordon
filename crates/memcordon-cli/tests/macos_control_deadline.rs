@@ -19,6 +19,32 @@ fn heartbeat_retains_the_inspection_deadline() {
 }
 
 #[test]
+fn admitted_inventory_retains_the_retirement_reserve() {
+    memcordon_platform::test_support::macos_delayed_inventory_response(Path::new(env!(
+        "CARGO_BIN_EXE_memcordon"
+    )))
+    .unwrap();
+}
+
+#[test]
+fn admitted_inventory_does_not_delay_the_work_deadline() {
+    memcordon_platform::test_support::macos_delayed_inventory_deadline(
+        Path::new(env!("CARGO_BIN_EXE_memcordon")),
+        Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture")),
+    )
+    .unwrap();
+}
+
+#[test]
+fn admitted_inventory_preserves_natural_completion() {
+    memcordon_platform::test_support::macos_delayed_inventory_completion(
+        Path::new(env!("CARGO_BIN_EXE_memcordon")),
+        Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture")),
+    )
+    .unwrap();
+}
+
+#[test]
 fn observed_status_retains_the_retirement_reserve() {
     memcordon_platform::test_support::macos_delayed_observed_status(Path::new(env!(
         "CARGO_BIN_EXE_memcordon"

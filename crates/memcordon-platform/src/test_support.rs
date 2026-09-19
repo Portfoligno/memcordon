@@ -78,6 +78,12 @@ pub use crate::macos_launch::control_flood as macos_control_flood;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::delayed_heartbeat as macos_delayed_heartbeat;
 #[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_inventory_completion as macos_delayed_inventory_completion;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_inventory_deadline as macos_delayed_inventory_deadline;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_inventory_response as macos_delayed_inventory_response;
+#[cfg(target_os = "macos")]
 pub use crate::macos_launch::delayed_observed_status as macos_delayed_observed_status;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::delayed_reaped_status as macos_delayed_reaped_status;

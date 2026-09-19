@@ -716,6 +716,7 @@ pub fn run_attempt(
         )
     };
     let mut command_exit_grace_started = None;
+    let mut inventory_query = None;
     let mut outcome = loop {
         let inspection_deadline =
             policy
@@ -737,6 +738,7 @@ pub fn run_attempt(
             Ok(Some(status)) => {
                 if policy.lifetime == Lifetime::Command {
                     completion = Some(status);
+                    command_exit_grace_started.get_or_insert_with(Instant::now);
                 }
             }
             Ok(None) => {}
@@ -744,10 +746,58 @@ pub fn run_attempt(
                 cycle_error = Some(error);
             }
         }
-        match guardian
-            .inventory_with_metric(policy.memory.map(|_| policy.metric), inspection_deadline)
-        {
-            Ok((snapshots, identities, sample)) => {
+        // The sampling deadline controls admission. Once admitted, retain one
+        // transaction across watchdog turns so host signals and native work
+        // deadlines remain responsive while inspectors finish within the fixed
+        // retirement reserve. Never replace a pending query with a retry.
+        let mut inventory_result = None;
+        if inventory_query.is_none() {
+            let inventory_response_deadline = inspection_deadline
+                .checked_add(CLEANUP_DEADLINE)
+                .expect("fixed inventory response reserve is representable");
+            let inventory_response_deadline = if let Some(expiry) = work_expiry {
+                let now = crate::macos_deadline::continuous_nanos().map_err(|error| {
+                    Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+                })?;
+                let retirement = crate::macos_deadline::add(
+                    crate::macos_deadline::add(expiry, policy.limit_grace).map_err(|error| {
+                        Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+                    })?,
+                    CLEANUP_DEADLINE,
+                )
+                .map_err(|error| {
+                    Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+                })?;
+                inventory_response_deadline
+                    .min(Instant::now() + Duration::from_nanos(retirement.saturating_sub(now)))
+            } else {
+                inventory_response_deadline
+            };
+            match guardian.begin_inventory_with_metric(
+                policy.memory.map(|_| policy.metric),
+                inspection_deadline,
+                inventory_response_deadline,
+            ) {
+                Ok(query) => inventory_query = Some(query),
+                Err(error) => inventory_result = Some(Err(error)),
+            }
+        }
+        if let Some(query) = inventory_query {
+            match guardian.poll_inventory(query) {
+                Ok(Some(inventory)) => {
+                    inventory_query = None;
+                    inventory_result = Some(Ok(inventory));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    inventory_query = None;
+                    inventory_result = Some(Err(error));
+                }
+            }
+        }
+        match inventory_result {
+            None => {}
+            Some(Ok((snapshots, identities, sample))) => {
                 known = identities;
                 workload_empty = snapshots.is_empty();
                 if policy.lifetime == Lifetime::Workload
@@ -825,7 +875,7 @@ pub fn run_attempt(
                     }
                 }
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 if cycle_error.is_none() {
                     cycle_error = Some(error);
                 }
@@ -948,7 +998,7 @@ pub fn run_attempt(
             };
         }
 
-        if let Some(status) = completion {
+        if let Some(status) = completion.filter(|_| inventory_query.is_none()) {
             let completed = if policy.lifetime == Lifetime::Workload || workload_empty {
                 workload_empty
             } else if policy.command_exit_grace.is_zero() {

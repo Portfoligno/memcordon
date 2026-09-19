@@ -32,6 +32,7 @@ std::thread_local! {
     static RUNNING_GUARDIAN_LOSS: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static RUNNING_GUARDIAN_LOSS_FAILURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static RUNNING_GUARDIAN_LOSS_AT: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static DELAY_NEXT_INVENTORY_RESPONSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Slots are reserved before spawn. Drop transfers an unreaped PID by one atomic
@@ -266,6 +267,8 @@ enum Message {
     DelayReapedStatus,
     #[cfg(feature = "test-support")]
     DelayObservedStatus,
+    #[cfg(feature = "test-support")]
+    DelayInventoryResponse,
     Configure {
         image: Vec<u8>,
         boot_identity: String,
@@ -363,6 +366,10 @@ struct Channel {
     received: u64,
     input: Vec<u8>,
     inventory_query: Option<u64>,
+    inventory_metric: Option<memcordon_core::Metric>,
+    inventory_payload: Vec<u8>,
+    inventory_finished: bool,
+    inventory_deadline: Option<Instant>,
     child_status_pending: bool,
     observed_status: Option<i32>,
     reaped_status: Option<i32>,
@@ -495,6 +502,10 @@ impl Channel {
             received: 0,
             input: Vec::new(),
             inventory_query: None,
+            inventory_metric: None,
+            inventory_payload: Vec::new(),
+            inventory_finished: false,
+            inventory_deadline: None,
             child_status_pending: false,
             observed_status: None,
             reaped_status: None,
@@ -542,8 +553,7 @@ impl Channel {
                     .compare_exchange(0, at, Ordering::AcqRel, Ordering::Acquire)
                     .ok();
             }
-            Some(Some(Message::InventoryChunk { query, .. }))
-                if self.inventory_query != Some(query) => {}
+            Some(Some(Message::InventoryChunk { .. })) => {}
             Some(Some(Message::FailureDetail { message })) => {
                 return Err(io::Error::other(message));
             }
@@ -832,6 +842,26 @@ impl Channel {
                 return Ok(None);
             }
         }
+        if let Message::InventoryChunk {
+            query,
+            bytes,
+            finished,
+        } = &frame.message
+        {
+            if self.inventory_query == Some(*query) {
+                if bytes.len() > 512
+                    || self.inventory_payload.len().saturating_add(bytes.len())
+                        > INVENTORY_FRAME_LIMIT
+                {
+                    return Err(io::Error::other(
+                        "guardian inventory response exceeds bound",
+                    ));
+                }
+                self.inventory_payload.extend(bytes);
+                self.inventory_finished = *finished;
+                return Ok(None);
+            }
+        }
         Ok(Some(Some(frame.message)))
     }
     fn expect(&mut self, expected: Message, deadline: Instant) -> io::Result<()> {
@@ -909,6 +939,8 @@ impl Message {
             Self::DelayReapedStatus => "DelayReapedStatus",
             #[cfg(feature = "test-support")]
             Self::DelayObservedStatus => "DelayObservedStatus",
+            #[cfg(feature = "test-support")]
+            Self::DelayInventoryResponse => "DelayInventoryResponse",
             #[cfg(feature = "test-support")]
             Self::StallInspectors { .. } => "StallInspectors",
             #[cfg(feature = "test-support")]
@@ -1270,6 +1302,13 @@ pub(crate) struct Guardian {
     child: Child,
 }
 impl Guardian {
+    fn clear_query(channel: &mut Channel) {
+        channel.inventory_query = None;
+        channel.inventory_metric = None;
+        channel.inventory_payload.clear();
+        channel.inventory_finished = false;
+        channel.inventory_deadline = None;
+    }
     pub(crate) fn force_receipt(&self) -> io::Result<Arc<std::sync::atomic::AtomicU64>> {
         Ok(self
             .channel
@@ -1294,11 +1333,12 @@ impl Guardian {
             .map_err(|_| io::Error::other("guardian channel poisoned"))?
             .send(Message::SignalStop { signal, force }, deadline)
     }
-    fn query(
+    fn begin_query(
         &self,
         metric: Option<memcordon_core::Metric>,
-        deadline: Instant,
-    ) -> Result<InventoryReply, String> {
+        admission_deadline: Instant,
+        response_deadline: Instant,
+    ) -> Result<u64, String> {
         let mut channel = self
             .channel
             .as_ref()
@@ -1307,47 +1347,97 @@ impl Guardian {
             .map_err(|_| "guardian channel poisoned")?;
         let query = channel.sent;
         channel
-            .send(Message::InventoryQuery { query, metric }, deadline)
+            .send(
+                Message::InventoryQuery { query, metric },
+                admission_deadline,
+            )
             .map_err(|error| {
                 format!("send guardian inventory query {query} ({metric:?}): {error}")
             })?;
         channel.inventory_query = Some(query);
-        let result = (|| {
-            let mut payload = Vec::new();
-            loop {
-                if Instant::now() >= deadline {
+        channel.inventory_metric = metric;
+        channel.inventory_payload.clear();
+        channel.inventory_finished = false;
+        channel.inventory_deadline = Some(response_deadline);
+        Ok(query)
+    }
+    fn poll_query(&self, query: u64) -> Result<Option<InventoryReply>, String> {
+        let mut channel = self
+            .channel
+            .as_ref()
+            .ok_or("guardian lease unavailable")?
+            .lock()
+            .map_err(|_| "guardian channel poisoned")?;
+        if channel.inventory_query != Some(query) {
+            return Err(format!("guardian inventory query {query} is not pending"));
+        }
+        loop {
+            if channel.inventory_finished {
+                let payload = std::mem::take(&mut channel.inventory_payload);
+                Self::clear_query(&mut channel);
+                return serde_json::from_slice(&payload)
+                    .map(Some)
+                    .map_err(|error| error.to_string());
+            }
+            let response_deadline = channel
+                .inventory_deadline
+                .expect("pending inventory has an immutable response deadline");
+            if Instant::now() >= response_deadline {
+                let metric = channel.inventory_metric;
+                let received = channel.inventory_payload.len();
+                Self::clear_query(&mut channel);
+                return Err(format!(
+                    "guardian inventory query {query} ({metric:?}) deadline expired after {received} response bytes"
+                ));
+            }
+            let received_before = channel.received;
+            let received = match channel.receive_available() {
+                Ok(received) => received,
+                Err(error) => {
+                    let message = format!(
+                        "receive guardian inventory query {query} ({:?}): {error}",
+                        channel.inventory_metric
+                    );
+                    Self::clear_query(&mut channel);
+                    return Err(message);
+                }
+            };
+            match received {
+                Some(Some(Message::ForceRequested { at })) => {
+                    channel
+                        .force_receipt
+                        .compare_exchange(0, at, Ordering::AcqRel, Ordering::Acquire)
+                        .ok();
+                }
+                Some(Some(Message::InventoryChunk { .. })) => {}
+                Some(Some(Message::FailureDetail { message })) => {
+                    Self::clear_query(&mut channel);
+                    return Err(message);
+                }
+                Some(message) => {
+                    Self::clear_query(&mut channel);
                     return Err(format!(
-                        "guardian inventory query {query} ({metric:?}) deadline expired after {} response bytes",
-                        payload.len()
+                        "unexpected guardian inventory response: {message:?}"
                     ));
                 }
-                let message = channel.receive(deadline).map_err(|error| {
-                    format!("receive guardian inventory query {query} ({metric:?}): {error}")
-                })?;
-                match message {
-                    Some(Message::InventoryChunk {
-                        bytes, finished, ..
-                    }) => {
-                        if bytes.len() > 512
-                            || payload.len().saturating_add(bytes.len()) > INVENTORY_FRAME_LIMIT
-                        {
-                            return Err("guardian inventory response exceeds bound".into());
-                        }
-                        payload.extend(bytes);
-                        if finished {
-                            return serde_json::from_slice(&payload)
-                                .map_err(|error| error.to_string());
-                        }
-                    }
-                    Some(Message::FailureDetail { message }) => return Err(message),
-                    other => {
-                        return Err(format!("unexpected guardian inventory response: {other:?}"));
-                    }
-                }
+                None if channel.received == received_before => return Ok(None),
+                None => {}
             }
-        })();
-        channel.inventory_query = None;
-        result
+        }
+    }
+    fn query(
+        &self,
+        metric: Option<memcordon_core::Metric>,
+        admission_deadline: Instant,
+        response_deadline: Instant,
+    ) -> Result<InventoryReply, String> {
+        let query = self.begin_query(metric, admission_deadline, response_deadline)?;
+        loop {
+            if let Some(reply) = self.poll_query(query)? {
+                return Ok(reply);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     pub(crate) fn inventory(
         &self,
@@ -1359,16 +1449,24 @@ impl Guardian {
         ),
         String,
     > {
-        let (snapshots, known, _) = self.query(None, deadline)?;
+        let (snapshots, known, _) = self.query(None, deadline, deadline)?;
         snapshots.map(|snapshots| (snapshots, known))
     }
-    pub(crate) fn inventory_with_metric(
+    pub(crate) fn begin_inventory_with_metric(
         &self,
         metric: Option<memcordon_core::Metric>,
-        deadline: Instant,
-    ) -> Result<ObservedInventory, String> {
-        let (snapshots, known, sample) = self.query(metric, deadline)?;
-        snapshots.map(|snapshots| (snapshots, known, sample))
+        admission_deadline: Instant,
+        response_deadline: Instant,
+    ) -> Result<u64, String> {
+        self.begin_query(metric, admission_deadline, response_deadline)
+    }
+    pub(crate) fn poll_inventory(&self, query: u64) -> Result<Option<ObservedInventory>, String> {
+        match self.poll_query(query)? {
+            None => Ok(None),
+            Some((snapshots, known, sample)) => {
+                snapshots.map(|snapshots| Some((snapshots, known, sample)))
+            }
+        }
     }
     pub(crate) fn pid(&self) -> u32 {
         self.child.id()
@@ -1444,6 +1542,8 @@ pub enum LaunchFault {
     DelayReapedStatus,
     #[cfg(feature = "test-support")]
     DelayObservedStatus,
+    #[cfg(feature = "test-support")]
+    DelayInventoryResponse,
 }
 
 pub(crate) fn launch(
@@ -1475,12 +1575,18 @@ pub(crate) fn launch_controlled(
     // The restart coordinator calls again only after proven retirement. Clearing
     // admission preserves every interruption bit for the entire run.
     signal.admission.next_attempt();
+    #[cfg(feature = "test-support")]
+    let fault = DELAY_NEXT_INVENTORY_RESPONSE
+        .replace(false)
+        .then_some(LaunchFault::DelayInventoryResponse);
+    #[cfg(not(feature = "test-support"))]
+    let fault = None;
     launch_configured(
         command,
         image,
         deadline,
         cleanup_deadline,
-        None,
+        fault,
         work,
         grace,
         Some((signal, signal_grace)),
@@ -1670,6 +1776,10 @@ fn launch_configured(
         #[cfg(feature = "test-support")]
         if fault == Some(LaunchFault::DelayObservedStatus) {
             control.send(Message::DelayObservedStatus, deadline)?;
+        }
+        #[cfg(feature = "test-support")]
+        if fault == Some(LaunchFault::DelayInventoryResponse) {
+            control.send(Message::DelayInventoryResponse, deadline)?;
         }
         // A failed partial Configure may still reach the guardian. Preserve its
         // custody from before the first write, rather than killing it on error.
@@ -2560,11 +2670,16 @@ fn guardian_main(
     #[cfg(feature = "test-support")]
     let mut delay_observed_status = configuration == Some(Message::DelayObservedStatus);
     #[cfg(feature = "test-support")]
+    let mut delay_inventory_response = configuration == Some(Message::DelayInventoryResponse);
+    #[cfg(feature = "test-support")]
+    let mut delay_inventory_until = None;
+    #[cfg(feature = "test-support")]
     let configuration = if hold_spawn
         || delay_released_receipt
         || delay_retired_receipt
         || delay_reaped_status
         || delay_observed_status
+        || delay_inventory_response
     {
         control.receive(initial)?
     } else {
@@ -2978,14 +3093,33 @@ fn guardian_main(
             }
             inspection = (pending || (empty && !inspectors_retired)).then_some(());
             if let Some(output) = &mut inventory_output {
-                match output.poll(&mut control) {
-                    Ok(true) => inventory_output = None,
-                    Ok(false) => {}
-                    Err(_) => {
-                        inventory_output = None;
-                        connected = false;
-                        terminal.get_or_insert(now);
-                        force_at.get_or_insert(now);
+                #[cfg(feature = "test-support")]
+                let response_delayed = {
+                    if delay_inventory_response {
+                        delay_inventory_until = Some(Instant::now() + Duration::from_millis(300));
+                        delay_inventory_response = false;
+                    }
+                    delay_inventory_until.is_some_and(|until| {
+                        if Instant::now() < until {
+                            true
+                        } else {
+                            delay_inventory_until = None;
+                            false
+                        }
+                    })
+                };
+                #[cfg(not(feature = "test-support"))]
+                let response_delayed = false;
+                if !response_delayed {
+                    match output.poll(&mut control) {
+                        Ok(true) => inventory_output = None,
+                        Ok(false) => {}
+                        Err(_) => {
+                            inventory_output = None;
+                            connected = false;
+                            terminal.get_or_insert(now);
+                            force_at.get_or_insert(now);
+                        }
                     }
                 }
             }
@@ -3568,6 +3702,151 @@ pub fn delayed_observed_status(image: &Path) -> Result<(), String> {
         .guardian
         .disarm(cleanup_deadline)
         .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "test-support")]
+pub fn delayed_inventory_response(image: &Path) -> Result<(), String> {
+    let command = CommandSpec::new(image.as_os_str()).args(["__execution-probe"]);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut launch = launch_inner(
+        &command,
+        image,
+        deadline,
+        deadline + Duration::from_secs(1),
+        Some(LaunchFault::DelayInventoryResponse),
+    )
+    .map_err(|error| error.error.to_string())?;
+    let sent_before = launch
+        .guardian
+        .channel
+        .as_ref()
+        .ok_or("guardian lease unavailable")?
+        .lock()
+        .map_err(|_| "guardian channel poisoned")?
+        .sent;
+    let admission_deadline = Instant::now() + Duration::from_millis(250);
+    let response_deadline = admission_deadline + crate::macos_watchdog::CLEANUP_DEADLINE;
+    let delayed = Instant::now();
+    let query = launch
+        .guardian
+        .begin_inventory_with_metric(
+            Some(memcordon_core::Metric::Native),
+            admission_deadline,
+            response_deadline,
+        )
+        .map_err(|error| error.to_string())?;
+    loop {
+        if launch
+            .guardian
+            .poll_inventory(query)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    if delayed.elapsed() < Duration::from_millis(300) {
+        return Err("inventory delay hook did not fire".into());
+    }
+    let sent_after = launch
+        .guardian
+        .channel
+        .as_ref()
+        .ok_or("guardian lease unavailable")?
+        .lock()
+        .map_err(|_| "guardian channel poisoned")?
+        .sent;
+    if sent_after != sent_before + 1 {
+        return Err(format!(
+            "delayed inventory issued {} queries instead of one",
+            sent_after.saturating_sub(sent_before)
+        ));
+    }
+    let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+    launch
+        .child
+        .retire(cleanup_deadline)
+        .map_err(|error| error.to_string())?;
+    launch
+        .guardian
+        .disarm(cleanup_deadline)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "test-support")]
+pub fn delayed_inventory_deadline(image: &Path, fixture: &Path) -> Result<(), String> {
+    DELAY_NEXT_INVENTORY_RESPONSE.set(true);
+    let started = Instant::now();
+    let result = crate::run(
+        memcordon_core::Policy::unbounded()
+            .with_deadline(Duration::from_millis(100))
+            .map_err(|error| error.to_string())?,
+        &CommandSpec::new(fixture).args(["hold", "--duration", "5s"]),
+        image,
+    );
+    DELAY_NEXT_INVENTORY_RESPONSE.set(false);
+    let execution = result.map_err(|error| error.to_string())?;
+    if started.elapsed() >= Duration::from_secs(2) {
+        return Err(format!(
+            "deadline handling waited for delayed inventory: {:?}",
+            started.elapsed()
+        ));
+    }
+    if !matches!(
+        &execution.outcome,
+        memcordon_core::RunOutcome::DeadlineExceeded { .. }
+    ) {
+        return Err(format!(
+            "delayed inventory replaced deadline outcome: {:?}",
+            execution.outcome
+        ));
+    }
+    let cleanup = execution.outcome.cleanup();
+    if !cleanup.direct_child_reaped || cleanup.workload_empty != Some(true) {
+        return Err(format!(
+            "delayed inventory deadline cleanup was incomplete: {cleanup:?}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+pub fn delayed_inventory_completion(image: &Path, fixture: &Path) -> Result<(), String> {
+    DELAY_NEXT_INVENTORY_RESPONSE.set(true);
+    let started = Instant::now();
+    let result = crate::run(
+        memcordon_core::Policy::unbounded(),
+        &CommandSpec::new(fixture).args(["hold", "--duration", "50ms"]),
+        image,
+    );
+    DELAY_NEXT_INVENTORY_RESPONSE.set(false);
+    let execution = result.map_err(|error| error.to_string())?;
+    let elapsed = started.elapsed();
+    if elapsed < Duration::from_millis(300) || elapsed >= Duration::from_secs(2) {
+        return Err(format!(
+            "completion did not cross the delayed inventory response: {elapsed:?}"
+        ));
+    }
+    if !matches!(
+        &execution.outcome,
+        memcordon_core::RunOutcome::Exited {
+            child: memcordon_core::ChildTermination::ExitCode { code: 0 },
+            ..
+        }
+    ) {
+        return Err(format!(
+            "delayed inventory replaced child completion: {:?}",
+            execution.outcome
+        ));
+    }
+    let cleanup = execution.outcome.cleanup();
+    if !cleanup.direct_child_reaped || cleanup.workload_empty != Some(true) {
+        return Err(format!(
+            "delayed inventory completion cleanup was incomplete: {cleanup:?}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "test-support")]
