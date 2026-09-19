@@ -2757,13 +2757,7 @@ fn workflow_provenance(
     root: &Path,
     identity: &ReleaseIdentity,
     release: &config::Release,
-) -> Result<(
-    String,
-    String,
-    String,
-    BTreeMap<String, String>,
-    BTreeMap<String, String>,
-)> {
+) -> Result<ResolvedWorkflowProvenance> {
     let commit = std::env::var("GITHUB_WORKFLOW_SHA")
         .map_err(|_| failure("GITHUB_WORKFLOW_SHA is required for release provenance"))?;
     let workflow_ref = std::env::var("GITHUB_WORKFLOW_REF")
@@ -2787,6 +2781,15 @@ fn workflow_provenance(
 struct WorkflowGraph {
     entry_path: String,
     documents: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct ResolvedWorkflowProvenance {
+    workflow_commit: String,
+    workflow_ref: String,
+    workflow_sha256: String,
+    workflow_resources: BTreeMap<String, String>,
+    action_revisions: BTreeMap<String, String>,
 }
 
 impl WorkflowGraph {
@@ -2954,13 +2957,7 @@ fn workflow_provenance_at(
     endpoints: &HttpEndpoints,
     commit: &str,
     workflow_ref: &str,
-) -> Result<(
-    String,
-    String,
-    String,
-    BTreeMap<String, String>,
-    BTreeMap<String, String>,
-)> {
+) -> Result<ResolvedWorkflowProvenance> {
     if commit != identity.commit {
         return Err(failure(
             "workflow provenance commit differs from source commit",
@@ -2986,20 +2983,20 @@ fn workflow_provenance_at(
         &policy,
         &graph.documents,
     )?;
-    let workflow_sha256 = sha256_bytes(&executed_bytes);
+    let workflow_sha256 = sha256_bytes(executed_bytes);
     let workflow_resources = graph.resource_digests();
     let action_revisions = config::action_pins(root)?
         .action
         .into_iter()
         .map(|pin| (pin.name, pin.uses))
         .collect();
-    Ok((
-        commit.to_owned(),
-        workflow_ref.to_owned(),
+    Ok(ResolvedWorkflowProvenance {
+        workflow_commit: commit.to_owned(),
+        workflow_ref: workflow_ref.to_owned(),
         workflow_sha256,
         workflow_resources,
         action_revisions,
-    ))
+    })
 }
 
 fn assemble(root: &Path) -> Result<()> {
@@ -3054,16 +3051,15 @@ fn assemble(root: &Path) -> Result<()> {
         identity.changelog_section, identity.tag, identity.commit, toolchains.stable
     );
     fs::write(output.join(&release.assets.notes), notes)?;
-    let (workflow_commit, workflow_ref, workflow_sha256, workflow_resources, action_revisions) =
-        workflow_provenance(root, &identity, &release)?;
+    let workflow_provenance = workflow_provenance(root, &identity, &release)?;
     let certification_origin = memcordon_ci::certification_context::ExpectedCertificationOrigin {
         source_commit: identity.commit.clone(),
         repository: required_platform_value("GITHUB_REPOSITORY")?,
         run_id: required_platform_value("GITHUB_RUN_ID")?
             .parse()
             .map_err(|_| failure("invalid producer run id"))?,
-        workflow_ref: workflow_ref.clone(),
-        workflow_commit: workflow_commit.clone(),
+        workflow_ref: workflow_provenance.workflow_ref.clone(),
+        workflow_commit: workflow_provenance.workflow_commit.clone(),
     };
     let certification = collect_certification(
         &root.join("target").join("ci").join("release-inputs"),
@@ -3082,11 +3078,11 @@ fn assemble(root: &Path) -> Result<()> {
         tag: identity.tag.clone(),
         version: identity.version.to_string(),
         source_commit: identity.commit.clone(),
-        workflow_commit,
-        workflow_ref,
-        workflow_sha256,
-        workflow_resources,
-        action_revisions,
+        workflow_commit: workflow_provenance.workflow_commit,
+        workflow_ref: workflow_provenance.workflow_ref,
+        workflow_sha256: workflow_provenance.workflow_sha256,
+        workflow_resources: workflow_provenance.workflow_resources,
+        action_revisions: workflow_provenance.action_revisions,
         prerelease: !identity.version.pre.is_empty(),
         rust_toolchain: toolchains.stable,
         assets,
@@ -6061,7 +6057,7 @@ fn verify_public_workflow_provenance(
 ) -> Result<()> {
     // The producer binds GitHub's exact-commit bytes. A checkout can have CRLF
     // conversion or other Git filters, so it is not the authoritative byte source.
-    let (_, _, workflow_sha256, workflow_resources, action_revisions) = workflow_provenance_at(
+    let provenance = workflow_provenance_at(
         root,
         identity,
         release,
@@ -6069,17 +6065,17 @@ fn verify_public_workflow_provenance(
         &manifest.workflow_commit,
         &manifest.workflow_ref,
     )?;
-    if manifest.workflow_sha256 != workflow_sha256 {
+    if manifest.workflow_sha256 != provenance.workflow_sha256 {
         return Err(failure(
             "release workflow digest differs from exact-commit bytes",
         ));
     }
-    if manifest.workflow_resources != workflow_resources {
+    if manifest.workflow_resources != provenance.workflow_resources {
         return Err(failure(
             "release workflow resources differ from exact-commit bytes",
         ));
     }
-    if manifest.action_revisions != action_revisions {
+    if manifest.action_revisions != provenance.action_revisions {
         return Err(failure("release action revisions differ"));
     }
     Ok(())

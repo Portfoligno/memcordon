@@ -2554,7 +2554,7 @@ fn workflow_provenance_fetches_public_bytes_without_a_token() {
     ]);
     let endpoints = HttpEndpoints::fixed_test_server(&server.root);
     let workflow_ref = "Portfoligno/memcordon/.github/workflows/release.yml@refs/tags/1.2.3";
-    let (commit, observed_ref, digest, resources, actions) = workflow_provenance_at(
+    let provenance = workflow_provenance_at(
         temporary.path(),
         &identity,
         &release,
@@ -2563,17 +2563,17 @@ fn workflow_provenance_fetches_public_bytes_without_a_token() {
         workflow_ref,
     )
     .expect("public workflow provenance should not need credentials");
-    assert_eq!(commit, identity.commit);
-    assert_eq!(observed_ref, workflow_ref);
-    assert_eq!(digest, sha256_bytes(workflow));
+    assert_eq!(provenance.workflow_commit, identity.commit);
+    assert_eq!(provenance.workflow_ref, workflow_ref);
+    assert_eq!(provenance.workflow_sha256, sha256_bytes(workflow));
     assert_eq!(
-        resources,
+        provenance.workflow_resources,
         BTreeMap::from([(
             ".github/actions/upload-artifact/action.yml".to_owned(),
             sha256_bytes(action),
         )])
     );
-    assert_eq!(actions.len(), 6);
+    assert_eq!(provenance.action_revisions.len(), 6);
     let requests = server.finish();
     assert_eq!(requests.len(), 2);
     assert!(requests[0].starts_with(
