@@ -49,6 +49,10 @@ const CRATES_IO_INDEX_ROOT: &str = "https://index.crates.io";
 const CRATES_IO_DOWNLOAD_ROOT: &str = "https://static.crates.io";
 const REGISTRY_USER_AGENT: &str = "memcordon-ci (https://github.com/Portfoligno/memcordon)";
 const GITHUB_RELEASES_PER_PAGE: usize = 100;
+const MAXIMUM_WORKFLOW_PROVENANCE_FILES: usize = 32;
+const MAXIMUM_WORKFLOW_PROVENANCE_DEPTH: usize = 8;
+const MAXIMUM_WORKFLOW_PROVENANCE_BYTES: usize =
+    memcordon_ci::policy::MAXIMUM_YAML_BYTES * MAXIMUM_WORKFLOW_PROVENANCE_FILES;
 const CRATES_IO_TOKEN_VARIABLE: &str = "CARGO_REGISTRIES_CRATES_IO_TOKEN";
 pub(crate) const TRUSTED_PUBLISHING_NEW_CRATE_MARKER: &str = "Trusted Publishing tokens do not support creating new crates. Publish the crate manually, first";
 const ACCESS_TOKEN_CRATE_REJECTION_MARKER: &str =
@@ -325,6 +329,7 @@ struct ReleaseManifest {
     workflow_commit: String,
     workflow_ref: String,
     workflow_sha256: String,
+    workflow_resources: BTreeMap<String, String>,
     action_revisions: BTreeMap<String, String>,
     prerelease: bool,
     rust_toolchain: String,
@@ -2752,7 +2757,13 @@ fn workflow_provenance(
     root: &Path,
     identity: &ReleaseIdentity,
     release: &config::Release,
-) -> Result<(String, String, String, BTreeMap<String, String>)> {
+) -> Result<(
+    String,
+    String,
+    String,
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+)> {
     let commit = std::env::var("GITHUB_WORKFLOW_SHA")
         .map_err(|_| failure("GITHUB_WORKFLOW_SHA is required for release provenance"))?;
     let workflow_ref = std::env::var("GITHUB_WORKFLOW_REF")
@@ -2772,6 +2783,170 @@ fn workflow_provenance(
     )
 }
 
+#[derive(Debug)]
+struct WorkflowGraph {
+    entry_path: String,
+    documents: BTreeMap<String, Vec<u8>>,
+}
+
+impl WorkflowGraph {
+    fn entry(&self) -> Result<&[u8]> {
+        self.documents
+            .get(&self.entry_path)
+            .map(Vec::as_slice)
+            .ok_or_else(|| failure("authoritative workflow entry is absent"))
+    }
+
+    fn resource_digests(&self) -> BTreeMap<String, String> {
+        self.documents
+            .iter()
+            .filter(|(path, _)| *path != &self.entry_path)
+            .map(|(path, bytes)| (path.clone(), sha256_bytes(bytes)))
+            .collect()
+    }
+}
+
+fn normalized_local_action_manifest(reference: &str) -> Result<String> {
+    let relative = reference
+        .strip_prefix("./")
+        .ok_or_else(|| failure("local action reference is not repository-relative"))?;
+    if relative.is_empty()
+        || relative.contains('\\')
+        || relative.contains("${{")
+        || relative.contains('@')
+    {
+        return Err(failure(format!(
+            "local action reference is not a canonical repository path: {reference}"
+        )));
+    }
+    let components: Vec<&str> = relative.split('/').collect();
+    if components.iter().any(|component| {
+        component.is_empty()
+            || *component == "."
+            || *component == ".."
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    }) {
+        return Err(failure(format!(
+            "local action reference escapes or aliases the repository: {reference}"
+        )));
+    }
+    let directory = components.join("/");
+    Ok(format!("{directory}/action.yml"))
+}
+
+fn github_commit_file(
+    release: &config::Release,
+    endpoints: &HttpEndpoints,
+    commit: &str,
+    path: &str,
+) -> Result<Vec<u8>> {
+    let url = format!(
+        "{}/repos/{}/contents/{path}?ref={commit}",
+        endpoints.github_api, release.repository
+    );
+    github_raw_get(
+        release,
+        endpoints,
+        &url,
+        None,
+        "application/vnd.github.raw+json",
+        memcordon_ci::policy::MAXIMUM_YAML_BYTES as u64,
+    )
+    .map_err(|error| {
+        failure(format!(
+            "fetch authoritative workflow resource {path}: {error}"
+        ))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_local_action(
+    release: &config::Release,
+    endpoints: &HttpEndpoints,
+    commit: &str,
+    reference: &str,
+    depth: usize,
+    documents: &mut BTreeMap<String, Vec<u8>>,
+    visiting: &mut BTreeSet<String>,
+    total_bytes: &mut usize,
+) -> Result<()> {
+    if depth > MAXIMUM_WORKFLOW_PROVENANCE_DEPTH {
+        return Err(failure(
+            "workflow local action dependency depth exceeds policy",
+        ));
+    }
+    let path = normalized_local_action_manifest(reference)?;
+    if documents.contains_key(&path) {
+        return Ok(());
+    }
+    if !visiting.insert(path.clone()) {
+        return Err(failure(format!(
+            "workflow local action dependency cycle includes {path}"
+        )));
+    }
+    if documents.len() + visiting.len() + 1 > MAXIMUM_WORKFLOW_PROVENANCE_FILES {
+        return Err(failure("workflow provenance file count exceeds policy"));
+    }
+    let bytes = github_commit_file(release, endpoints, commit, &path)?;
+    *total_bytes = total_bytes
+        .checked_add(bytes.len())
+        .ok_or_else(|| failure("workflow provenance byte count overflowed"))?;
+    if *total_bytes > MAXIMUM_WORKFLOW_PROVENANCE_BYTES {
+        return Err(failure("workflow provenance byte count exceeds policy"));
+    }
+    for nested in memcordon_ci::policy::composite_local_action_references(&bytes)? {
+        resolve_local_action(
+            release,
+            endpoints,
+            commit,
+            &nested,
+            depth + 1,
+            documents,
+            visiting,
+            total_bytes,
+        )?;
+    }
+    let removed = visiting.remove(&path);
+    if !removed {
+        return Err(failure(
+            "workflow local action traversal state is inconsistent",
+        ));
+    }
+    documents.insert(path, bytes);
+    Ok(())
+}
+
+fn workflow_graph_at(
+    release: &config::Release,
+    endpoints: &HttpEndpoints,
+    commit: &str,
+) -> Result<WorkflowGraph> {
+    let entry_path = [".github", "workflows", release.workflow.as_str()].join("/");
+    let entry = github_commit_file(release, endpoints, commit, &entry_path)?;
+    let mut total_bytes = entry.len();
+    let mut documents = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    for reference in memcordon_ci::policy::workflow_local_action_references(&entry)? {
+        resolve_local_action(
+            release,
+            endpoints,
+            commit,
+            &reference,
+            1,
+            &mut documents,
+            &mut visiting,
+            &mut total_bytes,
+        )?;
+    }
+    documents.insert(entry_path.clone(), entry);
+    Ok(WorkflowGraph {
+        entry_path,
+        documents,
+    })
+}
+
 fn workflow_provenance_at(
     root: &Path,
     identity: &ReleaseIdentity,
@@ -2779,7 +2954,13 @@ fn workflow_provenance_at(
     endpoints: &HttpEndpoints,
     commit: &str,
     workflow_ref: &str,
-) -> Result<(String, String, String, BTreeMap<String, String>)> {
+) -> Result<(
+    String,
+    String,
+    String,
+    BTreeMap<String, String>,
+    BTreeMap<String, String>,
+)> {
     if commit != identity.commit {
         return Err(failure(
             "workflow provenance commit differs from source commit",
@@ -2795,22 +2976,18 @@ fn workflow_provenance_at(
     if workflow_ref != expected_ref {
         return Err(failure("GITHUB_WORKFLOW_REF is not the exact release tag"));
     }
-    let workflow_api_path = [".github", "workflows", release.workflow.as_str()].join("/");
-    let url = format!(
-        "{}/repos/{}/contents/{}?ref={commit}",
-        endpoints.github_api, release.repository, workflow_api_path
-    );
-    let executed_bytes = github_raw_get(
-        release,
-        endpoints,
-        &url,
-        None,
-        "application/vnd.github.raw+json",
-        release.maximum_asset_bytes,
-    )?;
+    let graph = workflow_graph_at(release, endpoints, commit)?;
+    let executed_bytes = graph.entry()?;
     let policy = config::policy(root)?;
-    crate::policy::validate_workflow_bytes(root, &workflow_relative, &executed_bytes, &policy)?;
+    crate::policy::validate_workflow_bytes_with_local_actions(
+        root,
+        &workflow_relative,
+        executed_bytes,
+        &policy,
+        &graph.documents,
+    )?;
     let workflow_sha256 = sha256_bytes(&executed_bytes);
+    let workflow_resources = graph.resource_digests();
     let action_revisions = config::action_pins(root)?
         .action
         .into_iter()
@@ -2820,6 +2997,7 @@ fn workflow_provenance_at(
         commit.to_owned(),
         workflow_ref.to_owned(),
         workflow_sha256,
+        workflow_resources,
         action_revisions,
     ))
 }
@@ -2876,7 +3054,7 @@ fn assemble(root: &Path) -> Result<()> {
         identity.changelog_section, identity.tag, identity.commit, toolchains.stable
     );
     fs::write(output.join(&release.assets.notes), notes)?;
-    let (workflow_commit, workflow_ref, workflow_sha256, action_revisions) =
+    let (workflow_commit, workflow_ref, workflow_sha256, workflow_resources, action_revisions) =
         workflow_provenance(root, &identity, &release)?;
     let certification_origin = memcordon_ci::certification_context::ExpectedCertificationOrigin {
         source_commit: identity.commit.clone(),
@@ -2907,6 +3085,7 @@ fn assemble(root: &Path) -> Result<()> {
         workflow_commit,
         workflow_ref,
         workflow_sha256,
+        workflow_resources,
         action_revisions,
         prerelease: !identity.version.pre.is_empty(),
         rust_toolchain: toolchains.stable,
@@ -2929,6 +3108,20 @@ fn bundle_manifest(root: &Path) -> Result<(config::Release, ReleaseManifest, Pat
         serde_json::from_slice(&fs::read(output.join(&release.assets.manifest))?)?;
     if manifest.schema_version != config::RELEASE_SCHEMA_VERSION {
         return Err(failure("release manifest schema identity is invalid"));
+    }
+    if !is_lowercase_hex_digest(&manifest.workflow_sha256) {
+        return Err(failure("release workflow digest is invalid"));
+    }
+    for (path, digest) in &manifest.workflow_resources {
+        let directory = path
+            .strip_suffix("/action.yml")
+            .ok_or_else(|| failure("release workflow resource path is invalid"))?;
+        let reference = format!("./{directory}");
+        if normalized_local_action_manifest(&reference)? != *path
+            || !is_lowercase_hex_digest(digest)
+        {
+            return Err(failure("release workflow resource identity is invalid"));
+        }
     }
     validate_manifest_crates(&release, &manifest)?;
     if manifest.certification_contract != "standard-and-sealed-v1"
@@ -5868,7 +6061,7 @@ fn verify_public_workflow_provenance(
 ) -> Result<()> {
     // The producer binds GitHub's exact-commit bytes. A checkout can have CRLF
     // conversion or other Git filters, so it is not the authoritative byte source.
-    let (_, _, workflow_sha256, action_revisions) = workflow_provenance_at(
+    let (_, _, workflow_sha256, workflow_resources, action_revisions) = workflow_provenance_at(
         root,
         identity,
         release,
@@ -5879,6 +6072,11 @@ fn verify_public_workflow_provenance(
     if manifest.workflow_sha256 != workflow_sha256 {
         return Err(failure(
             "release workflow digest differs from exact-commit bytes",
+        ));
+    }
+    if manifest.workflow_resources != workflow_resources {
+        return Err(failure(
+            "release workflow resources differ from exact-commit bytes",
         ));
     }
     if manifest.action_revisions != action_revisions {

@@ -342,6 +342,72 @@ fn check_upload_artifact_action(root: &Path) -> Result<()> {
     validate_upload_artifact_action_bytes(&fs::read(root.join(UPLOAD_ARTIFACT_ACTION_PATH))?)
 }
 
+fn local_step_references(steps: &[Value], context: &str) -> Result<BTreeSet<String>> {
+    let mut references = BTreeSet::new();
+    for step in steps {
+        let step = mapping(step, context)?;
+        if let Some(uses) = step.get(key("uses")) {
+            let uses = uses
+                .as_str()
+                .ok_or_else(|| failure(format!("{context} uses must be a scalar string")))?;
+            if uses.starts_with("./") {
+                references.insert(uses.to_owned());
+            }
+        }
+    }
+    Ok(references)
+}
+
+/// Returns repository-local action references from workflow step positions.
+pub fn workflow_local_action_references(bytes: &[u8]) -> Result<BTreeSet<String>> {
+    let document = parse_yaml(bytes)?;
+    let workflow = mapping(&document, "workflow provenance")?;
+    let jobs = mapping(
+        workflow
+            .get(key("jobs"))
+            .ok_or_else(|| failure("workflow provenance jobs are absent"))?,
+        "workflow provenance jobs",
+    )?;
+    let mut references = BTreeSet::new();
+    for job in jobs.values() {
+        let job = mapping(job, "workflow provenance job")?;
+        if scalar(job, "uses").is_some_and(|uses| uses.starts_with("./")) {
+            return Err(failure(
+                "repository-local reusable workflows are forbidden in release provenance",
+            ));
+        }
+        if let Some(steps) = job.get(key("steps")) {
+            let steps = steps
+                .as_sequence()
+                .ok_or_else(|| failure("workflow provenance steps must be a sequence"))?;
+            references.extend(local_step_references(steps, "workflow provenance step")?);
+        }
+    }
+    Ok(references)
+}
+
+/// Returns repository-local action references from composite-action step positions.
+pub fn composite_local_action_references(bytes: &[u8]) -> Result<BTreeSet<String>> {
+    let document = parse_yaml(bytes)?;
+    let action = mapping(&document, "composite action provenance")?;
+    let runs = mapping(
+        action
+            .get(key("runs"))
+            .ok_or_else(|| failure("composite action provenance runs are absent"))?,
+        "composite action provenance runs",
+    )?;
+    if scalar(runs, "using") != Some("composite") {
+        return Err(failure(
+            "workflow provenance supports only repository-local composite actions",
+        ));
+    }
+    let steps = runs
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("composite action provenance steps are absent"))?;
+    local_step_references(steps, "composite action provenance step")
+}
+
 fn exact_string_sequence(value: &Value, expected: &[&str], context: &str) -> Result<()> {
     let sequence = value
         .as_sequence()
@@ -2812,6 +2878,7 @@ fn validate_workflow_bytes_into(
     policy: &config::Policy,
     environment_definitions: &mut BTreeSet<EnvironmentDefinition>,
     used_actions: &mut BTreeSet<String>,
+    authoritative_local_actions: Option<&BTreeMap<String, Vec<u8>>>,
 ) -> Result<()> {
     let text = std::str::from_utf8(bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -2848,7 +2915,16 @@ fn validate_workflow_bytes_into(
             return Err(failure("action pin manifest contains an incomplete entry"));
         }
     }
-    check_upload_artifact_action(root)?;
+    if let Some(actions) = authoritative_local_actions {
+        let bytes = actions.get(UPLOAD_ARTIFACT_ACTION_PATH).ok_or_else(|| {
+            failure(format!(
+                "authoritative local action is absent: {UPLOAD_ARTIFACT_ACTION_PATH}"
+            ))
+        })?;
+        validate_upload_artifact_action_bytes(bytes)?;
+    } else {
+        check_upload_artifact_action(root)?;
+    }
     if !allowed_actions.contains(PINNED_UPLOAD_ARTIFACT_ACTION) {
         return Err(failure(
             "artifact upload action pin is absent from the pin manifest",
@@ -3100,6 +3176,26 @@ pub fn validate_workflow_bytes(
         policy,
         &mut BTreeSet::new(),
         &mut BTreeSet::new(),
+        None,
+    )
+}
+
+/// Validates exact-commit workflow bytes against exact-commit local action bytes.
+pub fn validate_workflow_bytes_with_local_actions(
+    root: &Path,
+    relative: &Path,
+    bytes: &[u8],
+    policy: &config::Policy,
+    local_actions: &BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    validate_workflow_bytes_into(
+        root,
+        relative,
+        bytes,
+        policy,
+        &mut BTreeSet::new(),
+        &mut BTreeSet::new(),
+        Some(local_actions),
     )
 }
 
@@ -3117,6 +3213,7 @@ fn check_workflow(
         policy,
         environment_definitions,
         used_actions,
+        None,
     )
 }
 
