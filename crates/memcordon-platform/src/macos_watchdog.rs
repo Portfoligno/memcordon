@@ -19,6 +19,8 @@ const PROC_PIDTBSDINFO: i32 = 3;
 const PROC_PIDTASKINFO: i32 = 4;
 const RUSAGE_INFO_V2: i32 = 2;
 pub(crate) const CLEANUP_DEADLINE: Duration = Duration::from_secs(3);
+const PENDING_INVENTORY_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+const WATCHDOG_TURN_MAX: Duration = Duration::from_millis(20);
 
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
@@ -28,6 +30,27 @@ fn bounded_pause(duration: Duration) {
     let timeout = duration.as_millis().min(i32::MAX as u128) as i32;
     // SAFETY: zero-descriptor poll is a bounded kernel wait and remains signal-interruptible.
     unsafe { libc::poll(std::ptr::null_mut(), 0, timeout) };
+}
+
+fn watchdog_turn_wait(
+    poll_interval: Duration,
+    command_exit_grace_remaining: Option<Duration>,
+    inventory_pending: bool,
+) -> Duration {
+    let wait = if inventory_pending {
+        poll_interval.max(Duration::from_millis(1))
+    } else {
+        command_exit_grace_remaining.map_or(poll_interval, |remaining| poll_interval.min(remaining))
+    };
+    wait.min(WATCHDOG_TURN_MAX)
+}
+
+#[cfg(feature = "test-support")]
+pub fn pending_inventory_turn_wait(
+    poll_interval: Duration,
+    command_exit_grace_remaining: Duration,
+) -> Duration {
+    watchdog_turn_wait(poll_interval, Some(command_exit_grace_remaining), true)
 }
 
 #[link(name = "proc")]
@@ -719,6 +742,7 @@ pub fn run_attempt(
     };
     let mut command_exit_grace_started = None;
     let mut inventory_query = None;
+    let mut next_heartbeat = Instant::now();
     let mut outcome = loop {
         let inspection_deadline =
             policy
@@ -730,10 +754,7 @@ pub fn run_attempt(
                             .unwrap_or_else(|| deadline.duration()))
                     .min(Instant::now() + Duration::from_millis(250))
                 });
-        let mut cycle_error = guardian
-            .alive(inspection_deadline)
-            .err()
-            .map(|error| error.to_string());
+        let mut cycle_error = None;
         let mut completion = None;
         let mut workload_empty = false;
         match try_reap(&mut child, &mut stored_status, inspection_deadline) {
@@ -753,7 +774,33 @@ pub fn run_attempt(
         // deadlines remain responsive while inspectors finish within the fixed
         // retirement reserve. Never replace a pending query with a retry.
         let mut inventory_result = None;
-        if inventory_query.is_none() {
+        let inventory_was_pending = inventory_query.is_some();
+        if let Some(query) = inventory_query {
+            match guardian.poll_inventory(query) {
+                Ok(Some(inventory)) => {
+                    inventory_query = None;
+                    inventory_result = Some(Ok(inventory));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    inventory_query = None;
+                    inventory_result = Some(Err(error));
+                }
+            }
+        }
+        // An admitted inventory response is itself a live transaction. Poll it
+        // before emitting another control frame, and send heartbeats at a fixed
+        // cadence within the lease while it remains pending. This prevents an exited
+        // command with zero grace from flooding the guardian's control socket.
+        if inventory_result.is_none()
+            && (!inventory_was_pending || Instant::now() >= next_heartbeat)
+        {
+            if let Err(error) = guardian.alive(inspection_deadline) {
+                cycle_error = Some(error.to_string());
+            }
+            next_heartbeat = Instant::now() + PENDING_INVENTORY_HEARTBEAT_INTERVAL;
+        }
+        if inventory_query.is_none() && inventory_result.is_none() {
             let inventory_response_deadline = inspection_deadline
                 .checked_add(CLEANUP_DEADLINE)
                 .expect("fixed inventory response reserve is representable");
@@ -784,7 +831,7 @@ pub fn run_attempt(
                 Err(error) => inventory_result = Some(Err(error)),
             }
         }
-        if let Some(query) = inventory_query {
+        if !inventory_was_pending && let Some(query) = inventory_query {
             match guardian.poll_inventory(query) {
                 Ok(Some(inventory)) => {
                     inventory_query = None;
@@ -1042,15 +1089,16 @@ pub fn run_attempt(
             }
         }
 
-        let wait = command_exit_grace_started
-            .map_or(policy.poll_interval, |grace_started| {
-                policy.poll_interval.min(
-                    policy
-                        .command_exit_grace
-                        .saturating_sub(grace_started.elapsed()),
-                )
-            })
-            .min(Duration::from_millis(20));
+        let command_exit_grace_remaining = command_exit_grace_started.map(|grace_started| {
+            policy
+                .command_exit_grace
+                .saturating_sub(grace_started.elapsed())
+        });
+        let wait = watchdog_turn_wait(
+            policy.poll_interval,
+            command_exit_grace_remaining,
+            inventory_query.is_some(),
+        );
         let wait = policy.deadline.map_or(wait, |deadline| {
             wait.min(
                 context

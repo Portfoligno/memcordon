@@ -69,6 +69,8 @@ pub use crate::macos_deadline::retirement_mutation_probe as macos_retirement_mut
 #[cfg(target_os = "macos")]
 pub use crate::macos_watchdog::inventory_reconciliation as macos_inventory_reconciliation;
 #[cfg(target_os = "macos")]
+pub use crate::macos_watchdog::pending_inventory_turn_wait as macos_pending_inventory_turn_wait;
+#[cfg(target_os = "macos")]
 pub use crate::macos_watchdog::pid_inventory_reply as macos_pid_inventory_reply;
 
 #[cfg(target_os = "macos")]

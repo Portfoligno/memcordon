@@ -1,6 +1,18 @@
 #![cfg(all(target_os = "macos", feature = "test-fixtures"))]
 
 use std::path::Path;
+use std::time::Duration;
+
+#[test]
+fn pending_inventory_keeps_a_positive_watchdog_wait_after_zero_grace() {
+    assert_eq!(
+        memcordon_platform::test_support::macos_pending_inventory_turn_wait(
+            Duration::from_millis(50),
+            Duration::ZERO,
+        ),
+        Duration::from_millis(20)
+    );
+}
 
 #[test]
 fn confirmed_exec_receipt_retains_the_startup_deadline() {

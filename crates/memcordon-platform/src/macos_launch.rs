@@ -35,6 +35,7 @@ std::thread_local! {
     static DELAY_NEXT_INVENTORY_RESPONSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ABANDONED_INVENTORY_QUERY: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static RETIREMENT_INVENTORY_QUERY: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static WATCHDOG_HEARTBEATS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Slots are reserved before spawn. Drop transfers an unreaped PID by one atomic
@@ -1517,6 +1518,8 @@ impl Guardian {
         self.child.id()
     }
     pub(crate) fn alive(&self, deadline: Instant) -> io::Result<()> {
+        #[cfg(feature = "test-support")]
+        WATCHDOG_HEARTBEATS.with(|count| count.set(count.get().saturating_add(1)));
         if let Some(channel) = &self.channel {
             channel
                 .lock()
@@ -3858,8 +3861,9 @@ fn run_delayed_inventory(
     policy: memcordon_core::Policy,
     command: &CommandSpec,
     image: &Path,
-) -> Result<crate::backend::Execution, String> {
+) -> Result<(crate::backend::Execution, u64), String> {
     DELAY_NEXT_INVENTORY_RESPONSE.set(true);
+    WATCHDOG_HEARTBEATS.set(0);
     let result = (|| {
         let origin = crate::macos_continuous_nanos().map_err(|error| error.to_string())?;
         let snapshot = crate::CallerSignalSnapshot::capture().map_err(|error| error.to_string())?;
@@ -3870,7 +3874,8 @@ fn run_delayed_inventory(
             .map_err(|error| error.to_string())
     })();
     DELAY_NEXT_INVENTORY_RESPONSE.set(false);
-    result
+    let heartbeats = WATCHDOG_HEARTBEATS.replace(0);
+    result.map(|execution| (execution, heartbeats))
 }
 
 #[cfg(feature = "test-support")]
@@ -3887,7 +3892,7 @@ pub fn delayed_inventory_deadline(image: &Path, fixture: &Path) -> Result<(), St
     );
     let abandoned = ABANDONED_INVENTORY_QUERY.replace(None);
     let retirement = RETIREMENT_INVENTORY_QUERY.replace(None);
-    let execution = result?;
+    let (execution, _) = result?;
     let (Some(abandoned), Some(retirement)) = (abandoned, retirement) else {
         return Err("deadline cleanup did not hand off the pending inventory query".into());
     };
@@ -3923,7 +3928,7 @@ pub fn delayed_inventory_deadline(image: &Path, fixture: &Path) -> Result<(), St
 #[cfg(feature = "test-support")]
 pub fn delayed_inventory_completion(image: &Path, fixture: &Path) -> Result<(), String> {
     let started = Instant::now();
-    let execution = run_delayed_inventory(
+    let (execution, heartbeats) = run_delayed_inventory(
         memcordon_core::Policy::unbounded(),
         &CommandSpec::new(fixture).args(["hold", "--duration", "50ms"]),
         image,
@@ -3932,6 +3937,11 @@ pub fn delayed_inventory_completion(image: &Path, fixture: &Path) -> Result<(), 
     if elapsed < Duration::from_millis(1200) || elapsed >= Duration::from_secs(2) {
         return Err(format!(
             "completion did not cross the delayed inventory response: {elapsed:?}"
+        ));
+    }
+    if !(1..=4).contains(&heartbeats) {
+        return Err(format!(
+            "delayed inventory emitted {heartbeats} watchdog heartbeats instead of a bounded cadence"
         ));
     }
     if !matches!(
