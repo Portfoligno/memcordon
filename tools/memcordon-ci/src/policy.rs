@@ -2634,15 +2634,21 @@ fn check_release_structure(
             true,
         )?;
     }
+    check_rehearse_public_job(jobs, toolchains)?;
     let publish = mapping(
         jobs.get(key("publish"))
             .ok_or_else(|| failure("release publish job is absent"))?,
         "publish job",
     )?;
-    if scalar(publish, "needs") != Some("assemble") || publish.contains_key(key("environment")) {
-        return Err(failure(
-            "publish job dependency differs or names a GitHub environment",
-        ));
+    exact_string_sequence(
+        publish
+            .get(key("needs"))
+            .ok_or_else(|| failure("publish dependencies are absent"))?,
+        &["assemble", "rehearse-public"],
+        "publish dependencies",
+    )?;
+    if publish.contains_key(key("environment")) {
+        return Err(failure("publish job names a GitHub environment"));
     }
     let permissions = mapping(
         publish
@@ -2668,6 +2674,183 @@ fn check_release_structure(
     )?;
     check_verify_public_job(jobs, verify, toolchains)?;
     check_release_credentials(jobs, release, auth_action)?;
+    Ok(())
+}
+
+fn check_rehearse_public_job(jobs: &Mapping, _toolchains: &config::Toolchains) -> Result<()> {
+    let context = "release public rehearsal";
+    let job = mapping(
+        jobs.get(key("rehearse-public"))
+            .ok_or_else(|| failure("release public rehearsal job is absent"))?,
+        context,
+    )?;
+    exact_mapping_keys(
+        job,
+        &[
+            "name",
+            "needs",
+            "strategy",
+            "runs-on",
+            "timeout-minutes",
+            "permissions",
+            "steps",
+        ],
+        context,
+    )?;
+    if scalar(job, "name") != Some("Release / rehearse public state / ${{ matrix.id }}")
+        || scalar(job, "needs") != Some("assemble")
+        || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(90)
+    {
+        return Err(failure("release public rehearsal job identity differs"));
+    }
+    check_runner_matrix(jobs, "rehearse-public", &VERIFY_PUBLIC_MATRIX, context)?;
+    let permissions = mapping(
+        job.get(key("permissions"))
+            .ok_or_else(|| failure("release public rehearsal permissions are absent"))?,
+        context,
+    )?;
+    exact_mapping_keys(permissions, &["contents"], context)?;
+    if scalar(permissions, "contents") != Some("read") {
+        return Err(failure("release public rehearsal permissions differ"));
+    }
+    let steps = certification_steps(job, context)?;
+    // The managed-workflow envelope validates and projects the fingerprint,
+    // inventory upload, and final audit before this payload check.
+    if steps.len() != 8 {
+        return Err(failure("release public rehearsal step inventory differs"));
+    }
+    let expected = [
+        (
+            "uses",
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        ),
+        (
+            "uses",
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        ),
+        (
+            "uses",
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        ),
+        (
+            "uses",
+            "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        ),
+        ("run", "rustup toolchain install 1.97.1 --profile minimal"),
+        (
+            "run",
+            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public --bundle target/ci/release-bundle --report target/ci/public-rehearsal/report.json",
+        ),
+        ("uses", UPLOAD_ARTIFACT_ACTION),
+        (
+            "uses",
+            "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        ),
+    ];
+    for (step, (kind, value)) in steps.iter().zip(expected) {
+        let step = mapping(step, context)?;
+        if scalar(step, kind) != Some(value)
+            || step.contains_key(key("env"))
+            || step.contains_key(key("shell"))
+            || step.contains_key(key("continue-on-error"))
+        {
+            return Err(failure("release public rehearsal step contract differs"));
+        }
+    }
+    if scalar(mapping(&steps[0], context)?, "if") != Some("github.event_name == 'push'")
+        || scalar(mapping(&steps[1], context)?, "if")
+            != Some("github.event_name == 'workflow_dispatch'")
+        || steps[2..=5].iter().any(|step| {
+            step.as_mapping()
+                .is_none_or(|step| step.contains_key(key("if")))
+        })
+    {
+        return Err(failure(
+            "release public rehearsal conditional execution differs",
+        ));
+    }
+    let download = mapping(&steps[2], context)?;
+    let download_inputs = mapping(
+        download
+            .get(key("with"))
+            .ok_or_else(|| failure("rehearsal bundle download inputs absent"))?,
+        context,
+    )?;
+    exact_mapping_keys(download_inputs, &["name", "path"], context)?;
+    if scalar(download_inputs, "name") != Some("release-bundle")
+        || scalar(download_inputs, "path") != Some("target/ci/release-bundle")
+    {
+        return Err(failure("rehearsal bundle download differs"));
+    }
+    let restore = mapping(&steps[3], context)?;
+    let restore_inputs = mapping(
+        restore
+            .get(key("with"))
+            .ok_or_else(|| failure("rehearsal source cache inputs absent"))?,
+        context,
+    )?;
+    exact_mapping_keys(restore_inputs, &["path", "key"], context)?;
+    let source_paths = "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n";
+    if scalar(restore, "id") != Some("rehearse-public-deps")
+        || scalar(restore_inputs, "path") != Some(source_paths)
+        || !scalar(restore_inputs, "key").is_some_and(|value| {
+            value.starts_with("cargo-deps-release-rehearse-public-v1-")
+                && value.contains("${{ runner.os }}-${{ runner.arch }}-1.97.1-")
+                && value.contains("hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml')")
+        })
+    {
+        return Err(failure("rehearsal source cache differs"));
+    }
+    let upload = mapping(&steps[6], context)?;
+    let upload_inputs = mapping(
+        upload
+            .get(key("with"))
+            .ok_or_else(|| failure("rehearsal evidence inputs absent"))?,
+        context,
+    )?;
+    exact_mapping_keys(
+        upload_inputs,
+        &[
+            "name",
+            "path",
+            "if-no-files-found",
+            "retention-days",
+            "compression-level",
+        ],
+        context,
+    )?;
+    if scalar(upload, "if") != Some("always()")
+        || scalar(upload_inputs, "name") != Some("release-public-rehearsal-${{ matrix.id }}")
+        || scalar(upload_inputs, "path") != Some("target/ci/public-rehearsal/report.json")
+        || scalar(upload_inputs, "if-no-files-found") != Some("error")
+        || upload_inputs
+            .get(key("retention-days"))
+            .and_then(Value::as_u64)
+            != Some(30)
+        || upload_inputs
+            .get(key("compression-level"))
+            .and_then(Value::as_u64)
+            != Some(0)
+    {
+        return Err(failure("rehearsal evidence upload differs"));
+    }
+    let save = mapping(&steps[7], context)?;
+    let save_inputs = mapping(
+        save.get(key("with"))
+            .ok_or_else(|| failure("rehearsal source cache save inputs absent"))?,
+        context,
+    )?;
+    exact_mapping_keys(save_inputs, &["path", "key"], context)?;
+    if scalar(save, "if")
+        != Some(
+            "always() && steps.rehearse-public-deps.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.rehearse-public-deps.outputs.cache-primary-key != ''",
+        )
+        || scalar(save_inputs, "path") != Some(source_paths)
+        || scalar(save_inputs, "key")
+            != Some("${{ steps.rehearse-public-deps.outputs.cache-primary-key }}")
+    {
+        return Err(failure("rehearsal source cache save differs"));
+    }
     Ok(())
 }
 
@@ -4216,7 +4399,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   publish:
-    needs: assemble
+    needs:
+      - assemble
+      - rehearse-public
     permissions:
       actions: read
       contents: write

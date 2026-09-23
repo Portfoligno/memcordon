@@ -1260,6 +1260,48 @@ pub fn active() -> Option<&'static ValidatedBuildContext> {
     ACTIVE.get()
 }
 
+#[derive(Clone, Debug)]
+struct CanonicalOperationRoot(PathBuf);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AuthorizedOutputTree(PathBuf);
+
+/// Whether an isolated Cargo output must be a child of its measured source.
+/// Package-channel certification also has an owned output outside that source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IsolatedOutputScope {
+    SourceChild,
+    OwnedExternal,
+}
+
+impl AuthorizedOutputTree {
+    fn resolve(
+        root: &CanonicalOperationRoot,
+        requested: &Path,
+        scope: IsolatedOutputScope,
+    ) -> Result<Self> {
+        let output = normalize_isolated_output(&root.0, requested)?;
+        match scope {
+            IsolatedOutputScope::SourceChild if output != root.0.join("install") => {
+                return Err(CiError::Message(
+                    "isolated installation output is not the direct install child".into(),
+                ));
+            }
+            IsolatedOutputScope::OwnedExternal if output.starts_with(&root.0) => {
+                return Err(CiError::Message(
+                    "isolated external installation output overlaps source".into(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(Self(output))
+    }
+
+    fn contains_snapshot_path(&self, path: &Path) -> bool {
+        path.starts_with(&self.0)
+    }
+}
+
 fn normalize_isolated_output(directory: &Path, output: &Path) -> Result<PathBuf> {
     if output
         .components()
@@ -1310,14 +1352,36 @@ pub fn run_isolated_cargo(
     deadline: Duration,
     install_root: Option<&Path>,
 ) -> Result<Vec<u8>> {
-    let directory = directory.canonicalize()?;
+    run_isolated_cargo_with_output_scope(
+        directory,
+        toolchain,
+        arguments,
+        deadline,
+        install_root,
+        IsolatedOutputScope::OwnedExternal,
+    )
+}
+
+pub fn run_isolated_cargo_with_output_scope(
+    directory: &Path,
+    toolchain: &str,
+    arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    deadline: Duration,
+    install_root: Option<&Path>,
+    scope: IsolatedOutputScope,
+) -> Result<Vec<u8>> {
+    let operation_root = CanonicalOperationRoot(directory.canonicalize()?);
+    let directory = operation_root.0.clone();
+    let declared = install_root
+        .map(|path| AuthorizedOutputTree::resolve(&operation_root, path, scope))
+        .transpose()?;
     let temporary = tempfile::tempdir()?;
     let arguments: Vec<OsString> = arguments
         .into_iter()
         .map(|value| value.as_ref().to_os_string())
         .collect();
     let mut rewritten = Vec::new();
-    let mut outputs = Vec::new();
+    let mut outputs: Vec<AuthorizedOutputTree> = Vec::new();
     let mut iterator = arguments.iter();
     while let Some(argument) = iterator.next() {
         if argument == "--target-dir" {
@@ -1341,17 +1405,15 @@ pub fn run_isolated_cargo(
             let requested_output = iterator
                 .next()
                 .ok_or_else(|| CiError::Message("install root argument missing".into()))?;
-            let output = normalize_isolated_output(&directory, Path::new(requested_output))?;
-            let declared = install_root
-                .map(|path| normalize_isolated_output(&directory, path))
-                .transpose()?;
-            if declared.as_deref() != Some(output.as_path()) {
+            let output =
+                AuthorizedOutputTree::resolve(&operation_root, Path::new(requested_output), scope)?;
+            if declared.as_ref() != Some(&output) || !outputs.is_empty() {
                 return Err(CiError::Message(
                     "isolated installation output escapes source operation".into(),
                 ));
             }
             outputs.push(output.clone());
-            rewritten.push(environment::paths::command_output_path(&output)?.into_os_string());
+            rewritten.push(environment::paths::command_output_path(&output.0)?.into_os_string());
         } else if argument == "--manifest-path" || argument == "--path" {
             let input = iterator
                 .next()
@@ -1359,11 +1421,16 @@ pub fn run_isolated_cargo(
             rewritten.push(environment::command_path(&directory.join(input))?.into_os_string());
         }
     }
+    if declared.is_some() && outputs.is_empty() {
+        return Err(CiError::Message(
+            "declared isolated installation output has no --root argument".into(),
+        ));
+    }
     let acquisition = rewritten
         .first()
         .is_some_and(|value| value == "generate-lockfile");
     if acquisition {
-        outputs.push(directory.join("Cargo.lock"));
+        outputs.push(AuthorizedOutputTree(directory.join("Cargo.lock")));
     }
     let snapshot = |root: &Path| -> Result<BuildInputSnapshot> {
         let mut snapshot = BuildInputSnapshot::capture(root)?;
@@ -1371,7 +1438,7 @@ pub fn run_isolated_cargo(
             decode(&input.path).is_ok_and(|path| {
                 !outputs
                     .iter()
-                    .any(|output| Path::new(&path).starts_with(output))
+                    .any(|output| output.contains_snapshot_path(Path::new(&path)))
             })
         });
         Ok(snapshot)

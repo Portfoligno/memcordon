@@ -1031,9 +1031,92 @@ jobs:
           retention-days: 30
           compression-level: 0
 
+  rehearse-public:
+    name: Release / rehearse public state / ${{ matrix.id }}
+    needs: assemble
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x64
+            runner: ubuntu-24.04
+          - id: windows-x64
+            runner: windows-2025
+          - id: windows-arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Check out pushed tag
+        if: github.event_name == 'push'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out dispatched tag
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-bundle
+          path: target/ci/release-bundle
+      - id: rehearse-public-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-release-rehearse-public-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+      - id: inventory-observation
+        if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
+      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public --bundle target/ci/release-bundle --report target/ci/public-rehearsal/report.json
+      - if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: release-public-rehearsal-${{ matrix.id }}
+          path: target/ci/public-rehearsal/report.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - id: build-context-audit
+        if: always() && steps.build-context-prepare.outcome == 'success'
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.rehearse-public-deps.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.rehearse-public-deps.outputs.cache-primary-key != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: ${{ steps.rehearse-public-deps.outputs.cache-primary-key }}
+
   publish:
     name: Release / publish
-    needs: assemble
+    needs:
+      - assemble
+      - rehearse-public
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     permissions:

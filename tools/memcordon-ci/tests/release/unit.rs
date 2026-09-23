@@ -1029,7 +1029,7 @@ fn request_json_body(request: &str) -> serde_json::Value {
 #[path = "../support/standard.rs"]
 mod standard_fixture;
 
-fn release_fixture() -> (TempDir, config::Release) {
+pub(super) fn release_fixture() -> (TempDir, config::Release) {
     let temporary = TempDir::new().expect("temporary repository should exist");
     let root = temporary.path();
     write_canonical_publication_fixture(root);

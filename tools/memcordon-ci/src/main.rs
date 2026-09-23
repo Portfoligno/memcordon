@@ -135,6 +135,12 @@ enum ReleaseCommand {
     },
     VerifyCrates,
     FinalizeGithub,
+    RehearsePublic {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+    },
     VerifyPublic,
 }
 

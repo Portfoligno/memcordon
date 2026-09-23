@@ -2,9 +2,166 @@ use std::path::{Path, PathBuf};
 
 use memcordon_ci::{config, policy};
 use serde_yaml::Value;
+use syn::parse::Parser;
+use syn::visit::Visit;
 
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
+#[test]
+fn release_rehearsal_is_required_before_publication() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).expect("repository policy");
+    let fixture = include_str!("../../../.github/workflows/release.yml");
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/release.yml"),
+        fixture.as_bytes(),
+        &repository_policy,
+    )
+    .expect("complete release rehearsal gate");
+
+    for (original, replacement) in [
+        ("      - rehearse-public\n", ""),
+        (
+            "          - id: windows-arm64\n            runner: windows-11-arm\n",
+            "",
+        ),
+        (
+            "    name: Release / rehearse public state / ${{ matrix.id }}",
+            "    name: Release / unchecked public state / ${{ matrix.id }}",
+        ),
+        (
+            "    timeout-minutes: 90\n    permissions:\n      contents: read\n    steps:",
+            "    timeout-minutes: 90\n    permissions:\n      contents: write\n    steps:",
+        ),
+        (
+            "release rehearse-public --bundle target/ci/release-bundle",
+            "release verify-public --bundle target/ci/release-bundle",
+        ),
+        (
+            "      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public",
+            "      - if: false\n        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public",
+        ),
+        (
+            "    permissions:\n      contents: read\n    steps:",
+            "    permissions:\n      contents: read\n    env:\n      REHEARSAL_MODE: skip\n    steps:",
+        ),
+        (
+            "      - id: rehearse-public-deps\n        uses:",
+            "      - id: rehearse-public-deps\n        continue-on-error: true\n        uses:",
+        ),
+        (
+            "name: release-public-rehearsal-${{ matrix.id }}",
+            "name: omitted-public-rehearsal-${{ matrix.id }}",
+        ),
+        (
+            "path: target/ci/public-rehearsal/report.json",
+            "path: target/ci/public-rehearsal/missing.json",
+        ),
+        (
+            "key: ${{ steps.rehearse-public-deps.outputs.cache-primary-key }}",
+            "key: stale-rehearsal-cache",
+        ),
+    ] {
+        let rehearsal = fixture.find("  rehearse-public:\n").expect("rehearsal job");
+        let offset = fixture[rehearsal..]
+            .find(original)
+            .expect("missing mutation anchor in rehearsal or publish");
+        let start = rehearsal + offset;
+        let mut invalid = fixture.to_owned();
+        invalid.replace_range(start..start + original.len(), replacement);
+        assert!(
+            policy::validate_workflow_bytes(
+                &root,
+                Path::new(".github/workflows/release.yml"),
+                invalid.as_bytes(),
+                &repository_policy,
+            )
+            .is_err(),
+            "release rehearsal mutation was accepted: {original}"
+        );
+    }
+}
+
+#[test]
+fn incident_path_regression_remains_in_the_native_workspace_suite() {
+    struct Strings(Vec<String>);
+    impl<'ast> Visit<'ast> for Strings {
+        fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
+            self.0.push(literal.value());
+        }
+
+        fn visit_expr_macro(&mut self, expression: &'ast syn::ExprMacro) {
+            if expression.mac.path.is_ident("vec") {
+                let values =
+                    syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated
+                        .parse2(expression.mac.tokens.clone())
+                        .expect("native suite argument vector parses");
+                self.0.extend(values.iter().map(syn::LitStr::value));
+            }
+            syn::visit::visit_expr_macro(self, expression);
+        }
+    }
+
+    let source = include_str!("build_context.rs");
+    let file = syn::parse_file(source).expect("build-context tests parse");
+    let incident = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Fn(function)
+                if function.sig.ident
+                    == "isolated_install_child_uses_the_canonical_source_namespace" =>
+            {
+                Some(function)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(incident.len(), 1, "incident regression must be unique");
+    let incident = incident[0];
+    assert!(
+        incident
+            .attrs
+            .iter()
+            .any(|attr| attr.path().is_ident("test"))
+    );
+    assert!(
+        !incident
+            .attrs
+            .iter()
+            .any(|attr| attr.path().is_ident("ignore"))
+    );
+    let mut strings = Strings(Vec::new());
+    strings.visit_item_fn(incident);
+    assert!(
+        strings
+            .0
+            .iter()
+            .any(|value| value == "generated_package_unmanaged_child")
+    );
+
+    let suites = include_str!("../src/suites.rs");
+    assert!(suites.contains("Suite::Native => native(root, &toolchains.stable, false)"));
+    let suites = syn::parse_file(suites).expect("suite source parses");
+    let native = suites
+        .items
+        .iter()
+        .find_map(|item| match item {
+            syn::Item::Fn(function) if function.sig.ident == "native" => Some(function),
+            _ => None,
+        })
+        .expect("native suite implementation");
+    let mut native_strings = Strings(Vec::new());
+    native_strings.visit_item_fn(native);
+    for required in ["test", "--workspace", "--all-targets", "--all-features"] {
+        assert!(
+            native_strings.0.iter().any(|value| value == required),
+            "native suite dropped {required}"
+        );
+    }
 }
 
 #[test]
@@ -356,7 +513,13 @@ fn public_windows_release_smoke_is_structurally_required() {
             "verify-public verify-public-target cache inputs differ",
         ),
     ] {
-        let invalid = exact.replacen(source, replacement, 1);
+        let verify = exact.find("  verify-public:\n").expect("verify-public job");
+        let offset = exact[verify..]
+            .find(source)
+            .expect("verify-public mutation anchor");
+        let start = verify + offset;
+        let mut invalid = exact.clone();
+        invalid.replace_range(start..start + source.len(), replacement);
         assert_ne!(invalid, exact, "{name} mutation must apply");
         let error = policy::validate_workflow_bytes(
             &root,
@@ -718,5 +881,5 @@ fn every_workflow_upload_uses_the_bounded_action() {
             workflow.matches(local).count()
         })
         .sum();
-    assert_eq!(count, 53, "workflow artifact upload inventory differs");
+    assert_eq!(count, 55, "workflow artifact upload inventory differs");
 }

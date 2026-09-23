@@ -127,7 +127,10 @@ git push origin "refs/tags/$release_version"
 ## 4. Monitor publication
 
 The workflow validates tag and workflow provenance, package contents, native
-assets, Miri, fuzzing, and certified backends before it can publish. It then
+assets, Miri, fuzzing, and certified backends before it can publish. After
+assembly, the `rehearse-public` matrix consumes the exact release bundle on
+Linux x64, Windows x64, and Windows ARM64. All three candidate package and
+native-asset qualifications must pass before the publish job starts. It then
 stages a GitHub draft, publishes at most one crate per credential slot in
 dependency order, verifies public package content, uploads the deterministic
 publication report and native assets, publishes the GitHub Release, and runs

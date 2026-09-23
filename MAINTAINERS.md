@@ -139,6 +139,17 @@ The package and parity suites are release-blocking. Post-public verification
 also installs the published Cargo package and exercises the native archive on
 matching x64 and ARM64 Windows runners.
 
+Before publication, the `rehearse-public` release matrix qualifies the exact
+assembled bundle on Linux x64, Windows x64, and Windows ARM64. Its candidate
+consumer uses the same isolated Cargo source audit and direct `install` child
+as public verification; the public job remains required after publication.
+To inspect a locally assembled bundle or run the Windows path regression:
+
+```console
+cargo run --locked --package memcordon-ci -- release rehearse-public --bundle target/ci/release-bundle --report target/ci/public-rehearsal/report.json
+cargo test --locked --package memcordon-ci --test build_context isolated_install_child_uses_the_canonical_source_namespace
+```
+
 In certification schema 2, `runner_class: "ephemeral-certified"` describes the
 evidence from that exact hosted job run. It includes provider, fixed label,
 runtime qualification, commit identity, and per-test results; it is not advance

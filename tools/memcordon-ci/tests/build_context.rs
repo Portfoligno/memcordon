@@ -560,7 +560,7 @@ fn cold_seed_compiles_without_cargo_dependencies_and_rejects_override_before_boo
 }
 
 #[test]
-fn generated_package_builds_use_fresh_uncached_outputs_and_reject_configuration_overrides() {
+fn isolated_install_child_uses_the_canonical_source_namespace() {
     // This fixture exercises the unmanaged API. Cargo's managed parent may
     // supply compiler routing, but its in-process context is not inherited.
     let mut child = generated_fixture_child("generated_package_unmanaged_child");
@@ -578,6 +578,96 @@ fn generated_package_builds_use_fresh_uncached_outputs_and_reject_configuration_
             .unwrap()
             .contains("1 passed;")
     );
+}
+
+#[test]
+fn isolated_source_child_output_requires_exact_single_root_argument() {
+    use memcordon_ci::build_context::{IsolatedOutputScope, run_isolated_cargo_with_output_scope};
+
+    let source = tempfile::tempdir().unwrap();
+    let install = source.path().join("install");
+    let sibling = source.path().with_file_name("install-other");
+    let deadline = std::time::Duration::from_secs(1);
+    let run = |arguments: Vec<OsString>, declared: Option<&Path>| {
+        run_isolated_cargo_with_output_scope(
+            source.path(),
+            "1.97.1",
+            arguments,
+            deadline,
+            declared,
+            IsolatedOutputScope::SourceChild,
+        )
+    };
+
+    assert!(run(vec![OsString::from("install")], Some(&install)).is_err());
+    assert!(run(vec![OsString::from("install")], Some(&sibling)).is_err());
+    assert!(run(vec![OsString::from("install")], Some(source.path())).is_err());
+    assert!(
+        run(
+            vec![OsString::from("install")],
+            Some(&source.path().join("candidate/install")),
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            vec![
+                OsString::from("install"),
+                OsString::from("--root"),
+                install.as_os_str().to_os_string(),
+            ],
+            None,
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            vec![
+                OsString::from("install"),
+                OsString::from("--root"),
+                sibling.into_os_string(),
+            ],
+            Some(&install),
+        )
+        .is_err()
+    );
+    assert!(
+        run(
+            vec![
+                OsString::from("install"),
+                OsString::from("--root"),
+                install.as_os_str().to_os_string(),
+                OsString::from("--root"),
+                install.as_os_str().to_os_string(),
+            ],
+            Some(&install),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn isolated_external_output_cannot_hide_measured_source() {
+    let source = tempfile::tempdir().unwrap();
+    let deadline = std::time::Duration::from_secs(1);
+    for output in [source.path().to_path_buf(), source.path().join("install")] {
+        let error = memcordon_ci::build_context::run_isolated_cargo(
+            source.path(),
+            "1.97.1",
+            [
+                OsString::from("install"),
+                OsString::from("--root"),
+                output.as_os_str().to_os_string(),
+            ],
+            deadline,
+            Some(&output),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("overlaps source"),
+            "unexpected error: {error}"
+        );
+    }
 }
 
 fn generated_fixture_child(name: &str) -> Command {
@@ -614,7 +704,12 @@ fn unmanaged_generated_packages_reject_each_ambient_compiler_override() {
 #[test]
 fn generated_package_regression_isolated_from_parent_compiler_routing() {
     let mut child = Command::new(std::env::current_exe().unwrap());
-    child.args(["--exact", "generated_package_builds_use_fresh_uncached_outputs_and_reject_configuration_overrides", "--nocapture"])
+    child
+        .args([
+            "--exact",
+            "isolated_install_child_uses_the_canonical_source_namespace",
+            "--nocapture",
+        ])
         .env("RUSTC", "parent-compiler-routing-fixture")
         .env("RUSTDOC", "parent-rustdoc-routing-fixture");
     let output =
@@ -662,7 +757,9 @@ fn generated_package_rejected_override_child() {
 #[test]
 #[ignore = "invoked explicitly in a child with unmanaged compiler environment"]
 fn generated_package_unmanaged_child() {
-    use memcordon_ci::build_context::run_isolated_cargo;
+    use memcordon_ci::build_context::{
+        IsolatedOutputScope, run_isolated_cargo, run_isolated_cargo_with_output_scope,
+    };
     use std::time::Duration;
     let source = tempfile::tempdir().unwrap();
     fs::create_dir(source.path().join("src")).unwrap();
@@ -698,7 +795,7 @@ fn generated_package_unmanaged_child() {
     assert!(!cached.exists());
     assert!(!source.path().join("target").exists());
     let install = source.path().join("install");
-    run_isolated_cargo(
+    run_isolated_cargo_with_output_scope(
         source.path(),
         "1.97.1",
         [
@@ -711,6 +808,7 @@ fn generated_package_unmanaged_child() {
         ],
         deadline,
         Some(&install),
+        IsolatedOutputScope::SourceChild,
     )
     .unwrap();
     assert!(

@@ -57,6 +57,14 @@ are audited, install destinations are explicitly declared, and recorded evidence
 marks these builds ineligible for shared caches. A local package patch configuration
 may reference only canonical paths inside the measured source tree; ancestor
 configuration and command-line configuration overrides remain forbidden.
+The isolated Cargo runner canonicalizes the source operation root and each
+declared install output through its nearest existing ancestor before taking the
+first snapshot. It compares the normalized declaration with Cargo's `--root`
+argument and passes that same path to Cargo. Release consumers require a direct
+`install` child inside the measured source; package-channel certification may
+explicitly own an external install tree. Only the declared output is excluded
+from snapshots, so source changes and similarly named sibling paths remain
+fatal on Windows ordinary and verbatim path namespaces alike.
 
 Preflight and postflight content audits reject drift. Partial compilation from a
 failed test may be saved only after a successful audit, with the original nonempty

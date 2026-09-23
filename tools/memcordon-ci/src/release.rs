@@ -38,6 +38,9 @@ use crate::config::{self, AssetTarget, RuntimeComponentRole, SealedAssetPolicy};
 use crate::sealed_linux::QualificationReceipt as LinuxQualificationReceipt;
 use crate::{CiError, ReleaseCommand, Result};
 
+#[path = "release_rehearsal.rs"]
+mod rehearsal;
+
 #[cfg(any(target_os = "linux", test))]
 const LINUX_PROVIDER_QUALIFICATION_ARGUMENTS: &[&str] = &["probe"];
 
@@ -218,7 +221,7 @@ struct NativeAssetReport {
     smoke: NativeSmokeReport,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct NativeSmokeReport {
     cli_version: bool,
     doctor: bool,
@@ -953,7 +956,12 @@ fn canonical_crate_identity(path: &Path) -> Result<CrateArchiveIdentity> {
                 value
                     .get("dirty")
                     .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
+                    .unwrap_or(false)
+                    || value
+                        .get("git")
+                        .and_then(|git| git.get("dirty"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
             );
             bytes = serde_json::to_vec(&value)?;
         }
@@ -1447,7 +1455,7 @@ fn smoke_packaged_memcordon_install(
         })?,
     )?;
     let install_root = temporary.path().join("install");
-    memcordon_ci::build_context::run_isolated_cargo(
+    memcordon_ci::build_context::run_isolated_cargo_with_output_scope(
         temporary.path(),
         stable,
         [
@@ -1460,6 +1468,7 @@ fn smoke_packaged_memcordon_install(
         ],
         RELEASE_DEADLINE,
         Some(&install_root),
+        memcordon_ci::build_context::IsolatedOutputScope::SourceChild,
     )?;
     let binaries = install_root.join("bin");
     let cli_name = installed_binary_name("memcordon");
@@ -1870,6 +1879,24 @@ fn inspect_extract_and_smoke(
     identity: &ReleaseIdentity,
     execute: bool,
 ) -> Result<ArchiveInspection> {
+    inspect_extract_and_smoke_report(
+        root,
+        archive_path,
+        target,
+        identity,
+        execute,
+        &mut NativeSmokeReport::default(),
+    )
+}
+
+fn inspect_extract_and_smoke_report(
+    root: &Path,
+    archive_path: &Path,
+    target: &AssetTarget,
+    identity: &ReleaseIdentity,
+    execute: bool,
+    smoke: &mut NativeSmokeReport,
+) -> Result<ArchiveInspection> {
     let temporary = TempDir::new()?;
     let mut extracted_files = BTreeMap::<String, PathBuf>::new();
     let mut archive_modes = BTreeMap::<String, u32>::new();
@@ -2019,17 +2046,7 @@ fn inspect_extract_and_smoke(
         permissions.set_mode(0o755);
         fs::set_permissions(&executable, permissions)?;
     }
-    let mut smoke = NativeSmokeReport {
-        cli_version: false,
-        doctor: false,
-        agent_version: None,
-        agent_inspection: None,
-        provider_install: None,
-        provider_verify: None,
-        provider_qualification: None,
-        sealed_execution: None,
-        provider_uninstall: None,
-    };
+    *smoke = NativeSmokeReport::default();
     if execute {
         let expected_version = identity.version.to_string();
         verify_component_version(&executable, "memcordon", &expected_version, root)?;
@@ -2064,9 +2081,9 @@ fn inspect_extract_and_smoke(
             validate_agent_package_inspection(&output, &expected_version, &identity.commit)?;
             smoke.agent_inspection = Some(true);
             #[cfg(target_os = "linux")]
-            smoke_linux_provider(&executable, &agent_executable, root, &mut smoke)?;
+            smoke_linux_provider(&executable, &agent_executable, root, smoke)?;
             #[cfg(target_os = "windows")]
-            smoke_windows_provider(&executable, &agent_executable, root, &mut smoke)?;
+            smoke_windows_provider(&executable, &agent_executable, root, smoke)?;
         }
     }
     let mut inventory = Sha256::new();
@@ -2086,8 +2103,30 @@ fn inspect_extract_and_smoke(
         runtime_manifest_sha256: sha256_bytes(&manifest_bytes),
         components,
         archive_member_inventory_sha256: hex::encode(inventory.finalize()),
-        smoke,
+        smoke: smoke.clone(),
     })
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
+fn run_provider_lifecycle(
+    smoke: &mut NativeSmokeReport,
+    qualify: impl FnOnce(&mut NativeSmokeReport) -> Result<()>,
+    remove_and_verify_absent: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let primary = qualify(smoke);
+    smoke.provider_uninstall = Some(false);
+    let cleanup = remove_and_verify_absent();
+    if cleanup.is_ok() {
+        smoke.provider_uninstall = Some(true);
+    }
+    match (primary, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(primary), Err(cleanup)) => Err(failure(format!(
+            "bundle provider smoke failed: primary={primary}; cleanup={cleanup}"
+        ))),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2103,7 +2142,7 @@ fn smoke_windows_provider(
             .run()
             .map(|_| ())
     };
-    let primary: Result<()> = (|| {
+    let primary = |smoke: &mut NativeSmokeReport| {
         agent_command(&["package", "install", "--ephemeral-ci"])?;
         smoke.provider_install = Some(true);
         agent_command(&["package", "verify", "--json"])?;
@@ -2123,37 +2162,29 @@ fn smoke_windows_provider(
             .run()?;
         smoke.sealed_execution = Some(true);
         Ok(())
-    })();
-    let uninstall = agent_command(&["package", "uninstall", "--ephemeral-ci"])
-        .and_then(|()| {
-            let output = CommandSpec::new(agent, root, RELEASE_DEADLINE)
-                .arg("windows-provider-state-absent")
-                .run()?;
-            if output
-                .strip_suffix(b"\n")
-                .and_then(|value| value.strip_suffix(b"\r").or(Some(value)))
-                == Some(b"true")
-            {
-                Ok(())
-            } else {
-                Err(failure(format!(
-                    "Windows native absence probe did not report true: {:?}",
-                    String::from_utf8_lossy(&output)
-                )))
-            }
-        })
-        .and_then(|()| verify_windows_provider_absent());
-    if uninstall.is_ok() {
-        smoke.provider_uninstall = Some(true);
-    }
-    match (primary, uninstall) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(()), Err(cleanup)) => Err(cleanup),
-        (Err(primary), Err(cleanup)) => Err(failure(format!(
-            "Windows bundle provider smoke failed: primary={primary}; cleanup={cleanup}"
-        ))),
-    }
+    };
+    let uninstall = || {
+        agent_command(&["package", "uninstall", "--ephemeral-ci"])
+            .and_then(|()| {
+                let output = CommandSpec::new(agent, root, RELEASE_DEADLINE)
+                    .arg("windows-provider-state-absent")
+                    .run()?;
+                if output
+                    .strip_suffix(b"\n")
+                    .and_then(|value| value.strip_suffix(b"\r").or(Some(value)))
+                    == Some(b"true")
+                {
+                    Ok(())
+                } else {
+                    Err(failure(format!(
+                        "Windows native absence probe did not report true: {:?}",
+                        String::from_utf8_lossy(&output)
+                    )))
+                }
+            })
+            .and_then(|()| verify_windows_provider_absent())
+    };
+    run_provider_lifecycle(smoke, primary, uninstall)
 }
 
 #[cfg(target_os = "windows")]
@@ -2248,7 +2279,7 @@ fn smoke_linux_provider(
                 .run()
                 .map(|_| ())
         };
-    let primary: Result<()> = (|| {
+    let primary = |smoke: &mut NativeSmokeReport| {
         privileged_agent(&["package", "install", "--ephemeral-ci"])?;
         smoke.provider_install = Some(true);
         privileged_agent(&["package", "verify", "--json"])?;
@@ -2267,21 +2298,13 @@ fn smoke_linux_provider(
         authorized_release_cli(&identity, LinuxProviderFrontendStage::SealedExecution, cli)?;
         smoke.sealed_execution = Some(true);
         Ok(())
-    })();
-    let uninstall = privileged_agent(&["package", "uninstall", "--ephemeral-ci"])
-        .map(|_| ())
-        .and_then(|()| verify_linux_provider_absent());
-    if uninstall.is_ok() {
-        smoke.provider_uninstall = Some(true);
-    }
-    match (primary, uninstall) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(primary), Ok(())) => Err(primary),
-        (Ok(()), Err(cleanup)) => Err(cleanup),
-        (Err(primary), Err(cleanup)) => Err(failure(format!(
-            "Linux bundle provider smoke failed: primary={primary}; cleanup={cleanup}"
-        ))),
-    }
+    };
+    let uninstall = || {
+        privileged_agent(&["package", "uninstall", "--ephemeral-ci"])
+            .map(|_| ())
+            .and_then(|()| verify_linux_provider_absent())
+    };
+    run_provider_lifecycle(smoke, primary, uninstall)
 }
 
 #[cfg(target_os = "linux")]
@@ -2864,11 +2887,8 @@ fn github_commit_file(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn resolve_local_action(
-    release: &config::Release,
-    endpoints: &HttpEndpoints,
-    commit: &str,
+    fetch: &mut impl FnMut(&str) -> Result<Vec<u8>>,
     reference: &str,
     depth: usize,
     documents: &mut BTreeMap<String, Vec<u8>>,
@@ -2892,7 +2912,7 @@ fn resolve_local_action(
     if documents.len() + visiting.len() + 1 > MAXIMUM_WORKFLOW_PROVENANCE_FILES {
         return Err(failure("workflow provenance file count exceeds policy"));
     }
-    let bytes = github_commit_file(release, endpoints, commit, &path)?;
+    let bytes = fetch(&path)?;
     *total_bytes = total_bytes
         .checked_add(bytes.len())
         .ok_or_else(|| failure("workflow provenance byte count overflowed"))?;
@@ -2900,16 +2920,7 @@ fn resolve_local_action(
         return Err(failure("workflow provenance byte count exceeds policy"));
     }
     for nested in memcordon_ci::policy::composite_local_action_references(&bytes)? {
-        resolve_local_action(
-            release,
-            endpoints,
-            commit,
-            &nested,
-            depth + 1,
-            documents,
-            visiting,
-            total_bytes,
-        )?;
+        resolve_local_action(fetch, &nested, depth + 1, documents, visiting, total_bytes)?;
     }
     let removed = visiting.remove(&path);
     if !removed {
@@ -2927,15 +2938,22 @@ fn workflow_graph_at(
     commit: &str,
 ) -> Result<WorkflowGraph> {
     let entry_path = [".github", "workflows", release.workflow.as_str()].join("/");
-    let entry = github_commit_file(release, endpoints, commit, &entry_path)?;
+    workflow_graph_from(entry_path, |path| {
+        github_commit_file(release, endpoints, commit, path)
+    })
+}
+
+fn workflow_graph_from(
+    entry_path: String,
+    mut fetch: impl FnMut(&str) -> Result<Vec<u8>>,
+) -> Result<WorkflowGraph> {
+    let entry = fetch(&entry_path)?;
     let mut total_bytes = entry.len();
     let mut documents = BTreeMap::new();
     let mut visiting = BTreeSet::new();
     for reference in memcordon_ci::policy::workflow_local_action_references(&entry)? {
         resolve_local_action(
-            release,
-            endpoints,
-            commit,
+            &mut fetch,
             &reference,
             1,
             &mut documents,
@@ -3098,10 +3116,20 @@ fn assemble(root: &Path) -> Result<()> {
 
 fn bundle_manifest(root: &Path) -> Result<(config::Release, ReleaseManifest, PathBuf)> {
     let release = config::release(root)?;
-    config::validate_release_configuration_identity(&release)?;
     let output = root.join(&release.assets.output_directory);
-    let manifest: ReleaseManifest =
-        serde_json::from_slice(&fs::read(output.join(&release.assets.manifest))?)?;
+    bundle_manifest_at(root, &output)
+}
+
+fn bundle_manifest_at(
+    root: &Path,
+    output: &Path,
+) -> Result<(config::Release, ReleaseManifest, PathBuf)> {
+    let release = config::release(root)?;
+    config::validate_release_configuration_identity(&release)?;
+    let manifest: ReleaseManifest = serde_json::from_slice(&fs::read(rehearsal::bundle_file(
+        output,
+        Path::new(&release.assets.manifest),
+    )?)?)?;
     if manifest.schema_version != config::RELEASE_SCHEMA_VERSION {
         return Err(failure("release manifest schema identity is invalid"));
     }
@@ -3130,9 +3158,14 @@ fn bundle_manifest(root: &Path) -> Result<(config::Release, ReleaseManifest, Pat
     memcordon_ci::release_evidence::validate_required_certification_records(
         &manifest.certification,
         &manifest.certification_origin,
-        |path| memcordon_ci::release_evidence::read_report(&output.join(path)),
+        |path| {
+            memcordon_ci::release_evidence::read_report(&rehearsal::bundle_file(
+                output,
+                Path::new(path),
+            )?)
+        },
     )?;
-    Ok((release, manifest, output))
+    Ok((release, manifest, output.to_path_buf()))
 }
 
 fn is_lowercase_hex_digest(value: &str) -> bool {
@@ -4339,7 +4372,24 @@ fn transient_network_error(error: &CiError) -> bool {
 }
 
 fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
+    qualify_crate_consumer(
+        root,
+        record,
+        None,
+        &mut rehearsal::ConsumerEvidence::new(record),
+    )
+}
+
+fn qualify_crate_consumer(
+    root: &Path,
+    record: &CrateRecord,
+    candidate: Option<&rehearsal::CandidatePackages>,
+    evidence: &mut rehearsal::ConsumerEvidence,
+) -> Result<()> {
     let temporary = TempDir::new()?;
+    let candidate_sources = candidate
+        .map(|packages| packages.stage(temporary.path()))
+        .transpose()?;
     let source = temporary.path().join("src");
     fs::create_dir_all(&source)?;
     fs::write(source.join("main.rs"), b"fn main() {}\n")?;
@@ -4353,6 +4403,7 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
     let default_cargo_binaries = configured_default_cargo_binaries(&release)?;
     let toolchains = config::toolchains(root)?;
     let manifest_argument = manifest_path.into_os_string();
+    evidence.phase = "generate-lockfile";
     memcordon_ci::build_context::run_isolated_cargo(
         temporary.path(),
         &toolchains.stable,
@@ -4364,6 +4415,29 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
         RELEASE_DEADLINE,
         None,
     )?;
+    evidence.lock_generated = true;
+    if let Some(sources) = &candidate_sources {
+        evidence.phase = "candidate-resolution";
+        let metadata = memcordon_ci::build_context::run_isolated_cargo(
+            temporary.path(),
+            &toolchains.stable,
+            [
+                OsString::from("metadata"),
+                OsString::from("--locked"),
+                OsString::from("--format-version"),
+                OsString::from("1"),
+                OsString::from("--manifest-path"),
+                manifest_argument.clone(),
+            ],
+            RELEASE_DEADLINE,
+            None,
+        )?;
+        sources.validate_resolution(&metadata, &record.name)?;
+        evidence.dependency_resolution = Some("candidate-archive");
+    } else {
+        evidence.dependency_resolution = Some("registry");
+    }
+    evidence.phase = "check";
     memcordon_ci::build_context::run_isolated_cargo(
         temporary.path(),
         &toolchains.stable,
@@ -4376,23 +4450,29 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
         RELEASE_DEADLINE,
         None,
     )?;
+    evidence.check_passed = true;
     if record.name == "memcordon" {
         let install_root = temporary.path().join("install");
-        memcordon_ci::build_context::run_isolated_cargo(
+        evidence.phase = "install";
+        let arguments = rehearsal::consumer_install_arguments(
+            record,
+            candidate_sources
+                .as_ref()
+                .map(|sources| sources.package_root(&record.name))
+                .transpose()?
+                .as_deref(),
+            &install_root,
+        );
+        memcordon_ci::build_context::run_isolated_cargo_with_output_scope(
             temporary.path(),
             &toolchains.stable,
-            [
-                OsString::from("install"),
-                OsString::from("memcordon"),
-                OsString::from("--version"),
-                OsString::from(&record.version),
-                OsString::from("--locked"),
-                OsString::from("--root"),
-                install_root.clone().into_os_string(),
-            ],
+            arguments,
             RELEASE_DEADLINE,
             Some(&install_root),
+            memcordon_ci::build_context::IsolatedOutputScope::SourceChild,
         )?;
+        evidence.install_passed = Some(true);
+        evidence.phase = "installed-inventory";
         let binary_directory = install_root.join("bin");
         let cli_name = installed_binary_name("memcordon");
         let agent_name = installed_binary_name("memcordon-sealed-agent");
@@ -4424,6 +4504,7 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
             .args(["package", "inspect", "--json"])
             .run()?;
         validate_agent_package_inspection(&output, &record.version, &record.vcs_commit)?;
+        evidence.phase = "provider-lifecycle";
         #[cfg(target_os = "linux")]
         {
             let mut smoke = NativeSmokeReport {
@@ -4437,7 +4518,9 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
                 sealed_execution: None,
                 provider_uninstall: None,
             };
-            smoke_linux_provider(&executable, &agent, root, &mut smoke)?;
+            let result = smoke_linux_provider(&executable, &agent, root, &mut smoke);
+            evidence.provider = Some(smoke);
+            result?;
         }
         #[cfg(target_os = "windows")]
         {
@@ -4452,9 +4535,14 @@ fn verify_crate_consumer(root: &Path, record: &CrateRecord) -> Result<()> {
                 sealed_execution: None,
                 provider_uninstall: None,
             };
-            smoke_windows_provider(&executable, &agent, root, &mut smoke)?;
+            let result = smoke_windows_provider(&executable, &agent, root, &mut smoke);
+            evidence.provider = Some(smoke);
+            result?;
         }
     }
+    evidence.source_unchanged = true;
+    evidence.phase = "complete";
+    evidence.passed = true;
     Ok(())
 }
 
@@ -6276,6 +6364,7 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         }
         ReleaseCommand::VerifyCrates => verify_crates(root).map(|_| ()),
         ReleaseCommand::FinalizeGithub => finalize_github(root),
+        ReleaseCommand::RehearsePublic { bundle, report } => rehearsal::run(root, &bundle, &report),
         ReleaseCommand::VerifyPublic => verify_public(root),
     }
 }
