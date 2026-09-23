@@ -4570,11 +4570,50 @@ fn wait_for_public_crate(
             }
             Ok(CrateVersionLookup::Present(_)) => {
                 let verified = verify_public_crate(release, record)?;
-                verify_crate_consumer(root, record)?;
+                wait_for_registry_consumer(record, wait, started, || {
+                    verify_crate_consumer(root, record)
+                })?;
                 return Ok(verified);
             }
             Err(error) if transient_network_error(&error) && started.elapsed() < total => {
                 thread::sleep(delay);
+                delay = delay.saturating_mul(2).min(maximum);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn consumer_index_version_absent(error: &CiError, record: &CrateRecord) -> bool {
+    let CiError::Message(message) = error else {
+        return false;
+    };
+    if !message.starts_with("isolated Cargo failed: ") {
+        return false;
+    }
+    let expected = format!(
+        "error: could not find `{}` in registry `crates-io` with version `={}`",
+        record.name, record.version
+    );
+    message.lines().any(|line| line.trim() == expected)
+}
+
+fn wait_for_registry_consumer(
+    record: &CrateRecord,
+    wait: &config::RegistryWait,
+    started: Instant,
+    mut verify: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let total = Duration::from_secs(wait.total_seconds);
+    let maximum = Duration::from_millis(wait.maximum_milliseconds);
+    let mut delay = Duration::from_millis(wait.initial_milliseconds);
+    loop {
+        match verify() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if consumer_index_version_absent(&error, record) && started.elapsed() < total =>
+            {
+                thread::sleep(delay.min(total.saturating_sub(started.elapsed())));
                 delay = delay.saturating_mul(2).min(maximum);
             }
             Err(error) => return Err(error),

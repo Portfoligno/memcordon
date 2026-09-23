@@ -3660,6 +3660,63 @@ fn public_verifier_rejects_yanked_input_before_archive_download() {
 }
 
 #[test]
+fn consumer_wait_retries_only_the_exact_pending_registry_version() {
+    let record = verifier_crate_record("published");
+    let wait = config::RegistryWait {
+        initial_milliseconds: 1,
+        maximum_milliseconds: 1,
+        total_seconds: 1,
+    };
+    let missing = || {
+        CiError::Message(format!(
+            "isolated Cargo failed: exit status: 101; stderr=    Updating crates.io index\nerror: could not find `{}` in registry `crates-io` with version `={}`\n",
+            record.name, record.version
+        ))
+    };
+    let attempts = Cell::new(0);
+    wait_for_registry_consumer(&record, &wait, Instant::now(), || {
+        attempts.set(attempts.get() + 1);
+        if attempts.get() == 1 {
+            Err(missing())
+        } else {
+            Ok(())
+        }
+    })
+    .expect("the exact pending version should retry and then pass");
+    assert_eq!(attempts.get(), 2);
+
+    for error in [
+        CiError::Message(format!(
+            "isolated Cargo failed: exit status: 101; stderr=error: could not find `other` in registry `crates-io` with version `={}`",
+            record.version
+        )),
+        CiError::Message(
+            "isolated Cargo failed: exit status: 101; stderr=checksum mismatch".into(),
+        ),
+        CiError::Message("crate version is yanked: example 1.2.3".into()),
+    ] {
+        let attempts = Cell::new(0);
+        let expected = error.to_string();
+        let actual = wait_for_registry_consumer(&record, &wait, Instant::now(), || {
+            attempts.set(attempts.get() + 1);
+            Err(CiError::Message(expected.clone()))
+        })
+        .expect_err("non-propagation errors must fail immediately");
+        assert_eq!(actual.to_string(), expected);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    let attempts = Cell::new(0);
+    let expired = Instant::now() - Duration::from_secs(2);
+    wait_for_registry_consumer(&record, &wait, expired, || {
+        attempts.set(attempts.get() + 1);
+        Err(missing())
+    })
+    .expect_err("a missing version must stop when the shared visibility budget expires");
+    assert_eq!(attempts.get(), 1);
+}
+
+#[test]
 fn registry_http_403_is_diagnosed_without_retry() {
     let (temporary, mut release) = release_fixture();
     release.network_retry = config::RegistryWait {
