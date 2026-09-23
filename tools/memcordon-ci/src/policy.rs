@@ -3532,7 +3532,11 @@ fn reviewed_environment_removal(relative: &Path, visitor: &RustPolicy) -> bool {
     !visitor.calls_env_remove
         || relative == Path::new("tools/memcordon-ci/src/command.rs")
         || relative == Path::new("tools/memcordon-ci/src/release.rs")
-        || (relative == Path::new("tools/memcordon-ci/tests/build_context.rs")
+        || ([
+            Path::new("tools/memcordon-ci/tests/build_context.rs"),
+            Path::new("tools/memcordon-ci/tests/release/rehearsal.rs"),
+        ]
+        .contains(&relative)
             && !visitor.unreviewed_fixture_env_remove)
 }
 

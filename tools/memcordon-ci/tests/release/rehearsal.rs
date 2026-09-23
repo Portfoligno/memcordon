@@ -234,6 +234,32 @@ fn candidate_archive_admission_rejects_identity_tree_digest_and_dirty_provenance
 
 #[test]
 fn candidate_staging_resolves_and_compiles_the_admitted_archive_offline() {
+    let mut child = generated_fixture_child(
+        "release::rehearsal::tests::candidate_staging_resolves_and_compiles_the_admitted_archive_offline_child",
+    );
+    let output = memcordon_testkit::run_with_deadline(&mut child, Duration::from_secs(6 * 60))
+        .expect("candidate consumer fixture completed before its deadline");
+    assert!(
+        output.status.success(),
+        "candidate consumer fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+}
+
+fn generated_fixture_child(name: &str) -> std::process::Command {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["--exact", name, "--ignored", "--nocapture"])
+        .env_remove("RUSTC")
+        .env_remove("RUSTDOC");
+    child
+}
+
+#[test]
+#[ignore = "invoked by the candidate consumer environment boundary regression"]
+fn candidate_staging_resolves_and_compiles_the_admitted_archive_offline_child() {
     let temporary = TempDir::new().unwrap();
     let (record, archive) = archive_fixture(temporary.path(), false);
     let packages = CandidatePackages {

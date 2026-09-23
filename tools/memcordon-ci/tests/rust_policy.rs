@@ -10,6 +10,9 @@ fn compiler_selector_removal_is_confined_to_the_generated_fixture_child() {
     }"#;
     validate_rust_policy_bytes(fixture, allowed).unwrap();
     validate_rust_policy_bytes(fixture, include_bytes!("build_context.rs")).unwrap();
+    let rehearsal = Path::new("tools/memcordon-ci/tests/release/rehearsal.rs");
+    validate_rust_policy_bytes(rehearsal, allowed).unwrap();
+    validate_rust_policy_bytes(rehearsal, include_bytes!("release/rehearsal.rs")).unwrap();
     for path in [
         "tools/memcordon-ci/tests/other.rs",
         "crates/example/src/lib.rs",
@@ -32,6 +35,7 @@ fn compiler_selector_removal_is_confined_to_the_generated_fixture_child() {
         br#"fn generated_fixture_child(child: &mut Command) { child.env_remove("RUSTC"); fn nested(child: &mut Command) { child.env_remove("RUSTDOC"); } }"#,
     ] {
         assert!(validate_rust_policy_bytes(fixture, denied).is_err());
+        assert!(validate_rust_policy_bytes(rehearsal, denied).is_err());
     }
     let credential = br#"fn remove(child: &mut Command) { child.env_remove("GH_TOKEN"); }"#;
     for path in [
