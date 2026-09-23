@@ -155,9 +155,9 @@ fn incident_path_regression_remains_in_the_native_workspace_suite() {
             .any(|value| value == "generated_package_unmanaged_child")
     );
 
-    let suites = include_str!("../src/suites.rs");
-    assert!(suites.contains("Suite::Native => native(root, &toolchains.stable, false)"));
-    let suites = syn::parse_file(suites).expect("suite source parses");
+    let suites_source = include_str!("../src/suites.rs");
+    assert!(suites_source.contains("Suite::Native => native(root, &toolchains.stable, false)"));
+    let suites = syn::parse_file(suites_source).expect("suite source parses");
     let native = suites
         .items
         .iter()
@@ -168,11 +168,25 @@ fn incident_path_regression_remains_in_the_native_workspace_suite() {
         .expect("native suite implementation");
     let mut native_strings = Strings(Vec::new());
     native_strings.visit_item_fn(native);
-    for required in ["test", "--workspace", "--all-targets", "--all-features"] {
-        assert!(
-            native_strings.0.iter().any(|value| value == required),
-            "native suite dropped {required}"
-        );
+    assert!(native_strings.0.iter().any(|value| value == "test"));
+    assert!(
+        suites_source
+            .contains("for command in memcordon_ci::native_test_plan::commands(release_mode)")
+    );
+    assert!(suites_source.contains(
+        "cargo_with_deadline(root, stable, \"test\", command.arguments, command.deadline)"
+    ));
+    for release_mode in [false, true] {
+        let commands = memcordon_ci::native_test_plan::commands(release_mode);
+        assert!(!commands.is_empty(), "native test plan must run Cargo");
+        for command in commands {
+            for required in ["--workspace", "--all-targets", "--all-features"] {
+                assert!(
+                    command.arguments.contains(&required),
+                    "native suite dropped {required} in release_mode={release_mode}"
+                );
+            }
+        }
     }
 }
 
