@@ -13,75 +13,87 @@ fn repository_root() -> PathBuf {
 fn release_rehearsal_is_required_before_publication() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy");
-    let fixture = include_str!("../../../.github/workflows/release.yml");
-    policy::validate_workflow_bytes(
-        &root,
-        Path::new(".github/workflows/release.yml"),
-        fixture.as_bytes(),
-        &repository_policy,
-    )
-    .expect("complete release rehearsal gate");
+    let fixture = include_str!("../../../.github/workflows/release.yml").replace("\r\n", "\n");
+    let fixtures = [fixture.clone(), fixture.replace('\n', "\r\n")];
+    for fixture in &fixtures {
+        policy::validate_workflow_bytes(
+            &root,
+            Path::new(".github/workflows/release.yml"),
+            fixture.as_bytes(),
+            &repository_policy,
+        )
+        .expect("complete release rehearsal gate");
 
-    for (original, replacement) in [
-        ("      - rehearse-public\n", ""),
-        (
-            "          - id: windows-arm64\n            runner: windows-11-arm\n",
-            "",
-        ),
-        (
-            "    name: Release / rehearse public state / ${{ matrix.id }}",
-            "    name: Release / unchecked public state / ${{ matrix.id }}",
-        ),
-        (
-            "    timeout-minutes: 90\n    permissions:\n      contents: read\n    steps:",
-            "    timeout-minutes: 90\n    permissions:\n      contents: write\n    steps:",
-        ),
-        (
-            "release rehearse-public --bundle target/ci/release-bundle",
-            "release verify-public --bundle target/ci/release-bundle",
-        ),
-        (
-            "      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public",
-            "      - if: false\n        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public",
-        ),
-        (
-            "    permissions:\n      contents: read\n    steps:",
-            "    permissions:\n      contents: read\n    env:\n      REHEARSAL_MODE: skip\n    steps:",
-        ),
-        (
-            "      - id: rehearse-public-deps\n        uses:",
-            "      - id: rehearse-public-deps\n        continue-on-error: true\n        uses:",
-        ),
-        (
-            "name: release-public-rehearsal-${{ matrix.id }}",
-            "name: omitted-public-rehearsal-${{ matrix.id }}",
-        ),
-        (
-            "path: target/ci/public-rehearsal/report.json",
-            "path: target/ci/public-rehearsal/missing.json",
-        ),
-        (
-            "key: ${{ steps.rehearse-public-deps.outputs.cache-primary-key }}",
-            "key: stale-rehearsal-cache",
-        ),
-    ] {
-        let rehearsal = fixture.find("  rehearse-public:\n").expect("rehearsal job");
-        let offset = fixture[rehearsal..]
-            .find(original)
-            .expect("missing mutation anchor in rehearsal or publish");
-        let start = rehearsal + offset;
-        let mut invalid = fixture.to_owned();
-        invalid.replace_range(start..start + original.len(), replacement);
-        assert!(
-            policy::validate_workflow_bytes(
-                &root,
-                Path::new(".github/workflows/release.yml"),
-                invalid.as_bytes(),
-                &repository_policy,
-            )
-            .is_err(),
-            "release rehearsal mutation was accepted: {original}"
-        );
+        let fixture = fixture.replace("\r\n", "\n");
+        policy::validate_workflow_bytes(
+            &root,
+            Path::new(".github/workflows/release.yml"),
+            fixture.as_bytes(),
+            &repository_policy,
+        )
+        .expect("normalized release rehearsal gate");
+
+        for (original, replacement) in [
+            ("      - rehearse-public\n", ""),
+            (
+                "          - id: windows-arm64\n            runner: windows-11-arm\n",
+                "",
+            ),
+            (
+                "    name: Release / rehearse public state / ${{ matrix.id }}",
+                "    name: Release / unchecked public state / ${{ matrix.id }}",
+            ),
+            (
+                "    timeout-minutes: 90\n    permissions:\n      contents: read\n    steps:",
+                "    timeout-minutes: 90\n    permissions:\n      contents: write\n    steps:",
+            ),
+            (
+                "release rehearse-public --bundle target/ci/release-bundle",
+                "release verify-public --bundle target/ci/release-bundle",
+            ),
+            (
+                "      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public",
+                "      - if: false\n        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release rehearse-public",
+            ),
+            (
+                "    permissions:\n      contents: read\n    steps:",
+                "    permissions:\n      contents: read\n    env:\n      REHEARSAL_MODE: skip\n    steps:",
+            ),
+            (
+                "      - id: rehearse-public-deps\n        uses:",
+                "      - id: rehearse-public-deps\n        continue-on-error: true\n        uses:",
+            ),
+            (
+                "name: release-public-rehearsal-${{ matrix.id }}",
+                "name: omitted-public-rehearsal-${{ matrix.id }}",
+            ),
+            (
+                "path: target/ci/public-rehearsal/report.json",
+                "path: target/ci/public-rehearsal/missing.json",
+            ),
+            (
+                "key: ${{ steps.rehearse-public-deps.outputs.cache-primary-key }}",
+                "key: stale-rehearsal-cache",
+            ),
+        ] {
+            let rehearsal = fixture.find("  rehearse-public:\n").expect("rehearsal job");
+            let offset = fixture[rehearsal..]
+                .find(original)
+                .expect("missing mutation anchor in rehearsal or publish");
+            let start = rehearsal + offset;
+            let mut invalid = fixture.to_owned();
+            invalid.replace_range(start..start + original.len(), replacement);
+            assert!(
+                policy::validate_workflow_bytes(
+                    &root,
+                    Path::new(".github/workflows/release.yml"),
+                    invalid.as_bytes(),
+                    &repository_policy,
+                )
+                .is_err(),
+                "release rehearsal mutation was accepted: {original}"
+            );
+        }
     }
 }
 
