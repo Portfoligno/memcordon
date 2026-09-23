@@ -17,6 +17,7 @@ pub mod managed_workflow;
 pub mod miri_targets;
 pub mod native_file_digest;
 pub mod native_profile;
+pub mod native_test_plan;
 pub mod policy;
 pub mod producer_metadata;
 pub mod release_archive;

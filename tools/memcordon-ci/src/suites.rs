@@ -119,18 +119,9 @@ fn msrv(root: &Path, version: &str) -> Result<()> {
 }
 
 fn native(root: &Path, stable: &str, release_mode: bool) -> Result<()> {
-    let mut arguments = vec![
-        "--target-dir",
-        "target/ci/native",
-        "--workspace",
-        "--all-targets",
-        "--all-features",
-        "--locked",
-    ];
-    if release_mode {
-        arguments.push("--release");
+    for command in memcordon_ci::native_test_plan::commands(release_mode) {
+        cargo_with_deadline(root, stable, "test", command.arguments, command.deadline)?;
     }
-    cargo(root, stable, "test", arguments)?;
     Ok(())
 }
 

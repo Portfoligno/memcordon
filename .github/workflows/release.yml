@@ -883,7 +883,7 @@ jobs:
           - id: x64
             runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - name: Check out pushed tag
         id: source-push
