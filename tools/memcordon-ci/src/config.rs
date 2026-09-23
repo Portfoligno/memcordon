@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::Result;
 
-pub const RELEASE_SCHEMA_VERSION: u32 = 4;
+pub const RELEASE_SCHEMA_VERSION: u32 = 5;
 
 /// Derive and validate the canonical dependency order for public workspace packages.
 pub fn publish_order(metadata: &Metadata, configured: &[String]) -> Result<Vec<String>> {

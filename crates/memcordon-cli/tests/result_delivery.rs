@@ -186,6 +186,36 @@ fn result_writer_stalls_before_write_rename_and_ack_are_cancelled_and_reaped() {
 }
 
 #[test]
+fn result_writer_preserves_the_execution_return_deadline_for_durable_writes() {
+    let directory = tempfile::tempdir().expect("controlled native fixture directory");
+    let input = directory.path().join("input.json");
+    let output = directory.path().join("output.json");
+    let mut baseline = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    baseline
+        .args(["+0ms", "--report"])
+        .arg(&input)
+        .args(["--", "/usr/bin/true"]);
+    assert_eq!(bounded(baseline).code(), Some(123));
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_memcordon"));
+    command
+        .arg("__result-writer-delayed-write")
+        .arg(&input)
+        .arg(&output);
+    let started = Instant::now();
+    assert_eq!(bounded(command).code(), Some(0));
+    assert!(
+        started.elapsed() >= Duration::from_millis(1100),
+        "writer fixture did not consume the former 900ms write window"
+    );
+    let report: memcordon_core::MemcordonReport = serde_json::from_slice(
+        &std::fs::read(output).expect("delayed durable report should be committed"),
+    )
+    .expect("delayed durable report should remain valid");
+    assert_eq!(report.schema_version, 10);
+}
+
+#[test]
 fn mutation_synchronous_final_stderr_is_detected() {
     let started = Instant::now();
     let (sender, receiver) = std::sync::mpsc::sync_channel(0);

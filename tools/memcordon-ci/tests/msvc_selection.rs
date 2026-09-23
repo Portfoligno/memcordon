@@ -206,14 +206,25 @@ fn selected_compiler_environment_survives_closure_and_has_required_input_roots()
         );
     }
     let roots = native_environment_roots(&closed).unwrap();
-    for required in [
+    for name in ["INCLUDE", "LIB", "LIBPATH"] {
+        if let Some(value) = closed.get(OsStr::new(name)) {
+            for required in std::env::split_paths(value) {
+                assert!(
+                    roots.contains(&required.canonicalize().unwrap()),
+                    "missing required selected native root {required:?}"
+                );
+            }
+        }
+    }
+    for discovery_selector in [
         &installation.visual_studio,
         &installation.visual_studio.join("VC"),
+        &installation.visual_studio.join("VC/Tools/MSVC/14.40.12345"),
         &installation.sdk,
     ] {
         assert!(
-            roots.contains(&required.canonicalize().unwrap()),
-            "missing required selected native root {required:?}"
+            !roots.contains(&discovery_selector.canonicalize().unwrap()),
+            "broad discovery selector became a recursive root {discovery_selector:?}"
         );
     }
 }

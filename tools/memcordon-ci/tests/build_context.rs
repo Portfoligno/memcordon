@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use memcordon_ci::build_context::{BuildInputSnapshot, ValidatedBuildContext, environment};
@@ -267,17 +267,21 @@ fn external_sdk_and_native_path_lists_are_content_inputs() {
     fs::create_dir(&second).unwrap();
     let header = first.join("header.h");
     fs::write(&header, b"original\n").unwrap();
-    for name in [
-        "SDKROOT",
-        "DEVELOPER_DIR",
-        "VCToolsInstallDir",
-        "WindowsSdkDir",
-    ] {
+    for name in ["SDKROOT", "DEVELOPER_DIR"] {
         let env = BTreeMap::from([(OsString::from(name), first.clone().into_os_string())]);
         assert_eq!(
             native_environment_roots(&env).unwrap(),
             vec![first.canonicalize().unwrap()]
         );
+    }
+    for name in [
+        "VCToolsInstallDir",
+        "WindowsSdkDir",
+        "VCINSTALLDIR",
+        "VSINSTALLDIR",
+    ] {
+        let env = BTreeMap::from([(OsString::from(name), first.clone().into_os_string())]);
+        assert!(native_environment_roots(&env).unwrap().is_empty());
     }
     for name in ["INCLUDE", "LIB", "LIBPATH"] {
         let env = BTreeMap::from([(
@@ -296,14 +300,19 @@ fn external_sdk_and_native_path_lists_are_content_inputs() {
 #[test]
 fn windows_native_discovery_uses_all_canonical_environment_names() {
     use environment::{EnvironmentNames, closed_environment_with_names};
-    use memcordon_ci::build_context::{native_environment_roots, windows_native_roots};
+    use memcordon_ci::build_context::{
+        native_environment_roots, validate_windows_native_root_scope, windows_native_roots,
+    };
 
     let root = tempfile::tempdir().unwrap();
     let windows = root.path().join("Windows");
     let selected_sdk = root.path().join("SelectedSdk");
     let selected_compiler = root.path().join("SelectedCompiler");
+    let selected_include = selected_compiler.join("include");
+    let selected_library = selected_compiler.join("lib");
     fs::create_dir(&selected_sdk).unwrap();
-    fs::create_dir(&selected_compiler).unwrap();
+    fs::create_dir_all(&selected_include).unwrap();
+    fs::create_dir(&selected_library).unwrap();
     let mut env = BTreeMap::from([
         (OsString::from("pAtH"), root.path().as_os_str().to_owned()),
         (
@@ -318,6 +327,14 @@ fn windows_native_discovery_uses_all_canonical_environment_names() {
             OsString::from("vCtOoLsInStAlLdIr"),
             selected_compiler.clone().into_os_string(),
         ),
+        (
+            OsString::from("iNcLuDe"),
+            selected_include.clone().into_os_string(),
+        ),
+        (
+            OsString::from("lIb"),
+            selected_library.clone().into_os_string(),
+        ),
     ]);
     let mut expected = Vec::new();
     for name in ["pRoGrAmFiLeS", "pRoGrAmFiLeS(x86)", "pRoGrAmW6432"] {
@@ -325,7 +342,6 @@ fn windows_native_discovery_uses_all_canonical_environment_names() {
         for child in ["Windows Kits", "Microsoft Visual Studio"] {
             let directory = base.join(child);
             fs::create_dir_all(&directory).unwrap();
-            expected.push(directory);
         }
         env.insert(name.into(), base.into_os_string());
     }
@@ -338,12 +354,20 @@ fn windows_native_discovery_uses_all_canonical_environment_names() {
     expected.sort();
     assert_eq!(actual, expected);
     let selected = native_environment_roots(&closed).unwrap();
-    assert!(selected.contains(&selected_sdk.canonicalize().unwrap()));
-    assert!(selected.contains(&selected_compiler.canonicalize().unwrap()));
+    assert_eq!(
+        selected,
+        [
+            selected_include.canonicalize().unwrap(),
+            selected_library.canonicalize().unwrap(),
+        ]
+    );
+    assert!(!selected.contains(&selected_sdk.canonicalize().unwrap()));
+    assert!(!selected.contains(&selected_compiler.canonicalize().unwrap()));
+    validate_windows_native_root_scope(&closed, &selected).unwrap();
 }
 
 #[test]
-fn windows_native_discovery_requires_sdk_compiler_and_system_root() {
+fn windows_native_baseline_requires_only_the_system_root() {
     use memcordon_ci::build_context::windows_native_roots;
     let root = tempfile::tempdir().unwrap();
     let mut env = BTreeMap::from([(
@@ -351,20 +375,116 @@ fn windows_native_discovery_requires_sdk_compiler_and_system_root() {
         root.path().as_os_str().to_owned(),
     )]);
     assert!(windows_native_roots(&env).is_err());
-    fs::create_dir(root.path().join("Windows Kits")).unwrap();
-    assert!(windows_native_roots(&env).is_err());
-    fs::create_dir(root.path().join("Microsoft Visual Studio")).unwrap();
-    assert!(
-        windows_native_roots(&env)
-            .unwrap_err()
-            .to_string()
-            .contains("system root")
-    );
     env.insert(
         "SystemRoot".into(),
         root.path().join("Windows").into_os_string(),
     );
     assert!(windows_native_roots(&env).is_ok());
+}
+
+#[test]
+fn windows_native_scope_rejects_discovery_ancestors_but_accepts_selected_descendants() {
+    use memcordon_ci::build_context::validate_windows_native_root_scope;
+    let root = tempfile::tempdir().unwrap();
+    let program_files = root.path().join("Program Files");
+    let installation = program_files.join("Microsoft Visual Studio").join("2022");
+    let vc = installation.join("VC");
+    let toolset = vc.join("Tools/MSVC/selected");
+    let sdk = root.path().join("Windows Kits").join("10");
+    fs::create_dir_all(&toolset).unwrap();
+    fs::create_dir_all(&sdk).unwrap();
+    let environment = BTreeMap::from([
+        (
+            "ProgramFiles".into(),
+            program_files.clone().into_os_string(),
+        ),
+        ("VSINSTALLDIR".into(), installation.clone().into_os_string()),
+        ("VCINSTALLDIR".into(), vc.clone().into_os_string()),
+        ("VCToolsInstallDir".into(), toolset.clone().into_os_string()),
+        ("WindowsSdkDir".into(), sdk.clone().into_os_string()),
+    ]);
+    for broad in [
+        program_files.clone(),
+        program_files.join("Microsoft Visual Studio"),
+        installation,
+        vc.clone(),
+        toolset.clone(),
+        sdk.clone(),
+    ] {
+        assert!(
+            validate_windows_native_root_scope(&environment, &[broad.canonicalize().unwrap()])
+                .is_err()
+        );
+    }
+    validate_windows_native_root_scope(
+        &environment,
+        &[toolset.join("include"), sdk.join("Include/selected/um")],
+    )
+    .unwrap();
+}
+
+#[test]
+fn native_roots_drop_covered_descendants_without_admitting_siblings() {
+    use memcordon_ci::build_context::minimal_native_roots;
+    let root = PathBuf::from("root");
+    assert_eq!(
+        minimal_native_roots(vec![
+            root.join("selected/include"),
+            root.join("selected"),
+            root.join("selected/lib"),
+            root.join("sibling"),
+            root.join("selected"),
+        ]),
+        [root.join("selected"), root.join("sibling")]
+    );
+}
+
+#[test]
+fn inactive_windows_selection_siblings_do_not_change_selected_input_identity() {
+    use memcordon_ci::build_context::native_environment_roots;
+    let root = tempfile::tempdir().unwrap();
+    let selected = root.path().join("selected");
+    let include = selected.join("include");
+    let library = selected.join("lib");
+    let inactive = root.path().join("inactive-sdk");
+    fs::create_dir_all(&include).unwrap();
+    fs::create_dir(&library).unwrap();
+    fs::create_dir(&inactive).unwrap();
+    let header = include.join("selected.h");
+    fs::write(&header, b"selected header\n").unwrap();
+    fs::write(library.join("selected.lib"), b"selected library\n").unwrap();
+    let inactive_file = inactive.join("other-version.lib");
+    fs::write(&inactive_file, b"inactive version\n").unwrap();
+    let environment = BTreeMap::from([
+        (
+            OsString::from("INCLUDE"),
+            std::env::join_paths([&include]).unwrap(),
+        ),
+        (
+            OsString::from("LIB"),
+            std::env::join_paths([&library]).unwrap(),
+        ),
+        (
+            OsString::from("WindowsSdkDir"),
+            inactive.clone().into_os_string(),
+        ),
+    ]);
+    let roots = native_environment_roots(&environment).unwrap();
+    assert_eq!(
+        roots,
+        [
+            include.canonicalize().unwrap(),
+            library.canonicalize().unwrap(),
+        ]
+    );
+    let snapshots = roots
+        .iter()
+        .map(|root| BuildInputSnapshot::capture(root).unwrap())
+        .collect::<Vec<_>>();
+    fs::write(inactive_file, b"changed inactive version\n").unwrap();
+    assert!(snapshots.iter().all(|snapshot| snapshot.audit().is_ok()));
+    fs::write(header, b"changed selected header\n").unwrap();
+    assert!(snapshots.iter().any(|snapshot| snapshot.audit().is_err()));
 }
 
 #[test]
@@ -577,6 +697,32 @@ fn generated_package_unmanaged_child() {
     .unwrap();
     assert!(!cached.exists());
     assert!(!source.path().join("target").exists());
+    let install = source.path().join("install");
+    run_isolated_cargo(
+        source.path(),
+        "1.97.1",
+        [
+            OsString::from("install"),
+            OsString::from("--locked"),
+            OsString::from("--root"),
+            install.clone().into_os_string(),
+            OsString::from("--path"),
+            source.path().as_os_str().to_os_string(),
+        ],
+        deadline,
+        Some(&install),
+    )
+    .unwrap();
+    assert!(
+        install
+            .join("bin")
+            .join(if cfg!(windows) {
+                "isolated-fixture.exe"
+            } else {
+                "isolated-fixture"
+            })
+            .exists()
+    );
     for args in [
         vec!["check", "--config", "build.rustc-wrapper=other"],
         vec!["install", "--root=../escape"],

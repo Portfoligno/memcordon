@@ -134,7 +134,7 @@ fn standard_certificate_uploads_are_required_and_strict() {
         ] {
             let mut changed = original.clone();
             let steps = steps(&mut changed, job);
-            let index = action_index(steps, "actions/upload-artifact@");
+            let index = action_index(steps, "./.github/actions/upload-artifact");
             match mutation {
                 "delete" => {
                     steps.remove(index);
@@ -178,7 +178,7 @@ fn standard_suite_cannot_be_removed_substituted_skipped_or_published_before_runn
                 "cache-skip" => steps[suite]["if"] = Value::String("steps.standard-target.outputs.cache-hit != 'true'".into()),
                 "continue-on-error" => steps[suite]["continue-on-error"] = Value::Bool(true),
                 "upload-before-suite" => {
-                    let upload = action_index(steps, "actions/upload-artifact@");
+                    let upload = action_index(steps, "./.github/actions/upload-artifact");
                     steps.swap(suite, upload);
                 }
                 _ => unreachable!(),
@@ -235,7 +235,7 @@ fn assembly_download_precedes_assembly_and_bundle_upload_follows_it() {
             if swap_download {
                 "actions/download-artifact@"
             } else {
-                "actions/upload-artifact@"
+                "./.github/actions/upload-artifact"
             },
         );
         steps.swap(assemble, other);

@@ -69,12 +69,30 @@ pub use crate::macos_deadline::retirement_mutation_probe as macos_retirement_mut
 #[cfg(target_os = "macos")]
 pub use crate::macos_watchdog::inventory_reconciliation as macos_inventory_reconciliation;
 #[cfg(target_os = "macos")]
+pub use crate::macos_watchdog::pending_inventory_turn_wait as macos_pending_inventory_turn_wait;
+#[cfg(target_os = "macos")]
 pub use crate::macos_watchdog::pid_inventory_reply as macos_pid_inventory_reply;
 
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::clock_jump as macos_clock_jump;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::control_flood as macos_control_flood;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_heartbeat as macos_delayed_heartbeat;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_inventory_completion as macos_delayed_inventory_completion;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_inventory_deadline as macos_delayed_inventory_deadline;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_inventory_response as macos_delayed_inventory_response;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_observed_status as macos_delayed_observed_status;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_reaped_status as macos_delayed_reaped_status;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_released_receipt as macos_delayed_released_receipt;
+#[cfg(target_os = "macos")]
+pub use crate::macos_launch::delayed_retired_receipt as macos_delayed_retired_receipt;
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::expired_control_request_preserves_retirement as macos_expired_control_request_preserves_retirement;
 #[cfg(target_os = "macos")]
@@ -339,6 +357,22 @@ pub fn windows_assignment_failure() -> io::Result<bool> {
 }
 
 #[cfg(windows)]
+pub fn windows_empty_accounting_survives_consumed_zero_notification() -> io::Result<bool> {
+    crate::windows_job::test_empty_accounting_survives_consumed_zero_notification()
+}
+
+#[cfg(windows)]
+pub fn windows_zero_notification_outweighs_stale_accounting() -> io::Result<bool> {
+    crate::windows_job::test_zero_notification_outweighs_stale_accounting()
+}
+
+#[cfg(windows)]
+pub fn windows_nonempty_accounting_requires_cleanup_without_zero_notification() -> io::Result<bool>
+{
+    crate::windows_job::test_nonempty_accounting_requires_cleanup_without_zero_notification()
+}
+
+#[cfg(windows)]
 pub fn windows_token_group_entries_range(
     byte_length: usize,
     entry_count: usize,
@@ -453,6 +487,20 @@ pub fn windows_current_token_user_sid_string() -> Result<String, String> {
     crate::sealed::windows::token_user_sid_string(token.0)
 }
 
+fn process_probe_is_absent(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 impl ProcessIdentity {
     pub fn current() -> io::Result<Self> {
         Self::for_pid(std::process::id())
@@ -465,7 +513,7 @@ impl ProcessIdentity {
     pub fn still_exists(self) -> io::Result<bool> {
         match Self::for_pid(self.pid) {
             Ok(current) => Ok(current == self),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) if process_probe_is_absent(&error) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -808,6 +856,31 @@ fn configure_child_setup(command: &mut Command, setup: ChildSetup) {
     }
 }
 
+/// Interpret one procfs stat result while scanning a Unix session.
+///
+/// Exposed only so the test-support crate can deterministically cover disappearing procfs entries.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[doc(hidden)]
+pub fn unix_session_member_from_stat(
+    session: i32,
+    pid: i32,
+    stat: io::Result<String>,
+) -> io::Result<Option<i32>> {
+    let stat = match stat {
+        Ok(stat) => stat,
+        Err(error) if process_probe_is_absent(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(after_name) = stat.rsplit_once(')').map(|(_, fields)| fields) else {
+        return Ok(None);
+    };
+    let member_session = after_name
+        .split_whitespace()
+        .nth(3)
+        .and_then(|field| field.parse::<i32>().ok());
+    Ok((member_session == Some(session)).then_some(pid))
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 fn unix_session_members(session: i32) -> io::Result<Vec<i32>> {
     let mut members = Vec::new();
@@ -820,22 +893,13 @@ fn unix_session_members(session: i32) -> io::Result<Vec<i32>> {
         else {
             continue;
         };
-        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        let Some(after_name) = stat.rsplit_once(')').map(|(_, fields)| fields) else {
-            continue;
-        };
-        let member_session = after_name
-            .split_whitespace()
-            .nth(3)
-            .and_then(|field| field.parse::<i32>().ok());
-        if member_session != Some(session) {
-            continue;
+        if let Some(pid) = unix_session_member_from_stat(
+            session,
+            pid,
+            std::fs::read_to_string(entry.path().join("stat")),
+        )? {
+            members.push(pid);
         }
-        members.push(pid);
     }
     Ok(members)
 }
@@ -899,7 +963,7 @@ fn terminate_unix_session(
             };
             match process_identity(pid_value) {
                 Ok(identity) => members.push((pid, identity)),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if process_probe_is_absent(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -915,7 +979,7 @@ fn terminate_unix_session(
             // SAFETY: kill accepts a process identity and does not dereference Rust memory.
             if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
                 let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) && first_error.is_none() {
+                if !process_probe_is_absent(&error) && first_error.is_none() {
                     first_error = Some(error);
                 }
             } else {

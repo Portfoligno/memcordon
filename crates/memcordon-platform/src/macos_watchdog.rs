@@ -18,7 +18,9 @@ use crate::signal::SignalSource;
 const PROC_PIDTBSDINFO: i32 = 3;
 const PROC_PIDTASKINFO: i32 = 4;
 const RUSAGE_INFO_V2: i32 = 2;
-const CLEANUP_DEADLINE: Duration = Duration::from_secs(3);
+pub(crate) const CLEANUP_DEADLINE: Duration = Duration::from_secs(3);
+const PENDING_INVENTORY_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+const WATCHDOG_TURN_MAX: Duration = Duration::from_millis(20);
 
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
@@ -28,6 +30,27 @@ fn bounded_pause(duration: Duration) {
     let timeout = duration.as_millis().min(i32::MAX as u128) as i32;
     // SAFETY: zero-descriptor poll is a bounded kernel wait and remains signal-interruptible.
     unsafe { libc::poll(std::ptr::null_mut(), 0, timeout) };
+}
+
+fn watchdog_turn_wait(
+    poll_interval: Duration,
+    command_exit_grace_remaining: Option<Duration>,
+    inventory_pending: bool,
+) -> Duration {
+    let wait = if inventory_pending {
+        poll_interval.max(Duration::from_millis(1))
+    } else {
+        command_exit_grace_remaining.map_or(poll_interval, |remaining| poll_interval.min(remaining))
+    };
+    wait.min(WATCHDOG_TURN_MAX)
+}
+
+#[cfg(feature = "test-support")]
+pub fn pending_inventory_turn_wait(
+    poll_interval: Duration,
+    command_exit_grace_remaining: Duration,
+) -> Duration {
+    watchdog_turn_wait(poll_interval, Some(command_exit_grace_remaining), true)
 }
 
 #[link(name = "proc")]
@@ -702,6 +725,7 @@ pub fn run_attempt(
                                  stored: &mut Option<ChildTermination>,
                                  root,
                                  known: &mut HashSet<ProcessIdentity>,
+                                 inventory_query: &mut Option<u64>,
                                  signal,
                                  grace,
                                  deadline| {
@@ -711,27 +735,15 @@ pub fn run_attempt(
             stored,
             root,
             known,
+            inventory_query,
             (signal, grace),
             deadline,
         )
     };
     let mut command_exit_grace_started = None;
+    let mut inventory_query = None;
+    let mut next_heartbeat = Instant::now();
     let mut outcome = loop {
-        let mut cycle_error = guardian.alive().err().map(|error| error.to_string());
-        let mut completion = None;
-        let mut workload_empty = false;
-        match try_reap(&mut child, &mut stored_status) {
-            Ok(Some(status)) => {
-                if policy.lifetime == Lifetime::Command {
-                    completion = Some(status);
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                cycle_error = Some(error);
-            }
-        }
-
         let inspection_deadline =
             policy
                 .deadline
@@ -742,10 +754,101 @@ pub fn run_attempt(
                             .unwrap_or_else(|| deadline.duration()))
                     .min(Instant::now() + Duration::from_millis(250))
                 });
-        match guardian
-            .inventory_with_metric(policy.memory.map(|_| policy.metric), inspection_deadline)
+        let mut cycle_error = None;
+        let mut completion = None;
+        let mut workload_empty = false;
+        match try_reap(&mut child, &mut stored_status, inspection_deadline) {
+            Ok(Some(status)) => {
+                if policy.lifetime == Lifetime::Command {
+                    completion = Some(status);
+                    command_exit_grace_started.get_or_insert_with(Instant::now);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                cycle_error = Some(error);
+            }
+        }
+        // The sampling deadline controls admission. Once admitted, retain one
+        // transaction across watchdog turns so host signals and native work
+        // deadlines remain responsive while inspectors finish within the fixed
+        // retirement reserve. Never replace a pending query with a retry.
+        let mut inventory_result = None;
+        let inventory_was_pending = inventory_query.is_some();
+        if let Some(query) = inventory_query {
+            match guardian.poll_inventory(query) {
+                Ok(Some(inventory)) => {
+                    inventory_query = None;
+                    inventory_result = Some(Ok(inventory));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    inventory_query = None;
+                    inventory_result = Some(Err(error));
+                }
+            }
+        }
+        // An admitted inventory response is itself a live transaction. Poll it
+        // before emitting another control frame, and send heartbeats at a fixed
+        // cadence within the lease while it remains pending. This prevents an exited
+        // command with zero grace from flooding the guardian's control socket.
+        if inventory_result.is_none()
+            && (!inventory_was_pending || Instant::now() >= next_heartbeat)
         {
-            Ok((snapshots, identities, sample)) => {
+            if let Err(error) = guardian.alive(inspection_deadline) {
+                cycle_error = Some(error.to_string());
+            }
+            next_heartbeat = Instant::now() + PENDING_INVENTORY_HEARTBEAT_INTERVAL;
+        }
+        if inventory_query.is_none() && inventory_result.is_none() {
+            let inventory_response_deadline = inspection_deadline
+                .checked_add(CLEANUP_DEADLINE)
+                .expect("fixed inventory response reserve is representable");
+            let inventory_response_deadline = if let Some(expiry) = work_expiry {
+                let now = crate::macos_deadline::continuous_nanos().map_err(|error| {
+                    Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+                })?;
+                let retirement = crate::macos_deadline::add(
+                    crate::macos_deadline::add(expiry, policy.limit_grace).map_err(|error| {
+                        Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+                    })?,
+                    CLEANUP_DEADLINE,
+                )
+                .map_err(|error| {
+                    Error::new(ErrorCategory::Monitor, "MCMONITOR-CLOCK", error.to_string())
+                })?;
+                inventory_response_deadline
+                    .min(Instant::now() + Duration::from_nanos(retirement.saturating_sub(now)))
+            } else {
+                inventory_response_deadline
+            };
+            match guardian.begin_inventory_with_metric(
+                policy.memory.map(|_| policy.metric),
+                inspection_deadline,
+                inventory_response_deadline,
+            ) {
+                Ok(query) => inventory_query = Some(query),
+                Err(error) => inventory_result = Some(Err(error)),
+            }
+        }
+        if !inventory_was_pending {
+            if let Some(query) = inventory_query {
+                match guardian.poll_inventory(query) {
+                    Ok(Some(inventory)) => {
+                        inventory_query = None;
+                        inventory_result = Some(Ok(inventory));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        inventory_query = None;
+                        inventory_result = Some(Err(error));
+                    }
+                }
+            }
+        }
+        match inventory_result {
+            None => {}
+            Some(Ok((snapshots, identities, sample))) => {
                 known = identities;
                 workload_empty = snapshots.is_empty();
                 if policy.lifetime == Lifetime::Workload
@@ -794,6 +897,7 @@ pub fn run_attempt(
                                     &mut stored_status,
                                     root_pid,
                                     &mut known,
+                                    &mut inventory_query,
                                     if policy.limit_grace.is_zero() {
                                         libc::SIGKILL
                                     } else {
@@ -823,7 +927,7 @@ pub fn run_attempt(
                     }
                 }
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 if cycle_error.is_none() {
                     cycle_error = Some(error);
                 }
@@ -866,6 +970,7 @@ pub fn run_attempt(
                     &mut stored_status,
                     root_pid,
                     &mut known,
+                    &mut inventory_query,
                     if effective_grace.is_zero() {
                         libc::SIGKILL
                     } else {
@@ -906,6 +1011,7 @@ pub fn run_attempt(
                 &mut stored_status,
                 root_pid,
                 &mut known,
+                &mut inventory_query,
                 libc::SIGKILL,
                 Duration::ZERO,
                 cleanup_budget(),
@@ -935,6 +1041,7 @@ pub fn run_attempt(
                 &mut stored_status,
                 root_pid,
                 &mut known,
+                &mut inventory_query,
                 signal,
                 policy.signal_grace,
                 cleanup_budget(),
@@ -946,7 +1053,7 @@ pub fn run_attempt(
             };
         }
 
-        if let Some(status) = completion {
+        if let Some(status) = completion.filter(|_| inventory_query.is_none()) {
             let completed = if policy.lifetime == Lifetime::Workload || workload_empty {
                 workload_empty
             } else if policy.command_exit_grace.is_zero() {
@@ -972,6 +1079,7 @@ pub fn run_attempt(
                         &mut stored_status,
                         root_pid,
                         &mut known,
+                        &mut inventory_query,
                         completion_deadline,
                     )
                 };
@@ -983,15 +1091,16 @@ pub fn run_attempt(
             }
         }
 
-        let wait = command_exit_grace_started
-            .map_or(policy.poll_interval, |grace_started| {
-                policy.poll_interval.min(
-                    policy
-                        .command_exit_grace
-                        .saturating_sub(grace_started.elapsed()),
-                )
-            })
-            .min(Duration::from_millis(20));
+        let command_exit_grace_remaining = command_exit_grace_started.map(|grace_started| {
+            policy
+                .command_exit_grace
+                .saturating_sub(grace_started.elapsed())
+        });
+        let wait = watchdog_turn_wait(
+            policy.poll_interval,
+            command_exit_grace_remaining,
+            inventory_query.is_some(),
+        );
         let wait = policy.deadline.map_or(wait, |deadline| {
             wait.min(
                 context
@@ -1009,6 +1118,7 @@ pub fn run_attempt(
                     &mut stored_status,
                     root_pid,
                     &mut known,
+                    &mut inventory_query,
                     libc::SIGKILL,
                     Duration::ZERO,
                     cleanup_budget(),
@@ -1126,11 +1236,12 @@ pub fn run_attempt(
 fn try_reap(
     child: &mut Child,
     stored: &mut Option<ChildTermination>,
+    deadline: Instant,
 ) -> Result<Option<ChildTermination>, String> {
     if let Some(status) = stored.clone() {
         return Ok(Some(status));
     }
-    match child.observe() {
+    match child.observe_until(deadline) {
         Ok(Some(status)) => {
             let termination = termination_from_status(status);
             *stored = Some(termination.clone());
@@ -1151,12 +1262,45 @@ fn termination_from_status(status: ExitStatus) -> ChildTermination {
     }
 }
 
+fn retirement_inventory(
+    guardian: &crate::macos_launch::Guardian,
+    inventory_query: &mut Option<u64>,
+    deadline: Instant,
+) -> Result<(Vec<ProcessSnapshot>, HashSet<ProcessIdentity>), String> {
+    if let Some(query) = *inventory_query {
+        loop {
+            match guardian.poll_inventory(query) {
+                Ok(Some((snapshots, identities, _))) => {
+                    *inventory_query = None;
+                    return Ok((snapshots, identities));
+                }
+                Ok(None) if Instant::now() < deadline => bounded_pause(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
+                Ok(None) => {
+                    return Err(
+                        "retirement deadline expired with an admitted inventory query pending"
+                            .into(),
+                    );
+                }
+                Err(error) => {
+                    *inventory_query = None;
+                    return Err(error);
+                }
+            }
+        }
+    }
+    guardian.inventory(deadline)
+}
+
 fn retire_workload(
     guardian: &crate::macos_launch::Guardian,
     child: &mut Child,
     stored: &mut Option<ChildTermination>,
     _root_pid: i32,
     known: &mut HashSet<ProcessIdentity>,
+    inventory_query: &mut Option<u64>,
     termination: (i32, Duration),
     retirement_deadline: Option<Instant>,
 ) -> CleanupSummary {
@@ -1166,17 +1310,21 @@ fn retire_workload(
         force_attempted: initial_signal == libc::SIGKILL,
         ..CleanupSummary::default()
     };
-    if let Err(error) = guardian.signal_stop(initial_signal, grace) {
-        summary.errors.push(CleanupErrorRecord {
-            operation: "guardian-stop".into(),
-            message: error.to_string(),
-        });
-    }
     let started = Instant::now();
     let deadline = retirement_deadline.unwrap_or_else(|| started + grace + CLEANUP_DEADLINE);
+    let abandon_inventory = *inventory_query;
+    match guardian.signal_stop_with_inventory(initial_signal, grace, deadline, abandon_inventory) {
+        Ok(()) => *inventory_query = None,
+        Err(error) => {
+            summary.errors.push(CleanupErrorRecord {
+                operation: "guardian-stop".into(),
+                message: error.to_string(),
+            });
+        }
+    }
     let mut empty = false;
     while Instant::now() < deadline {
-        match guardian.inventory(deadline) {
+        match retirement_inventory(guardian, inventory_query, deadline) {
             Ok((snapshots, identities)) => {
                 *known = identities;
                 if snapshots.is_empty() {
@@ -1207,7 +1355,7 @@ fn retire_workload(
         });
     }
     while stored.is_none() && Instant::now() < deadline {
-        match child.observe() {
+        match child.observe_until(deadline) {
             Ok(Some(status)) => *stored = Some(termination_from_status(status)),
             Ok(None) => bounded_pause(
                 Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
@@ -1236,12 +1384,13 @@ fn cleanup_after_direct_exit(
     stored: &mut Option<ChildTermination>,
     root_pid: i32,
     known: &mut HashSet<ProcessIdentity>,
+    inventory_query: &mut Option<u64>,
     supervision_deadline: Option<Instant>,
 ) -> CleanupSummary {
     let deadline = supervision_deadline.map_or(Instant::now() + CLEANUP_DEADLINE, |deadline| {
         deadline.min(Instant::now() + CLEANUP_DEADLINE)
     });
-    match guardian.inventory(deadline) {
+    match retirement_inventory(guardian, inventory_query, deadline) {
         Ok((snapshots, _))
             if snapshots
                 .iter()
@@ -1259,6 +1408,7 @@ fn cleanup_after_direct_exit(
             stored,
             root_pid,
             known,
+            inventory_query,
             (libc::SIGKILL, Duration::ZERO),
             supervision_deadline,
         ),
@@ -1269,6 +1419,7 @@ fn cleanup_after_direct_exit(
                 stored,
                 root_pid,
                 known,
+                inventory_query,
                 (libc::SIGKILL, Duration::ZERO),
                 supervision_deadline,
             );

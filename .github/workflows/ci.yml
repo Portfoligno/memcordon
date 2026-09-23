@@ -45,7 +45,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -128,7 +128,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -213,7 +213,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -296,7 +296,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -408,7 +408,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -496,7 +496,7 @@ jobs:
         run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
           path: |
@@ -517,7 +517,7 @@ jobs:
           key: managed-v2-deadline-target-v1-${{ matrix.id }}-${{ github.sha }}-${{ hashFiles('target/ci/native-inputs.bin') }}
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite macos-deadline
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: ./.github/actions/upload-artifact
         with:
           name: macos-deadline-${{ matrix.id }}
           path: target/ci/deadline-evidence

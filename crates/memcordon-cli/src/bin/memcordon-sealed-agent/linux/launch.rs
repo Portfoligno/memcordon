@@ -20,12 +20,20 @@ use crate::request::{CallerExecutionEnvelopeV2, LaunchRequestV2};
 use super::attempt::AttemptRecord;
 use super::cgroup::{AttemptCgroup, AttemptRetirementObservation};
 
-const EXEC_CONTROL_VERSION: u8 = 1;
-const EXEC_CONTROL_ARMED: [u8; 4] = [EXEC_CONTROL_VERSION, 1, 1, 0];
+const TARGET_CONTROL_VERSION: u8 = 1;
+const EXEC_CONTROL_ARMED: [u8; 4] = [TARGET_CONTROL_VERSION, 1, 1, 0];
 const EXEC_CONTROL_FAILURE_KIND: u8 = 2;
 const EXEC_CONTROL_TARGET_EXEC_PHASE: u8 = 1;
 const EXEC_FAILURE_RECORD_LENGTH: usize = 8;
 const EXEC_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const TARGET_CONTROL_READY_KIND: u8 = 3;
+const TARGET_CONTROL_SETUP_PHASE: u8 = 1;
+const TARGET_CONTROL_READY: [u8; 4] = [
+    TARGET_CONTROL_VERSION,
+    TARGET_CONTROL_READY_KIND,
+    TARGET_CONTROL_SETUP_PHASE,
+    0,
+];
 const NAMESPACE_STARTUP_VERSION: u8 = 1;
 const NAMESPACE_STARTUP_READY_KIND: u8 = 1;
 const NAMESPACE_STARTUP_FAILURE_KIND: u8 = 2;
@@ -1116,12 +1124,13 @@ fn execute_inner(
             // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
             unsafe { libc::_exit(86) };
         }
+        let target_startup_deadline = Instant::now() + Duration::from_secs(5);
         let target_pid = wait_for_target(
             &cgroup,
             init.host_pid,
             &init.pidfd,
             &namespace_startup,
-            Instant::now() + Duration::from_secs(5),
+            target_startup_deadline,
         )
         .map_err(|error| {
             if error.starts_with("MCSEALED-") {
@@ -1134,6 +1143,7 @@ fn execute_inner(
         record
             .transition("target-created-gated")
             .map_err(|error| format!("MCSEALED-RECORD-TARGET: {error}"))?;
+        receive_target_ready(&provider_control, target_startup_deadline)?;
         verify_gated_target(
             target_pid,
             init.host_pid,
@@ -1807,6 +1817,11 @@ fn target_exec(
     for (name, value) in request.environment {
         command.env(OsString::from_vec(name), OsString::from_vec(value));
     }
+    if control.write_all(&TARGET_CONTROL_READY).is_err() {
+        // SAFETY: target setup is complete but authorization has not occurred. Losing the exact
+        // provider-owned readiness channel must fail closed before caller code can execute.
+        unsafe { libc::_exit(125) };
+    }
     let mut authorization = [0_u8; 1];
     if control.read_exact(&mut authorization).is_err() || authorization != [1] {
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
@@ -1908,7 +1923,7 @@ fn encode_exec_failure(class: ExecFailureClass, os_code: i32) -> [u8; EXEC_FAILU
     };
     let bytes = os_code.to_be_bytes();
     [
-        EXEC_CONTROL_VERSION,
+        TARGET_CONTROL_VERSION,
         EXEC_CONTROL_FAILURE_KIND,
         EXEC_CONTROL_TARGET_EXEC_PHASE,
         class,
@@ -1922,7 +1937,7 @@ fn encode_exec_failure(class: ExecFailureClass, os_code: i32) -> [u8; EXEC_FAILU
 fn decode_exec_failure(
     record: [u8; EXEC_FAILURE_RECORD_LENGTH],
 ) -> Result<TargetExecStatus, String> {
-    if record[0] != EXEC_CONTROL_VERSION
+    if record[0] != TARGET_CONTROL_VERSION
         || record[1] != EXEC_CONTROL_FAILURE_KIND
         || record[2] != EXEC_CONTROL_TARGET_EXEC_PHASE
     {
@@ -1960,20 +1975,20 @@ fn exec_status_deadline(policy: &crate::request::LaunchPolicyV2) -> Result<Insta
 }
 
 fn receive_exec_status(control: &mut File, deadline: Instant) -> Result<TargetExecStatus, String> {
-    let armed = read_control_packet(control, deadline)?.ok_or_else(|| {
-        "MCSEALED-TARGET-EXEC-STATUS: target closed before armed record".to_owned()
-    })?;
+    let armed = read_control_packet(control, deadline, "MCSEALED-TARGET-EXEC-STATUS")?.ok_or_else(
+        || "MCSEALED-TARGET-EXEC-STATUS: target closed before armed record".to_owned(),
+    )?;
     if armed.as_slice() != EXEC_CONTROL_ARMED {
         return Err("MCSEALED-TARGET-EXEC-STATUS: invalid armed record".to_owned());
     }
-    match read_control_packet(control, deadline)? {
+    match read_control_packet(control, deadline, "MCSEALED-TARGET-EXEC-STATUS")? {
         None => Ok(TargetExecStatus::Succeeded),
         Some(bytes) => {
             let record: [u8; EXEC_FAILURE_RECORD_LENGTH] = bytes.try_into().map_err(|_| {
                 "MCSEALED-TARGET-EXEC-STATUS: failure record length mismatch".to_owned()
             })?;
             let status = decode_exec_failure(record)?;
-            if read_control_packet(control, deadline)?.is_some() {
+            if read_control_packet(control, deadline, "MCSEALED-TARGET-EXEC-STATUS")?.is_some() {
                 return Err("MCSEALED-TARGET-EXEC-STATUS: trailing record".to_owned());
             }
             Ok(status)
@@ -1981,11 +1996,24 @@ fn receive_exec_status(control: &mut File, deadline: Instant) -> Result<TargetEx
     }
 }
 
-fn read_control_packet(control: &File, deadline: Instant) -> Result<Option<Vec<u8>>, String> {
+fn receive_target_ready(control: &File, deadline: Instant) -> Result<(), String> {
+    let ready = read_control_packet(control, deadline, "MCSEALED-TARGET-READY")?
+        .ok_or_else(|| "MCSEALED-TARGET-READY: target closed before ready record".to_owned())?;
+    if ready.as_slice() != TARGET_CONTROL_READY {
+        return Err("MCSEALED-TARGET-READY: invalid ready record".to_owned());
+    }
+    Ok(())
+}
+
+fn read_control_packet(
+    control: &File,
+    deadline: Instant,
+    context: &str,
+) -> Result<Option<Vec<u8>>, String> {
     loop {
         let now = Instant::now();
         if now >= deadline {
-            return Err("MCSEALED-TARGET-EXEC-STATUS: timed out".to_owned());
+            return Err(format!("{context}: timed out"));
         }
         let remaining = deadline.saturating_duration_since(now);
         let timeout = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
@@ -2003,13 +2031,13 @@ fn read_control_packet(control: &File, deadline: Instant) -> Result<Option<Vec<u
             if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(format!("MCSEALED-TARGET-EXEC-STATUS: {error}"));
+            return Err(format!("{context}: {error}"));
         }
         if ready == 0 {
             continue;
         }
         if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-            return Err("MCSEALED-TARGET-EXEC-STATUS: control socket failed".to_owned());
+            return Err(format!("{context}: control socket failed"));
         }
         let mut packet = [0_u8; EXEC_FAILURE_RECORD_LENGTH + 1];
         // SAFETY: recv writes at most `packet.len()` bytes into a live initialized buffer and
@@ -2027,13 +2055,13 @@ fn read_control_packet(control: &File, deadline: Instant) -> Result<Option<Vec<u
             if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(format!("MCSEALED-TARGET-EXEC-STATUS: {error}"));
+            return Err(format!("{context}: {error}"));
         }
         if count == 0 {
             return Ok(None);
         }
-        let count = usize::try_from(count)
-            .map_err(|_| "MCSEALED-TARGET-EXEC-STATUS: invalid packet length".to_owned())?;
+        let count =
+            usize::try_from(count).map_err(|_| format!("{context}: invalid packet length"))?;
         return Ok(Some(packet[..count].to_vec()));
     }
 }
@@ -2082,6 +2110,11 @@ pub const fn exec_armed_record_for_test() -> [u8; 4] {
 }
 
 #[cfg(feature = "test-support")]
+pub const fn target_ready_record_for_test() -> [u8; 4] {
+    TARGET_CONTROL_READY
+}
+
+#[cfg(feature = "test-support")]
 pub fn exec_failure_record_for_test(os_code: i32) -> [u8; EXEC_FAILURE_RECORD_LENGTH] {
     encode_exec_failure(classify_exec_error(os_code), os_code)
 }
@@ -2089,6 +2122,11 @@ pub fn exec_failure_record_for_test(os_code: i32) -> [u8; EXEC_FAILURE_RECORD_LE
 #[cfg(feature = "test-support")]
 pub fn receive_exec_status_for_test(control: &mut File) -> Result<TargetExecStatus, String> {
     receive_exec_status(control, Instant::now() + Duration::from_secs(1))
+}
+
+#[cfg(feature = "test-support")]
+pub fn receive_target_ready_for_test(control: &File, timeout: Duration) -> Result<(), String> {
+    receive_target_ready(control, Instant::now() + timeout)
 }
 
 fn pipe() -> Result<(File, File), String> {

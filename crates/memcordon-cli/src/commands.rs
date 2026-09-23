@@ -32,6 +32,11 @@ pub(crate) enum InternalInvocation {
         output: std::path::PathBuf,
         marker: std::path::PathBuf,
     },
+    #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+    ResultWriterDelayedWrite {
+        input: std::path::PathBuf,
+        output: std::path::PathBuf,
+    },
     #[cfg(target_os = "macos")]
     MacosInspector {
         descriptor: i32,
@@ -115,6 +120,17 @@ pub(crate) fn route_internal(
                 marker: argv[4].clone().into(),
             })
         })());
+    }
+    #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+    if name == "__result-writer-delayed-write" {
+        return Some(if argv.len() == 3 {
+            Ok(InternalInvocation::ResultWriterDelayedWrite {
+                input: argv[1].clone().into(),
+                output: argv[2].clone().into(),
+            })
+        } else {
+            Err("delayed writer requires input and output paths")
+        });
     }
     #[cfg(target_os = "macos")]
     if name == "__macos-inspector-v1" {
@@ -252,6 +268,10 @@ pub(crate) fn execute_internal(invocation: InternalInvocation) -> i32 {
             output,
             marker,
         } => result_delivery::fault_test(phase, &input, &output, &marker),
+        #[cfg(all(target_os = "macos", feature = "test-fixtures"))]
+        InternalInvocation::ResultWriterDelayedWrite { input, output } => {
+            result_delivery::delayed_write_test(&input, &output)
+        }
         #[cfg(target_os = "macos")]
         InternalInvocation::MacosInspector { descriptor, run } => {
             memcordon_platform::macos_inspector(descriptor, run)

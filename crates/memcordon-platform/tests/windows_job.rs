@@ -6,11 +6,14 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use memcordon_platform::test_support::{
     windows_assignment_failure, windows_current_token_contains_world_sid,
-    windows_current_token_user_sid_string, windows_encode_command_line, windows_kill_on_job_close,
-    windows_nested_assignment, windows_target_remains_suspended_until_assignment,
-    windows_token_group_entries, windows_token_group_entries_range, windows_token_group_sid_range,
+    windows_current_token_user_sid_string,
+    windows_empty_accounting_survives_consumed_zero_notification, windows_encode_command_line,
+    windows_kill_on_job_close, windows_nested_assignment,
+    windows_nonempty_accounting_requires_cleanup_without_zero_notification,
+    windows_target_remains_suspended_until_assignment, windows_token_group_entries,
+    windows_token_group_entries_range, windows_token_group_sid_range,
     windows_token_group_storage_contains, windows_token_user_sid_range,
-    windows_token_user_storage_matches,
+    windows_token_user_storage_matches, windows_zero_notification_outweighs_stale_accounting,
 };
 use windows_sys::Win32::Security::{SID, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_USER};
 use windows_sys::Win32::System::SystemServices::{SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY};
@@ -221,6 +224,30 @@ fn nested_assignment_is_accounted_by_the_memcordon_job() {
 #[test]
 fn assignment_failure_terminates_suspended_target_before_execution() {
     assert!(windows_assignment_failure().expect("assignment failure scenario should complete"));
+}
+
+#[test]
+fn empty_accounting_closes_a_consumed_zero_notification_race() {
+    assert!(
+        windows_empty_accounting_survives_consumed_zero_notification()
+            .expect("empty accounting transition should complete")
+    );
+}
+
+#[test]
+fn zero_notification_is_preserved_when_accounting_remains_stale() {
+    assert!(
+        windows_zero_notification_outweighs_stale_accounting()
+            .expect("zero notification should remain authoritative")
+    );
+}
+
+#[test]
+fn nonempty_accounting_without_a_zero_notification_still_requires_cleanup() {
+    assert!(
+        windows_nonempty_accounting_requires_cleanup_without_zero_notification()
+            .expect("nonempty accounting should fail closed")
+    );
 }
 
 #[test]

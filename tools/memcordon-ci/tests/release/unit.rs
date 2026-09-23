@@ -1057,6 +1057,7 @@ fn release_fixture() -> (TempDir, config::Release) {
         workflow_ref: "Portfoligno/memcordon/.github/workflows/release.yml@refs/tags/1.2.3"
             .to_owned(),
         workflow_sha256: "00".repeat(32),
+        workflow_resources: BTreeMap::new(),
         action_revisions: BTreeMap::new(),
         prerelease: false,
         rust_toolchain: "1.85.0".to_owned(),
@@ -2546,10 +2547,14 @@ fn deterministic_conflict_is_not_retried() {
 fn workflow_provenance_fetches_public_bytes_without_a_token() {
     let (temporary, release, identity) = provenance_fixture();
     let workflow = include_bytes!("../../../../.github/workflows/release.yml");
-    let server = MockServer::scripted(vec![MockResponse::Bytes(200, workflow.to_vec())]);
+    let action = include_bytes!("../../../../.github/actions/upload-artifact/action.yml");
+    let server = MockServer::scripted(vec![
+        MockResponse::Bytes(200, workflow.to_vec()),
+        MockResponse::Bytes(200, action.to_vec()),
+    ]);
     let endpoints = HttpEndpoints::fixed_test_server(&server.root);
     let workflow_ref = "Portfoligno/memcordon/.github/workflows/release.yml@refs/tags/1.2.3";
-    let (commit, observed_ref, digest, actions) = workflow_provenance_at(
+    let provenance = workflow_provenance_at(
         temporary.path(),
         &identity,
         &release,
@@ -2558,19 +2563,134 @@ fn workflow_provenance_fetches_public_bytes_without_a_token() {
         workflow_ref,
     )
     .expect("public workflow provenance should not need credentials");
-    assert_eq!(commit, identity.commit);
-    assert_eq!(observed_ref, workflow_ref);
-    assert_eq!(digest, sha256_bytes(workflow));
-    assert_eq!(actions.len(), 6);
+    assert_eq!(provenance.workflow_commit, identity.commit);
+    assert_eq!(provenance.workflow_ref, workflow_ref);
+    assert_eq!(provenance.workflow_sha256, sha256_bytes(workflow));
+    assert_eq!(
+        provenance.workflow_resources,
+        BTreeMap::from([(
+            ".github/actions/upload-artifact/action.yml".to_owned(),
+            sha256_bytes(action),
+        )])
+    );
+    assert_eq!(provenance.action_revisions.len(), 6);
     let requests = server.finish();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert!(requests[0].starts_with(
         "GET /repos/Portfoligno/memcordon/contents/.github/workflows/release.yml?ref=0123456789abcdef"
     ));
-    assert!(
-        !requests[0].to_ascii_lowercase().contains("authorization:"),
-        "public workflow provenance must not send an authorization credential"
+    assert!(requests[1].starts_with(
+        "GET /repos/Portfoligno/memcordon/contents/.github/actions/upload-artifact/action.yml?ref=0123456789abcdef"
+    ));
+    for request in requests {
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "public workflow provenance must not send an authorization credential"
+        );
+    }
+}
+
+#[test]
+fn workflow_provenance_resolves_nested_local_actions_once() {
+    let (_, release, identity) = provenance_fixture();
+    let workflow = b"name: provenance\non: push\njobs:\n  inspect:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: ./.github/actions/parent\n      - uses: ./.github/actions/parent\n";
+    let parent = b"name: parent\ndescription: parent\nruns:\n  using: composite\n  steps:\n    - uses: ./.github/actions/child\n";
+    let child = b"name: child\ndescription: child\nruns:\n  using: composite\n  steps:\n    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n";
+    let server = MockServer::scripted(vec![
+        MockResponse::Bytes(200, workflow.to_vec()),
+        MockResponse::Bytes(200, parent.to_vec()),
+        MockResponse::Bytes(200, child.to_vec()),
+    ]);
+    let graph = workflow_graph_at(
+        &release,
+        &HttpEndpoints::fixed_test_server(&server.root),
+        &identity.commit,
+    )
+    .expect("nested local actions should resolve");
+    assert_eq!(graph.entry().expect("entry"), workflow);
+    assert_eq!(
+        graph.resource_digests(),
+        BTreeMap::from([
+            (
+                ".github/actions/child/action.yml".to_owned(),
+                sha256_bytes(child),
+            ),
+            (
+                ".github/actions/parent/action.yml".to_owned(),
+                sha256_bytes(parent),
+            ),
+        ])
     );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    for (request, path) in requests.iter().zip([
+        ".github/workflows/release.yml",
+        ".github/actions/parent/action.yml",
+        ".github/actions/child/action.yml",
+    ]) {
+        assert!(request.starts_with(&format!(
+            "GET /repos/Portfoligno/memcordon/contents/{path}?ref=0123456789abcdef"
+        )));
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    }
+}
+
+#[test]
+fn workflow_provenance_rejects_local_action_cycles_and_escapes() {
+    let (_, release, identity) = provenance_fixture();
+    let workflow = b"name: provenance\non: push\njobs:\n  inspect:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: ./.github/actions/parent\n";
+    let parent = b"name: parent\ndescription: parent\nruns:\n  using: composite\n  steps:\n    - uses: ./.github/actions/child\n";
+    let child = b"name: child\ndescription: child\nruns:\n  using: composite\n  steps:\n    - uses: ./.github/actions/parent\n";
+    let cycle_server = MockServer::scripted(vec![
+        MockResponse::Bytes(200, workflow.to_vec()),
+        MockResponse::Bytes(200, parent.to_vec()),
+        MockResponse::Bytes(200, child.to_vec()),
+    ]);
+    let cycle = workflow_graph_at(
+        &release,
+        &HttpEndpoints::fixed_test_server(&cycle_server.root),
+        &identity.commit,
+    )
+    .expect_err("local action cycle must fail closed");
+    assert!(cycle.to_string().contains("dependency cycle"), "{cycle}");
+    assert_eq!(cycle_server.finish().len(), 3);
+
+    let escaping = b"name: provenance\non: push\njobs:\n  inspect:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: ./../escape\n";
+    let escape_server = MockServer::scripted(vec![MockResponse::Bytes(200, escaping.to_vec())]);
+    let escape = workflow_graph_at(
+        &release,
+        &HttpEndpoints::fixed_test_server(&escape_server.root),
+        &identity.commit,
+    )
+    .expect_err("escaping local action must fail closed");
+    assert!(
+        escape.to_string().contains("escapes or aliases"),
+        "{escape}"
+    );
+    assert_eq!(escape_server.finish().len(), 1);
+}
+
+#[test]
+fn workflow_provenance_names_a_missing_local_action_resource() {
+    let (_, release, identity) = provenance_fixture();
+    let workflow = include_bytes!("../../../../.github/workflows/release.yml");
+    let server = MockServer::scripted(vec![
+        MockResponse::Bytes(200, workflow.to_vec()),
+        MockResponse::Bytes(404, b"missing".to_vec()),
+    ]);
+    let error = workflow_graph_at(
+        &release,
+        &HttpEndpoints::fixed_test_server(&server.root),
+        &identity.commit,
+    )
+    .expect_err("missing local action must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains(".github/actions/upload-artifact/action.yml"),
+        "{error}"
+    );
+    assert_eq!(server.finish().len(), 2);
 }
 
 #[test]
@@ -2838,37 +2958,61 @@ fn public_provenance_fixture() -> (
     ReleaseIdentity,
     ReleaseManifest,
     Vec<u8>,
+    Vec<u8>,
 ) {
     let (temporary, release, mut identity) = provenance_fixture();
     // Construct canonical LF independently of the test host's checkout settings.
     let workflow = include_str!("../../../../.github/workflows/release.yml")
         .replace("\r\n", "\n")
         .into_bytes();
+    let action = include_str!("../../../../.github/actions/upload-artifact/action.yml")
+        .replace("\r\n", "\n")
+        .into_bytes();
     let (_, mut manifest, _) = bundle_manifest(temporary.path()).expect("fixture manifest");
     identity.commit = manifest.source_commit.clone();
     manifest.workflow_sha256 = sha256_bytes(&workflow);
+    manifest.workflow_resources = BTreeMap::from([(
+        ".github/actions/upload-artifact/action.yml".to_owned(),
+        sha256_bytes(&action),
+    )]);
     manifest.action_revisions = config::action_pins(temporary.path())
         .expect("fixture pins")
         .action
         .into_iter()
         .map(|pin| (pin.name, pin.uses))
         .collect();
-    (temporary, release, identity, manifest, workflow)
+    (temporary, release, identity, manifest, workflow, action)
 }
 
 #[test]
 fn public_workflow_provenance_uses_exact_commit_bytes_despite_crlf_checkout() {
-    let (temporary, release, identity, manifest, workflow) = public_provenance_fixture();
+    let (temporary, release, identity, manifest, workflow, action) = public_provenance_fixture();
     let checkout = String::from_utf8(workflow.clone())
         .expect("UTF-8 workflow")
         .replace('\n', "\r\n");
+    let action_checkout = String::from_utf8(action.clone())
+        .expect("UTF-8 action")
+        .replace('\n', "\r\n");
     let workflow_path = temporary.path().join(".github/workflows/release.yml");
     fs::write(&workflow_path, checkout).expect("CRLF checkout");
+    let action_path = temporary
+        .path()
+        .join(".github/actions/upload-artifact/action.yml");
+    fs::create_dir_all(action_path.parent().expect("action parent"))
+        .expect("action parent should exist");
+    fs::write(&action_path, action_checkout).expect("CRLF action checkout");
     assert_ne!(
         sha256_file(&workflow_path).expect("checkout digest"),
         manifest.workflow_sha256
     );
-    let server = MockServer::scripted(vec![MockResponse::Bytes(200, workflow)]);
+    assert_ne!(
+        sha256_file(&action_path).expect("action checkout digest"),
+        manifest.workflow_resources[".github/actions/upload-artifact/action.yml"]
+    );
+    let server = MockServer::scripted(vec![
+        MockResponse::Bytes(200, workflow),
+        MockResponse::Bytes(200, action),
+    ]);
     verify_public_workflow_provenance(
         temporary.path(),
         &release,
@@ -2878,17 +3022,33 @@ fn public_workflow_provenance_uses_exact_commit_bytes_despite_crlf_checkout() {
     )
     .expect("canonical provenance survives checkout conversion");
     let requests = server.finish();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert!(requests[0].starts_with(
         "GET /repos/Portfoligno/memcordon/contents/.github/workflows/release.yml?ref=0123456789abcdef"
     ));
-    assert!(!requests[0].to_ascii_lowercase().contains("authorization:"));
+    assert!(requests[1].starts_with(
+        "GET /repos/Portfoligno/memcordon/contents/.github/actions/upload-artifact/action.yml?ref=0123456789abcdef"
+    ));
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.to_ascii_lowercase().contains("authorization:"))
+    );
 }
 
 #[test]
 fn public_workflow_provenance_rejects_changed_authoritative_bytes_and_actions() {
-    for mismatch in ["workflow bytes", "digest", "actions", "policy"] {
-        let (temporary, release, identity, mut manifest, mut workflow) =
+    for mismatch in [
+        "workflow bytes",
+        "digest",
+        "action bytes",
+        "resources absent",
+        "resources extra",
+        "actions",
+        "workflow policy",
+        "action policy",
+    ] {
+        let (temporary, release, identity, mut manifest, mut workflow, mut action) =
             public_provenance_fixture();
         let expected = match mismatch {
             "workflow bytes" => {
@@ -2900,19 +3060,53 @@ fn public_workflow_provenance_rejects_changed_authoritative_bytes_and_actions() 
                 manifest.workflow_sha256 = "00".repeat(32);
                 "release workflow digest differs from exact-commit bytes"
             }
+            "action bytes" => {
+                action.extend_from_slice(b"\n");
+                "release workflow resources differ from exact-commit bytes"
+            }
+            "resources absent" => {
+                manifest.workflow_resources.clear();
+                "release workflow resources differ from exact-commit bytes"
+            }
+            "resources extra" => {
+                manifest.workflow_resources.insert(
+                    ".github/actions/extra/action.yml".to_owned(),
+                    "00".repeat(32),
+                );
+                "release workflow resources differ from exact-commit bytes"
+            }
             "actions" => {
                 manifest.action_revisions.clear();
                 "release action revisions differ"
             }
-            "policy" => {
+            "workflow policy" => {
                 workflow = b"name: untrusted\non: push\njobs: {}\n".to_vec();
                 // Even matching bytes cannot bypass policy validation.
                 manifest.workflow_sha256 = sha256_bytes(&workflow);
                 ""
             }
+            "action policy" => {
+                let text = String::from_utf8(action).expect("action should be UTF-8");
+                action = text
+                    .replacen("overwrite: false", "overwrite: true", 1)
+                    .into_bytes();
+                manifest.workflow_resources.insert(
+                    ".github/actions/upload-artifact/action.yml".to_owned(),
+                    sha256_bytes(&action),
+                );
+                ""
+            }
             _ => unreachable!(),
         };
-        let server = MockServer::scripted(vec![MockResponse::Bytes(200, workflow)]);
+        let responses = if mismatch == "workflow policy" {
+            vec![MockResponse::Bytes(200, workflow)]
+        } else {
+            vec![
+                MockResponse::Bytes(200, workflow),
+                MockResponse::Bytes(200, action),
+            ]
+        };
+        let server = MockServer::scripted(responses);
         let error = verify_public_workflow_provenance(
             temporary.path(),
             &release,
@@ -2924,14 +3118,17 @@ fn public_workflow_provenance_rejects_changed_authoritative_bytes_and_actions() 
         if !expected.is_empty() {
             assert!(error.to_string().contains(expected), "{mismatch}: {error}");
         }
-        assert_eq!(server.finish().len(), 1);
+        assert_eq!(
+            server.finish().len(),
+            if mismatch == "workflow policy" { 1 } else { 2 }
+        );
     }
 }
 
 #[test]
 fn public_workflow_provenance_rejects_wrong_commit_or_full_workflow_ref() {
     for mismatch in ["commit", "repository", "workflow", "tag"] {
-        let (temporary, release, identity, mut manifest, _) = public_provenance_fixture();
+        let (temporary, release, identity, mut manifest, _, _) = public_provenance_fixture();
         match mismatch {
             "commit" => manifest.workflow_commit = "different-commit".to_owned(),
             "repository" => {

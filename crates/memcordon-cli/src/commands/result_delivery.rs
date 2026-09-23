@@ -231,6 +231,8 @@ struct Payload {
     report: Option<MemcordonReport>,
     #[cfg(feature = "test-fixtures")]
     barrier: Option<(memcordon_core::ReportWritePhase, Vec<u8>)>,
+    #[cfg(feature = "test-fixtures")]
+    delay_before_write: bool,
 }
 
 struct BoundedBytes(Vec<u8>);
@@ -268,6 +270,8 @@ pub(super) fn deliver(
         return_deadline,
         #[cfg(feature = "test-fixtures")]
         None,
+        #[cfg(feature = "test-fixtures")]
+        false,
     )
 }
 
@@ -277,6 +281,7 @@ fn deliver_inner(
     report: Option<MemcordonReport>,
     return_deadline: Option<u64>,
     #[cfg(feature = "test-fixtures")] barrier: Option<(memcordon_core::ReportWritePhase, Vec<u8>)>,
+    #[cfg(feature = "test-fixtures")] delay_before_write: bool,
 ) -> bool {
     if diagnostics.is_empty() && report.is_none() {
         return true;
@@ -288,7 +293,12 @@ fn deliver_inner(
     let Some(local_deadline) = started.checked_add(DELIVERY_NANOS) else {
         return failed(FailureStage::Deadline, None, None);
     };
-    let deadline = return_deadline.map_or(local_deadline, |value| value.min(local_deadline));
+    // A completed native execution already owns one immutable return deadline
+    // covering its retirement and result-delivery reserves. Preserve unused
+    // retirement time for a durable report write instead of replacing it with
+    // a fresh, shorter scheduling window. Setup errors without that evidence
+    // remain bounded by the local delivery reserve.
+    let deadline = return_deadline.unwrap_or(local_deadline);
     let write_deadline = deadline.saturating_sub(REAP_RESERVE_NANOS);
     if started >= write_deadline {
         return failed(FailureStage::Deadline, None, None);
@@ -300,6 +310,8 @@ fn deliver_inner(
         report,
         #[cfg(feature = "test-fixtures")]
         barrier,
+        #[cfg(feature = "test-fixtures")]
+        delay_before_write,
     };
     if OWNER_RESERVED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -517,6 +529,7 @@ pub(super) fn writer() -> i32 {
             let path = PathBuf::from(OsString::from_vec(path));
             #[cfg(feature = "test-fixtures")]
             {
+                let delay_before_write = payload.delay_before_write;
                 let barrier = payload
                     .barrier
                     .map(|(phase, marker)| (phase, PathBuf::from(OsString::from_vec(marker))));
@@ -535,7 +548,12 @@ pub(super) fn writer() -> i32 {
                                 WriterPhase::BeforeRename
                             }
                             memcordon_core::ReportWritePhase::BeforeAck => WriterPhase::BeforeAck,
-                        })
+                        });
+                        if delay_before_write
+                            && phase == memcordon_core::ReportWritePhase::BeforeWrite
+                        {
+                            std::thread::sleep(Duration::from_millis(1100));
+                        }
                     },
                 )
                 .map_err(io::Error::other)?;
@@ -598,6 +616,38 @@ pub(super) fn fault_test(
         Some(report),
         None,
         Some((phase, marker.as_os_str().as_bytes().to_vec())),
+        false,
+    ) {
+        0
+    } else {
+        125
+    }
+}
+
+#[cfg(feature = "test-fixtures")]
+pub(super) fn delayed_write_test(input: &Path, output: &Path) -> i32 {
+    let report: MemcordonReport = match std::fs::read(input)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    {
+        Some(report) => report,
+        None => return 126,
+    };
+    let return_deadline = match now().and_then(|started| {
+        started
+            .checked_add(3_000_000_000)
+            .ok_or_else(|| io::Error::other("test return deadline overflow"))
+    }) {
+        Ok(deadline) => deadline,
+        Err(_) => return 126,
+    };
+    if deliver_inner(
+        Vec::new(),
+        Some(output),
+        Some(report),
+        Some(return_deadline),
+        None,
+        true,
     ) {
         0
     } else {

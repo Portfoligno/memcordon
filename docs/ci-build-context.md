@@ -34,8 +34,11 @@ Windows compilation admits a positive native-tool PATH before seed compilation,
 controller measurement and standalone generated-package compilation. It retains
 the selected MSVC tools, rustup, Git, LLVM and versioned Windows SDK tools; managed
 Cargo invocations also prepend their enrolled compiler sysroot. Discovery selects
-explicit executables, and their installation/support trees are measured alongside
-the existing SDK and compiler roots. Other ambient PATH directories are not
+explicit executables. The selected compiler/SDK include, library, binary and
+support roots are measured. Broad `VSINSTALLDIR`, `VCINSTALLDIR`, `WindowsSdkDir`
+and Program Files paths identify the selection but are never recursively measured;
+inactive toolsets, SDK versions and target architectures are outside the compile
+closure. Other ambient PATH directories are not
 inherited, and missing required tools fail admission without an ambient fallback.
 Unsupported entries in an admitted input tree still fail measurement.
 
@@ -75,8 +78,8 @@ tests do not establish those results or downstream installed-package acceptance.
 The separate [native profile qualification tool](native-profile-qualification.md)
 can construct and audit a staged candidate with complete selected support trees.
 It does not admit that candidate to this production contract or emit a cache key;
-full installation enrollment remains in place pending native closure and
-relocation qualification.
+production instead measures the selected compiler, SDK and support closure while
+relocation qualification remains experimental.
 
 The seed now owns final context admission. It revokes the old context and its
 `native-inputs.admission.json` sidecar before journal creation, supervises each

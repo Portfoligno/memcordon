@@ -67,6 +67,7 @@ fn provider_fixture() -> (TempDir, config::Release, Value) {
         "workflow_commit": FIXTURE_COMMIT,
         "workflow_ref": "Portfoligno/memcordon/.github/workflows/release.yml@refs/tags/0.5.2",
         "workflow_sha256": "00".repeat(32),
+        "workflow_resources": {},
         "action_revisions": {},
         "prerelease": false,
         "rust_toolchain": "stable",

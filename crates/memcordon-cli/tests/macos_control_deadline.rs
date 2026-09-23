@@ -1,5 +1,85 @@
 #![cfg(all(target_os = "macos", feature = "test-fixtures"))]
 
+use std::path::Path;
+use std::time::Duration;
+
+#[test]
+fn pending_inventory_keeps_a_positive_watchdog_wait_after_zero_grace() {
+    assert_eq!(
+        memcordon_platform::test_support::macos_pending_inventory_turn_wait(
+            Duration::from_millis(50),
+            Duration::ZERO,
+        ),
+        Duration::from_millis(20)
+    );
+}
+
+#[test]
+fn confirmed_exec_receipt_retains_the_startup_deadline() {
+    memcordon_platform::test_support::macos_delayed_released_receipt(Path::new(env!(
+        "CARGO_BIN_EXE_memcordon"
+    )))
+    .unwrap();
+}
+
+#[test]
+fn heartbeat_retains_the_inspection_deadline() {
+    memcordon_platform::test_support::macos_delayed_heartbeat(Path::new(env!(
+        "CARGO_BIN_EXE_memcordon"
+    )))
+    .unwrap();
+}
+
+#[test]
+fn admitted_inventory_retains_the_retirement_reserve() {
+    memcordon_platform::test_support::macos_delayed_inventory_response(Path::new(env!(
+        "CARGO_BIN_EXE_memcordon"
+    )))
+    .unwrap();
+}
+
+#[test]
+fn admitted_inventory_does_not_delay_the_work_deadline() {
+    memcordon_platform::test_support::macos_delayed_inventory_deadline(
+        Path::new(env!("CARGO_BIN_EXE_memcordon")),
+        Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture")),
+    )
+    .unwrap();
+}
+
+#[test]
+fn admitted_inventory_preserves_natural_completion() {
+    memcordon_platform::test_support::macos_delayed_inventory_completion(
+        Path::new(env!("CARGO_BIN_EXE_memcordon")),
+        Path::new(env!("CARGO_BIN_EXE_memcordon-test-fixture")),
+    )
+    .unwrap();
+}
+
+#[test]
+fn observed_status_retains_the_retirement_reserve() {
+    memcordon_platform::test_support::macos_delayed_observed_status(Path::new(env!(
+        "CARGO_BIN_EXE_memcordon"
+    )))
+    .unwrap();
+}
+
+#[test]
+fn retired_receipt_retains_the_cleanup_deadline() {
+    memcordon_platform::test_support::macos_delayed_retired_receipt(Path::new(env!(
+        "CARGO_BIN_EXE_memcordon"
+    )))
+    .unwrap();
+}
+
+#[test]
+fn reaped_status_retains_the_cleanup_deadline() {
+    memcordon_platform::test_support::macos_delayed_reaped_status(Path::new(env!(
+        "CARGO_BIN_EXE_memcordon"
+    )))
+    .unwrap();
+}
+
 #[test]
 fn complete_exec_receipt_survives_post_write_deadline() {
     memcordon_platform::test_support::complete_exec_receipt_survives_post_write_deadline();

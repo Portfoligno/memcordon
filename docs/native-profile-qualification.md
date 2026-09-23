@@ -3,9 +3,10 @@
 `memcordon-ci qualify-native-profile` constructs and verifies a job-local copy
 of selected native tooling. It is an acquisition qualification tool, not a
 production build context or a cache-key producer. Production Windows builds
-continue to measure all existing conventional installation roots and all
-environment-selected native roots. The tool rejects policies requesting
-production admission. Its evidence cannot be loaded by `--build-context`.
+measure the selected compiler, SDK and support closure; this qualification
+deliberately copies and measures broader staged ancestors. The tool rejects
+policies requesting production admission. Its evidence cannot be loaded by
+`--build-context`.
 
 ## Invocation and selection
 
@@ -67,8 +68,9 @@ include/library paths, and the existing positive PATH admission. It does not
 append ambient INCLUDE/LIB or manufacture ProgramFiles values. The qualifier
 checks that every environment-selected native root is within the stage and
 also measures the whole staged ancestor, catching files added between selected
-subtrees. Production `windows_native_roots` and `native_environment_roots`
-retain their existing behavior; this module does not switch their contract.
+subtrees. Production measures the typed selected compiler and SDK closure;
+this separate experiment deliberately retains its broader staged-candidate
+contract.
 
 The environment in the specification is the native selection overlay, not a
 claim to capture the complete environment of a production Cargo invocation.
@@ -192,6 +194,7 @@ Production migration requires a separate reviewed change with:
   copy/validation/audit costs and all failures. Local fixture success is not
   native Windows execution or performance qualification.
 
-Until those gates pass, full production installation scanning remains enabled.
-No native compiler bundle is distributed or cached by this qualification tool;
-existing dependency/compiled-output cache rules remain unchanged.
+Production measures its selected compiler, SDK and support closure independently
+of these qualification gates. No native compiler bundle is distributed or cached
+by this qualification tool; existing dependency/compiled-output cache rules remain
+unchanged.

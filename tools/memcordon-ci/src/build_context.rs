@@ -187,22 +187,14 @@ fn protected_native_digest(path: &Path) -> Result<String> {
     crate::native_file_digest::parse_digest_output(&output.stdout).map_err(Into::into)
 }
 
-/// Every permitted environment-selected native input is an explicit tree root.
+/// Every environment-selected compile input is an explicit tree root. Broad
+/// installation variables are selectors whose exact values remain in the
+/// serialized environment; their selected subtrees are admitted separately.
 pub fn native_environment_roots(
     environment: &BTreeMap<OsString, OsString>,
 ) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
-    for name in [
-        "DEVELOPER_DIR",
-        "SDKROOT",
-        "VCToolsInstallDir",
-        "WindowsSdkDir",
-        "VCINSTALLDIR",
-        "VSINSTALLDIR",
-        "INCLUDE",
-        "LIB",
-        "LIBPATH",
-    ] {
+    for name in ["DEVELOPER_DIR", "SDKROOT", "INCLUDE", "LIB", "LIBPATH"] {
         if let Some(value) = environment.get(OsStr::new(name)) {
             let paths = if matches!(name, "INCLUDE" | "LIB" | "LIBPATH") {
                 std::env::split_paths(value).collect::<Vec<_>>()
@@ -227,33 +219,11 @@ pub fn native_environment_roots(
     Ok(roots)
 }
 
-/// Discover Windows platform inputs from the canonical closed environment.
-/// Keep selection separate from measurement so Windows name semantics can be
-/// checked with a small fixture without traversing an installed SDK.
+/// Enroll the Windows loader baseline from the canonical closed environment.
+/// Compiler and SDK selection is admitted by `windows_compiler`; Program Files
+/// locations and broad installation variables are discovery selectors only.
 pub fn windows_native_roots(environment: &BTreeMap<OsString, OsString>) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
-    let mut sdk_found = false;
-    let mut compiler_found = false;
-    for name in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
-        if let Some(base) = environment.get(OsStr::new(name)) {
-            let base = PathBuf::from(base);
-            let sdk = base.join("Windows Kits");
-            if sdk.is_dir() {
-                sdk_found = true;
-                roots.push(sdk);
-            }
-            let compiler = base.join("Microsoft Visual Studio");
-            if compiler.is_dir() {
-                compiler_found = true;
-                roots.push(compiler);
-            }
-        }
-    }
-    if !sdk_found || !compiler_found {
-        return Err(CiError::Message(
-            "native Windows SDK/MSVC input roots unavailable".into(),
-        ));
-    }
     let windows = environment
         .get(OsStr::new("SystemRoot"))
         .ok_or_else(|| CiError::Message("Windows system root unavailable".into()))?;
@@ -261,6 +231,70 @@ pub fn windows_native_roots(environment: &BTreeMap<OsString, OsString>) -> Resul
         roots.push(PathBuf::from(windows).join("System32").join(name));
     }
     Ok(roots)
+}
+
+/// Reject accidental restoration of the installation-wide scans. Selected
+/// descendants remain valid roots; only an entire selector/installation root
+/// is outside the measured compilation closure.
+pub fn validate_windows_native_root_scope(
+    environment: &BTreeMap<OsString, OsString>,
+    roots: &[PathBuf],
+) -> Result<()> {
+    let mut forbidden = Vec::new();
+    for name in [
+        "VSINSTALLDIR",
+        "VCINSTALLDIR",
+        "VCToolsInstallDir",
+        "WindowsSdkDir",
+    ] {
+        if let Some(path) = environment.get(OsStr::new(name)) {
+            forbidden.push(PathBuf::from(path));
+        }
+    }
+    for name in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        if let Some(base) = environment.get(OsStr::new(name)) {
+            let base = Path::new(base);
+            forbidden.push(base.join("Microsoft Visual Studio"));
+            forbidden.push(base.join("Windows Kits"));
+        }
+    }
+    let forbidden = forbidden
+        .into_iter()
+        .flat_map(|path| {
+            let canonical = path.canonicalize().ok();
+            std::iter::once(path).chain(canonical)
+        })
+        .collect::<Vec<_>>();
+    if let Some(root) = roots.iter().find(|root| {
+        forbidden
+            .iter()
+            .any(|path| root == &path || path.starts_with(root))
+    }) {
+        return Err(CiError::Message(format!(
+            "broad Windows discovery selector cannot be a native input root: {}",
+            root.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Remove roots already covered by a declared ancestor without changing the
+/// measured closure. Ordering the result keeps context serialization stable.
+pub fn minimal_native_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut minimal = Vec::<PathBuf>::new();
+    for root in roots {
+        if !minimal.iter().any(|ancestor| root.starts_with(ancestor)) {
+            minimal.push(root);
+        }
+    }
+    minimal.sort();
+    minimal
 }
 
 fn mode(metadata: &fs::Metadata) -> u32 {
@@ -990,8 +1024,9 @@ impl ValidatedBuildContext {
                 discovery_roots.push(path.canonicalize()?);
             }
         }
-        input_roots.sort();
-        input_roots.dedup();
+        #[cfg(windows)]
+        validate_windows_native_root_scope(&env, &input_roots)?;
+        input_roots = minimal_native_roots(input_roots);
         discovery_roots.sort();
         discovery_roots.dedup();
         let worker = [
@@ -1225,6 +1260,46 @@ pub fn active() -> Option<&'static ValidatedBuildContext> {
     ACTIVE.get()
 }
 
+fn normalize_isolated_output(directory: &Path, output: &Path) -> Result<PathBuf> {
+    if output
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(CiError::Message(
+            "isolated installation output escapes source operation".into(),
+        ));
+    }
+    let mut existing = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        directory.join(output)
+    };
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match fs::symlink_metadata(&existing) {
+            Ok(_) => {
+                let mut normalized = existing.canonicalize()?;
+                for component in missing.iter().rev() {
+                    normalized.push(component);
+                }
+                return Ok(normalized);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = existing.file_name().ok_or_else(|| {
+                    CiError::Message("isolated installation output has no existing ancestor".into())
+                })?;
+                missing.push(component.to_os_string());
+                if !existing.pop() {
+                    return Err(CiError::Message(
+                        "isolated installation output has no existing ancestor".into(),
+                    ));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 /// Generated/package-source qualification is a separate, uncached operation.
 /// Its output and Cargo home live in a fresh temporary directory, and its source
 /// identity is recorded and audited independently of the checkout cache context.
@@ -1263,15 +1338,14 @@ pub fn run_isolated_cargo(
         }
         rewritten.push(argument.clone());
         if argument == "--root" {
-            let output = iterator
+            let requested_output = iterator
                 .next()
                 .ok_or_else(|| CiError::Message("install root argument missing".into()))?;
-            let output = directory.join(output);
-            if output
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
-                || install_root != Some(output.as_path())
-            {
+            let output = normalize_isolated_output(&directory, Path::new(requested_output))?;
+            let declared = install_root
+                .map(|path| normalize_isolated_output(&directory, path))
+                .transpose()?;
+            if declared.as_deref() != Some(output.as_path()) {
                 return Err(CiError::Message(
                     "isolated installation output escapes source operation".into(),
                 ));
@@ -1346,7 +1420,8 @@ pub fn run_isolated_cargo(
         .env("CARGO_TARGET_DIR", command_temporary.join("target"))
         .env("CARGO_NET_OFFLINE", "false");
     let output = memcordon_testkit::run_with_deadline(&mut command, deadline)?;
-    let unchanged = snapshot(&directory)?.inputs == before.inputs;
+    let after = snapshot(&directory)?;
+    let unchanged = after.inputs == before.inputs;
     if let Some(context) = active() {
         let evidence = context.root.join("target/ci/isolated-evidence");
         fs::create_dir_all(&evidence)?;
@@ -1357,9 +1432,10 @@ pub fn run_isolated_cargo(
         fs::write(path, serde_json::to_vec_pretty(&record)?)?;
     }
     if !unchanged {
-        return Err(CiError::Message(
-            "isolated package source changed during compilation".into(),
-        ));
+        return Err(CiError::Message(format!(
+            "isolated package source changed during compilation; {}",
+            difference::describe(&before.inputs, &after.inputs)
+        )));
     }
     if !output.status.success() {
         return Err(CiError::Message(format!(

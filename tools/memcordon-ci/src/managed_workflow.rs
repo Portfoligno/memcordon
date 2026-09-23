@@ -163,7 +163,7 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                     .get(Value::from("with"))
                     .and_then(Value::as_mapping)
                     .ok_or_else(|| fail("inventory observation upload settings missing"))?;
-                if action != "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+                if action != "./.github/actions/upload-artifact"
                     || text(step, "if") != Some("always()")
                     || text(with, "path")
                         != Some(if traced {
