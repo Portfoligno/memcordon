@@ -4,6 +4,8 @@ All notable user-visible changes to MemCordon are documented here.
 
 ## Unreleased
 
+## [0.5.6-rc.33] - 2026-09-24
+
 ### Fixed
 
 - On macOS, launched commands continue to ignore `SIGINT`, `SIGTERM` and
