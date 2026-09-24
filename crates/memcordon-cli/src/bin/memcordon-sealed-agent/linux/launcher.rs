@@ -3,16 +3,21 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 
-use crate::protocol::{Frame, MessageKind, read_frame, write_frame};
+use crate::protocol::{
+    Frame, MessageKind, read_frame, read_network_frame, write_frame, write_network_frame,
+};
 use crate::rejection::RejectionV1;
 use crate::request::{
-    DescriptorPurpose, LaunchBrokerRequestV2, decode_launch_broker_request,
-    encode_launch_broker_request,
+    DescriptorPurpose, LaunchBrokerRequestV2, NetworkBrokerExchangeError,
+    NetworkLaunchBrokerRequestV4, decode_launch_broker_request, encode_launch_broker_request,
+    encode_network_launch_broker_request, parse_network_broker_exchange,
 };
 
 pub const SOCKET_PATH: &str = "/run/memcordon/sealed-launcher.sock";
+pub const NETWORK_SOCKET_PATH: &str = "/run/memcordon/sealed-network-launcher.sock";
 const CONTROL_UNIT: &str = "memcordon-sealed-agent.service";
 const LAUNCHER_UNIT: &str = "memcordon-sealed-launcher.service";
+const NETWORK_LAUNCHER_UNIT: &str = "memcordon-sealed-network-launcher.service";
 const INSTALLED_BINARY: &str = "/usr/libexec/memcordon-sealed-agent";
 
 struct AllocatedRecordGuard(Option<super::attempt::AttemptRecord>);
@@ -61,6 +66,105 @@ pub fn serve() -> Result<(), String> {
         drop(stream);
         reap_workers();
     }
+}
+
+/// The optional unit has an authenticated V4 endpoint, but does not advertise
+/// or execute the private profile until native preparation and qualification
+/// can supply a verified release checkpoint.
+pub fn serve_network() -> Result<(), String> {
+    let listener = activated_listener()?;
+    loop {
+        let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+        // SAFETY: this is the single-threaded, bounded per-connection fork point.
+        let worker = unsafe { libc::fork() };
+        if worker == -1 {
+            return Err(format!(
+                "MCSEALED-NETWORK-LAUNCHER-WORKER: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        if worker == 0 {
+            drop(listener);
+            let code = match handle_network(&mut stream) {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("sealed network launcher rejected request: {error}");
+                    125
+                }
+            };
+            // SAFETY: the worker does not unwind after fork.
+            unsafe { libc::_exit(code) };
+        }
+        drop(stream);
+        reap_workers();
+    }
+}
+
+fn handle_network(stream: &mut UnixStream) -> Result<(), String> {
+    let peer = authenticate_peer(stream, CONTROL_UNIT)?;
+    let (authentication, descriptors) = super::transport::receive_network(stream)?;
+    if authentication.kind != MessageKind::BrokerAuthenticate
+        || !authentication.payload.is_empty()
+        || !descriptors.is_empty()
+    {
+        return Err("MCSEALED-NETWORK-LAUNCHER-AUTHENTICATION: invalid handshake".to_owned());
+    }
+    let authenticated = Frame {
+        kind: MessageKind::BrokerAuthenticated,
+        nonce: authentication.nonce,
+        attempt_id: authentication.attempt_id,
+        payload: Vec::new(),
+    };
+    let mut encoded = Vec::new();
+    write_network_frame(&mut encoded, &authenticated).map_err(|error| error.to_string())?;
+    // A single credential-bearing sendmsg binds the response to this worker.
+    super::transport::send(stream, &encoded, &[])?;
+
+    let (request, descriptors) = super::transport::receive_network(stream)?;
+    let rejection = if request.nonce != authentication.nonce
+        || request.attempt_id != authentication.attempt_id
+    {
+        RejectionV1::request_error(
+            "MCSEALED-NETWORK-LAUNCHER-REQUEST-BINDING",
+            "network broker request does not match authenticated exchange",
+        )
+    } else if request.kind != MessageKind::BrokerLaunch {
+        RejectionV1::request_error(
+            "MCSEALED-NETWORK-LAUNCHER-AUTHORIZATION",
+            "network launcher accepts only a V4 broker launch request",
+        )
+    } else {
+        match parse_network_broker_exchange(
+            &request.payload,
+            request.attempt_id,
+            peer.pid,
+            peer.process_start_time,
+            descriptors.len(),
+        ) {
+            Err(NetworkBrokerExchangeError::Decode(_)) => RejectionV1::request_error(
+                "MCSEALED-NETWORK-LAUNCHER-DECODE",
+                "invalid network broker request",
+            ),
+            Err(NetworkBrokerExchangeError::AttemptBinding) => RejectionV1::request_error(
+                "MCSEALED-NETWORK-LAUNCHER-ATTEMPT-BINDING",
+                "network broker attempt differs from authenticated frame",
+            ),
+            Err(NetworkBrokerExchangeError::ControlPeerBinding) => RejectionV1::request_error(
+                "MCSEALED-NETWORK-LAUNCHER-PEER-BINDING",
+                "network broker control process differs from authenticated peer",
+            ),
+            Err(NetworkBrokerExchangeError::DescriptorInventory) => RejectionV1::request_error(
+                "MCSEALED-NETWORK-LAUNCHER-DESCRIPTOR-SET",
+                "network broker descriptor inventory differs from transferred descriptors",
+            ),
+            Ok(_) => RejectionV1::request_error(
+                "MCSEALED-NETWORK-LAUNCHER-UNQUALIFIED",
+                "private target preparation and native qualification are unavailable",
+            ),
+        }
+    };
+    let response = rejected(&request, &rejection)?;
+    write_network_frame(stream, &response).map_err(|error| error.to_string())
 }
 
 pub fn probe() -> Result<super::qualification::QualificationReceipt, String> {
@@ -115,6 +219,39 @@ pub fn launch(
         || !matches!(response.kind, MessageKind::Terminal | MessageKind::Rejected)
     {
         return Err("MCSEALED-LAUNCHER-SERVICE-AUTHENTICATION: invalid launch response".to_owned());
+    }
+    Ok(response)
+}
+
+pub fn launch_network(
+    request: &Frame,
+    broker_request: &NetworkLaunchBrokerRequestV4,
+    descriptors: &[RawFd],
+) -> Result<Frame, String> {
+    if descriptors.len() != crate::request::network_broker_descriptor_manifest().len() {
+        return Err(
+            "MCSEALED-NETWORK-LAUNCHER-DESCRIPTOR-SET: exact inventory required".to_owned(),
+        );
+    }
+    let mut stream = connect_network_authenticated(request.nonce, request.attempt_id)?;
+    let broker_frame = Frame {
+        kind: MessageKind::BrokerLaunch,
+        nonce: request.nonce,
+        attempt_id: request.attempt_id,
+        payload: encode_network_launch_broker_request(broker_request)
+            .map_err(|error| format!("MCSEALED-NETWORK-LAUNCHER-ENCODE: {error:?}"))?,
+    };
+    let mut encoded = Vec::new();
+    write_network_frame(&mut encoded, &broker_frame).map_err(|error| error.to_string())?;
+    super::transport::send(&stream, &encoded, descriptors)?;
+    let response = read_network_frame(&mut stream).map_err(|error| error.to_string())?;
+    if response.nonce != request.nonce
+        || response.attempt_id != request.attempt_id
+        || response.kind != MessageKind::Rejected
+    {
+        return Err(
+            "MCSEALED-NETWORK-LAUNCHER-SERVICE-AUTHENTICATION: invalid response".to_owned(),
+        );
     }
     Ok(response)
 }
@@ -313,6 +450,41 @@ fn connect_authenticated(nonce: [u8; 16], attempt_id: [u8; 16]) -> Result<UnixSt
     write_frame(&mut stream, &authentication).map_err(|error| error.to_string())?;
     let credentials = receive_authentication_response(&stream, &authentication)?;
     let _ = authenticate_credentials(credentials, LAUNCHER_UNIT)?;
+    set_receive_credentials(&stream, false)?;
+    Ok(stream)
+}
+
+fn connect_network_authenticated(
+    nonce: [u8; 16],
+    attempt_id: [u8; 16],
+) -> Result<UnixStream, String> {
+    let mut stream = UnixStream::connect(NETWORK_SOCKET_PATH)
+        .map_err(|error| format!("MCSEALED-NETWORK-LAUNCHER-CONNECTION: {error}"))?;
+    set_receive_credentials(&stream, true)?;
+    let authentication = Frame {
+        kind: MessageKind::BrokerAuthenticate,
+        nonce,
+        attempt_id,
+        payload: Vec::new(),
+    };
+    write_network_frame(&mut stream, &authentication).map_err(|error| error.to_string())?;
+    let (response, descriptors, credentials) =
+        super::transport::receive_network_with_credentials(&stream)?;
+    if response.kind != MessageKind::BrokerAuthenticated
+        || response.nonce != nonce
+        || response.attempt_id != attempt_id
+        || !response.payload.is_empty()
+        || !descriptors.is_empty()
+    {
+        return Err(
+            "MCSEALED-NETWORK-LAUNCHER-SERVICE-AUTHENTICATION: invalid handshake response"
+                .to_owned(),
+        );
+    }
+    let credentials = credentials.ok_or_else(|| {
+        "MCSEALED-NETWORK-LAUNCHER-SERVICE-AUTHENTICATION: credentials missing".to_owned()
+    })?;
+    let _ = authenticate_credentials(credentials, NETWORK_LAUNCHER_UNIT)?;
     set_receive_credentials(&stream, false)?;
     Ok(stream)
 }

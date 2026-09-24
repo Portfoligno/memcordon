@@ -29,6 +29,7 @@ pub mod sealed_identity;
 pub mod sealed_selector;
 pub mod standard_contract;
 pub mod standard_runner;
+pub mod windows_causal_acceptance;
 pub mod windows_channel_identity;
 pub mod windows_package_cleanup;
 pub mod windows_package_staging;

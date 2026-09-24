@@ -476,6 +476,72 @@ fn spawn_tree(mut args: impl Iterator<Item = OsString>) {
 }
 
 #[cfg(windows)]
+fn windows_inventory_leaf(mut args: impl Iterator<Item = OsString>) {
+    let ordinal = take_value(&mut args, "windows-inventory-leaf ordinal")
+        .to_str()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value < memcordon_core::WINDOWS_MAX_JOB_PROCESS_IDENTITIES)
+        .unwrap_or_else(|| fail("invalid inventory leaf ordinal"));
+    let lifetime = take_value(&mut args, "windows-inventory-leaf lifetime")
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=240_000).contains(value))
+        .unwrap_or_else(|| fail("invalid inventory leaf lifetime"));
+    if args.next().is_some() {
+        fail("windows-inventory-leaf accepts exactly two arguments");
+    }
+    let identity = memcordon_platform::test_support::ProcessIdentity::current()
+        .unwrap_or_else(|error| fail(format!("cannot observe inventory leaf identity: {error}")));
+    println!(
+        "MEMCORDON-INVENTORY-READY:{}",
+        serde_json::json!({"kind":"inventory-leaf-ready", "ordinal":ordinal, "pid":identity.pid, "birth":identity.birth})
+    );
+    io::stdout()
+        .flush()
+        .unwrap_or_else(|error| fail(format!("cannot publish leaf readiness: {error}")));
+    thread::sleep(Duration::from_millis(lifetime));
+    fail("inventory leaf self-expired before provider cleanup");
+}
+
+#[cfg(windows)]
+fn windows_inventory_capacity(args: impl Iterator<Item = OsString>) {
+    if args.count() != 0 {
+        fail("windows-inventory-capacity accepts no arguments");
+    }
+    let count = memcordon_core::WINDOWS_MAX_JOB_PROCESS_IDENTITIES;
+    let _family_bound = count
+        .checked_add(1)
+        .unwrap_or_else(|| fail("inventory fixture family bound overflow"));
+    let identity = memcordon_platform::test_support::ProcessIdentity::current()
+        .unwrap_or_else(|error| fail(format!("cannot observe inventory root identity: {error}")));
+    println!(
+        "MEMCORDON-INVENTORY-READY:{}",
+        serde_json::json!({"kind":"inventory-root-ready", "ordinal":null, "pid":identity.pid, "birth":identity.birth})
+    );
+    io::stdout()
+        .flush()
+        .unwrap_or_else(|error| fail(format!("cannot publish root readiness: {error}")));
+    let executable = std::env::current_exe()
+        .unwrap_or_else(|error| fail(format!("cannot resolve inventory fixture image: {error}")));
+    let mut children = Vec::with_capacity(count);
+    for ordinal in 0..count {
+        let child = Command::new(&executable)
+            .arg("windows-inventory-leaf")
+            .arg(ordinal.to_string())
+            .arg("240000")
+            .spawn()
+            .unwrap_or_else(|error| fail(format!("cannot create inventory leaf: {error}")));
+        children.push(child);
+    }
+    thread::sleep(Duration::from_secs(240));
+    for mut child in children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    fail("inventory root self-expired before provider cleanup");
+}
+
+#[cfg(windows)]
 fn attempt_job_breakaway() {
     use std::os::windows::process::CommandExt;
 
@@ -812,6 +878,16 @@ fn main() {
         }
         "spawn-tree" => {
             spawn_tree(args);
+            0
+        }
+        #[cfg(windows)]
+        "windows-inventory-capacity" => {
+            windows_inventory_capacity(args);
+            0
+        }
+        #[cfg(windows)]
+        "windows-inventory-leaf" => {
+            windows_inventory_leaf(args);
             0
         }
         "print-pid-and-hold" => {

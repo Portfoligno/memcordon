@@ -449,13 +449,24 @@ into another session can also leave the sampled workload boundary.
 
 ## Sealed provider distribution
 
-`cargo install --locked memcordon` installs exactly two default binaries:
-`memcordon` and `memcordon-sealed-agent`. Test fixtures are feature-gated and
-are not installed by default. Linux and Windows native archives contain those
-same two runtime components plus `runtime-manifest.json`; macOS archives
-contain only the public CLI and mark sealed packaging not applicable. Windows
-manifests bind provider protocol 1, mechanism `windows-job-object-v2`, and
-qualification schema 1.
+`cargo install --locked memcordon` builds the public CLI, sealed agent, and two
+Windows-only helper binaries; test fixtures are feature-gated and are not
+installed by default. The helpers fail closed when invoked on other platforms.
+Native archives contain the following runtime components plus
+`runtime-manifest.json`:
+
+| Target | Runtime components |
+| --- | --- |
+| linux-x64 | memcordon, memcordon-sealed-agent |
+| linux-arm64 | memcordon, memcordon-sealed-agent |
+| macos-arm64 | memcordon |
+| macos-x64 | memcordon |
+| windows-x64 | memcordon.exe, memcordon-sealed-agent.exe, memcordon-target-desktop-bootstrap.exe, memcordon-session-broker.exe |
+| windows-arm64 | memcordon.exe, memcordon-sealed-agent.exe, memcordon-target-desktop-bootstrap.exe, memcordon-session-broker.exe |
+
+The macOS manifest marks sealed packaging not applicable. Current Windows
+manifests bind generic provider contract 3, public/private wire versions 2/2,
+mechanism `windows-job-object-v2`, and qualification schema 2.
 
 The provider remains an explicit root or elevated installation:
 

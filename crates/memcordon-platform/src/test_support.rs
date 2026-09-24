@@ -533,6 +533,129 @@ impl ProcessIdentity {
     }
 }
 
+/// Query-only handles retained by the Windows installed-fixture leak observer.
+/// The unique staged image path keeps the observation specific to one case.
+#[cfg(windows)]
+pub struct WindowsImageProcess {
+    pub identity: ProcessIdentity,
+    _handle: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+pub fn windows_processes_for_image(image: &Path) -> io::Result<Vec<WindowsImageProcess>> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{
+        ERROR_NO_MORE_FILES, FILETIME, GetLastError, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+
+    let expected = std::fs::canonicalize(image)?
+        .to_string_lossy()
+        .to_lowercase();
+    let expected_name = image
+        .file_name()
+        .ok_or_else(|| io::Error::other("fixture image has no filename"))?
+        .to_string_lossy()
+        .to_lowercase();
+    // SAFETY: a process snapshot has no mutable external buffers.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: snapshot is a new owned handle and is closed on all exits.
+    let _snapshot_owner = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(snapshot) };
+    // SAFETY: the Windows enumeration API initializes the remaining fields.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = u32::try_from(std::mem::size_of::<PROCESSENTRY32W>())
+        .expect("Windows process entry size fits u32");
+    // SAFETY: snapshot and entry are valid for enumeration.
+    let mut found = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    if !found {
+        return Err(io::Error::last_os_error());
+    }
+    let mut matching = Vec::new();
+    while found {
+        let name_len = entry
+            .szExeFile
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]).to_lowercase();
+        if name == expected_name {
+            // SAFETY: query-only access to an enumerated PID.
+            let raw =
+                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID) };
+            if raw.is_null() {
+                // A matching image that cannot be inspected is never interpreted as absent.
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: OpenProcess returned one owned non-null handle.
+            let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+            let mut units = [0u16; 32768];
+            let mut length = u32::try_from(units.len()).expect("image path buffer fits u32");
+            // SAFETY: handle and path buffer are valid, with writable length.
+            if unsafe { QueryFullProcessImageNameW(raw, 0, units.as_mut_ptr(), &mut length) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let observed = std::fs::canonicalize(Path::new(&String::from_utf16_lossy(
+                &units[..length as usize],
+            )))?
+            .to_string_lossy()
+            .to_lowercase();
+            if observed == expected {
+                let mut creation = FILETIME::default();
+                let mut exit = FILETIME::default();
+                let mut kernel = FILETIME::default();
+                let mut user = FILETIME::default();
+                // SAFETY: all FILETIME outputs are writable and handle remains open.
+                if unsafe { GetProcessTimes(raw, &mut creation, &mut exit, &mut kernel, &mut user) }
+                    == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                matching.push(WindowsImageProcess {
+                    identity: ProcessIdentity {
+                        pid: entry.th32ProcessID,
+                        birth: (u128::from(creation.dwHighDateTime) << 32)
+                            | u128::from(creation.dwLowDateTime),
+                    },
+                    _handle: handle,
+                });
+            }
+        }
+        // SAFETY: snapshot and entry remain valid for the next query.
+        found = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: GetLastError reads this thread's immediately preceding enumeration result.
+    let enumeration_error = unsafe { GetLastError() };
+    if enumeration_error != ERROR_NO_MORE_FILES {
+        return Err(io::Error::from_raw_os_error(
+            i32::try_from(enumeration_error).unwrap_or(i32::MAX),
+        ));
+    }
+    Ok(matching)
+}
+
+#[cfg(windows)]
+pub fn windows_available_memory_bytes() -> io::Result<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: Windows fills the initialized structure after its exact size is supplied.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>())
+        .expect("Windows memory status size fits u32");
+    // SAFETY: the pointer refers to a writable MEMORYSTATUSEX.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(status.ullAvailPhys)
+}
+
 #[cfg(target_os = "linux")]
 pub fn assert_native_containment(expected_memory: u64) -> io::Result<()> {
     let membership = std::fs::read_to_string("/proc/self/cgroup")?;

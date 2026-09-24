@@ -1520,6 +1520,30 @@ pub fn read_report(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Read a publication record with the correct framing rule: causal raw
+/// evidence includes binary stdout/stderr and need not end in a newline.
+pub fn read_certification_record(path: &Path, relative: &str) -> Result<Vec<u8>> {
+    let Some(name) = relative.strip_prefix("certification/windows-causal/") else {
+        return read_report(path);
+    };
+    for (_, _, artifact, prefix) in crate::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS {
+        if name == artifact {
+            return read_report(path);
+        }
+        for suffix in crate::windows_causal_acceptance::RAW_SUFFIXES {
+            if name == crate::windows_causal_acceptance::raw_name(prefix, suffix) {
+                return crate::windows_causal_acceptance::read_raw(
+                    path.parent()
+                        .ok_or_else(|| failure("causal certification has no parent"))?,
+                    prefix,
+                    suffix,
+                );
+            }
+        }
+    }
+    Err(failure("unknown installed causal certification record"))
+}
+
 fn validate_hard_report<R: DeserializeOwned>(
     bytes: &[u8],
     spec: ReportSpec,
@@ -1603,7 +1627,7 @@ fn validate_split_windows_certification(
         "aarch64" => "aarch64-pc-windows-msvc",
         _ => return Err(failure("unsupported Windows release architecture")),
     };
-    let mut expected_names: BTreeSet<&str> = [
+    let mut expected_names: BTreeSet<String> = [
         "production-result.json",
         "production-manifest.json",
         "lifecycle-outcomes.json",
@@ -1615,10 +1639,19 @@ fn validate_split_windows_certification(
         "launch-plan.json",
     ]
     .into_iter()
+    .map(str::to_owned)
     .collect();
     for (_, name, target, _) in crate::workload_qualification::ARTIFACTS {
         if target == expected_target {
-            expected_names.insert(name);
+            expected_names.insert(name.to_owned());
+        }
+    }
+    for (target, _, name, prefix) in crate::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS {
+        if target == expected_target {
+            expected_names.insert(name.to_owned());
+            for suffix in crate::windows_causal_acceptance::RAW_SUFFIXES {
+                expected_names.insert(crate::windows_causal_acceptance::raw_name(prefix, suffix));
+            }
         }
     }
     if report.schema_version != 1
@@ -1644,7 +1677,7 @@ fn validate_split_windows_certification(
         || report
             .evidence_bindings
             .keys()
-            .map(String::as_str)
+            .cloned()
             .collect::<BTreeSet<_>>()
             != expected_names
     {
@@ -1652,12 +1685,73 @@ fn validate_split_windows_certification(
     }
     let evidence = directory.join("release-evidence");
     for (name, expected_sha256) in &report.evidence_bindings {
-        if !valid_sha256(expected_sha256)
-            || sha256_bytes(&read_report(&evidence.join(name))?) != *expected_sha256
-        {
+        let installed_raw = crate::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS
+            .iter()
+            .flat_map(|(_, _, _, prefix)| {
+                crate::windows_causal_acceptance::RAW_SUFFIXES
+                    .into_iter()
+                    .map(move |suffix| (*prefix, suffix))
+            })
+            .find(|(prefix, suffix)| {
+                crate::windows_causal_acceptance::raw_name(prefix, suffix) == *name
+            });
+        let bytes = if let Some((prefix, suffix)) = installed_raw {
+            crate::windows_causal_acceptance::read_raw(&evidence, prefix, suffix)?
+        } else {
+            read_report(&evidence.join(name))?
+        };
+        if !valid_sha256(expected_sha256) || sha256_bytes(&bytes) != *expected_sha256 {
             return Err(failure(format!(
                 "Windows split evidence binding differs: {name}"
             )));
+        }
+    }
+    for (target, channel, name, prefix) in crate::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS
+    {
+        if target != expected_target {
+            continue;
+        }
+        let expected_channel = match channel {
+            "native-bundle" => crate::windows_causal_acceptance::InstalledChannel::NativeBundle,
+            "cargo-package" => crate::windows_causal_acceptance::InstalledChannel::CargoPackage,
+            _ => return Err(failure("unknown installed Windows causal channel")),
+        };
+        let bytes = read_report(&evidence.join(name))?;
+        let artifact = crate::windows_causal_acceptance::validate_artifact(
+            &bytes,
+            &evidence,
+            prefix,
+            expected_commit,
+            expected_target,
+            expected_channel,
+        )?;
+        if artifact.package_version != env!("CARGO_PKG_VERSION") {
+            return Err(failure(
+                "installed causal package version differs from the release",
+            ));
+        }
+        let raw_package: serde_json::Value = serde_json::from_slice(
+            &crate::windows_causal_acceptance::read_raw(&evidence, prefix, "package.json")?,
+        )?;
+        let fingerprint_name = if channel == "native-bundle" {
+            "native-fingerprint.json"
+        } else {
+            "cargo-fingerprint.json"
+        };
+        let fingerprint: serde_json::Value =
+            serde_json::from_slice(&read_report(&evidence.join(fingerprint_name))?)?;
+        if fingerprint.get("package_identity")
+            != Some(&crate::windows_channel_identity::package_contract(
+                raw_package,
+            )?)
+            || fingerprint
+                .get("execution_report_schema")
+                .and_then(serde_json::Value::as_u64)
+                != Some(u64::from(artifact.execution_report_schema))
+        {
+            return Err(failure(
+                "installed causal package or schema differs from measured channel",
+            ));
         }
     }
     Ok(())
@@ -2504,6 +2598,32 @@ fn validate_output_inventory(output: &Path) -> Result<()> {
             }
             continue;
         }
+        if name == "windows-causal" && entry.file_type()?.is_dir() {
+            let mut expected = BTreeSet::new();
+            for (_, _, artifact, prefix) in
+                crate::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS
+            {
+                expected.insert(artifact.to_owned());
+                for suffix in crate::windows_causal_acceptance::RAW_SUFFIXES {
+                    expected.insert(crate::windows_causal_acceptance::raw_name(prefix, suffix));
+                }
+            }
+            let actual: BTreeSet<String> = fs::read_dir(entry.path())?
+                .map(|file| {
+                    let file = file?;
+                    if !file.file_type()?.is_file() {
+                        return Err(failure("Windows causal evidence must be regular files"));
+                    }
+                    file.file_name()
+                        .into_string()
+                        .map_err(|_| failure("Windows causal evidence filename is not UTF-8"))
+                })
+                .collect::<Result<_>>()?;
+            if actual != expected {
+                return Err(failure("Windows causal publication inventory differs"));
+            }
+            continue;
+        }
         if !allowed_names.contains(name.as_str()) || !entry.file_type()?.is_file() {
             return Err(failure(format!(
                 "unexpected release certification evidence: {name}"
@@ -2559,6 +2679,7 @@ pub fn collect_certification(
     let mut validated = Vec::new();
     let mut linux_auxiliary = BTreeMap::new();
     let mut workload_auxiliary = BTreeMap::new();
+    let mut installed_causal_auxiliary = BTreeMap::new();
     for spec in REPORTS {
         let path = input.join(spec.artifact_directory).join(spec.report_name);
         let bytes = read_report(&path)?;
@@ -2611,12 +2732,41 @@ pub fn collect_certification(
                     }
                 }
             }
-            ReportKind::WindowsSplit => validate_split_windows_certification(
-                &bytes,
-                &input.join(spec.artifact_directory),
-                *spec,
-                expected_commit,
-            )?,
+            ReportKind::WindowsSplit => {
+                let directory = input.join(spec.artifact_directory);
+                validate_split_windows_certification(&bytes, &directory, *spec, expected_commit)?;
+                let target = match spec.architecture {
+                    Some("x86_64") => "x86_64-pc-windows-msvc",
+                    Some("aarch64") => "aarch64-pc-windows-msvc",
+                    _ => {
+                        return Err(failure(
+                            "unsupported Windows causal publication architecture",
+                        ));
+                    }
+                };
+                for (entry_target, _, artifact, prefix) in
+                    crate::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS
+                {
+                    if entry_target != target {
+                        continue;
+                    }
+                    let evidence = directory.join("release-evidence");
+                    if installed_causal_auxiliary
+                        .insert(artifact.to_owned(), read_report(&evidence.join(artifact))?)
+                        .is_some()
+                    {
+                        return Err(failure("duplicate installed causal acceptance artifact"));
+                    }
+                    for suffix in crate::windows_causal_acceptance::RAW_SUFFIXES {
+                        let name = crate::windows_causal_acceptance::raw_name(prefix, suffix);
+                        let raw =
+                            crate::windows_causal_acceptance::read_raw(&evidence, prefix, suffix)?;
+                        if installed_causal_auxiliary.insert(name, raw).is_some() {
+                            return Err(failure("duplicate installed causal raw artifact"));
+                        }
+                    }
+                }
+            }
             ReportKind::Macos => validate_macos_report(&bytes, *spec, expected_commit)?,
         }
         validated.push(ValidatedReport {
@@ -2684,8 +2834,26 @@ pub fn collect_certification(
             return Err(failure("duplicate auxiliary certification record key"));
         }
     }
+    let causal_output = evidence_directory.join("windows-causal");
+    fs::create_dir_all(&causal_output)?;
+    for (name, bytes) in installed_causal_auxiliary {
+        let relative = format!("certification/windows-causal/{name}");
+        fs::write(output.join(&relative), &bytes)?;
+        if records
+            .insert(
+                format!("windows-causal/{name}"),
+                CertificationRecord {
+                    evidence_path: relative,
+                    sha256: sha256_bytes(&bytes),
+                },
+            )
+            .is_some()
+        {
+            return Err(failure("duplicate installed causal publication record"));
+        }
+    }
     validate_required_certification_records(&records, expected, |path| {
-        read_report(&output.join(path))
+        read_certification_record(&output.join(path), path)
     })?;
     let final_directory = destination_root.join("certification");
     if final_directory.exists() {
@@ -2712,6 +2880,19 @@ pub fn validate_required_certification_records(
             format!("certification/workload/{name}"),
         );
     }
+    for (_, _, artifact, prefix) in crate::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS {
+        expected.insert(
+            format!("windows-causal/{artifact}"),
+            format!("certification/windows-causal/{artifact}"),
+        );
+        for suffix in crate::windows_causal_acceptance::RAW_SUFFIXES {
+            let name = crate::windows_causal_acceptance::raw_name(prefix, suffix);
+            expected.insert(
+                format!("windows-causal/{name}"),
+                format!("certification/windows-causal/{name}"),
+            );
+        }
+    }
     for name in LINUX_SEALED_FILES
         .iter()
         .filter(|name| **name != "cleanup-leak-check.json")
@@ -2732,10 +2913,31 @@ pub fn validate_required_certification_records(
             return Err(failure("certification record identity differs"));
         }
         let bytes = resolve(&path)?;
-        if !bytes.ends_with(b"\n")
-            || bytes.len()
-                > usize::try_from(MAXIMUM_CERTIFICATION_REPORT_BYTES)
-                    .expect("certificate bound fits usize")
+        let causal_raw_limit = crate::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS
+            .iter()
+            .flat_map(|(_, _, _, prefix)| {
+                crate::windows_causal_acceptance::RAW_SUFFIXES
+                    .into_iter()
+                    .map(move |suffix| {
+                        (
+                            crate::windows_causal_acceptance::raw_name(prefix, suffix),
+                            suffix,
+                        )
+                    })
+            })
+            .find(|(name, _)| key == format!("windows-causal/{name}"))
+            .map(|(_, suffix)| match suffix {
+                "report.json" => crate::windows_causal_acceptance::MAX_REPORT_BYTES,
+                "stdout.bin" | "stderr.bin" => crate::windows_causal_acceptance::MAX_STREAM_BYTES,
+                "runtime-manifest.json" => crate::windows_causal_acceptance::MAX_MANIFEST_BYTES,
+                _ => crate::windows_causal_acceptance::MAX_SUMMARY_BYTES,
+            });
+        let limit = causal_raw_limit.unwrap_or_else(|| {
+            usize::try_from(MAXIMUM_CERTIFICATION_REPORT_BYTES)
+                .expect("certificate bound fits usize")
+        });
+        if (causal_raw_limit.is_none() && !bytes.ends_with(b"\n"))
+            || bytes.len() > limit
             || sha256_bytes(&bytes) != record.sha256
         {
             return Err(failure("certification evidence bytes differ"));
@@ -2756,6 +2958,33 @@ pub fn validate_required_certification_records(
                     serde_json::from_slice(&bytes)?;
                 artifact.validate(kind, target, &origin.source_commit)?;
             }
+        }
+    }
+    for (target, channel, artifact, prefix) in
+        crate::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS
+    {
+        let expected_channel = match channel {
+            "native-bundle" => crate::windows_causal_acceptance::InstalledChannel::NativeBundle,
+            "cargo-package" => crate::windows_causal_acceptance::InstalledChannel::CargoPackage,
+            _ => return Err(failure("unknown installed causal channel")),
+        };
+        let bytes = resolve(&format!("certification/windows-causal/{artifact}"))?;
+        let parsed = crate::windows_causal_acceptance::validate_artifact_with_raw(
+            &bytes,
+            &origin.source_commit,
+            target,
+            expected_channel,
+            |suffix| {
+                resolve(&format!(
+                    "certification/windows-causal/{}",
+                    crate::windows_causal_acceptance::raw_name(prefix, suffix),
+                ))
+            },
+        )?;
+        if parsed.package_version != env!("CARGO_PKG_VERSION") {
+            return Err(failure(
+                "installed causal published package version differs",
+            ));
         }
     }
     Ok(())

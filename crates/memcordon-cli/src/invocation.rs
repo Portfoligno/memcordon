@@ -1349,10 +1349,19 @@ fn parse_policy_option(
             file.take(limit as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(|error| error.to_string())?;
-            memcordon_core::workload_contract::WorkloadContractV1::parse(&bytes)
+            memcordon_core::workload_contract::WorkloadContract::parse(&bytes)
         };
-        policy.workload_contract =
-            Some(read().map_err(|error| CliError::new("MCUSAGE-WORKLOAD-CONTRACT", error))?);
+        policy.workload_contract = Some(
+            match read().map_err(|error| CliError::new("MCUSAGE-WORKLOAD-CONTRACT", error))? {
+                memcordon_core::workload_contract::WorkloadContract::V1(contract) => contract,
+                memcordon_core::workload_contract::WorkloadContract::V2(_) => {
+                    return Err(CliError::new(
+                        "MCWORKLOAD-V2-UNAVAILABLE",
+                        "V2 workload contracts require a qualified Linux V4 provider; this invocation has no active V2 launch path",
+                    ));
+                }
+            },
+        );
         return Ok(());
     }
     if name == "--sealed" {

@@ -994,6 +994,219 @@ fn write_report(path: &Path, value: &Value) {
     fs::write(path, bytes).expect("report should write");
 }
 
+fn installed_causal_report(
+    qualification: &WindowsQualificationReceiptV1,
+    manifest_bytes: &[u8],
+) -> Value {
+    use memcordon_core::{
+        AttemptObservationPhaseV1, BoundarySetupPhase, CausalEventV1, DiagnosticOriginV1,
+        ExecutionErrorReport, FailureCategoryV1, FailureCodeV1, FailureOperationV1,
+        ProviderFailureDiagnosticV1, ProviderRejectionEvidence, SafeDiagnosticDetailV1,
+        SafeMessageIdV1, WindowsCausalDiagnosticsV1,
+    };
+    let manifest = memcordon_core::runtime_manifest::RuntimeManifestV2::parse(manifest_bytes)
+        .expect("fixture manifest should parse");
+    let binding = manifest
+        .public_binding(manifest_bytes)
+        .expect("fixture manifest should bind");
+    let mut journal = WindowsCausalDiagnosticsV1::default();
+    journal
+        .observe(CausalEventV1 {
+            sequence: 0,
+            origin: DiagnosticOriginV1::Launcher,
+            category: FailureCategoryV1::Monitor,
+            operation: FailureOperationV1::AccumulateProcessInventory,
+            code: FailureCodeV1::ProcessInventoryCapacity,
+            native_code: None,
+            observed_phase: AttemptObservationPhaseV1::Monitoring,
+            safe_detail: SafeDiagnosticDetailV1::CountAndLimit {
+                observed: 257,
+                limit: 256,
+            },
+            detail_redacted: false,
+            detail_truncated: false,
+            terminalization_reference: None,
+        })
+        .expect("original should append");
+    journal
+        .observe(CausalEventV1 {
+            sequence: 0,
+            origin: DiagnosticOriginV1::Launcher,
+            category: FailureCategoryV1::Terminalization,
+            operation: FailureOperationV1::ValidateTerminalResponse,
+            code: FailureCodeV1::TerminalBinding,
+            native_code: None,
+            observed_phase: AttemptObservationPhaseV1::Terminalizing,
+            safe_detail: SafeDiagnosticDetailV1::ProviderMessage {
+                id: SafeMessageIdV1::ReceiptRequiredForPosttarget,
+            },
+            detail_redacted: false,
+            detail_truncated: false,
+            terminalization_reference: None,
+        })
+        .expect("secondary should append");
+    journal.durable_through_sequence = Some(journal.sequence);
+    let projection = ProviderFailureDiagnosticV1::from_journal(
+        binding,
+        &"11".repeat(32),
+        &"22".repeat(32),
+        &journal,
+    )
+    .expect("fixture projection should bind");
+    let rejection = ProviderRejectionEvidence {
+        workload_admission: None,
+        provider_failure: Some(projection.clone()),
+        schema_version: 1,
+        code: "MCSEALED-WINDOWS-TERMINAL-BINDING".to_owned(),
+        phase: BoundarySetupPhase::Monitoring,
+        detail: "receipt required for posttarget refusal".to_owned(),
+        os_code: None,
+        loader_qualification: None,
+        target_created: true,
+        target_released: true,
+        cleanup_attempted: true,
+        restart_safety: RestartSafetyProof::default(),
+        terminal_ack_required: false,
+        terminal_receipt: None,
+    };
+    let error = ExecutionErrorReport {
+        runtime: None,
+        native_startup: None,
+        policy_enforcement: None,
+        category: "monitor".to_owned(),
+        code: "MCSEALED-WINDOWS-PROCESS-INVENTORY-CAPACITY".to_owned(),
+        message: "inventory capacity observed".to_owned(),
+        os_code: None,
+        attempt_number: Some(1),
+        supervision_phase: Some("monitoring".to_owned()),
+        launch_phase: Some("monitoring".to_owned()),
+        target_released: true,
+        workload_may_be_alive: false,
+        boundary_setup_failure: None,
+        provider_rejection: Some(rejection),
+        provider_failure: Some(projection),
+    };
+    let mut report = windows_public_launch_report(qualification);
+    report["supervision"] = Value::Null;
+    report["attempts"] = json!([]);
+    report["error"] = serde_json::to_value(error).expect("failure should serialize");
+    report["invocation"]["argv"] = json!([
+        NativeArgument::from_os(OsStr::new("inventory-fixture.exe")),
+        NativeArgument::from_os(OsStr::new("windows-inventory-capacity"))
+    ]);
+    let _: MemcordonReport = serde_json::from_value(report.clone())
+        .expect("installed causal failure report should parse");
+    report
+}
+
+fn write_installed_causal_artifacts(
+    evidence: &Path,
+    target: &str,
+    bindings: &mut serde_json::Map<String, Value>,
+) {
+    use memcordon_ci::windows_causal_acceptance::{
+        CleanupEvidenceV1, FixtureExitEvidenceV1, FixtureProcessIdentityV1, InstalledChannel,
+        InvocationEvidenceV1, RAW_SUFFIXES, raw_name, write_acceptance, write_raw,
+    };
+    use memcordon_core::runtime_manifest::{
+        RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifestV2,
+    };
+    let qualification = windows_qualification();
+    let manifest = RuntimeManifestV2::windows(
+        env!("CARGO_PKG_VERSION").to_owned(),
+        COMMIT.to_owned(),
+        target.to_owned(),
+        vec![RuntimeComponentRecord {
+            id: "sealed-agent".to_owned(),
+            path: "memcordon-sealed-agent.exe".to_owned(),
+            role: RuntimeComponentRole::SealedAgent,
+            size: 1,
+            mode: 0,
+            sha256: "aa".repeat(32),
+        }],
+    );
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize fixture manifest");
+    let report = installed_causal_report(&qualification, &manifest_bytes);
+    let report_bytes = serde_json::to_vec_pretty(&report).expect("serialize fixture report");
+    let package_bytes = serde_json::to_vec_pretty(&windows_package_inspection_v4())
+        .expect("serialize package inspection");
+    let qualification_bytes =
+        serde_json::to_vec_pretty(&qualification).expect("serialize native qualification");
+    let fixture_sha256 = "cc".repeat(32);
+    let fixture_bytes = serde_json::to_vec_pretty(&FixtureExitEvidenceV1 {
+        schema_version: 1,
+        image_sha256: fixture_sha256.clone(),
+        root_ready: true,
+        observed_family: vec![FixtureProcessIdentityV1 {
+            ordinal: None,
+            pid: 41,
+            birth: 101,
+        }],
+        root_exited: true,
+        all_matching_processes_gone: true,
+    })
+    .expect("serialize fixture exit evidence");
+    let cleanup_bytes = serde_json::to_vec_pretty(&CleanupEvidenceV1 {
+        schema_version: 1,
+        attempts_empty: true,
+        package_recovered: true,
+    })
+    .expect("serialize cleanup evidence");
+    let invocation_bytes = serde_json::to_vec_pretty(&InvocationEvidenceV1 {
+        schema_version: 1,
+        exit_code: Some(1),
+        runner_timed_out: false,
+        cli_sha256: "dd".repeat(32),
+        fixture_sha256: fixture_sha256.clone(),
+    })
+    .expect("serialize invocation evidence");
+    for (entry_target, channel, artifact, prefix) in
+        memcordon_ci::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS
+    {
+        if entry_target != target {
+            continue;
+        }
+        for (suffix, bytes) in [
+            ("report.json", report_bytes.as_slice()),
+            ("stdout.bin", b"fixture readiness retained\n".as_slice()),
+            ("stderr.bin", b"".as_slice()),
+            ("package.json", package_bytes.as_slice()),
+            ("qualification.json", qualification_bytes.as_slice()),
+            ("fixture.json", fixture_bytes.as_slice()),
+            ("cleanup.json", cleanup_bytes.as_slice()),
+            ("invocation.json", invocation_bytes.as_slice()),
+            ("runtime-manifest.json", manifest_bytes.as_slice()),
+        ] {
+            write_raw(evidence, prefix, suffix, bytes).expect("write raw causal artifact");
+        }
+        let installed_channel = if channel == "native-bundle" {
+            InstalledChannel::NativeBundle
+        } else {
+            InstalledChannel::CargoPackage
+        };
+        write_acceptance(
+            evidence,
+            prefix,
+            artifact,
+            COMMIT,
+            target,
+            installed_channel,
+            env!("CARGO_PKG_VERSION"),
+            memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
+            &fixture_sha256,
+        )
+        .expect("write validated installed causal acceptance");
+        for name in std::iter::once(artifact.to_owned()).chain(
+            RAW_SUFFIXES
+                .into_iter()
+                .map(|suffix| raw_name(prefix, suffix)),
+        ) {
+            let bytes = fs::read(evidence.join(&name)).expect("read causal artifact");
+            bindings.insert(name, Value::String(hex::encode(Sha256::digest(bytes))));
+        }
+    }
+}
+
 fn write_windows_artifact(
     input: &Path,
     id: &str,
@@ -1018,7 +1231,15 @@ fn write_windows_artifact(
     let mut bindings = serde_json::Map::new();
     for name in names {
         let path = evidence.join(name);
-        write_report(&path, &json!({"schema_version": 1, "name": name}));
+        let value = if matches!(name, "cargo-fingerprint.json" | "native-fingerprint.json") {
+            json!({
+                "package_identity": memcordon_ci::windows_channel_identity::package_contract(windows_package_inspection_v4()).expect("package contract should normalize"),
+                "execution_report_schema": memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
+            })
+        } else {
+            json!({"schema_version": 1, "name": name})
+        };
+        write_report(&path, &value);
         let bytes = fs::read(&path).expect("split Windows evidence should read");
         bindings.insert(
             name.to_owned(),
@@ -1040,6 +1261,7 @@ fn write_windows_artifact(
             );
         }
     }
+    write_installed_causal_artifacts(&evidence, native_target, &mut bindings);
     write_report(
         &directory.join("windows-release-certification.json"),
         &json!({
@@ -1616,7 +1838,7 @@ fn valid_reports_are_copied_and_digest_bound() {
     let records = collect_certification(&input, &output, COMMIT)
         .expect("valid certification reports should collect");
 
-    assert_eq!(records.len(), 19);
+    assert_eq!(records.len(), 59);
     for (backend, report_name) in [
         ("linux-pid-namespace-cgroup-v2", "cleanup-leak-check.json"),
         ("macos-watchdog", "backend-macos-watchdog.json"),
@@ -1658,6 +1880,41 @@ fn valid_reports_are_copied_and_digest_bound() {
             format!("certification/linux-sealed-v2/{name}")
         );
     }
+}
+
+#[test]
+fn installed_causal_raw_report_mutation_blocks_release_ingestion() {
+    let (temporary, _, _, _) = fixture();
+    let input = temporary.path().join("input");
+    let output = temporary.path().join("output");
+    let raw = input.join("release-windows-package-channel-x64/release-evidence/windows-x64-installed-causal-native-report.json");
+    fs::write(&raw, b"{\"schema_version\":10}").expect("mutate retained raw report");
+    assert!(collect_certification(&input, &output, COMMIT).is_err());
+}
+
+#[test]
+fn installed_causal_cross_target_substitution_fails_even_with_updated_outer_hash() {
+    let (temporary, _, _, _) = fixture();
+    let input = temporary.path().join("input");
+    let output = temporary.path().join("output");
+    let directory = input.join("release-windows-package-channel-x64");
+    let artifact_name = "windows-x64-installed-causal-native.json";
+    let artifact_path = directory.join("release-evidence").join(artifact_name);
+    let mut artifact: Value = serde_json::from_slice(&fs::read(&artifact_path).unwrap()).unwrap();
+    artifact["target"] = json!("aarch64-pc-windows-msvc");
+    write_report(&artifact_path, &artifact);
+    let mut certificate: Value = serde_json::from_slice(
+        &fs::read(directory.join("windows-release-certification.json")).unwrap(),
+    )
+    .unwrap();
+    certificate["evidence_bindings"][artifact_name] = json!(hex::encode(Sha256::digest(
+        fs::read(&artifact_path).unwrap()
+    )));
+    write_report(
+        &directory.join("windows-release-certification.json"),
+        &certificate,
+    );
+    assert!(collect_certification(&input, &output, COMMIT).is_err());
 }
 
 #[test]

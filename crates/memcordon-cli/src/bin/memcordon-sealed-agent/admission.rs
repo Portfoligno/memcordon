@@ -4,6 +4,10 @@ use memcordon_core::DiagnosticSha256;
 use memcordon_core::workload_contract::WorkloadContractV1;
 pub use memcordon_core::workload_registry::ProviderAdmissionSnapshotV1 as FrozenAdmission;
 use memcordon_core::workload_registry::{AdmissionRejectionV1, BaselineProfile, CallerSelector};
+#[cfg(target_os = "linux")]
+use memcordon_core::workload_registry_v2::{
+    AdmissionCodeV2, AdmissionRejectionV2, ProfileKindV2, resolve_v2,
+};
 #[cfg(target_os = "windows")]
 pub fn discover_windows(
     sid: &str,
@@ -270,6 +274,61 @@ pub fn check_linux(
         &digest,
     )
     .map(|_| ())
+}
+
+/// V2 plan routing authenticates policy/caller/identity selectors but cannot
+/// issue a planned or authorized result until a native V4 launch/qualification
+/// source exists. In particular a registry-supplied digest is never treated as
+/// proof that private networking is installed on this host.
+#[cfg(target_os = "linux")]
+pub fn plan_linux_v2_rejection(
+    request: &memcordon_core::workload_contract::WorkloadContractV2,
+    uid: u32,
+) -> AdmissionRejectionV2 {
+    let reject = AdmissionRejectionV2::single;
+    if request.validate().is_err() {
+        return reject(AdmissionCodeV2::PolicyIncompatible);
+    }
+    let lease = match crate::policy_registry::native::Lease::acquire() {
+        Ok(lease) => lease,
+        Err(_) => return reject(AdmissionCodeV2::HostPrerequisiteUnavailable),
+    };
+    let activation = match lease.read_v2() {
+        Ok(Some(activation)) => activation,
+        Ok(None) => return reject(AdmissionCodeV2::ProfileNotAuthorized),
+        Err(_) => return reject(AdmissionCodeV2::HostPrerequisiteUnavailable),
+    };
+    let native_profile = match [
+        ProfileKindV2::LinuxUnixCreateV1,
+        ProfileKindV2::LinuxTcp4PrivateV1,
+    ]
+    .into_iter()
+    .find(|profile| profile.reference() == request.authorized_profile)
+    {
+        Some(profile) => profile,
+        None => return reject(AdmissionCodeV2::ProfileDigestMismatch),
+    };
+    let qualification = match activation
+        .registry
+        .profiles
+        .as_slice()
+        .iter()
+        .find(|profile| profile.reference == request.authorized_profile)
+    {
+        Some(profile) => &profile.qualification_digest,
+        None => return reject(AdmissionCodeV2::ProfileNotAuthorized),
+    };
+    if let Err(rejection) = resolve_v2(
+        &activation.registry,
+        &activation.epoch,
+        request,
+        &CallerSelector::Linux { uid },
+        native_profile,
+        qualification,
+    ) {
+        return rejection;
+    }
+    reject(AdmissionCodeV2::HostPrerequisiteUnavailable)
 }
 
 #[cfg(target_os = "linux")]

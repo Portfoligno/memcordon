@@ -1,8 +1,11 @@
 use crate::request::{
     CallerExecutionEnvelopeV2, DeadlineScope, DescriptorPurpose, FileIdentity,
     LaunchBrokerRequestV2, LaunchPolicyV2, LaunchRequestV2, Lifetime, NamespaceIdentity,
+    NetworkBrokerExchangeError, NetworkLaunchBrokerRequestV4, NetworkLaunchRequestV4,
     RequestCodecError, SwapLimit, decode_launch_broker_request, decode_launch_request,
-    encode_launch_broker_request, encode_launch_request,
+    decode_network_launch_broker_request, decode_network_launch_request,
+    encode_launch_broker_request, encode_launch_request, encode_network_launch_broker_request,
+    encode_network_launch_request, parse_network_broker_exchange,
 };
 use sha2::{Digest, Sha256};
 
@@ -144,4 +147,129 @@ fn broker_request_rejects_digest_tampering_and_noncanonical_descriptor_inventory
     let mut invalid = request;
     invalid.descriptor_manifest.swap(0, 1);
     assert!(encode_launch_broker_request(&invalid).is_err());
+}
+
+fn network_request() -> NetworkLaunchRequestV4 {
+    use memcordon_core::workload_contract::{
+        AuthorizationRef, ContractVersionTwo, ExecutionIdentityRequestV2, LogicalId, Nonce128,
+        PolicyEpoch, WorkloadContractV2,
+    };
+    use memcordon_core::workload_registry_v2::ProfileKindV2;
+    use memcordon_core::{BoundedVec, DiagnosticSha256};
+    use std::num::NonZeroU64;
+
+    let digest = DiagnosticSha256::from_bytes([7; 32]);
+    let profile = ProfileKindV2::LinuxTcp4PrivateV1;
+    NetworkLaunchRequestV4 {
+        contract: WorkloadContractV2 {
+            schema_version: ContractVersionTwo::default(),
+            workload_plan_digest: digest.clone(),
+            authorized_profile: profile.reference(),
+            authorization: AuthorizationRef {
+                grant_id: LogicalId::new("private-grant".into()).unwrap(),
+                grant_revision: NonZeroU64::MIN,
+                approved_plan_digest: digest.clone(),
+            },
+            ceiling: profile.ceiling(),
+            requirements: BoundedVec::default(),
+            endpoints: BoundedVec::default(),
+            expected_epoch: PolicyEpoch {
+                service_instance: Nonce128([3; 16]),
+                revision: NonZeroU64::MIN,
+            },
+            execution_identity: ExecutionIdentityRequestV2::PreserveCaller,
+        },
+        registry_digest: DiagnosticSha256::from_bytes([8; 32]),
+        qualification_digest: DiagnosticSha256::from_bytes([9; 32]),
+        launch: request(),
+    }
+}
+
+#[test]
+fn network_v4_request_round_trips_without_legacy_fallback() {
+    let request = network_request();
+    let encoded = encode_network_launch_request(&request).unwrap();
+    assert_eq!(decode_network_launch_request(&encoded).unwrap(), request);
+    assert_eq!(
+        decode_launch_request(&encoded),
+        Err(RequestCodecError::UnsupportedVersion(4))
+    );
+    let mut invalid = request;
+    invalid.contract.authorized_profile =
+        memcordon_core::workload_registry_v2::ProfileKindV2::LinuxUnixCreateV1.reference();
+    assert_eq!(
+        encode_network_launch_request(&invalid),
+        Err(RequestCodecError::InvalidValue)
+    );
+}
+
+#[test]
+fn network_v4_broker_binds_contract_identity_and_exact_descriptor_manifest() {
+    let broker = NetworkLaunchBrokerRequestV4::authenticated(
+        [0x51; 16],
+        73,
+        99,
+        network_request(),
+        caller_envelope(),
+    )
+    .unwrap();
+    let encoded = encode_network_launch_broker_request(&broker).unwrap();
+    assert_eq!(
+        decode_network_launch_broker_request(&encoded).unwrap(),
+        broker
+    );
+    assert_eq!(
+        decode_launch_broker_request(&encoded),
+        Err(RequestCodecError::UnsupportedVersion(4))
+    );
+    let mut altered = broker.clone();
+    altered.launch.registry_digest = memcordon_core::DiagnosticSha256::from_bytes([10; 32]);
+    assert_eq!(
+        encode_network_launch_broker_request(&altered),
+        Err(RequestCodecError::InvalidValue)
+    );
+    let mut reordered = broker;
+    reordered.descriptor_manifest.swap(6, 7);
+    assert_eq!(
+        encode_network_launch_broker_request(&reordered),
+        Err(RequestCodecError::InvalidValue)
+    );
+}
+
+#[test]
+fn network_exchange_rejects_each_unbound_transport_claim_before_allocation() {
+    let broker = NetworkLaunchBrokerRequestV4::authenticated(
+        [0x51; 16],
+        73,
+        99,
+        network_request(),
+        caller_envelope(),
+    )
+    .unwrap();
+    let count = broker.descriptor_manifest.len();
+    let encoded = encode_network_launch_broker_request(&broker).unwrap();
+    let parse = |payload: &[u8], attempt_id, pid, start, count| {
+        parse_network_broker_exchange(payload, attempt_id, pid, start, count)
+    };
+    assert_eq!(parse(&encoded, [0x51; 16], 73, 99, count), Ok(broker));
+    assert_eq!(
+        parse(&encoded, [0x52; 16], 73, 99, count),
+        Err(NetworkBrokerExchangeError::AttemptBinding)
+    );
+    assert_eq!(
+        parse(&encoded, [0x51; 16], 74, 99, count),
+        Err(NetworkBrokerExchangeError::ControlPeerBinding)
+    );
+    assert_eq!(
+        parse(&encoded, [0x51; 16], 73, 100, count),
+        Err(NetworkBrokerExchangeError::ControlPeerBinding)
+    );
+    assert_eq!(
+        parse(&encoded, [0x51; 16], 73, 99, count - 1),
+        Err(NetworkBrokerExchangeError::DescriptorInventory)
+    );
+    assert!(matches!(
+        parse(&encoded[..encoded.len() - 1], [0x51; 16], 73, 99, count),
+        Err(NetworkBrokerExchangeError::Decode(_))
+    ));
 }

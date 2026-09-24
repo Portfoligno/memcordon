@@ -1,4 +1,4 @@
-//! Shared allocation and publication limits for workload admission V1.
+//! Shared allocation and publication limits for workload admission.
 pub const CONTRACT_BYTES: usize = 64 * 1024;
 pub const CONTRACT_ENVELOPE_BYTES: usize = 128 * 1024;
 pub const REGISTRY_BYTES: usize = 1024 * 1024;
@@ -6,6 +6,10 @@ pub const REQUIREMENTS: usize = 64;
 pub const ENDPOINTS: usize = 32;
 pub const IDENTIFIER_BYTES: usize = 64;
 pub const PROFILES: usize = 16;
+pub const EXECUTION_IDENTITIES: usize = 32;
+pub const GROUPS_PER_IDENTITY: usize = 32;
+pub const ENTRYPOINTS_PER_IDENTITY: usize = 8;
+pub const ENTRYPOINT_PATH_BYTES: usize = 4096;
 pub const GRANTS: usize = 128;
 pub const PLANS_PER_GRANT: usize = 16;
 pub const CALLERS_PER_GRANT: usize = 4;

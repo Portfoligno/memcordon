@@ -213,6 +213,7 @@ durability facts, bound to the exact attempt and baseline restriction.
 | Policy-bearing Linux durable attempt / Windows durable attempt | 3 / 3 |
 | Runtime manifest | 2 |
 | Package and installed-provider inspection | 5 |
+| Release configuration / release manifest | 5 / 5 |
 
 These are independent schema domains, not one interchangeable protocol
 number. Historical Linux records retain their older record conventions;
@@ -246,7 +247,7 @@ A local observation cannot satisfy a hosted producer-origin check. Standard
 and sealed jobs, artifacts, and required release records remain distinct.
 Compilation caches cannot substitute for fresh native scenario execution.
 
-Release configuration uses schema 4, and the release manifest records the
+Release configuration uses schema 5, and the release manifest records the
 `standard-and-sealed-v1` certification contract. Its producer-origin checks
 bind the separate standard certificates to the releasing workflow run;
 valid sealed evidence cannot compensate for missing ordinary certification.

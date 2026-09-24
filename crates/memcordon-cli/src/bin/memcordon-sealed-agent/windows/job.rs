@@ -66,12 +66,32 @@ impl std::fmt::Display for JobObservationError {
 }
 impl From<JobObservationError> for String {
     fn from(error: JobObservationError) -> Self {
-        super::diagnostics::capture_native(
+        super::diagnostics::capture(super::job_diagnostics::event(
             error.operation,
             error.source.raw_os_error(),
-            memcordon_core::FailureCodeV1::JobQuery,
-        );
+        ));
         error.to_string()
+    }
+}
+
+#[cfg(test)]
+pub(super) fn wrong_object_accounting_error() -> JobObservationError {
+    // Valid event handles deliberately have the wrong native object type. Their
+    // owners remain live until the accounting call has captured its Win32 error.
+    let event = || {
+        // SAFETY: anonymous event has no optional security or name pointers.
+        OwnedHandle::new(unsafe {
+            windows_sys::Win32::System::Threading::CreateEventW(ptr::null(), 0, 0, ptr::null())
+        })
+        .expect("test event")
+    };
+    let job = Job {
+        handle: event(),
+        completion_port: event(),
+    };
+    match job.accounting_observed() {
+        Ok(_) => panic!("event handle unexpectedly accepted as a Job"),
+        Err(error) => error,
     }
 }
 

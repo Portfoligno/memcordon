@@ -4,7 +4,18 @@ use crate::linux::launch::{
     decode_namespace_startup_record_for_test, namespace_startup_failure_record_for_test,
     namespace_startup_ready_record_for_test, target_after_startup_ready_for_test,
 };
-use crate::linux::namespace::NamespaceInitPhase;
+use crate::linux::namespace::{NamespaceInitPhase, NamespaceMode};
+
+#[test]
+fn private_namespace_mode_adds_only_a_new_network_namespace() {
+    let baseline = NamespaceMode::Baseline.clone_flags();
+    let private = NamespaceMode::PrivateTcp4.clone_flags();
+    assert_eq!(private ^ baseline, libc::CLONE_NEWNET as u64);
+    assert_eq!(baseline & libc::CLONE_NEWNET as u64, 0);
+    assert_ne!(private & libc::CLONE_NEWPID as u64, 0);
+    assert_ne!(private & libc::CLONE_NEWNS as u64, 0);
+    assert_ne!(private & libc::CLONE_NEWCGROUP as u64, 0);
+}
 
 #[test]
 fn namespace_startup_failure_preserves_phase_and_native_errno() {

@@ -3159,10 +3159,10 @@ fn bundle_manifest_at(
         &manifest.certification,
         &manifest.certification_origin,
         |path| {
-            memcordon_ci::release_evidence::read_report(&rehearsal::bundle_file(
-                output,
-                Path::new(path),
-            )?)
+            memcordon_ci::release_evidence::read_certification_record(
+                &rehearsal::bundle_file(output, Path::new(path))?,
+                path,
+            )
         },
     )?;
     Ok((release, manifest, output.to_path_buf()))
@@ -6278,7 +6278,10 @@ fn verify_public(root: &Path) -> Result<()> {
             let name = Path::new(path)
                 .file_name()
                 .ok_or_else(|| failure("public certification has no filename"))?;
-            memcordon_ci::release_evidence::read_report(&public_downloads.path().join(name))
+            memcordon_ci::release_evidence::read_certification_record(
+                &public_downloads.path().join(name),
+                path,
+            )
         },
     )?;
     verify_standard_producers(

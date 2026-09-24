@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use sha2::{Digest, Sha256};
 
 pub const PROTOCOL_VERSION: u16 = 3;
+pub const NETWORK_PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_LENGTH: usize = 1024 * 1024;
 const DIGEST_LENGTH: usize = 32;
 const HEADER_LENGTH: usize = 2 + 2 + 4 + 16 + 16 + DIGEST_LENGTH;
@@ -94,12 +95,23 @@ impl std::fmt::Display for ProtocolError {
 impl std::error::Error for ProtocolError {}
 
 pub fn read_frame(reader: &mut impl Read) -> Result<Frame, ProtocolError> {
+    read_frame_version(reader, PROTOCOL_VERSION)
+}
+
+pub fn read_network_frame(reader: &mut impl Read) -> Result<Frame, ProtocolError> {
+    read_frame_version(reader, NETWORK_PROTOCOL_VERSION)
+}
+
+fn read_frame_version(
+    reader: &mut impl Read,
+    expected_version: u16,
+) -> Result<Frame, ProtocolError> {
     let mut header = [0_u8; HEADER_LENGTH];
     reader
         .read_exact(&mut header)
         .map_err(|error| ProtocolError::Io(error.kind()))?;
     let version = u16::from_be_bytes([header[0], header[1]]);
-    if version != PROTOCOL_VERSION {
+    if version != expected_version {
         return Err(ProtocolError::UnsupportedVersion(version));
     }
     let kind = MessageKind::try_from(u16::from_be_bytes([header[2], header[3]]))?;
@@ -131,6 +143,18 @@ pub fn read_frame(reader: &mut impl Read) -> Result<Frame, ProtocolError> {
 }
 
 pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<(), ProtocolError> {
+    write_frame_version(writer, frame, PROTOCOL_VERSION)
+}
+
+pub fn write_network_frame(writer: &mut impl Write, frame: &Frame) -> Result<(), ProtocolError> {
+    write_frame_version(writer, frame, NETWORK_PROTOCOL_VERSION)
+}
+
+fn write_frame_version(
+    writer: &mut impl Write,
+    frame: &Frame,
+    version: u16,
+) -> Result<(), ProtocolError> {
     let total = HEADER_LENGTH
         .checked_add(frame.payload.len())
         .ok_or(ProtocolError::FrameTooLarge(usize::MAX))?;
@@ -140,7 +164,7 @@ pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<(), Protoco
     let total = u32::try_from(total).map_err(|_| ProtocolError::FrameTooLarge(total))?;
     let payload_digest = Sha256::digest(&frame.payload);
     writer
-        .write_all(&PROTOCOL_VERSION.to_be_bytes())
+        .write_all(&version.to_be_bytes())
         .and_then(|()| writer.write_all(&(frame.kind as u16).to_be_bytes()))
         .and_then(|()| writer.write_all(&total.to_be_bytes()))
         .and_then(|()| writer.write_all(&frame.nonce))

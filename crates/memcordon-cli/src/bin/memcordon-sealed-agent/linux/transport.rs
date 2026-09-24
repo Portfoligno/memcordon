@@ -3,20 +3,32 @@ use std::mem::{size_of, size_of_val, zeroed};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use crate::protocol::{Frame, MAX_FRAME_LENGTH, read_frame};
+use crate::protocol::{Frame, MAX_FRAME_LENGTH, read_frame, read_network_frame};
 
 const FRAME_HEADER_LENGTH: usize = 72;
 const MAX_DESCRIPTORS: usize = 8;
 
 pub fn receive(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>), String> {
-    let received = receive_inner(stream, false)?;
+    let received = receive_inner(stream, false, false)?;
+    Ok((received.frame, received.descriptors))
+}
+
+pub fn receive_network(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>), String> {
+    let received = receive_inner(stream, false, true)?;
     Ok((received.frame, received.descriptors))
 }
 
 pub(crate) fn receive_with_credentials(
     stream: &UnixStream,
 ) -> Result<(Frame, Vec<OwnedFd>, Option<libc::ucred>), String> {
-    let received = receive_inner(stream, true)?;
+    let received = receive_inner(stream, true, false)?;
+    Ok((received.frame, received.descriptors, received.credentials))
+}
+
+pub(crate) fn receive_network_with_credentials(
+    stream: &UnixStream,
+) -> Result<(Frame, Vec<OwnedFd>, Option<libc::ucred>), String> {
+    let received = receive_inner(stream, true, true)?;
     Ok((received.frame, received.descriptors, received.credentials))
 }
 
@@ -26,7 +38,11 @@ struct ReceivedMessage {
     credentials: Option<libc::ucred>,
 }
 
-fn receive_inner(stream: &UnixStream, accept_credentials: bool) -> Result<ReceivedMessage, String> {
+fn receive_inner(
+    stream: &UnixStream,
+    accept_credentials: bool,
+    network_version: bool,
+) -> Result<ReceivedMessage, String> {
     let mut header = [0_u8; FRAME_HEADER_LENGTH];
     let descriptor_capacity =
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
@@ -120,7 +136,12 @@ fn receive_inner(stream: &UnixStream, accept_credentials: bool) -> Result<Receiv
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
         header_ptr = unsafe { libc::CMSG_NXTHDR(&message, header_ptr) };
     }
-    let frame = read_frame(&mut Cursor::new(bytes)).map_err(|error| error.to_string())?;
+    let frame = if network_version {
+        read_network_frame(&mut Cursor::new(bytes))
+    } else {
+        read_frame(&mut Cursor::new(bytes))
+    }
+    .map_err(|error| error.to_string())?;
     Ok(ReceivedMessage {
         frame,
         descriptors,

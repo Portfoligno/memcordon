@@ -30,9 +30,10 @@ cargo install --locked memcordon
 %USERPROFILE%\.cargo\bin\memcordon-sealed-agent.exe package uninstall
 ```
 
-A verified Linux or Windows native archive contains `memcordon`,
-`memcordon-sealed-agent`, and `runtime-manifest.json` at its root (with `.exe`
-names on Windows). Its flow is equivalent:
+A verified Linux native archive contains `memcordon`,
+`memcordon-sealed-agent`, and `runtime-manifest.json` at its root. The Windows
+archive additionally contains `memcordon-target-desktop-bootstrap.exe` and
+`memcordon-session-broker.exe`. The Linux flow is equivalent:
 
 ```console
 sudo ./memcordon-sealed-agent package install
@@ -47,7 +48,7 @@ The Windows archive equivalents, again from an elevated terminal, are
 upgrade`, and `package uninstall`, plus `memcordon.exe doctor --require sealed`.
 
 `package inspect --json` is credential-free and reports the current agent,
-embedded unit or Windows service metadata digests, protocol, report schemas,
+embedded baseline-unit or Windows service metadata digests, protocol, report schemas,
 source commit, and executable digest. `package install`, `upgrade`, and
 `uninstall` remain explicit root or elevated mutations. CLI/provider version
 mismatch fails before target authorization; installation and upgrade never
@@ -56,6 +57,13 @@ download or compile a component.
 ## Trust and transport
 
 Linux mechanism v2 uses the fixed public local socket `/run/memcordon/sealed-agent.sock` and the root-only private broker socket `/run/memcordon/sealed-launcher.sock`. The hardened `memcordon-sealed-agent.service` control plane owns the public socket, runs with `NoNewPrivileges=yes`, authenticates the peer, captures its execution envelope, rejects callers already inside an active attempt, and never executes caller code. The minimally scoped `memcordon-sealed-launcher.service` accepts only the authenticated control service, runs with `NoNewPrivileges=no`, and creates the target from the caller's mount and privilege-transition context. A packaged tmpfiles declaration recreates `/run/memcordon` as mode `0750` `root:memcordon` before either socket activates, so reboot cannot replace the traversable public endpoint parent with a root-only directory.
+
+The optional `memcordon-sealed-network-launcher.service` and `.socket` are
+package-owned but installed disabled. Their presence does not enable
+`linux-tcp4-private-v1`, authorize a workload, or qualify native networking.
+The current manifest and inspection remain bound to the baseline profile;
+private-profile availability requires the separate V2 admission, broker,
+qualification, and inspection implementation.
 
 Windows mechanism v2 uses `MemCordonSealedControl` as restricted-service-SID LocalService on `\\.\pipe\memcordon-sealed-agent-v1` and `MemCordonSealedLauncher` as restricted-service-SID LocalSystem on `\\.\pipe\memcordon-sealed-launcher-v1`. Installation also provisions eight restricted LocalSystem, demand-start guardian slots with no required privileges or automatic restart. Each attempt leases one stopped slot and SCM starts a fresh guardian process over a nonce-derived private pipe. SCM status, pipe peer, image, token, service SID, attempt, and nonce must all agree before the launcher transfers the fixed five-capability guardian manifest. The launcher cannot create or reconfigure services, and capacity exhaustion fails before target creation without fallback. Installation uses native SCM and security-descriptor APIs, applies fixed directory and pipe ACLs, configures exact service privilege lists, starts the launcher before the control service, and persists qualification under `%ProgramData%\MemCordon\sealed`. The client verifies the server image, protocol/build/mechanism identity, and qualification before advertising capability. Caller identity and token or namespace state come from authenticated kernel objects, never authoritative request fields.
 

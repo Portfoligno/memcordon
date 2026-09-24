@@ -202,7 +202,22 @@ fn workload_plan_response(
     if descriptor_count != 0 || request.attempt_id != [0; 16] {
         return Err("workload plan must not allocate an attempt or carry descriptors".into());
     }
-    let contract = memcordon_core::workload_contract::WorkloadContractV1::parse(&request.payload)?;
+    let contract = match memcordon_core::workload_contract::WorkloadContract::parse(
+        &request.payload,
+    )? {
+        memcordon_core::workload_contract::WorkloadContract::V1(contract) => contract,
+        memcordon_core::workload_contract::WorkloadContract::V2(contract) => {
+            let rejection = crate::admission::plan_linux_v2_rejection(&contract, uid);
+            return rejected_text(
+                request,
+                "MCSEALED-WORKLOAD-V2-UNAVAILABLE",
+                &format!(
+                    "MCSEALED-WORKLOAD-V2-UNAVAILABLE: {:?}; native V4 qualification is not installed",
+                    rejection.code
+                ),
+            );
+        }
+    };
     let binding = RequestBindingV1::from_contract(&contract)?;
     let result = (|| -> Result<WorkloadResolutionReportV1, String> {
         let lease = crate::policy_registry::native::Lease::acquire()?;

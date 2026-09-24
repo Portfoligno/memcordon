@@ -8,15 +8,21 @@
 #![forbid(unsafe_code)]
 
 pub mod diagnostics;
+pub mod package_inspection_v6;
 pub mod runtime_evidence;
 pub mod runtime_manifest;
+pub mod runtime_manifest_v3;
 pub use runtime_evidence::*;
 pub mod workload_codec;
 pub mod workload_contract;
 pub mod workload_discovery;
+pub mod workload_discovery_v2;
 pub mod workload_evidence;
+pub mod workload_evidence_v2;
 pub mod workload_limits;
+pub mod workload_qualification_v2;
 pub mod workload_registry;
+pub mod workload_registry_v2;
 pub use diagnostics::*;
 mod error;
 mod outcome;

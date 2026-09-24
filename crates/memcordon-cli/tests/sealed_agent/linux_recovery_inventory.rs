@@ -230,3 +230,57 @@ fn recovery_preserves_unsafe_interrupted_transition_metadata() {
         assert!(std::fs::symlink_metadata(transaction).is_ok());
     }
 }
+
+#[test]
+fn recovery_keeps_unknown_v4_private_attempt_and_boundary_ambiguous() {
+    let temporary = TempDir::new().unwrap();
+    let state_root = temporary.path().join("state");
+    let cgroup_root = temporary.path().join("cgroup");
+    std::fs::create_dir(&state_root).unwrap();
+    std::fs::create_dir(&cgroup_root).unwrap();
+    std::fs::create_dir(cgroup_root.join(IDENTITY)).unwrap();
+    let record = state_root.join(IDENTITY);
+    write_record(
+        &record,
+        &format!(
+            "version=4\ncgroup={IDENTITY}\nprivate-profile=linux-tcp4-private-v1\nstate=checkpoint-committed\n"
+        ),
+    );
+
+    // The digest and identity are well formed, but recovery has no V4 owner
+    // ledger or terminal verifier. It must neither delete the record nor
+    // quietly declare the cgroup retired.
+    let ambiguous = crate::linux::recovery::recover_test_roots(&state_root, &cgroup_root).unwrap();
+    assert_eq!(ambiguous, [IDENTITY]);
+    assert!(record.exists());
+    assert!(cgroup_root.join(IDENTITY).exists());
+}
+
+#[test]
+fn recovery_does_not_roll_back_unknown_v4_interrupted_checkpoint() {
+    let temporary = TempDir::new().unwrap();
+    let state_root = temporary.path().join("state");
+    let cgroup_root = temporary.path().join("cgroup");
+    std::fs::create_dir(&state_root).unwrap();
+    std::fs::create_dir(&cgroup_root).unwrap();
+    let record = state_root.join(IDENTITY);
+    let interrupted = record.with_extension("new");
+    write_record(
+        &record,
+        &format!("version=4\ncgroup={IDENTITY}\nstate=network-prepared\n"),
+    );
+    write_transaction(
+        &interrupted,
+        &format!("version=4\ncgroup={IDENTITY}\nstate=checkpoint-committed\n"),
+    );
+
+    let ambiguous = crate::linux::recovery::recover_test_roots(&state_root, &cgroup_root).unwrap();
+    assert!(ambiguous.iter().any(|entry| entry == IDENTITY));
+    assert!(
+        ambiguous
+            .iter()
+            .any(|entry| entry == &format!("{IDENTITY}.new"))
+    );
+    assert!(record.exists());
+    assert!(interrupted.exists());
+}

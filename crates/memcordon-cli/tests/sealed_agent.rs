@@ -4,6 +4,8 @@
 mod admission;
 #[path = "sealed_agent/native_workload_admission.rs"]
 mod native_workload_admission;
+#[path = "sealed_agent/policy_activation_v2.rs"]
+mod policy_activation_v2;
 #[path = "../src/bin/memcordon-sealed-agent/policy_registry.rs"]
 mod policy_registry;
 #[path = "sealed_agent/policy_revocation.rs"]
@@ -62,6 +64,17 @@ mod linux_service;
 mod linux_startup;
 #[path = "sealed_agent/namespace_startup.rs"]
 mod namespace_startup;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/native_descriptor_custody.rs"]
+mod native_descriptor_custody;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/native_entrypoint.rs"]
+mod native_entrypoint;
+#[path = "sealed_agent/native_private_namespace_init.rs"]
+mod native_private_namespace_init;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/native_private_tcp.rs"]
+mod native_private_tcp;
 #[path = "sealed_agent/package.rs"]
 mod package_tests;
 #[path = "sealed_agent/package_verification.rs"]

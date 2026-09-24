@@ -1,6 +1,31 @@
 //! Exact native qualification obligations, separately published from runtime metadata.
 use crate::{CiError, Result};
+use memcordon_core::runtime_manifest_v3::QualificationArtifactReferenceV2;
+use memcordon_core::workload_qualification_v2::{
+    QualificationArtifactV2, TrustedQualificationExpectationV2,
+};
 use serde::{Deserialize, Serialize};
+
+/// Audits a proposed private-profile artifact but never promotes it into this
+/// release's required/accepted inventory. A trusted native completion source,
+/// installed V4 qualification producer, and package binding are not wired yet.
+pub fn reject_proposed_private_qualification_v2(
+    artifact_bytes: &[u8],
+    reference: &QualificationArtifactReferenceV2,
+    expected: &TrustedQualificationExpectationV2<'_>,
+) -> Result<()> {
+    QualificationArtifactV2::parse_and_validate(artifact_bytes, reference, expected).map_err(
+        |error| {
+            CiError::Message(format!(
+                "private V2 qualification artifact differs: {error}"
+            ))
+        },
+    )?;
+    Err(CiError::Message(
+        "private V2 qualification is not accepted until installed native V4 evidence is wired"
+            .into(),
+    ))
+}
 pub const PROFILE_TESTS: [&str; 2] = [
     "native_workload_admission::native_exact_grant_epoch_and_terminal_checkpoint_are_enforced",
     "native_workload_admission::native_tcp_requirement_preserves_baseline_authority",
@@ -10,7 +35,7 @@ pub const WINDOWS_PACKAGE_POLICY_TESTS: [&str; 3] = [
     "windows::package::policy_rollback_tests::mixed_runtime_component_is_rejected_before_execution",
     "windows::package::policy_rollback_tests::legacy_manifest_absence_survives_failed_upgrade_qualification",
 ];
-pub const DIAGNOSTIC_TESTS: [&str; 16] = [
+pub const DIAGNOSTIC_TESTS: [&str; 20] = [
     "windows_postauthorization_retirement::receiptless_posttarget_rejection_cannot_bypass_terminal_binding",
     "windows_replay_retention::final_outbox_store_failure_preserves_primary_and_bounds_secondary_diagnostics",
     "windows::record::record_fault_tests::native_publisher_process_exit_preserves_atomic_old_or_new_record",
@@ -26,6 +51,10 @@ pub const DIAGNOSTIC_TESTS: [&str; 16] = [
     "windows::diagnostics::causal_capture_tests::source_capture_and_record_cleanup_share_one_ordered_journal",
     "windows::diagnostics::causal_capture_tests::unwinding_and_reentrant_capture_preserve_original_and_expose_loss",
     "windows::job::native_diagnostic_codes::job_wrappers_capture_native_codes_before_last_error_changes",
+    "windows::launcher_service::job_conversion_tests::job_accounting_conversion_preserves_monitor_classification",
+    "windows::launcher_service::job_conversion_tests::job_observation_mapping_covers_emitted_operations",
+    "windows::launcher_service::job_conversion_tests::job_string_conversion_preserves_semantics",
+    "windows::launcher_service::job_conversion_tests::job_diagnostic_reconstruction_preserves_operation",
     "windows::control_service::retained_binding_tests::authenticated_retained_binding_rejects_other_attempt_request_process_creation_and_token",
 ];
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -115,5 +144,34 @@ pub const ARTIFACTS: [(&str, &str, &str, QualificationKind); 5] = [
         "windows-arm64-causal-diagnostics.json",
         "aarch64-pc-windows-msvc",
         QualificationKind::CausalDiagnostics,
+    ),
+];
+
+/// Installed public-path evidence is distinct from the source-native test inventory.
+/// Each row is (target, channel, accepted artifact, raw-file prefix).
+pub const INSTALLED_CAUSAL_ARTIFACTS: [(&str, &str, &str, &str); 4] = [
+    (
+        "x86_64-pc-windows-msvc",
+        "native-bundle",
+        "windows-x64-installed-causal-native.json",
+        "windows-x64-installed-causal-native",
+    ),
+    (
+        "x86_64-pc-windows-msvc",
+        "cargo-package",
+        "windows-x64-installed-causal-cargo.json",
+        "windows-x64-installed-causal-cargo",
+    ),
+    (
+        "aarch64-pc-windows-msvc",
+        "native-bundle",
+        "windows-arm64-installed-causal-native.json",
+        "windows-arm64-installed-causal-native",
+    ),
+    (
+        "aarch64-pc-windows-msvc",
+        "cargo-package",
+        "windows-arm64-installed-causal-cargo.json",
+        "windows-arm64-installed-causal-cargo",
     ),
 ];

@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 
 pub const LAUNCH_REQUEST_VERSION: u16 = 3;
 pub const LAUNCH_BROKER_REQUEST_VERSION: u16 = 3;
+pub const NETWORK_LAUNCH_REQUEST_VERSION: u16 = 4;
+pub const NETWORK_LAUNCH_BROKER_REQUEST_VERSION: u16 = 4;
 const MAX_SUPPLEMENTARY_GROUPS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +57,16 @@ pub struct LaunchRequestV2 {
     pub descriptors: Vec<DescriptorPurpose>,
 }
 
+/// Wire V4 is separate from the historical V3 launch. A V2 contract cannot be
+/// represented by the V3 optional-V1 field and cannot silently fall back to it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkLaunchRequestV4 {
+    pub contract: memcordon_core::workload_contract::WorkloadContractV2,
+    pub registry_digest: memcordon_core::DiagnosticSha256,
+    pub qualification_digest: memcordon_core::DiagnosticSha256,
+    pub launch: LaunchRequestV2,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum DescriptorPurpose {
@@ -65,6 +77,7 @@ pub enum DescriptorPurpose {
     FrontendLiveness = 5,
     CallerMountNamespace = 6,
     CallerRoot = 7,
+    VerifiedExecutable = 8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +147,73 @@ pub struct LaunchBrokerRequestV2 {
     pub request_authentication_binding: [u8; 32],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkLaunchBrokerRequestV4 {
+    pub attempt_id: [u8; 16],
+    pub request_digest: [u8; 32],
+    pub control_process_id: i32,
+    pub control_process_start_time: u64,
+    pub launch: NetworkLaunchRequestV4,
+    pub caller: CallerExecutionEnvelopeV2,
+    pub descriptor_manifest: Vec<DescriptorPurpose>,
+    pub record_identity: RecordIdentityV2,
+    pub request_authentication_binding: [u8; 32],
+}
+
+impl NetworkLaunchBrokerRequestV4 {
+    pub fn authenticated(
+        attempt_id: [u8; 16],
+        control_process_id: i32,
+        control_process_start_time: u64,
+        launch: NetworkLaunchRequestV4,
+        caller: CallerExecutionEnvelopeV2,
+    ) -> Result<Self, RequestCodecError> {
+        validate_network_launch_request(&launch)?;
+        if caller.pid <= 0 || caller.supplementary_groups.len() > MAX_SUPPLEMENTARY_GROUPS {
+            return Err(RequestCodecError::InvalidValue);
+        }
+        let request_digest = Sha256::digest(encode_network_launch_request(&launch)?).into();
+        let descriptor_manifest = network_broker_descriptor_manifest();
+        let record_identity = RecordIdentityV2 {
+            attempt_id,
+            caller_envelope_digest: caller.digest(),
+        };
+        let mut request = Self {
+            attempt_id,
+            request_digest,
+            control_process_id,
+            control_process_start_time,
+            launch,
+            caller,
+            descriptor_manifest,
+            record_identity,
+            request_authentication_binding: [0; 32],
+        };
+        request.request_authentication_binding = request.expected_authentication_binding();
+        validate_network_broker_request(&request)?;
+        Ok(request)
+    }
+
+    fn expected_authentication_binding(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"memcordon-network-launch-broker-request-v4\0");
+        digest.update(self.attempt_id);
+        digest.update(self.request_digest);
+        digest.update(self.control_process_id.to_be_bytes());
+        digest.update(self.control_process_start_time.to_be_bytes());
+        digest.update(self.caller.digest());
+        digest.update(self.record_identity.attempt_id);
+        digest.update(self.record_identity.caller_envelope_digest);
+        digest.update(
+            self.descriptor_manifest
+                .iter()
+                .map(|purpose| *purpose as u8)
+                .collect::<Vec<_>>(),
+        );
+        digest.finalize().into()
+    }
+}
+
 impl LaunchBrokerRequestV2 {
     pub fn authenticated(
         attempt_id: [u8; 16],
@@ -193,6 +273,250 @@ pub enum RequestCodecError {
     TooManyArguments,
     TooManyEnvironmentEntries,
     TrailingBytes,
+}
+
+pub fn network_broker_descriptor_manifest() -> Vec<DescriptorPurpose> {
+    vec![
+        DescriptorPurpose::CurrentDirectory,
+        DescriptorPurpose::Stdin,
+        DescriptorPurpose::Stdout,
+        DescriptorPurpose::Stderr,
+        DescriptorPurpose::FrontendLiveness,
+        DescriptorPurpose::CallerMountNamespace,
+        DescriptorPurpose::CallerRoot,
+        DescriptorPurpose::VerifiedExecutable,
+    ]
+}
+
+fn validate_network_launch_request(
+    request: &NetworkLaunchRequestV4,
+) -> Result<(), RequestCodecError> {
+    request
+        .contract
+        .validate()
+        .map_err(|_| RequestCodecError::InvalidValue)?;
+    if request.contract.authorized_profile.id.as_str() != "linux-tcp4-private-v1"
+        || request.launch.workload_contract.is_some()
+    {
+        return Err(RequestCodecError::InvalidValue);
+    }
+    validate_request(&request.launch)
+}
+
+pub fn encode_network_launch_request(
+    request: &NetworkLaunchRequestV4,
+) -> Result<Vec<u8>, RequestCodecError> {
+    validate_network_launch_request(request)?;
+    let contract =
+        serde_json::to_vec(&request.contract).map_err(|_| RequestCodecError::InvalidValue)?;
+    let contract_digest = memcordon_core::workload_codec::contract_digest_v2(&request.contract)
+        .map_err(|_| RequestCodecError::InvalidValue)?;
+    let launch = encode_launch_request(&request.launch)?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&NETWORK_LAUNCH_REQUEST_VERSION.to_be_bytes());
+    encoded.extend_from_slice(request.registry_digest.bytes());
+    encoded.extend_from_slice(request.qualification_digest.bytes());
+    encoded.extend_from_slice(contract_digest.bytes());
+    put_bytes(&mut encoded, &contract)?;
+    put_bytes(&mut encoded, &launch)?;
+    Ok(encoded)
+}
+
+pub fn decode_network_launch_request(
+    payload: &[u8],
+) -> Result<NetworkLaunchRequestV4, RequestCodecError> {
+    let mut cursor = Cursor::new(payload);
+    let version = cursor.u16()?;
+    if version != NETWORK_LAUNCH_REQUEST_VERSION {
+        return Err(RequestCodecError::UnsupportedVersion(version));
+    }
+    let registry_digest = memcordon_core::DiagnosticSha256::from_bytes(
+        cursor
+            .take(32)?
+            .try_into()
+            .expect("registry digest length is exact"),
+    );
+    let qualification_digest = memcordon_core::DiagnosticSha256::from_bytes(
+        cursor
+            .take(32)?
+            .try_into()
+            .expect("qualification digest length is exact"),
+    );
+    let contract_digest = cursor.take(32)?;
+    let contract = memcordon_core::workload_contract::WorkloadContractV2::parse(&cursor.bytes()?)
+        .map_err(|_| RequestCodecError::InvalidValue)?;
+    if memcordon_core::workload_codec::contract_digest_v2(&contract)
+        .map_err(|_| RequestCodecError::InvalidValue)?
+        .bytes()
+        != contract_digest
+    {
+        return Err(RequestCodecError::InvalidValue);
+    }
+    let launch = decode_launch_request(&cursor.bytes()?)?;
+    if !cursor.is_empty() {
+        return Err(RequestCodecError::TrailingBytes);
+    }
+    let request = NetworkLaunchRequestV4 {
+        contract,
+        registry_digest,
+        qualification_digest,
+        launch,
+    };
+    validate_network_launch_request(&request)?;
+    Ok(request)
+}
+
+pub fn encode_network_launch_broker_request(
+    request: &NetworkLaunchBrokerRequestV4,
+) -> Result<Vec<u8>, RequestCodecError> {
+    validate_network_broker_request(request)?;
+    let launch = encode_network_launch_request(&request.launch)?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&NETWORK_LAUNCH_BROKER_REQUEST_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&request.attempt_id);
+    encoded.extend_from_slice(&request.request_digest);
+    encoded.extend_from_slice(&request.control_process_id.to_be_bytes());
+    encoded.extend_from_slice(&request.control_process_start_time.to_be_bytes());
+    put_bytes(&mut encoded, &launch)?;
+    encode_caller_envelope(&mut encoded, &request.caller)?;
+    put_count(&mut encoded, request.descriptor_manifest.len())?;
+    encoded.extend(
+        request
+            .descriptor_manifest
+            .iter()
+            .map(|purpose| *purpose as u8),
+    );
+    encoded.extend_from_slice(&request.record_identity.attempt_id);
+    encoded.extend_from_slice(&request.record_identity.caller_envelope_digest);
+    encoded.extend_from_slice(&request.request_authentication_binding);
+    Ok(encoded)
+}
+
+pub fn decode_network_launch_broker_request(
+    payload: &[u8],
+) -> Result<NetworkLaunchBrokerRequestV4, RequestCodecError> {
+    let mut cursor = Cursor::new(payload);
+    let version = cursor.u16()?;
+    if version != NETWORK_LAUNCH_BROKER_REQUEST_VERSION {
+        return Err(RequestCodecError::UnsupportedVersion(version));
+    }
+    let attempt_id = cursor
+        .take(16)?
+        .try_into()
+        .expect("attempt identity length is exact");
+    let request_digest = cursor
+        .take(32)?
+        .try_into()
+        .expect("request digest length is exact");
+    let control_process_id = cursor.i32()?;
+    let control_process_start_time = cursor.u64()?;
+    let launch = decode_network_launch_request(&cursor.bytes()?)?;
+    let caller = decode_caller_envelope(&mut cursor)?;
+    let descriptor_count = cursor.count()?;
+    if descriptor_count != network_broker_descriptor_manifest().len() {
+        return Err(RequestCodecError::InvalidValue);
+    }
+    let mut descriptor_manifest = Vec::with_capacity(descriptor_count);
+    for _ in 0..descriptor_count {
+        descriptor_manifest.push(match cursor.u8()? {
+            1 => DescriptorPurpose::CurrentDirectory,
+            2 => DescriptorPurpose::Stdin,
+            3 => DescriptorPurpose::Stdout,
+            4 => DescriptorPurpose::Stderr,
+            5 => DescriptorPurpose::FrontendLiveness,
+            6 => DescriptorPurpose::CallerMountNamespace,
+            7 => DescriptorPurpose::CallerRoot,
+            8 => DescriptorPurpose::VerifiedExecutable,
+            _ => return Err(RequestCodecError::InvalidValue),
+        });
+    }
+    let record_identity = RecordIdentityV2 {
+        attempt_id: cursor
+            .take(16)?
+            .try_into()
+            .expect("record attempt length is exact"),
+        caller_envelope_digest: cursor
+            .take(32)?
+            .try_into()
+            .expect("caller digest length is exact"),
+    };
+    let request_authentication_binding = cursor
+        .take(32)?
+        .try_into()
+        .expect("authentication binding length is exact");
+    if !cursor.is_empty() {
+        return Err(RequestCodecError::TrailingBytes);
+    }
+    let request = NetworkLaunchBrokerRequestV4 {
+        attempt_id,
+        request_digest,
+        control_process_id,
+        control_process_start_time,
+        launch,
+        caller,
+        descriptor_manifest,
+        record_identity,
+        request_authentication_binding,
+    };
+    validate_network_broker_request(&request)?;
+    Ok(request)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkBrokerExchangeError {
+    Decode(RequestCodecError),
+    AttemptBinding,
+    ControlPeerBinding,
+    DescriptorInventory,
+}
+
+/// Validates only the authenticated transport exchange. This is not a native
+/// qualification or an authorization to allocate or release a target.
+pub fn parse_network_broker_exchange(
+    payload: &[u8],
+    frame_attempt_id: [u8; 16],
+    control_process_id: i32,
+    control_process_start_time: u64,
+    transferred_descriptor_count: usize,
+) -> Result<NetworkLaunchBrokerRequestV4, NetworkBrokerExchangeError> {
+    let request = decode_network_launch_broker_request(payload)
+        .map_err(NetworkBrokerExchangeError::Decode)?;
+    if request.attempt_id != frame_attempt_id {
+        return Err(NetworkBrokerExchangeError::AttemptBinding);
+    }
+    if request.control_process_id != control_process_id
+        || request.control_process_start_time != control_process_start_time
+    {
+        return Err(NetworkBrokerExchangeError::ControlPeerBinding);
+    }
+    if transferred_descriptor_count != request.descriptor_manifest.len() {
+        return Err(NetworkBrokerExchangeError::DescriptorInventory);
+    }
+    Ok(request)
+}
+
+fn validate_network_broker_request(
+    request: &NetworkLaunchBrokerRequestV4,
+) -> Result<(), RequestCodecError> {
+    validate_network_launch_request(&request.launch)?;
+    if request.caller.pid <= 0
+        || request.caller.supplementary_groups.len() > MAX_SUPPLEMENTARY_GROUPS
+    {
+        return Err(RequestCodecError::InvalidValue);
+    }
+    let launch_digest: [u8; 32] =
+        Sha256::digest(encode_network_launch_request(&request.launch)?).into();
+    if request.descriptor_manifest != network_broker_descriptor_manifest()
+        || request.control_process_id <= 0
+        || request.control_process_start_time == 0
+        || request.request_digest != launch_digest
+        || request.record_identity.attempt_id != request.attempt_id
+        || request.record_identity.caller_envelope_digest != request.caller.digest()
+        || request.request_authentication_binding != request.expected_authentication_binding()
+    {
+        return Err(RequestCodecError::InvalidValue);
+    }
+    Ok(())
 }
 
 pub fn encode_launch_request(request: &LaunchRequestV2) -> Result<Vec<u8>, RequestCodecError> {

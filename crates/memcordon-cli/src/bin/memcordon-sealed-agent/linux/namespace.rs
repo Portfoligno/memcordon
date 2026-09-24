@@ -32,6 +32,29 @@ pub struct NamespaceInit {
     pub pidfd: OwnedFd,
 }
 
+/// The namespace topology is chosen from already-frozen admission, never from
+/// a caller-provided clone flag mask. The private mode is not an authorization
+/// by itself: network initialization and target-entry verification must still
+/// complete before its target may be released.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamespaceMode {
+    Baseline,
+    PrivateTcp4,
+}
+
+impl NamespaceMode {
+    pub const fn clone_flags(self) -> u64 {
+        let baseline =
+            (libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP | libc::CLONE_PIDFD)
+                as u64
+                | (1_u64 << 33);
+        match self {
+            Self::Baseline => baseline,
+            Self::PrivateTcp4 => baseline | libc::CLONE_NEWNET as u64,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NamespaceInitPhase {
     MountIsolation,
@@ -110,11 +133,20 @@ pub fn clone_into_cgroup<F>(cgroup: &std::fs::File, child_entry: F) -> Result<Na
 where
     F: FnOnce() -> i32,
 {
+    clone_into_cgroup_with_mode(cgroup, NamespaceMode::Baseline, child_entry)
+}
+
+pub fn clone_into_cgroup_with_mode<F>(
+    cgroup: &std::fs::File,
+    mode: NamespaceMode,
+    child_entry: F,
+) -> Result<NamespaceInit, String>
+where
+    F: FnOnce() -> i32,
+{
     let mut pidfd = -1_i32;
     let arguments = CloneArgs {
-        flags: (libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::CLONE_NEWCGROUP | libc::CLONE_PIDFD)
-            as u64
-            | (1_u64 << 33),
+        flags: mode.clone_flags(),
         pidfd: (&raw mut pidfd).addr() as u64,
         exit_signal: libc::SIGCHLD as u64,
         cgroup: cgroup.as_raw_fd() as u64,
@@ -160,6 +192,18 @@ pub fn clone_into_cgroup_from_caller<F>(
 where
     F: FnOnce() -> i32,
 {
+    clone_into_cgroup_from_caller_with_mode(cgroup, context, NamespaceMode::Baseline, child_entry)
+}
+
+pub fn clone_into_cgroup_from_caller_with_mode<F>(
+    cgroup: &std::fs::File,
+    context: CallerMountContext,
+    mode: NamespaceMode,
+    child_entry: F,
+) -> Result<NamespaceInit, String>
+where
+    F: FnOnce() -> i32,
+{
     const RECORD_LENGTH: usize = 10;
     // The caller-context bootstrap must exit before the provider starts monitoring. Make this
     // single-request launcher worker the subreaper so the namespace init remains a waitable
@@ -194,8 +238,9 @@ where
     }
     if bootstrap == 0 {
         drop(read_end);
-        let result = adopt_caller_mount_context(&context)
-            .and_then(|()| clone_into_cgroup(cgroup, child_entry).map_err(|_| libc::EIO));
+        let result = adopt_caller_mount_context(&context).and_then(|()| {
+            clone_into_cgroup_with_mode(cgroup, mode, child_entry).map_err(|_| libc::EIO)
+        });
         let (status, pid, error) = match result {
             Ok(init) => (0_u8, init.host_pid, 0_i32),
             Err(error) => (1_u8, 0_i32, error),

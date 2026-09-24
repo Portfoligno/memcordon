@@ -1026,6 +1026,8 @@ fn request_json_body(request: &str) -> serde_json::Value {
     serde_json::from_str(&request[start..]).expect("request JSON should parse")
 }
 
+#[path = "installed_causal_fixture.rs"]
+mod installed_causal_fixture;
 #[path = "../support/standard.rs"]
 mod standard_fixture;
 
@@ -1212,9 +1214,15 @@ pub(super) fn release_fixture() -> (TempDir, config::Release) {
             },
         );
     }
+    manifest
+        .certification
+        .extend(installed_causal_fixture::write_installed_causal_fixture(
+            &output,
+            &manifest.source_commit,
+        ));
     assert_eq!(
         manifest.certification.len(),
-        19,
+        59,
         "fixture retains every current certification obligation"
     );
     write_json(&output.join(&release.assets.manifest), &manifest).expect("manifest should write");

@@ -49,6 +49,8 @@ fn main() {
         }
         [command] if command == "serve" => serve(),
         [command] if command == "launch-broker" => launch_broker(),
+        #[cfg(target_os = "linux")]
+        [command] if command == "network-launch-broker" => linux::launcher::serve_network(),
         [command] if command == "probe" => probe(),
         [command] if command == "qualify" => qualify(),
         #[cfg(target_os = "linux")]

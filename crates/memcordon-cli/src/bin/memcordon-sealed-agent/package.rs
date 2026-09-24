@@ -15,6 +15,11 @@ const SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision control 
 const SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision control socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-agent.sock\nDirectoryMode=0755\nSocketMode=0660\nSocketUser=root\nSocketGroup=memcordon\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
 const LAUNCHER_SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker\nRequires=memcordon-sealed-launcher.socket\nAfter=local-fs.target\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent launch-broker\nUser=root\nGroup=root\nDelegate=yes\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=no\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
 const LAUNCHER_SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision launch broker socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-launcher.sock\nDirectoryMode=0750\nSocketMode=0600\nSocketUser=root\nSocketGroup=root\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
+// Installed as an unavailable, disabled package component until native V2
+// admission and qualification are implemented. Installation must not activate
+// this privileged broker or advertise the private profile.
+const NETWORK_LAUNCHER_SERVICE: &str = "[Unit]\nDescription=MemCordon sealed private IPv4 launch broker\nRequires=memcordon-sealed-network-launcher.socket\nAfter=local-fs.target\nRefuseManualStart=yes\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent network-launch-broker\nUser=root\nGroup=root\nDelegate=yes\nKillMode=process\nStateDirectory=memcordon/sealed\nStateDirectoryMode=0700\nNoNewPrivileges=no\nAmbientCapabilities=\nCapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN\nRestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
+const NETWORK_LAUNCHER_SOCKET: &str = "[Unit]\nDescription=MemCordon sealed private IPv4 launch broker socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-network-launcher.sock\nDirectoryMode=0750\nSocketMode=0600\nSocketUser=root\nSocketGroup=root\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
 const TMPFILES: &str = "d /run/memcordon 0750 root memcordon -\nf /run/memcordon-sealed-package.lock 0600 root root -\n";
 #[cfg(target_os = "linux")]
 const BINARY: &str = "/usr/libexec/memcordon-sealed-agent";
@@ -26,6 +31,12 @@ const SOCKET_UNIT: &str = "/usr/lib/systemd/system/memcordon-sealed-agent.socket
 const LAUNCHER_UNIT: &str = "/usr/lib/systemd/system/memcordon-sealed-launcher.service";
 #[cfg(target_os = "linux")]
 const LAUNCHER_SOCKET_UNIT: &str = "/usr/lib/systemd/system/memcordon-sealed-launcher.socket";
+#[cfg(target_os = "linux")]
+const NETWORK_LAUNCHER_UNIT: &str =
+    "/usr/lib/systemd/system/memcordon-sealed-network-launcher.service";
+#[cfg(target_os = "linux")]
+const NETWORK_LAUNCHER_SOCKET_UNIT: &str =
+    "/usr/lib/systemd/system/memcordon-sealed-network-launcher.socket";
 #[cfg(target_os = "linux")]
 const TMPFILES_FILE: &str = "/usr/lib/tmpfiles.d/memcordon.conf";
 #[cfg(target_os = "linux")]
@@ -336,6 +347,14 @@ fn verify_compiled_metadata() -> Result<(), String> {
         .lines()
         .filter(|line| line.starts_with("AmbientCapabilities="))
         .collect::<Vec<_>>();
+    let network_launcher_capabilities = NETWORK_LAUNCHER_SERVICE
+        .lines()
+        .filter(|line| line.starts_with("CapabilityBoundingSet="))
+        .collect::<Vec<_>>();
+    let network_launcher_ambient = NETWORK_LAUNCHER_SERVICE
+        .lines()
+        .filter(|line| line.starts_with("AmbientCapabilities="))
+        .collect::<Vec<_>>();
     let launcher_forbidden = [
         "PrivateTmp=",
         "ProtectSystem=",
@@ -384,6 +403,32 @@ fn verify_compiled_metadata() -> Result<(), String> {
         && LAUNCHER_SOCKET.contains("SocketMode=0600")
         && LAUNCHER_SOCKET.contains("SocketUser=root")
         && LAUNCHER_SOCKET.contains("SocketGroup=root")
+        && NETWORK_LAUNCHER_SERVICE
+            .contains("Description=MemCordon sealed private IPv4 launch broker")
+        && NETWORK_LAUNCHER_SERVICE
+            .contains("ExecStart=/usr/libexec/memcordon-sealed-agent network-launch-broker")
+        && NETWORK_LAUNCHER_SERVICE.contains("Requires=memcordon-sealed-network-launcher.socket")
+        && NETWORK_LAUNCHER_SERVICE.contains("RefuseManualStart=yes")
+        && NETWORK_LAUNCHER_SERVICE.contains("User=root")
+        && NETWORK_LAUNCHER_SERVICE.contains("Group=root")
+        && NETWORK_LAUNCHER_SERVICE.contains("Delegate=yes")
+        && NETWORK_LAUNCHER_SERVICE.contains("NoNewPrivileges=no")
+        && NETWORK_LAUNCHER_SERVICE.contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK")
+        && !NETWORK_LAUNCHER_SERVICE.contains("CAP_NET_RAW")
+        && !NETWORK_LAUNCHER_SERVICE.contains("RuntimeDirectory=")
+        && !NETWORK_LAUNCHER_SERVICE.contains("RuntimeDirectoryMode=")
+        && network_launcher_capabilities
+            == [
+                "CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_DAC_OVERRIDE CAP_SYS_PTRACE CAP_KILL CAP_NET_ADMIN",
+            ]
+        && network_launcher_ambient == ["AmbientCapabilities="]
+        && NETWORK_LAUNCHER_SOCKET
+            .contains("ListenStream=/run/memcordon/sealed-network-launcher.sock")
+        && NETWORK_LAUNCHER_SOCKET.contains("After=systemd-tmpfiles-setup.service")
+        && NETWORK_LAUNCHER_SOCKET.contains("DirectoryMode=0750")
+        && NETWORK_LAUNCHER_SOCKET.contains("SocketMode=0600")
+        && NETWORK_LAUNCHER_SOCKET.contains("SocketUser=root")
+        && NETWORK_LAUNCHER_SOCKET.contains("SocketGroup=root")
         && TMPFILES
             == "d /run/memcordon 0750 root memcordon -\nf /run/memcordon-sealed-package.lock 0600 root root -\n"
     {
@@ -391,6 +436,16 @@ fn verify_compiled_metadata() -> Result<(), String> {
     } else {
         Err("compiled split-service metadata is inconsistent".to_owned())
     }
+}
+
+#[cfg(test)]
+pub(crate) fn network_launcher_templates_for_test() -> (&'static str, &'static str) {
+    (NETWORK_LAUNCHER_SERVICE, NETWORK_LAUNCHER_SOCKET)
+}
+
+#[cfg(test)]
+pub(crate) fn verify_compiled_metadata_for_test() -> Result<(), String> {
+    verify_compiled_metadata()
 }
 
 #[cfg(target_os = "linux")]
@@ -640,6 +695,16 @@ fn verify_installed_package_against(packaged_executable_sha256: &str) -> Result<
             0o644,
             Some(LAUNCHER_SOCKET.as_bytes()),
         ),
+        (
+            NETWORK_LAUNCHER_UNIT,
+            0o644,
+            Some(NETWORK_LAUNCHER_SERVICE.as_bytes()),
+        ),
+        (
+            NETWORK_LAUNCHER_SOCKET_UNIT,
+            0o644,
+            Some(NETWORK_LAUNCHER_SOCKET.as_bytes()),
+        ),
         (TMPFILES_FILE, 0o644, Some(TMPFILES.as_bytes())),
     ];
     for (path, expected_mode, expected_bytes) in artifacts {
@@ -689,11 +754,16 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     )?;
     if operation == "uninstall" {
         ensure_recovery_idle("uninstall")?;
+        stop_unit("memcordon-sealed-network-launcher.service")?;
+        stop_unit("memcordon-sealed-network-launcher.socket")?;
+        disable_optional_network_launcher()?;
         stop_unit("memcordon-sealed-agent.service")?;
         stop_unit("memcordon-sealed-launcher.service")?;
         stop_unit("memcordon-sealed-agent.socket")?;
         stop_unit("memcordon-sealed-launcher.socket")?;
         ensure_unit_inactive("memcordon-sealed-agent.service")?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.service")?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.socket")?;
         ensure_unit_inactive("memcordon-sealed-launcher.service")?;
         ensure_unit_inactive("memcordon-sealed-agent.socket")?;
         ensure_unit_inactive("memcordon-sealed-launcher.socket")?;
@@ -703,6 +773,8 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
             UNIT,
             LAUNCHER_SOCKET_UNIT,
             LAUNCHER_UNIT,
+            NETWORK_LAUNCHER_SOCKET_UNIT,
+            NETWORK_LAUNCHER_UNIT,
             TMPFILES_FILE,
             BINARY,
             crate::linux::runtime_manifest::INSTALLED,
@@ -734,11 +806,16 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     }
     if operation == "upgrade" {
         ensure_recovery_idle("upgrade")?;
+        stop_unit("memcordon-sealed-network-launcher.service")?;
+        stop_unit("memcordon-sealed-network-launcher.socket")?;
+        disable_optional_network_launcher()?;
         stop_unit("memcordon-sealed-agent.service")?;
         stop_unit("memcordon-sealed-launcher.service")?;
         stop_unit("memcordon-sealed-agent.socket")?;
         stop_unit("memcordon-sealed-launcher.socket")?;
         ensure_unit_inactive("memcordon-sealed-agent.service")?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.service")?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.socket")?;
         ensure_unit_inactive("memcordon-sealed-launcher.service")?;
         ensure_unit_inactive("memcordon-sealed-agent.socket")?;
         ensure_unit_inactive("memcordon-sealed-launcher.socket")?;
@@ -784,6 +861,16 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
             0o644,
         ),
         (
+            Path::new(NETWORK_LAUNCHER_UNIT),
+            NETWORK_LAUNCHER_SERVICE.as_bytes().to_vec(),
+            0o644,
+        ),
+        (
+            Path::new(NETWORK_LAUNCHER_SOCKET_UNIT),
+            NETWORK_LAUNCHER_SOCKET.as_bytes().to_vec(),
+            0o644,
+        ),
+        (
             Path::new(TMPFILES_FILE),
             TMPFILES.as_bytes().to_vec(),
             0o644,
@@ -815,6 +902,9 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     }
     verify_installed_package_against(&source_digest)?;
     systemctl(["daemon-reload"])?;
+    disable_optional_network_launcher()?;
+    ensure_unit_inactive("memcordon-sealed-network-launcher.service")?;
+    ensure_unit_inactive("memcordon-sealed-network-launcher.socket")?;
     if ephemeral_ci {
         systemctl(["start", "memcordon-sealed-launcher.socket"])?;
         systemctl(["start", "memcordon-sealed-agent.socket"])?;
@@ -1019,6 +1109,29 @@ fn systemctl<const N: usize>(arguments: [&str; N]) -> Result<(), String> {
     } else {
         Err(format!("systemctl failed with {status}"))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn disable_optional_network_launcher() -> Result<(), String> {
+    for (unit, path) in [
+        (
+            "memcordon-sealed-network-launcher.socket",
+            NETWORK_LAUNCHER_SOCKET_UNIT,
+        ),
+        (
+            "memcordon-sealed-network-launcher.service",
+            NETWORK_LAUNCHER_UNIT,
+        ),
+    ] {
+        if std::path::Path::new(path)
+            .try_exists()
+            .map_err(|error| error.to_string())?
+        {
+            systemctl(["disable", "--now", unit])?;
+            ensure_unit_inactive(unit)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

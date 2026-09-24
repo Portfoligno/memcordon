@@ -2,6 +2,7 @@ use crate::admission::LinuxAdmission;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
@@ -15,10 +16,142 @@ use sha2::{Digest, Sha256};
 use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 use crate::rejection::{RejectionCleanupV1, RejectionPhaseV1, RejectionV1};
-use crate::request::{CallerExecutionEnvelopeV2, LaunchRequestV2};
+use crate::request::{CallerExecutionEnvelopeV2, LaunchRequestV2, NetworkLaunchRequestV4};
+use memcordon_core::workload_contract::ExecutionIdentityRequestV2;
+use memcordon_core::workload_registry_v2::{LinuxExecutionIdentityV2, ProfileKindV2};
 
 use super::attempt::AttemptRecord;
 use super::cgroup::{AttemptCgroup, AttemptRetirementObservation};
+use super::descriptor_custody::{
+    ExpectedGatedDescriptorInventory, ProviderPipeStdio, provider_owned_byte_pipes,
+};
+use super::entrypoint::{VerifiedEntrypoint, open_verified_entrypoint};
+use super::execution_identity::{ResolvedTargetIdentity, resolve_target_identity};
+use super::network_filter::NativeAbi;
+use super::private_target::{
+    PrivateExecArguments, PrivateGatedTarget, PrivateNetworkNamespaceOwner,
+};
+
+/// Authority pinned before a private target is allocated. This is deliberately
+/// not a launch authorization: the optional network launcher remains disabled
+/// until descriptor, filter, checkpoint, retirement, and native qualification
+/// proofs are wired to the same attempt.
+#[derive(Debug)]
+pub struct PrivatePrelaunchAuthority {
+    request: NetworkLaunchRequestV4,
+    target_identity: ResolvedTargetIdentity,
+    entrypoint: VerifiedEntrypoint,
+}
+
+impl PrivatePrelaunchAuthority {
+    pub fn into_parts(self) -> (ResolvedTargetIdentity, VerifiedEntrypoint) {
+        (self.target_identity, self.entrypoint)
+    }
+}
+
+/// `selected_identity` must come from the authenticated active-registry grant,
+/// never the broker request. The trusted caller-root descriptor is captured by
+/// the provider; no consumer-provided descriptor is executable authority. The
+/// structured V4 request keeps the V2 contract and program bytes in one object.
+pub fn pin_private_prelaunch_authority(
+    request: &NetworkLaunchRequestV4,
+    selected_identity: Option<&LinuxExecutionIdentityV2>,
+    caller: &CallerExecutionEnvelopeV2,
+    caller_root: BorrowedFd<'_>,
+    provider_uid: u32,
+    guardian_uid: u32,
+) -> Result<PrivatePrelaunchAuthority, String> {
+    if request.contract.authorized_profile != ProfileKindV2::LinuxTcp4PrivateV1.reference()
+        || request.launch.workload_contract.is_some()
+    {
+        return Err("MCSEALED-PRIVATE-ENTRYPOINT: non-private or mixed-version request".into());
+    }
+    let identity_request = &request.contract.execution_identity;
+    let target_identity = resolve_target_identity(
+        identity_request,
+        selected_identity,
+        caller,
+        provider_uid,
+        guardian_uid,
+    )?;
+    let record = match identity_request {
+        ExecutionIdentityRequestV2::AdministratorProfile { .. } => selected_identity
+            .ok_or("MCSEALED-PRIVATE-ENTRYPOINT: granted identity record absent")?,
+        ExecutionIdentityRequestV2::PreserveCaller => {
+            return Err(
+                "MCSEALED-PRIVATE-ENTRYPOINT: preserved-caller entrypoint authority unavailable"
+                    .into(),
+            );
+        }
+    };
+    let mut matching = record.entrypoints.as_slice().iter().filter(|entrypoint| {
+        entrypoint.absolute_path.as_str().as_bytes() == request.launch.program
+    });
+    let approved = matching
+        .next()
+        .ok_or("MCSEALED-PRIVATE-ENTRYPOINT: program is not granted")?;
+    if matching.next().is_some() {
+        return Err("MCSEALED-PRIVATE-ENTRYPOINT: ambiguous granted program".into());
+    }
+    let entrypoint = open_verified_entrypoint(caller_root, approved)?;
+    Ok(PrivatePrelaunchAuthority {
+        request: request.clone(),
+        target_identity,
+        entrypoint,
+    })
+}
+
+/// Provider-owned resources assembled before a private namespace clone. The
+/// caller must retain these endpoints for gated readback, relay ownership,
+/// checkpoint, and eventual retirement. Constructing this object neither
+/// allocates a target nor permits candidate execution.
+pub struct PrivateGatedPrelaunch {
+    pub target: PrivateGatedTarget,
+    pub provider_stdio: ProviderPipeStdio,
+    pub provider_control: File,
+    pub expected_descriptors: ExpectedGatedDescriptorInventory,
+}
+
+/// The native filter digest must come from the exact installed qualification
+/// for `abi`; the trusted stub checks it again against the compiled bytes.
+pub fn prepare_private_gated_prelaunch(
+    authority: PrivatePrelaunchAuthority,
+    request: &NetworkLaunchRequestV4,
+    abi: NativeAbi,
+    expected_filter_digest: [u8; 32],
+) -> Result<PrivateGatedPrelaunch, String> {
+    if authority.request != *request {
+        return Err("MCSEALED-PRIVATE-PRELAUNCH: V4 request changed after ELF pinning".into());
+    }
+    let command = PrivateExecArguments::from_request(request)?;
+    let (target_stdio, provider_stdio) =
+        provider_owned_byte_pipes().map_err(|error| format!("MCSEALED-PRIVATE-STDIO: {error}"))?;
+    let (target_control, provider_control) =
+        control_socketpair().map_err(|error| format!("MCSEALED-PRIVATE-CONTROL: {error}"))?;
+    let (identity, entrypoint) = authority.into_parts();
+    let expected_descriptors = ExpectedGatedDescriptorInventory::capture(
+        &target_stdio,
+        provider_control.as_fd(),
+        target_control.as_fd(),
+        entrypoint.as_fd(),
+    )
+    .map_err(|error| format!("MCSEALED-PRIVATE-DESCRIPTOR-EXPECTATION: {error}"))?;
+    let target = PrivateGatedTarget {
+        entrypoint,
+        identity,
+        stdio: target_stdio,
+        target_control: target_control.into(),
+        command,
+        native_abi: abi,
+        expected_filter_digest,
+    };
+    Ok(PrivateGatedPrelaunch {
+        target,
+        provider_stdio,
+        provider_control,
+        expected_descriptors,
+    })
+}
 
 const TARGET_CONTROL_VERSION: u8 = 1;
 const EXEC_CONTROL_ARMED: [u8; 4] = [TARGET_CONTROL_VERSION, 1, 1, 0];
@@ -266,6 +399,7 @@ struct AttemptCleanupGuard {
     guardian_pid: Option<libc::pid_t>,
     guardian_control: Option<File>,
     guardian_terminal: Option<File>,
+    private_network: Option<PrivateNetworkNamespaceOwner>,
     attempt_id: [u8; 16],
     armed: bool,
 }
@@ -279,13 +413,22 @@ impl AttemptCleanupGuard {
             guardian_pid: None,
             guardian_control: None,
             guardian_terminal: None,
+            private_network: None,
             attempt_id,
             armed: true,
         }
     }
 
     fn disarm(&mut self) {
+        assert!(
+            self.can_disarm(),
+            "private namespace owner must be retired before disarming cleanup"
+        );
         self.armed = false;
+    }
+
+    fn can_disarm(&self) -> bool {
+        self.private_network.is_none()
     }
 
     fn set_cgroup(&mut self, cgroup: AttemptCgroup) {
@@ -295,6 +438,18 @@ impl AttemptCleanupGuard {
     fn set_guardian_channels(&mut self, control: File, terminal: File) {
         self.guardian_control = Some(control);
         self.guardian_terminal = Some(terminal);
+    }
+
+    fn set_private_network(&mut self, owner: PrivateNetworkNamespaceOwner) {
+        assert!(
+            self.private_network.is_none(),
+            "one private namespace owner per attempt"
+        );
+        self.private_network = Some(owner);
+    }
+
+    fn retire_private_network_owner(&mut self) {
+        self.private_network.take();
     }
 
     fn finalize_failure(&mut self) -> Result<(), String> {
@@ -373,6 +528,8 @@ impl AttemptCleanupGuard {
             );
         }
 
+        self.retire_private_network_owner();
+
         if !guardian_owned {
             self.record.transition("retired-after-failure")?;
             self.record.clone().retire()?;
@@ -380,6 +537,20 @@ impl AttemptCleanupGuard {
         self.armed = false;
         Ok(())
     }
+}
+
+#[cfg(feature = "test-support")]
+pub fn private_cleanup_guard_gate_for_test(
+    record: AttemptRecord,
+    owner: PrivateNetworkNamespaceOwner,
+) -> (bool, bool) {
+    let mut guard = AttemptCleanupGuard::new(record, [0; 16]);
+    guard.set_private_network(owner);
+    let before_retirement = guard.can_disarm();
+    guard.retire_private_network_owner();
+    let after_retirement = guard.can_disarm();
+    guard.disarm();
+    (before_retirement, after_retirement)
 }
 
 impl Drop for AttemptCleanupGuard {

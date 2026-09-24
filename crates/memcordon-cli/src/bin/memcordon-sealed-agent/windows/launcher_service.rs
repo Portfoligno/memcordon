@@ -32,6 +32,10 @@ use super::pipe::{self, OwnedHandle, PipeListener, PipePreparationError};
 use super::process::{StreamSet, SuspendedTarget};
 use super::security::{SecurityDescriptor, private_pipe_sddl};
 
+#[cfg(test)]
+#[path = "../../../../tests/sealed_agent/windows_job_diagnostic_conversion.rs"]
+mod job_conversion_tests;
+
 const LIMIT_STATUS: u32 = 0xC000_0017;
 const CANCEL_STATUS: u32 = 0xC000_013A;
 const DEADLINE_STATUS: u32 = 0xC000_0102;
@@ -47,6 +51,7 @@ struct LaunchAttemptError {
     mutant_observation: Option<Box<memcordon_core::WindowsMutantNativeObservationV1>>,
     loader_qualification: Option<memcordon_core::WindowsLoaderQualificationOutcomeV2>,
     terminal_candidate: Option<Box<WindowsTerminalReceiptV1>>,
+    job_operation: Option<memcordon_core::FailureOperationV1>,
 }
 
 impl From<String> for LaunchAttemptError {
@@ -60,6 +65,7 @@ impl From<String> for LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }
         .captured()
@@ -68,16 +74,7 @@ impl From<String> for LaunchAttemptError {
 
 impl From<super::job::JobObservationError> for LaunchAttemptError {
     fn from(error: super::job::JobObservationError) -> Self {
-        use memcordon_core::FailureOperationV1;
-        let code = match error.operation {
-            FailureOperationV1::QueryJobProcessIds => "MCSEALED-WINDOWS-JOB-PROCESS-IDS",
-            FailureOperationV1::QueryPeakMemory => "MCSEALED-WINDOWS-JOB-PEAK-MEMORY",
-            FailureOperationV1::ReadJobNotification => "MCSEALED-WINDOWS-JOB-NOTIFICATION",
-            FailureOperationV1::ResumeTarget => "MCSEALED-WINDOWS-TARGET-RESUME",
-            FailureOperationV1::PollTarget => "MCSEALED-WINDOWS-TARGET-POLL",
-            FailureOperationV1::ReadTargetExit => "MCSEALED-WINDOWS-TARGET-EXIT",
-            _ => "MCSEALED-WINDOWS-JOB-QUERY",
-        };
+        let code = super::job_diagnostics::public_code(error.operation);
         let os_code = error.source.raw_os_error();
         let failure = Self {
             code,
@@ -88,15 +85,10 @@ impl From<super::job::JobObservationError> for LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: Some(error.operation),
             workload_admission: None,
         };
-        let mut observation = failure.observation();
-        observation.operation = error.operation;
-        observation.native_code = os_code.map(|code| {
-            memcordon_core::NativeFailureCodeV1::Win32(u32::from_ne_bytes(code.to_ne_bytes()))
-        });
-        super::diagnostics::capture(observation);
-        failure
+        failure.captured()
     }
 }
 
@@ -106,6 +98,9 @@ impl LaunchAttemptError {
         self
     }
     fn observation(&self) -> memcordon_core::CausalEventV1 {
+        if let Some(operation) = self.job_operation {
+            return super::job_diagnostics::event(operation, self.os_code);
+        }
         use memcordon_core::{
             AttemptObservationPhaseV1 as Phase, FailureCategoryV1 as Category,
             FailureCodeV1 as Code, FailureOperationV1 as Operation,
@@ -240,6 +235,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }.captured()
     }
@@ -267,6 +263,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }.captured()
     }
@@ -286,6 +283,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: error.loader_qualification,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }
         .captured()
@@ -301,6 +299,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }
         .captured()
@@ -320,6 +319,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }
         .captured()
@@ -350,6 +350,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }.captured()
     }
@@ -373,6 +374,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }
         .captured()
@@ -388,6 +390,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }
         .captured()
@@ -403,6 +406,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }
         .captured()
@@ -423,6 +427,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }
         .captured()
@@ -441,6 +446,7 @@ impl LaunchAttemptError {
             mutant_observation: Some(Box::new(observation)),
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }
         .captured()
@@ -469,6 +475,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }
         .captured()
@@ -484,6 +491,7 @@ impl LaunchAttemptError {
             mutant_observation: None,
             loader_qualification: None,
             terminal_candidate: None,
+            job_operation: None,
             workload_admission: None,
         }
         .captured()
@@ -4084,6 +4092,7 @@ fn policy_revocation_failure() -> LaunchAttemptError {
         mutant_observation: None,
         loader_qualification: None,
         terminal_candidate: None,
+        job_operation: None,
         workload_admission: None,
     }
 }

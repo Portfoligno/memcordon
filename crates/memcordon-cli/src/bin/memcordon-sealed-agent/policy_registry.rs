@@ -1,10 +1,10 @@
 //! Provider-owned atomic policy activation and launch serialization.
-#[cfg(target_os = "linux")]
 use memcordon_core::BoundedVec;
 use memcordon_core::DiagnosticSha256;
 use memcordon_core::workload_contract::Nonce128;
-use memcordon_core::workload_contract::{ContractVersionOne, PolicyEpoch};
+use memcordon_core::workload_contract::{ContractVersionOne, ContractVersionTwo, PolicyEpoch};
 use memcordon_core::workload_registry::PolicyRegistryV1;
+use memcordon_core::workload_registry_v2::PolicyRegistryV2;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
@@ -80,7 +80,107 @@ impl Activation {
     }
 }
 
+/// Linux V2 authority is stored as its own exact activation shape. Existing
+/// V1 callers receive only its explicit preserve-caller baseline projection;
+/// private/delegated grants cannot be laundered into V1 authorization.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationV2 {
+    pub schema_version: ContractVersionTwo,
+    pub registry: PolicyRegistryV2,
+    pub registry_digest: DiagnosticSha256,
+    pub epoch: PolicyEpoch,
+    pub revoked_admissions: BoundedVec<Nonce128, 256>,
+}
+
+impl ActivationV2 {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.registry.canonical_digest()? != self.registry_digest {
+            return Err("V2 policy activation digest differs".into());
+        }
+        for (index, nonce) in self.revoked_admissions.as_slice().iter().enumerate() {
+            if self.revoked_admissions.as_slice()[..index].contains(nonce) {
+                return Err("duplicate V2 revoked admission".into());
+            }
+        }
+        self.registry.baseline_v1_projection()?;
+        Ok(())
+    }
+
+    pub(crate) fn baseline_projection(&self) -> Result<Activation, String> {
+        let registry = self.registry.baseline_v1_projection()?;
+        Ok(Activation {
+            schema_version: ContractVersionOne::default(),
+            registry_digest: registry.canonical_digest()?,
+            registry,
+            epoch: self.epoch.clone(),
+            revoked_admissions: self.revoked_admissions.clone(),
+        })
+    }
+}
+
+pub enum VersionedActivation {
+    V1(Activation),
+    V2(ActivationV2),
+}
+
+impl VersionedActivation {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len()
+            > memcordon_core::workload_limits::REGISTRY_BYTES
+                + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES
+        {
+            return Err("policy activation exceeds bound".into());
+        }
+        memcordon_core::workload_contract::reject_duplicate_json_keys(bytes)?;
+        let version = schema_version(bytes)?;
+        match version {
+            1 => {
+                let value: Activation =
+                    serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+                value.validate()?;
+                Ok(Self::V1(value))
+            }
+            2 => {
+                let value: ActivationV2 =
+                    serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+                value.validate()?;
+                Ok(Self::V2(value))
+            }
+            _ => Err("unsupported policy activation schema version".into()),
+        }
+    }
+}
+
+pub(crate) enum RegistryConfiguration {
+    V1(PolicyRegistryV1),
+    V2(PolicyRegistryV2),
+}
+
+impl RegistryConfiguration {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
+        memcordon_core::workload_contract::reject_duplicate_json_keys(bytes)?;
+        match schema_version(bytes)? {
+            1 => PolicyRegistryV1::parse(bytes).map(Self::V1),
+            2 => PolicyRegistryV2::parse(bytes).map(Self::V2),
+            _ => Err("unsupported policy registry schema version".into()),
+        }
+    }
+}
+
+fn schema_version(bytes: &[u8]) -> Result<u64, String> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .map_err(|error| error.to_string())?
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "policy document has no numeric schema version".into())
+}
+
 pub fn read_configuration(path: &Path) -> Result<PolicyRegistryV1, String> {
+    PolicyRegistryV1::parse(&read_configuration_bytes(path)?)
+}
+
+fn read_configuration_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     if !file
         .metadata()
@@ -93,17 +193,29 @@ pub fn read_configuration(path: &Path) -> Result<PolicyRegistryV1, String> {
     file.take(memcordon_core::workload_limits::REGISTRY_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    PolicyRegistryV1::parse(&bytes)
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn read_configuration_any(path: &Path) -> Result<RegistryConfiguration, String> {
+    let bytes = read_configuration_bytes(path)?;
+    RegistryConfiguration::parse(&bytes)
 }
 
 #[cfg(target_os = "linux")]
 pub fn inspect() -> Result<(), String> {
     let lease = native::Lease::acquire()?;
-    let activation = lease.read()?;
-    println!(
-        "{}",
-        serde_json::to_string(&activation).map_err(|error| error.to_string())?
-    );
+    match lease.read_any()? {
+        None => println!("null"),
+        Some(VersionedActivation::V1(activation)) => println!(
+            "{}",
+            serde_json::to_string(&activation).map_err(|error| error.to_string())?
+        ),
+        Some(VersionedActivation::V2(activation)) => println!(
+            "{}",
+            serde_json::to_string(&activation).map_err(|error| error.to_string())?
+        ),
+    }
     Ok(())
 }
 
@@ -111,12 +223,22 @@ pub fn inspect() -> Result<(), String> {
 pub fn apply(path: &Path) -> Result<(), String> {
     // Exclude package replacement while allowing policy changes during live launches.
     let _package = crate::linux::service::acquire_shared_package_lease()?;
-    let registry = read_configuration(path)?;
+    let registry = read_configuration_any(path)?;
     let lease = native::Lease::acquire()?;
-    let revoke = registry.active_attempt_disposition
-        == memcordon_core::workload_registry::GrantChangeDisposition::RevokeActive;
+    let revoke = match &registry {
+        RegistryConfiguration::V1(registry) => registry.active_attempt_disposition,
+        RegistryConfiguration::V2(registry) => registry.active_attempt_disposition,
+    } == memcordon_core::workload_registry::GrantChangeDisposition::RevokeActive;
     let active = lease.live_bindings()?;
-    let activation = lease.activate(registry, None)?;
+    let activation = match registry {
+        RegistryConfiguration::V1(registry) => {
+            serde_json::to_value(lease.activate(registry, None)?)
+        }
+        RegistryConfiguration::V2(registry) => {
+            serde_json::to_value(lease.activate_v2(registry, None)?)
+        }
+    }
+    .map_err(|error| error.to_string())?;
     drop(lease);
     if revoke {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -161,11 +283,34 @@ pub mod native {
     impl Lease {
         pub fn retain_snapshot(&self, registry: &PolicyRegistryV1) -> Result<(), String> {
             let digest = registry.canonical_digest()?;
-            self.check_capacity(&digest)?;
+            let bytes = serde_json::to_vec(registry).map_err(|error| error.to_string())?;
+            self.retain_snapshot_encoded(&digest, &bytes, 1)
+        }
+
+        fn retain_snapshot_v2(&self, registry: &PolicyRegistryV2) -> Result<(), String> {
+            let digest = registry.canonical_digest()?;
+            let bytes = serde_json::to_vec(registry).map_err(|error| error.to_string())?;
+            self.retain_snapshot_encoded(&digest, &bytes, 2)
+        }
+
+        fn retain_snapshot_encoded(
+            &self,
+            digest: &DiagnosticSha256,
+            bytes: &[u8],
+            version: u32,
+        ) -> Result<(), String> {
+            self.check_capacity(digest)?;
             let mut retained = std::collections::BTreeSet::new();
             retained.insert(String::from(digest.clone()));
             for (_, binding) in self.live_bindings()? {
                 retained.insert(String::from(binding.registry_digest));
+            }
+            if let Some(active) = self.read_any()? {
+                let active_digest = match active {
+                    VersionedActivation::V1(active) => active.registry_digest,
+                    VersionedActivation::V2(active) => active.registry_digest,
+                };
+                retained.insert(String::from(active_digest));
             }
             for entry in
                 std::fs::read_dir("/var/lib/memcordon/policy").map_err(|error| error.to_string())?
@@ -188,11 +333,11 @@ pub mod native {
                     }
                 }
             }
-            let path = std::path::PathBuf::from(String::from(digest)).with_extension("snapshot");
+            let path =
+                std::path::PathBuf::from(String::from(digest.clone())).with_extension("snapshot");
             use std::os::unix::ffi::OsStrExt;
             let name = std::ffi::CString::new(path.as_os_str().as_bytes())
                 .map_err(|error| error.to_string())?;
-            let bytes = serde_json::to_vec(registry).map_err(|error| error.to_string())?;
             if bytes.len() > memcordon_core::workload_limits::REGISTRY_BYTES {
                 return Err("encoded registry exceeds limit".into());
             }
@@ -202,7 +347,7 @@ pub mod native {
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             ) {
                 Ok(mut file) => {
-                    file.write_all(&bytes)
+                    file.write_all(bytes)
                         .and_then(|()| file.sync_all())
                         .map_err(|error| error.to_string())?;
                 }
@@ -213,9 +358,12 @@ pub mod native {
                     file.take(memcordon_core::workload_limits::REGISTRY_BYTES as u64 + 1)
                         .read_to_end(&mut existing)
                         .map_err(|error| error.to_string())?;
-                    if PolicyRegistryV1::parse(&existing)?.canonical_digest()?
-                        != registry.canonical_digest()?
-                    {
+                    let existing_digest = match version {
+                        1 => PolicyRegistryV1::parse(&existing)?.canonical_digest()?,
+                        2 => PolicyRegistryV2::parse(&existing)?.canonical_digest()?,
+                        _ => return Err("unsupported policy snapshot version".into()),
+                    };
+                    if existing_digest != *digest {
                         return Err("immutable policy snapshot differs".into());
                     }
                 }
@@ -259,6 +407,13 @@ pub mod native {
             snapshots.insert(*candidate.bytes());
             for (_, binding) in references {
                 snapshots.insert(*binding.registry_digest.bytes());
+            }
+            if let Some(active) = self.read_any()? {
+                let active_digest = match active {
+                    VersionedActivation::V1(active) => active.registry_digest,
+                    VersionedActivation::V2(active) => active.registry_digest,
+                };
+                snapshots.insert(*active_digest.bytes());
             }
             if snapshots.len() > memcordon_core::workload_limits::SNAPSHOTS {
                 return Err("policy snapshot capacity exhausted".into());
@@ -309,6 +464,21 @@ pub mod native {
             Ok(Self { directory, lock })
         }
         pub fn read(&self) -> Result<Option<Activation>, String> {
+            match self.read_any()? {
+                None => Ok(None),
+                Some(VersionedActivation::V1(value)) => Ok(Some(value)),
+                Some(VersionedActivation::V2(value)) => value.baseline_projection().map(Some),
+            }
+        }
+
+        pub fn read_v2(&self) -> Result<Option<ActivationV2>, String> {
+            match self.read_any()? {
+                Some(VersionedActivation::V2(value)) => Ok(Some(value)),
+                _ => Ok(None),
+            }
+        }
+
+        pub fn read_any(&self) -> Result<Option<VersionedActivation>, String> {
             let file = match open_at(&self.directory, c"policy-activation.json", libc::O_RDONLY) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -323,10 +493,7 @@ pub mod native {
             if bytes.len() > limit {
                 return Err("policy activation exceeds bound".into());
             }
-            let value: Activation =
-                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-            value.validate()?;
-            Ok(Some(value))
+            VersionedActivation::parse(&bytes).map(Some)
         }
         pub fn activate(
             &self,
@@ -371,6 +538,59 @@ pub mod native {
                 epoch,
                 revoked_admissions,
             };
+            self.write_activation(&value)?;
+            Ok(value)
+        }
+
+        pub fn activate_v2(
+            &self,
+            registry: PolicyRegistryV2,
+            instance: Option<Nonce128>,
+        ) -> Result<ActivationV2, String> {
+            registry.validate()?;
+            self.check_capacity(&registry.canonical_digest()?)?;
+            self.retain_snapshot_v2(&registry)?;
+            let previous = self.read()?;
+            let revoked_admissions = Activation::next_revocations(
+                previous.as_ref(),
+                registry.active_attempt_disposition,
+                &self.live_bindings()?,
+            )?;
+            let epoch = match (instance, previous) {
+                (Some(service_instance), _) => PolicyEpoch {
+                    service_instance,
+                    revision: NonZeroU64::MIN,
+                },
+                (None, Some(previous)) => PolicyEpoch {
+                    service_instance: previous.epoch.service_instance,
+                    revision: NonZeroU64::new(
+                        previous
+                            .epoch
+                            .revision
+                            .get()
+                            .checked_add(1)
+                            .ok_or("policy revision exhausted")?,
+                    )
+                    .ok_or("zero policy revision")?,
+                },
+                (None, None) => PolicyEpoch {
+                    service_instance: random_nonce()?,
+                    revision: NonZeroU64::MIN,
+                },
+            };
+            let value = ActivationV2 {
+                schema_version: ContractVersionTwo::default(),
+                registry_digest: registry.canonical_digest()?,
+                registry,
+                epoch,
+                revoked_admissions,
+            };
+            value.validate()?;
+            self.write_activation(&value)?;
+            Ok(value)
+        }
+
+        fn write_activation<T: Serialize>(&self, value: &T) -> Result<(), String> {
             let mut bytes = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
             if bytes.len()
                 > memcordon_core::workload_limits::REGISTRY_BYTES
@@ -407,7 +627,7 @@ pub mod native {
             self.directory
                 .sync_all()
                 .map_err(|error| error.to_string())?;
-            Ok(value)
+            Ok(())
         }
     }
     impl Drop for Lease {
@@ -468,16 +688,24 @@ pub mod native {
 #[cfg(target_os = "linux")]
 pub fn start_service_instance() -> Result<(), String> {
     let lease = native::Lease::acquire()?;
-    let registry = match lease.read()? {
-        Some(previous) => previous.registry,
-        None => PolicyRegistryV1 {
-            schema_version: ContractVersionOne::default(),
-            profiles: BoundedVec::default(),
-            grants: BoundedVec::default(),
-            active_attempt_disposition:
-                memcordon_core::workload_registry::GrantChangeDisposition::DrainExisting,
-        },
-    };
-    lease.activate(registry, Some(native::random_nonce()?))?;
+    let instance = native::random_nonce()?;
+    match lease.read_any()? {
+        Some(VersionedActivation::V2(previous)) => {
+            lease.activate_v2(previous.registry, Some(instance))?;
+        }
+        previous => {
+            let registry = match previous {
+                Some(VersionedActivation::V1(previous)) => previous.registry,
+                _ => PolicyRegistryV1 {
+                    schema_version: ContractVersionOne::default(),
+                    profiles: BoundedVec::default(),
+                    grants: BoundedVec::default(),
+                    active_attempt_disposition:
+                        memcordon_core::workload_registry::GrantChangeDisposition::DrainExisting,
+                },
+            };
+            lease.activate(registry, Some(instance))?;
+        }
+    }
     Ok(())
 }

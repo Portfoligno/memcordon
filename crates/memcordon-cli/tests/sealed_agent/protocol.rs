@@ -1,5 +1,6 @@
 use crate::protocol::{
-    Frame, MessageKind, PROTOCOL_VERSION, ProtocolError, read_frame, write_frame,
+    Frame, MessageKind, NETWORK_PROTOCOL_VERSION, PROTOCOL_VERSION, ProtocolError, read_frame,
+    read_network_frame, write_frame, write_network_frame,
 };
 use crate::state::{AttemptState, AttemptStateMachine};
 
@@ -40,6 +41,31 @@ fn payload_corruption_is_rejected() {
     assert_eq!(
         read_frame(&mut bytes.as_slice()),
         Err(ProtocolError::PayloadDigestMismatch)
+    );
+}
+
+#[test]
+fn network_wire_four_is_not_accepted_on_legacy_wire_three() {
+    let frame = Frame {
+        kind: MessageKind::BrokerLaunch,
+        nonce: [4; 16],
+        attempt_id: [5; 16],
+        payload: vec![1, 2, 3],
+    };
+    let mut network = Vec::new();
+    write_network_frame(&mut network, &frame).unwrap();
+    assert_eq!(network[1], NETWORK_PROTOCOL_VERSION as u8);
+    assert_eq!(read_network_frame(&mut network.as_slice()).unwrap(), frame);
+    assert_eq!(
+        read_frame(&mut network.as_slice()),
+        Err(ProtocolError::UnsupportedVersion(NETWORK_PROTOCOL_VERSION))
+    );
+
+    let mut legacy = Vec::new();
+    write_frame(&mut legacy, &frame).unwrap();
+    assert_eq!(
+        read_network_frame(&mut legacy.as_slice()),
+        Err(ProtocolError::UnsupportedVersion(PROTOCOL_VERSION))
     );
 }
 

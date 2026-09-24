@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 use memcordon_ci::command::{CommandSpec, git, rustup_cargo};
 use memcordon_ci::runtime_manifest::{RuntimeManifestV2, SealedRuntimeV2};
 use memcordon_ci::scenario_diagnostic::BoundedStream;
+use memcordon_ci::windows_causal_acceptance::{self, InstalledChannel};
+#[cfg(windows)]
+use memcordon_ci::windows_causal_acceptance::{
+    CleanupEvidenceV1, FixtureExitEvidenceV1, InvocationEvidenceV1,
+};
 use memcordon_ci::windows_package_cleanup::{
     ActivePackageMutation, certify_active_package_mutation, complete_optional_install_cleanup,
 };
@@ -1540,6 +1545,33 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
     require_native_architecture()?;
     certify_causal_diagnostics(root, stable)?;
     let native = native_channel_binaries(root, stable)?;
+    let fixture = if native.provenance == NativeChannelProvenance::PublishedArchive {
+        rustup_cargo(
+            root,
+            stable,
+            [
+                "build",
+                "--locked",
+                "--target-dir",
+                "target/ci/windows-sealed-fixture",
+                "--package",
+                "memcordon",
+                "--features",
+                "test-fixtures",
+                "--bin",
+                "memcordon-test-fixture",
+                "--release",
+            ],
+            DEADLINE,
+        )
+        .run()?;
+        Some(root.join("target/ci/windows-sealed-fixture/release/memcordon-test-fixture.exe"))
+    } else {
+        eprintln!(
+            "Windows channel evaluation uses a development build; installed release acceptance is unavailable"
+        );
+        None
+    };
     let channel = root.join("target").join("ci").join("windows-sealed-cargo");
     fs::create_dir_all(&channel)?;
     write_native_qualification(
@@ -1608,6 +1640,9 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
         &native_agent,
         &native.root.join("memcordon.exe"),
         &native_evidence,
+        InstalledChannel::NativeBundle,
+        fixture.as_deref(),
+        native.target.as_deref(),
     )?;
     let cargo_rollback_verified = certify_rollback_with_cleanup(root, &agent)?;
     write_json(
@@ -1617,7 +1652,15 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
             "fresh_install_rollback_verified": cargo_rollback_verified,
         }),
     )?;
-    let cargo_fingerprint = channel_smoke(root, &agent, &cli, &channel)?;
+    let cargo_fingerprint = channel_smoke(
+        root,
+        &agent,
+        &cli,
+        &channel,
+        InstalledChannel::CargoPackage,
+        fixture.as_deref(),
+        native.target.as_deref(),
+    )?;
     write_json(&channel.join("cargo-fingerprint.json"), &cargo_fingerprint)?;
     write_json(
         &channel.join("native-fingerprint.json"),
@@ -1628,7 +1671,11 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
             "Cargo/native Windows sealed channel identity differs: cargo={cargo_fingerprint:?} native={native_fingerprint:?}"
         )));
     }
-    write_split_windows_release_certification(root, &channel, &native)
+    if native.provenance == NativeChannelProvenance::PublishedArchive {
+        write_split_windows_release_certification(root, &channel, &native)
+    } else {
+        Ok(())
+    }
 }
 
 fn certify_rollback_with_cleanup(root: &Path, agent: &Path) -> Result<bool> {
@@ -1681,6 +1728,16 @@ fn write_split_windows_release_certification(
     channel: &Path,
     native: &NativeChannel,
 ) -> Result<()> {
+    if native.provenance != NativeChannelProvenance::PublishedArchive
+        || native.target.is_none()
+        || native.archive_sha256.is_none()
+        || native.runtime_manifest_sha256.is_none()
+    {
+        return Err(CiError::Message(
+            "development-built Windows providers cannot produce installed release acceptance"
+                .to_owned(),
+        ));
+    }
     let reports = report_directory(root);
     let production = reports.join("loader-production");
     let lifecycle = reports.join("provider-lifecycle");
@@ -1725,6 +1782,32 @@ fn write_split_windows_release_certification(
             bindings.insert(name.into(), Value::String(sha256_file(&destination)?));
         }
     }
+    for (target, installed_channel, name, prefix) in
+        memcordon_ci::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS
+    {
+        if Some(target) != native.target.as_deref() {
+            continue;
+        }
+        let source = if installed_channel == InstalledChannel::NativeBundle.name() {
+            channel.join("native").join("causal")
+        } else {
+            channel.join("causal")
+        };
+        for filename in std::iter::once(name.to_owned()).chain(
+            windows_causal_acceptance::RAW_SUFFIXES
+                .into_iter()
+                .map(|suffix| windows_causal_acceptance::raw_name(prefix, suffix)),
+        ) {
+            if bindings.contains_key(&filename) {
+                return Err(CiError::Message(format!(
+                    "duplicate Windows release evidence destination: {filename}"
+                )));
+            }
+            let destination = evidence.join(&filename);
+            fs::copy(source.join(&filename), &destination)?;
+            bindings.insert(filename, Value::String(sha256_file(&destination)?));
+        }
+    }
     for (name, path) in required {
         let destination = evidence.join(name);
         fs::copy(&path, &destination)?;
@@ -1762,9 +1845,16 @@ fn write_split_windows_release_certification(
 
 struct NativeChannel {
     root: PathBuf,
+    provenance: NativeChannelProvenance,
     archive_sha256: Option<String>,
     runtime_manifest_sha256: Option<String>,
     target: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeChannelProvenance {
+    PublishedArchive,
+    DevelopmentBuild,
 }
 
 fn native_channel_binaries(root: &Path, stable: &str) -> Result<NativeChannel> {
@@ -1777,6 +1867,7 @@ fn native_channel_binaries(root: &Path, stable: &str) -> Result<NativeChannel> {
                 .join("ci")
                 .join("windows-sealed")
                 .join("release"),
+            provenance: NativeChannelProvenance::DevelopmentBuild,
             archive_sha256: None,
             runtime_manifest_sha256: None,
             target: None,
@@ -1896,6 +1987,7 @@ fn native_channel_binaries(root: &Path, stable: &str) -> Result<NativeChannel> {
     }
     Ok(NativeChannel {
         root: extracted,
+        provenance: NativeChannelProvenance::PublishedArchive,
         archive_sha256: Some(archive_sha256),
         runtime_manifest_sha256: Some(runtime_manifest_sha256),
         target: Some(manifest.target),
@@ -1942,6 +2034,9 @@ fn channel_smoke(
     agent: &Path,
     cli: &Path,
     channel: &Path,
+    installed_channel: InstalledChannel,
+    fixture: Option<&Path>,
+    target: Option<&str>,
 ) -> Result<ChannelFingerprint> {
     let lifecycle_report = channel.join("package-lifecycle.json");
     if lifecycle_report.exists() {
@@ -1954,8 +2049,18 @@ fn channel_smoke(
         .args(windows_ephemeral_install_arguments(channel))
         .run()
         .map(|_| ());
-    let primary =
-        install_result.and_then(|()| channel_smoke_installed(root, agent, cli, channel, package));
+    let primary = install_result.and_then(|()| {
+        channel_smoke_installed(
+            root,
+            agent,
+            cli,
+            channel,
+            package,
+            installed_channel,
+            fixture,
+            target,
+        )
+    });
     complete_optional_install_cleanup(
         primary,
         || installed_provider_image_present().map_err(CiError::Message),
@@ -2115,6 +2220,9 @@ fn channel_smoke_installed(
     cli: &Path,
     channel: &Path,
     package: Value,
+    installed_channel: InstalledChannel,
+    fixture: Option<&Path>,
+    target: Option<&str>,
 ) -> Result<ChannelFingerprint> {
     let stable = memcordon_ci::config::toolchains(root)?.stable;
     for name in memcordon_ci::workload_qualification::PROFILE_TESTS
@@ -2168,6 +2276,20 @@ fn channel_smoke_installed(
     let report: MemcordonReport = serde_json::from_slice(&fs::read(&report_path)?)?;
     validate_public_launch(&report, &qualification)?;
     let fingerprint = channel_fingerprint(package.clone(), &qualification, &launch_plan, &report)?;
+    if let (Some(fixture), Some(target)) = (fixture, target) {
+        certify_installed_causal_failure(
+            root,
+            agent,
+            cli,
+            channel,
+            installed_channel,
+            fixture,
+            target,
+            &package,
+            &qualification,
+            &fingerprint,
+        )?;
+    }
     certify_active_mutation(
         root,
         cli,
@@ -2205,6 +2327,314 @@ fn channel_smoke_installed(
         }),
     )?;
     Ok(fingerprint)
+}
+
+#[allow(clippy::too_many_arguments)] // Every argument is a separate installed identity or evidence class.
+#[cfg(windows)]
+fn certify_installed_causal_failure(
+    root: &Path,
+    agent: &Path,
+    cli: &Path,
+    channel_directory: &Path,
+    installed_channel: InstalledChannel,
+    fixture_source: &Path,
+    target: &str,
+    package: &Value,
+    qualification: &WindowsQualificationReceiptV1,
+    fingerprint: &ChannelFingerprint,
+) -> Result<()> {
+    let available = memcordon_testkit::windows_available_memory_bytes()?;
+    if available < 4 * 1024 * 1024 * 1024 {
+        return Err(CiError::Message(format!(
+            "installed causal fixture requires 4 GiB available memory; observed {available} bytes"
+        )));
+    }
+    let (_, _, artifact_name, prefix) =
+        memcordon_ci::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS
+            .iter()
+            .copied()
+            .find(|(entry_target, entry_channel, _, _)| {
+                *entry_target == target && *entry_channel == installed_channel.name()
+            })
+            .ok_or_else(|| {
+                CiError::Message("installed causal target/channel is not inventoried".to_owned())
+            })?;
+    let causal = channel_directory.join("causal");
+    fs::create_dir_all(&causal)?;
+    let staging = tempfile::Builder::new()
+        .prefix("inventory-fixture-")
+        .tempdir_in(&causal)?;
+    let fixture = staging.path().join("inventory-fixture.exe");
+    fs::copy(fixture_source, &fixture)?;
+    let fixture_sha256 = sha256_file(&fixture)?;
+    if fixture_sha256 != sha256_file(fixture_source)? {
+        return Err(CiError::Message(
+            "staged inventory fixture digest differs".to_owned(),
+        ));
+    }
+    let report_path = staging.path().join("report.json");
+    let mut errors = Vec::new();
+    let output = CommandSpec::new(cli, root, Duration::from_secs(180))
+        .args([
+            OsString::from("+4GiB"),
+            OsString::from("+120s"),
+            OsString::from("--sealed"),
+            OsString::from("--report"),
+            report_path.as_os_str().to_os_string(),
+            OsString::from("--"),
+            fixture.as_os_str().to_os_string(),
+            OsString::from("windows-inventory-capacity"),
+        ])
+        .output();
+    let (exit_code, timed_out, stdout, stderr) = match output {
+        Ok(output) => (output.status.code(), false, output.stdout, output.stderr),
+        Err(CiError::Process(memcordon_testkit::ProcessTestError::Timeout {
+            stdout,
+            stderr,
+            ..
+        })) => {
+            errors.push(
+                "installed causal public CLI exceeded the 180-second runner deadline".to_owned(),
+            );
+            (None, true, stdout, stderr)
+        }
+        Err(error) => {
+            errors.push(format!(
+                "installed causal public CLI could not complete: {error}"
+            ));
+            (None, false, Vec::new(), Vec::new())
+        }
+    };
+    let report = match fs::symlink_metadata(&report_path) {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && metadata.len() <= windows_causal_acceptance::MAX_REPORT_BYTES as u64 =>
+        {
+            fs::read(&report_path)?
+        }
+        Ok(_) => {
+            errors.push("installed causal report is non-regular or oversized".to_owned());
+            Vec::new()
+        }
+        Err(error) => {
+            errors.push(format!("installed causal report is unavailable: {error}"));
+            Vec::new()
+        }
+    };
+    let manifest_path = package
+        .get("binary_install_path")
+        .and_then(Value::as_str)
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+        .and_then(Path::parent)
+        .map(|parent| parent.join("runtime-manifest.json"));
+    let manifest = match manifest_path.as_deref() {
+        Some(path) => match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.file_type().is_file()
+                    && metadata.len() <= windows_causal_acceptance::MAX_MANIFEST_BYTES as u64 =>
+            {
+                fs::read(path)?
+            }
+            Ok(_) => {
+                errors.push("installed runtime manifest is non-regular or oversized".to_owned());
+                Vec::new()
+            }
+            Err(error) => {
+                errors.push(format!(
+                    "installed runtime manifest is unavailable: {error}"
+                ));
+                Vec::new()
+            }
+        },
+        None => {
+            errors.push("package inspection has no absolute installed image path".to_owned());
+            Vec::new()
+        }
+    };
+    for (suffix, bytes) in [
+        ("report.json", report.as_slice()),
+        ("stdout.bin", stdout.as_slice()),
+        ("stderr.bin", stderr.as_slice()),
+        ("runtime-manifest.json", manifest.as_slice()),
+    ] {
+        if let Err(error) = windows_causal_acceptance::write_raw(&causal, prefix, suffix, bytes) {
+            errors.push(error.to_string());
+        }
+    }
+    if exit_code.is_none_or(|code| code == 0) {
+        errors
+            .push("installed causal public CLI did not return a failed process status".to_owned());
+    }
+    if let Err(error) = windows_causal_acceptance::validate_report(
+        &report,
+        fingerprint.execution_report_schema,
+        &git_commit(root)?,
+        qualification,
+        &manifest,
+    ) {
+        errors.push(error.to_string());
+    }
+    if let Ok(parsed) = serde_json::from_slice::<MemcordonReport>(&report) {
+        if let Err(error) = validate_public_qualification_binding(&parsed, qualification) {
+            errors.push(error.to_string());
+        }
+    }
+    let readiness = windows_causal_acceptance::parse_fixture_readiness(&stdout);
+    if let Err(error) = &readiness {
+        errors.push(error.to_string());
+    }
+    let mut observed_family = readiness.unwrap_or_default();
+    observed_family.sort_by_key(|identity| (identity.ordinal, identity.pid, identity.birth));
+    let root_identity = observed_family
+        .iter()
+        .find(|identity| identity.ordinal.is_none())
+        .copied();
+    let mut retained_handles = Vec::new();
+    let mut observed_live = std::collections::BTreeSet::new();
+    let cleanup_deadline = Instant::now() + Duration::from_secs(30);
+    let mut all_gone = false;
+    loop {
+        match memcordon_testkit::windows_processes_for_image(&fixture) {
+            Ok(live) => {
+                if live.is_empty() {
+                    all_gone = true;
+                    break;
+                }
+                for process in live {
+                    if observed_live.insert((process.identity.pid, process.identity.birth)) {
+                        retained_handles.push(process);
+                    }
+                }
+            }
+            Err(error) => {
+                errors.push(format!(
+                    "native inventory fixture process inspection failed: {error}"
+                ));
+                break;
+            }
+        }
+        if Instant::now() >= cleanup_deadline {
+            errors.push(
+                "inventory fixture family remained live after provider cleanup deadline".to_owned(),
+            );
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let root_exited = match root_identity {
+        Some(identity) => memcordon_testkit::ProcessIdentity {
+            pid: identity.pid,
+            birth: identity.birth,
+        }
+        .still_exists()
+        .map(|alive| !alive)
+        .unwrap_or(false),
+        None => false,
+    };
+    if !root_exited || !all_gone {
+        errors.push(
+            "inventory fixture root or descendants were not independently observed gone".to_owned(),
+        );
+    }
+    let fixture_evidence = FixtureExitEvidenceV1 {
+        schema_version: 1,
+        image_sha256: fixture_sha256.clone(),
+        root_ready: root_identity.is_some(),
+        observed_family,
+        root_exited,
+        all_matching_processes_gone: all_gone,
+    };
+    let package_bytes = serde_json::to_vec_pretty(package)?;
+    let qualification_bytes = serde_json::to_vec_pretty(qualification)?;
+    let fixture_bytes = serde_json::to_vec_pretty(&fixture_evidence)?;
+    let invocation_bytes = serde_json::to_vec_pretty(&InvocationEvidenceV1 {
+        schema_version: 1,
+        exit_code,
+        runner_timed_out: timed_out,
+        cli_sha256: sha256_file(cli)?,
+        fixture_sha256: fixture_sha256.clone(),
+    })?;
+    for (suffix, bytes) in [
+        ("package.json", package_bytes.as_slice()),
+        ("qualification.json", qualification_bytes.as_slice()),
+        ("fixture.json", fixture_bytes.as_slice()),
+        ("invocation.json", invocation_bytes.as_slice()),
+    ] {
+        if let Err(error) = windows_causal_acceptance::write_raw(&causal, prefix, suffix, bytes) {
+            errors.push(error.to_string());
+        }
+    }
+    let attempts_empty = wait_for_attempts_empty(root, agent).is_ok();
+    if !attempts_empty {
+        errors.push("installed causal attempt authority did not quiesce".to_owned());
+    }
+    let recovered = verify_channel_installation(root, agent, package).is_ok();
+    if !recovered {
+        errors.push("installed causal package recovery/verification failed".to_owned());
+    }
+    let cleanup_bytes = serde_json::to_vec_pretty(&CleanupEvidenceV1 {
+        schema_version: 1,
+        attempts_empty,
+        package_recovered: recovered,
+    })?;
+    if let Err(error) =
+        windows_causal_acceptance::write_raw(&causal, prefix, "cleanup.json", &cleanup_bytes)
+    {
+        errors.push(error.to_string());
+    }
+    drop(retained_handles);
+    if errors.is_empty() {
+        windows_causal_acceptance::write_acceptance(
+            &causal,
+            prefix,
+            artifact_name,
+            &git_commit(root)?,
+            target,
+            installed_channel,
+            env!("CARGO_PKG_VERSION"),
+            fingerprint.execution_report_schema,
+            &fixture_sha256,
+        )?;
+        Ok(())
+    } else {
+        write_json(
+            &causal.join("failure-assessment.json"),
+            &serde_json::json!({
+                "schema_version": 1, "accepted": false, "errors": errors,
+            }),
+        )?;
+        Err(CiError::Message(
+            "installed causal acceptance failed; raw evidence and failure assessment retained"
+                .to_owned(),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(windows))]
+fn certify_installed_causal_failure(
+    _root: &Path,
+    _agent: &Path,
+    _cli: &Path,
+    _channel_directory: &Path,
+    _installed_channel: InstalledChannel,
+    _fixture_source: &Path,
+    _target: &str,
+    _package: &Value,
+    _qualification: &WindowsQualificationReceiptV1,
+    _fingerprint: &ChannelFingerprint,
+) -> Result<()> {
+    Err(CiError::Message(
+        "installed causal acceptance requires Windows".to_owned(),
+    ))
+}
+
+#[cfg(windows)]
+fn git_commit(root: &Path) -> Result<String> {
+    let commit = String::from_utf8(git(root, ["rev-parse", "HEAD"])?)
+        .map_err(|error| CiError::Message(format!("git commit identity was not UTF-8: {error}")))?;
+    Ok(commit.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 fn channel_fingerprint(

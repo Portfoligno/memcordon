@@ -1,4 +1,4 @@
-//! V1 canonical bytes: explicit domains/tags and big-endian lengths and integers.
+//! Canonical workload bytes: explicit domains/tags and big-endian lengths and integers.
 use crate::DiagnosticSha256;
 use crate::workload_contract::*;
 use sha2::{Digest, Sha256};
@@ -205,6 +205,51 @@ pub fn hash_bytes(bytes: &[u8]) -> DiagnosticSha256 {
 
 pub fn contract_digest(request: &WorkloadContractV1) -> Result<DiagnosticSha256, String> {
     encode_contract(request).map(|bytes| hash_bytes(&bytes))
+}
+
+/// V2 has a separate domain and appends an explicit identity variant after the
+/// unchanged ordered V1 logical fields. This does not modify V1 preimages.
+pub fn encode_contract_v2(request: &WorkloadContractV2) -> Result<Vec<u8>, String> {
+    request.validate()?;
+    let mut encoder = Encoder::new(
+        b"memcordon-workload-contract-v2",
+        crate::workload_limits::CONTRACT_BYTES,
+    )?;
+    encoder.digest(&request.workload_plan_digest)?;
+    encoder.id(&request.authorized_profile.id)?;
+    encoder.digest(&request.authorized_profile.semantic_digest)?;
+    encoder.id(&request.authorization.grant_id)?;
+    encoder.u64(request.authorization.grant_revision.get())?;
+    encoder.digest(&request.authorization.approved_plan_digest)?;
+    encode_ceiling(&mut encoder, &request.ceiling)?;
+    let mut requirements: Vec<_> = request.requirements.as_slice().iter().collect();
+    requirements.sort_by_key(|value| value.id());
+    encoder.count(requirements.len())?;
+    for value in requirements {
+        requirement(&mut encoder, value)?;
+    }
+    let mut endpoints: Vec<_> = request.endpoints.as_slice().iter().collect();
+    endpoints.sort_by_key(|value| &value.id);
+    encoder.count(endpoints.len())?;
+    for endpoint in endpoints {
+        encoder.id(&endpoint.id)?;
+        encoder.id(&endpoint.requirement)?;
+    }
+    encoder.raw(&request.expected_epoch.service_instance.0)?;
+    encoder.u64(request.expected_epoch.revision.get())?;
+    match &request.execution_identity {
+        ExecutionIdentityRequestV2::PreserveCaller => encoder.byte(1)?,
+        ExecutionIdentityRequestV2::AdministratorProfile { reference } => {
+            encoder.byte(2)?;
+            encoder.id(&reference.id)?;
+            encoder.digest(&reference.semantic_digest)?;
+        }
+    }
+    Ok(encoder.finish())
+}
+
+pub fn contract_digest_v2(request: &WorkloadContractV2) -> Result<DiagnosticSha256, String> {
+    encode_contract_v2(request).map(|bytes| hash_bytes(&bytes))
 }
 
 struct Decoder<'a> {
@@ -455,6 +500,85 @@ pub fn decode_contract(bytes: &[u8]) -> Result<WorkloadContractV1, String> {
     };
     request.validate()?;
     if encode_contract(&request)?.as_slice() != bytes {
+        return Err("noncanonical workload set order".into());
+    }
+    Ok(request)
+}
+
+/// Strict inverse of the V2 semantic bytes; unknown identity tags reject.
+pub fn decode_contract_v2(bytes: &[u8]) -> Result<WorkloadContractV2, String> {
+    if bytes.len() > crate::workload_limits::CONTRACT_BYTES {
+        return Err("canonical workload exceeds byte limit".into());
+    }
+    const DOMAIN: &[u8] = b"memcordon-workload-contract-v2\0";
+    let mut decoder = Decoder { remaining: bytes };
+    if decoder.take(DOMAIN.len())? != DOMAIN || decoder.u16()? != 1 {
+        return Err("canonical workload domain or version differs".into());
+    }
+    let workload_plan_digest = decoder.digest()?;
+    let authorized_profile = ProfileRef {
+        id: decoder.id()?,
+        semantic_digest: decoder.digest()?,
+    };
+    let authorization = AuthorizationRef {
+        grant_id: decoder.id()?,
+        grant_revision: decoder.revision()?,
+        approved_plan_digest: decoder.digest()?,
+    };
+    let ceiling = decoder.ceiling()?;
+    let count = usize::from(decoder.u16()?);
+    if count > crate::workload_limits::REQUIREMENTS {
+        return Err("canonical requirement count exceeds bound".into());
+    }
+    let mut requirements = crate::BoundedVec::default();
+    for _ in 0..count {
+        requirements
+            .try_push(decoder.requirement()?)
+            .map_err(|_| "canonical requirement count exceeds bound")?;
+    }
+    let count = usize::from(decoder.u16()?);
+    if count > crate::workload_limits::ENDPOINTS {
+        return Err("canonical endpoint count exceeds bound".into());
+    }
+    let mut endpoints = crate::BoundedVec::default();
+    for _ in 0..count {
+        endpoints
+            .try_push(EndpointDeclarationV1 {
+                id: decoder.id()?,
+                requirement: decoder.id()?,
+            })
+            .map_err(|_| "canonical endpoint count exceeds bound")?;
+    }
+    let expected_epoch = PolicyEpoch {
+        service_instance: Nonce128(decoder.fixed()?),
+        revision: decoder.revision()?,
+    };
+    let execution_identity = match decoder.byte()? {
+        1 => ExecutionIdentityRequestV2::PreserveCaller,
+        2 => ExecutionIdentityRequestV2::AdministratorProfile {
+            reference: ExecutionIdentityRefV2 {
+                id: decoder.id()?,
+                semantic_digest: decoder.digest()?,
+            },
+        },
+        _ => return Err("unknown canonical execution identity tag".into()),
+    };
+    if !decoder.remaining.is_empty() {
+        return Err("unknown trailing canonical bytes".into());
+    }
+    let request = WorkloadContractV2 {
+        schema_version: ContractVersionTwo::default(),
+        workload_plan_digest,
+        authorized_profile,
+        authorization,
+        ceiling,
+        requirements,
+        endpoints,
+        expected_epoch,
+        execution_identity,
+    };
+    request.validate()?;
+    if encode_contract_v2(&request)?.as_slice() != bytes {
         return Err("noncanonical workload set order".into());
     }
     Ok(request)

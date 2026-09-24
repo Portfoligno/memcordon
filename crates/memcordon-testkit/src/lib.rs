@@ -5,6 +5,11 @@ pub use memcordon_platform::test_support::unsearchable_directory;
 
 #[cfg(target_os = "macos")]
 pub use memcordon_platform::test_support::macos_read_only_descriptor_path;
+#[cfg(windows)]
+pub use memcordon_platform::test_support::{
+    ProcessIdentity, WindowsImageProcess, windows_available_memory_bytes,
+    windows_processes_for_image,
+};
 
 use std::fmt;
 use std::io::{self, Read};

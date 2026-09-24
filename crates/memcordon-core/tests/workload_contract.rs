@@ -290,6 +290,84 @@ fn successful_tcp_rejects_but_qualified_denial_is_admitted() {
 }
 
 #[test]
+fn exact_tcp_peer_scope_rejects_nonloopback_and_mapped_addresses() {
+    let cases = [
+        (
+            TcpScope::HostSharedLoopback,
+            IpFamily::V4,
+            TcpEndpoint::V4 {
+                address: [127, 0, 0, 1],
+                port: 80.try_into().unwrap(),
+            },
+            true,
+        ),
+        (
+            TcpScope::HostSharedLoopback,
+            IpFamily::V4,
+            TcpEndpoint::V4 {
+                address: [192, 0, 2, 1],
+                port: 80.try_into().unwrap(),
+            },
+            false,
+        ),
+        (
+            TcpScope::HostSharedLoopback,
+            IpFamily::V6,
+            TcpEndpoint::V6 {
+                address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                port: 80.try_into().unwrap(),
+            },
+            true,
+        ),
+        (
+            TcpScope::HostSharedLoopback,
+            IpFamily::V6,
+            TcpEndpoint::V6 {
+                address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+                port: 80.try_into().unwrap(),
+            },
+            false,
+        ),
+        (
+            TcpScope::AttemptPrivateStack,
+            IpFamily::V6,
+            TcpEndpoint::V6 {
+                address: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 0, 0, 1],
+                port: 80.try_into().unwrap(),
+            },
+            false,
+        ),
+        (
+            TcpScope::AttemptPrivateStack,
+            IpFamily::V4,
+            TcpEndpoint::V4 {
+                address: [192, 0, 2, 1],
+                port: 80.try_into().unwrap(),
+            },
+            true,
+        ),
+    ];
+    for (scope, family, endpoint, valid) in cases {
+        let mut value = request();
+        let mut operations = BoundedVec::default();
+        operations.try_push(TcpOperation::Create).unwrap();
+        operations.try_push(TcpOperation::Connect).unwrap();
+        value
+            .requirements
+            .try_push(RequirementV1::Tcp {
+                id: id("tcp"),
+                family,
+                operations: TcpOperations::new(operations).unwrap(),
+                scope,
+                local_ports: LocalPortRequirement::KernelAssigned,
+                peer: TcpPeerRequirement::ExactAddress { endpoint },
+            })
+            .unwrap();
+        assert_eq!(value.validate().is_ok(), valid);
+    }
+}
+
+#[test]
 fn strict_parser_rejects_duplicate_keys_versions_and_oversized_input() {
     let bytes = serde_json::to_vec(&request()).unwrap();
     assert!(WorkloadContractV1::parse(&bytes).is_ok());

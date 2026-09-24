@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[path = "release/installed_causal_fixture.rs"]
+mod installed_causal_fixture;
 #[path = "support/standard.rs"]
 mod standard_fixture;
 
@@ -190,7 +192,15 @@ fn write_certification_fixture(output: &Path, manifest: &mut Value) {
             .unwrap(),
         );
     }
-    assert_eq!(records.len(), 19);
+    for (key, record) in
+        installed_causal_fixture::write_installed_causal_fixture(output, &origin.source_commit)
+    {
+        records.insert(
+            key,
+            serde_json::to_value(record).expect("causal record should serialize"),
+        );
+    }
+    assert_eq!(records.len(), 59);
     manifest["certification"] = Value::Object(records);
 }
 
