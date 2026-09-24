@@ -275,15 +275,43 @@ pub(super) fn write_installed_causal_fixture(
     let receipt = qualification();
     let receipt_bytes = serde_json::to_vec_pretty(&receipt).expect("serialize qualification");
     let fixture_sha256 = "cc".repeat(32);
+    let family = std::iter::once(FixtureProcessIdentityV1 {
+        ordinal: None,
+        pid: 41,
+        birth: 101,
+    })
+    .chain(
+        (0..memcordon_core::WINDOWS_MAX_JOB_PROCESS_IDENTITIES).map(|ordinal| {
+            FixtureProcessIdentityV1 {
+                ordinal: Some(ordinal),
+                pid: u32::try_from(ordinal).expect("fixture ordinal fits u32") + 42,
+                birth: u128::try_from(ordinal).expect("fixture ordinal fits u128") + 102,
+            }
+        }),
+    )
+    .collect::<Vec<_>>();
+    let mut stdout_bytes = Vec::new();
+    for identity in &family {
+        let kind = if identity.ordinal.is_some() {
+            "inventory-leaf-ready"
+        } else {
+            "inventory-root-ready"
+        };
+        let line = json!({
+            "kind": kind,
+            "ordinal": identity.ordinal,
+            "pid": identity.pid,
+            "birth": identity.birth,
+        });
+        stdout_bytes.extend_from_slice(b"MEMCORDON-INVENTORY-READY:");
+        stdout_bytes.extend_from_slice(line.to_string().as_bytes());
+        stdout_bytes.push(b'\n');
+    }
     let fixture_bytes = serde_json::to_vec_pretty(&FixtureExitEvidenceV1 {
         schema_version: 1,
         image_sha256: fixture_sha256.clone(),
         root_ready: true,
-        observed_family: vec![FixtureProcessIdentityV1 {
-            ordinal: None,
-            pid: 41,
-            birth: 101,
-        }],
+        observed_family: family,
         root_exited: true,
         all_matching_processes_gone: true,
     })
@@ -310,14 +338,24 @@ pub(super) fn write_installed_causal_fixture(
             env!("CARGO_PKG_VERSION").into(),
             source_commit.into(),
             target.into(),
-            vec![RuntimeComponentRecord {
-                id: "sealed-agent".into(),
-                path: "memcordon-sealed-agent.exe".into(),
-                role: RuntimeComponentRole::SealedAgent,
-                size: 1,
-                mode: 0,
-                sha256: "aa".repeat(32),
-            }],
+            vec![
+                RuntimeComponentRecord {
+                    id: "public-cli".into(),
+                    path: "memcordon.exe".into(),
+                    role: RuntimeComponentRole::PublicCli,
+                    size: 1,
+                    mode: 0,
+                    sha256: "dd".repeat(32),
+                },
+                RuntimeComponentRecord {
+                    id: "sealed-agent".into(),
+                    path: "memcordon-sealed-agent.exe".into(),
+                    role: RuntimeComponentRole::SealedAgent,
+                    size: 1,
+                    mode: 0,
+                    sha256: "aa".repeat(32),
+                },
+            ],
         );
         let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
         let report_bytes = serde_json::to_vec_pretty(&failed_report(&receipt, &manifest_bytes))
@@ -331,7 +369,7 @@ pub(super) fn write_installed_causal_fixture(
         .expect("serialize package inventory");
         for (suffix, bytes) in [
             ("report.json", report_bytes.as_slice()),
-            ("stdout.bin", b"fixture readiness retained\n".as_slice()),
+            ("stdout.bin", stdout_bytes.as_slice()),
             ("stderr.bin", b"".as_slice()),
             ("package.json", package_bytes.as_slice()),
             ("qualification.json", receipt_bytes.as_slice()),

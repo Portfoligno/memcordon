@@ -1,5 +1,7 @@
 use memcordon_ci::workload_qualification::{
-    ARTIFACTS, QualificationArtifactV1, QualificationKind, reject_proposed_private_qualification_v2,
+    ARTIFACTS, PRIVATE_V2_ARTIFACTS, QualificationArtifactV1, QualificationKind,
+    reject_proposed_private_qualification_v2,
+    validate_private_v2_against_trusted_native_completions,
 };
 use memcordon_core::runtime_manifest_v3::{
     QualificationArtifactReferenceV2, QualificationArtifactSchemaTwo,
@@ -132,6 +134,65 @@ fn even_structurally_valid_proposed_private_qualification_is_not_release_authori
     let error = reject_proposed_private_qualification_v2(&bytes, &reference(&bytes), &expected)
         .unwrap_err();
     assert!(error.to_string().contains("not accepted"));
+}
+
+#[test]
+fn private_v2_acceptance_requires_every_checked_in_native_completion() {
+    let mut fixture = Fixture::new();
+    let inventory: toml::Value =
+        toml::from_str(include_str!("../../../ci/private-native-v2.toml")).unwrap();
+    let names: Vec<&str> = inventory["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    let digests: Vec<DiagnosticSha256> = names
+        .iter()
+        .map(|name| hash_bytes(name.as_bytes()))
+        .collect();
+    let completions: Vec<TrustedNativeCompletionV2<'_>> = names
+        .iter()
+        .zip(&digests)
+        .map(|(name, digest)| TrustedNativeCompletionV2 {
+            name,
+            target: X64,
+            native_executed: true,
+            completion_digest: digest,
+        })
+        .collect();
+    let mut observed = BoundedVec::default();
+    for completion in &completions {
+        observed
+            .try_push(ObservedNativeTestV2 {
+                name: BoundedText::new(completion.name).unwrap(),
+                target: BoundedText::new(X64).unwrap(),
+                outcome: NativeTestOutcomeV2::Passed,
+                runner_completion_digest: completion.completion_digest.clone(),
+            })
+            .unwrap();
+    }
+    fixture.artifact.observed_results = observed;
+    fixture.artifact.test_inventory_digest = inventory_digest(&completions).unwrap();
+    let bytes = serde_json::to_vec(&fixture.artifact).unwrap();
+    let mut reference = reference(&bytes);
+    reference.artifact = PRIVATE_V2_ARTIFACTS[1].1.into();
+    let expected = fixture.expected(&completions);
+    assert!(
+        validate_private_v2_against_trusted_native_completions(&bytes, &reference, &expected)
+            .is_ok()
+    );
+    let mut wrong_target = reference.clone();
+    wrong_target.qualified_target = ARM64.into();
+    assert!(
+        validate_private_v2_against_trusted_native_completions(&bytes, &wrong_target, &expected)
+            .is_err()
+    );
+    let missing = fixture.expected(&completions[1..]);
+    assert!(
+        validate_private_v2_against_trusted_native_completions(&bytes, &reference, &missing)
+            .is_err()
+    );
 }
 
 #[test]

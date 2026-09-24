@@ -1,0 +1,30 @@
+schema_version = 1
+profile = "linux-tcp4-private-v1"
+targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+tests = [
+  "private_tcp::abi_alternate_entry_denied",
+  "private_tcp::af_unix_abstract_and_pathname_denied",
+  "private_tcp::af_unix_socketpair_denied",
+  "private_tcp::authorization_uncertainty_retired",
+  "private_tcp::caller_identity_and_epoch_bound",
+  "private_tcp::checkpoint_persisted_before_release",
+  "private_tcp::child_runtime_and_threads_retired",
+  "private_tcp::descriptor_table_and_stdio_bound",
+  "private_tcp::dual_attempt_namespace_isolation",
+  "private_tcp::elf_ancestor_and_identity_pinned",
+  "private_tcp::frontend_loss_retired",
+  "private_tcp::guardian_loss_retired",
+  "private_tcp::host_namespace_and_sysctl_unchanged",
+  "private_tcp::io_uring_and_pidfd_import_denied",
+  "private_tcp::namespace_reentry_denied",
+  "private_tcp::native_filter_digest_and_abi_bound",
+  "private_tcp::native_tcp_bind_listen_connect",
+  "private_tcp::port_collision_same_namespace",
+  "private_tcp::private_namespace_topology_exact",
+  "private_tcp::release_checkpoint_terminal_joined",
+  "private_tcp::retirement_failure_blocks_reuse",
+  "private_tcp::scm_rights_and_precreated_socket_denied",
+  "private_tcp::target_credentials_and_capabilities_dropped",
+  "private_tcp::target_exec_and_fd_leak_observed",
+  "private_tcp::wrong_grant_profile_and_port_rejected",
+]

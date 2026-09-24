@@ -1,6 +1,7 @@
 use memcordon_core::runtime_manifest::{
     RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifestV2,
 };
+use memcordon_core::runtime_manifest_v3::{RuntimeManifestV3, VersionedRuntimeManifest};
 use std::{
     fs::File,
     io::Read,
@@ -9,6 +10,7 @@ use std::{
 };
 
 pub const INSTALLED: &str = "/usr/libexec/memcordon-runtime-manifest.json";
+const V3_IMAGE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 pub(crate) fn target() -> Result<&'static str, String> {
     match (std::env::consts::ARCH, cfg!(target_env = "musl")) {
@@ -24,7 +26,7 @@ fn digest(bytes: &[u8]) -> String {
     memcordon_core::workload_codec::hash_bytes(bytes).into()
 }
 
-fn manifest_bytes(path: &Path, protected: bool) -> Result<Vec<u8>, String> {
+pub(crate) fn manifest_bytes(path: &Path, protected: bool) -> Result<Vec<u8>, String> {
     let file = File::options()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -45,6 +47,126 @@ fn manifest_bytes(path: &Path, protected: bool) -> Result<Vec<u8>, String> {
         return Err("runtime manifest exceeds limit".into());
     }
     Ok(bytes)
+}
+
+/// Reads an explicitly supplied V3 generation and independently verifies both
+/// executable images. Absence preserves the historical V2 package path.
+pub fn source_v3(source: &Path) -> Result<Option<(RuntimeManifestV3, Vec<u8>)>, String> {
+    let installed = source == Path::new("/usr/libexec/memcordon-sealed-agent");
+    let path = if installed {
+        Path::new(INSTALLED).to_path_buf()
+    } else {
+        source
+            .parent()
+            .ok_or("provider source has no parent")?
+            .join("runtime-manifest.json")
+    };
+    let bytes = match manifest_bytes(&path, installed) {
+        Ok(bytes) => bytes,
+        Err(error) => match std::fs::symlink_metadata(&path) {
+            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound && !installed => {
+                return Ok(None);
+            }
+            _ => return Err(error),
+        },
+    };
+    match VersionedRuntimeManifest::parse(&bytes)? {
+        VersionedRuntimeManifest::V2(_) => Ok(None),
+        VersionedRuntimeManifest::V3(_) => {
+            let public_path = if installed {
+                Path::new("/usr/bin/memcordon").to_path_buf()
+            } else {
+                source
+                    .parent()
+                    .expect("V3 source already has a parent")
+                    .join("memcordon")
+            };
+            let agent_bytes = read_v3_image(source, installed)?;
+            let public_bytes = read_v3_image(&public_path, installed)?;
+            let manifest = validate_v3_source(&bytes, &agent_bytes, &public_bytes)?;
+            Ok(Some((manifest, bytes)))
+        }
+    }
+}
+
+fn read_v3_image(path: &Path, protected: bool) -> Result<Vec<u8>, String> {
+    let mut file = File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o755
+        || (protected && metadata.uid() != 0)
+        || metadata.len() > V3_IMAGE_MAX_BYTES
+    {
+        return Err("V3 executable image is not an exact protected regular file".into());
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(V3_IMAGE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let after = file.metadata().map_err(|error| error.to_string())?;
+    if bytes.len() as u64 != metadata.len()
+        || (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec(),
+            after.ctime(),
+            after.ctime_nsec(),
+        ) != (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    {
+        return Err("V3 executable image changed during readback".into());
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn validate_v3_source(
+    bytes: &[u8],
+    agent_bytes: &[u8],
+    public_bytes: &[u8],
+) -> Result<RuntimeManifestV3, String> {
+    let manifest = RuntimeManifestV3::parse(bytes)?;
+    let expected = RuntimeManifestV3::linux_unqualified(
+        env!("CARGO_PKG_VERSION").into(),
+        crate::SOURCE_COMMIT.into(),
+        target()?.into(),
+        vec![
+            RuntimeComponentRecord {
+                id: "public-cli".into(),
+                path: "memcordon".into(),
+                role: RuntimeComponentRole::PublicCli,
+                size: public_bytes.len() as u64,
+                mode: 0o755,
+                sha256: digest(public_bytes),
+            },
+            RuntimeComponentRecord {
+                id: "sealed-agent".into(),
+                path: "memcordon-sealed-agent".into(),
+                role: RuntimeComponentRole::SealedAgent,
+                size: agent_bytes.len() as u64,
+                mode: 0o755,
+                sha256: digest(agent_bytes),
+            },
+        ],
+    )?;
+    if manifest != expected {
+        return Err("V3 runtime generation differs from exact executable images".into());
+    }
+    Ok(manifest)
 }
 
 pub fn source(source: &Path, agent_bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -144,6 +266,15 @@ pub fn installed_binding() -> Result<memcordon_core::PublicProviderBindingV1, St
     let installed_digest =
         crate::package::sha256_regular_no_follow(Path::new("/usr/libexec/memcordon-sealed-agent"))?;
     crate::package::verify_installed_executable_digest(&agent.sha256, &installed_digest)?;
+    manifest.public_binding(&bytes)
+}
+
+/// V3 binding is separate from the active V2 route until package installation
+/// and host V4 qualification can consume the same verified generation.
+pub fn installed_binding_v3() -> Result<memcordon_core::PublicProviderBindingV1, String> {
+    crate::package::verify()?;
+    let (manifest, bytes) = source_v3(Path::new("/usr/libexec/memcordon-sealed-agent"))?
+        .ok_or("installed runtime generation is not V3")?;
     manifest.public_binding(&bytes)
 }
 

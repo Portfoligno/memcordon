@@ -36,6 +36,16 @@ fn request() -> WorkloadContractV2 {
     }
 }
 
+#[test]
+fn v2_fuzz_seeds_reach_strict_version_dispatch() {
+    let request = include_bytes!("../../../fuzz/corpus/workload-request/baseline-v2.json");
+    let registry = include_bytes!("../../../fuzz/corpus/workload-registry/authorized-v2.json");
+    assert!(WorkloadContractV2::parse(request).is_ok());
+    assert!(WorkloadContractV1::parse(request).is_err());
+    assert!(PolicyRegistryV2::parse(registry).is_ok());
+    assert!(memcordon_core::workload_registry::PolicyRegistryV1::parse(registry).is_err());
+}
+
 fn identity() -> LinuxExecutionIdentityV2 {
     let mut entrypoints = BoundedVec::default();
     entrypoints

@@ -13,6 +13,8 @@ pub mod runtime_evidence;
 pub mod runtime_manifest;
 pub mod runtime_manifest_v3;
 pub use runtime_evidence::*;
+pub mod report_v11;
+pub mod workload_admission_v2;
 pub mod workload_codec;
 pub mod workload_contract;
 pub mod workload_discovery;

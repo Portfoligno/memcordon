@@ -1116,14 +1116,24 @@ fn write_installed_causal_artifacts(
         env!("CARGO_PKG_VERSION").to_owned(),
         COMMIT.to_owned(),
         target.to_owned(),
-        vec![RuntimeComponentRecord {
-            id: "sealed-agent".to_owned(),
-            path: "memcordon-sealed-agent.exe".to_owned(),
-            role: RuntimeComponentRole::SealedAgent,
-            size: 1,
-            mode: 0,
-            sha256: "aa".repeat(32),
-        }],
+        vec![
+            RuntimeComponentRecord {
+                id: "public-cli".to_owned(),
+                path: "memcordon.exe".to_owned(),
+                role: RuntimeComponentRole::PublicCli,
+                size: 1,
+                mode: 0,
+                sha256: "dd".repeat(32),
+            },
+            RuntimeComponentRecord {
+                id: "sealed-agent".to_owned(),
+                path: "memcordon-sealed-agent.exe".to_owned(),
+                role: RuntimeComponentRole::SealedAgent,
+                size: 1,
+                mode: 0,
+                sha256: "aa".repeat(32),
+            },
+        ],
     );
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize fixture manifest");
     let report = installed_causal_report(&qualification, &manifest_bytes);
@@ -1133,15 +1143,43 @@ fn write_installed_causal_artifacts(
     let qualification_bytes =
         serde_json::to_vec_pretty(&qualification).expect("serialize native qualification");
     let fixture_sha256 = "cc".repeat(32);
+    let family = std::iter::once(FixtureProcessIdentityV1 {
+        ordinal: None,
+        pid: 41,
+        birth: 101,
+    })
+    .chain(
+        (0..memcordon_core::WINDOWS_MAX_JOB_PROCESS_IDENTITIES).map(|ordinal| {
+            FixtureProcessIdentityV1 {
+                ordinal: Some(ordinal),
+                pid: u32::try_from(ordinal).expect("fixture ordinal fits u32") + 42,
+                birth: u128::try_from(ordinal).expect("fixture ordinal fits u128") + 102,
+            }
+        }),
+    )
+    .collect::<Vec<_>>();
+    let mut stdout_bytes = Vec::new();
+    for identity in &family {
+        let kind = if identity.ordinal.is_some() {
+            "inventory-leaf-ready"
+        } else {
+            "inventory-root-ready"
+        };
+        let line = json!({
+            "kind": kind,
+            "ordinal": identity.ordinal,
+            "pid": identity.pid,
+            "birth": identity.birth,
+        });
+        stdout_bytes.extend_from_slice(b"MEMCORDON-INVENTORY-READY:");
+        stdout_bytes.extend_from_slice(line.to_string().as_bytes());
+        stdout_bytes.push(b'\n');
+    }
     let fixture_bytes = serde_json::to_vec_pretty(&FixtureExitEvidenceV1 {
         schema_version: 1,
         image_sha256: fixture_sha256.clone(),
         root_ready: true,
-        observed_family: vec![FixtureProcessIdentityV1 {
-            ordinal: None,
-            pid: 41,
-            birth: 101,
-        }],
+        observed_family: family,
         root_exited: true,
         all_matching_processes_gone: true,
     })
@@ -1168,7 +1206,7 @@ fn write_installed_causal_artifacts(
         }
         for (suffix, bytes) in [
             ("report.json", report_bytes.as_slice()),
-            ("stdout.bin", b"fixture readiness retained\n".as_slice()),
+            ("stdout.bin", stdout_bytes.as_slice()),
             ("stderr.bin", b"".as_slice()),
             ("package.json", package_bytes.as_slice()),
             ("qualification.json", qualification_bytes.as_slice()),
@@ -1915,6 +1953,86 @@ fn installed_causal_cross_target_substitution_fails_even_with_updated_outer_hash
         &certificate,
     );
     assert!(collect_certification(&input, &output, COMMIT).is_err());
+}
+
+#[test]
+fn installed_causal_rejects_cli_substitution_with_rehashed_raw_evidence() {
+    use memcordon_ci::windows_causal_acceptance::{InstalledChannel, validate_artifact_with_raw};
+
+    let (temporary, _, _, _) = fixture();
+    let evidence = temporary
+        .path()
+        .join("input/release-windows-package-channel-x64/release-evidence");
+    let prefix = "windows-x64-installed-causal-native";
+    let invocation_name = format!("{prefix}-invocation.json");
+    let mut invocation: Value = serde_json::from_slice(
+        &fs::read(evidence.join(&invocation_name)).expect("read retained invocation"),
+    )
+    .expect("parse retained invocation");
+    invocation["cli_sha256"] = json!("ee".repeat(32));
+    let invocation_bytes = serde_json::to_vec_pretty(&invocation).expect("serialize mutation");
+    fs::write(evidence.join(&invocation_name), &invocation_bytes)
+        .expect("write retained invocation mutation");
+    let mut summary: Value = serde_json::from_slice(
+        &fs::read(evidence.join(format!("{prefix}.json"))).expect("read acceptance summary"),
+    )
+    .expect("parse acceptance summary");
+    summary["raw_evidence"]["invocation.json"] =
+        json!(hex::encode(Sha256::digest(&invocation_bytes)));
+    let summary_bytes = serde_json::to_vec(&summary).expect("serialize acceptance mutation");
+    assert!(
+        validate_artifact_with_raw(
+            &summary_bytes,
+            COMMIT,
+            "x86_64-pc-windows-msvc",
+            InstalledChannel::NativeBundle,
+            |suffix| Ok(fs::read(evidence.join(format!("{prefix}-{suffix}")))?),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn installed_causal_report_rejects_manifest_schema_substitution() {
+    use memcordon_ci::windows_causal_acceptance::validate_report;
+
+    let (temporary, _, _, _) = fixture();
+    let evidence = temporary
+        .path()
+        .join("input/release-windows-package-channel-x64/release-evidence");
+    let prefix = "windows-x64-installed-causal-native";
+    let report =
+        fs::read(evidence.join(format!("{prefix}-report.json"))).expect("read retained report");
+    let qualification: memcordon_core::WindowsQualificationReceiptV1 = serde_json::from_slice(
+        &fs::read(evidence.join(format!("{prefix}-qualification.json")))
+            .expect("read retained qualification"),
+    )
+    .expect("parse retained qualification");
+    let manifest = fs::read(evidence.join(format!("{prefix}-runtime-manifest.json")))
+        .expect("read retained manifest");
+    validate_report(
+        &report,
+        memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
+        COMMIT,
+        &qualification,
+        &manifest,
+    )
+    .expect("unchanged manifest and report agree");
+    let mut substituted: Value = serde_json::from_slice(&manifest).expect("parse manifest");
+    substituted["sealed"]["execution_report_schema"] = json!(11);
+    let error = validate_report(
+        &report,
+        memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION,
+        COMMIT,
+        &qualification,
+        &serde_json::to_vec(&substituted).expect("serialize changed manifest"),
+    );
+    assert!(
+        error
+            .expect_err("changed manifest schema must be rejected")
+            .to_string()
+            .contains("runtime manifest report schema")
+    );
 }
 
 #[test]

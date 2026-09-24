@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use memcordon_ci::windows_causal_acceptance::{
-    ASSERTIONS, InstalledCausalAcceptanceV1, InstalledChannel, RAW_SUFFIXES,
-    parse_fixture_readiness, validate_artifact_with_raw,
+    ASSERTIONS, FixtureProcessIdentityV1, InstalledCausalAcceptanceV1, InstalledChannel,
+    RAW_SUFFIXES, parse_fixture_readiness, validate_artifact_with_raw, validate_fixture_family,
 };
 
 fn candidate() -> InstalledCausalAcceptanceV1 {
@@ -141,4 +141,56 @@ fn inventory_readiness_rejects_duplicate_ordinals_and_malformed_records() {
     assert!(parse_fixture_readiness(malformed).is_err());
     let overflow = b"MEMCORDON-INVENTORY-READY:{\"kind\":\"inventory-leaf-ready\",\"ordinal\":256,\"pid\":42,\"birth\":101}\n";
     assert!(parse_fixture_readiness(overflow).is_err());
+}
+
+#[test]
+fn installed_family_requires_every_leaf_and_matching_raw_readiness() {
+    let family = std::iter::once(FixtureProcessIdentityV1 {
+        ordinal: None,
+        pid: 41,
+        birth: 101,
+    })
+    .chain(
+        (0..memcordon_core::WINDOWS_MAX_JOB_PROCESS_IDENTITIES).map(|ordinal| {
+            FixtureProcessIdentityV1 {
+                ordinal: Some(ordinal),
+                pid: u32::try_from(ordinal).expect("ordinal fits u32") + 42,
+                birth: u128::try_from(ordinal).expect("ordinal fits u128") + 102,
+            }
+        }),
+    )
+    .collect::<Vec<_>>();
+    let mut stdout = Vec::new();
+    for member in &family {
+        let kind = if member.ordinal.is_some() {
+            "inventory-leaf-ready"
+        } else {
+            "inventory-root-ready"
+        };
+        let line = serde_json::json!({
+            "kind": kind,
+            "ordinal": member.ordinal,
+            "pid": member.pid,
+            "birth": member.birth,
+        });
+        stdout.extend_from_slice(b"MEMCORDON-INVENTORY-READY:");
+        stdout.extend_from_slice(line.to_string().as_bytes());
+        stdout.push(b'\n');
+    }
+    validate_fixture_family(&stdout, &family).expect("complete observed family is valid");
+    assert!(validate_fixture_family(&stdout, &family[..family.len() - 1]).is_err());
+    let mut substituted = family.clone();
+    substituted[1].birth += 1;
+    assert!(validate_fixture_family(&stdout, &substituted).is_err());
+    let mut truncated_stdout = stdout.clone();
+    let last_line = truncated_stdout
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .expect("last line is terminated");
+    let previous_line = truncated_stdout[..last_line]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .expect("previous line is terminated");
+    truncated_stdout.truncate(previous_line + 1);
+    assert!(validate_fixture_family(&truncated_stdout, &family).is_err());
 }

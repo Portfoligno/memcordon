@@ -6,6 +6,234 @@ use std::process::Command;
 const AGENT: &str = "/usr/libexec/memcordon-sealed-agent";
 
 #[test]
+#[cfg(target_env = "gnu")]
+fn v4_receipt_requires_exact_host_boot_and_independent_native_completions() {
+    use crate::linux::qualification::{
+        NativeQualificationProbeV4, QualificationReceiptV4, TrustedQualificationProbeV4,
+        TrustedQualificationReceiptV4,
+    };
+    use memcordon_core::DiagnosticSha256;
+    use memcordon_core::package_inspection_v6::LinuxUnitHashesV6;
+    use memcordon_core::workload_codec::hash_bytes;
+    use memcordon_core::workload_registry_v2::ProfileKindV2;
+
+    let digest = |byte| DiagnosticSha256::from_bytes([byte; 32]);
+    let private = ProfileKindV2::LinuxTcp4PrivateV1.reference();
+    let baseline = ProfileKindV2::LinuxUnixCreateV1.reference();
+    let units = LinuxUnitHashesV6 {
+        control_service: digest(1),
+        control_socket: digest(2),
+        launcher_service: digest(3),
+        launcher_socket: digest(4),
+        tmpfiles: digest(5),
+        network_launcher_service: digest(6),
+        network_launcher_socket: digest(7),
+    };
+    let target = crate::linux::runtime_manifest::target().unwrap();
+    let boot = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let mut receipt = QualificationReceiptV4 {
+        schema_version: 4,
+        version: env!("CARGO_PKG_VERSION").into(),
+        source_commit: crate::SOURCE_COMMIT.into(),
+        target: target.into(),
+        boot_id: boot.into(),
+        installed_runtime_manifest_sha256: digest(8),
+        installed_agent_sha256: digest(9),
+        installed_units: units.clone(),
+        filter_abi: if target.starts_with("x86_64") {
+            "x86_64".into()
+        } else {
+            "aarch64".into()
+        },
+        filter_instruction_sha256: digest(10),
+        profile_catalog_sha256: memcordon_core::workload_discovery_v2::profile_catalog_digest_v2(),
+        host_prerequisites_digest: digest(11),
+        native_run_digest: digest(12),
+        probes: vec![
+            NativeQualificationProbeV4 {
+                profile: private.clone(),
+                name: "native_private_retirement".into(),
+                native_executed: true,
+                passed: true,
+                completion_digest: digest(13),
+            },
+            NativeQualificationProbeV4 {
+                profile: baseline.clone(),
+                name: "native_unix_retirement".into(),
+                native_executed: true,
+                passed: true,
+                completion_digest: digest(14),
+            },
+        ],
+        receipt_digest: digest(0),
+    };
+    receipt.receipt_digest = receipt.canonical_digest().unwrap();
+    let bytes = serde_json::to_vec(&receipt).unwrap();
+    let receipt_sha = hash_bytes(&bytes);
+    let probes = [
+        TrustedQualificationProbeV4 {
+            profile: &private,
+            name: "native_private_retirement",
+            native_executed: true,
+            completion_digest: &receipt.probes[0].completion_digest,
+        },
+        TrustedQualificationProbeV4 {
+            profile: &baseline,
+            name: "native_unix_retirement",
+            native_executed: true,
+            completion_digest: &receipt.probes[1].completion_digest,
+        },
+    ];
+    let trusted = TrustedQualificationReceiptV4 {
+        source_commit: crate::SOURCE_COMMIT,
+        target,
+        boot_id: boot,
+        installed_runtime_manifest_sha256: &receipt.installed_runtime_manifest_sha256,
+        installed_agent_sha256: &receipt.installed_agent_sha256,
+        installed_units: &units,
+        filter_instruction_sha256: &receipt.filter_instruction_sha256,
+        host_prerequisites_digest: &receipt.host_prerequisites_digest,
+        native_run_digest: &receipt.native_run_digest,
+        probes: &probes,
+        receipt_sha256: &receipt_sha,
+    };
+    assert_eq!(
+        QualificationReceiptV4::parse_and_validate(&bytes, &trusted).unwrap(),
+        receipt
+    );
+    let mut wrong_boot = receipt.clone();
+    wrong_boot.boot_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into();
+    assert!(wrong_boot.validate(&trusted).is_err());
+    let mut skipped = receipt.clone();
+    skipped.probes[0].native_executed = false;
+    skipped.receipt_digest = skipped.canonical_digest().unwrap();
+    assert!(skipped.validate(&trusted).is_err());
+    let mut missing_private = receipt.clone();
+    missing_private.probes.remove(0);
+    missing_private.receipt_digest = missing_private.canonical_digest().unwrap();
+    assert!(missing_private.validate(&trusted).is_err());
+    let mut wrong_filter = receipt.clone();
+    wrong_filter.filter_instruction_sha256 = digest(15);
+    wrong_filter.receipt_digest = wrong_filter.canonical_digest().unwrap();
+    assert!(wrong_filter.validate(&trusted).is_err());
+}
+
+#[test]
+#[cfg(target_env = "gnu")]
+fn v3_generation_readback_requires_both_exact_images_and_unqualified_profiles() {
+    use memcordon_core::runtime_manifest::{RuntimeComponentRecord, RuntimeComponentRole};
+    use memcordon_core::runtime_manifest_v3::{
+        RuntimeManifestV3, RuntimeProfileAvailabilityV3, SealedRuntimeV3,
+    };
+    use memcordon_core::workload_codec::hash_bytes;
+
+    let public = b"exact public image";
+    let agent = b"exact provider image";
+    let component = |id: &str, path: &str, role, bytes: &[u8]| RuntimeComponentRecord {
+        id: id.into(),
+        path: path.into(),
+        role,
+        size: bytes.len() as u64,
+        mode: 0o755,
+        sha256: String::from(hash_bytes(bytes)),
+    };
+    let manifest = RuntimeManifestV3::linux_unqualified(
+        env!("CARGO_PKG_VERSION").into(),
+        crate::SOURCE_COMMIT.into(),
+        crate::linux::runtime_manifest::target().unwrap().into(),
+        vec![
+            component(
+                "public-cli",
+                "memcordon",
+                RuntimeComponentRole::PublicCli,
+                public,
+            ),
+            component(
+                "sealed-agent",
+                "memcordon-sealed-agent",
+                RuntimeComponentRole::SealedAgent,
+                agent,
+            ),
+        ],
+    )
+    .unwrap();
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    assert_eq!(
+        crate::linux::runtime_manifest::validate_v3_source(&bytes, agent, public).unwrap(),
+        manifest
+    );
+    let inspected =
+        crate::package::package_inspection_v6_from_verified_manifest(&manifest, &bytes).unwrap();
+    assert_eq!(
+        inspected.schema_version,
+        memcordon_core::package_inspection_v6::InspectionVersionSix
+    );
+    assert_eq!(inspected.runtime_manifest_sha256, hash_bytes(&bytes));
+    assert_eq!(inspected.components, manifest.components);
+    let mut changed_manifest = manifest.clone();
+    changed_manifest.version = "wrong-version".into();
+    assert!(
+        crate::package::package_inspection_v6_from_verified_manifest(&changed_manifest, &bytes)
+            .is_err()
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("memcordon-sealed-agent");
+    let public_path = directory.path().join("memcordon");
+    let manifest_path = directory.path().join("runtime-manifest.json");
+    std::fs::write(&source, agent).unwrap();
+    std::fs::write(&public_path, public).unwrap();
+    std::fs::write(&manifest_path, &bytes).unwrap();
+    for image in [&source, &public_path] {
+        std::fs::set_permissions(image, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(
+        crate::linux::runtime_manifest::source_v3(&source)
+            .unwrap()
+            .unwrap()
+            .0,
+        manifest
+    );
+    std::fs::write(&public_path, b"changed public image").unwrap();
+    assert!(crate::linux::runtime_manifest::source_v3(&source).is_err());
+    std::fs::write(&public_path, public).unwrap();
+    std::fs::remove_file(&manifest_path).unwrap();
+    std::os::unix::fs::symlink("missing-manifest", &manifest_path).unwrap();
+    assert!(crate::linux::runtime_manifest::source_v3(&source).is_err());
+    std::fs::remove_file(&manifest_path).unwrap();
+    assert!(
+        crate::linux::runtime_manifest::source_v3(&source)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        crate::linux::runtime_manifest::validate_v3_source(&bytes, agent, b"other public").is_err()
+    );
+    assert!(
+        crate::linux::runtime_manifest::validate_v3_source(&bytes, b"other agent", public).is_err()
+    );
+
+    let mut claimed = manifest.clone();
+    let SealedRuntimeV3::WorkloadV2 { profiles, .. } = &mut claimed.sealed else {
+        panic!("Linux constructor emitted another policy");
+    };
+    let mut records = memcordon_core::BoundedVec::default();
+    for record in profiles.as_slice() {
+        let mut record = record.clone();
+        record.availability = RuntimeProfileAvailabilityV3::Unsupported;
+        records.try_push(record).unwrap();
+    }
+    *profiles = records;
+    assert!(
+        crate::linux::runtime_manifest::validate_v3_source(
+            &serde_json::to_vec(&claimed).unwrap(),
+            agent,
+            public,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn installed_upgrade_requires_exact_image_and_preserves_runtime_generation() {
     use memcordon_core::runtime_manifest::{
         RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifestV2,

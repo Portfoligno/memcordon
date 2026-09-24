@@ -41,11 +41,26 @@ pub struct PrivatePrelaunchAuthority {
     request: NetworkLaunchRequestV4,
     target_identity: ResolvedTargetIdentity,
     entrypoint: VerifiedEntrypoint,
+    entrypoint_digest: memcordon_core::DiagnosticSha256,
 }
 
 impl PrivatePrelaunchAuthority {
-    pub fn into_parts(self) -> (ResolvedTargetIdentity, VerifiedEntrypoint) {
-        (self.target_identity, self.entrypoint)
+    pub fn target_identity(&self) -> &ResolvedTargetIdentity {
+        &self.target_identity
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ResolvedTargetIdentity,
+        VerifiedEntrypoint,
+        memcordon_core::DiagnosticSha256,
+    ) {
+        (
+            self.target_identity,
+            self.entrypoint,
+            self.entrypoint_digest,
+        )
     }
 }
 
@@ -98,6 +113,7 @@ pub fn pin_private_prelaunch_authority(
         request: request.clone(),
         target_identity,
         entrypoint,
+        entrypoint_digest: approved.sha256.clone(),
     })
 }
 
@@ -110,6 +126,7 @@ pub struct PrivateGatedPrelaunch {
     pub provider_stdio: ProviderPipeStdio,
     pub provider_control: File,
     pub expected_descriptors: ExpectedGatedDescriptorInventory,
+    pub entrypoint_digest: memcordon_core::DiagnosticSha256,
 }
 
 /// The native filter digest must come from the exact installed qualification
@@ -128,7 +145,7 @@ pub fn prepare_private_gated_prelaunch(
         provider_owned_byte_pipes().map_err(|error| format!("MCSEALED-PRIVATE-STDIO: {error}"))?;
     let (target_control, provider_control) =
         control_socketpair().map_err(|error| format!("MCSEALED-PRIVATE-CONTROL: {error}"))?;
-    let (identity, entrypoint) = authority.into_parts();
+    let (identity, entrypoint, entrypoint_digest) = authority.into_parts();
     let expected_descriptors = ExpectedGatedDescriptorInventory::capture(
         &target_stdio,
         provider_control.as_fd(),
@@ -150,6 +167,7 @@ pub fn prepare_private_gated_prelaunch(
         provider_stdio,
         provider_control,
         expected_descriptors,
+        entrypoint_digest,
     })
 }
 

@@ -123,6 +123,7 @@ impl Fixture {
             network_launcher_state: NetworkLauncherStateV6::InstalledDisabled,
             baseline_qualification: None,
             private_qualification: None,
+            installed_qualification_sha256: None,
         };
         Self {
             manifest,
@@ -144,6 +145,8 @@ impl Fixture {
             provider_reachable: true,
             network_launcher_state: NetworkLauncherStateV6::InstalledDisabled,
             baseline_qualification: None,
+            private_qualification: None,
+            installed_qualification_sha256: None,
         }
     }
 
@@ -215,6 +218,9 @@ fn private_qualified_claims_reject_until_native_qualification_is_integrated() {
         profile: ProfileKindV2::LinuxTcp4PrivateV1.reference(),
     });
     assert!(fixture.validate().is_err());
+    fixture.inspection.private_qualification = None;
+    fixture.inspection.installed_qualification_sha256 = Some(digest(16));
+    assert!(fixture.validate().is_err());
 }
 
 #[test]
@@ -225,6 +231,36 @@ fn cross_target_and_unobserved_launcher_state_reject() {
     fixture.inspection.package.target = BoundedText::new(TARGET).unwrap();
     fixture.inspection.network_launcher_state = NetworkLauncherStateV6::EnabledUnqualified;
     assert!(fixture.validate().is_err());
+}
+
+#[test]
+fn unavailable_state_requires_unreachable_provider() {
+    let mut fixture = Fixture::new();
+    fixture.inspection.network_launcher_state = NetworkLauncherStateV6::Unavailable;
+    {
+        let mut trusted = fixture.trusted();
+        trusted.network_launcher_state = NetworkLauncherStateV6::Unavailable;
+        assert!(
+            LinuxInstalledInspectionV6::parse_and_validate(
+                &serde_json::to_vec(&fixture.inspection).unwrap(),
+                &fixture.manifest_bytes,
+                &trusted,
+            )
+            .is_err()
+        );
+    }
+    fixture.inspection.provider_reachable = false;
+    let mut trusted = fixture.trusted();
+    trusted.network_launcher_state = NetworkLauncherStateV6::Unavailable;
+    trusted.provider_reachable = false;
+    assert!(
+        LinuxInstalledInspectionV6::parse_and_validate(
+            &serde_json::to_vec(&fixture.inspection).unwrap(),
+            &fixture.manifest_bytes,
+            &trusted,
+        )
+        .is_ok()
+    );
 }
 
 #[test]

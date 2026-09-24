@@ -1,8 +1,8 @@
-//! Proposed Linux V6 package-inspection validation, not an active producer.
+//! Linux V6 package-inspection validation; the installed producer is not wired.
 //!
 //! The caller supplies a pinned runtime manifest and independently read back
-//! installed hashes/state. This parser cannot turn a package into a qualified
-//! private-network provider; that native path remains unavailable.
+//! installed hashes/state and a fresh host receipt digest. Parsed metadata
+//! alone cannot qualify the private-network provider.
 
 use crate::runtime_manifest::{
     NativeProviderProtocols, QualificationArtifactReferenceV1, RuntimeComponentRecord,
@@ -89,6 +89,8 @@ pub struct LinuxInstalledInspectionV6 {
     pub network_launcher_state: NetworkLauncherStateV6,
     pub baseline_qualification: Option<QualificationArtifactReferenceV1>,
     pub private_qualification: Option<QualificationArtifactReferenceV2>,
+    /// Digest of a fresh, protected installed V4 host/boot receipt.
+    pub installed_qualification_sha256: Option<DiagnosticSha256>,
 }
 
 /// These values must come from protected release inventory and fresh installed
@@ -101,6 +103,8 @@ pub struct TrustedLinuxInspectionV6<'a> {
     pub provider_reachable: bool,
     pub network_launcher_state: NetworkLauncherStateV6,
     pub baseline_qualification: Option<&'a QualificationArtifactReferenceV1>,
+    pub private_qualification: Option<&'a QualificationArtifactReferenceV2>,
+    pub installed_qualification_sha256: Option<&'a DiagnosticSha256>,
 }
 
 impl LinuxInstalledInspectionV6 {
@@ -171,13 +175,47 @@ impl LinuxInstalledInspectionV6 {
             || self.provider_reachable != trusted.provider_reachable
             || self.network_launcher_state != trusted.network_launcher_state
             || self.baseline_qualification.as_ref() != trusted.baseline_qualification
+            || self.private_qualification.as_ref() != trusted.private_qualification
+            || self.installed_qualification_sha256.as_ref()
+                != trusted.installed_qualification_sha256
         {
             return Err("V6 package or installed-state binding differs".into());
         }
-        if self.network_launcher_state == NetworkLauncherStateV6::EnabledQualified
-            || self.private_qualification.is_some()
-        {
-            return Err("private profile cannot be qualified by parse-only V6 inspection".into());
+        match self.network_launcher_state {
+            NetworkLauncherStateV6::EnabledQualified => {
+                if !self.provider_reachable {
+                    return Err("qualified V6 provider is unreachable".into());
+                }
+                let Some(reference) = &self.private_qualification else {
+                    return Err("qualified V6 state lacks private release reference".into());
+                };
+                if self.installed_qualification_sha256.is_none()
+                    || !matches!(
+                        &manifest.sealed,
+                        SealedRuntimeV3::WorkloadV2 { profiles, .. }
+                            if profiles.as_slice().iter().any(|record| {
+                                record.profile == reference.profile
+                                    && matches!(
+                                        &record.availability,
+                                        crate::runtime_manifest_v3::RuntimeProfileAvailabilityV3::Qualified {
+                                            qualification,
+                                        } if qualification == reference
+                                    )
+                            })
+                    )
+                {
+                    return Err("qualified V6 state lacks matching manifest or host receipt".into());
+                }
+            }
+            _ if self.private_qualification.is_some()
+                || self.installed_qualification_sha256.is_some() =>
+            {
+                return Err("unqualified V6 state carries private qualification".into());
+            }
+            NetworkLauncherStateV6::Unavailable if self.provider_reachable => {
+                return Err("unavailable V6 provider is reported reachable".into());
+            }
+            _ => {}
         }
         Ok(())
     }

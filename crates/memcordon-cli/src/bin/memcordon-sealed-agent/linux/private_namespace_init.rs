@@ -592,6 +592,7 @@ pub fn run_private_namespace_init(
     provider_startup_fd: BorrowedFd<'_>,
     provider_control_fd: BorrowedFd<'_>,
     mut status: File,
+    caller_cwd: OwnedFd,
     caller_namespace: NamespaceIdentity,
     provider_namespace: NamespaceIdentity,
     wait_for_descendants: bool,
@@ -616,6 +617,22 @@ pub fn run_private_namespace_init(
                 return 125;
             }
         };
+    // The caller's current-directory object was authenticated by the broker
+    // and inherited through the caller mount-context bootstrap. Change cwd
+    // before target fork, then close this extra capability so the gated target
+    // still receives only its exact five descriptors.
+    // SAFETY: fchdir reads the live, caller-bound directory descriptor.
+    if unsafe { libc::fchdir(caller_cwd.as_raw_fd()) } == -1 {
+        let _ = startup.report(
+            &PrivateNamespaceStartupObservation::Failed {
+                phase: PrivateNamespaceStartupPhase::NamespaceSetup,
+                detail: format!("caller cwd: {}", std::io::Error::last_os_error()),
+            },
+            None,
+        );
+        return 125;
+    }
+    drop(caller_cwd);
     let namespace = match super::network_profile::current_network_namespace() {
         Ok(namespace) => namespace,
         Err(detail) => {

@@ -93,6 +93,30 @@ pub struct ActivationV2 {
     pub revoked_admissions: BoundedVec<Nonce128, 256>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub(crate) enum VersionedLiveBinding {
+    V1(Box<crate::admission::FrozenAdmission>),
+    V2(Box<memcordon_core::workload_admission_v2::ProviderAdmissionSnapshotV2>),
+}
+
+#[cfg(target_os = "linux")]
+impl VersionedLiveBinding {
+    fn registry_digest(&self) -> &DiagnosticSha256 {
+        match self {
+            Self::V1(value) => &value.registry_digest,
+            Self::V2(value) => &value.registry_digest,
+        }
+    }
+
+    fn admission_nonce(&self) -> Nonce128 {
+        match self {
+            Self::V1(value) => value.admission_nonce,
+            Self::V2(value) => value.admission_nonce,
+        }
+    }
+}
+
 impl ActivationV2 {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.registry.canonical_digest()? != self.registry_digest {
@@ -229,7 +253,7 @@ pub fn apply(path: &Path) -> Result<(), String> {
         RegistryConfiguration::V1(registry) => registry.active_attempt_disposition,
         RegistryConfiguration::V2(registry) => registry.active_attempt_disposition,
     } == memcordon_core::workload_registry::GrantChangeDisposition::RevokeActive;
-    let active = lease.live_bindings()?;
+    let active = lease.versioned_live_bindings()?;
     let activation = match registry {
         RegistryConfiguration::V1(registry) => {
             serde_json::to_value(lease.activate(registry, None)?)
@@ -244,7 +268,7 @@ pub fn apply(path: &Path) -> Result<(), String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let lease = native::Lease::acquire()?;
-            let remaining = lease.live_bindings()?;
+            let remaining = lease.versioned_live_bindings()?;
             if active
                 .iter()
                 .all(|(identity, _)| !remaining.iter().any(|(other, _)| other == identity))
@@ -287,7 +311,7 @@ pub mod native {
             self.retain_snapshot_encoded(&digest, &bytes, 1)
         }
 
-        fn retain_snapshot_v2(&self, registry: &PolicyRegistryV2) -> Result<(), String> {
+        pub(crate) fn retain_snapshot_v2(&self, registry: &PolicyRegistryV2) -> Result<(), String> {
             let digest = registry.canonical_digest()?;
             let bytes = serde_json::to_vec(registry).map_err(|error| error.to_string())?;
             self.retain_snapshot_encoded(&digest, &bytes, 2)
@@ -302,8 +326,8 @@ pub mod native {
             self.check_capacity(digest)?;
             let mut retained = std::collections::BTreeSet::new();
             retained.insert(String::from(digest.clone()));
-            for (_, binding) in self.live_bindings()? {
-                retained.insert(String::from(binding.registry_digest));
+            for (_, binding) in self.versioned_live_bindings()? {
+                retained.insert(String::from(binding.registry_digest().clone()));
             }
             if let Some(active) = self.read_any()? {
                 let active_digest = match active {
@@ -401,12 +425,56 @@ pub mod native {
             Ok(references)
         }
 
+        pub(crate) fn versioned_live_bindings(
+            &self,
+        ) -> Result<Vec<(String, VersionedLiveBinding)>, String> {
+            let mut references = Vec::new();
+            for entry in
+                std::fs::read_dir(crate::linux::STATE_ROOT).map_err(|error| error.to_string())?
+            {
+                let entry = entry.map_err(|error| error.to_string())?;
+                let name = entry.file_name();
+                let Some(identity) = name
+                    .to_str()
+                    .filter(|value| crate::linux::cgroup::valid_attempt_identity(value))
+                else {
+                    continue;
+                };
+                let record = match crate::linux::recovery::read_record_no_follow(&entry.path()) {
+                    Ok(record) => record,
+                    Err(_) if !entry.path().exists() => continue,
+                    Err(error) => return Err(error),
+                };
+                let binding = if record.starts_with("version=4\n") {
+                    let record = crate::linux::private_attempt::PrivateAttemptRecordV4::parse(
+                        record.as_bytes(),
+                    )?;
+                    if record.attempt_id.as_str() != identity {
+                        return Err("V4 live reference filename differs".into());
+                    }
+                    record
+                        .admission
+                        .map(|admission| VersionedLiveBinding::V2(Box::new(admission)))
+                } else {
+                    crate::linux::attempt::parse_durable_policy(&record)?
+                        .map(|admission| VersionedLiveBinding::V1(Box::new(admission)))
+                };
+                if let Some(binding) = binding {
+                    if references.len() == memcordon_core::workload_limits::LIVE_BINDINGS {
+                        return Err("policy live reference capacity exceeded".into());
+                    }
+                    references.push((identity.into(), binding));
+                }
+            }
+            Ok(references)
+        }
+
         pub fn check_capacity(&self, candidate: &DiagnosticSha256) -> Result<(), String> {
-            let references = self.live_bindings()?;
+            let references = self.versioned_live_bindings()?;
             let mut snapshots = std::collections::BTreeSet::new();
             snapshots.insert(*candidate.bytes());
             for (_, binding) in references {
-                snapshots.insert(*binding.registry_digest.bytes());
+                snapshots.insert(*binding.registry_digest().bytes());
             }
             if let Some(active) = self.read_any()? {
                 let active_digest = match active {
@@ -504,10 +572,10 @@ pub mod native {
             self.check_capacity(&registry.canonical_digest()?)?;
             self.retain_snapshot(&registry)?;
             let previous = self.read()?;
-            let revoked_admissions = Activation::next_revocations(
+            let revoked_admissions = next_revocations_versioned(
                 previous.as_ref(),
                 registry.active_attempt_disposition,
-                &self.live_bindings()?,
+                &self.versioned_live_bindings()?,
             )?;
             let epoch = match (instance, previous) {
                 (Some(service_instance), _) => PolicyEpoch {
@@ -551,10 +619,10 @@ pub mod native {
             self.check_capacity(&registry.canonical_digest()?)?;
             self.retain_snapshot_v2(&registry)?;
             let previous = self.read()?;
-            let revoked_admissions = Activation::next_revocations(
+            let revoked_admissions = next_revocations_versioned(
                 previous.as_ref(),
                 registry.active_attempt_disposition,
-                &self.live_bindings()?,
+                &self.versioned_live_bindings()?,
             )?;
             let epoch = match (instance, previous) {
                 (Some(service_instance), _) => PolicyEpoch {
@@ -637,6 +705,27 @@ pub mod native {
                 libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN);
             }
         }
+    }
+    fn next_revocations_versioned(
+        previous: Option<&Activation>,
+        disposition: memcordon_core::workload_registry::GrantChangeDisposition,
+        live: &[(String, VersionedLiveBinding)],
+    ) -> Result<BoundedVec<Nonce128, 256>, String> {
+        let mut revoked = BoundedVec::default();
+        for (_, binding) in live {
+            let nonce = binding.admission_nonce();
+            if (disposition
+                == memcordon_core::workload_registry::GrantChangeDisposition::RevokeActive
+                || previous
+                    .is_some_and(|value| value.revoked_admissions.as_slice().contains(&nonce)))
+                && !revoked.as_slice().contains(&nonce)
+            {
+                revoked
+                    .try_push(nonce)
+                    .map_err(|_| "revocation reference bound exceeded")?;
+            }
+        }
+        Ok(revoked)
     }
     fn open_at(directory: &File, name: &std::ffi::CStr, flags: i32) -> std::io::Result<File> {
         // SAFETY: path is a fixed terminated relative name and directory is retained.

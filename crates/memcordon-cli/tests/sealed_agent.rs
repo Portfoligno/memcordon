@@ -79,6 +79,18 @@ mod native_private_tcp;
 mod package_tests;
 #[path = "sealed_agent/package_verification.rs"]
 mod package_verification;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_attempt.rs"]
+mod private_attempt;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_guardian.rs"]
+mod private_guardian;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_v4_failure_matrix.rs"]
+mod private_v4_failure_matrix;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_v4_relay_terminal.rs"]
+mod private_v4_relay_terminal;
 #[path = "sealed_agent/protocol.rs"]
 mod protocol_tests;
 #[path = "sealed_agent/rejection.rs"]

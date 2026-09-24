@@ -10,7 +10,8 @@ use super::{CGROUP_ROOT, STATE_ROOT};
 
 pub(crate) const MAX_RECORD_BYTES: u64 = 16 * 1024
     + memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64
-    + memcordon_core::workload_limits::CONTRACT_BYTES as u64;
+    + memcordon_core::workload_limits::CONTRACT_BYTES as u64
+    + super::private_attempt::MAX_PRIVATE_RECORD_BYTES as u64;
 
 pub fn recover() -> Result<Vec<String>, String> {
     recover_roots(Path::new(STATE_ROOT), Path::new(CGROUP_ROOT))
@@ -106,6 +107,18 @@ fn recover_records(
             ambiguous.push(identity.to_owned());
             continue;
         }
+        if record.starts_with("version=4\n") {
+            if super::private_attempt::PrivateAttemptRecordV4::parse(record.as_bytes())
+                .is_ok_and(|record| record.attempt_id.as_str() == identity)
+            {
+                // A V4 attempt may have released the target and owns more than
+                // a cgroup. Until its terminal ledger can be reconstructed,
+                // preserve every protected resource for explicit recovery.
+                authenticated.insert(name.clone());
+            }
+            ambiguous.push(identity.to_owned());
+            continue;
+        }
         authenticated.insert(name.clone());
         if record
             .lines()
@@ -172,6 +185,9 @@ fn interrupted_transition_is_recoverable(
     {
         return Ok(false);
     }
+    if canonical.starts_with("version=4\n") {
+        return Ok(false);
+    }
     if canonical
         .lines()
         .find_map(|line| line.strip_prefix("frontend-pid="))
@@ -185,6 +201,9 @@ fn interrupted_transition_is_recoverable(
         Ok(record) => record,
         Err(_) => return Ok(false),
     };
+    if interrupted.starts_with("version=4\n") {
+        return Ok(false);
+    }
     if interrupted
         .lines()
         .find_map(|line| line.strip_prefix("cgroup="))
@@ -282,5 +301,9 @@ pub(crate) fn read_record_no_follow(path: &Path) -> Result<String, String> {
 }
 
 pub(crate) fn integrity_valid(record: &str) -> bool {
-    super::attempt::parse_durable_policy(record).is_ok()
+    if record.starts_with("version=4\n") {
+        super::private_attempt::PrivateAttemptRecordV4::parse(record.as_bytes()).is_ok()
+    } else {
+        super::attempt::parse_durable_policy(record).is_ok()
+    }
 }

@@ -73,6 +73,25 @@ fn canonical_release() -> Release {
 }
 
 #[test]
+fn private_v2_native_artifact_targets_match_both_linux_release_targets() {
+    use memcordon_ci::workload_qualification::PRIVATE_V2_ARTIFACTS;
+    let release = canonical_release();
+    let mut linux_targets: Vec<&str> = release
+        .assets
+        .target
+        .iter()
+        .filter(|asset| asset.rust_target.ends_with("-unknown-linux-gnu"))
+        .map(|asset| asset.rust_target.as_str())
+        .collect();
+    linux_targets.sort_unstable();
+    let required: Vec<&str> = PRIVATE_V2_ARTIFACTS
+        .iter()
+        .map(|(target, _)| *target)
+        .collect();
+    assert_eq!(linux_targets, required);
+}
+
+#[test]
 fn canonical_fallback_configuration_derives_the_release_bound_dynamically() {
     let release = canonical_release();
     let development = workspace_version();

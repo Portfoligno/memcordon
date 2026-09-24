@@ -1,6 +1,12 @@
 use std::num::NonZeroU64;
 
+use memcordon_core::BoundedText;
 use memcordon_core::DiagnosticSha256;
+use memcordon_core::report_v11::{
+    PRIVATE_EXECUTION_REPORT_SCHEMA_V11, PrivateExecutionReportV11, PrivateTerminalOutcomeV11,
+    TrustedPrivateExecutionV11,
+};
+use memcordon_core::workload_admission_v2::AttemptBindingV2;
 use memcordon_core::workload_contract::{LogicalId, Nonce128, ProfileRef};
 use memcordon_core::workload_evidence_v2::{
     EntryResourceObservationV2, NamespaceObservationV2, PrivatePortPolicyV1,
@@ -49,6 +55,169 @@ fn checkpoint() -> PrivateTcpCheckpointV2 {
         epoch_revalidated: yes(),
         checkpoint_durable: yes(),
     }
+}
+
+#[test]
+fn schema11_private_projection_requires_trusted_terminal_and_exact_native_bindings() {
+    let attempt = AttemptBindingV2 {
+        attempt_id: BoundedText::new("00112233445566778899aabbccddeeff").unwrap(),
+        admission_digest: digest(7),
+        caller_envelope_digest: digest(8),
+        native_invocation_digest: digest(9),
+    };
+    let checkpoint = PrivateTcpCheckpointV2 {
+        attempt_binding: attempt.canonical_digest().unwrap(),
+        ..checkpoint()
+    };
+    let retirement =
+        PrivateTcpRetiredV2::observed(&checkpoint, true, true, true, true, true, true).unwrap();
+    let outcome = PrivateTerminalOutcomeV11::Exited { code: 0 };
+    let report = PrivateExecutionReportV11 {
+        schema_version: PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
+        source_commit: "a".repeat(40),
+        native_abi: QualifiedNativeAbiV2::X86_64LinuxGnu,
+        runtime_manifest_sha256: digest(10),
+        installed_qualification_sha256: digest(11),
+        attempt: attempt.clone(),
+        checkpoint: checkpoint.clone(),
+        retirement: retirement.clone(),
+        terminal_receipt_sha256: digest(12),
+        outcome: outcome.clone(),
+    };
+    let checkpoint_sha256 = checkpoint.canonical_digest().unwrap();
+    let retirement_sha256 = retirement.canonical_digest().unwrap();
+    let trusted = TrustedPrivateExecutionV11 {
+        source_commit: &report.source_commit,
+        native_abi: QualifiedNativeAbiV2::X86_64LinuxGnu,
+        runtime_manifest_sha256: &report.runtime_manifest_sha256,
+        installed_qualification_sha256: &report.installed_qualification_sha256,
+        attempt: &attempt,
+        checkpoint_sha256: &checkpoint_sha256,
+        retirement_sha256: &retirement_sha256,
+        terminal_receipt_sha256: &report.terminal_receipt_sha256,
+        outcome: &outcome,
+    };
+    assert_eq!(
+        PrivateExecutionReportV11::from_trusted_native(
+            checkpoint.clone(),
+            retirement.clone(),
+            &trusted,
+        )
+        .unwrap(),
+        report
+    );
+    assert!(
+        PrivateExecutionReportV11::from_trusted_native(
+            PrivateTcpCheckpointV2 {
+                topology_digest: digest(15),
+                ..checkpoint.clone()
+            },
+            retirement.clone(),
+            &trusted,
+        )
+        .is_err()
+    );
+    let bytes = serde_json::to_vec(&report).unwrap();
+    assert_eq!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &bytes,
+            PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
+            &trusted,
+        )
+        .unwrap(),
+        report
+    );
+    assert!(PrivateExecutionReportV11::parse_and_validate(&bytes, 10, &trusted).is_err());
+
+    let mut wrong = serde_json::to_value(&report).unwrap();
+    wrong["schema_version"] = serde_json::json!(10);
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &serde_json::to_vec(&wrong).unwrap(),
+            11,
+            &trusted
+        )
+        .is_err()
+    );
+    let mut wrong = serde_json::to_value(&report).unwrap();
+    wrong["terminal_receipt_sha256"] = serde_json::to_value(digest(13)).unwrap();
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &serde_json::to_vec(&wrong).unwrap(),
+            11,
+            &trusted
+        )
+        .is_err()
+    );
+    let mut wrong = serde_json::to_value(&report).unwrap();
+    wrong["native_abi"] = serde_json::json!("aarch64-unknown-linux-gnu");
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &serde_json::to_vec(&wrong).unwrap(),
+            11,
+            &trusted
+        )
+        .is_err()
+    );
+    let mut wrong = serde_json::to_value(&report).unwrap();
+    wrong["attempt"]["admission_digest"] = serde_json::to_value(digest(14)).unwrap();
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &serde_json::to_vec(&wrong).unwrap(),
+            11,
+            &trusted
+        )
+        .is_err()
+    );
+    let mut wrong = serde_json::to_value(&report).unwrap();
+    wrong["outcome"]["code"] = serde_json::json!(1);
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &serde_json::to_vec(&wrong).unwrap(),
+            11,
+            &trusted
+        )
+        .is_err()
+    );
+    let mut wrong = serde_json::to_value(&report).unwrap();
+    wrong["checkpoint"]["guardian_verified"] = serde_json::json!(false);
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &serde_json::to_vec(&wrong).unwrap(),
+            11,
+            &trusted
+        )
+        .is_err()
+    );
+    let mut wrong = serde_json::to_value(&report).unwrap();
+    wrong["retirement"]["checkpoint_digest"] = serde_json::to_value(digest(14)).unwrap();
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &serde_json::to_vec(&wrong).unwrap(),
+            11,
+            &trusted
+        )
+        .is_err()
+    );
+    let mut wrong = serde_json::to_value(&report).unwrap();
+    wrong["unknown"] = serde_json::json!(true);
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &serde_json::to_vec(&wrong).unwrap(),
+            11,
+            &trusted
+        )
+        .is_err()
+    );
+    let raw = String::from_utf8(bytes).unwrap();
+    let duplicate = raw.replace(
+        "\"schema_version\":11",
+        "\"schema_version\":11,\"schema_version\":11",
+    );
+    assert_ne!(duplicate, raw);
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(duplicate.as_bytes(), 11, &trusted).is_err()
+    );
 }
 
 #[test]
@@ -139,6 +308,45 @@ fn decoded_claims_reject_missing_native_facts_and_wrong_inventories() {
     let mut value = serde_json::to_value(&checkpoint).unwrap();
     value["port_policy"]["ephemeral_last"] = serde_json::json!(61000);
     assert!(serde_json::from_value::<PrivateTcpCheckpointV2>(value).is_err());
+}
+
+#[test]
+fn every_missing_retirement_fact_blocks_terminal_claim() {
+    let checkpoint = checkpoint();
+    let complete =
+        PrivateTcpRetiredV2::observed(&checkpoint, true, true, true, true, true, true).unwrap();
+    for missing in 0..6 {
+        let mut facts = [true; 6];
+        facts[missing] = false;
+        assert!(
+            PrivateTcpRetiredV2::observed(
+                &checkpoint,
+                facts[0],
+                facts[1],
+                facts[2],
+                facts[3],
+                facts[4],
+                facts[5],
+            )
+            .is_err(),
+            "missing retirement fact {missing} must fail"
+        );
+    }
+    for field in [
+        "workload_empty",
+        "required_helpers_reaped",
+        "cgroup_retired",
+        "provider_network_references_closed",
+        "stdio_and_setup_resources_closed",
+        "policy_snapshot_released",
+    ] {
+        let mut value = serde_json::to_value(&complete).unwrap();
+        value[field] = serde_json::json!(false);
+        assert!(
+            serde_json::from_value::<PrivateTcpRetiredV2>(value).is_err(),
+            "false serialized retirement fact {field} must fail"
+        );
+    }
 }
 
 #[test]

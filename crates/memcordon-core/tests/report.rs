@@ -480,6 +480,20 @@ fn atomic_report_replaces_existing_relative_destination_and_ends_in_newline() {
 }
 
 #[test]
+fn historical_execution_report_requires_exact_trusted_schema() {
+    let bytes = serde_json::to_vec(&report()).expect("serialize current report");
+    let historical = MemcordonReport::parse_historical_v10(&bytes)
+        .expect("schema 10 remains explicitly decodable");
+    assert_eq!(historical.schema_version, 10);
+    assert!(MemcordonReport::parse_exact_schema(&bytes, 11).is_err());
+    let mut wrong: serde_json::Value = serde_json::from_slice(&bytes).expect("parse report JSON");
+    wrong["schema_version"] = serde_json::json!(11);
+    let wrong = serde_json::to_vec(&wrong).expect("serialize wrong version");
+    assert!(MemcordonReport::parse_historical_v10(&wrong).is_err());
+    assert!(!MemcordonReport::supports_schema(11));
+}
+
+#[test]
 #[cfg_attr(
     miri,
     ignore = "requires host filesystem operations unavailable under Miri isolation"

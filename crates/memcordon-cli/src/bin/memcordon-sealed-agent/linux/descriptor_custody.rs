@@ -64,6 +64,17 @@ impl ProviderRelayStreams {
 }
 
 impl ProviderPipeStdio {
+    /// Exact provider-owned complements that a forked namespace init must
+    /// close before waiting for its target. Retaining any writer would hide
+    /// EOF from the supervising provider.
+    pub fn descriptor_numbers(&self) -> [std::os::fd::RawFd; 3] {
+        [
+            self.stdin.as_raw_fd(),
+            self.stdout.as_raw_fd(),
+            self.stderr.as_raw_fd(),
+        ]
+    }
+
     pub fn into_relay_streams(self) -> ProviderRelayStreams {
         ProviderRelayStreams {
             stdin_writer: Some(self.stdin.into()),
@@ -512,6 +523,19 @@ pub fn observe_private_exec_transition(
         return Err(invalid_data(
             "target reported exec failure or trailing control data",
         ));
+    }
+    verify_private_exec_entry(gated, provider_control)
+}
+
+/// Complete the exact pinned-ELF transition after the owner has already
+/// decoded the armed/failure control packets, retaining first failure detail.
+pub fn verify_private_exec_entry(
+    gated: GatedDescriptorProof,
+    provider_control: BorrowedFd<'_>,
+) -> io::Result<PostExecDescriptorProof> {
+    verify_control_socket(provider_control.as_raw_fd())?;
+    if ObjectIdentity::from_fd(provider_control.as_raw_fd())? != gated.expected.provider_control {
+        return Err(invalid_data("exec control channel identity mismatch"));
     }
     let exe = Path::new("/proc").join(gated.pid.to_string()).join("exe");
     if ObjectIdentity::from_proc_fd(&exe)? != gated.expected.objects[4] {

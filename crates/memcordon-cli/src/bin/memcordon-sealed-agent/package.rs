@@ -10,6 +10,122 @@ use crate::inspection_schema::{
     AgentPackageInspectionV5 as AgentPackageInspectionV4,
     InstalledProviderInspectionV5 as InstalledProviderInspectionV4,
 };
+#[cfg(target_os = "linux")]
+use memcordon_core::package_inspection_v6::{
+    InspectionVersionSix, LinuxInstalledInspectionV6, LinuxPackageInspectionV6, LinuxUnitHashesV6,
+    NetworkLauncherStateV6, TrustedLinuxInspectionV6,
+};
+#[cfg(target_os = "linux")]
+use memcordon_core::{BoundedText, DiagnosticSha256};
+
+/// The private launcher accepts this only after installed V3/V6 and a fresh
+/// native V4 host receipt have been independently read back and joined.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct VerifiedInstalledPrivateAuthority {
+    source_commit: String,
+    runtime_manifest_sha256: DiagnosticSha256,
+    generation_digest: DiagnosticSha256,
+    qualification_digest: DiagnosticSha256,
+    filter_abi: crate::linux::network_filter::NativeAbi,
+    filter_digest: DiagnosticSha256,
+}
+
+#[cfg(target_os = "linux")]
+/// A shared package lock couples readback to the generation used at the
+/// checkpoint/release boundary. Package mutation takes the exclusive lock.
+/// Callers must acquire this before the policy lease and hold it until the
+/// release packet is sent or the attempt is rejected.
+#[derive(Debug)]
+pub(crate) struct VerifiedInstalledPrivateAuthorityLease {
+    _package_lease: std::fs::File,
+    authority: VerifiedInstalledPrivateAuthority,
+}
+
+/// Launch-generation evidence retained after the package lease is consumed.
+/// This is report input only: it cannot authorize a workload or renew host
+/// qualification after the installed generation changes.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct VerifiedInstalledPrivateReportBinding {
+    source_commit: String,
+    runtime_manifest_sha256: DiagnosticSha256,
+    generation_digest: DiagnosticSha256,
+    qualification_digest: DiagnosticSha256,
+    filter_abi: crate::linux::network_filter::NativeAbi,
+    filter_digest: DiagnosticSha256,
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Accessors become live when the routed V4 checkpoint producer is integrated.
+impl VerifiedInstalledPrivateAuthorityLease {
+    pub(crate) fn source_commit(&self) -> &str {
+        &self.authority.source_commit
+    }
+
+    pub(crate) fn runtime_manifest_sha256(&self) -> &DiagnosticSha256 {
+        &self.authority.runtime_manifest_sha256
+    }
+
+    pub(crate) fn generation_digest(&self) -> &DiagnosticSha256 {
+        &self.authority.generation_digest
+    }
+
+    pub(crate) fn qualification_digest(&self) -> &DiagnosticSha256 {
+        &self.authority.qualification_digest
+    }
+
+    pub(crate) fn filter_abi(&self) -> crate::linux::network_filter::NativeAbi {
+        self.authority.filter_abi
+    }
+
+    pub(crate) fn filter_digest(&self) -> &DiagnosticSha256 {
+        &self.authority.filter_digest
+    }
+
+    /// Consume the lock-bound authority after the release decision. The
+    /// returned value is evidence for terminal projection, not a reusable
+    /// admission or package-verification token.
+    pub(crate) fn into_report_binding(self) -> VerifiedInstalledPrivateReportBinding {
+        let authority = self.authority;
+        VerifiedInstalledPrivateReportBinding {
+            source_commit: authority.source_commit,
+            runtime_manifest_sha256: authority.runtime_manifest_sha256,
+            generation_digest: authority.generation_digest,
+            qualification_digest: authority.qualification_digest,
+            filter_abi: authority.filter_abi,
+            filter_digest: authority.filter_digest,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Terminal V11 projection is not routed until native host qualification exists.
+impl VerifiedInstalledPrivateReportBinding {
+    pub(crate) fn source_commit(&self) -> &str {
+        &self.source_commit
+    }
+
+    pub(crate) fn runtime_manifest_sha256(&self) -> &DiagnosticSha256 {
+        &self.runtime_manifest_sha256
+    }
+
+    pub(crate) fn generation_digest(&self) -> &DiagnosticSha256 {
+        &self.generation_digest
+    }
+
+    pub(crate) fn qualification_digest(&self) -> &DiagnosticSha256 {
+        &self.qualification_digest
+    }
+
+    pub(crate) fn filter_abi(&self) -> crate::linux::network_filter::NativeAbi {
+        self.filter_abi
+    }
+
+    pub(crate) fn filter_digest(&self) -> &DiagnosticSha256 {
+        &self.filter_digest
+    }
+}
 
 const SERVICE: &str = "[Unit]\nDescription=MemCordon sealed supervision control provider\nRequires=memcordon-sealed-agent.socket memcordon-sealed-launcher.socket\nAfter=local-fs.target systemd-tmpfiles-setup.service memcordon-sealed-launcher.socket\n\n[Service]\nType=simple\nExecStart=/usr/libexec/memcordon-sealed-agent serve\nUser=root\nGroup=memcordon\nKillMode=process\nStateDirectory=memcordon/sealed memcordon/policy\nStateDirectoryMode=0700\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths=/run/memcordon /var/lib/memcordon/sealed /var/lib/memcordon/policy\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=\nRestrictAddressFamilies=AF_UNIX\nLockPersonality=yes\n\n[Install]\nWantedBy=multi-user.target\n";
 const SOCKET: &str = "[Unit]\nDescription=MemCordon sealed supervision control socket\nAfter=systemd-tmpfiles-setup.service\n\n[Socket]\nListenStream=/run/memcordon/sealed-agent.sock\nDirectoryMode=0755\nSocketMode=0660\nSocketUser=root\nSocketGroup=memcordon\nRemoveOnStop=yes\n\n[Install]\nWantedBy=sockets.target\n";
@@ -54,6 +170,10 @@ pub fn run(
         if ephemeral_ci {
             return Err("--ephemeral-ci is valid only for package mutations".to_owned());
         }
+        #[cfg(target_os = "linux")]
+        if let Some(inspection) = linux_package_inspection_v6()? {
+            return render_v6_package_inspection(&inspection, json);
+        }
         return render_inspection(&inspect()?, json);
     }
     if operation == "verify" {
@@ -61,6 +181,10 @@ pub fn run(
             return Err("--ephemeral-ci is valid only for package mutations".to_owned());
         }
         verify()?;
+        #[cfg(target_os = "linux")]
+        if let Some(inspection) = linux_installed_inspection_v6()? {
+            return render_v6_installed_inspection(&inspection, json);
+        }
         return render_installed_inspection(&installed_inspection()?, json);
     }
     if json {
@@ -84,6 +208,230 @@ pub fn run(
         let _ = (ephemeral_ci, qualification_artifact_directory);
         Err("provider package mutation is unavailable on this platform".to_owned())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn render_v6_package_inspection(
+    inspection: &LinuxPackageInspectionV6,
+    json: bool,
+) -> Result<(), String> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(inspection).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!(
+            "Linux sealed package V6: {} ({})",
+            inspection.version.as_str(),
+            inspection.source_commit.as_str()
+        );
+        println!("compiled package metadata: valid");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn render_v6_installed_inspection(
+    inspection: &LinuxInstalledInspectionV6,
+    json: bool,
+) -> Result<(), String> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(inspection).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!("Linux installed provider V6: artifacts valid");
+        println!("provider reachable: {}", inspection.provider_reachable);
+        println!(
+            "network launcher state: {:?}",
+            inspection.network_launcher_state
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn compiled_unit_hashes_v6() -> LinuxUnitHashesV6 {
+    let digest = |bytes: &[u8]| memcordon_core::workload_codec::hash_bytes(bytes);
+    LinuxUnitHashesV6 {
+        control_service: digest(SERVICE.as_bytes()),
+        control_socket: digest(SOCKET.as_bytes()),
+        launcher_service: digest(LAUNCHER_SERVICE.as_bytes()),
+        launcher_socket: digest(LAUNCHER_SOCKET.as_bytes()),
+        tmpfiles: digest(TMPFILES.as_bytes()),
+        network_launcher_service: digest(NETWORK_LAUNCHER_SERVICE.as_bytes()),
+        network_launcher_socket: digest(NETWORK_LAUNCHER_SOCKET.as_bytes()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn installed_unit_hashes_v6() -> Result<LinuxUnitHashesV6, String> {
+    let digest = |path: &str| -> Result<DiagnosticSha256, String> {
+        DiagnosticSha256::try_from(
+            BoundedText::<64>::new(&sha256_regular_no_follow(Path::new(path))?)
+                .map_err(str::to_owned)?,
+        )
+        .map_err(str::to_owned)
+    };
+    Ok(LinuxUnitHashesV6 {
+        control_service: digest(UNIT)?,
+        control_socket: digest(SOCKET_UNIT)?,
+        launcher_service: digest(LAUNCHER_UNIT)?,
+        launcher_socket: digest(LAUNCHER_SOCKET_UNIT)?,
+        tmpfiles: digest(TMPFILES_FILE)?,
+        network_launcher_service: digest(NETWORK_LAUNCHER_UNIT)?,
+        network_launcher_socket: digest(NETWORK_LAUNCHER_SOCKET_UNIT)?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn compiled_filter_digest_v6() -> Result<DiagnosticSha256, String> {
+    use crate::linux::network_filter::{
+        NativeAbi, compile_initial_closed_filter, filter_instruction_digest,
+    };
+    let abi = match crate::linux::runtime_manifest::target()? {
+        "x86_64-unknown-linux-gnu" => NativeAbi::X86_64,
+        "aarch64-unknown-linux-gnu" => NativeAbi::Aarch64,
+        _ => return Err("V6 inspection requires a supported GNU Linux ABI".into()),
+    };
+    let instructions = compile_initial_closed_filter(abi);
+    Ok(DiagnosticSha256::from_bytes(
+        filter_instruction_digest(&instructions).map_err(str::to_owned)?,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn package_inspection_v6_from_verified_manifest(
+    manifest: &memcordon_core::runtime_manifest_v3::RuntimeManifestV3,
+    manifest_bytes: &[u8],
+) -> Result<LinuxPackageInspectionV6, String> {
+    if memcordon_core::runtime_manifest_v3::RuntimeManifestV3::parse(manifest_bytes)? != *manifest {
+        return Err("V6 package manifest differs from pinned bytes".into());
+    }
+    verify_compiled_metadata()?;
+    let memcordon_core::runtime_manifest_v3::SealedRuntimeV3::WorkloadV2 {
+        native_protocols,
+        profile_catalog_sha256,
+        ..
+    } = &manifest.sealed
+    else {
+        return Err("V6 inspection requires Linux workload-V2 manifest".into());
+    };
+    Ok(LinuxPackageInspectionV6 {
+        schema_version: InspectionVersionSix,
+        version: BoundedText::new(&manifest.version).map_err(str::to_owned)?,
+        source_commit: BoundedText::new(&manifest.source_commit).map_err(str::to_owned)?,
+        target: BoundedText::new(&manifest.target).map_err(str::to_owned)?,
+        runtime_manifest_sha256: memcordon_core::workload_codec::hash_bytes(manifest_bytes),
+        components: manifest.components.clone(),
+        native_protocols: native_protocols.clone(),
+        profile_catalog_sha256: profile_catalog_sha256.clone(),
+        private_filter_sha256: compiled_filter_digest_v6()?,
+        compiled_units: compiled_unit_hashes_v6(),
+        compiled_metadata_valid: true,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_package_inspection_v6() -> Result<Option<LinuxPackageInspectionV6>, String> {
+    let source = std::env::current_exe().map_err(|error| error.to_string())?;
+    let Some((manifest, bytes)) = crate::linux::runtime_manifest::source_v3(&source)? else {
+        return Ok(None);
+    };
+    Ok(Some(package_inspection_v6_from_verified_manifest(
+        &manifest, &bytes,
+    )?))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_installed_inspection_v6() -> Result<Option<LinuxInstalledInspectionV6>, String> {
+    let Some((manifest, manifest_bytes)) =
+        crate::linux::runtime_manifest::source_v3(Path::new(BINARY))?
+    else {
+        return Ok(None);
+    };
+    let binding = crate::linux::runtime_manifest::installed_binding_v3()?;
+    if binding.runtime_manifest_sha256
+        != memcordon_core::workload_codec::hash_bytes(&manifest_bytes)
+    {
+        return Err("V6 installed generation changed during binding readback".into());
+    }
+    for unit in [
+        "memcordon-sealed-network-launcher.service",
+        "memcordon-sealed-network-launcher.socket",
+    ] {
+        ensure_unit_inactive(unit)?;
+        let output = std::process::Command::new("/usr/bin/systemctl")
+            .args(["show", "--property=UnitFileState", "--value", unit])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success()
+            || std::str::from_utf8(&output.stdout)
+                .map_err(|error| error.to_string())?
+                .trim()
+                != "disabled"
+        {
+            return Err("V6 optional network broker is not disabled".into());
+        }
+    }
+    let package = package_inspection_v6_from_verified_manifest(&manifest, &manifest_bytes)?;
+    let installed_agent_sha256 = DiagnosticSha256::try_from(
+        BoundedText::<64>::new(&sha256_regular_no_follow(Path::new(BINARY))?)
+            .map_err(str::to_owned)?,
+    )
+    .map_err(str::to_owned)?;
+    let provider_reachable = probe_provider().is_ok();
+    let inspection = LinuxInstalledInspectionV6 {
+        schema_version: InspectionVersionSix,
+        package: package.clone(),
+        installed_units: installed_unit_hashes_v6()?,
+        installed_agent_sha256: installed_agent_sha256.clone(),
+        installed_artifacts_valid: true,
+        provider_reachable,
+        network_launcher_state: NetworkLauncherStateV6::InstalledDisabled,
+        baseline_qualification: None,
+        private_qualification: None,
+        installed_qualification_sha256: None,
+    };
+    let serialized = serde_json::to_vec(&inspection).map_err(|error| error.to_string())?;
+    LinuxInstalledInspectionV6::parse_and_validate(
+        &serialized,
+        &manifest_bytes,
+        &TrustedLinuxInspectionV6 {
+            runtime_manifest_sha256: &package.runtime_manifest_sha256,
+            filter_sha256: &package.private_filter_sha256,
+            unit_hashes: &package.compiled_units,
+            installed_agent_sha256: &installed_agent_sha256,
+            provider_reachable,
+            network_launcher_state: NetworkLauncherStateV6::InstalledDisabled,
+            baseline_qualification: None,
+            private_qualification: None,
+            installed_qualification_sha256: None,
+        },
+    )?;
+    Ok(Some(inspection))
+}
+
+/// No private authority lease is issued while the installed V4 probe producer
+/// and routed terminal/retirement evidence are absent. The package lock stays
+/// held across verification and, once available, the caller's checkpoint and
+/// release. Readback still distinguishes an absent V3 package from an installed
+/// disabled one.
+#[cfg(target_os = "linux")]
+pub(crate) fn acquire_verified_private_qualification_lease()
+-> Result<VerifiedInstalledPrivateAuthorityLease, String> {
+    let _package_lease = crate::linux::service::acquire_shared_package_lease()?;
+    verify()?;
+    let inspection = linux_installed_inspection_v6()?
+        .ok_or("MCSEALED-PRIVATE-QUALIFICATION: installed V3 generation absent")?;
+    if inspection.network_launcher_state != NetworkLauncherStateV6::EnabledQualified {
+        return Err(
+            "MCSEALED-PRIVATE-QUALIFICATION: network profile is not enabled and qualified".into(),
+        );
+    }
+    unimplemented!("routed native V4 host receipt producer and verifier are not integrated")
 }
 
 pub(crate) fn verify() -> Result<(), String> {

@@ -157,10 +157,32 @@ fn handle_network(stream: &mut UnixStream) -> Result<(), String> {
                 "MCSEALED-NETWORK-LAUNCHER-DESCRIPTOR-SET",
                 "network broker descriptor inventory differs from transferred descriptors",
             ),
-            Ok(_) => RejectionV1::request_error(
-                "MCSEALED-NETWORK-LAUNCHER-UNQUALIFIED",
-                "private target preparation and native qualification are unavailable",
-            ),
+            Ok(broker) => match super::private_execution::execute_private_broker(
+                broker,
+                descriptors,
+                request.nonce,
+            ) {
+                Ok(payload) => {
+                    let response = Frame {
+                        kind: MessageKind::Terminal,
+                        nonce: request.nonce,
+                        attempt_id: request.attempt_id,
+                        payload,
+                    };
+                    return write_network_frame(stream, &response)
+                        .map_err(|error| error.to_string());
+                }
+                Err(error) => {
+                    let response = Frame {
+                        kind: MessageKind::Rejected,
+                        nonce: request.nonce,
+                        attempt_id: request.attempt_id,
+                        payload: error.encode(request.attempt_id)?,
+                    };
+                    return write_network_frame(stream, &response)
+                        .map_err(|error| error.to_string());
+                }
+            },
         }
     };
     let response = rejected(&request, &rejection)?;
@@ -247,11 +269,47 @@ pub fn launch_network(
     let response = read_network_frame(&mut stream).map_err(|error| error.to_string())?;
     if response.nonce != request.nonce
         || response.attempt_id != request.attempt_id
-        || response.kind != MessageKind::Rejected
+        || !matches!(response.kind, MessageKind::Terminal | MessageKind::Rejected)
     {
         return Err(
             "MCSEALED-NETWORK-LAUNCHER-SERVICE-AUTHENTICATION: invalid response".to_owned(),
         );
+    }
+    match response.kind {
+        MessageKind::Terminal => {
+            super::private_lifecycle::PrivateTerminalReceiptV4::parse_verified(
+                &response.payload,
+                request.attempt_id,
+            )?;
+        }
+        MessageKind::Rejected => {
+            let value: serde_json::Value = serde_json::from_slice(&response.payload)
+                .map_err(|error| format!("MCSEALED-NETWORK-LAUNCHER-REJECTION: {error}"))?;
+            match value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+            {
+                Some(4) => super::private_execution::validate_broker_rejection(
+                    &response.payload,
+                    request.attempt_id,
+                )?,
+                Some(1) => {
+                    let rejection: RejectionV1 = serde_json::from_slice(&response.payload)
+                        .map_err(|error| error.to_string())?;
+                    rejection.validate()?;
+                    if rejection.target_created
+                        || rejection.target_released
+                        || rejection.cleanup.attempted
+                    {
+                        return Err(
+                            "MCSEALED-NETWORK-LAUNCHER-REJECTION: V1 post-allocation claim".into(),
+                        );
+                    }
+                }
+                _ => return Err("MCSEALED-NETWORK-LAUNCHER-REJECTION: unknown schema".into()),
+            }
+        }
+        _ => unreachable!("validated network broker response kind"),
     }
     Ok(response)
 }

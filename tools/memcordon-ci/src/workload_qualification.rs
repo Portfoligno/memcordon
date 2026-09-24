@@ -6,6 +6,71 @@ use memcordon_core::workload_qualification_v2::{
 };
 use serde::{Deserialize, Serialize};
 
+/// These are additional, independently required rows for a future Linux V2
+/// release. The active V1 release inventory below does not promote them.
+pub const PRIVATE_V2_ARTIFACTS: [(&str, &str); 2] = [
+    (
+        "aarch64-unknown-linux-gnu",
+        "certification/workload/linux-arm64-private-v2.json",
+    ),
+    (
+        "x86_64-unknown-linux-gnu",
+        "certification/workload/linux-x64-private-v2.json",
+    ),
+];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateNativeInventoryV2 {
+    schema_version: u32,
+    profile: String,
+    targets: Vec<String>,
+    tests: Vec<String>,
+}
+
+/// Applies the checked-in test inventory before structural artifact parsing.
+/// The caller must obtain completions from an independent native runner; this
+/// validator cannot turn a self-reported artifact into release authority.
+pub fn validate_private_v2_against_trusted_native_completions(
+    artifact_bytes: &[u8],
+    reference: &QualificationArtifactReferenceV2,
+    expected: &TrustedQualificationExpectationV2<'_>,
+) -> Result<QualificationArtifactV2> {
+    let inventory: PrivateNativeInventoryV2 =
+        toml::from_str(include_str!("../../../ci/private-native-v2.toml"))
+            .map_err(|error| CiError::Message(error.to_string()))?;
+    let target_rows = PRIVATE_V2_ARTIFACTS.map(|(target, _)| target.to_owned());
+    if inventory.schema_version != 1
+        || inventory.profile != "linux-tcp4-private-v1"
+        || inventory.targets != target_rows
+        || inventory.tests.is_empty()
+        || inventory.tests.len() > memcordon_core::workload_qualification_v2::NATIVE_TESTS_MAX
+        || inventory.tests.windows(2).any(|pair| pair[0] >= pair[1])
+        || !PRIVATE_V2_ARTIFACTS.iter().any(|(target, artifact)| {
+            *target == expected.target
+                && reference.qualified_target == *target
+                && reference.artifact == *artifact
+        })
+        || expected.profile
+            != &memcordon_core::workload_registry_v2::ProfileKindV2::LinuxTcp4PrivateV1.reference()
+        || expected.completions.len() != inventory.tests.len()
+    {
+        return Err(CiError::Message(
+            "private V2 release inventory or target binding differs".into(),
+        ));
+    }
+    for (observed, name) in expected.completions.iter().zip(&inventory.tests) {
+        if observed.name != name || observed.target != expected.target || !observed.native_executed
+        {
+            return Err(CiError::Message(
+                "private V2 native completion differs from required test inventory".into(),
+            ));
+        }
+    }
+    QualificationArtifactV2::parse_and_validate(artifact_bytes, reference, expected)
+        .map_err(|error| CiError::Message(format!("private V2 artifact differs: {error}")))
+}
+
 /// Audits a proposed private-profile artifact but never promotes it into this
 /// release's required/accepted inventory. A trusted native completion source,
 /// installed V4 qualification producer, and package binding are not wired yet.

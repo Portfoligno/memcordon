@@ -88,6 +88,58 @@ fn qualification(profile: ProfileKindV2) -> QualificationArtifactReferenceV2 {
 }
 
 #[test]
+fn linux_constructor_emits_exact_unqualified_catalogue() {
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let generated = RuntimeManifestV3::linux_unqualified(
+            "0.5.7-dev".into(),
+            SOURCE.into(),
+            target.into(),
+            components(),
+        )
+        .unwrap();
+        let parsed = RuntimeManifestV3::parse(&serde_json::to_vec(&generated).unwrap()).unwrap();
+        assert_eq!(parsed, generated);
+        let SealedRuntimeV3::WorkloadV2 { profiles, .. } = parsed.sealed else {
+            panic!("Linux constructor emitted another provider policy");
+        };
+        assert_eq!(profiles.as_slice().len(), 2);
+        assert!(profiles.as_slice().iter().all(|record| matches!(
+            record.availability,
+            RuntimeProfileAvailabilityV3::Unqualified
+        )));
+    }
+    assert!(
+        RuntimeManifestV3::linux_unqualified(
+            "0.5.7-dev".into(),
+            SOURCE.into(),
+            "x86_64-unknown-linux-musl".into(),
+            components(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn v3_public_binding_requires_exact_manifest_bytes() {
+    let manifest = RuntimeManifestV3::linux_unqualified(
+        "0.5.7-dev".into(),
+        SOURCE.into(),
+        TARGET.into(),
+        components(),
+    )
+    .unwrap();
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let binding = manifest.public_binding(&bytes).unwrap();
+    assert_eq!(
+        binding.runtime_manifest_sha256,
+        memcordon_core::workload_codec::hash_bytes(&bytes)
+    );
+    let mut changed = manifest.clone();
+    changed.version = "0.5.8-dev".into();
+    assert!(changed.public_binding(&bytes).is_err());
+}
+
+#[test]
 fn v3_parser_is_closed_and_versioned_without_rewriting_v2() {
     let v3 = manifest();
     let bytes = serde_json::to_vec(&v3).unwrap();

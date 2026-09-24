@@ -107,3 +107,163 @@ fn valid_sha256(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
+
+/// A V4 host receipt can be qualified only against independently observed
+/// native probe completions and the protected installed byte identity.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeQualificationProbeV4 {
+    pub profile: memcordon_core::workload_contract::ProfileRef,
+    pub name: String,
+    pub native_executed: bool,
+    pub passed: bool,
+    pub completion_digest: memcordon_core::DiagnosticSha256,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationReceiptV4 {
+    pub schema_version: u32,
+    pub version: String,
+    pub source_commit: String,
+    pub target: String,
+    pub boot_id: String,
+    pub installed_runtime_manifest_sha256: memcordon_core::DiagnosticSha256,
+    pub installed_agent_sha256: memcordon_core::DiagnosticSha256,
+    pub installed_units: memcordon_core::package_inspection_v6::LinuxUnitHashesV6,
+    pub filter_abi: String,
+    pub filter_instruction_sha256: memcordon_core::DiagnosticSha256,
+    pub profile_catalog_sha256: memcordon_core::DiagnosticSha256,
+    pub host_prerequisites_digest: memcordon_core::DiagnosticSha256,
+    pub native_run_digest: memcordon_core::DiagnosticSha256,
+    pub probes: Vec<NativeQualificationProbeV4>,
+    pub receipt_digest: memcordon_core::DiagnosticSha256,
+}
+
+pub struct TrustedQualificationProbeV4<'a> {
+    pub profile: &'a memcordon_core::workload_contract::ProfileRef,
+    pub name: &'a str,
+    pub native_executed: bool,
+    pub completion_digest: &'a memcordon_core::DiagnosticSha256,
+}
+
+pub struct TrustedQualificationReceiptV4<'a> {
+    pub source_commit: &'a str,
+    pub target: &'a str,
+    pub boot_id: &'a str,
+    pub installed_runtime_manifest_sha256: &'a memcordon_core::DiagnosticSha256,
+    pub installed_agent_sha256: &'a memcordon_core::DiagnosticSha256,
+    pub installed_units: &'a memcordon_core::package_inspection_v6::LinuxUnitHashesV6,
+    pub filter_instruction_sha256: &'a memcordon_core::DiagnosticSha256,
+    pub host_prerequisites_digest: &'a memcordon_core::DiagnosticSha256,
+    pub native_run_digest: &'a memcordon_core::DiagnosticSha256,
+    pub probes: &'a [TrustedQualificationProbeV4<'a>],
+    pub receipt_sha256: &'a memcordon_core::DiagnosticSha256,
+}
+
+impl QualificationReceiptV4 {
+    pub fn parse_and_validate(
+        bytes: &[u8],
+        trusted: &TrustedQualificationReceiptV4<'_>,
+    ) -> Result<Self, String> {
+        if bytes.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES {
+            return Err("V4 qualification receipt exceeds byte limit".into());
+        }
+        memcordon_core::workload_contract::reject_duplicate_json_keys(bytes)?;
+        if &memcordon_core::workload_codec::hash_bytes(bytes) != trusted.receipt_sha256 {
+            return Err("V4 qualification receipt bytes differ from protected readback".into());
+        }
+        let receipt: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        receipt.validate(trusted)?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self, trusted: &TrustedQualificationReceiptV4<'_>) -> Result<(), String> {
+        use memcordon_core::workload_registry_v2::ProfileKindV2;
+        let expected_abi = match trusted.target {
+            "x86_64-unknown-linux-gnu" => "x86_64",
+            "aarch64-unknown-linux-gnu" => "aarch64",
+            _ => return Err("V4 qualification target is not a supported native GNU ABI".into()),
+        };
+        if self.schema_version != 4
+            || self.version != env!("CARGO_PKG_VERSION")
+            || self.source_commit != trusted.source_commit
+            || self.source_commit.len() != 40
+            || !self
+                .source_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || self.target != trusted.target
+            || self.boot_id != trusted.boot_id
+            || !valid_boot_id(&self.boot_id)
+            || self.installed_runtime_manifest_sha256 != *trusted.installed_runtime_manifest_sha256
+            || self.installed_agent_sha256 != *trusted.installed_agent_sha256
+            || self.installed_units != *trusted.installed_units
+            || self.filter_abi != expected_abi
+            || self.filter_instruction_sha256 != *trusted.filter_instruction_sha256
+            || self.profile_catalog_sha256
+                != memcordon_core::workload_discovery_v2::profile_catalog_digest_v2()
+            || self.host_prerequisites_digest != *trusted.host_prerequisites_digest
+            || self.native_run_digest != *trusted.native_run_digest
+            || self.probes.len() != trusted.probes.len()
+            || self.probes.len() < 2
+            || self.probes.len() > 64
+        {
+            return Err("V4 qualification host, boot, image or native run differs".into());
+        }
+        let private = ProfileKindV2::LinuxTcp4PrivateV1.reference();
+        let baseline = ProfileKindV2::LinuxUnixCreateV1.reference();
+        let mut saw_private = false;
+        let mut saw_baseline = false;
+        let mut previous: Option<(&str, &str)> = None;
+        for (probe, expected) in self.probes.iter().zip(trusted.probes) {
+            let key = (probe.profile.id.as_str(), probe.name.as_str());
+            if probe.name.is_empty()
+                || probe.name.len() > 256
+                || !probe.name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')
+                })
+                || previous.is_some_and(|prior| prior >= key)
+                || probe.profile != *expected.profile
+                || probe.name != expected.name
+                || !probe.native_executed
+                || !probe.passed
+                || !expected.native_executed
+                || probe.completion_digest != *expected.completion_digest
+            {
+                return Err("V4 qualification probe inventory or completion differs".into());
+            }
+            saw_private |= probe.profile == private;
+            saw_baseline |= probe.profile == baseline;
+            if probe.profile != private && probe.profile != baseline {
+                return Err("V4 qualification contains an unknown profile".into());
+            }
+            previous = Some(key);
+        }
+        if !saw_private || !saw_baseline || self.receipt_digest != self.canonical_digest()? {
+            return Err("V4 qualification is incomplete or receipt digest differs".into());
+        }
+        Ok(())
+    }
+
+    pub fn canonical_digest(&self) -> Result<memcordon_core::DiagnosticSha256, String> {
+        let mut content = self.clone();
+        content.receipt_digest = memcordon_core::DiagnosticSha256::from_bytes([0; 32]);
+        Ok(memcordon_core::workload_codec::hash_bytes(
+            &serde_json::to_vec(&content).map_err(|error| error.to_string())?,
+        ))
+    }
+}
+
+fn valid_boot_id(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    parts.len() == 5
+        && parts.iter().zip([8, 4, 4, 4, 12]).all(|(part, length)| {
+            part.len() == length
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+}

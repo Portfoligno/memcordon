@@ -15,6 +15,7 @@ use crate::{
 };
 
 pub const EXECUTION_REPORT_SCHEMA_VERSION: u32 = 10;
+pub const HISTORICAL_EXECUTION_REPORT_SCHEMA_V10: u32 = 10;
 pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 9;
 pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 6;
 pub const CLEAN_REPORT_SCHEMA_VERSION: u32 = 2;
@@ -32,6 +33,30 @@ pub struct MemcordonReport {
 }
 
 impl MemcordonReport {
+    /// Selects only schemas that this binary can validate. Schema 11 joins
+    /// this set when the V2 report model and producer are activated together.
+    pub fn supports_schema(schema: u32) -> bool {
+        schema == HISTORICAL_EXECUTION_REPORT_SCHEMA_V10
+            || schema == EXECUTION_REPORT_SCHEMA_VERSION
+    }
+
+    /// Decode a report against a trusted, exact release-selected schema.
+    /// The report's own version field cannot choose a decoder on its own.
+    pub fn parse_exact_schema(bytes: &[u8], expected_schema: u32) -> Result<Self, String> {
+        if !Self::supports_schema(expected_schema) {
+            return Err(ReportModelError::SchemaVersion.to_string());
+        }
+        let report: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if report.schema_version != expected_schema {
+            return Err(ReportModelError::SchemaVersion.to_string());
+        }
+        Ok(report)
+    }
+
+    pub fn parse_historical_v10(bytes: &[u8]) -> Result<Self, String> {
+        Self::parse_exact_schema(bytes, HISTORICAL_EXECUTION_REPORT_SCHEMA_V10)
+    }
+
     /// Builds the current schema-10 report. Older constructor names are aliases,
     /// not historical schema writers.
     pub fn schema10(
@@ -126,7 +151,7 @@ impl<'de> Deserialize<'de> for MemcordonReport {
             error: Option<ExecutionErrorReport>,
         }
         let wire = Wire::deserialize(deserializer)?;
-        if wire.schema_version != EXECUTION_REPORT_SCHEMA_VERSION {
+        if !Self::supports_schema(wire.schema_version) {
             return Err(serde::de::Error::custom(ReportModelError::SchemaVersion));
         }
         if wire.supervision.is_some() == wire.error.is_some() {

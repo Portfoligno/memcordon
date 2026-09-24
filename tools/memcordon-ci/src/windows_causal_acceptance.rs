@@ -188,6 +188,59 @@ pub fn parse_fixture_readiness(stdout: &[u8]) -> Result<Vec<FixtureProcessIdenti
     Ok(identities)
 }
 
+/// Reconcile the independently retained process family with the public CLI's
+/// original readiness stream. A reported capacity failure requires every leaf
+/// that made the Job inventory exceed its bound, not just a plausible root.
+pub fn validate_fixture_family(stdout: &[u8], family: &[FixtureProcessIdentityV1]) -> Result<()> {
+    let expected_len = WINDOWS_MAX_JOB_PROCESS_IDENTITIES
+        .checked_add(1)
+        .ok_or_else(|| failure("inventory fixture family bound overflow"))?;
+    if family.len() != expected_len {
+        return Err(failure("installed causal fixture family is incomplete"));
+    }
+    let mut ordinals = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    let mut roots = 0;
+    for member in family {
+        if member.pid == 0 || member.birth == 0 || !identities.insert((member.pid, member.birth)) {
+            return Err(failure("installed causal fixture identity is invalid"));
+        }
+        match member.ordinal {
+            None => roots += 1,
+            Some(ordinal) if ordinal < WINDOWS_MAX_JOB_PROCESS_IDENTITIES => {
+                if !ordinals.insert(ordinal) {
+                    return Err(failure("installed causal fixture ordinal is duplicated"));
+                }
+            }
+            _ => return Err(failure("installed causal fixture ordinal is out of range")),
+        }
+    }
+    if roots != 1
+        || ordinals.len() != WINDOWS_MAX_JOB_PROCESS_IDENTITIES
+        || !ordinals
+            .iter()
+            .copied()
+            .eq(0..WINDOWS_MAX_JOB_PROCESS_IDENTITIES)
+    {
+        return Err(failure("installed causal fixture family is incomplete"));
+    }
+    let readiness = parse_fixture_readiness(stdout)?;
+    let reported: BTreeSet<_> = readiness
+        .into_iter()
+        .map(|identity| (identity.ordinal, identity.pid, identity.birth))
+        .collect();
+    let retained: BTreeSet<_> = family
+        .iter()
+        .map(|identity| (identity.ordinal, identity.pid, identity.birth))
+        .collect();
+    if reported != retained {
+        return Err(failure(
+            "installed causal fixture family differs from retained readiness",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CleanupEvidenceV1 {
@@ -323,19 +376,28 @@ pub fn validate_report(
     qualification: &WindowsQualificationReceiptV1,
     manifest_bytes: &[u8],
 ) -> Result<()> {
-    if bytes.len() > MAX_REPORT_BYTES
-        || expected_schema != memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION
-    {
+    if bytes.len() > MAX_REPORT_BYTES || !MemcordonReport::supports_schema(expected_schema) {
         return Err(failure(
             "installed causal report schema or byte bound differs",
         ));
     }
-    let report: MemcordonReport = serde_json::from_slice(bytes)?;
+    let report = MemcordonReport::parse_exact_schema(bytes, expected_schema).map_err(failure)?;
     if manifest_bytes.len() > MAX_MANIFEST_BYTES {
         return Err(failure("installed runtime manifest is oversized"));
     }
     let manifest = memcordon_core::runtime_manifest::RuntimeManifestV2::parse(manifest_bytes)
         .map_err(failure)?;
+    if !matches!(
+        &manifest.sealed,
+        memcordon_core::runtime_manifest::SealedRuntimeV2::Included {
+            execution_report_schema,
+            ..
+        } if *execution_report_schema == expected_schema
+    ) {
+        return Err(failure(
+            "installed causal runtime manifest report schema differs",
+        ));
+    }
     let provider_binding = manifest.public_binding(manifest_bytes).map_err(failure)?;
     if report.schema_version != expected_schema
         || report.supervision.is_some()
@@ -496,7 +558,7 @@ pub fn validate_artifact_with_raw(
         || artifact.target != expected_target
         || artifact.channel != expected_channel
         || artifact.package_version.is_empty()
-        || artifact.execution_report_schema != memcordon_core::EXECUTION_REPORT_SCHEMA_VERSION
+        || !MemcordonReport::supports_schema(artifact.execution_report_schema)
         || artifact.expected_case != "inventory-capacity-receiptless"
         || !valid_sha256(&artifact.provider_identity_sha256)
         || !valid_sha256(&artifact.component_inventory_sha256)
@@ -550,42 +612,29 @@ pub fn validate_artifact_with_raw(
     let manifest =
         memcordon_core::runtime_manifest::RuntimeManifestV2::parse(&raw["runtime-manifest.json"])
             .map_err(failure)?;
-    let unique_ordinals: BTreeSet<_> = fixture
-        .observed_family
-        .iter()
-        .filter_map(|identity| identity.ordinal)
-        .collect();
-    let unique_identities: BTreeSet<_> = fixture
-        .observed_family
-        .iter()
-        .map(|identity| (identity.pid, identity.birth))
-        .collect();
+    let mut installed_clis = manifest.components.iter().filter(|component| {
+        component.role == memcordon_core::runtime_manifest::RuntimeComponentRole::PublicCli
+    });
+    let installed_cli = installed_clis
+        .next()
+        .ok_or_else(|| failure("installed causal manifest has no public CLI component"))?;
+    if installed_clis.next().is_some() {
+        return Err(failure(
+            "installed causal manifest has multiple public CLI components",
+        ));
+    }
+    validate_fixture_family(&raw["stdout.bin"], &fixture.observed_family)?;
     if invocation.schema_version != 1
         || invocation.runner_timed_out
         || invocation.exit_code.is_none_or(|code| code == 0)
         || !valid_sha256(&invocation.cli_sha256)
+        || invocation.cli_sha256 != installed_cli.sha256
         || invocation.fixture_sha256 != artifact.fixture_sha256
         || fixture.schema_version != 1
         || fixture.image_sha256 != artifact.fixture_sha256
         || !fixture.root_ready
         || !fixture.root_exited
         || !fixture.all_matching_processes_gone
-        || fixture.observed_family.len() > WINDOWS_MAX_JOB_PROCESS_IDENTITIES + 1
-        || fixture
-            .observed_family
-            .iter()
-            .filter(|identity| identity.ordinal.is_none())
-            .count()
-            != 1
-        || unique_ordinals.len() + 1 != fixture.observed_family.len()
-        || unique_identities.len() != fixture.observed_family.len()
-        || fixture.observed_family.iter().any(|identity| {
-            identity.pid == 0
-                || identity.birth == 0
-                || identity
-                    .ordinal
-                    .is_some_and(|ordinal| ordinal >= WINDOWS_MAX_JOB_PROCESS_IDENTITIES)
-        })
         || cleanup.schema_version != 1
         || !cleanup.attempts_empty
         || !cleanup.package_recovered

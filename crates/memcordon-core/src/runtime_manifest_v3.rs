@@ -142,6 +142,79 @@ impl VersionedRuntimeManifest {
 }
 
 impl RuntimeManifestV3 {
+    pub fn public_binding(&self, bytes: &[u8]) -> Result<crate::PublicProviderBindingV1, String> {
+        if Self::parse(bytes)? != *self {
+            return Err("V3 public binding differs from pinned manifest bytes".into());
+        }
+        let binding = crate::PublicProviderBindingV1 {
+            generation: crate::BoundedText::new(&format!(
+                "{}:{}",
+                self.version, self.source_commit
+            ))
+            .map_err(str::to_owned)?,
+            source_commit: crate::BoundedText::new(&self.source_commit).map_err(str::to_owned)?,
+            runtime_manifest_sha256: crate::workload_codec::hash_bytes(bytes),
+        };
+        if !binding.is_consistent() {
+            return Err("invalid V3 runtime provider identity".into());
+        }
+        Ok(binding)
+    }
+
+    /// Constructs the Linux V2 catalogue without claiming native private-profile
+    /// qualification. Release inventory must supply independently verified
+    /// references before either profile can be advertised as qualified.
+    pub fn linux_unqualified(
+        version: String,
+        source_commit: String,
+        target: String,
+        components: Vec<RuntimeComponentRecord>,
+    ) -> Result<Self, String> {
+        let mut profiles = BoundedVec::default();
+        for profile in [
+            ProfileKindV2::LinuxTcp4PrivateV1.reference(),
+            ProfileKindV2::LinuxUnixCreateV1.reference(),
+        ] {
+            profiles
+                .try_push(RuntimeProfileRecordV3 {
+                    profile,
+                    availability: RuntimeProfileAvailabilityV3::Unqualified,
+                })
+                .map_err(|_| "Linux runtime profile catalogue exceeds bound")?;
+        }
+        let mut supported_contract_versions = BoundedVec::default();
+        for version in [1, 2] {
+            supported_contract_versions
+                .try_push(version)
+                .map_err(|_| "Linux runtime contract versions exceed bound")?;
+        }
+        let manifest = Self {
+            schema_version: RuntimeManifestVersionThree::default(),
+            project: "memcordon".into(),
+            version,
+            source_commit,
+            target,
+            components,
+            sealed: SealedRuntimeV3::WorkloadV2 {
+                agent_component: "sealed-agent".into(),
+                native_protocols: NativeProviderProtocols::Linux {
+                    provider_contract: 4,
+                    launch_wire: 4,
+                },
+                broker_wire: 4,
+                execution_report_schema: 11,
+                plan_report_schema: 10,
+                doctor_report_schema: 7,
+                installed_qualification_schema: 4,
+                supported_contract_versions,
+                profile_catalog_sha256: profile_catalog_digest_v2(),
+                profiles,
+            },
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() > limits::PUBLIC_OBJECT_BYTES {
             return Err("runtime manifest exceeds bound".into());
