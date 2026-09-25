@@ -12,6 +12,8 @@ use std::io::Read;
 use std::path::Path;
 
 use memcordon_core::DiagnosticSha256;
+use memcordon_core::private_public_report_v2::PublicCliReportEvidenceV2;
+use memcordon_core::private_release_case_v1::PrivateReleaseAllocatedOutcomeV1;
 use memcordon_core::report_v11::{
     PrivatePublicOutcomeV11, PrivatePublicResultV11, PrivateTerminalOutcomeV11,
 };
@@ -62,6 +64,7 @@ pub enum ExpectedPublicV2Outcome {
     Indeterminate,
     BeforeSubmissionFailure,
     TransportUnverified,
+    FrontendLost,
 }
 
 /// Every hash must come from an independently reopened final installation or
@@ -86,11 +89,75 @@ pub struct StructuralPublicV2Readback {
     pub child_start_time_ticks: u64,
 }
 
-pub fn validate_structural_public_v2_readback(
+/// Replacement facts obtained from protected terminal, transport and recovery
+/// readers outside the CLI process. Copying them from `report_evidence` would
+/// make an absent report self-authenticating.
+pub struct ExpectedFrontendLossEvidenceV2<'a> {
+    pub authenticated_terminal_sha256: &'a DiagnosticSha256,
+    pub supervised_transport_sha256: &'a DiagnosticSha256,
+    pub independent_recovery_sha256: &'a DiagnosticSha256,
+}
+
+pub enum StructuralPublicV2ReportPresence {
+    Present(StructuralPublicV2Readback),
+    AbsentFrontendLoss {
+        child_pid: u32,
+        child_start_time_ticks: u64,
+    },
+}
+
+/// Joins the versioned report-presence record with independently obtained
+/// replacement facts. This remains structural and cannot construct P.
+pub fn validate_public_v2_report_presence(
     observed: &SupervisedProcessV2,
-    report_bytes: &[u8],
+    report_bytes: Option<&[u8]>,
+    report_evidence: &PublicCliReportEvidenceV2,
+    release_outcome: PrivateReleaseAllocatedOutcomeV1,
     expected: &ExpectedPublicV2Readback<'_>,
-) -> Result<StructuralPublicV2Readback> {
+    replacement: Option<&ExpectedFrontendLossEvidenceV2<'_>>,
+) -> Result<StructuralPublicV2ReportPresence> {
+    report_evidence
+        .validate_for_outcome(release_outcome, report_bytes)
+        .map_err(CiError::Message)?;
+    match (report_evidence, report_bytes, replacement) {
+        (PublicCliReportEvidenceV2::Present { .. }, Some(bytes), None) => {
+            Ok(StructuralPublicV2ReportPresence::Present(
+                validate_structural_public_v2_readback(observed, bytes, expected)?,
+            ))
+        }
+        (
+            PublicCliReportEvidenceV2::AbsentFrontendLoss {
+                authenticated_terminal_sha256,
+                supervised_transport_sha256,
+                independent_recovery_sha256,
+            },
+            None,
+            Some(independent),
+        ) if expected.outcome == ExpectedPublicV2Outcome::FrontendLost
+            && !observed.status.success()
+            && authenticated_terminal_sha256 == independent.authenticated_terminal_sha256
+            && supervised_transport_sha256 == independent.supervised_transport_sha256
+            && independent_recovery_sha256 == independent.independent_recovery_sha256 =>
+        {
+            validate_public_expected_identity(expected)?;
+            let child = observed
+                .linux_child
+                .filter(|identity| identity.pid != 0 && identity.start_time_ticks != 0)
+                .ok_or_else(|| {
+                    CiError::Message("public V2 child kernel identity is absent".into())
+                })?;
+            Ok(StructuralPublicV2ReportPresence::AbsentFrontendLoss {
+                child_pid: child.pid,
+                child_start_time_ticks: child.start_time_ticks,
+            })
+        }
+        _ => Err(CiError::Message(
+            "public V2 report evidence or independent replacement differs".into(),
+        )),
+    }
+}
+
+fn validate_public_expected_identity(expected: &ExpectedPublicV2Readback<'_>) -> Result<()> {
     let zero = DiagnosticSha256::from_bytes([0; 32]);
     if expected.source_commit.len() != 40
         || !expected
@@ -110,6 +177,15 @@ pub fn validate_structural_public_v2_readback(
             "public V2 independent final identity is incomplete".into(),
         ));
     }
+    Ok(())
+}
+
+pub fn validate_structural_public_v2_readback(
+    observed: &SupervisedProcessV2,
+    report_bytes: &[u8],
+    expected: &ExpectedPublicV2Readback<'_>,
+) -> Result<StructuralPublicV2Readback> {
+    validate_public_expected_identity(expected)?;
     let child = observed
         .linux_child
         .filter(|identity| identity.pid != 0 && identity.start_time_ticks != 0)
@@ -181,6 +257,55 @@ pub fn read_structural_public_v2_report(
     observed: &SupervisedProcessV2,
     expected: &ExpectedPublicV2Readback<'_>,
 ) -> Result<StructuralPublicV2Readback> {
+    let bytes = read_public_v2_report_bytes(path, expected.report_owner_uid)?;
+    validate_structural_public_v2_readback(observed, &bytes, expected)
+}
+
+/// Reads a present report or verifies exact absence for a frontend-loss case.
+/// Protected replacement observations must be independently supplied.
+#[cfg(unix)]
+pub fn read_structural_public_v2_report_presence(
+    path: &Path,
+    observed: &SupervisedProcessV2,
+    report_evidence: &PublicCliReportEvidenceV2,
+    release_outcome: PrivateReleaseAllocatedOutcomeV1,
+    expected: &ExpectedPublicV2Readback<'_>,
+    replacement: Option<&ExpectedFrontendLossEvidenceV2<'_>>,
+) -> Result<StructuralPublicV2ReportPresence> {
+    if !path.is_absolute() {
+        return Err(CiError::Message(
+            "public V2 report path is not absolute".into(),
+        ));
+    }
+    let bytes = match report_evidence {
+        PublicCliReportEvidenceV2::Present { .. } => Some(read_public_v2_report_bytes(
+            path,
+            expected.report_owner_uid,
+        )?),
+        PublicCliReportEvidenceV2::AbsentFrontendLoss { .. } => {
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+                Ok(_) => {
+                    return Err(CiError::Message(
+                        "frontend-loss CLI report unexpectedly exists".into(),
+                    ));
+                }
+            }
+        }
+    };
+    validate_public_v2_report_presence(
+        observed,
+        bytes.as_deref(),
+        report_evidence,
+        release_outcome,
+        expected,
+        replacement,
+    )
+}
+
+#[cfg(unix)]
+fn read_public_v2_report_bytes(path: &Path, report_owner_uid: u32) -> Result<Vec<u8>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     if !path.is_absolute() {
@@ -195,7 +320,7 @@ pub fn read_structural_public_v2_report(
     let before = file.metadata()?;
     if !before.is_file()
         || before.nlink() != 1
-        || before.uid() != expected.report_owner_uid
+        || before.uid() != report_owner_uid
         || before.mode() & 0o7777 != 0o600
         || before.len() == 0
         || before.len() > PUBLIC_OBJECT_BYTES as u64
@@ -233,5 +358,5 @@ pub fn read_structural_public_v2_report(
             "public V2 report changed during readback".into(),
         ));
     }
-    validate_structural_public_v2_readback(observed, &bytes, expected)
+    Ok(bytes)
 }

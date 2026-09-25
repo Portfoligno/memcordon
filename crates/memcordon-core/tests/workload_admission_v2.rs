@@ -219,3 +219,49 @@ fn frozen_v2_rejects_authority_substitution() {
         snapshot.canonical_digest().unwrap()
     );
 }
+
+#[test]
+fn candidate_decision_uses_production_predicate_without_freezing_authority() {
+    let (registry, request) = authority();
+    let caller = CallerSelector::Linux { uid: 1000 };
+    let decide =
+        |request: &WorkloadContractV2, caller: &CallerSelector, digest: &DiagnosticSha256| {
+            evaluate_candidate_policy_v2(
+                &registry,
+                &request.expected_epoch,
+                request,
+                caller,
+                ProfileKindV2::LinuxTcp4PrivateV1,
+                digest,
+            )
+        };
+    assert_eq!(
+        decide(&request, &caller, &digest(3)),
+        CandidatePolicyDecisionV2::Accepted
+    );
+
+    let mut wrong_grant = request.clone();
+    wrong_grant.authorization.grant_id = id("other-grant");
+    assert_eq!(
+        decide(&wrong_grant, &caller, &digest(3)),
+        CandidatePolicyDecisionV2::Rejected(AdmissionRejectionV2::single(
+            AdmissionCodeV2::ProfileNotAuthorized
+        ))
+    );
+
+    let mut wrong_profile = request.clone();
+    wrong_profile.authorized_profile = ProfileKindV2::LinuxUnixCreateV1.reference();
+    assert_eq!(
+        decide(&wrong_profile, &caller, &digest(3)),
+        CandidatePolicyDecisionV2::Rejected(AdmissionRejectionV2::single(
+            AdmissionCodeV2::ProfileDigestMismatch
+        ))
+    );
+
+    assert_eq!(
+        decide(&request, &caller, &digest(99)),
+        CandidatePolicyDecisionV2::Rejected(AdmissionRejectionV2::single(
+            AdmissionCodeV2::HostPrerequisiteUnavailable
+        ))
+    );
+}

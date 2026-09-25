@@ -42,6 +42,7 @@ pub(crate) mod private_release_child_gate;
 #[allow(dead_code)] // Closed physical owner prerequisite until dispatch joins land.
 pub(crate) mod private_release_child_owner;
 pub(crate) mod private_release_children;
+pub(crate) mod private_release_compat_abi;
 pub(crate) mod private_release_denial;
 pub(crate) mod private_release_descriptors;
 pub(crate) mod private_release_dual_attempt;
@@ -67,6 +68,7 @@ pub(crate) mod private_release_terminal_execution;
 pub(crate) mod private_release_terminal_gate;
 pub(crate) mod private_release_terminal_join;
 pub(crate) mod private_release_terminal_raw;
+pub(crate) mod private_release_unix_gate;
 #[allow(dead_code)] // Closed target subwitness until owner/raw/detached/CI joins land.
 pub(crate) mod private_release_unix_intent;
 pub(crate) mod private_release_unix_owner;

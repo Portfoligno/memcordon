@@ -63,6 +63,10 @@ impl PrivateObservedTarget {
         self.native.network_namespace.inode
     }
 
+    pub(crate) fn target_identity(&self) -> &ProcessIdentityV4 {
+        &self.target
+    }
+
     pub(crate) fn precreated_sendmsg_errno(&self) -> Option<i32> {
         self.native.ready.precreated_sendmsg_errno
     }
@@ -505,6 +509,27 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
         self.record
             .as_ref()
             .is_some_and(PrivateNativeJournal::possibly_released)
+    }
+
+    pub(crate) fn require_live_target_identity(
+        &self,
+        target: &ProcessIdentityV4,
+    ) -> Result<(), String> {
+        let pidfd = self
+            .target_pidfd
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: retained target pidfd absent")?;
+        if ProcessIdentityV4::observe(target.pid as libc::pid_t, pidfd.as_fd())? != *target {
+            return Err("MCSEALED-PRIVATE-RELEASE: retained target identity changed".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn tick_relay_for_unix_observer(&mut self) -> Result<(), String> {
+        self.relay
+            .as_mut()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: Unix observer relay absent")?
+            .tick(Duration::from_millis(10))
     }
 
     pub(crate) fn revalidate_precreated_socket_before_release(

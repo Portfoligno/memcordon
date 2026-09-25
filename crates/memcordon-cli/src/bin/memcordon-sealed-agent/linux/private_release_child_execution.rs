@@ -161,6 +161,7 @@ pub(crate) fn execute_child_candidate_case(
             settlement: retirement.settlement,
             host_network_preservation: None,
             agent_path_preservation: None,
+            unix_absence: None,
         },
         live,
     })

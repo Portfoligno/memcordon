@@ -269,6 +269,7 @@ pub(crate) fn execute_checkpoint_gate_case(
             settlement: retirement.settlement,
             host_network_preservation: None,
             agent_path_preservation: None,
+            unix_absence: None,
         },
         gate_sha256,
     })

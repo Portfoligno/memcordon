@@ -656,6 +656,50 @@ fn github_run_job_and_downloaded_zip_must_join_the_candidate_target() {
         validate_native_run_platform_provenance(&envelope, &origin, &run, &jobs, &artifact, zip)
             .unwrap();
     assert_eq!(spec.target, TARGET);
+    let mut collecting_run = run.clone();
+    collecting_run["status"] = serde_json::json!("in_progress");
+    collecting_run["conclusion"] = serde_json::Value::Null;
+    assert!(
+        validate_native_run_platform_provenance(
+            &envelope,
+            &origin,
+            &collecting_run,
+            &jobs,
+            &artifact,
+            zip,
+        )
+        .is_ok(),
+        "a downstream collector must accept a completed producer job while its workflow runs"
+    );
+    let mut unfinished_job = jobs.clone();
+    unfinished_job["jobs"][0]["status"] = serde_json::json!("in_progress");
+    unfinished_job["jobs"][0]["conclusion"] = serde_json::Value::Null;
+    assert!(
+        validate_native_run_platform_provenance(
+            &envelope,
+            &origin,
+            &collecting_run,
+            &unfinished_job,
+            &artifact,
+            zip,
+        )
+        .is_err(),
+        "an unfinished producer cannot authenticate its own artifact"
+    );
+    let mut failed_job = jobs.clone();
+    failed_job["jobs"][0]["conclusion"] = serde_json::json!("failure");
+    assert!(
+        validate_native_run_platform_provenance(
+            &envelope,
+            &origin,
+            &collecting_run,
+            &failed_job,
+            &artifact,
+            zip,
+        )
+        .is_err(),
+        "an unsuccessful producer cannot authenticate its artifact"
+    );
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default()
         .system(zip::System::Unix)
@@ -686,6 +730,10 @@ fn github_run_job_and_downloaded_zip_must_join_the_candidate_target() {
     .unwrap();
     assert_eq!(verified.envelope, envelope);
     assert_eq!(verified.producer.target, TARGET);
+    assert_eq!(verified.attachment_count(), attachments.len());
+    for (path, bytes) in &attachments {
+        assert_eq!(verified.attachment(path), Some(bytes.as_slice()));
+    }
     let mut substituted_artifact = real_artifact.clone();
     substituted_artifact["digest"] =
         serde_json::json!(format!("sha256:{}", String::from(hash_bytes(b"other ZIP"))));

@@ -6,7 +6,8 @@ use memcordon_ci::private_protected_readback::{
     expected_protected_candidate_leaves, expected_protected_candidate_leaves_for_selector,
     parse_protected_candidate_attempt, parse_protected_candidate_request,
     read_protected_raw_case_file, validate_candidate_blocked_retirement_raw_attachments,
-    validate_candidate_tcp_raw_attachments, validate_fixed_case_observation,
+    validate_candidate_target_stdio, validate_candidate_tcp_raw_attachments,
+    validate_candidate_unix_absence_observer, validate_fixed_case_observation,
 };
 use memcordon_core::DiagnosticSha256;
 use memcordon_core::private_release_case_v1::{
@@ -18,6 +19,107 @@ use memcordon_core::private_release_case_v1::{
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+
+#[test]
+fn unix_intent_readback_requires_both_exact_early_socket_denials() {
+    let selector = "private_tcp::af_unix_abstract_and_pathname_denied";
+    let challenge = [0xa5; 32];
+    let name_prefix = format!("memcordon-private-unix-{}", hex::encode(challenge));
+    let mut response = b"memcordon-private-unix-intent-v1\0".to_vec();
+    response.extend_from_slice(&challenge);
+    for (kind, address) in [
+        (1_u8, format!("/tmp/{name_prefix}-path\0").into_bytes()),
+        (2_u8, format!("\0{name_prefix}-abstract").into_bytes()),
+    ] {
+        response.push(kind);
+        response.extend_from_slice(&u16::try_from(address.len()).unwrap().to_le_bytes());
+        response.extend_from_slice(&address);
+        response.extend_from_slice(&97_i32.to_le_bytes());
+        response.extend_from_slice(&[0, 0]);
+    }
+    let mut stdio = challenge.to_vec();
+    stdio.extend_from_slice(&response);
+    assert!(
+        validate_candidate_target_stdio(
+            selector,
+            "x86_64-unknown-linux-gnu",
+            challenge,
+            &stdio,
+            None
+        )
+        .is_ok()
+    );
+    let last = stdio.len() - 1;
+    stdio[last] = 1;
+    assert!(
+        validate_candidate_target_stdio(
+            selector,
+            "x86_64-unknown-linux-gnu",
+            challenge,
+            &stdio,
+            None
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn unix_held_target_observer_requires_exact_target_namespace_absence_and_ack() {
+    let challenge = [0xa5; 32];
+    let target = memcordon_ci::private_protected_readback::ProtectedCoordinatorIdentityV1 {
+        pid: 123,
+        start_time: 456,
+    };
+    let mut ack = b"memcordon-private-unix-observer-ack-v1\0".to_vec();
+    ack.extend_from_slice(&challenge);
+    let snapshot = json!({
+        "network_namespace_inode": 777,
+        "mount_namespace_inode": 888,
+        "target_root_inode": 999,
+        "proc_unix_sha256": DiagnosticSha256::from_bytes([7; 32]),
+        "pathname_absent": true,
+        "abstract_absent": true,
+    });
+    let mut observer = json!({
+        "schema_version": 1,
+        "attempt_id": "ab".repeat(16),
+        "checkpoint_sha256": DiagnosticSha256::from_bytes([1; 32]),
+        "terminal_record_digest": DiagnosticSha256::from_bytes([2; 32]),
+        "settlement": {
+            "schema_version": 1,
+            "monitor_outcome": "Completed",
+            "cgroup_empty_before_cleanup": true,
+            "containment_removed": true,
+            "target_pidfd_exited": true,
+            "namespace_init_reaped": true,
+            "guardian_terminal": Vec::from([0_u8; 20]),
+            "candidate_exit_code": 0,
+        },
+        "host_network_preservation": null,
+        "agent_path_preservation": null,
+        "unix_absence": {
+            "target": target,
+            "challenge_sha256": memcordon_core::workload_codec::hash_bytes(&challenge),
+            "before_release": snapshot,
+            "after_denials_before_ack": snapshot,
+            "ack_sha256": memcordon_core::workload_codec::hash_bytes(&ack),
+        },
+    });
+    let check = |value: &serde_json::Value| {
+        validate_candidate_unix_absence_observer(
+            &serde_json::to_vec(value).unwrap(),
+            challenge,
+            &target,
+            777,
+        )
+    };
+    assert!(check(&observer).is_ok());
+    observer["unix_absence"]["after_denials_before_ack"]["abstract_absent"] = json!(false);
+    assert!(check(&observer).is_err());
+    observer["unix_absence"]["after_denials_before_ack"]["abstract_absent"] = json!(true);
+    observer["unix_absence"]["target"]["start_time"] = json!(457);
+    assert!(check(&observer).is_err());
+}
 
 #[test]
 fn candidate_admission_request_requires_exact_protected_identity() {
@@ -107,6 +209,22 @@ fn protected_inventory_distinguishes_preallocation_from_allocated_attempts() {
     assert_eq!(allocated_leaves.len(), 7);
     assert!(allocated_leaves.contains("attempt.json"));
     assert!(allocated_leaves.contains("request.bin"));
+    let unix_leaves = expected_protected_candidate_leaves_for_selector(
+        "private_tcp::af_unix_abstract_and_pathname_denied",
+        &allocated,
+    )
+    .unwrap();
+    assert_eq!(unix_leaves.len(), 9);
+    assert!(unix_leaves.contains("unix-intent-gate.json"));
+    assert!(unix_leaves.contains("unix-intent-ack.json"));
+    assert!(!unix_leaves.contains("unix-intent-ack.pending"));
+    assert!(
+        expected_protected_candidate_leaves_for_selector(
+            "private_tcp::af_unix_abstract_and_pathname_denied",
+            &rejected,
+        )
+        .is_err()
+    );
     let child_leaves = expected_protected_candidate_leaves_for_selector(
         "private_tcp::child_runtime_and_threads_retired",
         &allocated,

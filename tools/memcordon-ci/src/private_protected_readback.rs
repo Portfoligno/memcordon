@@ -50,6 +50,37 @@ const CHILD_RUNTIME_SELECTOR: &str = "private_tcp::child_runtime_and_threads_ret
 const SOCKET_SELECTOR: &str = "private_tcp::scm_rights_and_precreated_socket_denied";
 const TERMINAL_JOIN_SELECTOR: &str = "private_tcp::release_checkpoint_terminal_joined";
 const DUAL_SELECTOR: &str = "private_tcp::dual_attempt_namespace_isolation";
+const UNIX_INTENT_SELECTOR: &str = "private_tcp::af_unix_abstract_and_pathname_denied";
+
+/// The protected target bytes assert early AF_UNIX socket creation denial.
+/// Neither address is passed to bind; this contract does not claim an
+/// address-sensitive bind decision by the kernel.
+fn expected_unix_intent_response(challenge: [u8; 32]) -> Result<Vec<u8>> {
+    let challenge_hex = hex::encode(challenge);
+    let mut response = b"memcordon-private-unix-intent-v1\0".to_vec();
+    response.extend_from_slice(&challenge);
+    for (kind, suffix) in [(1_u8, "-path"), (2_u8, "-abstract")] {
+        let name = format!("memcordon-private-unix-{challenge_hex}{suffix}");
+        let mut address = Vec::new();
+        if kind == 1 {
+            address.extend_from_slice(b"/tmp/");
+        } else {
+            address.push(0);
+        }
+        address.extend_from_slice(name.as_bytes());
+        if kind == 1 {
+            address.push(0);
+        }
+        let length = u16::try_from(address.len())
+            .map_err(|_| CiError::Message("AF_UNIX intent address exceeds bound".into()))?;
+        response.push(kind);
+        response.extend_from_slice(&length.to_le_bytes());
+        response.extend_from_slice(&address);
+        response.extend_from_slice(&97_i32.to_le_bytes()); // EAFNOSUPPORT
+        response.extend_from_slice(&[0, 0]); // no bind attempt or endpoint
+    }
+    Ok(response)
+}
 
 pub fn expected_protected_candidate_leaves(
     observation: &PrivateReleaseObservationV1,
@@ -164,6 +195,21 @@ pub fn expected_protected_candidate_leaves_for_selector(
         ] {
             leaves.insert(leaf.into());
         }
+    }
+    if selector == UNIX_INTENT_SELECTOR {
+        if !matches!(
+            observation,
+            PrivateReleaseObservationV1::AllocatedRetired {
+                outcome: PrivateReleaseAllocatedOutcomeV1::TargetCompleted,
+                ..
+            }
+        ) {
+            return Err(CiError::Message(
+                "Unix live gate result has wrong fixed outcome".into(),
+            ));
+        }
+        leaves.insert("unix-intent-gate.json".into());
+        leaves.insert("unix-intent-ack.json".into());
     }
     Ok(leaves)
 }
@@ -1096,6 +1142,92 @@ struct CandidateKernelObservationV1 {
     settlement: CandidateKernelSettlementV1,
     host_network_preservation: Option<serde_json::Value>,
     agent_path_preservation: Option<serde_json::Value>,
+    #[serde(default)]
+    unix_absence: Option<UnixIntentSupervisorAbsenceV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UnixAbsenceSnapshotV1 {
+    pub(crate) network_namespace_inode: u64,
+    pub(crate) mount_namespace_inode: u64,
+    pub(crate) target_root_inode: u64,
+    pub(crate) proc_unix_sha256: DiagnosticSha256,
+    pub(crate) pathname_absent: bool,
+    pub(crate) abstract_absent: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UnixIntentSupervisorAbsenceV1 {
+    pub(crate) target: ProtectedCoordinatorIdentityV1,
+    pub(crate) challenge_sha256: DiagnosticSha256,
+    pub(crate) before_release: UnixAbsenceSnapshotV1,
+    pub(crate) after_denials_before_ack: UnixAbsenceSnapshotV1,
+    pub(crate) ack_sha256: DiagnosticSha256,
+}
+
+pub(crate) fn validate_unix_supervisor_absence(
+    witness: &UnixIntentSupervisorAbsenceV1,
+    challenge: [u8; 32],
+    target: &ProtectedCoordinatorIdentityV1,
+    network_namespace_inode: u64,
+) -> Result<()> {
+    let mut ack = b"memcordon-private-unix-observer-ack-v1\0".to_vec();
+    ack.extend_from_slice(&challenge);
+    let snapshots = [&witness.before_release, &witness.after_denials_before_ack];
+    let zero = DiagnosticSha256::from_bytes([0; 32]);
+    if witness.target != *target
+        || witness.challenge_sha256 != hash_bytes(&challenge)
+        || witness.ack_sha256 != hash_bytes(&ack)
+        || network_namespace_inode == 0
+        || snapshots.iter().any(|snapshot| {
+            snapshot.network_namespace_inode != network_namespace_inode
+                || snapshot.mount_namespace_inode == 0
+                || snapshot.target_root_inode == 0
+                || snapshot.proc_unix_sha256 == zero
+                || !snapshot.pathname_absent
+                || !snapshot.abstract_absent
+        })
+        || witness.before_release.mount_namespace_inode
+            != witness.after_denials_before_ack.mount_namespace_inode
+        || witness.before_release.target_root_inode
+            != witness.after_denials_before_ack.target_root_inode
+    {
+        return Err(CiError::Message(
+            "candidate Unix held-target absence observer differs".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks the versioned held-target Unix observer against independently
+/// supplied challenge, process identity and checkpoint namespace. The bytes
+/// still originate from the native worker; they do not alone create Q.
+pub fn validate_candidate_unix_absence_observer(
+    observer_bytes: &[u8],
+    challenge: [u8; 32],
+    target: &ProtectedCoordinatorIdentityV1,
+    network_namespace_inode: u64,
+) -> Result<()> {
+    reject_duplicate_json_keys(observer_bytes).map_err(CiError::Message)?;
+    let observer: CandidateKernelObservationV1 = serde_json::from_slice(observer_bytes)?;
+    let witness = observer
+        .unix_absence
+        .as_ref()
+        .ok_or_else(|| CiError::Message("candidate Unix absence observer is missing".into()))?;
+    validate_unix_supervisor_absence(witness, challenge, target, network_namespace_inode)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn parsed_candidate_unix_absence_observer(
+    observer_bytes: &[u8],
+) -> Result<UnixIntentSupervisorAbsenceV1> {
+    reject_duplicate_json_keys(observer_bytes).map_err(CiError::Message)?;
+    let observer: CandidateKernelObservationV1 = serde_json::from_slice(observer_bytes)?;
+    observer
+        .unix_absence
+        .ok_or_else(|| CiError::Message("candidate Unix absence observer is missing".into()))
 }
 
 #[derive(Deserialize)]
@@ -1979,6 +2111,9 @@ pub fn validate_candidate_target_stdio_with_agent_identity(
         "private_tcp::af_unix_socketpair_denied" => {
             response.extend_from_slice(&97_i32.to_le_bytes()); // EAFNOSUPPORT
             response.extend_from_slice(&1_i32.to_le_bytes()); // EPERM
+        }
+        UNIX_INTENT_SELECTOR => {
+            response = expected_unix_intent_response(challenge)?;
         }
         "private_tcp::io_uring_and_pidfd_import_denied"
         | "private_tcp::namespace_reentry_denied" => {
@@ -2872,10 +3007,29 @@ pub fn validate_candidate_allocated_raw_attachments_with_agent_identity(
         != kernel.host_network_preservation.is_some()
         || (selector == crate::private_agent_path::AGENT_PATH_SELECTOR)
             != kernel.agent_path_preservation.is_some()
+        || (selector == UNIX_INTENT_SELECTOR) != kernel.unix_absence.is_some()
     {
         return Err(CiError::Message(
             "candidate host-preservation observer inventory differs".into(),
         ));
+    }
+    if selector == UNIX_INTENT_SELECTOR {
+        let target = attempt
+            .target
+            .as_ref()
+            .ok_or_else(|| CiError::Message("candidate Unix target identity is absent".into()))?;
+        let network_namespace_inode = attempt
+            .checkpoint_network_namespace_inode()
+            .ok_or_else(|| CiError::Message("candidate Unix namespace is absent".into()))?;
+        validate_unix_supervisor_absence(
+            kernel
+                .unix_absence
+                .as_ref()
+                .expect("Unix observer inventory was checked"),
+            challenge,
+            target,
+            network_namespace_inode,
+        )?;
     }
     let cleanup: CandidateTcpCleanupV1 = serde_json::from_slice(cleanup_bytes)?;
     let expected_guardian_attempt = hex::decode(&attempt.attempt_id)

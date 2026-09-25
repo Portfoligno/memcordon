@@ -119,6 +119,8 @@ struct NativeCandidateKernelObservationV1 {
     host_network_preservation: Option<super::private_release_host_state::HostNetworkPreservationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_path_preservation: Option<super::private_release_ancestor::AgentPathPreservationV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unix_absence: Option<super::private_release_unix_intent::UnixIntentSupervisorAbsenceV1>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1133,8 +1135,8 @@ pub(crate) fn persist_candidate_raw(
     persist_candidate_raw_with_exact_selector(context, observed)
 }
 
-/// Protected raw for the closed AF_UNIX socket-stage subwitness. The exact
-/// selector remains excluded from ordinary fixture and result admission.
+/// Protected raw for the AF_UNIX socket-stage case. Its exact selector stays
+/// outside the generic TCP fixture path and requires the held-target witness.
 pub(crate) fn persist_closed_unix_intent_raw(
     context: CandidateRawContextV1<'_>,
     observed: &CandidateNativeObservationV1,
@@ -1142,6 +1144,15 @@ pub(crate) fn persist_closed_unix_intent_raw(
     if context.selector != super::private_release_unix_intent::SELECTOR
         || context.expected_response
             != super::private_release_unix_intent::expected_observation_bytes(context.challenge)?
+        || observed.unix_absence.as_ref().is_none_or(|witness| {
+            witness
+                .verify_binding(
+                    context.challenge,
+                    &witness.target,
+                    observed.network_namespace_inode,
+                )
+                .is_err()
+        })
     {
         return Err("MCSEALED-PRIVATE-RELEASE: Unix intent raw selector or shape differs".into());
     }
@@ -1158,6 +1169,8 @@ fn persist_candidate_raw_with_exact_selector(
         || observed.challenge_sha256 != hash_bytes(context.challenge)
         || observed.response_bytes != context.expected_response
         || observed.response_sha256 != hash_bytes(context.expected_response)
+        || (context.selector == super::private_release_unix_intent::SELECTOR)
+            != observed.unix_absence.is_some()
     {
         return Err("MCSEALED-PRIVATE-RELEASE: raw producer authority differs".into());
     }
@@ -1190,6 +1203,7 @@ fn persist_candidate_raw_with_exact_selector(
         settlement: observed.settlement.clone(),
         host_network_preservation: observed.host_network_preservation.clone(),
         agent_path_preservation: observed.agent_path_preservation.clone(),
+        unix_absence: observed.unix_absence.clone(),
     })
     .map_err(|error| error.to_string())?;
     let mut stdio = Vec::with_capacity(context.challenge.len() + observed.response_bytes.len());
@@ -2368,6 +2382,29 @@ fn readback_candidate_worker_raw_with_owner(
         (false, None, None) => true,
         _ => false,
     };
+    let unix_absence_valid = match (
+        context.selector == super::private_release_unix_intent::SELECTOR,
+        kernel_trace.unix_absence.as_ref(),
+    ) {
+        (true, Some(witness)) => journal
+            .native_identities()
+            .and_then(|native| {
+                witness.verify_binding(
+                    context.challenge,
+                    &native.target,
+                    native.network_namespace_inode,
+                )?;
+                super::private_release_unix_gate::readback_gate_and_ack(
+                    context.directory,
+                    context.result_key,
+                    context.challenge,
+                    witness,
+                )
+            })
+            .is_ok(),
+        (false, None) => true,
+        _ => false,
+    };
     let guardian = super::private_guardian::GuardianTerminalV4::decode(
         settlement.guardian_terminal,
         super::private_release_attempt::candidate_attempt_bytes(context.result_key),
@@ -2385,6 +2422,7 @@ fn readback_candidate_worker_raw_with_owner(
         || settlement.candidate_exit_code != Some(0)
         || !host_preservation_valid
         || !agent_path_valid
+        || !unix_absence_valid
         || guardian.trigger != super::private_guardian::GuardianTriggerV4::Stopped
         || guardian.boundary_retired
     {

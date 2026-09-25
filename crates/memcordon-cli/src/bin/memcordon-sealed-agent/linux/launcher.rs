@@ -465,6 +465,29 @@ fn validate_release_candidate_operation(
         }
         return Err("MCSEALED-PRIVATE-RELEASE: awaiting dual coordinator cleanup".into());
     }
+    if fixed.selector == super::private_release_unix_intent::SELECTOR {
+        let observed = super::private_release_unix_owner::execute_and_persist(&case)?;
+        let native = &observed.native;
+        if native.attempt_id.is_empty()
+            || native.checkpoint_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || native.terminal_record_digest
+                == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || native.challenge_sha256
+                != memcordon_core::workload_codec::hash_bytes(&fixed.challenge)
+            || native.response_sha256
+                != memcordon_core::workload_codec::hash_bytes(
+                    &case.expected_closed_unix_intent_output()?,
+                )
+            || native.candidate_exit_code != 0
+            || observed.worker_inventory.len()
+                != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL
+                    .len()
+                    - 1
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: Unix intent observation differs".into());
+        }
+        return Err("MCSEALED-PRIVATE-RELEASE: awaiting Unix intent coordinator cleanup".into());
+    }
     let observed = super::private_release_execution::execute_candidate_fixture_case(&case)?;
     let namespace_inode = case.retired_native_namespace_inode()?;
     let expected_response = case.expected_fixture_output(namespace_inode)?;
@@ -843,6 +866,8 @@ pub(crate) fn execute_release_candidate_case(
         prepared.persist_control_terminal_join_cleanup(&worker_identity, worker_pidfd.as_fd())?;
     } else if prepared.request.selector == super::private_release_dual_attempt::SELECTOR {
         prepared.persist_control_dual_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else if prepared.request.selector == super::private_release_unix_intent::SELECTOR {
+        prepared.persist_control_unix_intent_cleanup(&worker_identity, worker_pidfd.as_fd())?;
     } else {
         prepared.persist_control_cleanup(&worker_identity, worker_pidfd.as_fd())?;
     }

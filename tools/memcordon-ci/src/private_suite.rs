@@ -65,6 +65,9 @@ use crate::private_terminal_live::{
     TERMINAL_JOIN_SELECTOR, join_sampled_midpoint_to_result,
     sample_and_ack_if_ready as sample_terminal_midpoint,
 };
+use crate::private_unix_live::{
+    UNIX_INTENT_SELECTOR, join_sampled_unix_to_result, sample_and_ack_if_ready as sample_unix_gate,
+};
 use crate::release_private::{
     PreparedPrivateCandidateV2, PrivateCandidateInputs, prepare_private_candidate,
     validate_private_candidate_record,
@@ -482,7 +485,7 @@ pub fn run(root: &Path, stage: NativeRunStageV2, target: &str) -> Result<()> {
             OsString::from("--challenge"),
             OsString::from(hex::encode(challenge)),
         ];
-        let (observed, child_live, socket_live, terminal_live, dual_live) = if selector
+        let (observed, child_live, socket_live, terminal_live, dual_live, unix_live) = if selector
             == CHILD_RUNTIME_SELECTOR
         {
             let (process, sampled) = supervise_private_case_process_with_observer(
@@ -491,7 +494,7 @@ pub fn run(root: &Path, stage: NativeRunStageV2, target: &str) -> Result<()> {
                 Duration::from_secs(120),
                 || sample_and_ack_if_ready(challenge),
             )?;
-            (process, sampled, None, None, None)
+            (process, sampled, None, None, None, None)
         } else if selector == SOCKET_SELECTOR {
             let (downloaded, _) = candidate_h0.as_ref().ok_or_else(|| {
                 CiError::Message("SCM installed candidate B/M0/H0 is unavailable".into())
@@ -503,7 +506,7 @@ pub fn run(root: &Path, stage: NativeRunStageV2, target: &str) -> Result<()> {
                 Duration::from_secs(120),
                 || sample_socket_gate(challenge, &filter),
             )?;
-            (process, None, sampled, None, None)
+            (process, None, sampled, None, None, None)
         } else if selector == TERMINAL_JOIN_SELECTOR {
             let (downloaded, _) = candidate_h0.as_ref().ok_or_else(|| {
                 CiError::Message("terminal installed candidate B/M0/H0 is unavailable".into())
@@ -518,7 +521,7 @@ pub fn run(root: &Path, stage: NativeRunStageV2, target: &str) -> Result<()> {
                 Duration::from_secs(120),
                 || sample_terminal_midpoint(challenge, &filter, image),
             )?;
-            (process, None, None, sampled, None)
+            (process, None, None, sampled, None, None)
         } else if selector == DUAL_SELECTOR {
             let (downloaded, _) = candidate_h0.as_ref().ok_or_else(|| {
                 CiError::Message("dual installed candidate B/M0/H0 is unavailable".into())
@@ -532,7 +535,15 @@ pub fn run(root: &Path, stage: NativeRunStageV2, target: &str) -> Result<()> {
                 Duration::from_secs(120),
                 || sample_dual_gate(challenge, &filter, image),
             )?;
-            (process, None, None, None, sampled)
+            (process, None, None, None, sampled, None)
+        } else if selector == UNIX_INTENT_SELECTOR {
+            let (process, sampled) = supervise_private_case_process_with_observer(
+                Path::new(AGENT),
+                &arguments,
+                Duration::from_secs(120),
+                || sample_unix_gate(challenge),
+            )?;
+            (process, None, None, None, None, sampled)
         } else {
             (
                 supervise_private_case_process(
@@ -540,6 +551,7 @@ pub fn run(root: &Path, stage: NativeRunStageV2, target: &str) -> Result<()> {
                     &arguments,
                     Duration::from_secs(120),
                 )?,
+                None,
                 None,
                 None,
                 None,
@@ -704,6 +716,18 @@ pub fn run(root: &Path, stage: NativeRunStageV2, target: &str) -> Result<()> {
                         &h0.inspection_sha256,
                     )?;
                     verify_checkpoint_gate_processes_exited(&structural)?;
+                } else if selector == UNIX_INTENT_SELECTOR {
+                    let sampled = unix_live.as_ref().ok_or_else(|| {
+                        CiError::Message("independent Unix live sample absent".into())
+                    })?;
+                    validate_candidate_allocated_raw_attachments_with_agent_identity(
+                        &structural,
+                        challenge,
+                        &h0.inspection_sha256,
+                        image_after,
+                    )?;
+                    join_sampled_unix_to_result(&structural, sampled, challenge)?;
+                    verify_candidate_worker_exited(&structural)?;
                 } else if selector == CHILD_RUNTIME_SELECTOR {
                     let sampled = child_live.as_ref().ok_or_else(|| {
                         CiError::Message("independent child live sample absent".into())

@@ -1,5 +1,5 @@
-//! Closed AF_UNIX candidate owner. Its typed entrypoint deliberately has no
-//! service or selector dispatch until native and independent CI joins exist.
+//! AF_UNIX candidate owner for two fixed naming intents denied at socket
+//! creation. It persists raw evidence for detached service and CI readback.
 
 use memcordon_core::private_release_case_v1::PrivateReleaseAttachmentV1;
 

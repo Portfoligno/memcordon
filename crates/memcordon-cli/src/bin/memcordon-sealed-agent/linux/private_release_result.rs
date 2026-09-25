@@ -202,9 +202,8 @@ impl VerifiedCandidateCaseCompletion {
         Self::from_completed_detached(readback, CompletedResultKindV1::Ordinary)
     }
 
-    /// Builds only an in-memory candidate projection after the detached
-    /// AF_UNIX socket-stage reader has completed. No selector dispatch or CI
-    /// Q admission is opened by this constructor.
+    /// Builds a candidate projection after detached AF_UNIX socket-stage
+    /// readback. The result is evidence for CI, not release-Q authority.
     pub(crate) fn from_closed_unix_intent_detached(
         readback: DetachedCandidateReadbackV1,
     ) -> Result<Self, String> {

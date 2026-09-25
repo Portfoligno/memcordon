@@ -149,6 +149,7 @@ pub(crate) fn execute_socket_launder_candidate_case(
             settlement: retirement.settlement,
             host_network_preservation: None,
             agent_path_preservation: None,
+            unix_absence: None,
         },
         gated_witness: witness,
         socket_gate_sha256: gate_sha256,

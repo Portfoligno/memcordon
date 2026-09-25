@@ -2,7 +2,7 @@
 //! owner. Returning an observation is not a release-case result or Q proof.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
@@ -31,6 +31,8 @@ pub(crate) struct CandidateNativeObservationV1 {
         Option<super::private_release_host_state::HostNetworkPreservationV1>,
     pub(crate) agent_path_preservation:
         Option<super::private_release_ancestor::AgentPathPreservationV1>,
+    pub(crate) unix_absence:
+        Option<super::private_release_unix_intent::UnixIntentSupervisorAbsenceV1>,
 }
 
 pub(crate) struct UncertainCandidateNativeObservationV1 {
@@ -308,8 +310,8 @@ pub(crate) fn execute_candidate_fixture_case(
     execute_fixture_case_with_mode(case, FixtureExecutionModeV1::Ordinary)
 }
 
-/// A closed physical owner may execute the exact AF_UNIX socket-stage target
-/// without changing ordinary candidate selector support or publishing a case.
+/// Runs the AF_UNIX socket-stage target under the ordinary V4 lifecycle while
+/// retaining a held-target observer handshake for independent absence checks.
 pub(crate) fn execute_closed_unix_intent_case(
     case: &ReleaseCandidateRunAuthorityV1,
 ) -> Result<CandidateNativeObservationV1, String> {
@@ -372,9 +374,18 @@ fn execute_fixture_case_with_mode(
     let (stdout_read, stdout_write) = super::private_probe_execution::nonblocking_pipe()?;
     let (stderr_read, stderr_write) = super::private_probe_execution::nonblocking_pipe()?;
     let challenge = case.challenge_bytes();
-    File::from(stdin_write)
+    let mut challenge_writer = File::from(stdin_write);
+    challenge_writer
         .write_all(&challenge)
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: challenge pipe: {error}"))?;
+    let mut observer_input = match mode {
+        FixtureExecutionModeV1::Ordinary => {
+            drop(challenge_writer);
+            None
+        }
+        FixtureExecutionModeV1::ClosedUnixIntent => Some(challenge_writer),
+    };
+    let mut stdout_pipe = File::from(stdout_read);
     let mut owner = case.begin_native_owner()?;
     let startup_deadline = (Instant::now() + Duration::from_secs(5)).min(case.deadline());
     if startup_deadline <= Instant::now() {
@@ -404,6 +415,19 @@ fn execute_fixture_case_with_mode(
             startup_deadline,
         )?;
         let network_namespace_inode = observed.network_namespace_inode();
+        let unix_target = (matches!(mode, FixtureExecutionModeV1::ClosedUnixIntent))
+            .then(|| observed.target_identity().clone());
+        let unix_before = unix_target
+            .as_ref()
+            .map(|target| {
+                owner.require_live_target_identity(target)?;
+                super::private_release_unix_intent::observe_target_absence(
+                    target,
+                    &challenge,
+                    network_namespace_inode,
+                )
+            })
+            .transpose()?;
         owner.prepare_relay([stdin_read, stdout_write, stderr_write])?;
         let checkpoint = owner.commit_release_candidate_and_release(observed, case)?;
         if !matches!(
@@ -411,9 +435,6 @@ fn execute_fixture_case_with_mode(
             PrivateExecObservation::ArmedAndControlClosed
         ) {
             return Err("MCSEALED-PRIVATE-RELEASE: target failed native exec".into());
-        }
-        if owner.monitor_release_candidate(case)? != PrivateMonitorOutcome::Completed {
-            return Err("MCSEALED-PRIVATE-RELEASE: native monitor did not complete".into());
         }
         let expected = match mode {
             FixtureExecutionModeV1::Ordinary => {
@@ -423,16 +444,83 @@ fn execute_fixture_case_with_mode(
                 case.expected_closed_unix_intent_output()?
             }
         };
-        let response =
-            super::private_probe_execution::read_bounded_pipe(stdout_read, expected.len() + 1)?;
+        let (response, unix_absence) = if let Some(target) = unix_target {
+            let response = super::private_release_unix_intent::read_held_target_response(
+                &mut stdout_pipe,
+                &challenge,
+                case.deadline(),
+                || owner.tick_relay_for_unix_observer(),
+            )?;
+            owner.require_live_target_identity(&target)?;
+            let after = super::private_release_unix_intent::observe_target_absence(
+                &target,
+                &challenge,
+                network_namespace_inode,
+            )?;
+            owner.require_live_target_identity(&target)?;
+            let witness = super::private_release_unix_intent::UnixIntentSupervisorAbsenceV1 {
+                target,
+                challenge_sha256: hash_bytes(&challenge),
+                before_release: unix_before
+                    .ok_or("MCSEALED-PRIVATE-RELEASE: Unix before-release observation absent")?,
+                after_denials_before_ack: after,
+                ack_sha256: super::private_release_unix_intent::observer_ack_digest(&challenge),
+            };
+            witness.verify_binding(&challenge, &witness.target, network_namespace_inode)?;
+            let directory = case.protected_case_directory()?;
+            let result_key = case.protected_result_key()?;
+            let gate_sha256 = super::private_release_unix_gate::persist_gate(
+                directory, result_key, &challenge, &witness,
+            )?;
+            super::private_release_unix_gate::wait_for_ci_ack(
+                directory,
+                result_key,
+                &challenge,
+                &witness,
+                &gate_sha256,
+                case.deadline(),
+            )?;
+            owner.require_live_target_identity(&witness.target)?;
+            let input = observer_input
+                .as_mut()
+                .ok_or("MCSEALED-PRIVATE-RELEASE: Unix observer input absent")?;
+            input
+                .write_all(witness.ack_sha256.bytes())
+                .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: Unix observer ACK: {error}"))?;
+            drop(observer_input.take());
+            (response, Some(witness))
+        } else {
+            (Vec::new(), None)
+        };
+        if owner.monitor_release_candidate(case)? != PrivateMonitorOutcome::Completed {
+            return Err("MCSEALED-PRIVATE-RELEASE: native monitor did not complete".into());
+        }
+        let response = if unix_absence.is_some() {
+            let mut extra = Vec::new();
+            (&mut stdout_pipe)
+                .take(1)
+                .read_to_end(&mut extra)
+                .map_err(|error| {
+                    format!("MCSEALED-PRIVATE-RELEASE: Unix trailing output: {error}")
+                })?;
+            if !extra.is_empty() {
+                return Err("MCSEALED-PRIVATE-RELEASE: Unix target emitted trailing output".into());
+            }
+            response
+        } else {
+            super::private_probe_execution::read_bounded_pipe(
+                stdout_pipe.into(),
+                expected.len() + 1,
+            )?
+        };
         let stderr = super::private_probe_execution::read_bounded_pipe(stderr_read, 1025)?;
         if response != expected || !stderr.is_empty() {
             return Err("MCSEALED-PRIVATE-RELEASE: fixture response or stderr differs".into());
         }
-        Ok((checkpoint, response, network_namespace_inode))
+        Ok((checkpoint, response, network_namespace_inode, unix_absence))
     })();
     let retirement = owner.retire_release_candidate(Instant::now() + Duration::from_secs(30));
-    let (checkpoint, response, network_namespace_inode) = run?;
+    let (checkpoint, response, network_namespace_inode, unix_absence) = run?;
     let retirement = retirement?;
     if current_network_namespace()? != provider_namespace
         || retirement.checkpoint_digest.as_ref() != Some(&checkpoint)
@@ -470,5 +558,6 @@ fn execute_fixture_case_with_mode(
         settlement: retirement.settlement,
         host_network_preservation,
         agent_path_preservation,
+        unix_absence,
     })
 }

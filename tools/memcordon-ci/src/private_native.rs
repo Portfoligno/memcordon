@@ -469,9 +469,11 @@ fn valid_relative_path(path: &str) -> bool {
         })
 }
 
-/// Joins independently fetched GitHub run, job, and artifact metadata to the
-/// downloaded artifact ZIP. This authenticates workflow ownership of those
-/// bytes; native observer semantics and installed qualification remain
+/// Joins independently fetched GitHub run, completed producer job, and
+/// artifact metadata to the downloaded artifact ZIP. A downstream collector
+/// can run before its enclosing workflow completes, but the exact producer
+/// job must already have succeeded. This authenticates workflow ownership of
+/// those bytes; native observer semantics and installed qualification remain
 /// separate checks.
 pub fn validate_native_run_platform_provenance(
     envelope: &NativeRunEnvelopeV2,
@@ -521,8 +523,10 @@ pub fn validate_native_run_platform_provenance(
             run.get("event").and_then(Value::as_str),
             Some("push" | "workflow_dispatch")
         )
-        || run.get("status").and_then(Value::as_str) != Some("completed")
-        || run.get("conclusion").and_then(Value::as_str) != Some("success")
+        || !(run.get("status").and_then(Value::as_str) == Some("in_progress")
+            && run.get("conclusion").is_some_and(Value::is_null)
+            || run.get("status").and_then(Value::as_str) == Some("completed")
+                && run.get("conclusion").and_then(Value::as_str) == Some("success"))
         || archive_bytes.is_empty()
         || archive_bytes.len() > 128 * 1024 * 1024
     {
@@ -600,6 +604,19 @@ pub fn validate_native_run_platform_provenance(
 pub struct StructuralNativeArtifactV2 {
     pub envelope: NativeRunEnvelopeV2,
     pub producer: PrivateNativeProducerSpec,
+    /// Exact bounded ZIP members retained for a separate semantic verifier.
+    /// These are provenance-bound producer bytes, not independent observations.
+    attachments: BTreeMap<String, Vec<u8>>,
+}
+
+impl StructuralNativeArtifactV2 {
+    pub fn attachment(&self, path: &str) -> Option<&[u8]> {
+        self.attachments.get(path).map(Vec::as_slice)
+    }
+
+    pub fn attachment_count(&self) -> usize {
+        self.attachments.len()
+    }
 }
 
 /// Independent values measured from B, sealed A/M1, and installed H1. They
@@ -783,7 +800,11 @@ pub fn validate_native_artifact_zip(
         artifact,
         archive_bytes,
     )?;
-    Ok(StructuralNativeArtifactV2 { envelope, producer })
+    Ok(StructuralNativeArtifactV2 {
+        envelope,
+        producer,
+        attachments,
+    })
 }
 
 fn error(message: impl Into<String>) -> CiError {

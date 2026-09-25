@@ -266,7 +266,9 @@ pub(crate) fn candidate_fixture_supported(selector: &str) -> bool {
 /// retirement fault executes a target fixture. Neither may enter the normal
 /// TargetCompleted result constructor.
 pub(crate) fn candidate_physical_selector_supported(selector: &str) -> bool {
-    candidate_executable_fixture_supported(selector) || selector == AUTHORIZATION_UNCERTAIN_SELECTOR
+    candidate_executable_fixture_supported(selector)
+        || selector == AUTHORIZATION_UNCERTAIN_SELECTOR
+        || selector == super::private_release_unix_intent::SELECTOR
 }
 
 pub(crate) fn candidate_executable_fixture_supported(selector: &str) -> bool {

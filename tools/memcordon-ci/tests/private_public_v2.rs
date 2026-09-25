@@ -3,13 +3,18 @@ use std::path::Path;
 use memcordon_ci::private_public_v2::public_v2_argv;
 #[cfg(unix)]
 use memcordon_ci::private_public_v2::{
-    ExpectedPublicV2Outcome, ExpectedPublicV2Readback, read_structural_public_v2_report,
-    validate_structural_public_v2_readback,
+    ExpectedFrontendLossEvidenceV2, ExpectedPublicV2Outcome, ExpectedPublicV2Readback,
+    StructuralPublicV2ReportPresence, read_structural_public_v2_report,
+    read_structural_public_v2_report_presence, validate_structural_public_v2_readback,
 };
 #[cfg(unix)]
 use memcordon_ci::private_supervisor::{LinuxChildIdentityV1, SupervisedProcessV2};
 #[cfg(unix)]
 use memcordon_core::DiagnosticSha256;
+#[cfg(unix)]
+use memcordon_core::private_public_report_v2::PublicCliReportEvidenceV2;
+#[cfg(unix)]
+use memcordon_core::private_release_case_v1::PrivateReleaseAllocatedOutcomeV1;
 #[cfg(unix)]
 use memcordon_core::workload_evidence_v2::QualifiedNativeAbiV2;
 
@@ -124,4 +129,94 @@ fn structural_public_failure_requires_exact_child_exit_and_separate_final_inputs
         br#"{"schema_version":11,"schema_version":11,"result":{"kind":"before-submission-failure","reason":"admission unavailable"}}"#,
         &expected
     ).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn lost_frontend_requires_absent_file_and_independent_replacement_hashes() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("public-report.json");
+    let digest = DiagnosticSha256::from_bytes([7; 32]);
+    let other = DiagnosticSha256::from_bytes([8; 32]);
+    let expected = ExpectedPublicV2Readback {
+        source_commit: &"a".repeat(40),
+        native_abi: QualifiedNativeAbiV2::X86_64LinuxGnu,
+        archive_sha256: &digest,
+        runtime_manifest_sha256: &digest,
+        qualification_sha256: &digest,
+        host_receipt_sha256: &digest,
+        report_owner_uid: 1234,
+        outcome: ExpectedPublicV2Outcome::FrontendLost,
+    };
+    let observed = SupervisedProcessV2 {
+        status: std::process::ExitStatus::from_raw(9),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        linux_child: Some(LinuxChildIdentityV1 {
+            pid: 41,
+            start_time_ticks: 9,
+        }),
+    };
+    let evidence = PublicCliReportEvidenceV2::AbsentFrontendLoss {
+        authenticated_terminal_sha256: digest.clone(),
+        supervised_transport_sha256: digest.clone(),
+        independent_recovery_sha256: digest.clone(),
+    };
+    let replacement = ExpectedFrontendLossEvidenceV2 {
+        authenticated_terminal_sha256: &digest,
+        supervised_transport_sha256: &digest,
+        independent_recovery_sha256: &digest,
+    };
+    assert!(matches!(
+        read_structural_public_v2_report_presence(
+            &path,
+            &observed,
+            &evidence,
+            PrivateReleaseAllocatedOutcomeV1::FrontendLost,
+            &expected,
+            Some(&replacement),
+        )
+        .unwrap(),
+        StructuralPublicV2ReportPresence::AbsentFrontendLoss { child_pid: 41, .. }
+    ));
+    let wrong_replacement = ExpectedFrontendLossEvidenceV2 {
+        independent_recovery_sha256: &other,
+        ..replacement
+    };
+    assert!(
+        read_structural_public_v2_report_presence(
+            &path,
+            &observed,
+            &evidence,
+            PrivateReleaseAllocatedOutcomeV1::FrontendLost,
+            &expected,
+            Some(&wrong_replacement),
+        )
+        .is_err()
+    );
+    assert!(
+        read_structural_public_v2_report_presence(
+            &path,
+            &observed,
+            &evidence,
+            PrivateReleaseAllocatedOutcomeV1::TargetCompleted,
+            &expected,
+            Some(&replacement),
+        )
+        .is_err()
+    );
+    std::fs::write(&path, b"unexpected report").unwrap();
+    assert!(
+        read_structural_public_v2_report_presence(
+            &path,
+            &observed,
+            &evidence,
+            PrivateReleaseAllocatedOutcomeV1::FrontendLost,
+            &expected,
+            Some(&replacement),
+        )
+        .is_err()
+    );
 }

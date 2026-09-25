@@ -310,78 +310,89 @@ impl PrivateReleaseCaseResultV1 {
         if observer_hash != recorded_observer_hash {
             return Err("private release observer attachment hash differs".into());
         }
-        let expected = if self.selector == "private_tcp::wrong_grant_profile_and_port_rejected" {
-            match self.installed.stage() {
-                PrivateReleaseStageV1::CandidateCapability => "grant-rejected",
-                PrivateReleaseStageV1::FinalPublic => "public-grant-rejected",
-            }
-        } else if self.selector == "private_tcp::retirement_failure_blocks_reuse" {
-            "retirement-failure"
-        } else if self.selector == "private_tcp::authorization_uncertainty_retired" {
-            "authorization-uncertain"
-        } else if self.selector == "private_tcp::frontend_loss_retired" {
-            "frontend-lost"
-        } else if self.selector == "private_tcp::guardian_loss_retired" {
-            "guardian-lost"
-        } else {
-            "target-completed"
-        };
-        match (&self.observation, expected) {
-            (
-                PrivateReleaseObservationV1::DualAttemptsRetired { first, second, .. },
-                "target-completed",
-            ) if self.selector == "private_tcp::dual_attempt_namespace_isolation"
-                && first.valid_completed()
-                && second.valid_completed()
-                && first.attempt_id != second.attempt_id
-                && first.checkpoint_sha256 != second.checkpoint_sha256
-                && first.terminal_sha256 != second.terminal_sha256
-                && first.retirement_sha256 != second.retirement_sha256 => {}
-            (
-                PrivateReleaseObservationV1::PreallocationRejected { rejection_code, .. },
-                "grant-rejected",
-            )
-            | (
-                PrivateReleaseObservationV1::PreallocationRejected { rejection_code, .. },
-                "public-grant-rejected",
-            ) if !rejection_code.is_empty() && rejection_code.len() <= 128 => {}
-            (
-                PrivateReleaseObservationV1::RetirementFailureBlockedReuse {
-                    attempt_id,
-                    release_knowledge,
-                    ..
-                },
-                "retirement-failure",
-            ) if valid_attempt_id(attempt_id)
-                && *release_knowledge != PrivateReleaseKnowledgeV1::NotReleased => {}
-            (
-                PrivateReleaseObservationV1::AllocatedRetired {
-                    outcome,
-                    attempt_id,
-                    release_knowledge,
-                    exec,
-                    ..
-                },
-                expected,
-            ) if valid_attempt_id(attempt_id)
-                && allocated_outcome_name(*outcome) == expected
-                && match outcome {
-                    PrivateReleaseAllocatedOutcomeV1::TargetCompleted => {
-                        *release_knowledge == PrivateReleaseKnowledgeV1::ExecObserved
-                            && *exec == PrivateReleaseExecV1::Succeeded
-                    }
-                    PrivateReleaseAllocatedOutcomeV1::FrontendLost
-                    | PrivateReleaseAllocatedOutcomeV1::GuardianLost => {
-                        *release_knowledge == PrivateReleaseKnowledgeV1::ExecObserved
-                    }
-                    PrivateReleaseAllocatedOutcomeV1::AuthorizationUncertain => {
-                        *release_knowledge != PrivateReleaseKnowledgeV1::NotReleased
-                    }
-                } => {}
-            _ => return Err("private release case phase or outcome differs".into()),
-        }
-        Ok(())
+        validate_release_observation_v1(&self.selector, self.installed.stage(), &self.observation)
     }
+}
+
+/// Shared selector semantics for V1 raw cases and the V2 public evidence
+/// envelope. This validates claimed shape; independent native observation is
+/// still required before either record can qualify a release.
+pub fn validate_release_observation_v1(
+    selector: &str,
+    stage: PrivateReleaseStageV1,
+    observation: &PrivateReleaseObservationV1,
+) -> Result<(), String> {
+    let expected = if selector == "private_tcp::wrong_grant_profile_and_port_rejected" {
+        match stage {
+            PrivateReleaseStageV1::CandidateCapability => "grant-rejected",
+            PrivateReleaseStageV1::FinalPublic => "public-grant-rejected",
+        }
+    } else if selector == "private_tcp::retirement_failure_blocks_reuse" {
+        "retirement-failure"
+    } else if selector == "private_tcp::authorization_uncertainty_retired" {
+        "authorization-uncertain"
+    } else if selector == "private_tcp::frontend_loss_retired" {
+        "frontend-lost"
+    } else if selector == "private_tcp::guardian_loss_retired" {
+        "guardian-lost"
+    } else {
+        "target-completed"
+    };
+    match (observation, expected) {
+        (
+            PrivateReleaseObservationV1::DualAttemptsRetired { first, second, .. },
+            "target-completed",
+        ) if selector == "private_tcp::dual_attempt_namespace_isolation"
+            && first.valid_completed()
+            && second.valid_completed()
+            && first.attempt_id != second.attempt_id
+            && first.checkpoint_sha256 != second.checkpoint_sha256
+            && first.terminal_sha256 != second.terminal_sha256
+            && first.retirement_sha256 != second.retirement_sha256 => {}
+        (
+            PrivateReleaseObservationV1::PreallocationRejected { rejection_code, .. },
+            "grant-rejected",
+        )
+        | (
+            PrivateReleaseObservationV1::PreallocationRejected { rejection_code, .. },
+            "public-grant-rejected",
+        ) if !rejection_code.is_empty() && rejection_code.len() <= 128 => {}
+        (
+            PrivateReleaseObservationV1::RetirementFailureBlockedReuse {
+                attempt_id,
+                release_knowledge,
+                ..
+            },
+            "retirement-failure",
+        ) if valid_attempt_id(attempt_id)
+            && *release_knowledge != PrivateReleaseKnowledgeV1::NotReleased => {}
+        (
+            PrivateReleaseObservationV1::AllocatedRetired {
+                outcome,
+                attempt_id,
+                release_knowledge,
+                exec,
+                ..
+            },
+            expected,
+        ) if valid_attempt_id(attempt_id)
+            && allocated_outcome_name(*outcome) == expected
+            && match outcome {
+                PrivateReleaseAllocatedOutcomeV1::TargetCompleted => {
+                    *release_knowledge == PrivateReleaseKnowledgeV1::ExecObserved
+                        && *exec == PrivateReleaseExecV1::Succeeded
+                }
+                PrivateReleaseAllocatedOutcomeV1::FrontendLost
+                | PrivateReleaseAllocatedOutcomeV1::GuardianLost => {
+                    *release_knowledge == PrivateReleaseKnowledgeV1::ExecObserved
+                }
+                PrivateReleaseAllocatedOutcomeV1::AuthorizationUncertain => {
+                    *release_knowledge != PrivateReleaseKnowledgeV1::NotReleased
+                }
+            } => {}
+        _ => return Err("private release case phase or outcome differs".into()),
+    }
+    Ok(())
 }
 
 fn valid_attempt_id(value: &str) -> bool {

@@ -656,8 +656,8 @@ enum CompletedReadbackKindV1 {
     TerminalJoin,
 }
 
-/// Detached protected readback only. This deliberately does not construct a
-/// publishable release result or make the AF_UNIX selector suite-eligible.
+/// Detached protected readback for the AF_UNIX socket-stage case. The service
+/// alone can convert this into a candidate result after full retirement.
 pub(crate) fn verify_detached_closed_unix_intent(
     request: &ReleaseCaseRequestV1,
 ) -> Result<DetachedCandidateReadbackV1, String> {
@@ -2086,6 +2086,42 @@ struct ProtectedReleaseRequestV1 {
     coordinator: ProcessIdentityV4,
 }
 
+/// A protected, canonical record can be old without being malformed. The
+/// epoch comparison precedes service/process comparisons because an authentic
+/// request from an earlier installation necessarily has older process facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateRequestMismatch {
+    Origin,
+    InstallationEpoch,
+    ServiceGeneration,
+    Coordinator,
+}
+
+fn compare_protected_request(
+    recorded: &ProtectedReleaseRequestV1,
+    expected: &ProtectedReleaseRequestV1,
+) -> Result<(), CandidateRequestMismatch> {
+    if recorded.schema_version != expected.schema_version
+        || recorded.stage != expected.stage
+        || recorded.selector != expected.selector
+        || recorded.challenge != expected.challenge
+        || recorded.result_key != expected.result_key
+        || recorded.candidate_manifest_sha256 != expected.candidate_manifest_sha256
+    {
+        return Err(CandidateRequestMismatch::Origin);
+    }
+    if recorded.installation_epoch != expected.installation_epoch {
+        return Err(CandidateRequestMismatch::InstallationEpoch);
+    }
+    if recorded.service_generation_sha256 != expected.service_generation_sha256 {
+        return Err(CandidateRequestMismatch::ServiceGeneration);
+    }
+    if recorded.coordinator != expected.coordinator {
+        return Err(CandidateRequestMismatch::Coordinator);
+    }
+    Ok(())
+}
+
 /// This capability owns a package lock and a pinned, never-reused release
 /// directory. It is neither serializable nor convertible into an H1 or
 /// production authority. A future physical candidate case runner must borrow
@@ -2199,9 +2235,9 @@ impl ReleaseCandidateRunAuthorityV1 {
             return Err("MCSEALED-PRIVATE-RELEASE: coordinator case handle differs".into());
         }
         let expected = protected_request(request, &package, service.digest()?, coordinator.clone());
-        if read_request(&case_directory, 0)? != expected {
-            return Err("MCSEALED-PRIVATE-RELEASE: protected coordinator request differs".into());
-        }
+        compare_protected_request(&read_request(&case_directory, 0)?, &expected).map_err(
+            |reason| format!("MCSEALED-PRIVATE-RELEASE: protected coordinator request {reason:?}"),
+        )?;
         let installation_epoch = package.installation_epoch.clone();
         let service_generation_digest = service.digest()?;
         Ok(Self {

@@ -5,10 +5,174 @@
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::path::Path;
+use std::time::Instant;
+
+use memcordon_core::{DiagnosticSha256, workload_codec::hash_bytes};
+use serde::{Deserialize, Serialize};
+
+use super::private_attempt::ProcessIdentityV4;
 
 pub(crate) const SELECTOR: &str = "private_tcp::af_unix_abstract_and_pathname_denied";
 const DOMAIN: &[u8] = b"memcordon-private-unix-intent-v1\0";
 const PROC_UNIX_LIMIT: u64 = 1024 * 1024;
+const ACK_DOMAIN: &[u8] = b"memcordon-private-unix-observer-ack-v1\0";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UnixAbsenceSnapshotV1 {
+    pub(crate) network_namespace_inode: u64,
+    pub(crate) mount_namespace_inode: u64,
+    pub(crate) target_root_inode: u64,
+    pub(crate) proc_unix_sha256: DiagnosticSha256,
+    pub(crate) pathname_absent: bool,
+    pub(crate) abstract_absent: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UnixIntentSupervisorAbsenceV1 {
+    pub(crate) target: ProcessIdentityV4,
+    pub(crate) challenge_sha256: DiagnosticSha256,
+    pub(crate) before_release: UnixAbsenceSnapshotV1,
+    pub(crate) after_denials_before_ack: UnixAbsenceSnapshotV1,
+    pub(crate) ack_sha256: DiagnosticSha256,
+}
+
+impl UnixIntentSupervisorAbsenceV1 {
+    pub(crate) fn verify_binding(
+        &self,
+        challenge: &[u8; 32],
+        target: &ProcessIdentityV4,
+        expected_network_namespace_inode: u64,
+    ) -> Result<(), String> {
+        let snapshots = [&self.before_release, &self.after_denials_before_ack];
+        if self.target != *target
+            || self.challenge_sha256 != hash_bytes(challenge)
+            || self.ack_sha256 != observer_ack_digest(challenge)
+            || snapshots.iter().any(|snapshot| {
+                snapshot.network_namespace_inode != expected_network_namespace_inode
+                    || snapshot.mount_namespace_inode == 0
+                    || snapshot.target_root_inode == 0
+                    || snapshot.proc_unix_sha256 == DiagnosticSha256::from_bytes([0; 32])
+                    || !snapshot.pathname_absent
+                    || !snapshot.abstract_absent
+            })
+            || self.before_release.mount_namespace_inode
+                != self.after_denials_before_ack.mount_namespace_inode
+            || self.before_release.target_root_inode
+                != self.after_denials_before_ack.target_root_inode
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: Unix supervisor absence binding differs".into());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn observer_ack_digest(challenge: &[u8; 32]) -> DiagnosticSha256 {
+    let mut bytes = ACK_DOMAIN.to_vec();
+    bytes.extend_from_slice(challenge);
+    hash_bytes(&bytes)
+}
+
+/// Reads exactly the fixed target record while the target remains alive and
+/// blocked for the observer ACK. The owning worker later checks EOF/extra
+/// bytes after target retirement.
+pub(crate) fn read_held_target_response(
+    pipe: &mut std::fs::File,
+    challenge: &[u8; 32],
+    deadline: Instant,
+    mut pump_relay: impl FnMut() -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
+    use std::os::fd::AsRawFd;
+    let expected = expected_observation_bytes(challenge)?;
+    let mut response = vec![0_u8; expected.len()];
+    let mut read = 0;
+    while read < response.len() {
+        pump_relay()?;
+        match pipe.read(&mut response[read..]) {
+            Ok(0) => return Err("MCSEALED-PRIVATE-RELEASE: Unix target closed before ACK".into()),
+            Ok(count) => read += count,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err("MCSEALED-PRIVATE-RELEASE: Unix target response timed out".into());
+                }
+                let mut pollfd = libc::pollfd {
+                    fd: pipe.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let millis = remaining.as_millis().clamp(1, 10) as i32;
+                // SAFETY: poll observes only the retained fixed stdout pipe.
+                let status = unsafe { libc::poll(&raw mut pollfd, 1, millis) };
+                if status == 0 {
+                    return Err("MCSEALED-PRIVATE-RELEASE: Unix target response timed out".into());
+                }
+                if status < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                {
+                    continue;
+                }
+                if status < 0 || pollfd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+                    return Err("MCSEALED-PRIVATE-RELEASE: Unix target response poll failed".into());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    if response != expected {
+        return Err("MCSEALED-PRIVATE-RELEASE: Unix target response differs".into());
+    }
+    Ok(response)
+}
+
+/// The worker reads through the pinned target's proc view while its pidfd is
+/// retained. The caller checks that exact pidfd/start identity around this
+/// read; the target remains gated or is waiting for the observer ACK.
+pub(crate) fn observe_target_absence(
+    target: &ProcessIdentityV4,
+    challenge: &[u8; 32],
+    expected_network_namespace_inode: u64,
+) -> Result<UnixAbsenceSnapshotV1, String> {
+    use std::os::unix::fs::MetadataExt;
+    let proc_root = Path::new("/proc").join(target.pid.to_string());
+    let net = std::fs::metadata(proc_root.join("ns/net")).map_err(|error| error.to_string())?;
+    let mount = std::fs::metadata(proc_root.join("ns/mnt")).map_err(|error| error.to_string())?;
+    let root = std::fs::metadata(proc_root.join("root")).map_err(|error| error.to_string())?;
+    if net.ino() != expected_network_namespace_inode || mount.ino() == 0 || root.ino() == 0 {
+        return Err("MCSEALED-PRIVATE-RELEASE: Unix observer namespace differs".into());
+    }
+    let mut inventory = Vec::new();
+    std::fs::File::open(proc_root.join("net/unix"))
+        .map_err(|error| error.to_string())?
+        .take(PROC_UNIX_LIMIT + 1)
+        .read_to_end(&mut inventory)
+        .map_err(|error| error.to_string())?;
+    if inventory.len() as u64 > PROC_UNIX_LIMIT {
+        return Err("MCSEALED-PRIVATE-RELEASE: Unix observer inventory exceeds bound".into());
+    }
+    let pathname = endpoint_name(challenge, IntentKind::Pathname);
+    let abstract_name = endpoint_name(challenge, IntentKind::Abstract);
+    let pathname_absent =
+        match std::fs::symlink_metadata(proc_root.join("root/tmp").join(&pathname)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Ok(_) => false,
+            Err(error) => return Err(error.to_string()),
+        };
+    let pathname_in_proc = proc_unix_endpoint_absent(&inventory, &format!("/tmp/{pathname}"))?;
+    let abstract_absent = proc_unix_endpoint_absent(&inventory, &format!("@{abstract_name}"))?;
+    if !pathname_absent || !pathname_in_proc || !abstract_absent {
+        return Err("MCSEALED-PRIVATE-RELEASE: Unix observer found endpoint".into());
+    }
+    Ok(UnixAbsenceSnapshotV1 {
+        network_namespace_inode: net.ino(),
+        mount_namespace_inode: mount.ino(),
+        target_root_inode: root.ino(),
+        proc_unix_sha256: hash_bytes(&inventory),
+        pathname_absent: true,
+        abstract_absent: true,
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntentKind {
@@ -65,14 +229,70 @@ fn endpoint_absent(name: &str, kind: IntentKind) -> Result<(), String> {
         .take(PROC_UNIX_LIMIT + 1)
         .read_to_end(&mut observed)
         .map_err(|error| error.to_string())?;
-    if observed.len() as u64 > PROC_UNIX_LIMIT
-        || observed
-            .windows(name.len())
-            .any(|window| window == name.as_bytes())
-    {
+    if observed.len() as u64 > PROC_UNIX_LIMIT {
+        return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: AF_UNIX inventory exceeds bound".into());
+    }
+    let pathname = match kind {
+        IntentKind::Pathname => format!("/tmp/{name}"),
+        IntentKind::Abstract => format!("@{name}"),
+    };
+    if !proc_unix_endpoint_absent(&observed, &pathname)? {
         return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: AF_UNIX endpoint present".into());
     }
     Ok(())
+}
+
+/// Parses complete proc rows and compares the exact endpoint field. A name
+/// embedded in an unrelated endpoint is not evidence that this endpoint
+/// exists. Malformed or truncated inventory fails closed.
+pub(crate) fn proc_unix_endpoint_absent(bytes: &[u8], endpoint: &str) -> Result<bool, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "MCSEALED-PRIVATE-RELEASE-FIXTURE: AF_UNIX inventory is not UTF-8")?;
+    if !text.ends_with('\n') {
+        return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: AF_UNIX inventory is truncated".into());
+    }
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .ok_or("MCSEALED-PRIVATE-RELEASE-FIXTURE: AF_UNIX inventory header absent")?;
+    if header.split_ascii_whitespace().collect::<Vec<_>>()
+        != [
+            "Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path",
+        ]
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: AF_UNIX inventory header differs".into());
+    }
+    for line in lines {
+        let mut rest = line.trim_ascii_start();
+        let mut fields = Vec::with_capacity(7);
+        for _ in 0..7 {
+            if rest.is_empty() {
+                return Err(
+                    "MCSEALED-PRIVATE-RELEASE-FIXTURE: AF_UNIX inventory row differs".into(),
+                );
+            }
+            let field_end = rest
+                .find(|character: char| character.is_ascii_whitespace())
+                .unwrap_or(rest.len());
+            fields.push(&rest[..field_end]);
+            rest = rest[field_end..].trim_ascii_start();
+        }
+        if !fields[0].ends_with(':')
+            || !fields[0][..fields[0].len() - 1]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || fields[1..6]
+                .iter()
+                .any(|field| !field.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            || !fields[6].bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: AF_UNIX inventory row differs".into());
+        }
+        if rest == endpoint {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn begin_observation(challenge: &[u8; 32]) -> Result<Vec<u8>, String> {
@@ -173,7 +393,18 @@ pub(crate) fn run_target_fixture() -> Result<(), String> {
             format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: Unix intent challenge: {error}")
         })?;
     let observed = observe_target_denials(&challenge)?;
+    std::io::stdout().write_all(&observed).map_err(|error| {
+        format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: Unix intent output: {error}")
+    })?;
     std::io::stdout()
-        .write_all(&observed)
-        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: Unix intent output: {error}"))
+        .flush()
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: Unix intent flush: {error}"))?;
+    let mut ack = [0_u8; 32];
+    std::io::stdin()
+        .read_exact(&mut ack)
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: observer ACK: {error}"))?;
+    if ack != *observer_ack_digest(&challenge).bytes() {
+        return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: observer ACK differs".into());
+    }
+    Ok(())
 }

@@ -203,6 +203,7 @@ pub(crate) fn execute_terminal_join_candidate_case(
             settlement: retirement.settlement,
             host_network_preservation: None,
             agent_path_preservation: None,
+            unix_absence: None,
         },
         live_frame,
         target_namespace_pid,

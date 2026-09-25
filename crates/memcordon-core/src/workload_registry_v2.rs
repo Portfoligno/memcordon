@@ -453,6 +453,42 @@ impl AdmissionRejectionV2 {
     }
 }
 
+/// A candidate run can test the production policy predicate without acquiring
+/// launch authority. This value deliberately contains neither a grant nor an
+/// admission snapshot and cannot be promoted into either one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CandidatePolicyDecisionV2 {
+    Accepted,
+    Rejected(AdmissionRejectionV2),
+}
+
+/// Evaluate the exact predicate used by ordinary V2 admission for a protected
+/// candidate fixture. The caller must authenticate the candidate registry,
+/// caller, and H0 qualification input independently. Even `Accepted` is only
+/// a decision observation: this function does not verify installed Q/H1 or
+/// allocate an attempt. The production path uses `resolve_v2` directly and
+/// must still acquire its installed authority lease.
+pub fn evaluate_candidate_policy_v2(
+    registry: &PolicyRegistryV2,
+    current_epoch: &PolicyEpoch,
+    request: &WorkloadContractV2,
+    authenticated_caller: &CallerSelector,
+    native_profile: ProfileKindV2,
+    candidate_qualification: &DiagnosticSha256,
+) -> CandidatePolicyDecisionV2 {
+    match resolve_v2(
+        registry,
+        current_epoch,
+        request,
+        authenticated_caller,
+        native_profile,
+        candidate_qualification,
+    ) {
+        Ok(_) => CandidatePolicyDecisionV2::Accepted,
+        Err(rejection) => CandidatePolicyDecisionV2::Rejected(rejection),
+    }
+}
+
 /// Resolves static administrator authority and functional compatibility.
 /// Native caller/entrypoint/filter/namespace checks remain mandatory before
 /// the provider may commit a checkpoint or release the target.

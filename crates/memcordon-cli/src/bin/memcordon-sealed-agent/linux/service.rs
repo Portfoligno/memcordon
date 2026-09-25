@@ -410,6 +410,11 @@ fn handle(
                         readback,
                     )?
                     .publish()?;
+                } else if fixed.selector == super::private_release_unix_intent::SELECTOR {
+                    let readback =
+                        super::private_release_run::verify_detached_closed_unix_intent(&fixed)?;
+                    super::private_release_result::VerifiedCandidateCaseCompletion::from_closed_unix_intent_detached(readback)?
+                        .publish()?;
                 } else {
                     let readback =
                         super::private_release_run::verify_detached_candidate_case(&fixed)?;
