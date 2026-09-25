@@ -5,6 +5,70 @@ use crate::protocol::{Frame, MessageKind};
 use crate::rejection::{RejectionPhaseV1, RejectionV1};
 use std::path::Path;
 
+#[test]
+fn public_transport_preserves_wire_version_for_private_dispatch() {
+    use crate::protocol::{write_frame, write_network_frame};
+    use std::os::unix::net::UnixStream;
+
+    for (private, kind) in [
+        (false, MessageKind::Launch),
+        (true, MessageKind::PrivateLaunch),
+    ] {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        let expected = Frame {
+            kind,
+            nonce: [5; 16],
+            attempt_id: [7; 16],
+            payload: vec![1, 2, 3],
+        };
+        let mut bytes = Vec::new();
+        if private {
+            write_network_frame(&mut bytes, &expected).unwrap();
+        } else {
+            write_frame(&mut bytes, &expected).unwrap();
+        }
+        crate::linux::transport::send(&writer, &bytes, &[]).unwrap();
+        let (observed, descriptors, version) =
+            crate::linux::transport::receive_public(&reader).unwrap();
+        assert_eq!(observed, expected);
+        assert!(descriptors.is_empty());
+        assert_eq!(version, if private { 4 } else { 3 });
+    }
+}
+
+#[test]
+fn private_indeterminate_response_preserves_attempt_and_denies_replay_claim() {
+    let request = Frame {
+        kind: MessageKind::PrivateLaunch,
+        nonce: [5; 16],
+        attempt_id: [7; 16],
+        payload: Vec::new(),
+    };
+    let response = crate::linux::service::private_indeterminate_response(&request).unwrap();
+    assert_eq!(response.kind, MessageKind::PrivateIndeterminate);
+    assert_eq!(response.nonce, request.nonce);
+    assert_eq!(response.attempt_id, request.attempt_id);
+    let value: serde_json::Value = serde_json::from_slice(&response.payload).unwrap();
+    assert_eq!(value["schema_version"], 11);
+    assert_eq!(value["attempt_id"], "07070707070707070707070707070707");
+    assert_eq!(value["release_knowledge"], "possibly-released");
+    assert_eq!(value["retirement_knowledge"], "unverified");
+    assert_eq!(value["replay_disposition"], "do-not-replay");
+    assert!(value.get("cleanup_complete").is_none());
+    assert!(value.get("execution_succeeded").is_none());
+    let mut wire = Vec::new();
+    crate::protocol::write_network_frame(&mut wire, &response).unwrap();
+    assert_eq!(
+        crate::protocol::read_network_frame(&mut wire.as_slice()).unwrap(),
+        response
+    );
+    let wrong_kind = Frame {
+        kind: MessageKind::Launch,
+        ..request
+    };
+    assert!(crate::linux::service::private_indeterminate_response(&wrong_kind).is_err());
+}
+
 const PEER_PID: libc::pid_t = 100;
 const MEMBER_PID: libc::pid_t = 200;
 const ATTEMPT_ID: &str = "0123456789abcdef0123456789abcdef";
@@ -140,6 +204,41 @@ fn probe_with_descriptors_receives_a_typed_rejection() {
     assert!(rejection.detail.contains("must not carry descriptors"));
     assert!(!rejection.target_created);
     assert!(!rejection.cleanup.attempted);
+}
+
+#[test]
+fn private_plan_rejects_bad_frame_before_any_installed_authority_lookup() {
+    let request = Frame {
+        kind: MessageKind::PrivatePlan,
+        nonce: [4; 16],
+        attempt_id: [0; 16],
+        payload: Vec::new(),
+    };
+    let response = crate::linux::service::private_plan_response_for_test(&request, 1, 1000)
+        .expect("invalid frame produces a typed rejection");
+    assert_eq!(response.kind, MessageKind::Rejected);
+    let rejection: RejectionV1 =
+        serde_json::from_slice(&response.payload).expect("typed rejection");
+    rejection.validate().expect("valid rejection");
+    assert!(rejection.detail.contains("no descriptors"));
+    assert!(!rejection.target_created);
+}
+
+#[test]
+fn private_plan_rejects_an_incomplete_baseline_shape() {
+    let request = Frame {
+        kind: MessageKind::PrivatePlan,
+        nonce: [5; 16],
+        attempt_id: [0; 16],
+        payload: br#"{"schema_version":1}"#.to_vec(),
+    };
+    let response = crate::linux::service::private_plan_response_for_test(&request, 0, 1000)
+        .expect("baseline data produces a typed rejection");
+    assert_eq!(response.kind, MessageKind::Rejected);
+    let rejection: RejectionV1 =
+        serde_json::from_slice(&response.payload).expect("typed rejection");
+    rejection.validate().expect("valid rejection");
+    assert!(!rejection.target_created);
 }
 
 #[test]

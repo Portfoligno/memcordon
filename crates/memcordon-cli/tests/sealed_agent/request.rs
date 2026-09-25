@@ -207,6 +207,7 @@ fn network_v4_request_round_trips_without_legacy_fallback() {
 fn network_v4_broker_binds_contract_identity_and_exact_descriptor_manifest() {
     let broker = NetworkLaunchBrokerRequestV4::authenticated(
         [0x51; 16],
+        memcordon_core::DiagnosticSha256::from_bytes([0x44; 32]),
         73,
         99,
         network_request(),
@@ -228,6 +229,13 @@ fn network_v4_broker_binds_contract_identity_and_exact_descriptor_manifest() {
         encode_network_launch_broker_request(&altered),
         Err(RequestCodecError::InvalidValue)
     );
+    let mut wrong_generation = broker.clone();
+    wrong_generation.installed_generation_digest =
+        memcordon_core::DiagnosticSha256::from_bytes([0x45; 32]);
+    assert_eq!(
+        encode_network_launch_broker_request(&wrong_generation),
+        Err(RequestCodecError::InvalidValue)
+    );
     let mut reordered = broker;
     reordered.descriptor_manifest.swap(6, 7);
     assert_eq!(
@@ -240,6 +248,7 @@ fn network_v4_broker_binds_contract_identity_and_exact_descriptor_manifest() {
 fn network_exchange_rejects_each_unbound_transport_claim_before_allocation() {
     let broker = NetworkLaunchBrokerRequestV4::authenticated(
         [0x51; 16],
+        memcordon_core::DiagnosticSha256::from_bytes([0x44; 32]),
         73,
         99,
         network_request(),

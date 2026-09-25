@@ -72,6 +72,10 @@ enum TopLevel {
     Suite {
         #[arg(value_enum)]
         suite: Suite,
+        #[arg(long, value_enum)]
+        stage: Option<PrivateStage>,
+        #[arg(long)]
+        target: Option<String>,
     },
     Release {
         #[command(subcommand)]
@@ -102,6 +106,7 @@ enum Suite {
     Stress,
     BackendLinuxCgroup,
     BackendLinuxSealedV2,
+    BackendLinuxPrivateV4,
     BackendWindowsJob,
     BackendWindowsSealedV2,
     WindowsLoaderProduction,
@@ -117,9 +122,26 @@ enum Suite {
     ReleaseMacos,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PrivateStage {
+    CandidateCapability,
+    FinalPublic,
+}
+
+impl From<PrivateStage> for memcordon_ci::private_native::NativeRunStageV2 {
+    fn from(stage: PrivateStage) -> Self {
+        match stage {
+            PrivateStage::CandidateCapability => Self::CandidateCapability,
+            PrivateStage::FinalPublic => Self::FinalPublic,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum ReleaseCommand {
     Assemble,
+    VerifyPrivateCandidate,
+    InstallPrivateCandidate,
     StageGithub,
     AttemptOidc {
         #[arg(long)]
@@ -206,7 +228,14 @@ fn run() -> Result<()> {
             memcordon_ci::build_context::ValidatedBuildContext::read(&input)?.audit()
         }
         (true, None) => release::cargo_credential_provider(&root),
-        (false, Some(TopLevel::Suite { suite })) => suites::run(&root, suite),
+        (
+            false,
+            Some(TopLevel::Suite {
+                suite,
+                stage,
+                target,
+            }),
+        ) => suites::run(&root, suite, stage, target.as_deref()),
         (false, Some(TopLevel::Release { command })) => release::run(&root, command),
         (
             false,

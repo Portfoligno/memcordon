@@ -335,6 +335,7 @@ impl ObjectIdentity {
 pub struct ExpectedGatedDescriptorInventory {
     objects: [ObjectIdentity; 5],
     provider_control: ObjectIdentity,
+    precreated_probe_pair: bool,
 }
 
 impl ExpectedGatedDescriptorInventory {
@@ -365,7 +366,19 @@ impl ExpectedGatedDescriptorInventory {
                 ObjectIdentity::from_fd(verified_elf.as_raw_fd())?,
             ],
             provider_control: ObjectIdentity::from_fd(provider_control.as_raw_fd())?,
+            precreated_probe_pair: false,
         })
+    }
+
+    /// Only the fixed release-domain socket-laundering selector may change
+    /// the gated inventory. Production stays at the exact fd0–4 shape.
+    pub(crate) fn for_precreated_probe_pair(mut self) -> Self {
+        self.precreated_probe_pair = true;
+        self
+    }
+
+    pub(crate) fn expects_precreated_probe_pair(&self) -> bool {
+        self.precreated_probe_pair
     }
 }
 
@@ -409,6 +422,36 @@ fn socket_option(fd: RawFd, option: i32) -> io::Result<i32> {
 pub struct GatedDescriptorProof {
     pid: libc::pid_t,
     expected: ExpectedGatedDescriptorInventory,
+    precreated_pair: Option<[ObjectIdentity; 2]>,
+}
+
+impl GatedDescriptorProof {
+    pub(crate) fn precreated_pair_identities(&self) -> Option<[(u64, u64); 2]> {
+        self.precreated_pair.map(|pair| {
+            [
+                (pair[0].device, pair[0].inode),
+                (pair[1].device, pair[1].inode),
+            ]
+        })
+    }
+
+    pub(crate) fn revalidate_precreated_pair(&self) -> io::Result<()> {
+        let pair = self
+            .precreated_pair
+            .ok_or_else(|| invalid_data("precreated probe pair absent"))?;
+        let process = Path::new("/proc").join(self.pid.to_string());
+        for (fd, expected) in [(5, pair[0]), (6, pair[1])] {
+            let path = process.join("fd").join(fd.to_string());
+            let flags = proc_fd_flags(&process.join("fdinfo").join(fd.to_string()))?;
+            if ObjectIdentity::from_proc_fd(&path)? != expected
+                || flags & libc::O_CLOEXEC == 0
+                || flags & libc::O_NONBLOCK == 0
+            {
+                return Err(invalid_data("precreated probe pair changed before release"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Binds the gated five-fd inventory to an observed successful exec boundary.
@@ -446,11 +489,38 @@ pub fn verify_private_gated_descriptor_inventory(
         })
         .collect::<io::Result<Vec<_>>>()?;
     actual.sort_unstable();
-    if actual != GATED_FDS {
+    let expected_fds: &[RawFd] = if expected.precreated_probe_pair {
+        &[0, 1, 2, 3, 4, 5, 6]
+    } else {
+        &GATED_FDS
+    };
+    if actual != expected_fds {
         return Err(invalid_data(
-            "gated descriptor inventory is not exactly fd 0–4",
+            "gated descriptor inventory differs from sealed mode",
         ));
     }
+    let precreated_pair = if expected.precreated_probe_pair {
+        let mut pair = Vec::with_capacity(2);
+        for fd in [5, 6] {
+            let path = process.join("fd").join(fd.to_string());
+            let identity = ObjectIdentity::from_proc_fd(&path)?;
+            let flags = proc_fd_flags(&process.join("fdinfo").join(fd.to_string()))?;
+            if identity.kind != libc::S_IFSOCK
+                || flags & libc::O_ACCMODE != libc::O_RDWR
+                || flags & libc::O_CLOEXEC == 0
+                || flags & libc::O_NONBLOCK == 0
+            {
+                return Err(invalid_data("precreated probe pair fd shape differs"));
+            }
+            pair.push(identity);
+        }
+        if pair[0] == pair[1] {
+            return Err(invalid_data("precreated probe sockets share one inode"));
+        }
+        Some([pair[0], pair[1]])
+    } else {
+        None
+    };
     for (index, fd) in GATED_FDS.into_iter().enumerate() {
         let fd_path = process.join("fd").join(fd.to_string());
         if ObjectIdentity::from_proc_fd(&fd_path)? != expected.objects[index] {
@@ -472,7 +542,11 @@ pub fn verify_private_gated_descriptor_inventory(
             return Err(invalid_data("gated descriptor CLOEXEC mismatch"));
         }
     }
-    Ok(GatedDescriptorProof { pid, expected })
+    Ok(GatedDescriptorProof {
+        pid,
+        expected,
+        precreated_pair,
+    })
 }
 
 fn proc_fd_flags(path: &Path) -> io::Result<i32> {
@@ -540,6 +614,20 @@ pub fn verify_private_exec_entry(
     let exe = Path::new("/proc").join(gated.pid.to_string()).join("exe");
     if ObjectIdentity::from_proc_fd(&exe)? != gated.expected.objects[4] {
         return Err(invalid_data("exec did not enter the pinned ELF"));
+    }
+    if let Some(pair) = gated.precreated_pair {
+        let directory = Path::new("/proc").join(gated.pid.to_string()).join("fd");
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let identity = match ObjectIdentity::from_proc_fd(&entry.path()) {
+                Ok(identity) => identity,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if pair.contains(&identity) {
+                return Err(invalid_data("precreated probe socket survived pinned exec"));
+            }
+        }
     }
     Ok(PostExecDescriptorProof {
         pid: gated.pid,

@@ -26,6 +26,8 @@ Usage:
   memcordon-sealed-agent --version
   memcordon-sealed-agent package inspect [--json]
   memcordon-sealed-agent package verify [--json]
+  memcordon-sealed-agent package qualify-private
+  memcordon-sealed-agent package release-case --stage STAGE --selector SELECTOR --challenge HEX
   memcordon-sealed-agent package install [--ephemeral-ci]
   memcordon-sealed-agent package upgrade [--ephemeral-ci]
   memcordon-sealed-agent package uninstall [--ephemeral-ci]
@@ -56,6 +58,41 @@ fn main() {
         #[cfg(target_os = "linux")]
         [command] if command == "workload-profile-probe" => {
             linux::qualification::workload_profile_probe()
+        }
+        #[cfg(target_os = "linux")]
+        [command, case] if command == "private-probe-fixture" => {
+            linux::private_qualification::run_fixture(case)
+        }
+        #[cfg(target_os = "linux")]
+        [command, selector] if command == "private-release-fixture" => {
+            linux::private_release_case::run_candidate_fixture(selector)
+        }
+        #[cfg(target_os = "linux")]
+        [command] if command == "private-release-unix-intent" => {
+            linux::private_release_unix_intent::run_target_fixture()
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            stage_flag,
+            stage,
+            selector_flag,
+            selector,
+            challenge_flag,
+            challenge,
+        ] if package == "package"
+            && operation == "release-case"
+            && stage_flag == "--stage"
+            && selector_flag == "--selector"
+            && challenge_flag == "--challenge" =>
+        {
+            linux::private_release_case::ReleaseCaseRequestV1::parse(
+                stage.as_os_str(),
+                selector.as_os_str(),
+                challenge.as_os_str(),
+            )
+            .and_then(linux::private_release_case::run)
         }
         #[cfg(target_os = "windows")]
         [command] if command == "windows-control" => windows::control(),

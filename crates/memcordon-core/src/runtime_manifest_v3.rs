@@ -7,6 +7,9 @@ use crate::runtime_manifest::{
 use crate::workload_contract::ProfileRef;
 use crate::workload_discovery_v2::profile_catalog_digest_v2;
 use crate::workload_limits as limits;
+use crate::workload_qualification_v2::{
+    QualificationArtifactV2, TrustedQualificationExpectationV2,
+};
 use crate::workload_registry::BaselineProfile;
 use crate::workload_registry_v2::ProfileKindV2;
 use crate::{BoundedVec, DiagnosticSha256};
@@ -61,6 +64,23 @@ pub struct QualificationArtifactReferenceV2 {
     pub qualified_target: String,
     pub source_commit: String,
     pub profile: ProfileRef,
+}
+
+/// A release reference joined to actual qualification bytes and an independent
+/// native-run expectation. This proves a release artifact, not current host
+/// qualification; installed admission must verify the host separately.
+pub struct ValidatedQualificationReferenceV2(QualificationArtifactReferenceV2);
+
+impl ValidatedQualificationReferenceV2 {
+    pub fn from_verified_artifact(
+        bytes: &[u8],
+        reference: QualificationArtifactReferenceV2,
+        expected: &TrustedQualificationExpectationV2<'_>,
+    ) -> Result<Self, String> {
+        QualificationArtifactV2::parse_and_validate(bytes, &reference, expected)?;
+        reference.validate(expected.target, expected.source_commit, expected.profile)?;
+        Ok(Self(reference))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -161,24 +181,43 @@ impl RuntimeManifestV3 {
         Ok(binding)
     }
 
-    /// Constructs the Linux V2 catalogue without claiming native private-profile
-    /// qualification. Release inventory must supply independently verified
-    /// references before either profile can be advertised as qualified.
+    /// Constructs a candidate Linux catalogue before native capability proof.
     pub fn linux_unqualified(
         version: String,
         source_commit: String,
         target: String,
         components: Vec<RuntimeComponentRecord>,
     ) -> Result<Self, String> {
+        Self::linux_with_qualifications(version, source_commit, target, components, None)
+    }
+
+    /// Constructs a final Linux catalogue using release qualification checked
+    /// against independent native completions. The installed host still needs
+    /// a fresh qualification receipt before private execution is available.
+    pub fn linux_with_qualifications(
+        version: String,
+        source_commit: String,
+        target: String,
+        components: Vec<RuntimeComponentRecord>,
+        private: Option<ValidatedQualificationReferenceV2>,
+    ) -> Result<Self, String> {
+        let private_availability = private.map_or(RuntimeProfileAvailabilityV3::Unqualified, |q| {
+            RuntimeProfileAvailabilityV3::Qualified { qualification: q.0 }
+        });
         let mut profiles = BoundedVec::default();
         for profile in [
             ProfileKindV2::LinuxTcp4PrivateV1.reference(),
             ProfileKindV2::LinuxUnixCreateV1.reference(),
         ] {
+            let is_private = profile == ProfileKindV2::LinuxTcp4PrivateV1.reference();
             profiles
                 .try_push(RuntimeProfileRecordV3 {
                     profile,
-                    availability: RuntimeProfileAvailabilityV3::Unqualified,
+                    availability: if is_private {
+                        private_availability.clone()
+                    } else {
+                        RuntimeProfileAvailabilityV3::Unqualified
+                    },
                 })
                 .map_err(|_| "Linux runtime profile catalogue exceeds bound")?;
         }
@@ -347,8 +386,10 @@ impl RuntimeManifestV3 {
                     if let RuntimeProfileAvailabilityV3::Qualified { qualification } =
                         &record.availability
                     {
-                        if record.profile == ProfileKindV2::LinuxTcp4PrivateV1.reference() {
-                            return Err("private TCP has no verified V3 publication source".into());
+                        if record.profile != ProfileKindV2::LinuxTcp4PrivateV1.reference() {
+                            return Err(
+                                "Linux V3 has no qualified release source for this profile".into(),
+                            );
                         }
                         qualification.validate(
                             &self.target,
@@ -402,16 +443,15 @@ impl QualificationArtifactReferenceV2 {
         source_commit: &str,
         profile: &ProfileRef,
     ) -> Result<(), String> {
+        let expected_artifact = match target {
+            "x86_64-unknown-linux-gnu" => "certification/workload/linux-x64-private-v2.json",
+            "aarch64-unknown-linux-gnu" => "certification/workload/linux-arm64-private-v2.json",
+            _ => return Err("V2 qualification target is unsupported".into()),
+        };
         if self.qualified_target != target
             || self.source_commit != source_commit
             || &self.profile != profile
-            || self.artifact.len() > 256
-            || !self.artifact.starts_with("certification/workload/")
-            || self
-                .artifact
-                .split('/')
-                .any(|part| part.is_empty() || matches!(part, "." | ".."))
-            || self.artifact.contains('\\')
+            || self.artifact != expected_artifact
         {
             return Err("V2 qualification reference is not native, exact or complete".into());
         }

@@ -1,5 +1,7 @@
+use memcordon_core::runtime_manifest::{RuntimeComponentRecord, RuntimeComponentRole};
 use memcordon_core::runtime_manifest_v3::{
-    QualificationArtifactReferenceV2, QualificationArtifactSchemaTwo,
+    QualificationArtifactReferenceV2, QualificationArtifactSchemaTwo, RuntimeManifestV3,
+    RuntimeProfileAvailabilityV3, SealedRuntimeV3, ValidatedQualificationReferenceV2,
 };
 use memcordon_core::workload_codec::hash_bytes;
 use memcordon_core::workload_discovery_v2::profile_catalog_digest_v2;
@@ -107,6 +109,70 @@ fn reference(bytes: &[u8]) -> QualificationArtifactReferenceV2 {
         source_commit: SOURCE.into(),
         profile: ProfileKindV2::LinuxTcp4PrivateV1.reference(),
     }
+}
+
+#[test]
+fn final_manifest_requires_verified_qualification_bytes_and_exact_target_path() {
+    let fixture = Fixture::new();
+    let trusted = trusted_completions(&fixture.completions);
+    let expected = fixture.expectation(&trusted);
+    let bytes = serde_json::to_vec(&fixture.artifact).unwrap();
+    let mut q = reference(&bytes);
+    assert!(
+        ValidatedQualificationReferenceV2::from_verified_artifact(&bytes, q.clone(), &expected)
+            .is_err()
+    );
+    q.artifact = "certification/workload/linux-x64-private-v2.json".into();
+    let mut changed = bytes.clone();
+    changed.push(b' ');
+    assert!(
+        ValidatedQualificationReferenceV2::from_verified_artifact(&changed, q.clone(), &expected)
+            .is_err()
+    );
+    let verified =
+        ValidatedQualificationReferenceV2::from_verified_artifact(&bytes, q.clone(), &expected)
+            .unwrap();
+    let components = [
+        (
+            "memcordon",
+            "bin/memcordon",
+            RuntimeComponentRole::PublicCli,
+        ),
+        (
+            "sealed-agent",
+            "bin/memcordon-sealed-agent",
+            RuntimeComponentRole::SealedAgent,
+        ),
+    ]
+    .into_iter()
+    .map(|(id, path, role)| RuntimeComponentRecord {
+        id: id.into(),
+        path: path.into(),
+        role,
+        size: 4096,
+        mode: 0o755,
+        sha256: "7".repeat(64),
+    })
+    .collect();
+    let manifest = RuntimeManifestV3::linux_with_qualifications(
+        "0.5.7-dev".into(),
+        SOURCE.into(),
+        TARGET.into(),
+        components,
+        Some(verified),
+    )
+    .unwrap();
+    let SealedRuntimeV3::WorkloadV2 { profiles, .. } = &manifest.sealed else {
+        panic!("Linux constructor emitted another provider policy");
+    };
+    assert!(matches!(
+        &profiles.as_slice()[0].availability,
+        RuntimeProfileAvailabilityV3::Qualified { qualification } if qualification == &q
+    ));
+    assert_eq!(
+        RuntimeManifestV3::parse(&serde_json::to_vec(&manifest).unwrap()).unwrap(),
+        manifest
+    );
 }
 
 #[test]

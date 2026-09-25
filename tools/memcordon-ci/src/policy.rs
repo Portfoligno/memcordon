@@ -617,6 +617,220 @@ fn check_runner_matrix(
     Ok(())
 }
 
+fn check_private_native_diagnostic_job(
+    jobs: &Mapping,
+    job_id: &str,
+    name: &str,
+    dependency: &str,
+    stage: &str,
+) -> Result<()> {
+    let job = mapping(
+        jobs.get(key(job_id))
+            .ok_or_else(|| failure("private native diagnostic job is absent"))?,
+        "private native diagnostic job",
+    )?;
+    let candidate = stage == "candidate-capability";
+    let mut job_keys = vec![
+        "name",
+        "if",
+        "needs",
+        "strategy",
+        "runs-on",
+        "timeout-minutes",
+        "steps",
+    ];
+    if candidate {
+        job_keys.push("permissions");
+    }
+    exact_mapping_keys(job, &job_keys, "private native diagnostic job")?;
+    if candidate {
+        let permissions = mapping(
+            job.get(key("permissions"))
+                .ok_or_else(|| failure("candidate Actions permissions absent"))?,
+            "candidate Actions permissions",
+        )?;
+        exact_mapping_keys(
+            permissions,
+            &["contents", "actions"],
+            "candidate Actions permissions",
+        )?;
+        if scalar(permissions, "contents") != Some("read")
+            || scalar(permissions, "actions") != Some("read")
+        {
+            return Err(failure("candidate Actions permissions differ"));
+        }
+    }
+    if scalar(job, "name") != Some(name)
+        || scalar(job, "if")
+            != Some("github.event_name == 'workflow_dispatch' && inputs.private_native == true")
+        || scalar(job, "needs") != Some(dependency)
+        || scalar(job, "runs-on") != Some("${{ matrix.runner }}")
+        || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(75)
+    {
+        return Err(failure(
+            "private native diagnostic job is not opt-in and bounded",
+        ));
+    }
+    let strategy = mapping(
+        job.get(key("strategy"))
+            .ok_or_else(|| failure("private native strategy absent"))?,
+        "private native strategy",
+    )?;
+    exact_mapping_keys(
+        strategy,
+        &["fail-fast", "matrix"],
+        "private native strategy",
+    )?;
+    if strategy.get(key("fail-fast")).and_then(Value::as_bool) != Some(false) {
+        return Err(failure("private native strategy fail-fast differs"));
+    }
+    let matrix = mapping(
+        strategy
+            .get(key("matrix"))
+            .ok_or_else(|| failure("private native matrix absent"))?,
+        "private native matrix",
+    )?;
+    exact_mapping_keys(matrix, &["include"], "private native matrix")?;
+    let rows = matrix
+        .get(key("include"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("private native matrix rows absent"))?;
+    let actual: Vec<(&str, &str, Option<&str>)> = rows
+        .iter()
+        .map(|row| {
+            let row = mapping(row, "private native matrix row")?;
+            if candidate {
+                exact_mapping_keys(row, &["id", "runner", "asset"], "private native matrix row")?;
+            } else {
+                exact_mapping_keys(row, &["id", "runner"], "private native matrix row")?;
+            }
+            Ok((
+                scalar(row, "id").ok_or_else(|| failure("private native matrix id absent"))?,
+                scalar(row, "runner")
+                    .ok_or_else(|| failure("private native matrix runner absent"))?,
+                scalar(row, "asset"),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let expected = if candidate {
+        [
+            ("x64", "ubuntu-24.04", Some("linux-x64")),
+            ("arm64", "ubuntu-24.04-arm", Some("linux-arm64")),
+        ]
+    } else {
+        [
+            ("x64", "ubuntu-24.04", None),
+            ("arm64", "ubuntu-24.04-arm", None),
+        ]
+    };
+    if actual != expected {
+        return Err(failure("private native matrix target/runner differs"));
+    }
+    let steps = job
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("private native diagnostic steps absent"))?;
+    let command = if candidate {
+        "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native"
+    } else {
+        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage final-public --target native"
+    };
+    let invocations: Vec<&Mapping> = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter(|step| scalar(step, "run") == Some(command))
+        .collect();
+    if invocations.len() != 1 {
+        return Err(failure("private native suite invocation differs"));
+    }
+    if candidate {
+        exact_mapping_keys(
+            invocations[0],
+            &["name", "run", "env"],
+            "private native suite step",
+        )?;
+        if scalar(invocations[0], "name") != Some("Private candidate suite") {
+            return Err(failure("private candidate suite step identity differs"));
+        }
+        let environment = mapping(
+            invocations[0]
+                .get(key("env"))
+                .ok_or_else(|| failure("private candidate Actions token absent"))?,
+            "private candidate suite environment",
+        )?;
+        exact_mapping_keys(
+            environment,
+            &["GITHUB_TOKEN"],
+            "private candidate suite env",
+        )?;
+        if scalar(environment, "GITHUB_TOKEN") != Some("${{ github.token }}") {
+            return Err(failure("private candidate Actions token source differs"));
+        }
+    } else {
+        exact_mapping_keys(invocations[0], &["run"], "private native suite step")?;
+    }
+    if candidate {
+        let downloads = action_steps(
+            steps,
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        )?;
+        if downloads.len() != 1 {
+            return Err(failure("private native candidate download count differs"));
+        }
+        let inputs = mapping(
+            downloads[0]
+                .get(key("with"))
+                .ok_or_else(|| failure("private native candidate download inputs absent"))?,
+            "private native candidate download",
+        )?;
+        exact_mapping_keys(
+            inputs,
+            &["name", "path"],
+            "private native candidate download",
+        )?;
+        if scalar(inputs, "name") != Some("release-native-${{ matrix.asset }}")
+            || scalar(inputs, "path")
+                != Some("target/ci/release-inputs/release-native-${{ matrix.asset }}")
+        {
+            return Err(failure("private native candidate download target differs"));
+        }
+        let verify = "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate";
+        let install = "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-candidate";
+        let position = |needle: &str| {
+            steps
+                .iter()
+                .enumerate()
+                .filter_map(|(index, step)| {
+                    (step.as_mapping().and_then(|step| scalar(step, "run")) == Some(needle))
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>()
+        };
+        let verified = position(verify);
+        let installed = position(install);
+        let executed = position(command);
+        let downloaded = steps
+            .iter()
+            .position(|step| step.as_mapping() == Some(downloads[0]));
+        if verified.len() != 1
+            || installed.len() != 1
+            || executed.len() != 1
+            || !matches!(downloaded, Some(index) if index < verified[0])
+            || !(verified[0] < installed[0] && installed[0] < executed[0])
+        {
+            return Err(failure(
+                "private native candidate provisioning order differs",
+            ));
+        }
+    }
+    if !action_steps(steps, UPLOAD_ARTIFACT_ACTION)?.is_empty() {
+        return Err(failure(
+            "private diagnostic job must not publish Q-shaped artifact",
+        ));
+    }
+    Ok(())
+}
+
 pub fn check_fuzz_shards(fuzz: &Mapping) -> Result<()> {
     exact_mapping_keys(
         fuzz,
@@ -2339,7 +2553,7 @@ fn check_release_structure(
             .ok_or_else(|| failure("release dispatch lacks inputs"))?,
         "release inputs",
     )?;
-    let input_names: Vec<&str> = vec!["tag"];
+    let input_names: Vec<&str> = vec!["tag", "private_native"];
     exact_mapping_keys(inputs, &input_names, "release inputs")?;
     let tag = mapping(
         inputs
@@ -2351,6 +2565,23 @@ fn check_release_structure(
         || scalar(tag, "type") != Some("string")
     {
         return Err(failure("release tag input must be a required string"));
+    }
+    let private_native = mapping(
+        inputs
+            .get(key("private_native"))
+            .ok_or_else(|| failure("private native opt-in input is absent"))?,
+        "private native opt-in input",
+    )?;
+    exact_mapping_keys(
+        private_native,
+        &["description", "required", "type", "default"],
+        "private native opt-in input",
+    )?;
+    if private_native.get(key("required")).and_then(Value::as_bool) != Some(false)
+        || scalar(private_native, "type") != Some("boolean")
+        || private_native.get(key("default")).and_then(Value::as_bool) != Some(false)
+    {
+        return Err(failure("private native opt-in must default closed"));
     }
     check_top_level_permissions(workflow)?;
     let concurrency = mapping(
@@ -2369,6 +2600,120 @@ fn check_release_structure(
     }
     config::validate_release_configuration_identity(release)?;
     check_runner_matrix(jobs, "native", &NATIVE_MATRIX, "release native")?;
+    check_runner_matrix(
+        jobs,
+        "linux-private-candidate-inputs",
+        &[
+            ("linux-x64", "ubuntu-24.04"),
+            ("linux-arm64", "ubuntu-24.04-arm"),
+        ],
+        "release private candidate inputs",
+    )?;
+    let private_inputs = mapping(
+        jobs.get(key("linux-private-candidate-inputs"))
+            .ok_or_else(|| failure("release private candidate input job is absent"))?,
+        "release private candidate inputs",
+    )?;
+    exact_mapping_keys(
+        private_inputs,
+        &[
+            "name",
+            "needs",
+            "strategy",
+            "runs-on",
+            "timeout-minutes",
+            "steps",
+        ],
+        "release private candidate inputs",
+    )?;
+    if scalar(private_inputs, "name")
+        != Some("Release / private candidate inputs / ${{ matrix.id }}")
+        || scalar(private_inputs, "needs") != Some("native")
+        || private_inputs
+            .get(key("timeout-minutes"))
+            .and_then(Value::as_u64)
+            != Some(45)
+    {
+        return Err(failure(
+            "release private candidate job is not native and bounded",
+        ));
+    }
+    let private_steps = private_inputs
+        .get(key("steps"))
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| failure("release private candidate steps are absent"))?;
+    let verification_command = "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate";
+    let verification_steps: Vec<&Mapping> = private_steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter(|step| scalar(step, "run") == Some(verification_command))
+        .collect();
+    if verification_steps.len() != 1 {
+        return Err(failure(
+            "release private candidate readback invocation differs",
+        ));
+    }
+    exact_mapping_keys(
+        verification_steps[0],
+        &["run"],
+        "release private candidate readback step",
+    )?;
+    let downloads = action_steps(
+        private_steps,
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+    )?;
+    if downloads.len() != 1 {
+        return Err(failure("release private candidate download count differs"));
+    }
+    let download_inputs = mapping(
+        downloads[0]
+            .get(key("with"))
+            .ok_or_else(|| failure("release private candidate download inputs absent"))?,
+        "release private candidate download",
+    )?;
+    exact_mapping_keys(
+        download_inputs,
+        &["name", "path"],
+        "release private candidate download",
+    )?;
+    if scalar(download_inputs, "name") != Some("release-native-${{ matrix.id }}")
+        || scalar(download_inputs, "path")
+            != Some("target/ci/release-inputs/release-native-${{ matrix.id }}")
+    {
+        return Err(failure("release private candidate download target differs"));
+    }
+    let uploads = action_steps(private_steps, UPLOAD_ARTIFACT_ACTION)?;
+    if uploads.len() != 1 || scalar(uploads[0], "if") != Some("always()") {
+        return Err(failure(
+            "release private candidate diagnostic upload differs",
+        ));
+    }
+    let upload_inputs = mapping(
+        uploads[0]
+            .get(key("with"))
+            .ok_or_else(|| failure("release private candidate upload inputs absent"))?,
+        "release private candidate upload",
+    )?;
+    if scalar(upload_inputs, "name") != Some("private-candidate-inputs-${{ matrix.id }}")
+        || scalar(upload_inputs, "path") != Some("target/ci/reports/private-candidate-inputs")
+        || scalar(upload_inputs, "if-no-files-found") != Some("warn")
+    {
+        return Err(failure("release private candidate upload target differs"));
+    }
+    check_private_native_diagnostic_job(
+        jobs,
+        "linux-private-candidate",
+        "Release / Linux private candidate / ${{ matrix.id }}",
+        "linux-private-candidate-inputs",
+        "candidate-capability",
+    )?;
+    check_private_native_diagnostic_job(
+        jobs,
+        "linux-private-final",
+        "Release / Linux private final / ${{ matrix.id }}",
+        "linux-private-candidate",
+        "final-public",
+    )?;
     let preflight = mapping(
         jobs.get(key("preflight"))
             .ok_or_else(|| failure("release preflight job is absent"))?,

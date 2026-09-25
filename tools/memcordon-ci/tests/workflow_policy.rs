@@ -10,6 +10,140 @@ fn repository_root() -> PathBuf {
 }
 
 #[test]
+fn private_candidate_inputs_require_both_native_linux_rows_and_exact_readback() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).unwrap();
+    let workflow = include_str!("../../../.github/workflows/release.yml");
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/release.yml"),
+        workflow.as_bytes(),
+        &repository_policy,
+    )
+    .unwrap();
+    for (original, replacement) in [
+        (
+            "  linux-private-candidate-inputs:\n",
+            "  linux-private-candidate-inputs-disabled:\n",
+        ),
+        (
+            "          - id: linux-arm64\n            runner: ubuntu-24.04-arm\n",
+            "",
+        ),
+        (
+            "    needs: native\n    strategy:\n",
+            "    needs: preflight\n    strategy:\n",
+        ),
+        ("release verify-private-candidate", "release verify-public"),
+        (
+            "      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate",
+            "      - if: false\n        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate",
+        ),
+        (
+            "name: release-native-${{ matrix.id }}\n          path: target/ci/release-inputs/release-native-${{ matrix.id }}",
+            "name: release-native-linux-x64\n          path: target/ci/release-inputs/release-native-${{ matrix.id }}",
+        ),
+    ] {
+        assert!(workflow.contains(original));
+        let mutant = workflow.replace(original, replacement);
+        assert!(
+            policy::validate_workflow_bytes(
+                &root,
+                Path::new(".github/workflows/release.yml"),
+                mutant.as_bytes(),
+                &repository_policy,
+            )
+            .is_err(),
+            "private candidate workflow mutation was accepted: {original}"
+        );
+    }
+}
+
+#[test]
+fn private_native_jobs_are_explicitly_opt_in_target_exact_and_nonpublishing() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).unwrap();
+    let workflow = include_str!("../../../.github/workflows/release.yml");
+    policy::validate_workflow_bytes(
+        &root,
+        Path::new(".github/workflows/release.yml"),
+        workflow.as_bytes(),
+        &repository_policy,
+    )
+    .unwrap();
+    for (original, replacement) in [
+        (
+            "private_native:\n        description: Run fail-closed private native qualification diagnostics",
+            "private_native_disabled:\n        description: Run fail-closed private native qualification diagnostics",
+        ),
+        (
+            "if: github.event_name == 'workflow_dispatch' && inputs.private_native == true",
+            "if: github.event_name == 'workflow_dispatch'",
+        ),
+        (
+            "  linux-private-candidate:\n",
+            "  linux-private-candidate-disabled:\n",
+        ),
+        (
+            "          - id: arm64\n            runner: ubuntu-24.04-arm",
+            "          - id: arm64\n            runner: ubuntu-24.04",
+        ),
+        (
+            "suite backend-linux-private-v4 --stage candidate-capability --target native",
+            "suite backend-linux-private-v4 --stage final-public --target native",
+        ),
+        (
+            "            asset: linux-arm64\n",
+            "            asset: linux-x64\n",
+        ),
+        (
+            "  linux-private-candidate:\n    name: Release / Linux private candidate / ${{ matrix.id }}\n    if: github.event_name == 'workflow_dispatch' && inputs.private_native == true\n    needs: linux-private-candidate-inputs\n    permissions:\n      contents: read\n      actions: read",
+            "  linux-private-candidate:\n    name: Release / Linux private candidate / ${{ matrix.id }}\n    if: github.event_name == 'workflow_dispatch' && inputs.private_native == true\n    needs: linux-private-candidate-inputs\n    permissions:\n      contents: read\n      actions: none",
+        ),
+        (
+            "      - name: Private candidate suite\n        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native\n        env:\n          GITHUB_TOKEN: ${{ github.token }}",
+            "      - name: Private candidate suite\n        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native",
+        ),
+        (
+            "name: release-native-${{ matrix.asset }}",
+            "name: release-native-linux-x64",
+        ),
+        (
+            "path: target/ci/release-inputs/release-native-${{ matrix.asset }}",
+            "path: target/ci/release-inputs/release-native-linux-x64",
+        ),
+        (
+            "      - run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-candidate\n",
+            "",
+        ),
+        (
+            "      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate\n      - run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-candidate",
+            "      - run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-candidate\n      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate",
+        ),
+        (
+            "  linux-private-final:\n    name: Release / Linux private final / ${{ matrix.id }}\n    if: github.event_name == 'workflow_dispatch' && inputs.private_native == true\n    needs: linux-private-candidate",
+            "  linux-private-final:\n    name: Release / Linux private final / ${{ matrix.id }}\n    if: github.event_name == 'workflow_dispatch' && inputs.private_native == true\n    needs: linux-private-candidate-inputs",
+        ),
+    ] {
+        assert!(
+            workflow.contains(original),
+            "missing policy fixture: {original}"
+        );
+        let mutant = workflow.replacen(original, replacement, 1);
+        assert!(
+            policy::validate_workflow_bytes(
+                &root,
+                Path::new(".github/workflows/release.yml"),
+                mutant.as_bytes(),
+                &repository_policy,
+            )
+            .is_err(),
+            "private native workflow mutation was accepted: {original}"
+        );
+    }
+}
+
+#[test]
 fn release_rehearsal_is_required_before_publication() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy");
@@ -907,5 +1041,5 @@ fn every_workflow_upload_uses_the_bounded_action() {
             workflow.matches(local).count()
         })
         .sum();
-    assert_eq!(count, 55, "workflow artifact upload inventory differs");
+    assert_eq!(count, 56, "workflow artifact upload inventory differs");
 }

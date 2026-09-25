@@ -58,6 +58,15 @@ pub(crate) fn execute(args: ExecutionArgs, presentation: &Presentation) -> i32 {
     }
     let (program, arguments) = args.command.split_first().expect("router requires command");
     let command = CommandSpec::new(program.clone()).args(arguments.iter().cloned());
+    if let Some(contract) = args.policy.private_workload_contract() {
+        #[cfg(target_os = "linux")]
+        return execute_private_v2(&args, &command, contract, presentation);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = contract;
+            return unavailable_private_v2(presentation);
+        }
+    }
     #[cfg(target_os = "macos")]
     let run_origin = match memcordon_platform::macos_continuous_nanos() {
         Ok(origin) => origin,
@@ -948,7 +957,7 @@ fn requested_report(
 ) -> RequestedPolicyReport {
     RequestedPolicyReport {
         workload: memcordon_core::workload_evidence::WorkloadRequestReport::from_contract(
-            args.workload_contract.as_ref(),
+            args.baseline_workload_contract(),
         ),
         boundary: args.boundary,
         memory: budgets.memory.map(|memory| RequestedMemoryPolicyReport {
@@ -1017,7 +1026,7 @@ fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeRe
         requested: requested_report(args, budgets, configured),
         effective: EffectivePolicyReport {
             workload: memcordon_core::workload_evidence::WorkloadResolutionReportV1::unresolved(
-                args.workload_contract.as_ref(), memcordon_core::workload_evidence::BaselineRestrictionObservationV1::UnmanagedStandardBackend,
+                args.baseline_workload_contract(), memcordon_core::workload_evidence::BaselineRestrictionObservationV1::UnmanagedStandardBackend,
             ),
             boundary: memcordon_core::BoundaryClass::Unavailable,
             memory: budgets.memory.map(|memory| EffectiveMemoryPolicyReport {
@@ -1049,6 +1058,9 @@ fn unresolved_report(args: &PolicyArgs, budgets: &BudgetSet) -> PolicyEnvelopeRe
 }
 
 pub(crate) fn plan(args: PlanArgs, presentation: &Presentation) -> i32 {
+    if let Some(contract) = args.policy.private_workload_contract() {
+        return plan_private_v2(contract, args.json, presentation);
+    }
     let (backend, report) = match resolve(&args.policy, &args.budgets) {
         Ok(value) => (value.backend, value.report),
         Err(error) if error.code == "MCBOUNDARY-UNSUPPORTED" => (
@@ -1120,6 +1132,11 @@ fn unavailable_backend_capability() -> BackendCapabilityReport {
 }
 
 pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
+    if let Some(memcordon_core::workload_contract::WorkloadContract::V2(contract)) =
+        args.workload_contract.as_ref()
+    {
+        return doctor_private_v2(contract, args.json, args.probe_execution, presentation);
+    }
     let probe = probe();
     use memcordon_core::workload_discovery::DiscoveryReportV1;
     use memcordon_core::workload_evidence::{
@@ -1140,16 +1157,21 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
     } else {
         DiscoveryReportV1::Unsupported
     };
-    let workload = args.workload_contract.as_ref().map(|contract| {
-        memcordon_platform::workload_plan(contract).unwrap_or_else(|_| {
-            WorkloadResolutionReportV1::Unavailable {
-                request: Some(
-                    RequestBindingV1::from_contract(contract).expect("CLI validated contract"),
-                ),
-                reason: AdmissionAvailabilityFailure::BindingUnavailable,
-                authorization: AuthorizationKnowledge::NotAuthorized,
-            }
-        })
+    let workload = args.workload_contract.as_ref().and_then(|versioned| {
+        let memcordon_core::workload_contract::WorkloadContract::V1(contract) = versioned else {
+            return None;
+        };
+        Some(
+            memcordon_platform::workload_plan(contract).unwrap_or_else(|_| {
+                WorkloadResolutionReportV1::Unavailable {
+                    request: Some(
+                        RequestBindingV1::from_contract(contract).expect("CLI validated contract"),
+                    ),
+                    reason: AdmissionAvailabilityFailure::BindingUnavailable,
+                    authorization: AuthorizationKnowledge::NotAuthorized,
+                }
+            }),
+        )
     });
     let capability = |backend: &memcordon_platform::BackendInfo| match args.requirement {
         Some(Requirement::Sealed) => {
@@ -1239,6 +1261,309 @@ pub(crate) fn doctor(args: DoctorArgs, presentation: &Presentation) -> i32 {
                 }
             }
         }
+    }
+    if met { 0 } else { 125 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unavailable_private_v2(presentation: &Presentation) -> i32 {
+    let mut out = presentation.stderr();
+    presentation::write_runtime_error(
+        &mut out,
+        "MCWORKLOAD-V2-PLATFORM-UNSUPPORTED: Linux private V2 is unavailable on this platform",
+    )
+    .expect("private V2 diagnostic should be writable");
+    125
+}
+
+#[cfg(target_os = "linux")]
+fn execute_private_v2(
+    args: &ExecutionArgs,
+    command: &CommandSpec,
+    contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    presentation: &Presentation,
+) -> i32 {
+    use memcordon_core::report_v11::{
+        PrivatePublicOutcomeV11, PrivatePublicResultV11, PrivateTerminalOutcomeV11,
+    };
+    use memcordon_platform::{PrivateLaunchErrorV2, PrivateServiceResultV2};
+
+    let (result, exit_code, diagnostic) = if args.policy.restart || args.policy.restart_on.is_some()
+    {
+        (
+            PrivatePublicOutcomeV11::BeforeSubmissionFailure {
+                reason: "automatic V2 restart requires a typed limit cause and authenticated receipt query".into(),
+            },
+            125,
+            Some("MCWORKLOAD-V2-RESTART-UNAVAILABLE: automatic restart was not attempted".to_owned()),
+        )
+    } else {
+        match memcordon_platform::execute_private_v2(
+            &args.policy.policy(&args.budgets),
+            command,
+            contract,
+            memcordon_platform::AttemptContext::default(),
+        ) {
+            Ok(PrivateServiceResultV2::Complete(terminal)) => {
+                let exit_code = match &terminal.report().outcome {
+                    PrivateTerminalOutcomeV11::Exited { code } if (0..=255).contains(code) => *code,
+                    _ => 125,
+                };
+                let diagnostic = match &terminal.report().outcome {
+                    PrivateTerminalOutcomeV11::Exited { code } if (0..=255).contains(code) => None,
+                    PrivateTerminalOutcomeV11::Exited { code } => Some(format!(
+                        "private V2 target reported invalid exit code {code}"
+                    )),
+                    _ => Some("private V2 target did not exit ordinarily".to_owned()),
+                };
+                (
+                    PrivatePublicOutcomeV11::Complete {
+                        terminal: Box::new(terminal.report().clone()),
+                        raw_response: terminal.raw_response().to_vec(),
+                    },
+                    exit_code,
+                    diagnostic,
+                )
+            }
+            Ok(PrivateServiceResultV2::Rejected {
+                evidence,
+                raw_response,
+                release_knowledge: _,
+            }) => {
+                let diagnostic = format!(
+                    "private V2 rejected [{}]: {}",
+                    evidence.code, evidence.detail
+                );
+                let result = if evidence.target_created {
+                    PrivatePublicOutcomeV11::AllocatedUnverified {
+                        rejection: evidence,
+                        raw_response,
+                    }
+                } else {
+                    PrivatePublicOutcomeV11::PreallocationRejected {
+                        rejection: evidence,
+                        raw_response,
+                    }
+                };
+                (result, 125, Some(diagnostic))
+            }
+            Ok(PrivateServiceResultV2::Indeterminate {
+                attempt_id,
+                raw_response,
+                reason_code,
+            }) => (
+                PrivatePublicOutcomeV11::Indeterminate {
+                    attempt_id: attempt_id
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                    reason_code: reason_code.clone(),
+                    raw_response,
+                },
+                125,
+                Some(format!(
+                    "private V2 release/retirement indeterminate [{reason_code}]; do not replay"
+                )),
+            ),
+            Err(PrivateLaunchErrorV2::BeforeSubmission(reason)) => (
+                PrivatePublicOutcomeV11::BeforeSubmissionFailure {
+                    reason: reason.clone(),
+                },
+                125,
+                Some(format!("private V2 not submitted: {reason}")),
+            ),
+            Err(PrivateLaunchErrorV2::AfterSubmission(failure)) => (
+                PrivatePublicOutcomeV11::TransportUnverified {
+                    reason: failure.detail.clone(),
+                    raw_response: failure.raw_response,
+                },
+                125,
+                Some(format!(
+                    "private V2 response unverified: {}; do not replay",
+                    failure.detail
+                )),
+            ),
+        }
+    };
+    let report = PrivatePublicResultV11 {
+        schema_version: 11,
+        result,
+    };
+    if let Err(error) = report.validate_structure() {
+        let mut out = presentation.stderr();
+        presentation::write_runtime_error(
+            &mut out,
+            format_args!("private V11 report invalid: {error}"),
+        )
+        .expect("private report diagnostic should be writable");
+        return 125;
+    }
+    if let Some(path) = &args.output.report_path {
+        if let Err(error) = write_private_result_atomic(path, &report) {
+            let mut out = presentation.stderr();
+            presentation::write_runtime_error(
+                &mut out,
+                format_args!("private V11 report write failed: {error}"),
+            )
+            .expect("private report write diagnostic should be writable");
+            return 125;
+        }
+    }
+    if let Some(diagnostic) = diagnostic {
+        let mut out = presentation.stderr();
+        presentation::write_runtime_error(&mut out, diagnostic)
+            .expect("private V2 diagnostic should be writable");
+    } else if args.output.summary {
+        let mut out = presentation.stderr();
+        presentation::write_runtime_error(&mut out, format_args!("private V2 exit: {exit_code}"))
+            .expect("private V2 summary should be writable");
+    }
+    exit_code
+}
+
+#[cfg(target_os = "linux")]
+fn write_private_result_atomic(
+    path: &Path,
+    report: &memcordon_core::report_v11::PrivatePublicResultV11,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), report)
+        .map_err(|error| error.to_string())?;
+    temporary
+        .write_all(b"\n")
+        .map_err(|error| error.to_string())?;
+    temporary.flush().map_err(|error| error.to_string())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error.to_string())?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+fn private_plan_availability(
+    contract: &memcordon_core::workload_contract::WorkloadContractV2,
+) -> memcordon_core::workload_plan_v2::PrivatePlanAvailabilityV2 {
+    use memcordon_core::workload_plan_v2::PrivatePlanAvailabilityV2;
+    #[cfg(target_os = "linux")]
+    {
+        match memcordon_platform::private_plan_v2(contract) {
+            Ok(receipt) => PrivatePlanAvailabilityV2::Available { receipt },
+            Err(reason) => PrivatePlanAvailabilityV2::Unavailable { reason },
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = contract;
+        PrivatePlanAvailabilityV2::Unavailable {
+            reason: "Linux private V2 is unsupported on this platform".into(),
+        }
+    }
+}
+
+fn plan_private_v2(
+    contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    json: bool,
+    presentation: &Presentation,
+) -> i32 {
+    let digest = match memcordon_core::workload_codec::contract_digest_v2(contract) {
+        Ok(value) => value,
+        Err(error) => {
+            let mut out = presentation.stderr();
+            presentation::write_runtime_error(&mut out, error)
+                .expect("V2 plan diagnostic should be writable");
+            return 125;
+        }
+    };
+    let report = memcordon_core::workload_plan_v2::PrivatePlanReportV10 {
+        schema_version: 10,
+        contract_digest: digest,
+        availability: private_plan_availability(contract),
+        launch_proof: false,
+    };
+    if let Err(error) = report.validate_for_contract(contract) {
+        let mut out = presentation.stderr();
+        presentation::write_runtime_error(&mut out, error)
+            .expect("V2 plan validation diagnostic should be writable");
+        return 125;
+    }
+    if json {
+        return print_json(&report, "private V2 plan", presentation);
+    }
+    let mut out = presentation.stdout();
+    match report.availability {
+        memcordon_core::workload_plan_v2::PrivatePlanAvailabilityV2::Available { .. } => {
+            writeln!(out, "private V2 plan: available (launch proof: false)")
+                .expect("V2 plan output should be writable");
+        }
+        memcordon_core::workload_plan_v2::PrivatePlanAvailabilityV2::Unavailable { reason } => {
+            writeln!(out, "private V2 plan: unavailable ({reason})")
+                .expect("V2 plan output should be writable");
+        }
+    }
+    0
+}
+
+fn doctor_private_v2(
+    contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    json: bool,
+    probe_execution: bool,
+    presentation: &Presentation,
+) -> i32 {
+    use memcordon_core::workload_plan_v2::{PrivateDoctorReportV7, PrivatePlanAvailabilityV2};
+    let digest = match memcordon_core::workload_codec::contract_digest_v2(contract) {
+        Ok(value) => value,
+        Err(error) => {
+            let mut out = presentation.stderr();
+            presentation::write_runtime_error(&mut out, error)
+                .expect("V2 doctor diagnostic should be writable");
+            return 125;
+        }
+    };
+    let availability = if probe_execution {
+        PrivatePlanAvailabilityV2::Unavailable {
+            reason: "public V2 doctor execution probe is not available".into(),
+        }
+    } else {
+        private_plan_availability(contract)
+    };
+    let met = matches!(availability, PrivatePlanAvailabilityV2::Available { .. });
+    let report = PrivateDoctorReportV7 {
+        schema_version: 7,
+        contract_digest: digest,
+        host_os: std::env::consts::OS.into(),
+        architecture: std::env::consts::ARCH.into(),
+        availability,
+        execution_probe_performed: false,
+    };
+    if let Err(error) = report.validate_for_contract(contract) {
+        let mut out = presentation.stderr();
+        presentation::write_runtime_error(&mut out, error)
+            .expect("V2 doctor validation diagnostic should be writable");
+        return 125;
+    }
+    if json {
+        let code = print_json(&report, "private V2 doctor", presentation);
+        if code != 0 {
+            return code;
+        }
+    } else {
+        let mut out = presentation.stdout();
+        writeln!(
+            out,
+            "private V2 doctor: {}",
+            if met { "available" } else { "unavailable" }
+        )
+        .expect("V2 doctor output should be writable");
     }
     if met { 0 } else { 125 }
 }

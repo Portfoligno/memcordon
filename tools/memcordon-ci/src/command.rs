@@ -13,6 +13,7 @@ pub struct CommandSpec {
     arguments: Vec<OsString>,
     toolchain: Option<ToolchainInvocation>,
     credential_policy: CredentialPolicy,
+    remove_github_token: bool,
     current_dir: PathBuf,
     deadline: Duration,
 }
@@ -41,6 +42,7 @@ impl CommandSpec {
             arguments: Vec::new(),
             toolchain: None,
             credential_policy: CredentialPolicy::RemoveInherited,
+            remove_github_token: false,
             current_dir: current_dir.to_path_buf(),
             deadline,
         }
@@ -96,10 +98,18 @@ impl CommandSpec {
         self
     }
 
+    pub fn remove_github_token(mut self) -> Self {
+        self.remove_github_token = true;
+        self
+    }
+
     pub fn apply_environment(&self, command: &mut Command) {
         command.env_remove("CARGO_REGISTRY_TOKEN");
         if self.credential_policy == CredentialPolicy::RemoveInherited {
             command.env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
+        }
+        if self.remove_github_token {
+            command.env_remove("GITHUB_TOKEN");
         }
     }
 

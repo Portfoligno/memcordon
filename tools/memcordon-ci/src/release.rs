@@ -1684,6 +1684,320 @@ fn runtime_components(root: &Path, target: &AssetTarget) -> Result<Vec<RuntimeCo
         .collect()
 }
 
+/// Produces immutable B/M0 candidate inputs next to (but not inside) the
+/// historical V2 archive. This is not Q or a publishable private asset.
+fn prepare_linux_private_candidate(
+    root: &Path,
+    identity: &ReleaseIdentity,
+    target: &AssetTarget,
+) -> Result<()> {
+    use memcordon_ci::release_private::{PrivateCandidateInputs, prepare_private_candidate};
+    use memcordon_core::package_inspection_v6::LinuxPackageInspectionV6;
+    use memcordon_core::runtime_manifest_v3::RuntimeManifestV3;
+    use memcordon_core::workload_codec::hash_bytes;
+
+    if !matches!(
+        target.rust_target.as_str(),
+        "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+    ) {
+        return Err(failure(
+            "private candidate requires native GNU Linux target",
+        ));
+    }
+    let output = root.join("target/ci/release-output");
+    fs::create_dir_all(&output)?;
+    let candidate_dir = output.join(format!("private-candidate-{}", target.id));
+    fs::create_dir(&candidate_dir)?;
+    let components = runtime_components(root, target)?;
+    let mut copied = BTreeMap::new();
+    for component in &target.executable {
+        let source = built_executable_path(root, target, component);
+        let destination = candidate_dir.join(&component.archive_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, &destination)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if fs::metadata(&destination)?.permissions().mode() & 0o777 != component.mode {
+                return Err(failure("private candidate executable mode differs"));
+            }
+        }
+        copied.insert(component.archive_path.clone(), fs::read(&destination)?);
+    }
+    let manifest = RuntimeManifestV3::linux_unqualified(
+        identity.version.to_string(),
+        identity.commit.clone(),
+        target.rust_target.clone(),
+        components.clone(),
+    )
+    .map_err(failure)?;
+    let manifest_bytes = serde_json::to_vec(&manifest)?;
+    fs::write(candidate_dir.join("runtime-manifest.json"), &manifest_bytes)?;
+    let agent = candidate_dir.join("memcordon-sealed-agent");
+    let inspection_bytes = CommandSpec::new(&agent, root, Duration::from_secs(30))
+        .args(["package", "inspect", "--json"])
+        .run()?;
+    if inspection_bytes.len() > 128 * 1024 {
+        return Err(failure(
+            "private candidate package inspection exceeds bound",
+        ));
+    }
+    memcordon_core::workload_contract::reject_duplicate_json_keys(&inspection_bytes)
+        .map_err(failure)?;
+    let inspection: LinuxPackageInspectionV6 = serde_json::from_slice(&inspection_bytes)?;
+    let expected_protocols_and_catalog = match &manifest.sealed {
+        memcordon_core::runtime_manifest_v3::SealedRuntimeV3::WorkloadV2 {
+            native_protocols,
+            profile_catalog_sha256,
+            ..
+        } => (native_protocols, profile_catalog_sha256),
+        _ => return Err(failure("private candidate M0 is not Linux workload V2")),
+    };
+    if inspection.version.as_str() != identity.version.to_string()
+        || inspection.source_commit.as_str() != identity.commit
+        || inspection.target.as_str() != target.rust_target
+        || inspection.runtime_manifest_sha256 != hash_bytes(&manifest_bytes)
+        || inspection.components != components
+        || &inspection.native_protocols != expected_protocols_and_catalog.0
+        || &inspection.profile_catalog_sha256 != expected_protocols_and_catalog.1
+        || !inspection.compiled_metadata_valid
+    {
+        return Err(failure(
+            "private candidate V6 inspection differs from pinned B/M0",
+        ));
+    }
+    let prepared = prepare_private_candidate(PrivateCandidateInputs {
+        version: &identity.version.to_string(),
+        source_commit: &identity.commit,
+        target: &target.rust_target,
+        components: &components,
+        component_bytes: &copied,
+        compiled_units: &inspection.compiled_units,
+        filter_sha256: &inspection.private_filter_sha256,
+    })?;
+    if prepared.manifest_bytes != manifest_bytes || prepared.manifest != manifest {
+        return Err(failure("private candidate M0 changed during inspection"));
+    }
+    fs::write(
+        candidate_dir.join("package-inspection-v6.json"),
+        &inspection_bytes,
+    )?;
+    write_json(
+        &candidate_dir.join("candidate-build-v2.json"),
+        &prepared.record(),
+    )?;
+    Ok(())
+}
+
+/// Reopens a downloaded native-job artifact on the matching Linux runner.
+/// This checks candidate build inputs only; it does not produce Q or certify
+/// any of the 25 private native cases.
+fn verify_linux_private_candidate(root: &Path) -> Result<()> {
+    use memcordon_ci::release_private::{
+        PrivateCandidateInputs, prepare_private_candidate, validate_private_candidate_record,
+    };
+    use memcordon_core::package_inspection_v6::LinuxPackageInspectionV6;
+    use memcordon_core::runtime_manifest_v3::RuntimeManifestV3;
+    use memcordon_core::workload_codec::hash_bytes;
+
+    if !cfg!(target_os = "linux") {
+        return Err(failure("private candidate readback requires native Linux"));
+    }
+    let identity = preflight(root)?;
+    let release = config::release(root)?;
+    let target = host_target(&release.assets.target)?;
+    let target_id = target.id.as_str();
+    if !matches!(target_id, "linux-x64" | "linux-arm64")
+        || !matches!(
+            target.rust_target.as_str(),
+            "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+        )
+    {
+        return Err(failure(
+            "private candidate target is not this native GNU host",
+        ));
+    }
+    let input = root
+        .join("target/ci/release-inputs")
+        .join(format!("release-native-{target_id}"))
+        .join(format!("private-candidate-{target_id}"));
+    if !fs::symlink_metadata(&input)?.file_type().is_dir() {
+        return Err(failure("private candidate artifact directory is not real"));
+    }
+    let mut expected_files = BTreeSet::from([
+        PathBuf::from("runtime-manifest.json"),
+        PathBuf::from("package-inspection-v6.json"),
+        PathBuf::from("candidate-build-v2.json"),
+    ]);
+    expected_files.extend(
+        target
+            .executable
+            .iter()
+            .map(|component| PathBuf::from(&component.archive_path)),
+    );
+    let mut observed_files = BTreeSet::new();
+    for entry in WalkDir::new(&input).min_depth(1) {
+        let entry = entry.map_err(|error| failure(error.to_string()))?;
+        let relative = entry
+            .path()
+            .strip_prefix(&input)
+            .map_err(|_| failure("private candidate member escapes artifact root"))?;
+        if entry.file_type().is_file() {
+            if !expected_files.contains(relative) || !observed_files.insert(relative.to_path_buf())
+            {
+                return Err(failure(
+                    "private candidate artifact member inventory differs",
+                ));
+            }
+        } else if !entry.file_type().is_dir()
+            || !expected_files.iter().any(|path| path.starts_with(relative))
+        {
+            return Err(failure(
+                "private candidate artifact has non-file or extra member",
+            ));
+        }
+    }
+    if observed_files != expected_files {
+        return Err(failure("private candidate artifact omits required member"));
+    }
+    let read_regular = |path: &Path| -> Result<Vec<u8>> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() || metadata.len() > 256 * 1024 * 1024 {
+            return Err(failure(
+                "private candidate artifact contains non-file input",
+            ));
+        }
+        Ok(fs::read(path)?)
+    };
+    let manifest_bytes = read_regular(&input.join("runtime-manifest.json"))?;
+    let manifest = RuntimeManifestV3::parse(&manifest_bytes).map_err(failure)?;
+    if manifest.version != identity.version.to_string()
+        || manifest.source_commit != identity.commit
+        || manifest.target != target.rust_target
+        || manifest.components.len() != target.executable.len()
+    {
+        return Err(failure("private candidate M0 identity differs"));
+    }
+    let mut component_bytes = BTreeMap::new();
+    for configured in &target.executable {
+        let record = manifest
+            .components
+            .iter()
+            .find(|record| record.path == configured.archive_path)
+            .ok_or_else(|| failure("private candidate M0 lacks configured component"))?;
+        if record.role != configured.role || record.mode != configured.mode {
+            return Err(failure(
+                "private candidate M0 component role or mode differs",
+            ));
+        }
+        let path = input.join(&configured.archive_path);
+        let bytes = read_regular(&path)?;
+        component_bytes.insert(configured.archive_path.clone(), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(configured.mode))?;
+        }
+    }
+    let agent_path = target
+        .executable
+        .iter()
+        .find(|component| component.role == RuntimeComponentRole::SealedAgent)
+        .map(|component| input.join(&component.archive_path))
+        .ok_or_else(|| failure("private candidate lacks sealed agent"))?;
+    let observed_bytes = CommandSpec::new(agent_path, root, Duration::from_secs(30))
+        .args(["package", "inspect", "--json"])
+        .run()?;
+    let recorded_bytes = read_regular(&input.join("package-inspection-v6.json"))?;
+    if observed_bytes.len() > 128 * 1024 || recorded_bytes.len() > 128 * 1024 {
+        return Err(failure("private candidate V6 readback exceeds bound"));
+    }
+    for bytes in [&observed_bytes, &recorded_bytes] {
+        memcordon_core::workload_contract::reject_duplicate_json_keys(bytes).map_err(failure)?;
+    }
+    let observed: LinuxPackageInspectionV6 = serde_json::from_slice(&observed_bytes)?;
+    let recorded: LinuxPackageInspectionV6 = serde_json::from_slice(&recorded_bytes)?;
+    if observed != recorded
+        || observed.runtime_manifest_sha256 != hash_bytes(&manifest_bytes)
+        || observed.components != manifest.components
+        || !observed.compiled_metadata_valid
+    {
+        return Err(failure("private candidate package V6 readback differs"));
+    }
+    let prepared = prepare_private_candidate(PrivateCandidateInputs {
+        version: &identity.version.to_string(),
+        source_commit: &identity.commit,
+        target: &target.rust_target,
+        components: &manifest.components,
+        component_bytes: &component_bytes,
+        compiled_units: &observed.compiled_units,
+        filter_sha256: &observed.private_filter_sha256,
+    })?;
+    if prepared.manifest_bytes != manifest_bytes {
+        return Err(failure("private candidate M0 bytes are not canonical B"));
+    }
+    let record = read_regular(&input.join("candidate-build-v2.json"))?;
+    let validated = validate_private_candidate_record(&record, &prepared)?;
+    let report_dir = root.join("target/ci/reports/private-candidate-inputs");
+    fs::create_dir_all(&report_dir)?;
+    write_json(&report_dir.join(format!("{target_id}.json")), &validated)
+}
+
+/// On the opt-in native candidate runner only: install the already verified
+/// exact M0 agent under the package lock, then independently remeasure its
+/// installed static H0. This does not enable private admission or emit Q.
+fn install_linux_private_candidate(root: &Path) -> Result<()> {
+    let release = config::release(root)?;
+    let target = host_target(&release.assets.target)?;
+    let context = memcordon_ci::certification_context::CertificationContext::capture(
+        root,
+        "backend-linux-private-v4",
+    )?;
+    let producer = memcordon_ci::private_suite::producer_for_host(
+        memcordon_ci::private_native::NativeRunStageV2::CandidateCapability,
+        &target.rust_target,
+    )?;
+    memcordon_ci::private_suite::validate_private_job_context(&context, &producer)?;
+    verify_linux_private_candidate(root)?;
+    let identity = preflight(root)?;
+    let source = root
+        .join("target/ci/release-inputs")
+        .join(format!("release-native-{}", target.id))
+        .join(format!("private-candidate-{}", target.id))
+        .join("memcordon-sealed-agent");
+    // verify-private-candidate restores the two downloaded executable modes
+    // and reexecs the exact candidate before package installation.
+    let downloaded = memcordon_ci::private_suite::read_downloaded_candidate(
+        root,
+        &target.rust_target,
+        &identity.commit,
+    )?;
+    CommandSpec::new(&source, root, Duration::from_secs(180))
+        .args(["package", "install", "--ephemeral-ci"])
+        .run()?;
+    let installed = memcordon_ci::private_installed_h0::read_fixed_installed_h0()?;
+    let output = CommandSpec::new(
+        "/usr/libexec/memcordon-sealed-agent",
+        root,
+        Duration::from_secs(30),
+    )
+    .args(["package", "verify", "--json"])
+    .run()?;
+    let inspection: memcordon_core::package_inspection_v6::LinuxInstalledInspectionV6 =
+        serde_json::from_slice(&output)?;
+    let compact = serde_json::to_vec(&inspection)?;
+    memcordon_ci::private_installed_h0::validate_installed_h0_static(
+        &downloaded.prepared,
+        &downloaded.compiled_units,
+        &installed,
+        &compact,
+    )?;
+    memcordon_ci::private_installed_h0::read_fixed_installation_epoch()?;
+    Ok(())
+}
+
 fn runtime_manifest(
     identity: &ReleaseIdentity,
     target: &AssetTarget,
@@ -2450,6 +2764,9 @@ pub fn native_asset(root: &Path) -> Result<()> {
                 memcordon_core::verify_session_broker_pe(&bytes).map_err(failure)?;
             }
         }
+    }
+    if cfg!(target_os = "linux") {
+        prepare_linux_private_candidate(root, &identity, target)?;
     }
     let built = build_archive(root, &identity, target)?;
     if fs::metadata(&built.path)?.len() > release.maximum_asset_bytes {
@@ -6394,6 +6711,8 @@ fn verify_public(root: &Path) -> Result<()> {
 pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
     match command {
         ReleaseCommand::Assemble => assemble(root),
+        ReleaseCommand::VerifyPrivateCandidate => verify_linux_private_candidate(root),
+        ReleaseCommand::InstallPrivateCandidate => install_linux_private_candidate(root),
         ReleaseCommand::StageGithub => stage_github(root),
         ReleaseCommand::AttemptOidc { publication_slot } => {
             attempt_oidc_publication_at(root, publication_slot)

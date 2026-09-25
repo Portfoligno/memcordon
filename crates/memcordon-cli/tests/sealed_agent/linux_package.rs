@@ -6,8 +6,100 @@ use std::process::Command;
 const AGENT: &str = "/usr/libexec/memcordon-sealed-agent";
 
 #[test]
+fn install_cannot_replace_a_live_generation_without_upgrade_quiescence() {
+    assert!(crate::package::ensure_install_is_new(std::ffi::OsStr::new("install"), false).is_ok());
+    assert!(crate::package::ensure_install_is_new(std::ffi::OsStr::new("install"), true).is_err());
+    assert!(crate::package::ensure_install_is_new(std::ffi::OsStr::new("upgrade"), true).is_ok());
+}
+
+#[test]
+fn redundant_install_is_rejected_before_qualification_revocation_or_epoch_change() {
+    let install = std::ffi::OsStr::new("install");
+    let upgrade = std::ffi::OsStr::new("upgrade");
+    let uninstall = std::ffi::OsStr::new("uninstall");
+    assert!(crate::package::ensure_install_preflight(install, false, false).is_ok());
+    assert!(crate::package::ensure_install_preflight(install, false, true).is_err());
+    assert!(crate::package::ensure_install_preflight(install, true, false).is_err());
+    assert!(crate::package::ensure_install_preflight(install, true, true).is_err());
+    assert!(crate::package::ensure_install_preflight(upgrade, true, true).is_ok());
+    assert!(crate::package::ensure_install_preflight(uninstall, true, true).is_ok());
+}
+
+#[test]
+fn package_crash_journal_accepts_only_fixed_artifact_and_backup_inventory() {
+    use crate::package::{PackageJournal, PackageJournalEntry, validate_package_journal};
+    use memcordon_core::DiagnosticSha256;
+    let target = std::path::PathBuf::from("/usr/libexec/memcordon-runtime-manifest.json");
+    let entry = PackageJournalEntry {
+        path: target.clone(),
+        backup: Some(std::path::PathBuf::from(
+            "/usr/libexec/.memcordon-backup-example",
+        )),
+        old_sha256: Some(DiagnosticSha256::from_bytes([1; 32])),
+        old_device: Some(1),
+        old_inode: Some(2),
+    };
+    let journal = PackageJournal {
+        schema_version: 1,
+        entries: vec![entry.clone()],
+    };
+    assert!(validate_package_journal(&journal).is_ok());
+    let mut duplicate = journal;
+    duplicate.entries.push(entry.clone());
+    assert!(validate_package_journal(&duplicate).is_err());
+    let mut wrong_target = entry.clone();
+    wrong_target.path = "/etc/passwd".into();
+    assert!(
+        validate_package_journal(&PackageJournal {
+            schema_version: 1,
+            entries: vec![wrong_target],
+        })
+        .is_err()
+    );
+    let mut wrong_backup = entry.clone();
+    wrong_backup.backup = Some("/tmp/.memcordon-backup-example".into());
+    assert!(
+        validate_package_journal(&PackageJournal {
+            schema_version: 1,
+            entries: vec![wrong_backup],
+        })
+        .is_err()
+    );
+    let mut missing_identity = entry;
+    missing_identity.old_inode = None;
+    assert!(
+        validate_package_journal(&PackageJournal {
+            schema_version: 1,
+            entries: vec![missing_identity],
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn installation_epoch_advances_even_for_byte_identical_package_replacement() {
+    let first = crate::package::next_installation_epoch(None, [1; 32]).unwrap();
+    let second = crate::package::next_installation_epoch(Some(&first), [2; 32]).unwrap();
+    assert_eq!(first.counter, 1);
+    assert_eq!(second.counter, 2);
+    assert_ne!(first.nonce_digest, second.nonce_digest);
+    let same_nonce = crate::package::next_installation_epoch(Some(&first), [1; 32]).unwrap();
+    assert_eq!(same_nonce.counter, 2);
+    assert_ne!(
+        serde_json::to_vec(&first).unwrap(),
+        serde_json::to_vec(&same_nonce).unwrap()
+    );
+    let exhausted = crate::package::PackageInstallationEpochV1 {
+        counter: u64::MAX,
+        ..first
+    };
+    assert!(crate::package::next_installation_epoch(Some(&exhausted), [3; 32]).is_err());
+}
+
+#[test]
 #[cfg(target_env = "gnu")]
 fn v4_receipt_requires_exact_host_boot_and_independent_native_completions() {
+    use crate::linux::qualification::HOST_PROBE_CATALOG_V1;
     use crate::linux::qualification::{
         NativeQualificationProbeV4, QualificationReceiptV4, TrustedQualificationProbeV4,
         TrustedQualificationReceiptV4,
@@ -15,11 +107,8 @@ fn v4_receipt_requires_exact_host_boot_and_independent_native_completions() {
     use memcordon_core::DiagnosticSha256;
     use memcordon_core::package_inspection_v6::LinuxUnitHashesV6;
     use memcordon_core::workload_codec::hash_bytes;
-    use memcordon_core::workload_registry_v2::ProfileKindV2;
 
     let digest = |byte| DiagnosticSha256::from_bytes([byte; 32]);
-    let private = ProfileKindV2::LinuxTcp4PrivateV1.reference();
-    let baseline = ProfileKindV2::LinuxUnixCreateV1.reference();
     let units = LinuxUnitHashesV6 {
         control_service: digest(1),
         control_socket: digest(2),
@@ -49,41 +138,32 @@ fn v4_receipt_requires_exact_host_boot_and_independent_native_completions() {
         profile_catalog_sha256: memcordon_core::workload_discovery_v2::profile_catalog_digest_v2(),
         host_prerequisites_digest: digest(11),
         native_run_digest: digest(12),
-        probes: vec![
-            NativeQualificationProbeV4 {
-                profile: private.clone(),
-                name: "native_private_retirement".into(),
+        probes: HOST_PROBE_CATALOG_V1
+            .iter()
+            .enumerate()
+            .map(|(index, (kind, name))| NativeQualificationProbeV4 {
+                profile: kind.reference(),
+                name: (*name).into(),
                 native_executed: true,
                 passed: true,
-                completion_digest: digest(13),
-            },
-            NativeQualificationProbeV4 {
-                profile: baseline.clone(),
-                name: "native_unix_retirement".into(),
-                native_executed: true,
-                passed: true,
-                completion_digest: digest(14),
-            },
-        ],
+                completion_digest: digest(index as u8 + 13),
+            })
+            .collect(),
         receipt_digest: digest(0),
     };
     receipt.receipt_digest = receipt.canonical_digest().unwrap();
     let bytes = serde_json::to_vec(&receipt).unwrap();
     let receipt_sha = hash_bytes(&bytes);
-    let probes = [
-        TrustedQualificationProbeV4 {
-            profile: &private,
-            name: "native_private_retirement",
+    let probes = receipt
+        .probes
+        .iter()
+        .map(|probe| TrustedQualificationProbeV4 {
+            profile: &probe.profile,
+            name: &probe.name,
             native_executed: true,
-            completion_digest: &receipt.probes[0].completion_digest,
-        },
-        TrustedQualificationProbeV4 {
-            profile: &baseline,
-            name: "native_unix_retirement",
-            native_executed: true,
-            completion_digest: &receipt.probes[1].completion_digest,
-        },
-    ];
+            completion_digest: &probe.completion_digest,
+        })
+        .collect::<Vec<_>>();
     let trusted = TrustedQualificationReceiptV4 {
         source_commit: crate::SOURCE_COMMIT,
         target,
@@ -112,6 +192,24 @@ fn v4_receipt_requires_exact_host_boot_and_independent_native_completions() {
     missing_private.probes.remove(0);
     missing_private.receipt_digest = missing_private.canonical_digest().unwrap();
     assert!(missing_private.validate(&trusted).is_err());
+    let mut substituted = receipt.clone();
+    substituted.probes[0].name = "arbitrary_success".into();
+    substituted.receipt_digest = substituted.canonical_digest().unwrap();
+    let substituted_probes = substituted
+        .probes
+        .iter()
+        .map(|probe| TrustedQualificationProbeV4 {
+            profile: &probe.profile,
+            name: &probe.name,
+            native_executed: true,
+            completion_digest: &probe.completion_digest,
+        })
+        .collect::<Vec<_>>();
+    let substituted_trusted = TrustedQualificationReceiptV4 {
+        probes: &substituted_probes,
+        ..trusted
+    };
+    assert!(substituted.validate(&substituted_trusted).is_err());
     let mut wrong_filter = receipt.clone();
     wrong_filter.filter_instruction_sha256 = digest(15);
     wrong_filter.receipt_digest = wrong_filter.canonical_digest().unwrap();
@@ -231,6 +329,127 @@ fn v3_generation_readback_requires_both_exact_images_and_unqualified_profiles() 
         )
         .is_err()
     );
+}
+
+#[test]
+#[cfg(target_env = "gnu")]
+fn m1_package_source_snapshot_requires_fixed_q_bytes_and_images() {
+    use memcordon_core::runtime_manifest::{RuntimeComponentRecord, RuntimeComponentRole};
+    use memcordon_core::runtime_manifest_v3::{
+        QualificationArtifactReferenceV2, RuntimeManifestV3, RuntimeProfileAvailabilityV3,
+        SealedRuntimeV3,
+    };
+    use memcordon_core::workload_discovery_v2::profile_catalog_digest_v2;
+    use memcordon_core::workload_qualification_v2::QualificationArtifactV2;
+    use memcordon_core::workload_registry_v2::ProfileKindV2;
+    use memcordon_core::{BoundedText, BoundedVec, DiagnosticSha256, workload_codec::hash_bytes};
+
+    let agent = b"exact package provider";
+    let public = b"exact package public";
+    let target = crate::linux::runtime_manifest::target().unwrap();
+    let zero = DiagnosticSha256::from_bytes([0; 32]);
+    let q = serde_json::to_vec(&QualificationArtifactV2 {
+        schema_version: Default::default(),
+        source_commit: BoundedText::new(crate::SOURCE_COMMIT).unwrap(),
+        target: BoundedText::new(target).unwrap(),
+        profile: ProfileKindV2::LinuxTcp4PrivateV1.reference(),
+        profile_catalog_digest: profile_catalog_digest_v2(),
+        filter_digest: zero.clone(),
+        unit_digest: zero.clone(),
+        component_digest: zero.clone(),
+        test_inventory_digest: zero.clone(),
+        runner_run_digest: zero.clone(),
+        host_prerequisites_digest: zero,
+        observed_results: BoundedVec::default(),
+        tests_skipped: 0,
+    })
+    .unwrap();
+    let component = |id: &str, path: &str, role, bytes: &[u8]| RuntimeComponentRecord {
+        id: id.into(),
+        path: path.into(),
+        role,
+        size: bytes.len() as u64,
+        mode: 0o755,
+        sha256: String::from(hash_bytes(bytes)),
+    };
+    let mut manifest = RuntimeManifestV3::linux_unqualified(
+        env!("CARGO_PKG_VERSION").into(),
+        crate::SOURCE_COMMIT.into(),
+        target.into(),
+        vec![
+            component(
+                "public-cli",
+                "memcordon",
+                RuntimeComponentRole::PublicCli,
+                public,
+            ),
+            component(
+                "sealed-agent",
+                "memcordon-sealed-agent",
+                RuntimeComponentRole::SealedAgent,
+                agent,
+            ),
+        ],
+    )
+    .unwrap();
+    let m0 = manifest.clone();
+    let relative =
+        crate::linux::installed_release_qualification::fixed_q_reference_path(target).unwrap();
+    let SealedRuntimeV3::WorkloadV2 { profiles, .. } = &mut manifest.sealed else {
+        panic!("Linux V3 workload protocol changed");
+    };
+    let mut records = BoundedVec::default();
+    for (index, record) in profiles.as_slice().iter().enumerate() {
+        let mut record = record.clone();
+        if index == 0 {
+            record.availability = RuntimeProfileAvailabilityV3::Qualified {
+                qualification: QualificationArtifactReferenceV2 {
+                    schema_version: Default::default(),
+                    artifact: relative.into(),
+                    artifact_sha256: hash_bytes(&q),
+                    qualified_target: target.into(),
+                    source_commit: crate::SOURCE_COMMIT.into(),
+                    profile: ProfileKindV2::LinuxTcp4PrivateV1.reference(),
+                },
+            };
+        }
+        records.try_push(record).unwrap();
+    }
+    *profiles = records;
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("memcordon-sealed-agent");
+    let public_path = directory.path().join("memcordon");
+    let manifest_path = directory.path().join("runtime-manifest.json");
+    let q_path = directory.path().join(relative);
+    std::fs::create_dir_all(q_path.parent().unwrap()).unwrap();
+    std::fs::write(&source, agent).unwrap();
+    std::fs::write(&public_path, public).unwrap();
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    std::fs::write(&q_path, &q).unwrap();
+    for image in [&source, &public_path] {
+        std::fs::set_permissions(image, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let snapshot = crate::package::linux_source_snapshot(&source).unwrap();
+    assert!(snapshot.v3);
+    assert_eq!(snapshot.agent_bytes, agent);
+    assert_eq!(
+        snapshot.manifest_bytes,
+        serde_json::to_vec(&manifest).unwrap()
+    );
+    assert_eq!(snapshot.qualification.unwrap().1, q);
+    std::fs::write(&q_path, b"substituted Q").unwrap();
+    assert!(crate::package::linux_source_snapshot(&source).is_err());
+    std::fs::remove_file(&q_path).unwrap();
+    std::os::unix::fs::symlink("missing Q", &q_path).unwrap();
+    assert!(crate::package::linux_source_snapshot(&source).is_err());
+    std::fs::write(&manifest_path, serde_json::to_vec(&m0).unwrap()).unwrap();
+    let m0_snapshot = crate::package::linux_source_snapshot(&source).unwrap();
+    assert!(m0_snapshot.v3);
+    assert!(m0_snapshot.qualification.is_none());
+    std::fs::remove_file(&manifest_path).unwrap();
+    let v2_snapshot = crate::package::linux_source_snapshot(&source).unwrap();
+    assert!(!v2_snapshot.v3);
+    assert!(v2_snapshot.qualification.is_none());
 }
 
 #[test]

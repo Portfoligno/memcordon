@@ -1931,6 +1931,36 @@ fn installed_causal_raw_report_mutation_blocks_release_ingestion() {
 }
 
 #[test]
+fn every_installed_windows_architecture_and_channel_is_individually_required() {
+    for (target, channel, artifact, _) in
+        memcordon_ci::workload_qualification::INSTALLED_CAUSAL_ARTIFACTS
+    {
+        let (temporary, _, _, _) = fixture();
+        let input = temporary.path().join("input");
+        let output = temporary.path().join("output");
+        let architecture = if target == "x86_64-pc-windows-msvc" {
+            "x64"
+        } else {
+            assert_eq!(target, "aarch64-pc-windows-msvc");
+            "arm64"
+        };
+        let acceptance = input
+            .join(format!("release-windows-package-channel-{architecture}"))
+            .join("release-evidence")
+            .join(artifact);
+        assert!(
+            acceptance.is_file(),
+            "missing fixture for {target}/{channel}"
+        );
+        fs::remove_file(&acceptance).expect("inject one missing channel artifact");
+        assert!(
+            collect_certification(&input, &output, COMMIT).is_err(),
+            "omitting {target}/{channel} cannot certify the other rows"
+        );
+    }
+}
+
+#[test]
 fn installed_causal_cross_target_substitution_fails_even_with_updated_outer_hash() {
     let (temporary, _, _, _) = fixture();
     let input = temporary.path().join("input");

@@ -70,6 +70,69 @@ fn network_wire_four_is_not_accepted_on_legacy_wire_three() {
 }
 
 #[test]
+fn private_indeterminate_has_distinct_network_discriminant() {
+    let frame = Frame {
+        kind: MessageKind::PrivateIndeterminate,
+        nonce: [4; 16],
+        attempt_id: [5; 16],
+        payload: b"possibly-released".to_vec(),
+    };
+    let mut wire = Vec::new();
+    write_network_frame(&mut wire, &frame).unwrap();
+    assert_eq!(u16::from_be_bytes([wire[2], wire[3]]), 110);
+    assert_eq!(read_network_frame(&mut wire.as_slice()).unwrap(), frame);
+    assert_eq!(
+        read_frame(&mut wire.as_slice()),
+        Err(ProtocolError::UnsupportedVersion(NETWORK_PROTOCOL_VERSION))
+    );
+}
+
+#[test]
+fn private_plan_uses_the_platforms_exact_v4_discriminants() {
+    for (kind, discriminant) in [
+        (MessageKind::PrivatePlan, 13_u16),
+        (MessageKind::PrivatePlanReceipt, 111_u16),
+    ] {
+        let frame = Frame {
+            kind,
+            nonce: [3; 16],
+            attempt_id: [0; 16],
+            payload: vec![1, 2, 3],
+        };
+        let mut wire = Vec::new();
+        write_network_frame(&mut wire, &frame).unwrap();
+        assert_eq!(u16::from_be_bytes([wire[2], wire[3]]), discriminant);
+        assert_eq!(read_network_frame(&mut wire.as_slice()).unwrap(), frame);
+        assert_eq!(
+            read_frame(&mut wire.as_slice()),
+            Err(ProtocolError::UnsupportedVersion(NETWORK_PROTOCOL_VERSION))
+        );
+    }
+}
+
+#[test]
+fn candidate_release_route_has_distinct_v4_kinds() {
+    for (kind, discriminant) in [
+        (MessageKind::ReleaseCase, 15_u16),
+        (MessageKind::BrokerReleaseCase, 16_u16),
+        (MessageKind::FinalizeReleaseCase, 17_u16),
+        (MessageKind::ReleaseCaseIncomplete, 114_u16),
+        (MessageKind::ReleaseCaseCompleted, 115_u16),
+    ] {
+        let frame = Frame {
+            kind,
+            nonce: [4; 16],
+            attempt_id: [5; 16],
+            payload: Vec::new(),
+        };
+        let mut wire = Vec::new();
+        write_network_frame(&mut wire, &frame).unwrap();
+        assert_eq!(u16::from_be_bytes([wire[2], wire[3]]), discriminant);
+        assert_eq!(read_network_frame(&mut wire.as_slice()).unwrap(), frame);
+    }
+}
+
+#[test]
 fn retirement_cannot_skip_empty_proof() {
     let mut machine = AttemptStateMachine::default();
     assert!(machine.transition(AttemptState::Retired).is_err());

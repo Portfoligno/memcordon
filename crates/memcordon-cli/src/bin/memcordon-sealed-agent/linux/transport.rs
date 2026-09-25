@@ -3,32 +3,43 @@ use std::mem::{size_of, size_of_val, zeroed};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use crate::protocol::{Frame, MAX_FRAME_LENGTH, read_frame, read_network_frame};
+use crate::protocol::{
+    Frame, MAX_FRAME_LENGTH, NETWORK_PROTOCOL_VERSION, PROTOCOL_VERSION, read_frame,
+    read_network_frame,
+};
 
 const FRAME_HEADER_LENGTH: usize = 72;
 const MAX_DESCRIPTORS: usize = 8;
 
 pub fn receive(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>), String> {
-    let received = receive_inner(stream, false, false)?;
+    let received = receive_inner(stream, false, Some(PROTOCOL_VERSION))?;
     Ok((received.frame, received.descriptors))
 }
 
+/// The public socket accepts the historical V3 envelope unchanged and the
+/// distinct V4 private envelope. The caller must dispatch by this returned
+/// wire version as well as by message kind.
+pub fn receive_public(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>, u16), String> {
+    let received = receive_inner(stream, false, None)?;
+    Ok((received.frame, received.descriptors, received.version))
+}
+
 pub fn receive_network(stream: &UnixStream) -> Result<(Frame, Vec<OwnedFd>), String> {
-    let received = receive_inner(stream, false, true)?;
+    let received = receive_inner(stream, false, Some(NETWORK_PROTOCOL_VERSION))?;
     Ok((received.frame, received.descriptors))
 }
 
 pub(crate) fn receive_with_credentials(
     stream: &UnixStream,
 ) -> Result<(Frame, Vec<OwnedFd>, Option<libc::ucred>), String> {
-    let received = receive_inner(stream, true, false)?;
+    let received = receive_inner(stream, true, Some(PROTOCOL_VERSION))?;
     Ok((received.frame, received.descriptors, received.credentials))
 }
 
 pub(crate) fn receive_network_with_credentials(
     stream: &UnixStream,
 ) -> Result<(Frame, Vec<OwnedFd>, Option<libc::ucred>), String> {
-    let received = receive_inner(stream, true, true)?;
+    let received = receive_inner(stream, true, Some(NETWORK_PROTOCOL_VERSION))?;
     Ok((received.frame, received.descriptors, received.credentials))
 }
 
@@ -36,12 +47,13 @@ struct ReceivedMessage {
     frame: Frame,
     descriptors: Vec<OwnedFd>,
     credentials: Option<libc::ucred>,
+    version: u16,
 }
 
 fn receive_inner(
     stream: &UnixStream,
     accept_credentials: bool,
-    network_version: bool,
+    expected_version: Option<u16>,
 ) -> Result<ReceivedMessage, String> {
     let mut header = [0_u8; FRAME_HEADER_LENGTH];
     let descriptor_capacity =
@@ -81,6 +93,12 @@ fn receive_inner(
     }
     if message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
         return Err("provider request or descriptor inventory was truncated".to_owned());
+    }
+    let version = u16::from_be_bytes([header[0], header[1]]);
+    if !matches!(version, PROTOCOL_VERSION | NETWORK_PROTOCOL_VERSION)
+        || expected_version.is_some_and(|expected| expected != version)
+    {
+        return Err("unsupported provider frame version".to_owned());
     }
     let total = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
     if !(FRAME_HEADER_LENGTH..=MAX_FRAME_LENGTH).contains(&total) {
@@ -136,7 +154,7 @@ fn receive_inner(
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
         header_ptr = unsafe { libc::CMSG_NXTHDR(&message, header_ptr) };
     }
-    let frame = if network_version {
+    let frame = if version == NETWORK_PROTOCOL_VERSION {
         read_network_frame(&mut Cursor::new(bytes))
     } else {
         read_frame(&mut Cursor::new(bytes))
@@ -146,6 +164,7 @@ fn receive_inner(
         frame,
         descriptors,
         credentials,
+        version,
     })
 }
 

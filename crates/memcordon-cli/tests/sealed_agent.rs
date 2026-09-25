@@ -42,6 +42,8 @@ mod cgroup_grace;
 mod exec_status;
 #[path = "sealed_agent/guardian_terminal.rs"]
 mod guardian_terminal;
+#[path = "sealed_agent/installed_release_qualification.rs"]
+mod installed_release_qualification;
 #[path = "sealed_agent/launcher_activation.rs"]
 mod launcher_activation;
 #[path = "sealed_agent/linux_cgroup_readback.rs"]
@@ -85,12 +87,89 @@ mod private_attempt;
 #[cfg(target_os = "linux")]
 #[path = "sealed_agent/private_guardian.rs"]
 mod private_guardian;
+#[path = "sealed_agent/private_host_prerequisites.rs"]
+mod private_host_prerequisites;
+#[path = "sealed_agent/private_host_receipt.rs"]
+mod private_host_receipt;
+#[path = "sealed_agent/private_probe_baseline.rs"]
+mod private_probe_baseline;
+#[path = "sealed_agent/private_probe_faults.rs"]
+mod private_probe_faults;
+#[path = "sealed_agent/private_probe_loss.rs"]
+mod private_probe_loss;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_public_release_case.rs"]
+mod private_public_release_case;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_qualification.rs"]
+mod private_qualification;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_release_alt_abi.rs"]
+mod private_release_alt_abi;
+#[path = "sealed_agent/private_release_alt_abi_raw.rs"]
+mod private_release_alt_abi_raw;
+#[path = "sealed_agent/private_release_ancestor.rs"]
+mod private_release_ancestor;
+#[path = "sealed_agent/private_release_attempt.rs"]
+mod private_release_attempt;
+#[path = "sealed_agent/private_release_caller.rs"]
+mod private_release_caller;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_release_case.rs"]
+mod private_release_case;
+#[path = "sealed_agent/private_release_child_gate.rs"]
+mod private_release_child_gate;
+#[path = "sealed_agent/private_release_child_owner.rs"]
+mod private_release_child_owner;
+#[path = "sealed_agent/private_release_children.rs"]
+mod private_release_children;
+#[path = "sealed_agent/private_release_dual_attempt.rs"]
+mod private_release_dual_attempt;
+#[path = "sealed_agent/private_release_socket_gate.rs"]
+mod private_release_socket_gate;
+#[path = "sealed_agent/private_release_terminal_join.rs"]
+mod private_release_terminal_join;
+
+#[path = "sealed_agent/private_release_denial.rs"]
+mod private_release_denial;
+#[path = "sealed_agent/private_release_descriptors.rs"]
+mod private_release_descriptors;
+#[path = "sealed_agent/private_release_exec.rs"]
+mod private_release_exec;
+#[path = "sealed_agent/private_release_filter.rs"]
+mod private_release_filter;
+#[path = "sealed_agent/private_release_frontend_loss.rs"]
+mod private_release_frontend_loss;
+#[path = "sealed_agent/private_release_gate.rs"]
+mod private_release_gate;
+#[path = "sealed_agent/private_release_guardian_loss.rs"]
+mod private_release_guardian_loss;
+#[path = "sealed_agent/private_release_host_state.rs"]
+mod private_release_host_state;
+#[path = "sealed_agent/private_release_identity.rs"]
+mod private_release_identity;
+#[path = "sealed_agent/private_release_result.rs"]
+mod private_release_result;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_release_run.rs"]
+mod private_release_run;
+#[path = "sealed_agent/private_release_topology.rs"]
+mod private_release_topology;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_release_unix_intent.rs"]
+mod private_release_unix_intent;
+
+#[path = "sealed_agent/private_release_raw.rs"]
+mod private_release_raw;
 #[cfg(target_os = "linux")]
 #[path = "sealed_agent/private_v4_failure_matrix.rs"]
 mod private_v4_failure_matrix;
 #[cfg(target_os = "linux")]
 #[path = "sealed_agent/private_v4_relay_terminal.rs"]
 mod private_v4_relay_terminal;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_version_recovery.rs"]
+mod private_version_recovery;
 #[path = "sealed_agent/protocol.rs"]
 mod protocol_tests;
 #[path = "sealed_agent/rejection.rs"]

@@ -34,6 +34,7 @@ use super::network_filter::NativeAbi;
 use super::network_profile::PrivateNetworkSetup;
 use super::private_attempt::{
     DurablePrivateAttempt, PrivateAttemptPhase, PrivateAttemptRecordV4, ProcessIdentityV4,
+    ReleaseKnowledge,
 };
 use super::private_guardian::PrivateGuardian;
 use super::private_namespace_init::{
@@ -54,6 +55,47 @@ pub struct PrivateObservedTarget {
     target: ProcessIdentityV4,
     namespace_init: ProcessIdentityV4,
     caller_network_namespace: NamespaceIdentity,
+    identity: ResolvedTargetIdentity,
+}
+
+impl PrivateObservedTarget {
+    pub(crate) fn network_namespace_inode(&self) -> u64 {
+        self.native.network_namespace.inode
+    }
+
+    pub(crate) fn precreated_sendmsg_errno(&self) -> Option<i32> {
+        self.native.ready.precreated_sendmsg_errno
+    }
+
+    pub(crate) fn precreated_socket_witness(
+        &self,
+    ) -> Result<super::private_release_socket_launder::PrecreatedSocketGatedWitnessV1, String> {
+        let pair = self
+            .native
+            .descriptors
+            .precreated_pair_identities()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: gated precreated pair absent")?;
+        if self.native.ready.precreated_sendmsg_errno != Some(libc::EPERM)
+            || pair[0].1 == 0
+            || pair[1].1 == 0
+            || pair[0] == pair[1]
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: gated socket proof differs".into());
+        }
+        Ok(
+            super::private_release_socket_launder::PrecreatedSocketGatedWitnessV1 {
+                schema_version: 1,
+                target: self.target.clone(),
+                network_namespace_inode: self.native.network_namespace.inode,
+                first_socket_device: pair[0].0,
+                first_socket_inode: pair[0].1,
+                second_socket_device: pair[1].0,
+                second_socket_inode: pair[1].1,
+                filter_sha256: DiagnosticSha256::from_bytes(self.native.ready.filter_digest),
+                sendmsg_errno: libc::EPERM,
+            },
+        )
+    }
 }
 
 pub enum PrivateExecObservation {
@@ -68,6 +110,21 @@ pub enum PrivateMonitorOutcome {
     FrontendLost,
     Revoked,
     MemoryOom,
+}
+
+/// Kernel-facing observations collected by the move-only candidate owner.
+/// This is an owner-produced trace, not an independent CI supervisor proof.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseCandidateSettlementFactsV1 {
+    pub(crate) schema_version: u8,
+    pub(crate) monitor_outcome: PrivateMonitorOutcome,
+    pub(crate) cgroup_empty_before_cleanup: bool,
+    pub(crate) containment_removed: bool,
+    pub(crate) target_pidfd_exited: bool,
+    pub(crate) namespace_init_reaped: bool,
+    pub(crate) guardian_terminal: [u8; 20],
+    pub(crate) candidate_exit_code: Option<i32>,
 }
 
 pub struct PrivateRetirementObservation {
@@ -89,6 +146,8 @@ pub enum PrivateCandidateTerminalV4 {
 pub struct PrivateTerminalReceiptV4 {
     schema_version: u8,
     attempt_id: String,
+    installed_generation_digest: DiagnosticSha256,
+    installed_qualification_digest: DiagnosticSha256,
     attempt: AttemptBindingV2,
     checkpoint: PrivateTcpCheckpointV2,
     retirement: PrivateTcpRetiredV2,
@@ -99,6 +158,8 @@ impl PrivateTerminalReceiptV4 {
     /// Only a completed owner ledger can supply retirement; candidate outcome
     /// remains independent of cleanup success and is never inferred from it.
     pub fn observed(
+        installed_generation_digest: DiagnosticSha256,
+        installed_qualification_digest: DiagnosticSha256,
         attempt: AttemptBindingV2,
         checkpoint: PrivateTcpCheckpointV2,
         exec: PrivateExecObservation,
@@ -134,6 +195,8 @@ impl PrivateTerminalReceiptV4 {
         Ok(Self {
             schema_version: 4,
             attempt_id: retirement.attempt_id,
+            installed_generation_digest,
+            installed_qualification_digest,
             attempt,
             checkpoint,
             retirement: retired,
@@ -182,6 +245,24 @@ impl PrivateTerminalReceiptV4 {
         Ok(receipt)
     }
 
+    /// A structurally valid native terminal is still bound to the exact
+    /// authenticated control request before it can become a public report.
+    pub fn verify_broker_binding(
+        &self,
+        broker: &crate::request::NetworkLaunchBrokerRequestV4,
+    ) -> Result<(), String> {
+        if self.installed_generation_digest != broker.installed_generation_digest
+            || self.installed_qualification_digest != broker.launch.qualification_digest
+            || self.attempt.caller_envelope_digest
+                != DiagnosticSha256::from_bytes(broker.caller.digest())
+            || self.attempt.native_invocation_digest
+                != DiagnosticSha256::from_bytes(broker.request_digest)
+        {
+            return Err("MCSEALED-PRIVATE-RECEIPT: broker request binding differs".into());
+        }
+        Ok(())
+    }
+
     /// Project an authenticated native terminal into the distinct V11 report
     /// contract using the move-only installed generation retained at release.
     /// This does not publish the report or qualify the host by itself.
@@ -192,6 +273,8 @@ impl PrivateTerminalReceiptV4 {
     ) -> Result<PrivateExecutionReportV11, String> {
         if self.schema_version != 4
             || self.attempt_id != self.attempt.attempt_id.as_str()
+            || self.installed_generation_digest != *installed.generation_digest()
+            || self.installed_qualification_digest != *installed.qualification_digest()
             || self.attempt.canonical_digest()? != self.checkpoint.attempt_binding
             || !self.retirement.terminal_success(&self.checkpoint)
             || self.checkpoint.filter_digest != *installed.filter_digest()
@@ -281,8 +364,96 @@ impl VerifiedPrivateRetirement {
     }
 }
 
-pub struct PrivateAttemptOwner {
-    record: Option<DurablePrivateAttempt>,
+/// Domain-specific durable journals share the same physical V4 custody
+/// sequence. Implementing this trait cannot itself authorize the release
+/// byte; production and probe checkpoints remain distinct sealed adapters.
+pub trait PrivateNativeJournal {
+    fn phase(&self) -> PrivateAttemptPhase;
+    fn read_back_native(&self) -> Result<(), String>;
+    fn attempt_id(&self) -> &str;
+    fn frontend(&self) -> &ProcessIdentityV4;
+    fn target(&self) -> Option<&ProcessIdentityV4>;
+    fn namespace_init(&self) -> Option<&ProcessIdentityV4>;
+    fn network_namespace_inode(&self) -> Option<u64>;
+    fn possibly_released(&self) -> bool;
+    fn boundary_created(&mut self) -> Result<(), String>;
+    fn guardian_ready(&mut self, guardian: ProcessIdentityV4) -> Result<(), String>;
+    fn target_gated(
+        &mut self,
+        namespace_init: ProcessIdentityV4,
+        target: ProcessIdentityV4,
+        network_namespace_inode: u64,
+    ) -> Result<(), String>;
+    fn execution_observed(&mut self) -> Result<(), String>;
+    fn retiring(&mut self) -> Result<(), String>;
+    fn cleanup_incomplete(&mut self, detail: &str) -> Result<(), String>;
+}
+
+impl PrivateNativeJournal for DurablePrivateAttempt {
+    fn phase(&self) -> PrivateAttemptPhase {
+        self.record().phase
+    }
+
+    fn read_back_native(&self) -> Result<(), String> {
+        self.read_back().map(|_| ())
+    }
+
+    fn attempt_id(&self) -> &str {
+        self.record().attempt_id.as_str()
+    }
+
+    fn frontend(&self) -> &ProcessIdentityV4 {
+        &self.record().frontend
+    }
+
+    fn target(&self) -> Option<&ProcessIdentityV4> {
+        self.record().target.as_ref()
+    }
+
+    fn namespace_init(&self) -> Option<&ProcessIdentityV4> {
+        self.record().namespace_init.as_ref()
+    }
+
+    fn network_namespace_inode(&self) -> Option<u64> {
+        self.record().network_namespace_inode
+    }
+
+    fn possibly_released(&self) -> bool {
+        self.record().release_knowledge != ReleaseKnowledge::NotReleased
+    }
+
+    fn boundary_created(&mut self) -> Result<(), String> {
+        DurablePrivateAttempt::boundary_created(self)
+    }
+
+    fn guardian_ready(&mut self, guardian: ProcessIdentityV4) -> Result<(), String> {
+        DurablePrivateAttempt::guardian_ready(self, guardian)
+    }
+
+    fn target_gated(
+        &mut self,
+        namespace_init: ProcessIdentityV4,
+        target: ProcessIdentityV4,
+        network_namespace_inode: u64,
+    ) -> Result<(), String> {
+        DurablePrivateAttempt::target_gated(self, namespace_init, target, network_namespace_inode)
+    }
+
+    fn execution_observed(&mut self) -> Result<(), String> {
+        DurablePrivateAttempt::execution_observed(self)
+    }
+
+    fn retiring(&mut self) -> Result<(), String> {
+        DurablePrivateAttempt::retiring(self)
+    }
+
+    fn cleanup_incomplete(&mut self, detail: &str) -> Result<(), String> {
+        DurablePrivateAttempt::cleanup_incomplete(self, detail)
+    }
+}
+
+pub struct PrivateAttemptOwner<J: PrivateNativeJournal = DurablePrivateAttempt> {
+    record: Option<J>,
     cgroup: Option<AttemptCgroup>,
     namespace_init: Option<NamespaceInit>,
     guardian: Option<PrivateGuardian>,
@@ -299,12 +470,12 @@ pub struct PrivateAttemptOwner {
     monitor_outcome: Option<PrivateMonitorOutcome>,
 }
 
-impl PrivateAttemptOwner {
-    pub fn new(record: DurablePrivateAttempt) -> Result<Self, String> {
-        if record.record().phase != PrivateAttemptPhase::AuthorityFrozen {
+impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
+    pub fn new(record: J) -> Result<Self, String> {
+        if record.phase() != PrivateAttemptPhase::AuthorityFrozen {
             return Err("MCSEALED-PRIVATE-OWNER: authority must be frozen".into());
         }
-        record.read_back()?;
+        record.read_back_native()?;
         Ok(Self {
             record: Some(record),
             cgroup: None,
@@ -324,17 +495,41 @@ impl PrivateAttemptOwner {
         })
     }
 
-    fn record_mut(&mut self) -> &mut DurablePrivateAttempt {
+    fn record_mut(&mut self) -> &mut J {
         self.record
             .as_mut()
             .expect("private owner retains durable record")
     }
 
     pub fn possibly_released(&self) -> bool {
-        self.record.as_ref().is_some_and(|record| {
-            record.record().release_knowledge
-                != super::private_attempt::ReleaseKnowledge::NotReleased
-        })
+        self.record
+            .as_ref()
+            .is_some_and(PrivateNativeJournal::possibly_released)
+    }
+
+    pub(crate) fn revalidate_precreated_socket_before_release(
+        &self,
+        observed: &PrivateObservedTarget,
+    ) -> Result<(), String> {
+        if self.record.as_ref().map(PrivateNativeJournal::phase)
+            != Some(PrivateAttemptPhase::TargetGated)
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: precreated target not gated".into());
+        }
+        let pidfd = self
+            .target_pidfd
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: precreated target pidfd absent")?;
+        if ProcessIdentityV4::observe(observed.target.pid as libc::pid_t, pidfd.as_fd())?
+            != observed.target
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: precreated target identity changed".into());
+        }
+        observed
+            .native
+            .descriptors
+            .revalidate_precreated_pair()
+            .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: precreated pair: {error}"))
     }
 
     pub fn create_boundary(
@@ -345,7 +540,7 @@ impl PrivateAttemptOwner {
         if self.cgroup.is_some() {
             return Err("MCSEALED-PRIVATE-OWNER: boundary already owned".into());
         }
-        let identity = self.record_mut().record().attempt_id.as_str().to_owned();
+        let identity = self.record_mut().attempt_id().to_owned();
         let cgroup = AttemptCgroup::create(&identity, memory_max, swap_limit)?;
         self.cgroup = Some(cgroup);
         self.record_mut().boundary_created()
@@ -387,7 +582,7 @@ impl PrivateAttemptOwner {
         caller_namespace: NamespaceIdentity,
         provider_namespace: NamespaceIdentity,
     ) -> Result<(), String> {
-        if self.record_mut().record().phase != PrivateAttemptPhase::BoundaryCreated
+        if self.record_mut().phase() != PrivateAttemptPhase::BoundaryCreated
             || self.namespace_init.is_some()
         {
             return Err("MCSEALED-PRIVATE-OWNER: namespace clone phase differs".into());
@@ -488,7 +683,7 @@ impl PrivateAttemptOwner {
         deadline: Instant,
     ) -> Result<(), String> {
         if self.guardian.is_some()
-            || self.record_mut().record().phase != PrivateAttemptPhase::BoundaryCreated
+            || self.record_mut().phase() != PrivateAttemptPhase::BoundaryCreated
         {
             return Err("MCSEALED-PRIVATE-OWNER: guardian phase differs".into());
         }
@@ -496,13 +691,13 @@ impl PrivateAttemptOwner {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let record = self.record.as_ref().expect("owner retains record").record();
-        if record.attempt_id.as_str() != hex_identity {
+        let record = self.record.as_ref().expect("owner retains record");
+        if record.attempt_id() != hex_identity {
             return Err("MCSEALED-PRIVATE-OWNER: guardian attempt identity differs".into());
         }
         let frontend =
-            ProcessIdentityV4::observe(record.frontend.pid as libc::pid_t, frontend_pidfd)?;
-        if frontend != record.frontend {
+            ProcessIdentityV4::observe(record.frontend().pid as libc::pid_t, frontend_pidfd)?;
+        if frontend != *record.frontend() {
             return Err("MCSEALED-PRIVATE-OWNER: frontend process identity changed".into());
         }
         // SAFETY: getpid has no pointer preconditions and names this exact
@@ -553,7 +748,7 @@ impl PrivateAttemptOwner {
         filter_digest: [u8; 32],
         deadline: Instant,
     ) -> Result<PrivateObservedTarget, String> {
-        if self.record_mut().record().phase != PrivateAttemptPhase::GuardianReady
+        if self.record_mut().phase() != PrivateAttemptPhase::GuardianReady
             || !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live)
         {
             return Err("MCSEALED-PRIVATE-OWNER: guardian is not live".into());
@@ -632,6 +827,7 @@ impl PrivateAttemptOwner {
             target,
             namespace_init,
             caller_network_namespace: caller_namespace,
+            identity: target_identity.clone(),
         })
     }
 
@@ -640,9 +836,7 @@ impl PrivateAttemptOwner {
     /// nonblocking pipe/socket descriptors, so this never changes a caller's
     /// shared file-description flags.
     pub fn prepare_relay(&mut self, frontend: [OwnedFd; 3]) -> Result<(), String> {
-        if self.record_mut().record().phase != PrivateAttemptPhase::TargetGated
-            || self.relay.is_some()
-        {
+        if self.record_mut().phase() != PrivateAttemptPhase::TargetGated || self.relay.is_some() {
             return Err("MCSEALED-PRIVATE-RELAY: target is not gated".into());
         }
         let provider = self
@@ -652,7 +846,9 @@ impl PrivateAttemptOwner {
         self.relay = Some(PrivateRelay::prepare(provider, frontend)?);
         Ok(())
     }
+}
 
+impl PrivateAttemptOwner<DurablePrivateAttempt> {
     /// The caller must hold a stable installed-generation lease before the
     /// activation lease. This consumes the unforgeable native readback and
     /// gives the target exactly one release byte only after durable commit.
@@ -661,14 +857,7 @@ impl PrivateAttemptOwner {
         observed: PrivateObservedTarget,
         authority: &crate::package::VerifiedInstalledPrivateAuthorityLease,
     ) -> Result<PrivateTcpCheckpointV2, String> {
-        if self.record_mut().record().phase != PrivateAttemptPhase::TargetGated
-            || !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live)
-            || self.relay.is_none()
-        {
-            return Err(
-                "MCSEALED-PRIVATE-CHECKPOINT: target or guardian is not gated and live".into(),
-            );
-        }
+        self.validate_gated_native_resources(&observed)?;
         let record = self.record.as_ref().expect("owner retains record").record();
         let admission = record
             .admission
@@ -678,15 +867,7 @@ impl PrivateAttemptOwner {
             .binding
             .as_ref()
             .ok_or("MCSEALED-PRIVATE-CHECKPOINT: binding absent")?;
-        if record.target.as_ref() != Some(&observed.target)
-            || record.namespace_init.as_ref() != Some(&observed.namespace_init)
-            || record.network_namespace_inode != Some(observed.native.network_namespace.inode)
-            || self
-                .network
-                .as_ref()
-                .map(PrivateNetworkNamespaceOwner::identity)
-                != Some(observed.native.network_namespace)
-            || admission.package_generation_digest != *authority.generation_digest()
+        if admission.package_generation_digest != *authority.generation_digest()
             || admission.qualification_digest != *authority.qualification_digest()
             || observed.native.ready.filter_digest != *authority.filter_digest().bytes()
             || !matches!(
@@ -781,9 +962,980 @@ impl PrivateAttemptOwner {
         drop(lease);
         Ok(checkpoint)
     }
+}
+
+impl PrivateAttemptOwner<super::private_qualification::DurableProbeAttempt> {
+    pub(crate) fn pump_loss_probe_until_armed(
+        &mut self,
+        case: &super::private_qualification::ProbeLossCaseAuthority<'_>,
+        proxy: &super::private_probe_loss::FrontendProxy,
+    ) -> Result<(), String> {
+        if self.record_mut().phase() != PrivateAttemptPhase::ExecutionObserved {
+            return Err("MCSEALED-PRIVATE-PROBE-LOSS: armed wait before native exec".into());
+        }
+        let expected = case.expected_armed_response();
+        loop {
+            if Instant::now() >= case.deadline() {
+                return Err("MCSEALED-PRIVATE-PROBE-LOSS: armed wait deadline expired".into());
+            }
+            case.verify_proxy_live()?;
+            if !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live) {
+                return Err("MCSEALED-PRIVATE-PROBE-LOSS: guardian exited before arming".into());
+            }
+            let target = self
+                .target_pidfd
+                .as_ref()
+                .ok_or("MCSEALED-PRIVATE-PROBE-LOSS: target pidfd absent")?;
+            if pidfd_exited(target.as_fd())? {
+                return Err("MCSEALED-PRIVATE-PROBE-LOSS: target exited before arming".into());
+            }
+            self.relay
+                .as_mut()
+                .ok_or("MCSEALED-PRIVATE-PROBE-LOSS: relay absent")?
+                .tick(Duration::from_millis(100))?;
+            if proxy.try_armed(expected)? {
+                return Ok(());
+            }
+        }
+    }
+
+    pub(crate) fn monitor_frontend_loss_probe(
+        &mut self,
+        case: &super::private_qualification::ProbeLossCaseAuthority<'_>,
+    ) -> Result<PrivateMonitorOutcome, String> {
+        if case.kind() != super::private_qualification::ProbeLossKindV1::Frontend
+            || self.record_mut().phase() != PrivateAttemptPhase::ExecutionObserved
+        {
+            return Err("MCSEALED-PRIVATE-PROBE-LOSS: frontend monitor phase differs".into());
+        }
+        self.monitor_native(case.frontend_pidfd(), Some(case.deadline()), || {
+            Ok(case.as_case().revoked())
+        })
+    }
+
+    pub(crate) fn retire_probe_after_frontend_loss(
+        mut self,
+        case: &super::private_qualification::ProbeLossCaseAuthority<'_>,
+        deadline: Instant,
+    ) -> Result<
+        (
+            super::private_qualification::ProbeRetirementObservationV1,
+            super::private_guardian::GuardianTerminalV4,
+        ),
+        String,
+    > {
+        if case.kind() != super::private_qualification::ProbeLossKindV1::Frontend {
+            return Err("MCSEALED-PRIVATE-PROBE-LOSS: wrong loss branch".into());
+        }
+        self.record_mut().retiring()?;
+        let completed = (|| -> Result<_, String> {
+            let guardian = self
+                .guardian
+                .take()
+                .ok_or("MCSEALED-PRIVATE-PROBE-LOSS: guardian absent")?;
+            let terminal = guardian.finish_after_loss(deadline);
+            // The guardian has already killed and removed this exact boundary;
+            // a second cgroup.kill on the removed path would be an error.
+            if terminal
+                .as_ref()
+                .is_ok_and(|terminal| terminal.boundary_retired)
+            {
+                self.cgroup.take();
+            }
+            let candidate_exit = self.settle_native_resources(deadline);
+            let (terminal, candidate_exit) = join_loss_cleanup(terminal, candidate_exit)?;
+            if terminal.trigger != super::private_guardian::GuardianTriggerV4::FrontendLost
+                || !terminal.boundary_retired
+            {
+                return Err("MCSEALED-PRIVATE-PROBE-LOSS: guardian containment differs".into());
+            }
+            Ok((terminal, candidate_exit))
+        })();
+        let (terminal, candidate_exit) = match completed {
+            Ok(observed) => observed,
+            Err(error) => {
+                if let Some(record) = self.record.as_mut() {
+                    let _ = record.cleanup_incomplete(&error);
+                }
+                return Err(error);
+            }
+        };
+        let retired = self
+            .record_mut()
+            .retired_after_native_cleanup(candidate_exit)?;
+        self.record.take();
+        Ok((retired, terminal))
+    }
+
+    pub(crate) fn retire_probe_after_guardian_loss(
+        mut self,
+        deadline: Instant,
+    ) -> Result<
+        (
+            super::private_qualification::ProbeRetirementObservationV1,
+            super::private_guardian::ProbeGuardianKilledV1,
+        ),
+        String,
+    > {
+        if self.record_mut().phase() != PrivateAttemptPhase::ExecutionObserved {
+            return Err("MCSEALED-PRIVATE-PROBE-LOSS: guardian loss before native exec".into());
+        }
+        self.record_mut().retiring()?;
+        let completed = (|| -> Result<_, String> {
+            let guardian = self
+                .guardian
+                .take()
+                .ok_or("MCSEALED-PRIVATE-PROBE-LOSS: guardian absent")?;
+            let killed = guardian.kill_for_probe(deadline);
+            let candidate_exit = self.settle_native_resources(deadline);
+            let (killed, candidate_exit) = join_loss_cleanup(killed, candidate_exit)?;
+            Ok((killed, candidate_exit))
+        })();
+        let (killed, candidate_exit) = match completed {
+            Ok(observed) => observed,
+            Err(error) => {
+                if let Some(record) = self.record.as_mut() {
+                    let _ = record.cleanup_incomplete(&error);
+                }
+                return Err(error);
+            }
+        };
+        let retired = self
+            .record_mut()
+            .retired_after_native_cleanup(candidate_exit)?;
+        self.record.take();
+        Ok((retired, killed))
+    }
+
+    pub(crate) fn wait_failed_probe_target_exit(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if self.record_mut().phase() != PrivateAttemptPhase::ReleaseIntent {
+            return Err("MCSEALED-PRIVATE-PROBE: failed-exec release intent absent".into());
+        }
+        let target = self
+            .target_pidfd
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-PROBE: failed-exec target absent")?;
+        wait_pidfd(target.as_fd(), deadline)
+    }
+
+    pub(crate) fn retire_probe(
+        mut self,
+        deadline: Instant,
+    ) -> Result<super::private_qualification::ProbeRetirementObservationV1, String> {
+        self.record_mut().retiring()?;
+        let candidate_exit_code = match self.settle_native_resources(deadline) {
+            Ok(code) => code,
+            Err(error) => {
+                if let Some(record) = self.record.as_mut() {
+                    let _ = record.cleanup_incomplete(&error);
+                }
+                return Err(error);
+            }
+        };
+        let retired = self
+            .record_mut()
+            .retired_after_native_cleanup(candidate_exit_code)?;
+        self.record.take();
+        Ok(retired)
+    }
+
+    pub(crate) fn monitor_probe(
+        &mut self,
+        case: &super::private_qualification::ProbeCaseAuthority<'_>,
+    ) -> Result<PrivateMonitorOutcome, String> {
+        if self.record_mut().phase() != PrivateAttemptPhase::ExecutionObserved {
+            return Err("MCSEALED-PRIVATE-PROBE: exec observation absent".into());
+        }
+        self.monitor_native(case.coordinator_pidfd(), Some(case.deadline()), || {
+            Ok(case.revoked())
+        })
+    }
+
+    /// The probe can release only its own fixed fixture after the identical
+    /// native gate readback, then a distinct durable probe checkpoint and
+    /// release-intent transition. No production policy lease participates.
+    pub(crate) fn commit_probe_and_release(
+        &mut self,
+        observed: PrivateObservedTarget,
+        case: &super::private_qualification::ProbeCaseAuthority<'_>,
+    ) -> Result<DiagnosticSha256, String> {
+        self.validate_gated_native_resources(&observed)?;
+        let (uid, gid) = case.target_ids();
+        if observed.identity.uid() != uid
+            || observed.identity.gid() != gid
+            || !observed.identity.groups().is_empty()
+            || observed.identity.delegated()
+            || observed.native.ready.native_abi != case.native_abi()?
+            || observed.native.ready.filter_digest != *case.filter_digest().bytes()
+            || self.entrypoint_digest.as_ref() != Some(case.fixture_digest())
+        {
+            return Err("MCSEALED-PRIVATE-PROBE: gated fixture identity differs".into());
+        }
+        let guardian = self
+            .guardian
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-PROBE: guardian absent")?
+            .identity()?;
+        let topology = private_topology_digest(&observed);
+        let mut readback = Sha256::new();
+        readback.update(b"memcordon-private-probe-native-readback-v1\0");
+        readback.update([match observed.native.ready.native_abi {
+            NativeAbi::X86_64 => 1,
+            NativeAbi::Aarch64 => 2,
+        }]);
+        readback.update(observed.native.ready.instruction_count.to_be_bytes());
+        readback.update(observed.native.ready.filter_digest);
+        readback.update(observed.native.network_namespace.device.to_be_bytes());
+        readback.update(observed.native.network_namespace.inode.to_be_bytes());
+        readback.update(topology.bytes());
+        let binding = case.bind_native_checkpoint(
+            guardian,
+            observed.namespace_init,
+            observed.target,
+            observed.native.network_namespace.inode,
+            uid,
+            gid,
+            observed.native.ready.filter_digest,
+            topology,
+            DiagnosticSha256::from_bytes(readback.finalize().into()),
+        )?;
+        let digest = self.record_mut().commit_checkpoint(binding)?;
+        let permit = self.record_mut().release_intent(case, &digest)?;
+        case.revalidate()?;
+        let attempt_id = self
+            .record
+            .as_ref()
+            .expect("owner retains record")
+            .attempt_id()
+            .to_owned();
+        self.gated_descriptors = Some(observed.native.descriptors);
+        let control = self
+            .control
+            .as_mut()
+            .ok_or("MCSEALED-PRIVATE-PROBE: control absent")?;
+        permit.send(control, &attempt_id, &digest)?;
+        Ok(digest)
+    }
+}
+
+impl PrivateAttemptOwner<super::private_release_attempt::DurableReleaseCandidateAttemptV1> {
+    /// This is the physical V4 release transition for a candidate case, not
+    /// an H1 probe or a public grant. The separate release-domain checkpoint
+    /// binds the same gated readback before the release byte can be sent.
+    pub(crate) fn commit_release_candidate_and_release(
+        &mut self,
+        observed: PrivateObservedTarget,
+        case: &super::private_release_run::ReleaseCandidateRunAuthorityV1,
+    ) -> Result<DiagnosticSha256, String> {
+        let (digest, permit) = self.commit_release_candidate_intent(observed, case, None)?;
+        let attempt_id = self
+            .record
+            .as_ref()
+            .expect("owner retains record")
+            .attempt_id()
+            .to_owned();
+        let control = self
+            .control
+            .as_mut()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: control absent")?;
+        permit.send(control, &attempt_id, &digest)?;
+        Ok(digest)
+    }
+
+    pub(crate) fn commit_dual_candidate_and_release(
+        &mut self,
+        observed: PrivateObservedTarget,
+        case: &super::private_release_run::ReleaseCandidateRunAuthorityV1,
+        role: super::private_release_dual_attempt::DualAttemptRoleV1,
+    ) -> Result<DiagnosticSha256, String> {
+        if case.selector() != super::private_release_dual_attempt::SELECTOR {
+            return Err("MCSEALED-PRIVATE-RELEASE: dual release selector differs".into());
+        }
+        let (digest, permit) = self.commit_release_candidate_intent(observed, case, Some(role))?;
+        let attempt_id = self
+            .record
+            .as_ref()
+            .expect("owner retains dual journal")
+            .attempt_id()
+            .to_owned();
+        let control = self
+            .control
+            .as_mut()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: dual control absent")?;
+        permit.send(control, &attempt_id, &digest)?;
+        Ok(digest)
+    }
+
+    pub(crate) fn commit_checkpoint_gate_intent(
+        &mut self,
+        observed: PrivateObservedTarget,
+        case: &super::private_release_run::ReleaseCandidateRunAuthorityV1,
+    ) -> Result<
+        (
+            DiagnosticSha256,
+            super::private_release_attempt::ReleaseCandidatePermitV1,
+        ),
+        String,
+    > {
+        if case.selector() != super::private_release_case::CHECKPOINT_GATE_SELECTOR {
+            return Err("MCSEALED-PRIVATE-RELEASE: checkpoint-gate selector differs".into());
+        }
+        self.commit_release_candidate_intent(observed, case, None)
+    }
+
+    pub(crate) fn observe_unsent_checkpoint_gate(&mut self) -> Result<ProcessIdentityV4, String> {
+        if self.record_mut().phase() != PrivateAttemptPhase::ReleaseIntent {
+            return Err("MCSEALED-PRIVATE-RELEASE: checkpoint gate phase differs".into());
+        }
+        self.record
+            .as_ref()
+            .expect("owner retains checkpoint journal")
+            .read_back_native()?;
+        let target = self
+            .record
+            .as_ref()
+            .expect("owner retains checkpoint journal")
+            .target()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: checkpoint gate target absent")?
+            .clone();
+        let target_pidfd = self
+            .target_pidfd
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: checkpoint gate pidfd absent")?;
+        if pidfd_exited(target_pidfd.as_fd())?
+            || ProcessIdentityV4::observe(target.pid as libc::pid_t, target_pidfd.as_fd())?
+                != target
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: checkpoint gate target changed".into());
+        }
+        let control = self
+            .control
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: checkpoint gate control absent")?;
+        let mut polled = libc::pollfd {
+            fd: control.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: this nonblocking poll borrows the retained target control
+        // socket before the move-only permit can send the release byte.
+        if unsafe { libc::poll(&raw mut polled, 1, 0) } != 0 || polled.revents != 0 {
+            return Err("MCSEALED-PRIVATE-RELEASE: checkpoint gate control changed".into());
+        }
+        Ok(target)
+    }
+
+    #[allow(dead_code)] // Enabled only by the fixed child/thread release case.
+    pub(crate) fn observe_release_live_descendants(
+        &mut self,
+        challenge: &[u8; 32],
+        stdout: std::os::fd::BorrowedFd<'_>,
+        deadline: Instant,
+    ) -> Result<super::private_release_child_owner::LiveDescendantCustodyV1, String> {
+        if self.record_mut().phase() != PrivateAttemptPhase::ExecutionObserved {
+            return Err("MCSEALED-PRIVATE-RELEASE: child exec observation absent".into());
+        }
+        let record = self
+            .record
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: child attempt absent")?;
+        let attempt_id = record.attempt_id();
+        let target = record
+            .target()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: child target absent")?
+            .clone();
+        let target_pidfd = self
+            .target_pidfd
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: child target pidfd absent")?;
+        let frame = super::private_release_child_owner::read_live_frame(stdout, deadline)?;
+        super::private_release_child_owner::LiveDescendantCustodyV1::capture(
+            &target,
+            target_pidfd.as_fd(),
+            attempt_id,
+            challenge,
+            &frame,
+        )
+    }
+
+    #[allow(dead_code)] // Enabled with the fixed child/thread release case.
+    pub(crate) fn revalidate_release_live_descendants(
+        &self,
+        custody: &super::private_release_child_owner::LiveDescendantCustodyV1,
+    ) -> Result<(), String> {
+        let record = self
+            .record
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: child attempt absent")?;
+        let target_pidfd = self
+            .target_pidfd
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: child target pidfd absent")?;
+        custody.revalidate_live(target_pidfd.as_fd(), record.attempt_id())
+    }
+
+    pub(crate) fn observe_live_terminal_join_target(&self) -> Result<ProcessIdentityV4, String> {
+        let record = self
+            .record
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: terminal-join attempt absent")?;
+        if record.phase() != PrivateAttemptPhase::ExecutionObserved {
+            return Err("MCSEALED-PRIVATE-RELEASE: terminal-join exec not observed".into());
+        }
+        record.read_back_native()?;
+        let target = record
+            .target()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: terminal-join target absent")?
+            .clone();
+        let pidfd = self
+            .target_pidfd
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: terminal-join target pidfd absent")?;
+        if pidfd_exited(pidfd.as_fd())?
+            || ProcessIdentityV4::observe(target.pid as libc::pid_t, pidfd.as_fd())? != target
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: terminal-join live target changed".into());
+        }
+        Ok(target)
+    }
+
+    pub(crate) fn send_checkpoint_gate_release(
+        &mut self,
+        case: &super::private_release_run::ReleaseCandidateRunAuthorityV1,
+        permit: super::private_release_attempt::ReleaseCandidatePermitV1,
+        digest: &DiagnosticSha256,
+        target: &ProcessIdentityV4,
+    ) -> Result<(), String> {
+        if case.selector() != super::private_release_case::CHECKPOINT_GATE_SELECTOR
+            || self.observe_unsent_checkpoint_gate()? != *target
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: checkpoint gate changed before release".into());
+        }
+        case.require_persisted_checkpoint_gate(digest, target)?;
+        let attempt_id = self
+            .record
+            .as_ref()
+            .expect("owner retains checkpoint journal")
+            .attempt_id()
+            .to_owned();
+        let control = self
+            .control
+            .as_mut()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: checkpoint gate control absent")?;
+        permit.send(control, &attempt_id, digest)
+    }
+
+    /// The guardian-loss target must finish real TCP work and emit its exact
+    /// armed response while its pidfd is still live. This does not complete
+    /// the case; the owner subsequently kills the exact guardian and settles
+    /// the target/init/cgroup under a separate durable retirement transition.
+    pub(crate) fn await_release_guardian_loss_armed(
+        &mut self,
+        case: &super::private_release_run::ReleaseCandidateRunAuthorityV1,
+        stdout: BorrowedFd<'_>,
+        expected: &[u8; 32],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if case.selector() != super::private_release_guardian_loss::SELECTOR
+            || self.record_mut().phase() != PrivateAttemptPhase::ExecutionObserved
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: guardian-loss armed phase differs".into());
+        }
+        let mut observed = [0_u8; 32];
+        let mut filled = 0;
+        while filled < observed.len() {
+            case.revalidate()?;
+            if Instant::now() >= deadline {
+                return Err("MCSEALED-PRIVATE-RELEASE: guardian-loss armed deadline".into());
+            }
+            let target = self
+                .target_pidfd
+                .as_ref()
+                .ok_or("MCSEALED-PRIVATE-RELEASE: guardian-loss target pidfd absent")?;
+            if pidfd_exited(target.as_fd())? {
+                return Err("MCSEALED-PRIVATE-RELEASE: guardian-loss target exited early".into());
+            }
+            self.relay
+                .as_mut()
+                .ok_or("MCSEALED-PRIVATE-RELEASE: guardian-loss relay absent")?
+                .tick(Duration::from_millis(100))?;
+            // SAFETY: stdout is the retained nonblocking pipe read end; the
+            // remaining writable slice is bounded by the fixed response.
+            let count = unsafe {
+                libc::read(
+                    stdout.as_raw_fd(),
+                    observed[filled..].as_mut_ptr().cast(),
+                    observed.len() - filled,
+                )
+            };
+            if count > 0 {
+                filled += count as usize;
+            } else if count == 0 {
+                return Err("MCSEALED-PRIVATE-RELEASE: guardian-loss armed pipe closed".into());
+            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
+                return Err(format!(
+                    "MCSEALED-PRIVATE-RELEASE: guardian-loss armed read: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        if &observed != expected {
+            return Err("MCSEALED-PRIVATE-RELEASE: guardian-loss armed response differs".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retire_release_candidate_after_guardian_loss(
+        mut self,
+        deadline: Instant,
+    ) -> Result<super::private_release_attempt::GuardianLossCandidateRetirementObservationV1, String>
+    {
+        if self.record_mut().phase() != PrivateAttemptPhase::ExecutionObserved
+            || self.monitor_outcome.is_some()
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: guardian-loss owner phase differs".into());
+        }
+        self.record_mut().retiring()?;
+        let completed = (|| -> Result<_, String> {
+            let guardian = self
+                .guardian
+                .take()
+                .ok_or("MCSEALED-PRIVATE-RELEASE: guardian-loss guardian absent")?;
+            let killed = guardian.kill_for_probe(deadline);
+            let settled = self.settle_native_resources(deadline);
+            join_loss_cleanup(killed, settled)
+        })();
+        let (killed, candidate_exit_code) = match completed {
+            Ok(facts) => facts,
+            Err(error) => {
+                if let Some(record) = self.record.as_mut() {
+                    let _ = record.cleanup_incomplete(&error);
+                }
+                return Err(error);
+            }
+        };
+        let settlement = super::private_release_attempt::GuardianLossCandidateSettlementFactsV1 {
+            schema_version: 1,
+            guardian: killed.identity,
+            guardian_signal: killed.signal,
+            containment_removed: true,
+            target_pidfd_exited: true,
+            namespace_init_reaped: true,
+            candidate_exit_code,
+        };
+        let retired = self.record_mut().retired_after_guardian_loss(settlement)?;
+        self.record.take();
+        Ok(retired)
+    }
+
+    pub(crate) fn pump_release_frontend_until_armed(
+        &mut self,
+        case: &super::private_release_run::ReleaseCandidateRunAuthorityV1,
+        proxy: &super::private_probe_loss::FrontendProxy,
+        expected: [u8; 32],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        if case.selector() != super::private_release_frontend_loss::SELECTOR
+            || self.record_mut().phase() != PrivateAttemptPhase::ExecutionObserved
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: frontend-loss arming phase differs".into());
+        }
+        loop {
+            if Instant::now() >= deadline {
+                return Err("MCSEALED-PRIVATE-RELEASE: frontend-loss arming deadline".into());
+            }
+            case.revalidate()?;
+            if !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live)
+                || pidfd_exited(proxy.pidfd())?
+                || pidfd_exited(
+                    self.target_pidfd
+                        .as_ref()
+                        .ok_or("MCSEALED-PRIVATE-RELEASE: frontend-loss target pidfd absent")?
+                        .as_fd(),
+                )?
+            {
+                return Err(
+                    "MCSEALED-PRIVATE-RELEASE: frontend-loss process exited before arming".into(),
+                );
+            }
+            self.relay
+                .as_mut()
+                .ok_or("MCSEALED-PRIVATE-RELEASE: frontend-loss relay absent")?
+                .tick(Duration::from_millis(100))?;
+            if proxy.try_armed(expected)? {
+                return Ok(());
+            }
+        }
+    }
+
+    pub(crate) fn monitor_release_frontend_loss(
+        &mut self,
+        case: &super::private_release_run::ReleaseCandidateRunAuthorityV1,
+        frontend_pidfd: BorrowedFd<'_>,
+        deadline: Instant,
+    ) -> Result<PrivateMonitorOutcome, String> {
+        if case.selector() != super::private_release_frontend_loss::SELECTOR
+            || self.record_mut().phase() != PrivateAttemptPhase::ExecutionObserved
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: frontend-loss monitor phase differs".into());
+        }
+        self.monitor_native(frontend_pidfd, Some(deadline), || {
+            case.revalidate().map(|()| false)
+        })
+    }
+
+    pub(crate) fn retire_release_candidate_after_frontend_loss(
+        mut self,
+        frontend: ProcessIdentityV4,
+        frontend_signal: i32,
+        deadline: Instant,
+    ) -> Result<super::private_release_attempt::FrontendLossCandidateRetirementObservationV1, String>
+    {
+        if self.record_mut().phase() != PrivateAttemptPhase::ExecutionObserved {
+            return Err("MCSEALED-PRIVATE-RELEASE: frontend-loss owner phase differs".into());
+        }
+        self.record_mut().retiring()?;
+        let completed = (|| -> Result<_, String> {
+            let guardian = self
+                .guardian
+                .take()
+                .ok_or("MCSEALED-PRIVATE-RELEASE: frontend-loss guardian absent")?;
+            let terminal = guardian.finish_after_loss(deadline);
+            if terminal
+                .as_ref()
+                .is_ok_and(|terminal| terminal.boundary_retired)
+            {
+                self.cgroup.take();
+            }
+            let settled = self.settle_native_resources(deadline);
+            join_loss_cleanup(terminal, settled)
+        })();
+        let (terminal, candidate_exit_code) = match completed {
+            Ok(facts) => facts,
+            Err(error) => {
+                if let Some(record) = self.record.as_mut() {
+                    let _ = record.cleanup_incomplete(&error);
+                }
+                return Err(error);
+            }
+        };
+        let settlement = super::private_release_attempt::FrontendLossCandidateSettlementFactsV1 {
+            schema_version: 1,
+            frontend,
+            frontend_signal,
+            guardian_terminal: terminal.encode(),
+            containment_removed: terminal.boundary_retired,
+            target_pidfd_exited: true,
+            namespace_init_reaped: true,
+            candidate_exit_code,
+        };
+        let retired = self.record_mut().retired_after_frontend_loss(settlement)?;
+        self.record.take();
+        Ok(retired)
+    }
+
+    /// A setup failure cannot become a guardian-loss terminal. It still gets
+    /// bounded native settlement and a durable blocking disposition rather
+    /// than relying only on Drop's best-effort cleanup.
+    pub(crate) fn abort_release_candidate_guardian_loss_setup(
+        mut self,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let transition = self.record_mut().retiring();
+        let cleanup = self.settle_native_resources(deadline);
+        let durable = self
+            .record_mut()
+            .cleanup_incomplete("guardian-loss setup did not reach armed target");
+        if durable.is_ok() {
+            self.record.take();
+        }
+        transition?;
+        cleanup?;
+        durable
+    }
+
+    pub(crate) fn abort_release_candidate_frontend_loss_setup(
+        mut self,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let transition = self.record_mut().retiring();
+        let cleanup = self.settle_native_resources(deadline);
+        let durable = self
+            .record_mut()
+            .cleanup_incomplete("frontend-loss setup did not reach verified loss");
+        if durable.is_ok() {
+            self.record.take();
+        }
+        transition?;
+        cleanup?;
+        durable
+    }
+
+    /// Fixed release-matrix fault only. The actual control socket is shut
+    /// down after durable ReleaseIntent and a one-byte send is attempted with
+    /// MSG_NOSIGNAL. This can never restore NotReleased or authorize replay.
+    #[allow(dead_code)] // Routed only after distinct uncertainty retirement exists.
+    pub(crate) fn commit_uncertain_candidate_transport_loss(
+        &mut self,
+        observed: PrivateObservedTarget,
+        case: &super::private_release_run::ReleaseCandidateRunAuthorityV1,
+    ) -> Result<(DiagnosticSha256, i32), String> {
+        if case.selector() != super::private_release_case::AUTHORIZATION_UNCERTAIN_SELECTOR {
+            return Err("MCSEALED-PRIVATE-RELEASE: uncertainty fault selector differs".into());
+        }
+        let (digest, permit) = self.commit_release_candidate_intent(observed, case, None)?;
+        let attempt_id = self
+            .record
+            .as_ref()
+            .expect("owner retains record")
+            .attempt_id()
+            .to_owned();
+        let control = self
+            .control
+            .as_mut()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: control absent")?;
+        let errno = permit.force_transport_loss(control, &attempt_id, &digest)?;
+        Ok((digest, errno))
+    }
+
+    fn commit_release_candidate_intent(
+        &mut self,
+        observed: PrivateObservedTarget,
+        case: &super::private_release_run::ReleaseCandidateRunAuthorityV1,
+        dual_role: Option<super::private_release_dual_attempt::DualAttemptRoleV1>,
+    ) -> Result<
+        (
+            DiagnosticSha256,
+            super::private_release_attempt::ReleaseCandidatePermitV1,
+        ),
+        String,
+    > {
+        self.validate_gated_native_resources(&observed)?;
+        let (uid, gid) = case.target_ids()?;
+        if observed.identity.uid() != uid
+            || observed.identity.gid() != gid
+            || !observed.identity.groups().is_empty()
+            || observed.identity.delegated()
+            || observed.native.ready.native_abi != case.native_abi()?
+            || observed.native.ready.filter_digest != *case.filter_digest().bytes()
+            || self.entrypoint_digest.as_ref() != Some(case.fixture_digest())
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: gated candidate identity differs".into());
+        }
+        let guardian = self
+            .guardian
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: guardian absent")?
+            .identity()?;
+        let topology = private_topology_digest(&observed);
+        let mut readback = Sha256::new();
+        readback.update(b"memcordon-private-release-candidate-native-readback-v1\0");
+        readback.update([match observed.native.ready.native_abi {
+            NativeAbi::X86_64 => 1,
+            NativeAbi::Aarch64 => 2,
+        }]);
+        readback.update(observed.native.ready.instruction_count.to_be_bytes());
+        readback.update(observed.native.ready.filter_digest);
+        readback.update(observed.native.network_namespace.device.to_be_bytes());
+        readback.update(observed.native.network_namespace.inode.to_be_bytes());
+        readback.update(topology.bytes());
+        let native_readback = DiagnosticSha256::from_bytes(readback.finalize().into());
+        let binding = match dual_role {
+            Some(role) => case.bind_dual_native_checkpoint(
+                role,
+                guardian,
+                observed.namespace_init,
+                observed.target,
+                observed.native.network_namespace.inode,
+                uid,
+                gid,
+                observed.native.ready.filter_digest,
+                topology,
+                native_readback,
+            )?,
+            None => case.bind_native_checkpoint(
+                guardian,
+                observed.namespace_init,
+                observed.target,
+                observed.native.network_namespace.inode,
+                uid,
+                gid,
+                observed.native.ready.filter_digest,
+                topology,
+                native_readback,
+            )?,
+        };
+        if self
+            .record
+            .as_ref()
+            .expect("owner retains candidate journal")
+            .attempt_id()
+            != binding.attempt_id
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: dual journal attempt differs".into());
+        }
+        let digest = self.record_mut().commit_checkpoint(binding)?;
+        let permit = self.record_mut().release_intent(&digest)?;
+        case.revalidate()?;
+        self.gated_descriptors = Some(observed.native.descriptors);
+        Ok((digest, permit))
+    }
+
+    pub(crate) fn monitor_release_candidate(
+        &mut self,
+        case: &super::private_release_run::ReleaseCandidateRunAuthorityV1,
+    ) -> Result<PrivateMonitorOutcome, String> {
+        if self.record_mut().phase() != PrivateAttemptPhase::ExecutionObserved {
+            return Err("MCSEALED-PRIVATE-RELEASE: exec observation absent".into());
+        }
+        self.monitor_native(case.coordinator_pidfd(), Some(case.deadline()), || {
+            Ok(case.revalidate().is_err())
+        })
+    }
+
+    pub(crate) fn retire_release_candidate(
+        mut self,
+        deadline: Instant,
+    ) -> Result<super::private_release_attempt::ReleaseCandidateRetirementObservationV1, String>
+    {
+        let monitor_completed = self.monitor_outcome == Some(PrivateMonitorOutcome::Completed);
+        self.record_mut().retiring()?;
+        let settlement = match self.settle_release_candidate_resources(deadline) {
+            Ok(facts) => facts,
+            Err(error) => {
+                if let Some(record) = self.record.as_mut() {
+                    let _ = record.cleanup_incomplete(&error);
+                }
+                return Err(error);
+            }
+        };
+        if !monitor_completed {
+            self.record_mut()
+                .cleanup_incomplete("native monitor did not complete")?;
+            self.record.take();
+            return Err("MCSEALED-PRIVATE-RELEASE: native monitor did not complete".into());
+        }
+        let retired = self.record_mut().retired_after_native_cleanup(settlement)?;
+        self.record.take();
+        Ok(retired)
+    }
+
+    /// Settles a deliberately lost authorization transport without claiming
+    /// an exec observation or a successful monitor. Failure leaves the
+    /// protected journal CleanupIncomplete and blocks attempt reuse.
+    #[allow(dead_code)] // Routed only after detached uncertainty proof exists.
+    pub(crate) fn retire_uncertain_release_candidate(
+        mut self,
+        transport_errno: i32,
+        deadline: Instant,
+    ) -> Result<super::private_release_attempt::UncertainCandidateRetirementObservationV1, String>
+    {
+        if transport_errno != libc::EPIPE || self.monitor_outcome.is_some() {
+            return Err("MCSEALED-PRIVATE-RELEASE: uncertainty owner state differs".into());
+        }
+        self.record_mut().retiring()?;
+        let settlement = match self.settle_uncertain_candidate_resources(transport_errno, deadline)
+        {
+            Ok(facts) => facts,
+            Err(error) => {
+                if let Some(record) = self.record.as_mut() {
+                    let _ = record.cleanup_incomplete(&error);
+                }
+                return Err(error);
+            }
+        };
+        let retired = self
+            .record_mut()
+            .retired_after_uncertain_cleanup(settlement)?;
+        self.record.take();
+        Ok(retired)
+    }
+
+    /// Physically settle a successful target, then deliberately make only
+    /// the durable Retired journal transition fail. The protected Retiring
+    /// record and fault marker remain blocking evidence; this is not a
+    /// successful retirement or a restart-safe terminal.
+    #[allow(dead_code)] // Fixed release fault selector is not routed yet.
+    pub(crate) fn retire_release_candidate_with_durable_fault(
+        mut self,
+        challenge: &[u8; 32],
+        deadline: Instant,
+    ) -> Result<super::private_release_attempt::BlockedCandidateRetirementObservationV1, String>
+    {
+        if self.monitor_outcome != Some(PrivateMonitorOutcome::Completed) {
+            return Err("MCSEALED-PRIVATE-RELEASE: retirement fault monitor absent".into());
+        }
+        self.record_mut().retiring()?;
+        let settlement = match self.settle_release_candidate_resources(deadline) {
+            Ok(facts) => facts,
+            Err(error) => {
+                if let Some(record) = self.record.as_mut() {
+                    let _ = record.cleanup_incomplete(&error);
+                }
+                return Err(error);
+            }
+        };
+        let blocked = self
+            .record_mut()
+            .force_retirement_transition_conflict(challenge, settlement)?;
+        // This is intentionally still Retiring. The verified fault marker
+        // makes any further transition/allocator attempt fail closed.
+        self.record.take();
+        Ok(blocked)
+    }
+}
+
+fn join_loss_cleanup<T, U>(
+    observation: Result<T, String>,
+    cleanup: Result<U, String>,
+) -> Result<(T, U), String> {
+    match (observation, cleanup) {
+        (Ok(observation), Ok(cleanup)) => Ok((observation, cleanup)),
+        (Err(observation), Ok(_)) => Err(observation),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(observation), Err(cleanup)) => {
+            Err(format!("{observation}; native cleanup: {cleanup}"))
+        }
+    }
+}
+
+impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
+    /// Checks only observed native resource custody. A separate sealed
+    /// authorization adapter must still validate the production grant or an
+    /// exact protected probe case before any durable checkpoint or release.
+    fn validate_gated_native_resources(
+        &self,
+        observed: &PrivateObservedTarget,
+    ) -> Result<(), String> {
+        if self.record.as_ref().expect("owner retains record").phase()
+            != PrivateAttemptPhase::TargetGated
+            || !self.guardian.as_ref().is_some_and(PrivateGuardian::is_live)
+            || self.relay.is_none()
+        {
+            return Err(
+                "MCSEALED-PRIVATE-CHECKPOINT: target or guardian is not gated and live".into(),
+            );
+        }
+        let record = self.record.as_ref().expect("owner retains record");
+        if record.target() != Some(&observed.target)
+            || record.namespace_init() != Some(&observed.namespace_init)
+            || record.network_namespace_inode() != Some(observed.native.network_namespace.inode)
+            || self
+                .network
+                .as_ref()
+                .map(PrivateNetworkNamespaceOwner::identity)
+                != Some(observed.native.network_namespace)
+        {
+            return Err("MCSEALED-PRIVATE-CHECKPOINT: observed native custody differs".into());
+        }
+        Ok(())
+    }
 
     pub fn observe_exec(&mut self, deadline: Instant) -> Result<PrivateExecObservation, String> {
-        if self.record_mut().record().phase != PrivateAttemptPhase::ReleaseIntent {
+        if self.record_mut().phase() != PrivateAttemptPhase::ReleaseIntent {
             return Err("MCSEALED-PRIVATE-EXEC: release intent absent".into());
         }
         let control = self
@@ -823,7 +1975,9 @@ impl PrivateAttemptOwner {
             },
         }
     }
+}
 
+impl PrivateAttemptOwner<DurablePrivateAttempt> {
     /// Polls every endpoint in bounded intervals and returns a distinct
     /// native stop reason. No stop reason is itself terminal cleanup proof;
     /// the caller must still invoke `retire` and preserve candidate outcome.
@@ -842,7 +1996,24 @@ impl PrivateAttemptOwner {
             .record()
             .admission
             .as_ref()
-            .ok_or("MCSEALED-PRIVATE-MONITOR: admission absent")?;
+            .ok_or("MCSEALED-PRIVATE-MONITOR: admission absent")?
+            .clone();
+        self.monitor_native(frontend_pidfd, deadline, || {
+            crate::admission::revoked_linux_v2(&admission)
+        })
+    }
+}
+
+impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
+    /// Physical monitoring is shared with a future probe authorization
+    /// adapter. The adapter supplies its own live-authority/revocation check;
+    /// this loop never assumes that a probe owns a production policy grant.
+    fn monitor_native(
+        &mut self,
+        frontend_pidfd: BorrowedFd<'_>,
+        deadline: Option<Instant>,
+        mut revoked: impl FnMut() -> Result<bool, String>,
+    ) -> Result<PrivateMonitorOutcome, String> {
         let outcome = loop {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 break PrivateMonitorOutcome::DeadlineExceeded;
@@ -850,7 +2021,7 @@ impl PrivateAttemptOwner {
             if pidfd_exited(frontend_pidfd)? {
                 break PrivateMonitorOutcome::FrontendLost;
             }
-            if crate::admission::revoked_linux_v2(admission)? {
+            if revoked()? {
                 break PrivateMonitorOutcome::Revoked;
             }
             let cgroup = self
@@ -880,48 +2051,16 @@ impl PrivateAttemptOwner {
         self.monitor_outcome = Some(outcome);
         Ok(outcome)
     }
+}
 
+impl PrivateAttemptOwner<DurablePrivateAttempt> {
     /// Cleanup success is emitted only after each resource was explicitly
     /// observed empty, reaped or closed and the durable record was retired.
     pub fn retire(mut self, deadline: Instant) -> Result<PrivateRetirementObservation, String> {
         self.record_mut().retiring()?;
         let checkpoint: Option<PrivateTcpCheckpointV2> =
             self.record_mut().record().checkpoint.clone();
-        let completed = (|| -> Result<Option<i32>, String> {
-            if let Some(cgroup) = self.cgroup.as_ref() {
-                cgroup.clone().kill_and_retire(deadline)?;
-                self.cgroup.take();
-            }
-            if let Some(target) = self.target_pidfd.as_ref() {
-                wait_pidfd(target.as_fd(), deadline)?;
-            }
-            self.target_pidfd.take();
-            if let Some(init) = self.namespace_init.as_ref() {
-                wait_exact_child(init.host_pid, init.pidfd.as_fd(), deadline)?;
-            }
-            self.namespace_init.take();
-            self.startup.take();
-            let candidate_exit_code = self
-                .status
-                .take()
-                .map(|status| read_status_until(status, deadline))
-                .transpose()?
-                .flatten();
-            if self.monitor_outcome == Some(PrivateMonitorOutcome::Completed)
-                && candidate_exit_code.is_none()
-            {
-                return Err("MCSEALED-PRIVATE-OWNER: completed target status absent".into());
-            }
-            self.control.take();
-            self.expected_descriptors.take();
-            self.stdio.take();
-            self.relay.take();
-            self.network.take();
-            if let Some(guardian) = self.guardian.take() {
-                guardian.stop(deadline)?;
-            }
-            Ok(candidate_exit_code)
-        })();
+        let completed = self.settle_native_resources(deadline);
         let candidate_exit_code = match completed {
             Ok(code) => code,
             Err(error) => {
@@ -967,7 +2106,182 @@ impl PrivateAttemptOwner {
     }
 }
 
-impl Drop for PrivateAttemptOwner {
+impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
+    /// Candidate-only physical settlement captures the exact kernel-facing
+    /// checks that were consumed. A successful trace still needs a separate
+    /// post-exit reader and independent CI supervisor join.
+    fn settle_release_candidate_resources(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<ReleaseCandidateSettlementFactsV1, String> {
+        if self.monitor_outcome != Some(PrivateMonitorOutcome::Completed) {
+            return Err("MCSEALED-PRIVATE-RELEASE: monitor completion absent".into());
+        }
+        let cgroup = self
+            .cgroup
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: cgroup absent")?;
+        if !cgroup.member_pids()?.is_empty() {
+            return Err("MCSEALED-PRIVATE-RELEASE: cgroup remained populated".into());
+        }
+        cgroup.clone().kill_and_retire(deadline)?;
+        self.cgroup.take();
+        let target = self
+            .target_pidfd
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: target pidfd absent")?;
+        wait_pidfd(target.as_fd(), deadline)?;
+        if !pidfd_exited(target.as_fd())? {
+            return Err("MCSEALED-PRIVATE-RELEASE: target pidfd remained live".into());
+        }
+        self.target_pidfd.take();
+        let init = self
+            .namespace_init
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: namespace init absent")?;
+        wait_exact_child(init.host_pid, init.pidfd.as_fd(), deadline)?;
+        self.namespace_init.take();
+        self.startup.take();
+        let status = self
+            .status
+            .take()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: target status absent")?;
+        let candidate_exit_code = read_status_until(status, deadline)?;
+        self.control.take();
+        self.expected_descriptors.take();
+        self.stdio.take();
+        self.relay.take();
+        self.network.take();
+        let guardian = self
+            .guardian
+            .take()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: guardian absent")?;
+        let terminal = guardian.stop(deadline)?;
+        if terminal.trigger != super::private_guardian::GuardianTriggerV4::Stopped
+            || terminal.boundary_retired
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: guardian terminal differs".into());
+        }
+        Ok(ReleaseCandidateSettlementFactsV1 {
+            schema_version: 1,
+            monitor_outcome: PrivateMonitorOutcome::Completed,
+            cgroup_empty_before_cleanup: true,
+            containment_removed: true,
+            target_pidfd_exited: true,
+            namespace_init_reaped: true,
+            guardian_terminal: terminal.encode(),
+            candidate_exit_code,
+        })
+    }
+
+    /// This is not the normal Completed settlement: no target exec or
+    /// candidate exit success is inferred from the control-channel EPIPE.
+    fn settle_uncertain_candidate_resources(
+        &mut self,
+        transport_errno: i32,
+        deadline: Instant,
+    ) -> Result<super::private_release_attempt::UncertainCandidateSettlementFactsV1, String> {
+        if transport_errno != libc::EPIPE || self.monitor_outcome.is_some() {
+            return Err("MCSEALED-PRIVATE-RELEASE: uncertainty settlement state differs".into());
+        }
+        self.control.take();
+        let cgroup = self
+            .cgroup
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: uncertainty cgroup absent")?;
+        cgroup.clone().kill_and_retire(deadline)?;
+        self.cgroup.take();
+        let target = self
+            .target_pidfd
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: uncertainty target pidfd absent")?;
+        wait_pidfd(target.as_fd(), deadline)?;
+        if !pidfd_exited(target.as_fd())? {
+            return Err("MCSEALED-PRIVATE-RELEASE: uncertainty target remained live".into());
+        }
+        self.target_pidfd.take();
+        let init = self
+            .namespace_init
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: uncertainty namespace init absent")?;
+        wait_exact_child(init.host_pid, init.pidfd.as_fd(), deadline)?;
+        self.namespace_init.take();
+        self.startup.take();
+        let status = self
+            .status
+            .take()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: uncertainty target status absent")?;
+        let candidate_exit_code = read_status_until(status, deadline)?;
+        if candidate_exit_code == Some(0) {
+            return Err("MCSEALED-PRIVATE-RELEASE: uncertainty target exited successfully".into());
+        }
+        self.expected_descriptors.take();
+        self.stdio.take();
+        self.relay.take();
+        self.network.take();
+        let guardian = self
+            .guardian
+            .take()
+            .ok_or("MCSEALED-PRIVATE-RELEASE: uncertainty guardian absent")?;
+        let terminal = guardian.stop(deadline)?;
+        if terminal.trigger != super::private_guardian::GuardianTriggerV4::Stopped
+            || terminal.boundary_retired
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: uncertainty guardian terminal differs".into());
+        }
+        Ok(
+            super::private_release_attempt::UncertainCandidateSettlementFactsV1 {
+                schema_version: 1,
+                transport_errno,
+                containment_removed: true,
+                target_pidfd_exited: true,
+                namespace_init_reaped: true,
+                guardian_terminal: terminal.encode(),
+                candidate_exit_code,
+            },
+        )
+    }
+
+    /// This consumes only observed native resources. It does not remove a
+    /// durable record, release a policy reference, or claim terminal success.
+    fn settle_native_resources(&mut self, deadline: Instant) -> Result<Option<i32>, String> {
+        if let Some(cgroup) = self.cgroup.as_ref() {
+            cgroup.clone().kill_and_retire(deadline)?;
+            self.cgroup.take();
+        }
+        if let Some(target) = self.target_pidfd.as_ref() {
+            wait_pidfd(target.as_fd(), deadline)?;
+        }
+        self.target_pidfd.take();
+        if let Some(init) = self.namespace_init.as_ref() {
+            wait_exact_child(init.host_pid, init.pidfd.as_fd(), deadline)?;
+        }
+        self.namespace_init.take();
+        self.startup.take();
+        let candidate_exit_code = self
+            .status
+            .take()
+            .map(|status| read_status_until(status, deadline))
+            .transpose()?
+            .flatten();
+        if self.monitor_outcome == Some(PrivateMonitorOutcome::Completed)
+            && candidate_exit_code.is_none()
+        {
+            return Err("MCSEALED-PRIVATE-OWNER: completed target status absent".into());
+        }
+        self.control.take();
+        self.expected_descriptors.take();
+        self.stdio.take();
+        self.relay.take();
+        self.network.take();
+        if let Some(guardian) = self.guardian.take() {
+            guardian.stop(deadline)?;
+        }
+        Ok(candidate_exit_code)
+    }
+}
+
+impl<J: PrivateNativeJournal> Drop for PrivateAttemptOwner<J> {
     fn drop(&mut self) {
         // Closing provider copies cannot certify retirement. The guardian
         // remains armed until its lease closes and initiates containment.

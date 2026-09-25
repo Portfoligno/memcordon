@@ -112,6 +112,241 @@ fn terminal(status: i32, exec_status: &str, os_code: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+#[test]
+fn private_v4_indeterminate_and_rejection_never_create_restart_proof() {
+    use memcordon_core::DiagnosticSha256;
+    use memcordon_core::workload_evidence_v2::QualifiedNativeAbiV2;
+    use memcordon_platform::{
+        PrivateExpectedResultV2, PrivateReleaseKnowledgeV2, PrivateReplayDispositionV2,
+        private_response_disposition_for_test,
+    };
+
+    let attempt = [0x12; 16];
+    let digest = DiagnosticSha256::from_bytes([0x34; 32]);
+    let expected = PrivateExpectedResultV2 {
+        source_commit: "a",
+        native_abi: QualifiedNativeAbiV2::X86_64LinuxGnu,
+        runtime_manifest_sha256: &digest,
+        installed_qualification_sha256: &digest,
+    };
+    let indeterminate = serde_json::json!({
+        "schema_version": 11,
+        "attempt_id": "12121212121212121212121212121212",
+        "release_knowledge": "possibly-released",
+        "retirement_knowledge": "unverified",
+        "replay_disposition": "do-not-replay",
+        "reason_code": "MCSEALED-PRIVATE-TERMINAL-UNVERIFIED"
+    });
+    let bytes = serde_json::to_vec(&indeterminate).unwrap();
+    let (release, replay, restart_safe, raw) = private_response_disposition_for_test(
+        110, [0x56; 16], attempt, [0x56; 16], attempt, &bytes, &expected,
+    )
+    .unwrap();
+    assert_eq!(release, PrivateReleaseKnowledgeV2::PossiblyReleased);
+    assert_eq!(replay, PrivateReplayDispositionV2::DoNotReplay);
+    assert!(!restart_safe);
+    assert_eq!(raw, bytes);
+
+    let swapped_attempt = String::from_utf8(bytes.clone()).unwrap().replace(
+        "12121212121212121212121212121212",
+        "34343434343434343434343434343434",
+    );
+    let error = private_response_disposition_for_test(
+        110,
+        [0x56; 16],
+        attempt,
+        [0x56; 16],
+        attempt,
+        swapped_attempt.as_bytes(),
+        &expected,
+    )
+    .expect_err("swapped attempt must be rejected");
+    assert_eq!(
+        error.release_knowledge(),
+        PrivateReleaseKnowledgeV2::PossiblyReleased
+    );
+    assert_eq!(
+        error.replay_disposition(),
+        PrivateReplayDispositionV2::DoNotReplay
+    );
+    assert_eq!(error.raw_response, Some(swapped_attempt.into_bytes()));
+
+    let rejection = br#"{
+        "schema_version":1,
+        "code":"MCSEALED-PRIVATE-QUALIFICATION",
+        "phase":"request-validation",
+        "detail":"no installed qualification",
+        "os_code":null,
+        "target_created":false,
+        "target_released":false,
+        "cleanup":{"attempted":false,"direct_child_reaped":false,
+            "workload_empty":null,"helpers_reaped":false,
+            "containment_removed":false,"sealed_boundary_retired":false,"errors":[]}
+    }"#;
+    let (release, replay, restart_safe, raw) = private_response_disposition_for_test(
+        106, [0x56; 16], attempt, [0x56; 16], attempt, rejection, &expected,
+    )
+    .unwrap();
+    assert_eq!(release, PrivateReleaseKnowledgeV2::NotReleased);
+    assert_eq!(
+        replay,
+        PrivateReplayDispositionV2::NewAttemptWithFreshAdmission
+    );
+    assert!(!restart_safe);
+    assert_eq!(raw, rejection);
+
+    let error = private_response_disposition_for_test(
+        106, [0x56; 16], attempt, [0x57; 16], attempt, rejection, &expected,
+    )
+    .expect_err("response nonce mismatch must reject even a valid rejection");
+    assert_eq!(
+        error.replay_disposition(),
+        PrivateReplayDispositionV2::DoNotReplay
+    );
+}
+
+#[test]
+fn private_v4_terminal_needs_exact_installed_binding_and_retirement() {
+    use std::num::NonZeroU64;
+
+    use memcordon_core::report_v11::{
+        PRIVATE_EXECUTION_REPORT_SCHEMA_V11, PrivateExecutionReportV11, PrivateTerminalOutcomeV11,
+    };
+    use memcordon_core::workload_admission_v2::AttemptBindingV2;
+    use memcordon_core::workload_contract::{LogicalId, Nonce128, ProfileRef};
+    use memcordon_core::workload_evidence_v2::{
+        EntryResourceObservationV2, NamespaceObservationV2, PrivatePortPolicyV1,
+        PrivateTcpCheckpointV2, PrivateTcpRetiredV2, QualifiedNativeAbiV2, TargetIdentityKindV2,
+        TargetIdentityObservationV2, VerifiedTrue,
+    };
+    use memcordon_core::{BoundedText, DiagnosticSha256};
+    use memcordon_platform::{
+        PrivateExpectedResultV2, PrivateReleaseKnowledgeV2, PrivateReplayDispositionV2,
+        private_response_disposition_for_test,
+    };
+
+    fn digest(byte: u8) -> DiagnosticSha256 {
+        DiagnosticSha256::from_bytes([byte; 32])
+    }
+    fn yes() -> VerifiedTrue {
+        VerifiedTrue::observed(true).unwrap()
+    }
+    let attempt_bytes = [0x12; 16];
+    let attempt = AttemptBindingV2 {
+        attempt_id: BoundedText::new("12121212121212121212121212121212").unwrap(),
+        admission_digest: digest(7),
+        caller_envelope_digest: digest(8),
+        native_invocation_digest: digest(9),
+    };
+    let checkpoint = PrivateTcpCheckpointV2 {
+        attempt_binding: attempt.canonical_digest().unwrap(),
+        profile: ProfileRef {
+            id: LogicalId::new("linux-tcp4-private-v1".into()).unwrap(),
+            semantic_digest: digest(2),
+        },
+        identity: TargetIdentityObservationV2 {
+            kind: TargetIdentityKindV2::PreserveCaller,
+            entrypoint_digest: digest(3),
+            exact_credentials_verified: yes(),
+            no_new_privileges_verified: yes(),
+            capability_sets_empty: yes(),
+            bounding_set_empty: yes(),
+        },
+        caller_envelope_reference: Nonce128([4; 16]),
+        target_network_namespace: NamespaceObservationV2::observed(
+            NonZeroU64::new(11).unwrap(),
+            NonZeroU64::new(22).unwrap(),
+            true,
+            true,
+        )
+        .unwrap(),
+        topology_digest: digest(5),
+        filter_digest: digest(6),
+        native_abi: QualifiedNativeAbiV2::X86_64LinuxGnu,
+        port_policy: PrivatePortPolicyV1::observed(0, 32768, 60999, true).unwrap(),
+        resources: EntryResourceObservationV2::observed(5, 3, true, true, true, true, true)
+            .unwrap(),
+        guardian_verified: yes(),
+        epoch_revalidated: yes(),
+        checkpoint_durable: yes(),
+    };
+    let retirement =
+        PrivateTcpRetiredV2::observed(&checkpoint, true, true, true, true, true, true).unwrap();
+    let report = PrivateExecutionReportV11 {
+        schema_version: PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
+        source_commit: "a".repeat(40),
+        native_abi: QualifiedNativeAbiV2::X86_64LinuxGnu,
+        runtime_manifest_sha256: digest(10),
+        installed_qualification_sha256: digest(11),
+        attempt,
+        checkpoint,
+        retirement,
+        terminal_receipt_sha256: digest(12),
+        outcome: PrivateTerminalOutcomeV11::Exited { code: 0 },
+    };
+    let bytes = serde_json::to_vec(&report).unwrap();
+    let expected = PrivateExpectedResultV2 {
+        source_commit: &report.source_commit,
+        native_abi: report.native_abi,
+        runtime_manifest_sha256: &report.runtime_manifest_sha256,
+        installed_qualification_sha256: &report.installed_qualification_sha256,
+    };
+    let (release, replay, restart_safe, raw) = private_response_disposition_for_test(
+        105,
+        [0x56; 16],
+        attempt_bytes,
+        [0x56; 16],
+        attempt_bytes,
+        &bytes,
+        &expected,
+    )
+    .unwrap();
+    assert_eq!(release, PrivateReleaseKnowledgeV2::Released);
+    assert_eq!(replay, PrivateReplayDispositionV2::QuerySameAttemptOnly);
+    assert!(restart_safe);
+    assert_eq!(raw, bytes);
+
+    let wrong_manifest = digest(99);
+    let swapped_expected = PrivateExpectedResultV2 {
+        runtime_manifest_sha256: &wrong_manifest,
+        ..expected
+    };
+    let error = private_response_disposition_for_test(
+        105,
+        [0x56; 16],
+        attempt_bytes,
+        [0x56; 16],
+        attempt_bytes,
+        &bytes,
+        &swapped_expected,
+    )
+    .expect_err("swapped installed manifest must be rejected");
+    assert_eq!(
+        error.release_knowledge(),
+        PrivateReleaseKnowledgeV2::PossiblyReleased
+    );
+    assert_eq!(
+        error.replay_disposition(),
+        PrivateReplayDispositionV2::DoNotReplay
+    );
+
+    let mut unretired = serde_json::to_value(&report).unwrap();
+    unretired["retirement"]["provider_network_references_closed"] = serde_json::json!(false);
+    let unretired = serde_json::to_vec(&unretired).unwrap();
+    assert!(
+        private_response_disposition_for_test(
+            105,
+            [0x56; 16],
+            attempt_bytes,
+            [0x56; 16],
+            attempt_bytes,
+            &unretired,
+            &expected,
+        )
+        .is_err()
+    );
+}
+
 fn revoked_terminal() -> Vec<u8> {
     use memcordon_core::workload_contract::*;
     use memcordon_core::workload_evidence::*;

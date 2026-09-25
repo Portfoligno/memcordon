@@ -29,6 +29,7 @@ pub(crate) struct VerifiedInstalledPrivateAuthority {
     qualification_digest: DiagnosticSha256,
     filter_abi: crate::linux::network_filter::NativeAbi,
     filter_digest: DiagnosticSha256,
+    active_host_receipt_sha256: DiagnosticSha256,
 }
 
 #[cfg(target_os = "linux")]
@@ -40,6 +41,106 @@ pub(crate) struct VerifiedInstalledPrivateAuthority {
 pub(crate) struct VerifiedInstalledPrivateAuthorityLease {
     _package_lease: std::fs::File,
     authority: VerifiedInstalledPrivateAuthority,
+}
+
+/// A candidate package readback for the administrator's fixed native canary.
+/// This is intentionally separate from the qualified production authority;
+/// it cannot be converted into `VerifiedInstalledPrivateAuthorityLease`.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub(crate) struct VerifiedProbePackageLease {
+    _package_lease: std::fs::File,
+    _agent_file: std::fs::File,
+    pub(crate) runtime_manifest_sha256: DiagnosticSha256,
+    pub(crate) release_qualification_sha256: DiagnosticSha256,
+    pub(crate) agent_sha256: DiagnosticSha256,
+    pub(crate) units: LinuxUnitHashesV6,
+    pub(crate) filter_sha256: DiagnosticSha256,
+    pub(crate) source_commit: String,
+    pub(crate) target: String,
+}
+
+/// Candidate-capability release tests run against installed M0 before any Q
+/// exists. This non-convertible lease must never be built through the H1 probe
+/// lease, which intentionally requires M1 plus installed Q bytes.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct VerifiedReleaseCandidatePackageLease {
+    _package_lease: std::fs::File,
+    _agent_file: std::fs::File,
+    pub(crate) runtime_manifest_sha256: DiagnosticSha256,
+    pub(crate) installation_epoch: DiagnosticSha256,
+    pub(crate) agent_sha256: DiagnosticSha256,
+    pub(crate) units: LinuxUnitHashesV6,
+    pub(crate) filter_sha256: DiagnosticSha256,
+    pub(crate) source_commit: String,
+    pub(crate) target: String,
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+impl VerifiedReleaseCandidatePackageLease {
+    pub(crate) fn agent_installation_path(&self) -> &'static Path {
+        Path::new(BINARY)
+    }
+
+    pub(crate) fn agent_file_identity(&self) -> Result<(u64, u64), String> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self
+            ._agent_file
+            .metadata()
+            .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: pinned image identity: {error}"))?;
+        if !metadata.is_file() || metadata.dev() == 0 || metadata.ino() == 0 {
+            return Err("MCSEALED-PRIVATE-RELEASE: pinned image identity differs".into());
+        }
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    /// Read a fresh V6 installed inspection under this M0 package lock. The
+    /// bytes are diagnostic release evidence, not a Q or H1 authority.
+    pub(crate) fn installed_inspection_bytes(&self) -> Result<Vec<u8>, String> {
+        let inspection = linux_installed_inspection_v6()?
+            .ok_or("MCSEALED-PRIVATE-RELEASE: installed V6 inspection absent")?;
+        if inspection.package.runtime_manifest_sha256 != self.runtime_manifest_sha256
+            || inspection.installed_agent_sha256 != self.agent_sha256
+            || inspection.installed_units != self.units
+            || inspection.private_qualification.is_some()
+            || inspection.installed_qualification_sha256.is_some()
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: installed M0 inspection differs".into());
+        }
+        serde_json::to_vec(&inspection).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn pinned_fixture_entrypoint(
+        &self,
+    ) -> Result<crate::linux::entrypoint::VerifiedEntrypoint, String> {
+        let file = self
+            ._agent_file
+            .try_clone()
+            .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: clone pinned image: {error}"))?;
+        crate::linux::entrypoint::VerifiedEntrypoint::from_probe_package_image(
+            file,
+            &self.agent_sha256,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedProbePackageLease {
+    pub(crate) fn pinned_fixture_entrypoint(
+        &self,
+    ) -> Result<crate::linux::entrypoint::VerifiedEntrypoint, String> {
+        let file = self
+            ._agent_file
+            .try_clone()
+            .map_err(|error| format!("MCSEALED-PRIVATE-PROBE: clone pinned image: {error}"))?;
+        crate::linux::entrypoint::VerifiedEntrypoint::from_probe_package_image(
+            file,
+            &self.agent_sha256,
+        )
+    }
 }
 
 /// Launch-generation evidence retained after the package lease is consumed.
@@ -81,6 +182,10 @@ impl VerifiedInstalledPrivateAuthorityLease {
 
     pub(crate) fn filter_digest(&self) -> &DiagnosticSha256 {
         &self.authority.filter_digest
+    }
+
+    pub(crate) fn active_host_receipt_sha256(&self) -> &DiagnosticSha256 {
+        &self.authority.active_host_receipt_sha256
     }
 
     /// Consume the lock-bound authority after the release decision. The
@@ -159,6 +264,174 @@ const TMPFILES_FILE: &str = "/usr/lib/tmpfiles.d/memcordon.conf";
 const LEGACY_PACKAGE_LEASE: &str = "/run/memcordon/sealed-package.lock";
 #[cfg(target_os = "linux")]
 const RUNTIME_DIRECTORY: &str = "/run/memcordon";
+#[cfg(target_os = "linux")]
+const INSTALLED_QUALIFICATION_ROOT: &str = "/usr/libexec/memcordon";
+#[cfg(target_os = "linux")]
+const PACKAGE_TRANSACTION_JOURNAL: &str = "/usr/libexec/.memcordon-package-transaction.json";
+#[cfg(target_os = "linux")]
+const PACKAGE_INSTALLATION_EPOCH: &str = "/usr/libexec/.memcordon-installation-epoch.json";
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PackageInstallationEpochV1 {
+    pub(crate) schema_version: u8,
+    pub(crate) counter: u64,
+    pub(crate) nonce_digest: DiagnosticSha256,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct LinuxSourceSnapshot {
+    pub(crate) agent_bytes: Vec<u8>,
+    pub(crate) manifest_bytes: Vec<u8>,
+    pub(crate) qualification: Option<(std::path::PathBuf, Vec<u8>)>,
+    pub(crate) v3: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn read_source_regular(path: &Path, maximum: u64, mode: u32) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| format!("package source open {}: {error}", path.display()))?;
+    let before = file.metadata().map_err(|error| error.to_string())?;
+    if !before.is_file()
+        || before.nlink() != 1
+        || before.mode() & 0o7777 != mode
+        || before.len() > maximum
+    {
+        return Err("package source is not an exact regular artifact".into());
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let after = file.metadata().map_err(|error| error.to_string())?;
+    if bytes.len() as u64 != before.len()
+        || (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec(),
+            before.ctime(),
+            before.ctime_nsec(),
+        ) != (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec(),
+            after.ctime(),
+            after.ctime_nsec(),
+        )
+    {
+        return Err("package source changed during pinned readback".into());
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_source_snapshot(source: &Path) -> Result<LinuxSourceSnapshot, String> {
+    use memcordon_core::runtime_manifest_v3::{
+        RuntimeProfileAvailabilityV3, SealedRuntimeV3, VersionedRuntimeManifest,
+    };
+    let parent = source.parent().ok_or("package source has no parent")?;
+    let agent_bytes = read_source_regular(source, 128 * 1024 * 1024, 0o755)?;
+    if source == Path::new(BINARY) {
+        if let Some(candidate) = crate::linux::runtime_manifest::source_v3_candidate(source)? {
+            let qualification = match candidate.qualification_bytes() {
+                Some(bytes) => {
+                    let relative =
+                        crate::linux::installed_release_qualification::fixed_q_reference_path(
+                            &candidate.manifest.target,
+                        )?;
+                    Some((
+                        Path::new(INSTALLED_QUALIFICATION_ROOT).join(relative),
+                        bytes.to_vec(),
+                    ))
+                }
+                None => None,
+            };
+            return Ok(LinuxSourceSnapshot {
+                agent_bytes,
+                manifest_bytes: candidate.manifest_bytes,
+                qualification,
+                v3: true,
+            });
+        }
+    }
+    let manifest_path = parent.join("runtime-manifest.json");
+    let manifest_bytes = match std::fs::symlink_metadata(&manifest_path) {
+        Ok(_) => Some(read_source_regular(
+            &manifest_path,
+            memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+            0o644,
+        )?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    if let Some(bytes) = manifest_bytes {
+        if let VersionedRuntimeManifest::V3(manifest) = VersionedRuntimeManifest::parse(&bytes)? {
+            let public = read_source_regular(&parent.join("memcordon"), 128 * 1024 * 1024, 0o755)?;
+            let SealedRuntimeV3::WorkloadV2 { profiles, .. } = &manifest.sealed else {
+                return Err("package V3 source lacks workload protocol".into());
+            };
+            let qualification = match &profiles
+                .as_slice()
+                .first()
+                .ok_or("package V3 source lacks private profile")?
+                .availability
+            {
+                RuntimeProfileAvailabilityV3::Qualified { qualification } => {
+                    let relative =
+                        crate::linux::installed_release_qualification::fixed_q_reference_path(
+                            &manifest.target,
+                        )?;
+                    if qualification.artifact != relative {
+                        return Err("package M1 Q reference is not the fixed archive member".into());
+                    }
+                    let source_q = parent.join(relative);
+                    let q_bytes = read_source_regular(
+                        &source_q,
+                        memcordon_core::workload_limits::REGISTRY_BYTES as u64,
+                        0o644,
+                    )?;
+                    Some((
+                        Path::new(INSTALLED_QUALIFICATION_ROOT).join(relative),
+                        q_bytes,
+                    ))
+                }
+                RuntimeProfileAvailabilityV3::Unqualified => None,
+                RuntimeProfileAvailabilityV3::Unsupported => {
+                    return Err("package V3 private profile is unsupported".into());
+                }
+            };
+            crate::linux::installed_release_qualification::from_exact_bytes(
+                bytes.clone(),
+                &agent_bytes,
+                &public,
+                qualification.as_ref().map(|(_, bytes)| bytes.clone()),
+            )?;
+            return Ok(LinuxSourceSnapshot {
+                agent_bytes,
+                manifest_bytes: bytes,
+                qualification,
+                v3: true,
+            });
+        }
+    }
+    let legacy_manifest = crate::linux::runtime_manifest::source(source, &agent_bytes)?;
+    Ok(LinuxSourceSnapshot {
+        agent_bytes,
+        manifest_bytes: legacy_manifest,
+        qualification: None,
+        v3: false,
+    })
+}
 
 pub fn run(
     operation: &OsStr,
@@ -187,6 +460,13 @@ pub fn run(
         }
         return render_installed_inspection(&installed_inspection()?, json);
     }
+    #[cfg(target_os = "linux")]
+    if operation == "qualify-private" {
+        if json || ephemeral_ci || qualification_artifact_directory.is_some() {
+            return Err("qualify-private accepts no modifiers or external artifacts".into());
+        }
+        return qualify_private_host();
+    }
     if json {
         return Err("--json is valid only for package inspect and package verify".to_owned());
     }
@@ -208,6 +488,35 @@ pub fn run(
         let _ = (ephemeral_ci, qualification_artifact_directory);
         Err("provider package mutation is unavailable on this platform".to_owned())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn qualify_private_host() -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("MCSEALED-PRIVATE-PROBE: root administrator required".into());
+    }
+    let current = std::fs::metadata(std::env::current_exe().map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let installed = std::fs::symlink_metadata(BINARY).map_err(|error| error.to_string())?;
+    if !installed.is_file() || current.dev() != installed.dev() || current.ino() != installed.ino()
+    {
+        return Err("MCSEALED-PRIVATE-PROBE: invoke the installed agent image".into());
+    }
+    // Starting the socket only activates the protected launcher service for
+    // this administrator operation. It does not publish or enable a profile.
+    let status = std::process::Command::new("systemctl")
+        .arg("start")
+        .arg("memcordon-sealed-network-launcher.socket")
+        .status()
+        .map_err(|error| format!("MCSEALED-PRIVATE-PROBE: start socket: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "MCSEALED-PRIVATE-PROBE: start socket exited {status}"
+        ));
+    }
+    crate::linux::service::request_private_host_qualification()
 }
 
 #[cfg(target_os = "linux")]
@@ -337,8 +646,20 @@ pub(crate) fn package_inspection_v6_from_verified_manifest(
 #[cfg(target_os = "linux")]
 fn linux_package_inspection_v6() -> Result<Option<LinuxPackageInspectionV6>, String> {
     let source = std::env::current_exe().map_err(|error| error.to_string())?;
-    let Some((manifest, bytes)) = crate::linux::runtime_manifest::source_v3(&source)? else {
-        return Ok(None);
+    let (manifest, bytes) = if source == Path::new(BINARY) {
+        let Some(candidate) = crate::linux::runtime_manifest::source_v3_candidate(&source)? else {
+            return Ok(None);
+        };
+        (candidate.manifest, candidate.manifest_bytes)
+    } else {
+        let snapshot = linux_source_snapshot(&source)?;
+        if !snapshot.v3 {
+            return Ok(None);
+        }
+        let manifest = memcordon_core::runtime_manifest_v3::RuntimeManifestV3::parse(
+            &snapshot.manifest_bytes,
+        )?;
+        (manifest, snapshot.manifest_bytes)
     };
     Ok(Some(package_inspection_v6_from_verified_manifest(
         &manifest, &bytes,
@@ -347,35 +668,19 @@ fn linux_package_inspection_v6() -> Result<Option<LinuxPackageInspectionV6>, Str
 
 #[cfg(target_os = "linux")]
 fn linux_installed_inspection_v6() -> Result<Option<LinuxInstalledInspectionV6>, String> {
-    let Some((manifest, manifest_bytes)) =
-        crate::linux::runtime_manifest::source_v3(Path::new(BINARY))?
+    let Some(candidate) = crate::linux::runtime_manifest::source_v3_candidate(Path::new(BINARY))?
     else {
         return Ok(None);
     };
-    let binding = crate::linux::runtime_manifest::installed_binding_v3()?;
+    let manifest = candidate.manifest;
+    let manifest_bytes = candidate.manifest_bytes;
+    let binding = manifest.public_binding(&manifest_bytes)?;
     if binding.runtime_manifest_sha256
         != memcordon_core::workload_codec::hash_bytes(&manifest_bytes)
     {
         return Err("V6 installed generation changed during binding readback".into());
     }
-    for unit in [
-        "memcordon-sealed-network-launcher.service",
-        "memcordon-sealed-network-launcher.socket",
-    ] {
-        ensure_unit_inactive(unit)?;
-        let output = std::process::Command::new("/usr/bin/systemctl")
-            .args(["show", "--property=UnitFileState", "--value", unit])
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !output.status.success()
-            || std::str::from_utf8(&output.stdout)
-                .map_err(|error| error.to_string())?
-                .trim()
-                != "disabled"
-        {
-            return Err("V6 optional network broker is not disabled".into());
-        }
-    }
+    let network_launcher_state = observed_network_launcher_state()?;
     let package = package_inspection_v6_from_verified_manifest(&manifest, &manifest_bytes)?;
     let installed_agent_sha256 = DiagnosticSha256::try_from(
         BoundedText::<64>::new(&sha256_regular_no_follow(Path::new(BINARY))?)
@@ -390,7 +695,7 @@ fn linux_installed_inspection_v6() -> Result<Option<LinuxInstalledInspectionV6>,
         installed_agent_sha256: installed_agent_sha256.clone(),
         installed_artifacts_valid: true,
         provider_reachable,
-        network_launcher_state: NetworkLauncherStateV6::InstalledDisabled,
+        network_launcher_state,
         baseline_qualification: None,
         private_qualification: None,
         installed_qualification_sha256: None,
@@ -405,7 +710,7 @@ fn linux_installed_inspection_v6() -> Result<Option<LinuxInstalledInspectionV6>,
             unit_hashes: &package.compiled_units,
             installed_agent_sha256: &installed_agent_sha256,
             provider_reachable,
-            network_launcher_state: NetworkLauncherStateV6::InstalledDisabled,
+            network_launcher_state,
             baseline_qualification: None,
             private_qualification: None,
             installed_qualification_sha256: None,
@@ -414,28 +719,286 @@ fn linux_installed_inspection_v6() -> Result<Option<LinuxInstalledInspectionV6>,
     Ok(Some(inspection))
 }
 
-/// No private authority lease is issued while the installed V4 probe producer
-/// and routed terminal/retirement evidence are absent. The package lock stays
-/// held across verification and, once available, the caller's checkpoint and
-/// release. Readback still distinguishes an absent V3 package from an installed
-/// disabled one.
+/// The package lock stays held across installed readback and, once native host
+/// qualification is available, the caller's checkpoint and release. This
+/// constructor must use independent protected host evidence, never inspection
+/// output: inspection itself observes whether the private profile is ready.
 #[cfg(target_os = "linux")]
 pub(crate) fn acquire_verified_private_qualification_lease()
 -> Result<VerifiedInstalledPrivateAuthorityLease, String> {
     let _package_lease = crate::linux::service::acquire_shared_package_lease()?;
     verify()?;
-    let inspection = linux_installed_inspection_v6()?
-        .ok_or("MCSEALED-PRIVATE-QUALIFICATION: installed V3 generation absent")?;
-    if inspection.network_launcher_state != NetworkLauncherStateV6::EnabledQualified {
-        return Err(
-            "MCSEALED-PRIVATE-QUALIFICATION: network profile is not enabled and qualified".into(),
-        );
+    let Some((_manifest, _bytes)) = crate::linux::runtime_manifest::source_v3(Path::new(BINARY))?
+    else {
+        return Err("MCSEALED-PRIVATE-QUALIFICATION: installed V3 generation absent".into());
+    };
+    if observed_network_launcher_state()? != NetworkLauncherStateV6::EnabledUnqualified {
+        return Err("MCSEALED-PRIVATE-QUALIFICATION: network launcher is not active".into());
     }
-    unimplemented!("routed native V4 host receipt producer and verifier are not integrated")
+    Err("MCSEALED-PRIVATE-QUALIFICATION: trusted native V4 host run is absent".into())
+}
+
+/// This route cannot be called from structurally valid installed Q bytes: the
+/// release token is available only to an independent native-run verifier.
+/// The lock is retained through the caller's native release decision.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Independent release-Q provenance is not yet published.
+pub(crate) fn acquire_verified_private_qualification_lease_with_release(
+    release: &crate::linux::installed_release_qualification::TrustedReleaseQualification,
+) -> Result<VerifiedInstalledPrivateAuthorityLease, String> {
+    use crate::linux::network_filter::NativeAbi;
+
+    let package_lease = crate::linux::service::acquire_shared_package_lease()?;
+    verify()?;
+    let candidate = crate::linux::runtime_manifest::source_v3_candidate(Path::new(BINARY))?
+        .ok_or("MCSEALED-PRIVATE-QUALIFICATION: installed M1 absent")?;
+    let q_digest = candidate
+        .qualification_sha256
+        .as_ref()
+        .ok_or("MCSEALED-PRIVATE-QUALIFICATION: installed release Q absent")?;
+    if release.reference().artifact_sha256 != *q_digest {
+        return Err("MCSEALED-PRIVATE-QUALIFICATION: trusted release Q differs from M1".into());
+    }
+    if observed_network_launcher_state()? != NetworkLauncherStateV6::EnabledUnqualified {
+        return Err("MCSEALED-PRIVATE-QUALIFICATION: network launcher is not active".into());
+    }
+    let host = crate::linux::private_host_receipt::read_current_active(release)?
+        .ok_or("MCSEALED-PRIVATE-QUALIFICATION: current active H1 absent")?;
+    let epoch = installed_generation_epoch()?;
+    let manifest_sha256 = memcordon_core::workload_codec::hash_bytes(&candidate.manifest_bytes);
+    if host.installation_epoch() != &epoch
+        || host.release_qualification_sha256() != q_digest
+        || host.receipt().installed_runtime_manifest_sha256 != manifest_sha256
+        || host.receipt().source_commit != candidate.manifest.source_commit
+        || host.receipt().target != candidate.manifest.target
+    {
+        return Err("MCSEALED-PRIVATE-QUALIFICATION: active H1 differs from current M1/Q".into());
+    }
+    let filter_abi = match candidate.manifest.target.as_str() {
+        "x86_64-unknown-linux-gnu" => NativeAbi::X86_64,
+        "aarch64-unknown-linux-gnu" => NativeAbi::Aarch64,
+        _ => return Err("MCSEALED-PRIVATE-QUALIFICATION: unsupported native ABI".into()),
+    };
+    let filter_digest = compiled_filter_digest_v6()?;
+    if host.receipt().filter_instruction_sha256 != filter_digest {
+        return Err("MCSEALED-PRIVATE-QUALIFICATION: active H1 filter differs".into());
+    }
+    Ok(VerifiedInstalledPrivateAuthorityLease {
+        _package_lease: package_lease,
+        authority: VerifiedInstalledPrivateAuthority {
+            source_commit: candidate.manifest.source_commit,
+            runtime_manifest_sha256: manifest_sha256,
+            generation_digest: epoch,
+            qualification_digest: q_digest.clone(),
+            filter_abi,
+            filter_digest,
+            active_host_receipt_sha256: host.receipt_sha256().clone(),
+        },
+    })
+}
+
+/// Qualification bootstrap verifies installed candidate bytes under the
+/// package lock without asking for an already qualified host lease.
+#[cfg(target_os = "linux")]
+pub(crate) fn acquire_verified_release_candidate_package_lease()
+-> Result<VerifiedReleaseCandidatePackageLease, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    // SAFETY: geteuid has no pointers and returns the kernel effective UID.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("MCSEALED-PRIVATE-RELEASE: root candidate supervisor required".into());
+    }
+    let package_lease = crate::linux::service::acquire_shared_package_lease()?;
+    verify()?;
+    let (manifest, manifest_bytes) = crate::linux::runtime_manifest::source_v3(Path::new(BINARY))?
+        .ok_or("MCSEALED-PRIVATE-RELEASE: installed unqualified M0 absent")?;
+    let installation_epoch = installed_generation_epoch()?;
+    let units = installed_unit_hashes_v6()?;
+    if units != compiled_unit_hashes_v6() {
+        return Err("MCSEALED-PRIVATE-RELEASE: installed unit bytes differ".into());
+    }
+    let mut agent_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(BINARY)
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: pinned image open: {error}"))?;
+    let metadata = agent_file
+        .metadata()
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: pinned image metadata: {error}"))?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o777 != 0o755
+        || metadata.nlink() != 1
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: pinned image protection differs".into());
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = agent_file
+            .read(&mut buffer)
+            .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: pinned image read: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    let agent_sha256 = DiagnosticSha256::from_bytes(hash.finalize().into());
+    let expected_agent = DiagnosticSha256::try_from(
+        BoundedText::<64>::new(&inspect()?.executable_sha256).map_err(str::to_owned)?,
+    )
+    .map_err(str::to_owned)?;
+    if agent_sha256 != expected_agent {
+        return Err("MCSEALED-PRIVATE-RELEASE: pinned image digest differs".into());
+    }
+    let path_metadata = std::fs::symlink_metadata(BINARY)
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: installed image path: {error}"))?;
+    if metadata.dev() != path_metadata.dev() || metadata.ino() != path_metadata.ino() {
+        return Err("MCSEALED-PRIVATE-RELEASE: installed image changed during pinning".into());
+    }
+    Ok(VerifiedReleaseCandidatePackageLease {
+        _package_lease: package_lease,
+        _agent_file: agent_file,
+        runtime_manifest_sha256: memcordon_core::workload_codec::hash_bytes(&manifest_bytes),
+        installation_epoch,
+        agent_sha256,
+        units,
+        filter_sha256: compiled_filter_digest_v6()?,
+        source_commit: manifest.source_commit,
+        target: manifest.target,
+    })
+}
+
+/// Installed H1 canaries require a structurally bound M1/Q candidate but
+/// still cannot construct a production private qualification lease.
+#[cfg(target_os = "linux")]
+pub(crate) fn acquire_verified_probe_package_lease() -> Result<VerifiedProbePackageLease, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    // SAFETY: geteuid has no pointers and returns the kernel's effective UID.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("MCSEALED-PRIVATE-PROBE: root coordinator required".into());
+    }
+    let package_lease = crate::linux::service::acquire_shared_package_lease()?;
+    verify()?;
+    let candidate = crate::linux::runtime_manifest::source_v3_candidate(Path::new(BINARY))?
+        .ok_or("MCSEALED-PRIVATE-PROBE: installed V3 candidate absent")?;
+    let release_qualification_sha256 = candidate
+        .qualification_sha256
+        .clone()
+        .ok_or("MCSEALED-PRIVATE-PROBE: installed M1 Q bytes absent")?;
+    let units = installed_unit_hashes_v6()?;
+    if units != compiled_unit_hashes_v6() {
+        return Err("MCSEALED-PRIVATE-PROBE: installed unit bytes differ".into());
+    }
+    let mut agent_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(BINARY)
+        .map_err(|error| format!("MCSEALED-PRIVATE-PROBE: pinned image open: {error}"))?;
+    let metadata = agent_file
+        .metadata()
+        .map_err(|error| format!("MCSEALED-PRIVATE-PROBE: pinned image metadata: {error}"))?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o777 != 0o755 {
+        return Err("MCSEALED-PRIVATE-PROBE: pinned image protection differs".into());
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = agent_file
+            .read(&mut buffer)
+            .map_err(|error| format!("MCSEALED-PRIVATE-PROBE: pinned image read: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    let agent_sha256 = DiagnosticSha256::from_bytes(hash.finalize().into());
+    let expected_agent = DiagnosticSha256::try_from(
+        BoundedText::<64>::new(&inspect()?.executable_sha256).map_err(str::to_owned)?,
+    )
+    .map_err(str::to_owned)?;
+    if agent_sha256 != expected_agent {
+        return Err("MCSEALED-PRIVATE-PROBE: pinned image digest differs".into());
+    }
+    let path_metadata = std::fs::symlink_metadata(BINARY)
+        .map_err(|error| format!("MCSEALED-PRIVATE-PROBE: installed image path: {error}"))?;
+    if metadata.dev() != path_metadata.dev() || metadata.ino() != path_metadata.ino() {
+        return Err("MCSEALED-PRIVATE-PROBE: installed image changed during pinning".into());
+    }
+    Ok(VerifiedProbePackageLease {
+        _package_lease: package_lease,
+        _agent_file: agent_file,
+        runtime_manifest_sha256: memcordon_core::workload_codec::hash_bytes(
+            &candidate.manifest_bytes,
+        ),
+        release_qualification_sha256,
+        agent_sha256,
+        units,
+        filter_sha256: compiled_filter_digest_v6()?,
+        source_commit: candidate.manifest.source_commit,
+        target: candidate.manifest.target,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn observed_network_launcher_state() -> Result<NetworkLauncherStateV6, String> {
+    let mut all_disabled = true;
+    for unit in [
+        "memcordon-sealed-network-launcher.service",
+        "memcordon-sealed-network-launcher.socket",
+    ] {
+        let output = std::process::Command::new("/usr/bin/systemctl")
+            .args(["show", "--property=ActiveState,UnitFileState", unit])
+            .output()
+            .map_err(|error| format!("V6 network launcher state readback: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "V6 network launcher state readback failed for {unit}: {}",
+                output.status
+            ));
+        }
+        let values = std::str::from_utf8(&output.stdout).map_err(|error| error.to_string())?;
+        let mut active = None;
+        let mut enabled = None;
+        for line in values.lines() {
+            if let Some(value) = line.strip_prefix("ActiveState=") {
+                if active.replace(value).is_some() {
+                    return Err("V6 network launcher has duplicate active state".into());
+                }
+            } else if let Some(value) = line.strip_prefix("UnitFileState=") {
+                if enabled.replace(value).is_some() {
+                    return Err("V6 network launcher has duplicate unit state".into());
+                }
+            } else {
+                return Err("V6 network launcher has an unknown state field".into());
+            }
+        }
+        let (Some(active), Some(enabled)) = (active, enabled) else {
+            return Err("V6 network launcher state readback is incomplete".into());
+        };
+        if !matches!(active, "inactive" | "failed" | "active" | "activating")
+            || !matches!(enabled, "disabled" | "enabled" | "static")
+        {
+            return Err("V6 network launcher has an unsupported state".into());
+        }
+        all_disabled &= matches!(active, "inactive" | "failed") && enabled == "disabled";
+    }
+    Ok(if all_disabled {
+        NetworkLauncherStateV6::InstalledDisabled
+    } else {
+        NetworkLauncherStateV6::EnabledUnqualified
+    })
 }
 
 pub(crate) fn verify() -> Result<(), String> {
     verify_compiled_metadata()?;
+    #[cfg(target_os = "linux")]
+    match std::fs::symlink_metadata(PACKAGE_TRANSACTION_JOURNAL) {
+        Ok(_) => return Err("package generation has an unrecovered transaction journal".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
     #[cfg(target_os = "linux")]
     verify_installed_package()?;
     #[cfg(target_os = "windows")]
@@ -1068,10 +1631,587 @@ fn verify_installed_package_against(packaged_executable_sha256: &str) -> Result<
 }
 
 #[cfg(target_os = "linux")]
+struct PackageFileChange {
+    path: std::path::PathBuf,
+    bytes: Option<Vec<u8>>,
+    mode: u32,
+}
+
+#[cfg(target_os = "linux")]
+struct AppliedPackageFileChange {
+    path: std::path::PathBuf,
+    backup: Option<tempfile::TempPath>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PackageJournalEntry {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) backup: Option<std::path::PathBuf>,
+    pub(crate) old_sha256: Option<DiagnosticSha256>,
+    pub(crate) old_device: Option<u64>,
+    pub(crate) old_inode: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PackageJournal {
+    pub(crate) schema_version: u8,
+    pub(crate) entries: Vec<PackageJournalEntry>,
+}
+
+#[cfg(target_os = "linux")]
+struct PackageFileTransaction {
+    applied: Vec<AppliedPackageFileChange>,
+    directories: CreatedPackageDirectories,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct CreatedPackageDirectories {
+    paths: Vec<std::path::PathBuf>,
+    keep: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl CreatedPackageDirectories {
+    fn cleanup(&mut self) -> Result<(), String> {
+        while let Some(path) = self.paths.pop() {
+            if let Err(error) = std::fs::remove_dir(&path) {
+                self.paths.push(path);
+                return Err(error.to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CreatedPackageDirectories {
+    fn drop(&mut self) {
+        if !self.keep {
+            for path in self.paths.drain(..).rev() {
+                let _ = std::fs::remove_dir(path);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_protected_package_parent(
+    path: &Path,
+    directories: &mut CreatedPackageDirectories,
+) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let parent = path.parent().ok_or("package artifact has no parent")?;
+    let mut current = std::path::PathBuf::from("/");
+    for component in parent.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+                    return Err(format!(
+                        "package artifact parent is not root-protected: {}",
+                        current.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .mode(0o755)
+                    .create(&current)
+                    .map_err(|error| error.to_string())?;
+                directories.paths.push(current.clone());
+                let metadata =
+                    std::fs::symlink_metadata(&current).map_err(|error| error.to_string())?;
+                if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o7777 != 0o755 {
+                    return Err("created package directory protection differs".into());
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn sync_package_parent(path: &Path) -> Result<(), String> {
+    std::fs::File::open(path.parent().ok_or("package artifact has no parent")?)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn allowed_journal_target(path: &Path) -> bool {
+    [
+        BINARY,
+        UNIT,
+        SOCKET_UNIT,
+        LAUNCHER_UNIT,
+        LAUNCHER_SOCKET_UNIT,
+        NETWORK_LAUNCHER_UNIT,
+        NETWORK_LAUNCHER_SOCKET_UNIT,
+        TMPFILES_FILE,
+        crate::linux::runtime_manifest::INSTALLED,
+        "/usr/libexec/memcordon/certification/workload/linux-x64-private-v2.json",
+        "/usr/libexec/memcordon/certification/workload/linux-arm64-private-v2.json",
+    ]
+    .into_iter()
+    .any(|expected| path == Path::new(expected))
+}
+
+#[cfg(target_os = "linux")]
+fn protected_file_digest(path: &Path) -> Result<DiagnosticSha256, String> {
+    DiagnosticSha256::try_from(
+        BoundedText::<64>::new(&sha256_regular_no_follow(path)?).map_err(str::to_owned)?,
+    )
+    .map_err(str::to_owned)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_package_journal(journal: &PackageJournal) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    if journal.schema_version != 1 || journal.entries.is_empty() || journal.entries.len() > 11 {
+        return Err("package transaction journal inventory differs".into());
+    }
+    for entry in &journal.entries {
+        if !allowed_journal_target(&entry.path)
+            || !seen.insert(&entry.path)
+            || entry.backup.is_some() != entry.old_sha256.is_some()
+            || entry.backup.is_some() != entry.old_device.is_some()
+            || entry.backup.is_some() != entry.old_inode.is_some()
+        {
+            return Err("package transaction journal target differs".into());
+        }
+        if let Some(backup) = &entry.backup {
+            if backup.parent() != entry.path.parent()
+                || !backup
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".memcordon-backup-"))
+            {
+                return Err("package transaction journal backup path differs".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_package_journal(journal: &PackageJournal) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+    validate_package_journal(journal)?;
+    let path = Path::new(PACKAGE_TRANSACTION_JOURNAL);
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Err("unrecovered package transaction journal exists".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let bytes = serde_json::to_vec(journal).map_err(|error| error.to_string())?;
+    if bytes.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES {
+        return Err("package transaction journal exceeds byte bound".into());
+    }
+    let mut stage = tempfile::Builder::new()
+        .prefix(".memcordon-journal-")
+        .tempfile_in(path.parent().expect("fixed journal parent"))
+        .map_err(|error| error.to_string())?;
+    // SAFETY: the open staging file is exclusively owned by this root installer.
+    if unsafe { libc::fchown(stage.as_file().as_raw_fd(), 0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    stage.write_all(&bytes).map_err(|error| error.to_string())?;
+    stage
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    stage
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    std::fs::rename(stage.path(), path).map_err(|error| error.to_string())?;
+    sync_package_parent(path)
+}
+
+#[cfg(target_os = "linux")]
+fn clear_package_journal() -> Result<(), String> {
+    let path = Path::new(PACKAGE_TRANSACTION_JOURNAL);
+    crate::linux::installed_release_qualification::read_protected_absolute(
+        path,
+        memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+        Some(0o600),
+    )?;
+    std::fs::remove_file(path).map_err(|error| error.to_string())?;
+    sync_package_parent(path)
+}
+
+#[cfg(target_os = "linux")]
+fn read_installation_epoch() -> Result<Option<(PackageInstallationEpochV1, Vec<u8>)>, String> {
+    let path = Path::new(PACKAGE_INSTALLATION_EPOCH);
+    let bytes = match std::fs::symlink_metadata(path) {
+        Ok(_) => crate::linux::installed_release_qualification::read_protected_absolute(
+            path,
+            memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+            Some(0o600),
+        )?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+    let epoch: PackageInstallationEpochV1 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if epoch.schema_version != 1
+        || epoch.counter == 0
+        || epoch.nonce_digest == DiagnosticSha256::from_bytes([0; 32])
+        || serde_json::to_vec(&epoch).map_err(|error| error.to_string())? != bytes
+    {
+        return Err("package installation epoch differs from canonical record".into());
+    }
+    Ok(Some((epoch, bytes)))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn next_installation_epoch(
+    previous: Option<&PackageInstallationEpochV1>,
+    nonce: [u8; 32],
+) -> Result<PackageInstallationEpochV1, String> {
+    let counter = previous.map_or(Ok(1), |epoch| {
+        epoch.counter.checked_add(1).ok_or("package epoch overflow")
+    })?;
+    Ok(PackageInstallationEpochV1 {
+        schema_version: 1,
+        counter,
+        nonce_digest: memcordon_core::workload_codec::hash_bytes(&nonce),
+    })
+}
+
+/// A package-generation identity independent of M1/Q bytes. Callers must
+/// retain a shared or exclusive package lease across this read and admission.
+#[cfg(target_os = "linux")]
+pub(crate) fn installed_generation_epoch() -> Result<DiagnosticSha256, String> {
+    let (_, bytes) = read_installation_epoch()?
+        .ok_or("protected package installation epoch is absent; re-install or upgrade")?;
+    Ok(memcordon_core::workload_codec::hash_bytes(&bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn advance_installation_epoch() -> Result<DiagnosticSha256, String> {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    let previous = read_installation_epoch()?;
+    let mut nonce = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut random| random.read_exact(&mut nonce))
+        .map_err(|error| format!("package epoch entropy unavailable: {error}"))?;
+    let epoch = next_installation_epoch(previous.as_ref().map(|(epoch, _)| epoch), nonce)?;
+    let bytes = serde_json::to_vec(&epoch).map_err(|error| error.to_string())?;
+    let path = Path::new(PACKAGE_INSTALLATION_EPOCH);
+    let mut directories = CreatedPackageDirectories::default();
+    ensure_protected_package_parent(path, &mut directories)?;
+    let mut stage = tempfile::Builder::new()
+        .prefix(".memcordon-epoch-")
+        .tempfile_in(path.parent().expect("fixed epoch parent"))
+        .map_err(|error| error.to_string())?;
+    // SAFETY: the staged epoch descriptor remains live in this root installer.
+    if unsafe { libc::fchown(stage.as_file().as_raw_fd(), 0, 0) } == -1 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    stage.write_all(&bytes).map_err(|error| error.to_string())?;
+    stage
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| error.to_string())?;
+    stage
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    std::fs::rename(stage.path(), path).map_err(|error| error.to_string())?;
+    sync_package_parent(path)?;
+    directories.keep = true;
+    let (_, readback) = read_installation_epoch()?.ok_or("package epoch vanished after write")?;
+    if readback != bytes {
+        return Err("package epoch changed during protected readback".into());
+    }
+    Ok(memcordon_core::workload_codec::hash_bytes(&bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn recover_package_journal() -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let path = Path::new(PACKAGE_TRANSACTION_JOURNAL);
+    let bytes = match std::fs::symlink_metadata(path) {
+        Ok(_) => crate::linux::installed_release_qualification::read_protected_absolute(
+            path,
+            memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+            Some(0o600),
+        )?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+    let journal: PackageJournal =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    validate_package_journal(&journal)?;
+    for unit in [
+        "memcordon-sealed-network-launcher.service",
+        "memcordon-sealed-network-launcher.socket",
+        "memcordon-sealed-agent.service",
+        "memcordon-sealed-launcher.service",
+        "memcordon-sealed-agent.socket",
+        "memcordon-sealed-launcher.socket",
+    ] {
+        stop_unit(unit)?;
+    }
+    ensure_recovery_idle("recover package transaction")?;
+    for entry in journal.entries.iter().rev() {
+        if let (Some(backup), Some(old_sha256)) = (&entry.backup, &entry.old_sha256) {
+            let original_matches = |path: &Path| -> Result<bool, String> {
+                let metadata = match std::fs::symlink_metadata(path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(error) => return Err(error.to_string()),
+                };
+                Ok(metadata.is_file()
+                    && metadata.uid() == 0
+                    && metadata.nlink() == 1
+                    && Some(metadata.dev()) == entry.old_device
+                    && Some(metadata.ino()) == entry.old_inode
+                    && protected_file_digest(path)? == *old_sha256)
+            };
+            let backup_present = match std::fs::symlink_metadata(backup) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.to_string()),
+            };
+            if original_matches(backup)? {
+                std::fs::rename(backup, &entry.path).map_err(|error| error.to_string())?;
+            } else if original_matches(&entry.path)? {
+                if backup_present {
+                    std::fs::remove_file(backup).map_err(|error| error.to_string())?;
+                }
+            } else {
+                return Err("package transaction backup and old artifact both differ".into());
+            }
+        } else {
+            match std::fs::remove_file(&entry.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        sync_package_parent(&entry.path)?;
+    }
+    systemctl(["daemon-reload"])?;
+    clear_package_journal()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_install_is_new(operation: &OsStr, installed: bool) -> Result<(), String> {
+    if operation == "install" && installed {
+        return Err(
+            "provider is already installed; use package upgrade for a quiesced replacement".into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn ensure_install_preflight(
+    operation: &OsStr,
+    journal_pending: bool,
+    installed: bool,
+) -> Result<(), String> {
+    if operation != "install" {
+        return Ok(());
+    }
+    if journal_pending {
+        return Err("package install requires recovery of a pending transaction first".into());
+    }
+    ensure_install_is_new(operation, installed)
+}
+
+#[cfg(target_os = "linux")]
+impl PackageFileTransaction {
+    fn apply(changes: Vec<PackageFileChange>) -> Result<Self, String> {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let mut staged = Vec::with_capacity(changes.len());
+        let mut directories = CreatedPackageDirectories::default();
+        for change in changes {
+            ensure_protected_package_parent(&change.path, &mut directories)?;
+            let stage = if let Some(bytes) = &change.bytes {
+                let parent = change.path.parent().expect("protected parent");
+                let mut stage =
+                    tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+                // SAFETY: the temporary file descriptor remains live, and the
+                // installer is root under the exclusive package-generation lock.
+                if unsafe { libc::fchown(stage.as_file().as_raw_fd(), 0, 0) } == -1 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                stage.write_all(bytes).map_err(|error| error.to_string())?;
+                stage
+                    .as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(change.mode))
+                    .map_err(|error| error.to_string())?;
+                stage
+                    .as_file()
+                    .sync_all()
+                    .map_err(|error| error.to_string())?;
+                Some(stage)
+            } else {
+                None
+            };
+            staged.push((change.path, stage));
+        }
+        let mut prepared = Vec::with_capacity(staged.len());
+        let mut journal_entries = Vec::with_capacity(staged.len());
+        for (path, stage) in staged {
+            let parent = path.parent().expect("protected parent");
+            let (backup, old_sha256, old_device, old_inode) = match std::fs::symlink_metadata(&path)
+            {
+                Ok(metadata) => {
+                    if !metadata.is_file()
+                        || metadata.uid() != 0
+                        || metadata.nlink() != 1
+                        || metadata.mode() & 0o022 != 0
+                    {
+                        return Err("existing package artifact is not root-protected".into());
+                    }
+                    let old_sha256 = protected_file_digest(&path)?;
+                    let backup = tempfile::Builder::new()
+                        .prefix(".memcordon-backup-")
+                        .tempfile_in(parent)
+                        .map_err(|error| error.to_string())?
+                        .into_temp_path();
+                    (
+                        Some(backup),
+                        Some(old_sha256),
+                        Some(metadata.dev()),
+                        Some(metadata.ino()),
+                    )
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (None, None, None, None)
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            journal_entries.push(PackageJournalEntry {
+                path: path.clone(),
+                backup: backup.as_ref().map(|value| value.to_path_buf()),
+                old_sha256,
+                old_device,
+                old_inode,
+            });
+            prepared.push((path, stage, backup));
+        }
+        if let Err(error) = write_package_journal(&PackageJournal {
+            schema_version: 1,
+            entries: journal_entries,
+        }) {
+            // A directory fsync can fail after the journal rename. In that
+            // state its recorded backup names must outlive these TempPaths so
+            // the next locked mutation can inspect/recover the transaction.
+            if std::fs::symlink_metadata(PACKAGE_TRANSACTION_JOURNAL).is_ok() {
+                for (_, _, backup) in &mut prepared {
+                    if let Some(backup) = backup.take() {
+                        backup.keep().map_err(|keep_error| {
+                            format!("journal write failed: {error}; backup retain: {keep_error}")
+                        })?;
+                    }
+                }
+                directories.keep = true;
+            }
+            return Err(error);
+        }
+        let mut transaction = Self {
+            applied: Vec::with_capacity(prepared.len()),
+            directories,
+        };
+        for (path, stage, backup) in prepared {
+            let result = (|| {
+                if let Some(backup) = &backup {
+                    std::fs::rename(&path, backup).map_err(|error| error.to_string())?;
+                }
+                transaction.applied.push(AppliedPackageFileChange {
+                    path: path.clone(),
+                    backup,
+                });
+                if let Some(stage) = stage {
+                    std::fs::rename(stage.path(), &path).map_err(|error| error.to_string())?;
+                }
+                sync_package_parent(&path)
+            })();
+            if let Err(error) = result {
+                return match transaction.rollback() {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(format!("{error}; package rollback failed: {rollback}")),
+                };
+            }
+        }
+        Ok(transaction)
+    }
+
+    fn rollback(mut self) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for applied in self.applied.drain(..).rev() {
+            match std::fs::remove_file(&applied.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => failures.push(error.to_string()),
+            }
+            if let Some(backup) = applied.backup {
+                if let Err(error) = std::fs::rename(&backup, &applied.path) {
+                    failures.push(error.to_string());
+                    if let Err(keep_error) = backup.keep() {
+                        failures.push(format!("could not retain rollback backup: {keep_error}"));
+                    }
+                }
+            }
+            if let Err(error) = sync_package_parent(&applied.path) {
+                failures.push(error);
+            }
+        }
+        if failures.is_empty() {
+            self.directories.cleanup()?;
+            clear_package_journal()
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    fn commit(mut self) -> Result<(), String> {
+        if let Err(error) = clear_package_journal() {
+            for applied in &mut self.applied {
+                if let Some(backup) = applied.backup.take() {
+                    backup.keep().map_err(|keep_error| {
+                        format!("journal commit failed: {error}; backup retain: {keep_error}")
+                    })?;
+                }
+            }
+            self.directories.keep = true;
+            return Err(error);
+        }
+        self.directories.keep = true;
+        for applied in self.applied.drain(..) {
+            drop(applied.backup);
+            sync_package_parent(&applied.path)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     use std::fs;
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::path::Path;
 
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
@@ -1081,14 +2221,6 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     if operation != "install" && operation != "upgrade" && operation != "uninstall" {
         return Err("unknown package operation".to_owned());
     }
-    let source_snapshot = if operation == "uninstall" {
-        None
-    } else {
-        let source = std::env::current_exe().map_err(|error| error.to_string())?;
-        let source_bytes = fs::read(&source).map_err(|error| error.to_string())?;
-        let runtime_manifest = crate::linux::runtime_manifest::source(&source, &source_bytes)?;
-        Some((source_bytes, runtime_manifest))
-    };
     let _package_lease = crate::linux::service::acquire_package_lease().map_err(|error| {
         format!("refusing package mutation while a sealed provider attempt is active: {error}")
     })?;
@@ -1100,6 +2232,40 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
             )
         },
     )?;
+    // An already installed generation must not lose its active H1 or epoch
+    // merely because a caller used install instead of the quiesced upgrade.
+    // A pending journal is a separate fail-closed state for install; upgrade
+    // and uninstall retain the locked recovery path below.
+    let journal_pending = match fs::symlink_metadata(PACKAGE_TRANSACTION_JOURNAL) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.to_string()),
+    };
+    let installed_before_mutation = match fs::symlink_metadata(BINARY) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.to_string()),
+    };
+    ensure_install_preflight(operation, journal_pending, installed_before_mutation)?;
+    // Revocation precedes crash recovery and any byte replacement, including
+    // byte-identical upgrades. Restoring old package files never restores H1.
+    crate::linux::private_host_receipt::revoke_active()?;
+    recover_package_journal()?;
+    // This is intentionally outside the rollback set: an interrupted or
+    // byte-identical replacement may never resurrect an older detached run.
+    advance_installation_epoch()?;
+    let existing_installation = match fs::symlink_metadata(BINARY) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.to_string()),
+    };
+    ensure_install_is_new(operation, existing_installation)?;
+    let source_snapshot = if operation == "uninstall" {
+        None
+    } else {
+        let source = std::env::current_exe().map_err(|error| error.to_string())?;
+        Some(linux_source_snapshot(&source)?)
+    };
     if operation == "uninstall" {
         ensure_recovery_idle("uninstall")?;
         stop_unit("memcordon-sealed-network-launcher.service")?;
@@ -1116,6 +2282,25 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         ensure_unit_inactive("memcordon-sealed-agent.socket")?;
         ensure_unit_inactive("memcordon-sealed-launcher.socket")?;
         ensure_recovery_idle("uninstall")?;
+        // Refuse a substituted Q path before removing any installed package
+        // file; the later unlink repeats the protected readback under the lock.
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let relative =
+                crate::linux::installed_release_qualification::fixed_q_reference_path(target)?;
+            let path = Path::new(INSTALLED_QUALIFICATION_ROOT).join(relative);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    crate::linux::installed_release_qualification::read_protected_absolute(
+                        &path,
+                        memcordon_core::workload_limits::REGISTRY_BYTES as u64,
+                        None,
+                    )?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        let mut removals = Vec::new();
         for path in [
             SOCKET_UNIT,
             UNIT,
@@ -1127,25 +2312,91 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
             BINARY,
             crate::linux::runtime_manifest::INSTALLED,
         ] {
-            match fs::remove_file(path) {
-                Ok(()) => {}
+            match fs::symlink_metadata(path) {
+                Ok(_) => removals.push(PackageFileChange {
+                    path: Path::new(path).to_path_buf(),
+                    bytes: None,
+                    mode: 0,
+                }),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("could not remove {path}: {error}")),
+                Err(error) => return Err(format!("could not inspect {path}: {error}")),
             }
         }
-        systemctl(["daemon-reload"])?;
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let relative =
+                crate::linux::installed_release_qualification::fixed_q_reference_path(target)?;
+            let path = Path::new(INSTALLED_QUALIFICATION_ROOT).join(relative);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    crate::linux::installed_release_qualification::read_protected_absolute(
+                        &path,
+                        memcordon_core::workload_limits::REGISTRY_BYTES as u64,
+                        None,
+                    )?;
+                    removals.push(PackageFileChange {
+                        path,
+                        bytes: None,
+                        mode: 0,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        if !removals.is_empty() {
+            let transaction = PackageFileTransaction::apply(removals)?;
+            if let Err(error) = systemctl(["daemon-reload"]) {
+                return match transaction.rollback() {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(format!(
+                        "{error}; package uninstall rollback failed: {rollback}"
+                    )),
+                };
+            }
+            transaction.commit()?;
+        } else {
+            systemctl(["daemon-reload"])?;
+        }
+        for path in [
+            "/usr/libexec/memcordon/certification/workload",
+            "/usr/libexec/memcordon/certification",
+            INSTALLED_QUALIFICATION_ROOT,
+        ] {
+            remove_uninstalled_directory(path)?;
+        }
         remove_uninstalled_file(LEGACY_PACKAGE_LEASE)?;
-        // A failed startup may have durably recorded its diagnostics in the
-        // provider runtime directory. Uninstall is an explicit ownership transfer
-        // back to the caller, so remove that owned evidence after collecting the
-        // stopped/recovery proofs above and before proving the directory empty.
+        // Startup diagnostics are package-owned and may be cleared after stop
+        // proofs. Protected completed native/H1 evidence is different: retain
+        // it for audit after revoking active admission, never erase it merely
+        // to make the state directory appear empty.
         crate::linux::startup::clear()?;
+        let retained_private_evidence =
+            match fs::read_dir(crate::linux::private_qualification::PROBE_ROOT) {
+                Ok(mut entries) => entries
+                    .next()
+                    .transpose()
+                    .map_err(|error| error.to_string())?
+                    .is_some(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.to_string()),
+            };
+        if !retained_private_evidence {
+            remove_uninstalled_directory(crate::linux::private_qualification::PROBE_ROOT)?;
+        }
         for path in [
             crate::linux::CGROUP_ROOT,
-            crate::linux::STATE_ROOT,
+            crate::linux::private_qualification::PROBE_WORKING_DIRECTORY,
             RUNTIME_DIRECTORY,
         ] {
             remove_uninstalled_directory(path)?;
+        }
+        if retained_private_evidence {
+            eprintln!(
+                "provider uninstall retained protected completed qualification evidence in {}",
+                crate::linux::private_qualification::PROBE_ROOT
+            );
+        } else {
+            remove_uninstalled_directory(crate::linux::STATE_ROOT)?;
         }
         // This is the final uninstall mutation. The open exclusive lease remains locked until
         // return, while unlinking prevents the package lock itself becoming residual state.
@@ -1171,6 +2422,8 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
     }
     verify_compiled_metadata()?;
     let service_gid = ensure_service_group()?;
+    ensure_probe_account()?;
+    ensure_probe_working_directory()?;
     // Already-loaded pre-transition units can remove their shared RuntimeDirectory while upgrade
     // quiesces both services. Re-establish the tmpfiles contract after all stop/recovery checks and
     // immediately before assigning the reviewed ownership. Successful uninstall returns above.
@@ -1186,87 +2439,108 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         ));
     }
     verify_runtime_directory_owner(service_gid)?;
-    let (source_bytes, runtime_manifest) =
-        source_snapshot.expect("uninstall returned before installation");
-    let source_digest = sha256_bytes(&source_bytes);
-    let installations = [
-        (Path::new(BINARY), source_bytes, 0o755),
+    let source_snapshot = source_snapshot.expect("uninstall returned before installation");
+    let source_digest = sha256_bytes(&source_snapshot.agent_bytes);
+    let mut changes = Vec::new();
+    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        let relative =
+            crate::linux::installed_release_qualification::fixed_q_reference_path(target)?;
+        let path = Path::new(INSTALLED_QUALIFICATION_ROOT).join(relative);
+        let bytes = source_snapshot
+            .qualification
+            .as_ref()
+            .and_then(|(source_path, bytes)| (source_path == &path).then(|| bytes.clone()));
+        if bytes.is_none() {
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+                Ok(_) => {}
+            }
+        }
+        changes.push(PackageFileChange {
+            path,
+            bytes,
+            mode: 0o644,
+        });
+    }
+    for (path, bytes, mode) in [
+        (BINARY, source_snapshot.agent_bytes, 0o755),
+        (UNIT, SERVICE.as_bytes().to_vec(), 0o644),
+        (SOCKET_UNIT, SOCKET.as_bytes().to_vec(), 0o644),
+        (LAUNCHER_UNIT, LAUNCHER_SERVICE.as_bytes().to_vec(), 0o644),
         (
-            Path::new(crate::linux::runtime_manifest::INSTALLED),
-            runtime_manifest,
-            0o644,
-        ),
-        (Path::new(UNIT), SERVICE.as_bytes().to_vec(), 0o644),
-        (Path::new(SOCKET_UNIT), SOCKET.as_bytes().to_vec(), 0o644),
-        (
-            Path::new(LAUNCHER_UNIT),
-            LAUNCHER_SERVICE.as_bytes().to_vec(),
-            0o644,
-        ),
-        (
-            Path::new(LAUNCHER_SOCKET_UNIT),
+            LAUNCHER_SOCKET_UNIT,
             LAUNCHER_SOCKET.as_bytes().to_vec(),
             0o644,
         ),
         (
-            Path::new(NETWORK_LAUNCHER_UNIT),
+            NETWORK_LAUNCHER_UNIT,
             NETWORK_LAUNCHER_SERVICE.as_bytes().to_vec(),
             0o644,
         ),
         (
-            Path::new(NETWORK_LAUNCHER_SOCKET_UNIT),
+            NETWORK_LAUNCHER_SOCKET_UNIT,
             NETWORK_LAUNCHER_SOCKET.as_bytes().to_vec(),
             0o644,
         ),
+        (TMPFILES_FILE, TMPFILES.as_bytes().to_vec(), 0o644),
         (
-            Path::new(TMPFILES_FILE),
-            TMPFILES.as_bytes().to_vec(),
+            crate::linux::runtime_manifest::INSTALLED,
+            source_snapshot.manifest_bytes.clone(),
             0o644,
         ),
-    ];
-    for (path, bytes, mode) in installations {
-        let parent = path
-            .parent()
-            .ok_or_else(|| "install path has no parent".to_owned())?;
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        let temporary = parent.join(format!(
-            ".{}.new",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        if temporary.exists() {
-            fs::remove_file(&temporary).map_err(|error| error.to_string())?;
+    ] {
+        changes.push(PackageFileChange {
+            path: Path::new(path).to_path_buf(),
+            bytes: Some(bytes),
+            mode,
+        });
+    }
+    let transaction = PackageFileTransaction::apply(changes)?;
+    let installed = (|| {
+        verify_installed_package_against(&source_digest)?;
+        if source_snapshot.v3 {
+            let candidate = crate::linux::runtime_manifest::source_v3_candidate(Path::new(BINARY))?
+                .ok_or("installed V3 candidate disappeared")?;
+            if candidate.manifest_bytes != source_snapshot.manifest_bytes
+                || candidate.qualification_sha256
+                    != source_snapshot
+                        .qualification
+                        .as_ref()
+                        .map(|(_, bytes)| memcordon_core::workload_codec::hash_bytes(bytes))
+            {
+                return Err("installed V3/Q candidate differs from snapshotted source".into());
+            }
         }
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(&temporary)
-            .map_err(|error| error.to_string())?;
-        file.write_all(&bytes).map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))
-            .map_err(|error| error.to_string())?;
-        fs::rename(temporary, path).map_err(|error| error.to_string())?;
+        systemctl(["daemon-reload"])?;
+        disable_optional_network_launcher()?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.service")?;
+        ensure_unit_inactive("memcordon-sealed-network-launcher.socket")?;
+        if ephemeral_ci {
+            systemctl(["start", "memcordon-sealed-launcher.socket"])?;
+            systemctl(["start", "memcordon-sealed-agent.socket"])?;
+        } else {
+            systemctl(["enable", "--now", "memcordon-sealed-launcher.socket"])?;
+            systemctl(["enable", "--now", "memcordon-sealed-agent.socket"])?;
+        }
+        systemctl(["restart", "memcordon-sealed-launcher.service"])?;
+        systemctl(["restart", "memcordon-sealed-agent.service"])?;
+        wait_provider_ready()?;
+        // Root deliberately bypasses ordinary directory and socket ACL checks.
+        verify_client_access_configuration()
+    })();
+    if let Err(error) = installed {
+        let _ = stop_unit("memcordon-sealed-agent.service");
+        let _ = stop_unit("memcordon-sealed-launcher.service");
+        let _ = stop_unit("memcordon-sealed-agent.socket");
+        let _ = stop_unit("memcordon-sealed-launcher.socket");
+        let rollback = transaction.rollback();
+        let reload = systemctl(["daemon-reload"]);
+        return Err(format!(
+            "package install/upgrade failed: {error}; rollback: {rollback:?}; daemon reload: {reload:?}"
+        ));
     }
-    verify_installed_package_against(&source_digest)?;
-    systemctl(["daemon-reload"])?;
-    disable_optional_network_launcher()?;
-    ensure_unit_inactive("memcordon-sealed-network-launcher.service")?;
-    ensure_unit_inactive("memcordon-sealed-network-launcher.socket")?;
-    if ephemeral_ci {
-        systemctl(["start", "memcordon-sealed-launcher.socket"])?;
-        systemctl(["start", "memcordon-sealed-agent.socket"])?;
-    } else {
-        systemctl(["enable", "--now", "memcordon-sealed-launcher.socket"])?;
-        systemctl(["enable", "--now", "memcordon-sealed-agent.socket"])?;
-    }
-    systemctl(["restart", "memcordon-sealed-launcher.service"])?;
-    systemctl(["restart", "memcordon-sealed-agent.service"])?;
-    wait_provider_ready()?;
-    // Root deliberately bypasses ordinary directory and socket ACL checks. The
-    // release smoke exercises this endpoint as an authorized non-root client.
-    verify_client_access_configuration()?;
-    Ok(())
+    transaction.commit()
 }
 
 #[cfg(target_os = "linux")]
@@ -1414,11 +2688,19 @@ fn wait_provider_ready() -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn live_attempt_exists() -> Result<bool, String> {
     let state_root = std::path::Path::new("/var/lib/memcordon/sealed");
-    Ok(state_root.exists()
-        && std::fs::read_dir(state_root)
-            .map_err(|error| error.to_string())?
-            .next()
-            .is_some())
+    if !state_root.exists() {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(state_root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.file_name() != crate::linux::private_qualification::PROBE_DIRECTORY_NAME {
+            return Ok(true);
+        }
+        if !crate::linux::private_qualification::pending_records(&entry.path())?.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -1444,6 +2726,73 @@ fn ensure_service_group() -> Result<libc::gid_t, String> {
     }
     // SAFETY: getgrnam returned a live libc-managed group record.
     Ok(unsafe { (*group).gr_gid })
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_probe_account() -> Result<(), String> {
+    let name = std::ffi::CString::new("memcordon-qualify")
+        .expect("static qualification account has no NUL");
+    // SAFETY: this package mutation runs single-threaded and reads the returned
+    // entry before any other account database lookup can invalidate it.
+    let existing = unsafe { libc::getpwnam(name.as_ptr()) };
+    if existing.is_null() {
+        let status = std::process::Command::new("/usr/sbin/useradd")
+            .args([
+                "--system",
+                "--user-group",
+                "--no-create-home",
+                "--home-dir",
+                "/nonexistent",
+                "--shell",
+                "/usr/sbin/nologin",
+                "memcordon-qualify",
+            ])
+            .status()
+            .map_err(|error| format!("could not create qualification account: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "qualification account creation failed with {status}"
+            ));
+        }
+    }
+    let _numeric_identity = crate::linux::private_qualification::fixed_probe_account()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_probe_working_directory() -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let path = Path::new(crate::linux::private_qualification::PROBE_WORKING_DIRECTORY);
+    let parent = path.parent().ok_or("qualification workdir parent absent")?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let parent_metadata = std::fs::symlink_metadata(parent).map_err(|error| error.to_string())?;
+    if !parent_metadata.is_dir()
+        || parent_metadata.uid() != 0
+        || parent_metadata.mode() & 0o022 != 0
+    {
+        return Err("qualification workdir parent is not protected".into());
+    }
+    match std::fs::create_dir(path) {
+        Ok(()) => std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
+            .map_err(|error| error.to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(format!("qualification workdir creation: {error}")),
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_dir()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o777 != 0o555
+        || std::fs::read_dir(path)
+            .map_err(|error| error.to_string())?
+            .next()
+            .is_some()
+    {
+        return Err("qualification workdir identity, mode or emptiness differs".into());
+    }
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "linux")]

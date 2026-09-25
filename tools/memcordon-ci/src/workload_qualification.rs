@@ -1,6 +1,10 @@
 //! Exact native qualification obligations, separately published from runtime metadata.
 use crate::{CiError, Result};
+use memcordon_core::DiagnosticSha256;
+use memcordon_core::package_inspection_v6::LinuxUnitHashesV6;
+use memcordon_core::runtime_manifest::{RuntimeComponentRecord, RuntimeComponentRole};
 use memcordon_core::runtime_manifest_v3::QualificationArtifactReferenceV2;
+use memcordon_core::workload_codec::{Encoder, hash_bytes};
 use memcordon_core::workload_qualification_v2::{
     QualificationArtifactV2, TrustedQualificationExpectationV2,
 };
@@ -18,6 +22,114 @@ pub const PRIVATE_V2_ARTIFACTS: [(&str, &str); 2] = [
         "certification/workload/linux-x64-private-v2.json",
     ),
 ];
+
+/// Domain-separated identity of the immutable Linux executable build B.
+/// It deliberately excludes runtime manifest, archive, installed receipt and
+/// qualification-result bytes, so Q can refer to B before M1/A exist.
+pub fn private_component_digest_v2(
+    target: &str,
+    source_commit: &str,
+    version: &str,
+    components: &[RuntimeComponentRecord],
+) -> Result<DiagnosticSha256> {
+    if !PRIVATE_V2_ARTIFACTS.iter().any(|(row, _)| *row == target)
+        || !crate::certification_context::valid_commit(source_commit)
+        || version.is_empty()
+        || version.len() > 64
+        || components.len() != 2
+    {
+        return Err(CiError::Message(
+            "private component build identity differs".into(),
+        ));
+    }
+    let mut sorted = components.to_vec();
+    sorted.sort_by_key(|component| match component.role {
+        RuntimeComponentRole::PublicCli => 1,
+        RuntimeComponentRole::SealedAgent => 2,
+        RuntimeComponentRole::DesktopBootstrap => 3,
+        RuntimeComponentRole::SessionBroker => 4,
+    });
+    if sorted[0].role != RuntimeComponentRole::PublicCli
+        || sorted[1].role != RuntimeComponentRole::SealedAgent
+        || sorted[0].id != "public-cli"
+        || sorted[1].id != "sealed-agent"
+        || sorted[0].path != "memcordon"
+        || sorted[1].path != "memcordon-sealed-agent"
+        || sorted.iter().any(|component| {
+            component.size == 0
+                || component.mode != 0o755
+                || component.sha256.len() != std::mem::size_of::<[u8; 32]>() * 2
+        })
+    {
+        return Err(CiError::Message(
+            "private component inventory differs".into(),
+        ));
+    }
+    let mut encoder =
+        Encoder::new(b"private-release-components-v2", 4096).map_err(CiError::Message)?;
+    for text in [target, source_commit, version] {
+        encoder.count(text.len()).map_err(CiError::Message)?;
+        encoder.raw(text.as_bytes()).map_err(CiError::Message)?;
+    }
+    encoder.count(sorted.len()).map_err(CiError::Message)?;
+    for (tag, component) in sorted.iter().enumerate() {
+        let sha = hex::decode(&component.sha256)
+            .map_err(|_| CiError::Message("private component digest is invalid".into()))?;
+        if sha.len() != std::mem::size_of::<[u8; 32]>()
+            || !component
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(CiError::Message(
+                "private component digest is invalid".into(),
+            ));
+        }
+        encoder
+            .byte(u8::try_from(tag + 1).expect("two components fit u8"))
+            .map_err(CiError::Message)?;
+        encoder
+            .count(component.id.len())
+            .map_err(CiError::Message)?;
+        encoder
+            .raw(component.id.as_bytes())
+            .map_err(CiError::Message)?;
+        encoder
+            .count(component.path.len())
+            .map_err(CiError::Message)?;
+        encoder
+            .raw(component.path.as_bytes())
+            .map_err(CiError::Message)?;
+        encoder.u64(component.size).map_err(CiError::Message)?;
+        encoder
+            .u64(u64::from(component.mode))
+            .map_err(CiError::Message)?;
+        encoder.raw(&sha).map_err(CiError::Message)?;
+    }
+    Ok(hash_bytes(&encoder.finish()))
+}
+
+/// Canonical seven-unit identity used by Q, independent of manifest/archive
+/// serialization and of a host's current service state.
+pub fn private_unit_digest_v2(units: &LinuxUnitHashesV6) -> DiagnosticSha256 {
+    let mut encoder =
+        Encoder::new(b"private-release-units-v2", 512).expect("fixed unit identity fits bound");
+    for (tag, digest) in [
+        (1, &units.control_service),
+        (2, &units.control_socket),
+        (3, &units.launcher_service),
+        (4, &units.launcher_socket),
+        (5, &units.tmpfiles),
+        (6, &units.network_launcher_service),
+        (7, &units.network_launcher_socket),
+    ] {
+        encoder.byte(tag).expect("fixed unit identity fits bound");
+        encoder
+            .digest(digest)
+            .expect("fixed unit identity fits bound");
+    }
+    hash_bytes(&encoder.finish())
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +181,26 @@ pub fn validate_private_v2_against_trusted_native_completions(
     }
     QualificationArtifactV2::parse_and_validate(artifact_bytes, reference, expected)
         .map_err(|error| CiError::Message(format!("private V2 artifact differs: {error}")))
+}
+
+/// Release readback additionally joins Q's component digest to the exact
+/// immutable executable inventory B. The version, target and source are
+/// supplied by the release identity, never copied from Q or its reference.
+pub fn validate_private_v2_against_build(
+    artifact_bytes: &[u8],
+    reference: &QualificationArtifactReferenceV2,
+    expected: &TrustedQualificationExpectationV2<'_>,
+    version: &str,
+    components: &[RuntimeComponentRecord],
+) -> Result<QualificationArtifactV2> {
+    let actual =
+        private_component_digest_v2(expected.target, expected.source_commit, version, components)?;
+    if &actual != expected.component_digest {
+        return Err(CiError::Message(
+            "private qualification component digest differs from build B".into(),
+        ));
+    }
+    validate_private_v2_against_trusted_native_completions(artifact_bytes, reference, expected)
 }
 
 /// Audits a proposed private-profile artifact but never promotes it into this

@@ -1,7 +1,10 @@
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::STATE_ROOT;
 use sha2::{Digest, Sha256};
@@ -15,6 +18,7 @@ pub struct AttemptRecord {
     path: PathBuf,
     state_root: PathBuf,
     caller_envelope_digest: Option<String>,
+    probe_root: Option<Arc<File>>,
 }
 
 struct TransitionTemporary {
@@ -77,6 +81,19 @@ pub enum TransitionFault {
 }
 
 impl AttemptRecord {
+    pub(crate) fn is_probe_domain(&self) -> bool {
+        self.probe_root.is_some()
+    }
+
+    pub(crate) fn matches_probe_attempt(&self, attempt: [u8; 16]) -> bool {
+        self.is_probe_domain()
+            && self.identity
+                == attempt
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+    }
+
     pub fn create(identity: String, frontend_pid: libc::pid_t) -> Result<Self, String> {
         secure_state_root()?;
         Self::create_in(Path::new(STATE_ROOT), identity, frontend_pid, None)
@@ -142,6 +159,7 @@ impl AttemptRecord {
             path,
             state_root: state_root.to_owned(),
             caller_envelope_digest: Some(caller_envelope_digest),
+            probe_root: None,
         })
     }
 
@@ -210,6 +228,62 @@ impl AttemptRecord {
             path,
             state_root: state_root.to_owned(),
             caller_envelope_digest,
+            probe_root: None,
+        })
+    }
+
+    /// The candidate host probe has its own pinned record directory and no
+    /// production attempt allocation. A retired record remains in this domain
+    /// for the protected case reader; it is never a production grant.
+    pub(crate) fn create_probe_in(
+        directory: File,
+        identity: String,
+        frontend_pid: libc::pid_t,
+        caller_envelope_digest: String,
+    ) -> Result<Self, String> {
+        validate_identity(&identity, Some(&caller_envelope_digest))?;
+        let metadata = directory.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_dir()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return Err("probe attempt directory protection differs".into());
+        }
+        let leaf =
+            CString::new(identity.as_bytes()).expect("validated hexadecimal identity has no NUL");
+        // SAFETY: the validated leaf is opened exclusively relative to the
+        // retained protected directory, without following a final symlink.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                leaf.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd == -1 {
+            return Err(format!(
+                "probe attempt allocation: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: successful openat returned one owned descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let body = format!(
+            "version=2\ncgroup={identity}\nfrontend-pid={frontend_pid}\ncaller-envelope-digest={caller_envelope_digest}\nstate=allocated\n"
+        );
+        write_record(&mut file, &body)?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        directory.sync_all().map_err(|error| error.to_string())?;
+        Ok(Self {
+            policy_binding: None,
+            private_invocation: None,
+            policy_checkpoint: None,
+            identity,
+            path: PathBuf::new(),
+            state_root: PathBuf::new(),
+            caller_envelope_digest: Some(caller_envelope_digest),
+            probe_root: Some(Arc::new(directory)),
         })
     }
 
@@ -290,8 +364,6 @@ impl AttemptRecord {
         #[cfg(feature = "test-support")] fault: Option<TransitionFault>,
         #[cfg(not(feature = "test-support"))] _fault: Option<()>,
     ) -> Result<(), String> {
-        let mut temporary =
-            TransitionTemporary::create(self.path.with_extension("new"), &self.state_root)?;
         let version = if self.policy_binding.is_some() {
             3
         } else if self.caller_envelope_digest.is_some() {
@@ -322,13 +394,16 @@ impl AttemptRecord {
                 format!("authenticated-uid={uid}\nprivate-invocation-digest={digest}\n")
             })
             .unwrap_or_default();
-        write_record(
-            &mut temporary.file,
-            &format!(
-                "version={version}\ncgroup={}\n{envelope}{private_invocation}{policy}{checkpoint}state={state}\n",
-                self.identity
-            ),
-        )?;
+        let body = format!(
+            "version={version}\ncgroup={}\n{envelope}{private_invocation}{policy}{checkpoint}state={state}\n",
+            self.identity
+        );
+        if let Some(directory) = &self.probe_root {
+            return self.transition_probe(directory, &body);
+        }
+        let mut temporary =
+            TransitionTemporary::create(self.path.with_extension("new"), &self.state_root)?;
+        write_record(&mut temporary.file, &body)?;
         temporary
             .file
             .sync_all()
@@ -346,9 +421,125 @@ impl AttemptRecord {
     }
 
     pub fn retire(self) -> Result<(), String> {
+        if let Some(directory) = &self.probe_root {
+            let source =
+                CString::new(self.identity.as_bytes()).expect("validated identity has no NUL");
+            let retired = CString::new(format!("{}.retired", self.identity))
+                .expect("validated identity has no NUL");
+            // SAFETY: both names are validated leaves under the same retained
+            // protected directory. Existing terminal evidence cannot be replaced.
+            let status = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    directory.as_raw_fd(),
+                    source.as_ptr(),
+                    directory.as_raw_fd(),
+                    retired.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if status == -1 {
+                return Err(format!(
+                    "probe attempt retirement: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            return directory.sync_all().map_err(|error| error.to_string());
+        }
         fs::remove_file(&self.path).map_err(|error| error.to_string())?;
         sync_directory(&self.state_root)
     }
+
+    fn transition_probe(&self, directory: &File, body: &str) -> Result<(), String> {
+        let source = CString::new(self.identity.as_bytes()).expect("validated identity has no NUL");
+        let temporary =
+            CString::new(format!("{}.new", self.identity)).expect("validated identity has no NUL");
+        // SAFETY: exact validated leaves are rooted at the retained directory.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd == -1 {
+            return Err(format!(
+                "probe attempt transition creation: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: successful openat returned one owned descriptor.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        write_record(&mut file, body)?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        // SAFETY: replacement is atomic within the same pinned protected root.
+        if unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                directory.as_raw_fd(),
+                source.as_ptr(),
+            )
+        } == -1
+        {
+            return Err(format!(
+                "probe attempt transition rename: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        directory.sync_all().map_err(|error| error.to_string())
+    }
+}
+
+/// Independently read one terminal baseline-probe journal from the retained
+/// run directory. The exact serialized state is fixed; a caller-provided
+/// digest, pathname, or plausible collection of booleans cannot replace it.
+pub(crate) fn verify_probe_retired_in(
+    directory: &File,
+    identity: &str,
+    expected_envelope_digest: &str,
+) -> Result<memcordon_core::DiagnosticSha256, String> {
+    validate_identity(identity, Some(expected_envelope_digest))?;
+    let leaf = CString::new(format!("{identity}.retired"))
+        .expect("validated hexadecimal identity has no NUL");
+    // SAFETY: exact leaf is opened without following a final symlink relative
+    // to the caller's retained protected run-directory descriptor.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            leaf.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return Err(format!(
+            "probe retired record open: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: successful openat returned one owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.len() > 16 * 1024
+    {
+        return Err("probe retired record protection or bound differs".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let expected = record_text(&format!(
+        "version=2\ncgroup={identity}\ncaller-envelope-digest={expected_envelope_digest}\nstate=retired\n"
+    ));
+    if bytes != expected.as_bytes() {
+        return Err("probe retired record contents differ".into());
+    }
+    Ok(memcordon_core::workload_codec::hash_bytes(&bytes))
 }
 
 pub fn secure_state_root() -> Result<(), String> {

@@ -292,7 +292,7 @@ Rules:
             r#"Configure execution reports and optional wrapper output.
 
 Output options (value; default):
-  --report PATH                          Write schema-10 JSON to PATH; unset
+  --report PATH                          Write schema-10 V1 or schema-11 private V2 JSON; unset
   --summary                              Write one final summary line to stderr; off
   --quiet                                Suppress optional wrapper output; off
 
@@ -471,7 +471,7 @@ Circuit breaker (requires --restart or --restart-on):
   and cannot be set by itself.
 
 Output:
-  --report PATH                          Write a schema-10 JSON report; unset
+  --report PATH                          Write schema-10 V1 or schema-11 private V2 JSON; unset
   --summary                              Final summary line on stderr; off
   --quiet                                Suppress optional MemCordon output; off
 
@@ -740,7 +740,7 @@ impl LimitToken {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicyArgs {
-    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContractV1>,
+    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContract>,
     pub boundary: BoundaryRequirement,
     pub enforcement: Enforcement,
     pub wait_for: Lifetime,
@@ -813,6 +813,28 @@ impl Default for PolicyArgs {
 }
 
 impl PolicyArgs {
+    pub fn baseline_workload_contract(
+        &self,
+    ) -> Option<&memcordon_core::workload_contract::WorkloadContractV1> {
+        match self.workload_contract.as_ref() {
+            Some(memcordon_core::workload_contract::WorkloadContract::V1(contract)) => {
+                Some(contract)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn private_workload_contract(
+        &self,
+    ) -> Option<&memcordon_core::workload_contract::WorkloadContractV2> {
+        match self.workload_contract.as_ref() {
+            Some(memcordon_core::workload_contract::WorkloadContract::V2(contract)) => {
+                Some(contract)
+            }
+            _ => None,
+        }
+    }
+
     pub fn policy(&self, budgets: &BudgetSet) -> Policy {
         let mut policy = Policy::unbounded();
         policy.memory = budgets.memory;
@@ -829,7 +851,7 @@ impl PolicyArgs {
         policy.command_exit_grace = self.command_exit_grace;
         policy.limit_grace = self.limit_grace;
         policy.swap = self.swap;
-        if let Some(request) = &self.workload_contract {
+        if let Some(request) = self.baseline_workload_contract() {
             policy = policy
                 .with_workload_contract(request.clone())
                 .expect("validated CLI workload contract remains valid");
@@ -865,7 +887,7 @@ pub struct DoctorArgs {
     pub json: bool,
     pub probe_execution: bool,
     pub requirement: Option<Requirement>,
-    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContractV1>,
+    pub workload_contract: Option<memcordon_core::workload_contract::WorkloadContract>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1351,17 +1373,8 @@ fn parse_policy_option(
                 .map_err(|error| error.to_string())?;
             memcordon_core::workload_contract::WorkloadContract::parse(&bytes)
         };
-        policy.workload_contract = Some(
-            match read().map_err(|error| CliError::new("MCUSAGE-WORKLOAD-CONTRACT", error))? {
-                memcordon_core::workload_contract::WorkloadContract::V1(contract) => contract,
-                memcordon_core::workload_contract::WorkloadContract::V2(_) => {
-                    return Err(CliError::new(
-                        "MCWORKLOAD-V2-UNAVAILABLE",
-                        "V2 workload contracts require a qualified Linux V4 provider; this invocation has no active V2 launch path",
-                    ));
-                }
-            },
-        );
+        policy.workload_contract =
+            Some(read().map_err(|error| CliError::new("MCUSAGE-WORKLOAD-CONTRACT", error))?);
         return Ok(());
     }
     if name == "--sealed" {

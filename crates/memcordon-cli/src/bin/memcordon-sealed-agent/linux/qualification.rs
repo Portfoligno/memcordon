@@ -4,8 +4,8 @@ pub use super::qualification_schema::QualificationReceipt;
 #[allow(unused_imports)]
 // V4 receipt readback is used by the Linux test harness until its producer is routed.
 pub use super::qualification_schema::{
-    NativeQualificationProbeV4, QualificationReceiptV4, TrustedQualificationProbeV4,
-    TrustedQualificationReceiptV4,
+    HOST_PROBE_CATALOG_V1, NativeQualificationProbeV4, QualificationReceiptV4,
+    TrustedQualificationProbeV4, TrustedQualificationReceiptV4,
 };
 
 fn certification_digest(scenario: &str, expected: &[&str]) -> String {

@@ -13,6 +13,13 @@ use sha2::{Digest, Sha256};
 
 const ENDPOINT: &str = "/run/memcordon/sealed-agent.sock";
 const VERSION: u16 = 3;
+const PRIVATE_VERSION: u16 = 4;
+const PRIVATE_LAUNCH_KIND: u16 = 10;
+const PRIVATE_PLAN_KIND: u16 = 13;
+const PRIVATE_TERMINAL_KIND: u16 = 105;
+const PRIVATE_REJECTION_KIND: u16 = 106;
+const PRIVATE_INDETERMINATE_KIND: u16 = 110;
+const PRIVATE_PLAN_RECEIPT_KIND: u16 = 111;
 const HEADER_LENGTH: usize = 72;
 const MAX_FRAME: usize = 1024 * 1024;
 const MAX_NATIVE_VALUE: usize = 64 * 1024;
@@ -202,31 +209,157 @@ pub enum LaunchError {
     Rejected(Box<memcordon_core::ProviderRejectionEvidence>),
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RejectionCleanupV1 {
-    attempted: bool,
-    direct_child_reaped: bool,
-    workload_empty: Option<bool>,
-    helpers_reaped: bool,
-    containment_removed: bool,
-    sealed_boundary_retired: bool,
-    errors: Vec<String>,
+/// These are knowledge states, not a request to send another release byte.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrivateReleaseKnowledgeV2 {
+    NotReleased,
+    PossiblyReleased,
+    Released,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrivateReplayDispositionV2 {
+    /// The failed request allocated no target. A later launch needs fresh admission.
+    NewAttemptWithFreshAdmission,
+    /// Recover the historical receipt for this identity, never launch it again.
+    QuerySameAttemptOnly,
+    /// Neither automatic retry nor a second release is authorized.
+    DoNotReplay,
+}
+
+/// Values must come from independent installed-runtime readback, not from the
+/// report being decoded. The live provider socket supplies terminal authority.
+pub struct PrivateExpectedResultV2<'a> {
+    pub source_commit: &'a str,
+    pub native_abi: memcordon_core::workload_evidence_v2::QualifiedNativeAbiV2,
+    pub runtime_manifest_sha256: &'a memcordon_core::DiagnosticSha256,
+    pub installed_qualification_sha256: &'a memcordon_core::DiagnosticSha256,
+}
+
+pub struct PrivateAuthenticatedTerminalV2 {
+    report: memcordon_core::report_v11::PrivateExecutionReportV11,
+    raw_response: Vec<u8>,
+    restart_safety: memcordon_core::RestartSafetyProof,
+}
+
+impl PrivateAuthenticatedTerminalV2 {
+    pub fn report(&self) -> &memcordon_core::report_v11::PrivateExecutionReportV11 {
+        &self.report
+    }
+
+    pub fn raw_response(&self) -> &[u8] {
+        &self.raw_response
+    }
+
+    pub fn restart_safety(&self) -> &memcordon_core::RestartSafetyProof {
+        &self.restart_safety
+    }
+}
+
+pub enum PrivateServiceResultV2 {
+    Complete(Box<PrivateAuthenticatedTerminalV2>),
+    Rejected {
+        evidence: Box<memcordon_core::ProviderRejectionEvidence>,
+        raw_response: Vec<u8>,
+        release_knowledge: PrivateReleaseKnowledgeV2,
+    },
+    Indeterminate {
+        attempt_id: [u8; 16],
+        raw_response: Vec<u8>,
+        reason_code: String,
+    },
+}
+
+/// One authenticated, non-allocating public V2 plan exchange. The raw bytes
+/// are the provider's exact response payload, retained for release evidence;
+/// neither variant authorizes a later target release.
+pub enum PrivatePlanExchangeV2 {
+    Available {
+        receipt: memcordon_core::workload_plan_v2::PrivatePlanReceiptV2,
+        raw_response: Vec<u8>,
+    },
+    Rejected {
+        evidence: Box<memcordon_core::ProviderRejectionEvidence>,
+        raw_response: Vec<u8>,
+    },
+}
+
+impl PrivateServiceResultV2 {
+    pub fn release_knowledge(&self) -> PrivateReleaseKnowledgeV2 {
+        match self {
+            Self::Complete(_) => PrivateReleaseKnowledgeV2::Released,
+            Self::Rejected {
+                release_knowledge, ..
+            } => *release_knowledge,
+            Self::Indeterminate { .. } => PrivateReleaseKnowledgeV2::PossiblyReleased,
+        }
+    }
+
+    pub fn replay_disposition(&self) -> PrivateReplayDispositionV2 {
+        match self {
+            Self::Complete(_) => PrivateReplayDispositionV2::QuerySameAttemptOnly,
+            Self::Rejected {
+                release_knowledge: PrivateReleaseKnowledgeV2::NotReleased,
+                ..
+            } => PrivateReplayDispositionV2::NewAttemptWithFreshAdmission,
+            Self::Rejected { .. } | Self::Indeterminate { .. } => {
+                PrivateReplayDispositionV2::DoNotReplay
+            }
+        }
+    }
+}
+
+/// A failed read after request submission cannot establish that release did not
+/// occur. Preserve the raw response if one was received but failed validation.
+#[derive(Debug)]
+pub struct PrivateResponseFailureV2 {
+    pub detail: String,
+    pub raw_response: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub enum PrivateLaunchErrorV2 {
+    /// No request bytes were submitted to the provider.
+    BeforeSubmission(String),
+    /// Submission may have reached the provider; no release retry is safe.
+    AfterSubmission(PrivateResponseFailureV2),
+}
+
+impl PrivateLaunchErrorV2 {
+    pub fn release_knowledge(&self) -> PrivateReleaseKnowledgeV2 {
+        match self {
+            Self::BeforeSubmission(_) => PrivateReleaseKnowledgeV2::NotReleased,
+            Self::AfterSubmission(failure) => failure.release_knowledge(),
+        }
+    }
+
+    pub fn replay_disposition(&self) -> PrivateReplayDispositionV2 {
+        match self {
+            Self::BeforeSubmission(_) => PrivateReplayDispositionV2::NewAttemptWithFreshAdmission,
+            Self::AfterSubmission(failure) => failure.replay_disposition(),
+        }
+    }
+}
+
+impl PrivateResponseFailureV2 {
+    pub fn release_knowledge(&self) -> PrivateReleaseKnowledgeV2 {
+        PrivateReleaseKnowledgeV2::PossiblyReleased
+    }
+
+    pub fn replay_disposition(&self) -> PrivateReplayDispositionV2 {
+        PrivateReplayDispositionV2::DoNotReplay
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RejectionV1 {
-    #[serde(default)]
-    workload_admission: Option<memcordon_core::workload_evidence::WorkloadAdmissionRejectionV1>,
+struct PrivateIndeterminateV11 {
     schema_version: u32,
-    code: String,
-    phase: memcordon_core::BoundarySetupPhase,
-    detail: String,
-    os_code: Option<i32>,
-    target_created: bool,
-    target_released: bool,
-    cleanup: RejectionCleanupV1,
+    attempt_id: String,
+    release_knowledge: String,
+    retirement_knowledge: String,
+    replay_disposition: String,
+    reason_code: String,
 }
 
 #[allow(
@@ -676,74 +809,7 @@ pub(crate) fn launch(
 pub(crate) fn parse_rejection(
     payload: &[u8],
 ) -> Result<memcordon_core::ProviderRejectionEvidence, String> {
-    const MAX_CODE_BYTES: usize = 128;
-    const MAX_DETAIL_BYTES: usize = 8 * 1024;
-    const MAX_CLEANUP_ERRORS: usize = 16;
-    const MAX_CLEANUP_ERROR_BYTES: usize = 1024;
-    let receipt: RejectionV1 =
-        serde_json::from_slice(payload).map_err(|error| error.to_string())?;
-    if receipt.schema_version != 1
-        || receipt.code.is_empty()
-        || receipt.code.len() > MAX_CODE_BYTES
-        || !receipt
-            .code
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
-        || receipt.detail.len() > MAX_DETAIL_BYTES
-        || receipt.detail.contains('\0')
-        || receipt.target_released && !receipt.target_created
-        || receipt.cleanup.errors.len() > MAX_CLEANUP_ERRORS
-        || receipt
-            .cleanup
-            .errors
-            .iter()
-            .any(|error| error.len() > MAX_CLEANUP_ERROR_BYTES || error.contains('\0'))
-    {
-        return Err("typed rejection fields violate protocol bounds".to_owned());
-    }
-    if !receipt.cleanup.attempted
-        && (receipt.cleanup.direct_child_reaped
-            || receipt.cleanup.workload_empty.is_some()
-            || receipt.cleanup.helpers_reaped
-            || receipt.cleanup.containment_removed
-            || receipt.cleanup.sealed_boundary_retired
-            || !receipt.cleanup.errors.is_empty())
-    {
-        return Err("typed rejection cleanup evidence is contradictory".to_owned());
-    }
-    if receipt.cleanup.sealed_boundary_retired
-        && (!receipt.cleanup.direct_child_reaped
-            || receipt.cleanup.workload_empty != Some(true)
-            || !receipt.cleanup.helpers_reaped
-            || !receipt.cleanup.containment_removed
-            || !receipt.cleanup.errors.is_empty())
-    {
-        return Err("typed rejection retirement evidence is incomplete".to_owned());
-    }
-    Ok(memcordon_core::ProviderRejectionEvidence {
-        workload_admission: receipt.workload_admission,
-        provider_failure: None,
-        schema_version: receipt.schema_version,
-        code: receipt.code,
-        phase: receipt.phase,
-        detail: receipt.detail,
-        os_code: receipt.os_code,
-        loader_qualification: None,
-        target_created: receipt.target_created,
-        target_released: receipt.target_released,
-        cleanup_attempted: receipt.cleanup.attempted,
-        restart_safety: memcordon_core::RestartSafetyProof {
-            direct_child_reaped: receipt.cleanup.direct_child_reaped,
-            workload_empty: receipt.cleanup.workload_empty,
-            helpers_reaped: receipt.cleanup.helpers_reaped,
-            containment_removed: receipt.cleanup.containment_removed,
-            containment_incapable_of_live_members: receipt.cleanup.workload_empty == Some(true),
-            sealed_boundary_retired: receipt.cleanup.sealed_boundary_retired,
-            errors: receipt.cleanup.errors,
-        },
-        terminal_ack_required: false,
-        terminal_receipt: None,
-    })
+    memcordon_core::provider_rejection_wire::RejectionWireV1::parse_evidence(payload)
 }
 
 fn boundary_phase_name(phase: memcordon_core::BoundarySetupPhase) -> &'static str {
@@ -1157,6 +1223,16 @@ fn encoded_frame(
     attempt: [u8; 16],
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
+    encoded_frame_for_version(VERSION, kind, nonce, attempt, payload)
+}
+
+fn encoded_frame_for_version(
+    version: u16,
+    kind: u16,
+    nonce: [u8; 16],
+    attempt: [u8; 16],
+    payload: &[u8],
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     let total = HEADER_LENGTH
         .checked_add(payload.len())
@@ -1165,7 +1241,7 @@ fn encoded_frame(
         return Err("frame exceeds protocol limit".to_owned());
     }
     let total = u32::try_from(total).map_err(|_| "frame exceeds protocol limit".to_owned())?;
-    bytes.extend_from_slice(&VERSION.to_be_bytes());
+    bytes.extend_from_slice(&version.to_be_bytes());
     bytes.extend_from_slice(&kind.to_be_bytes());
     bytes.extend_from_slice(&total.to_be_bytes());
     bytes.extend_from_slice(&nonce);
@@ -1495,11 +1571,18 @@ struct WireFrame {
 }
 
 fn read_frame(stream: &mut UnixStream) -> Result<WireFrame, String> {
+    read_frame_for_version(stream, VERSION)
+}
+
+fn read_frame_for_version(
+    stream: &mut UnixStream,
+    expected_version: u16,
+) -> Result<WireFrame, String> {
     let mut header = [0_u8; HEADER_LENGTH];
     stream
         .read_exact(&mut header)
         .map_err(|error| error.to_string())?;
-    if u16::from_be_bytes([header[0], header[1]]) != VERSION {
+    if u16::from_be_bytes([header[0], header[1]]) != expected_version {
         return Err("unsupported provider protocol".to_owned());
     }
     let kind = u16::from_be_bytes([header[2], header[3]]);
@@ -1524,4 +1607,366 @@ fn read_frame(stream: &mut UnixStream) -> Result<WireFrame, String> {
         attempt,
         payload,
     })
+}
+
+/// Submit one already-encoded V4 private request to the fixed root-owned
+/// service endpoint. The service remains authoritative for decoding,
+/// admission, installed qualification and the single native release. This
+/// transport never retries after a send attempt, including a short send.
+pub fn run_private_v2(
+    encoded_request: &[u8],
+    expected: &PrivateExpectedResultV2<'_>,
+) -> Result<PrivateServiceResultV2, PrivateLaunchErrorV2> {
+    verify_endpoint().map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let mut stream = UnixStream::connect(Path::new(ENDPOINT))
+        .map_err(|error| PrivateLaunchErrorV2::BeforeSubmission(error.to_string()))?;
+    verify_peer(&stream).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let request_nonce = nonce().map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let attempt = nonce().map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    if attempt == [0; 16] {
+        return Err(PrivateLaunchErrorV2::BeforeSubmission(
+            "private attempt identity is zero".into(),
+        ));
+    }
+    let frame = encoded_frame_for_version(
+        PRIVATE_VERSION,
+        PRIVATE_LAUNCH_KIND,
+        request_nonce,
+        attempt,
+        encoded_request,
+    )
+    .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let cwd = fs::File::open(".")
+        .map_err(|error| PrivateLaunchErrorV2::BeforeSubmission(error.to_string()))?;
+    let frontend_pidfd = pidfd_self().map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let descriptors = [cwd.as_raw_fd(), 0, 1, 2, frontend_pidfd.as_raw_fd()];
+    send_with_descriptors(&stream, &frame, &descriptors).map_err(|detail| {
+        PrivateLaunchErrorV2::AfterSubmission(PrivateResponseFailureV2 {
+            detail,
+            raw_response: None,
+        })
+    })?;
+    receive_private_result(&mut stream, request_nonce, attempt, expected)
+        .map_err(PrivateLaunchErrorV2::AfterSubmission)
+}
+
+/// Obtain a non-allocating V2 plan only from the authenticated root provider.
+/// The receipt is a time-of-check snapshot; `run_private_v2` does not reuse it
+/// as authority, and the service must repeat admission under its package and
+/// policy leases before the release byte.
+pub fn private_plan_v2(
+    contract: &memcordon_core::workload_contract::WorkloadContractV2,
+) -> Result<memcordon_core::workload_plan_v2::PrivatePlanReceiptV2, String> {
+    match private_plan_exchange_v2(contract)? {
+        PrivatePlanExchangeV2::Available { receipt, .. } => Ok(receipt),
+        PrivatePlanExchangeV2::Rejected { evidence, .. } => Err(format!(
+            "private plan unavailable [{}]: {}",
+            evidence.code, evidence.detail
+        )),
+    }
+}
+
+/// The authenticated provider response is kept typed and byte-exact for the
+/// final-public release verifier. A transport error is not a grant rejection.
+pub fn private_plan_exchange_v2(
+    contract: &memcordon_core::workload_contract::WorkloadContractV2,
+) -> Result<PrivatePlanExchangeV2, String> {
+    contract.validate()?;
+    verify_endpoint()?;
+    let mut stream = UnixStream::connect(Path::new(ENDPOINT)).map_err(|error| error.to_string())?;
+    verify_peer(&stream)?;
+    let nonce = nonce()?;
+    let payload = serde_json::to_vec(contract).map_err(|error| error.to_string())?;
+    let frame =
+        encoded_frame_for_version(PRIVATE_VERSION, PRIVATE_PLAN_KIND, nonce, [0; 16], &payload)?;
+    stream
+        .write_all(&frame)
+        .map_err(|error| error.to_string())?;
+    let response = read_frame_for_version(&mut stream, PRIVATE_VERSION)?;
+    if response.nonce != nonce || response.attempt != [0; 16] {
+        return Err("private plan response identity differs".into());
+    }
+    match response.kind {
+        PRIVATE_PLAN_RECEIPT_KIND => {
+            let receipt =
+                memcordon_core::workload_plan_v2::PrivatePlanReceiptV2::parse_for_contract(
+                    &response.payload,
+                    contract,
+                )?;
+            super::linux_runtime::verify_private(&receipt)?;
+            Ok(PrivatePlanExchangeV2::Available {
+                receipt,
+                raw_response: response.payload,
+            })
+        }
+        PRIVATE_REJECTION_KIND => {
+            let rejection = parse_rejection(&response.payload)?;
+            if rejection.phase != memcordon_core::BoundarySetupPhase::RequestValidation
+                || rejection.target_created
+                || rejection.target_released
+                || rejection.cleanup_attempted
+            {
+                return Err("private plan rejection claims a native attempt".into());
+            }
+            Ok(PrivatePlanExchangeV2::Rejected {
+                evidence: Box::new(rejection),
+                raw_response: response.payload,
+            })
+        }
+        _ => Err("provider omitted V2 private plan receipt".into()),
+    }
+}
+
+/// Build the exact V4 private launch from a freshly authenticated plan. A
+/// later package/policy mutation is still rejected by the service at launch;
+/// this method cannot authorize a target from the plan alone.
+pub fn execute_private_v2(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    context: crate::AttemptContext,
+) -> Result<PrivateServiceResultV2, PrivateLaunchErrorV2> {
+    use memcordon_core::workload_contract::ExecutionIdentityRequestV2;
+
+    contract
+        .validate()
+        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    if policy.boundary() != memcordon_core::BoundaryRequirement::Sealed
+        || policy.workload_contract().is_some()
+        || contract.authorized_profile.id.as_str() != "linux-tcp4-private-v1"
+    {
+        return Err(PrivateLaunchErrorV2::BeforeSubmission(
+            "V2 private launch requires sealed boundary, private profile and no V1 contract".into(),
+        ));
+    }
+    if !matches!(
+        contract.execution_identity,
+        ExecutionIdentityRequestV2::AdministratorProfile { .. }
+    ) {
+        return Err(PrivateLaunchErrorV2::BeforeSubmission(
+            "private preserve-caller execution identity is not available".into(),
+        ));
+    }
+    let started = std::time::Instant::now();
+    let plan = private_plan_v2(contract).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let deadline_budget = effective_deadline_duration(policy, context, started.elapsed());
+    let launch = encode_launch(policy, command, deadline_budget, context.restart_attempt)
+        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let contract_bytes = serde_json::to_vec(contract)
+        .map_err(|error| PrivateLaunchErrorV2::BeforeSubmission(error.to_string()))?;
+    let contract_digest = memcordon_core::workload_codec::contract_digest_v2(contract)
+        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&PRIVATE_VERSION.to_be_bytes());
+    encoded.extend_from_slice(plan.registry_digest.bytes());
+    encoded.extend_from_slice(plan.installed_qualification_sha256.bytes());
+    encoded.extend_from_slice(contract_digest.bytes());
+    put_bytes(&mut encoded, &contract_bytes).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    put_bytes(&mut encoded, &launch).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let expected = PrivateExpectedResultV2 {
+        source_commit: &plan.source_commit,
+        native_abi: plan.native_abi,
+        runtime_manifest_sha256: &plan.runtime_manifest_sha256,
+        installed_qualification_sha256: &plan.installed_qualification_sha256,
+    };
+    run_private_v2(&encoded, &expected)
+}
+
+/// Decode only a response read from the already-connected, authenticated
+/// provider channel after the private request was sent. This function cannot
+/// make a transport failure safe to replay, and does not perform a new launch.
+pub fn receive_private_result(
+    stream: &mut UnixStream,
+    expected_nonce: [u8; 16],
+    expected_attempt: [u8; 16],
+    expected: &PrivateExpectedResultV2<'_>,
+) -> Result<PrivateServiceResultV2, PrivateResponseFailureV2> {
+    verify_peer(stream).map_err(|detail| PrivateResponseFailureV2 {
+        detail,
+        raw_response: None,
+    })?;
+    let frame = read_frame_for_version(stream, PRIVATE_VERSION).map_err(|detail| {
+        PrivateResponseFailureV2 {
+            detail,
+            raw_response: None,
+        }
+    })?;
+    decode_private_frame(frame, expected_nonce, expected_attempt, expected)
+}
+
+fn decode_private_frame(
+    frame: WireFrame,
+    expected_nonce: [u8; 16],
+    expected_attempt: [u8; 16],
+    expected: &PrivateExpectedResultV2<'_>,
+) -> Result<PrivateServiceResultV2, PrivateResponseFailureV2> {
+    let raw_response = frame.payload;
+    let decode = || -> Result<PrivateServiceResultV2, String> {
+        if frame.nonce != expected_nonce || frame.attempt != expected_attempt {
+            return Err("private response nonce or attempt differs".into());
+        }
+        if raw_response.len() > memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES {
+            return Err("private response exceeds byte bound".into());
+        }
+        memcordon_core::workload_contract::reject_duplicate_json_keys(&raw_response)?;
+        match frame.kind {
+            PRIVATE_TERMINAL_KIND => {
+                let report: memcordon_core::report_v11::PrivateExecutionReportV11 =
+                    serde_json::from_slice(&raw_response).map_err(|error| error.to_string())?;
+                validate_private_service_report(&report, expected_attempt, expected)?;
+                let restart_safety = private_terminal_restart_safety(&report);
+                Ok(PrivateServiceResultV2::Complete(Box::new(
+                    PrivateAuthenticatedTerminalV2 {
+                        report,
+                        raw_response: raw_response.clone(),
+                        restart_safety,
+                    },
+                )))
+            }
+            PRIVATE_REJECTION_KIND => {
+                let evidence = parse_rejection(&raw_response)?;
+                // A target allocation may already have durable release intent.
+                // Baseline rejection cleanup fields cannot prove private
+                // namespace and policy-snapshot retirement.
+                let release_knowledge = if evidence.target_created {
+                    PrivateReleaseKnowledgeV2::PossiblyReleased
+                } else {
+                    PrivateReleaseKnowledgeV2::NotReleased
+                };
+                Ok(PrivateServiceResultV2::Rejected {
+                    evidence: Box::new(evidence),
+                    raw_response: raw_response.clone(),
+                    release_knowledge,
+                })
+            }
+            PRIVATE_INDETERMINATE_KIND => {
+                let envelope: PrivateIndeterminateV11 =
+                    serde_json::from_slice(&raw_response).map_err(|error| error.to_string())?;
+                if envelope.schema_version != 11
+                    || envelope.attempt_id != private_attempt_hex(expected_attempt)
+                    || envelope.release_knowledge != "possibly-released"
+                    || envelope.retirement_knowledge != "unverified"
+                    || envelope.replay_disposition != "do-not-replay"
+                    || envelope.reason_code != "MCSEALED-PRIVATE-TERMINAL-UNVERIFIED"
+                {
+                    return Err("private indeterminate envelope differs from protocol".into());
+                }
+                Ok(PrivateServiceResultV2::Indeterminate {
+                    attempt_id: expected_attempt,
+                    raw_response: raw_response.clone(),
+                    reason_code: envelope.reason_code,
+                })
+            }
+            _ => Err("private response kind differs from V4 protocol".into()),
+        }
+    };
+    decode().map_err(|detail| PrivateResponseFailureV2 {
+        detail,
+        raw_response: Some(raw_response),
+    })
+}
+
+fn private_attempt_hex(attempt: [u8; 16]) -> String {
+    attempt.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn validate_private_service_report(
+    report: &memcordon_core::report_v11::PrivateExecutionReportV11,
+    expected_attempt: [u8; 16],
+    expected: &PrivateExpectedResultV2<'_>,
+) -> Result<(), String> {
+    if report.schema_version != memcordon_core::report_v11::PRIVATE_EXECUTION_REPORT_SCHEMA_V11
+        || report.source_commit != expected.source_commit
+        || report.native_abi != expected.native_abi
+        || report.runtime_manifest_sha256 != *expected.runtime_manifest_sha256
+        || report.installed_qualification_sha256 != *expected.installed_qualification_sha256
+        || report.attempt.attempt_id.as_str() != private_attempt_hex(expected_attempt)
+    {
+        return Err("private terminal differs from request or installed readback".into());
+    }
+    report.checkpoint.validate().map_err(str::to_owned)?;
+    if report.checkpoint.native_abi != report.native_abi
+        || report.checkpoint.attempt_binding != report.attempt.canonical_digest()?
+        || !report.retirement.terminal_success(&report.checkpoint)
+    {
+        return Err("private terminal lacks bound checkpoint and retirement".into());
+    }
+    match &report.outcome {
+        memcordon_core::report_v11::PrivateTerminalOutcomeV11::Exited { .. } => {}
+        memcordon_core::report_v11::PrivateTerminalOutcomeV11::NativeFailure { phase, detail }
+            if !phase.is_empty()
+                && !detail.is_empty()
+                && phase.len() <= 128
+                && detail.len() <= 1024 => {}
+        memcordon_core::report_v11::PrivateTerminalOutcomeV11::Interrupted { reason }
+            if !reason.is_empty() && reason.len() <= 128 => {}
+        _ => return Err("private terminal outcome violates V11 bound".into()),
+    }
+    Ok(())
+}
+
+fn private_terminal_restart_safety(
+    report: &memcordon_core::report_v11::PrivateExecutionReportV11,
+) -> memcordon_core::RestartSafetyProof {
+    // This is reachable only after peer, frame, installed-readback and native
+    // checkpoint/retirement joins. A bare report JSON cannot create this proof.
+    debug_assert!(report.retirement.terminal_success(&report.checkpoint));
+    memcordon_core::RestartSafetyProof {
+        direct_child_reaped: true,
+        workload_empty: Some(true),
+        helpers_reaped: true,
+        containment_removed: true,
+        containment_incapable_of_live_members: true,
+        sealed_boundary_retired: true,
+        errors: Vec::new(),
+    }
+}
+
+#[cfg(feature = "test-support")]
+/// Exercises structural decoding only. Its boolean is not an authenticated
+/// restart proof and must never be used by a production caller.
+pub fn private_response_disposition_for_test(
+    kind: u16,
+    frame_nonce: [u8; 16],
+    frame_attempt: [u8; 16],
+    expected_nonce: [u8; 16],
+    expected_attempt: [u8; 16],
+    payload: &[u8],
+    expected: &PrivateExpectedResultV2<'_>,
+) -> Result<
+    (
+        PrivateReleaseKnowledgeV2,
+        PrivateReplayDispositionV2,
+        bool,
+        Vec<u8>,
+    ),
+    PrivateResponseFailureV2,
+> {
+    let result = decode_private_frame(
+        WireFrame {
+            kind,
+            nonce: frame_nonce,
+            attempt: frame_attempt,
+            payload: payload.to_vec(),
+        },
+        expected_nonce,
+        expected_attempt,
+        expected,
+    )?;
+    let restart_safe = matches!(
+        &result,
+        PrivateServiceResultV2::Complete(terminal)
+            if terminal.restart_safety().is_safe_for(memcordon_core::BoundaryRequirement::Sealed)
+    );
+    let raw = match &result {
+        PrivateServiceResultV2::Complete(terminal) => terminal.raw_response().to_vec(),
+        PrivateServiceResultV2::Rejected { raw_response, .. }
+        | PrivateServiceResultV2::Indeterminate { raw_response, .. } => raw_response.clone(),
+    };
+    Ok((
+        result.release_knowledge(),
+        result.replay_disposition(),
+        restart_safe,
+        raw,
+    ))
 }

@@ -3,8 +3,8 @@ use std::num::NonZeroU64;
 use memcordon_core::BoundedText;
 use memcordon_core::DiagnosticSha256;
 use memcordon_core::report_v11::{
-    PRIVATE_EXECUTION_REPORT_SCHEMA_V11, PrivateExecutionReportV11, PrivateTerminalOutcomeV11,
-    TrustedPrivateExecutionV11,
+    PRIVATE_EXECUTION_REPORT_SCHEMA_V11, PrivateExecutionReportV11, PrivatePublicOutcomeV11,
+    PrivatePublicResultV11, PrivateTerminalOutcomeV11, TrustedPrivateExecutionV11,
 };
 use memcordon_core::workload_admission_v2::AttemptBindingV2;
 use memcordon_core::workload_contract::{LogicalId, Nonce128, ProfileRef};
@@ -218,6 +218,18 @@ fn schema11_private_projection_requires_trusted_terminal_and_exact_native_bindin
     assert!(
         PrivateExecutionReportV11::parse_and_validate(duplicate.as_bytes(), 11, &trusted).is_err()
     );
+    let mut public = PrivatePublicResultV11 {
+        schema_version: PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
+        result: PrivatePublicOutcomeV11::Complete {
+            terminal: Box::new(report.clone()),
+            raw_response: serde_json::to_vec(&report).unwrap(),
+        },
+    };
+    public.validate_structure().unwrap();
+    if let PrivatePublicOutcomeV11::Complete { raw_response, .. } = &mut public.result {
+        *raw_response = br#"{"schema_version":11}"#.to_vec();
+    }
+    assert!(public.validate_structure().is_err());
 }
 
 #[test]

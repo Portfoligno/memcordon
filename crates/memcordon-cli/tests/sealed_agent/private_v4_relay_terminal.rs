@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use crate::linux::descriptor_custody::provider_owned_byte_pipes;
 use crate::linux::private_execution::validate_broker_rejection;
-use crate::linux::private_lifecycle::{PrivateCandidateTerminalV4, PrivateMonitorOutcome};
+use crate::linux::private_lifecycle::{
+    PrivateCandidateTerminalV4, PrivateMonitorOutcome, PrivateTerminalReceiptV4,
+};
 use crate::linux::private_relay::PrivateRelay;
 
 fn pipe() -> (OwnedFd, OwnedFd) {
@@ -220,4 +222,20 @@ fn private_broker_rejection_requires_exact_attempt_and_consistent_cleanup_knowle
     let mut changed = valid.clone();
     changed["unexpected"] = true.into();
     assert!(validate_broker_rejection(&serde_json::to_vec(&changed).unwrap(), attempt).is_err());
+}
+
+#[test]
+fn private_terminal_parser_rejects_oversized_and_duplicate_key_frames_before_binding() {
+    let oversized = vec![b' '; memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES + 1];
+    assert_eq!(
+        PrivateTerminalReceiptV4::parse_verified(&oversized, [0x11; 16])
+            .err()
+            .unwrap(),
+        "MCSEALED-PRIVATE-RECEIPT: terminal exceeds byte bound"
+    );
+    let duplicate = br#"{"schema_version":4,"schema_version":4}"#;
+    let error = PrivateTerminalReceiptV4::parse_verified(duplicate, [0x11; 16])
+        .err()
+        .unwrap();
+    assert!(error.contains("duplicate JSON key"), "{error}");
 }

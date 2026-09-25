@@ -12,6 +12,77 @@ use std::{
 pub const INSTALLED: &str = "/usr/libexec/memcordon-runtime-manifest.json";
 const V3_IMAGE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Read an exact installed M0/M1 candidate without inferring that Q came from
+/// an independently verified native run or that this host is qualified. The
+/// installed caller must hold the shared package-generation lease throughout.
+pub(crate) fn source_v3_candidate(
+    source: &Path,
+) -> Result<Option<super::installed_release_qualification::CandidateV3Readback>, String> {
+    let installed = source == Path::new("/usr/libexec/memcordon-sealed-agent");
+    let path = if installed {
+        Path::new(INSTALLED).to_path_buf()
+    } else {
+        source
+            .parent()
+            .ok_or("provider source has no parent")?
+            .join("runtime-manifest.json")
+    };
+    let bytes = if installed {
+        super::installed_release_qualification::read_protected_absolute(
+            &path,
+            memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES as u64,
+            None,
+        )?
+    } else {
+        match manifest_bytes(&path, false) {
+            Ok(bytes) => bytes,
+            Err(error) => match std::fs::symlink_metadata(&path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                _ => return Err(error),
+            },
+        }
+    };
+    match VersionedRuntimeManifest::parse(&bytes)? {
+        VersionedRuntimeManifest::V2(_) => Ok(None),
+        VersionedRuntimeManifest::V3(_) => {
+            let public_path = if installed {
+                Path::new("/usr/bin/memcordon").to_path_buf()
+            } else {
+                source
+                    .parent()
+                    .expect("V3 source already has a parent")
+                    .join("memcordon")
+            };
+            let (agent_bytes, public_bytes) = if installed {
+                (
+                    super::installed_release_qualification::read_protected_absolute(
+                        source,
+                        V3_IMAGE_MAX_BYTES,
+                        Some(0o755),
+                    )?,
+                    super::installed_release_qualification::read_protected_absolute(
+                        &public_path,
+                        V3_IMAGE_MAX_BYTES,
+                        Some(0o755),
+                    )?,
+                )
+            } else {
+                (
+                    read_v3_image(source, false)?,
+                    read_v3_image(&public_path, false)?,
+                )
+            };
+            super::installed_release_qualification::read_candidate(
+                bytes,
+                &agent_bytes,
+                &public_bytes,
+                installed,
+            )
+            .map(Some)
+        }
+    }
+}
+
 pub(crate) fn target() -> Result<&'static str, String> {
     match (std::env::consts::ARCH, cfg!(target_env = "musl")) {
         ("x86_64", false) => Ok("x86_64-unknown-linux-gnu"),
@@ -257,25 +328,46 @@ pub fn source(source: &Path, agent_bytes: &[u8]) -> Result<Vec<u8>, String> {
 pub fn installed_binding() -> Result<memcordon_core::PublicProviderBindingV1, String> {
     crate::package::verify()?;
     let bytes = manifest_bytes(Path::new(INSTALLED), true)?;
-    let manifest = installed_generation(&bytes)?;
-    let agent = manifest
-        .components
-        .iter()
-        .find(|entry| entry.role == RuntimeComponentRole::SealedAgent)
-        .expect("installed generation validates the agent role");
-    let installed_digest =
-        crate::package::sha256_regular_no_follow(Path::new("/usr/libexec/memcordon-sealed-agent"))?;
-    crate::package::verify_installed_executable_digest(&agent.sha256, &installed_digest)?;
-    manifest.public_binding(&bytes)
+    match VersionedRuntimeManifest::parse(&bytes)? {
+        VersionedRuntimeManifest::V2(_) => {
+            let manifest = installed_generation(&bytes)?;
+            let agent = manifest
+                .components
+                .iter()
+                .find(|entry| entry.role == RuntimeComponentRole::SealedAgent)
+                .expect("installed generation validates the agent role");
+            let installed_digest = crate::package::sha256_regular_no_follow(Path::new(
+                "/usr/libexec/memcordon-sealed-agent",
+            ))?;
+            crate::package::verify_installed_executable_digest(&agent.sha256, &installed_digest)?;
+            manifest.public_binding(&bytes)
+        }
+        VersionedRuntimeManifest::V3(_) => {
+            let candidate = source_v3_candidate(Path::new("/usr/libexec/memcordon-sealed-agent"))?
+                .ok_or("installed V3 candidate absent")?;
+            if candidate.manifest_bytes != bytes {
+                return Err("installed V3 generation changed during public binding".into());
+            }
+            candidate_public_binding(&candidate)
+        }
+    }
 }
 
-/// V3 binding is separate from the active V2 route until package installation
-/// and host V4 qualification can consume the same verified generation.
+/// Candidate M1 may identify the public baseline generation, but this does
+/// not qualify its private profile or construct a native host lease.
+pub(crate) fn candidate_public_binding(
+    candidate: &super::installed_release_qualification::CandidateV3Readback,
+) -> Result<memcordon_core::PublicProviderBindingV1, String> {
+    candidate.manifest.public_binding(&candidate.manifest_bytes)
+}
+
+/// The V3 public generation binding is candidate-only; it grants no private
+/// admission and supplies no independent release or host qualification.
 pub fn installed_binding_v3() -> Result<memcordon_core::PublicProviderBindingV1, String> {
     crate::package::verify()?;
-    let (manifest, bytes) = source_v3(Path::new("/usr/libexec/memcordon-sealed-agent"))?
+    let candidate = source_v3_candidate(Path::new("/usr/libexec/memcordon-sealed-agent"))?
         .ok_or("installed runtime generation is not V3")?;
-    manifest.public_binding(&bytes)
+    candidate_public_binding(&candidate)
 }
 
 fn validate_installed_source(bytes: &[u8], agent_bytes: &[u8]) -> Result<(), String> {

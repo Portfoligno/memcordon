@@ -1,5 +1,5 @@
 use crate::admission::LinuxAdmission;
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd};
@@ -141,18 +141,60 @@ pub fn prepare_private_gated_prelaunch(
         return Err("MCSEALED-PRIVATE-PRELAUNCH: V4 request changed after ELF pinning".into());
     }
     let command = PrivateExecArguments::from_request(request)?;
+    let (identity, entrypoint, entrypoint_digest) = authority.into_parts();
+    build_private_gated_prelaunch(
+        identity,
+        entrypoint,
+        entrypoint_digest,
+        command,
+        abi,
+        expected_filter_digest,
+    )
+}
+
+/// The probe uses the identical descriptor, control and target construction
+/// but its authority is a protected installed-image lease, not a production
+/// request or synthetic administrator grant.
+pub(crate) fn prepare_probe_gated_prelaunch(
+    identity: ResolvedTargetIdentity,
+    entrypoint: VerifiedEntrypoint,
+    entrypoint_digest: memcordon_core::DiagnosticSha256,
+    command: PrivateExecArguments,
+    abi: NativeAbi,
+    expected_filter_digest: [u8; 32],
+) -> Result<PrivateGatedPrelaunch, String> {
+    build_private_gated_prelaunch(
+        identity,
+        entrypoint,
+        entrypoint_digest,
+        command,
+        abi,
+        expected_filter_digest,
+    )
+}
+
+fn build_private_gated_prelaunch(
+    identity: ResolvedTargetIdentity,
+    entrypoint: VerifiedEntrypoint,
+    entrypoint_digest: memcordon_core::DiagnosticSha256,
+    command: PrivateExecArguments,
+    abi: NativeAbi,
+    expected_filter_digest: [u8; 32],
+) -> Result<PrivateGatedPrelaunch, String> {
     let (target_stdio, provider_stdio) =
         provider_owned_byte_pipes().map_err(|error| format!("MCSEALED-PRIVATE-STDIO: {error}"))?;
     let (target_control, provider_control) =
         control_socketpair().map_err(|error| format!("MCSEALED-PRIVATE-CONTROL: {error}"))?;
-    let (identity, entrypoint, entrypoint_digest) = authority.into_parts();
-    let expected_descriptors = ExpectedGatedDescriptorInventory::capture(
+    let mut expected_descriptors = ExpectedGatedDescriptorInventory::capture(
         &target_stdio,
         provider_control.as_fd(),
         target_control.as_fd(),
         entrypoint.as_fd(),
     )
     .map_err(|error| format!("MCSEALED-PRIVATE-DESCRIPTOR-EXPECTATION: {error}"))?;
+    if command.probes_precreated_socket() {
+        expected_descriptors = expected_descriptors.for_precreated_probe_pair();
+    }
     let target = PrivateGatedTarget {
         entrypoint,
         identity,
@@ -914,6 +956,46 @@ pub fn execute(
         None,
         None,
         None,
+        None,
+    )
+}
+
+/// Candidate-only baseline UNIX owner. A pinned installed image and a
+/// probe-domain record are mandatory; no production attempt is allocated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_pinned_probe_baseline(
+    request: LaunchRequestV2,
+    descriptors: Vec<OwnedFd>,
+    attempt: [u8; 16],
+    frontend_pid: libc::pid_t,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    groups: Vec<libc::gid_t>,
+    record: AttemptRecord,
+    entrypoint: VerifiedEntrypoint,
+) -> Result<TerminalFacts, String> {
+    if request.workload_contract.is_some()
+        || !request.environment.is_empty()
+        || !record.matches_probe_attempt(attempt)
+    {
+        return Err(
+            "MCSEALED-PROBE-BASELINE: production admission or unpinned record rejected".into(),
+        );
+    }
+    let credentials = TargetCredentials::direct(uid, gid, groups)?;
+    execute_inner(
+        None,
+        request,
+        descriptors,
+        attempt,
+        frontend_pid,
+        credentials,
+        Some(record),
+        None,
+        None,
+        None,
+        None,
+        Some(entrypoint),
     )
 }
 
@@ -997,6 +1079,7 @@ pub fn execute_brokered_typed(
         None,
         None,
         None,
+        None,
     )
     .map_err(|error| rejection_for_launch_error(&error, attempt))
 }
@@ -1024,6 +1107,7 @@ pub fn execute_with_fault(
         None,
         None,
         Some(fault),
+        None,
         None,
         None,
     )
@@ -1056,6 +1140,7 @@ pub fn execute_with_fault_typed(
         Some(point),
         plan.postauthorization_ready,
         plan.provider_loss_claim_path,
+        None,
     )
     .map_err(|detail| fault_outcome(attempt, point, &detail))
 }
@@ -1076,6 +1161,7 @@ fn execute_inner(
     #[cfg(not(feature = "test-support"))] _postauthorization_ready: Option<()>,
     #[cfg(feature = "test-support")] provider_loss_claim_path: Option<PathBuf>,
     #[cfg(not(feature = "test-support"))] _provider_loss_claim_path: Option<()>,
+    pinned_probe_entrypoint: Option<VerifiedEntrypoint>,
 ) -> Result<TerminalFacts, String> {
     let started = Instant::now();
     if descriptors.len() != 5 {
@@ -1177,6 +1263,7 @@ fn execute_inner(
                 provider_fd: provider_startup_fd,
                 inject_failure_before_target: inject_namespace_init_failure,
             },
+            pinned_probe_entrypoint,
         )
     };
     let init = if let Some(context) = mount_context {
@@ -1836,6 +1923,7 @@ pub fn wait_command_exit_grace_for_test(
     wait_command_exit_grace(cgroup, policy)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn namespace_init(
     request: LaunchRequestV2,
     descriptors: Vec<OwnedFd>,
@@ -1844,6 +1932,7 @@ fn namespace_init(
     mut status: File,
     credentials: TargetCredentials,
     startup: NamespaceStartupChannel,
+    pinned_probe_entrypoint: Option<VerifiedEntrypoint>,
 ) -> i32 {
     let NamespaceStartupChannel {
         init: startup,
@@ -1886,6 +1975,7 @@ fn namespace_init(
             control,
             status.as_raw_fd(),
             credentials,
+            pinned_probe_entrypoint,
         );
     }
     if report_namespace_startup(&startup, NamespaceStartupStatus::TargetForked).is_err() {
@@ -1921,6 +2011,7 @@ fn target_exec(
     control: File,
     status_fd: i32,
     credentials: TargetCredentials,
+    pinned_probe_entrypoint: Option<VerifiedEntrypoint>,
 ) -> ! {
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     if unsafe { libc::fchdir(descriptors[0].as_raw_fd()) } == -1 {
@@ -1990,8 +2081,26 @@ fn target_exec(
         // SAFETY: target has not been authorized and exits without invoking caller code.
         unsafe { libc::_exit(125) };
     }
-    // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
-    if unsafe { libc::syscall(libc::SYS_close_range, 4_u32, u32::MAX, 0) } == -1 {
+    let pinned_probe_entrypoint = if let Some(entrypoint) = pinned_probe_entrypoint {
+        if entrypoint.raw_fd() != 4 {
+            // SAFETY: target stdio and control now occupy only fd 0–3. The
+            // fourth slot is reserved for the verified package image.
+            unsafe { libc::close(4) };
+        }
+        match entrypoint.into_exec_slot() {
+            Ok(entrypoint) => Some(entrypoint),
+            Err(_) => unsafe { libc::_exit(125) },
+        }
+    } else {
+        None
+    };
+    let first_to_close = if pinned_probe_entrypoint.is_some() {
+        5_u32
+    } else {
+        4_u32
+    };
+    // SAFETY: all descriptor slots above the exact target inventory are closed.
+    if unsafe { libc::syscall(libc::SYS_close_range, first_to_close, u32::MAX, 0) } == -1 {
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
         unsafe { libc::_exit(125) };
     }
@@ -2000,6 +2109,17 @@ fn target_exec(
         // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
         unsafe { libc::_exit(125) };
     }
+    let pinned_argv = pinned_probe_entrypoint.as_ref().map(|_| {
+        std::iter::once(request.program.clone())
+            .chain(request.arguments.iter().cloned())
+            .map(CString::new)
+            .collect::<Result<Vec<_>, _>>()
+    });
+    let pinned_argv = match pinned_argv {
+        Some(Ok(argv)) => Some(argv),
+        Some(Err(_)) => unsafe { libc::_exit(125) },
+        None => None,
+    };
     let mut command = Command::new(OsString::from_vec(request.program));
     command.args(request.arguments.into_iter().map(OsString::from_vec));
     command.env_clear();
@@ -2022,8 +2142,15 @@ fn target_exec(
         // namespace init, the provider cleanup guard, and the external guardian.
         unsafe { libc::_exit(125) };
     }
-    let error = command.exec();
-    let os_code = error.raw_os_error().unwrap_or(0);
+    let os_code = if let Some(entrypoint) = pinned_probe_entrypoint {
+        let argv = pinned_argv.expect("pinned probe retained exact argv");
+        let _error = entrypoint.execveat(&argv, &[]);
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+    } else {
+        command.exec().raw_os_error().unwrap_or(0)
+    };
     let class = classify_exec_error(os_code);
     let record = encode_exec_failure(class, os_code);
     let reported = control.write_all(&record).is_ok();

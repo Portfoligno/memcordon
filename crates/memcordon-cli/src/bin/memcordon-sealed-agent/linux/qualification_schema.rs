@@ -161,6 +161,44 @@ pub struct TrustedQualificationReceiptV4<'a> {
     pub receipt_sha256: &'a memcordon_core::DiagnosticSha256,
 }
 
+/// The installed host canary is a closed inventory. Release qualification has
+/// its own, larger native catalogue; a receipt with arbitrary successful probe
+/// names cannot qualify this host.
+pub const HOST_PROBE_CATALOG_V1: &[(memcordon_core::workload_registry_v2::ProfileKindV2, &str)] = &[
+    (
+        memcordon_core::workload_registry_v2::ProfileKindV2::LinuxTcp4PrivateV1,
+        "descriptor_identity_filter_namespace",
+    ),
+    (
+        memcordon_core::workload_registry_v2::ProfileKindV2::LinuxTcp4PrivateV1,
+        "frontend_guardian_loss_retirement",
+    ),
+    (
+        memcordon_core::workload_registry_v2::ProfileKindV2::LinuxTcp4PrivateV1,
+        "namespace_port_sysctl_isolation",
+    ),
+    (
+        memcordon_core::workload_registry_v2::ProfileKindV2::LinuxTcp4PrivateV1,
+        "target_exec_failure_retirement",
+    ),
+    (
+        memcordon_core::workload_registry_v2::ProfileKindV2::LinuxTcp4PrivateV1,
+        "tcp_listener_client_competitor",
+    ),
+    (
+        memcordon_core::workload_registry_v2::ProfileKindV2::LinuxTcp4PrivateV1,
+        "unix_creation_socketpair_denial",
+    ),
+    (
+        memcordon_core::workload_registry_v2::ProfileKindV2::LinuxTcp4PrivateV1,
+        "wrong_family_protocol_denial",
+    ),
+    (
+        memcordon_core::workload_registry_v2::ProfileKindV2::LinuxUnixCreateV1,
+        "baseline_unix_success_retirement",
+    ),
+];
+
 impl QualificationReceiptV4 {
     pub fn parse_and_validate(
         bytes: &[u8],
@@ -206,8 +244,7 @@ impl QualificationReceiptV4 {
             || self.host_prerequisites_digest != *trusted.host_prerequisites_digest
             || self.native_run_digest != *trusted.native_run_digest
             || self.probes.len() != trusted.probes.len()
-            || self.probes.len() < 2
-            || self.probes.len() > 64
+            || self.probes.len() != HOST_PROBE_CATALOG_V1.len()
         {
             return Err("V4 qualification host, boot, image or native run differs".into());
         }
@@ -216,7 +253,12 @@ impl QualificationReceiptV4 {
         let mut saw_private = false;
         let mut saw_baseline = false;
         let mut previous: Option<(&str, &str)> = None;
-        for (probe, expected) in self.probes.iter().zip(trusted.probes) {
+        for ((probe, expected), (kind, name)) in self
+            .probes
+            .iter()
+            .zip(trusted.probes)
+            .zip(HOST_PROBE_CATALOG_V1)
+        {
             let key = (probe.profile.id.as_str(), probe.name.as_str());
             if probe.name.is_empty()
                 || probe.name.len() > 256
@@ -228,6 +270,8 @@ impl QualificationReceiptV4 {
                 || previous.is_some_and(|prior| prior >= key)
                 || probe.profile != *expected.profile
                 || probe.name != expected.name
+                || probe.profile != kind.reference()
+                || probe.name != *name
                 || !probe.native_executed
                 || !probe.passed
                 || !expected.native_executed

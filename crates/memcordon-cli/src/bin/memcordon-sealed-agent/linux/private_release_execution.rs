@@ -1,0 +1,474 @@
+//! Physically implemented candidate release selectors through the V4
+//! owner. Returning an observation is not a release-case result or Q proof.
+
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::AsFd;
+use std::os::unix::fs::MetadataExt;
+use std::time::{Duration, Instant};
+
+use memcordon_core::DiagnosticSha256;
+use memcordon_core::workload_codec::hash_bytes;
+
+use super::namespace::CallerMountContext;
+use super::network_profile::current_network_namespace;
+use super::private_lifecycle::{PrivateExecObservation, PrivateMonitorOutcome};
+use super::private_release_run::ReleaseCandidateRunAuthorityV1;
+use crate::request::{FileIdentity, NamespaceIdentity, SwapLimit};
+
+pub(crate) struct CandidateNativeObservationV1 {
+    pub(crate) attempt_id: String,
+    pub(crate) checkpoint_digest: DiagnosticSha256,
+    pub(crate) terminal_record_digest: DiagnosticSha256,
+    pub(crate) challenge_sha256: DiagnosticSha256,
+    pub(crate) response_sha256: DiagnosticSha256,
+    pub(crate) candidate_exit_code: i32,
+    pub(crate) response_bytes: Vec<u8>,
+    pub(crate) network_namespace_inode: u64,
+    pub(crate) terminal_bytes: Vec<u8>,
+    pub(crate) settlement: super::private_lifecycle::ReleaseCandidateSettlementFactsV1,
+    pub(crate) host_network_preservation:
+        Option<super::private_release_host_state::HostNetworkPreservationV1>,
+    pub(crate) agent_path_preservation:
+        Option<super::private_release_ancestor::AgentPathPreservationV1>,
+}
+
+pub(crate) struct UncertainCandidateNativeObservationV1 {
+    pub(crate) attempt_id: String,
+    pub(crate) checkpoint_digest: DiagnosticSha256,
+    pub(crate) terminal_record_digest: DiagnosticSha256,
+    pub(crate) challenge_sha256: DiagnosticSha256,
+    pub(crate) authorization_failure_phase: u8,
+    pub(crate) authorization_failure_detail: String,
+    pub(crate) terminal_bytes: Vec<u8>,
+    pub(crate) settlement: super::private_release_attempt::UncertainCandidateSettlementFactsV1,
+}
+
+pub(crate) struct BlockedCandidateNativeObservationV1 {
+    pub(crate) attempt_id: String,
+    pub(crate) checkpoint_digest: DiagnosticSha256,
+    pub(crate) terminal_record_digest: DiagnosticSha256,
+    pub(crate) challenge_sha256: DiagnosticSha256,
+    pub(crate) response_sha256: DiagnosticSha256,
+    pub(crate) response_bytes: Vec<u8>,
+    pub(crate) network_namespace_inode: u64,
+    pub(crate) terminal_bytes: Vec<u8>,
+    pub(crate) fault_marker_bytes: Vec<u8>,
+    pub(crate) transition_error: String,
+    pub(crate) reuse_error: String,
+    pub(crate) settlement: super::private_lifecycle::ReleaseCandidateSettlementFactsV1,
+}
+
+/// Executes the fixed TCP target through the real V4 owner, proves ordinary
+/// physical resource settlement, then injects only the durable Retired write
+/// conflict. The returned observation is a failure, never TargetCompleted.
+#[allow(dead_code)] // Detached fault verifier and result are not connected yet.
+pub(crate) fn execute_blocked_retirement_candidate_case(
+    case: &ReleaseCandidateRunAuthorityV1,
+) -> Result<BlockedCandidateNativeObservationV1, String> {
+    if case.selector() != super::private_release_case::RETIREMENT_FAULT_SELECTOR {
+        return Err("MCSEALED-PRIVATE-RELEASE: retirement fault selector differs".into());
+    }
+    case.revalidate()?;
+    let prelaunch = case.prepare_native_prelaunch()?;
+    let (uid, gid) = case.target_ids()?;
+    let identity = super::execution_identity::ResolvedTargetIdentity::for_probe_account(uid, gid)?;
+    let abi = case.native_abi()?;
+    let mount = File::open("/proc/self/ns/mnt")
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: mount namespace: {error}"))?;
+    let root = File::open("/")
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: root descriptor: {error}"))?;
+    let mount_metadata = mount.metadata().map_err(|error| error.to_string())?;
+    let root_metadata = root.metadata().map_err(|error| error.to_string())?;
+    let mount_context = CallerMountContext {
+        mount_namespace: mount.into(),
+        root: root.into(),
+        mount_namespace_identity: NamespaceIdentity {
+            device: mount_metadata.dev(),
+            inode: mount_metadata.ino(),
+        },
+        root_identity: FileIdentity {
+            device: root_metadata.dev(),
+            inode: root_metadata.ino(),
+        },
+    };
+    let work_directory = case.work_directory()?;
+    let provider_namespace = current_network_namespace()?;
+    let worker_pidfd = super::private_execution::pidfd_for_self()?;
+    let (stdin_read, stdin_write) = super::private_probe_execution::nonblocking_pipe()?;
+    let (stdout_read, stdout_write) = super::private_probe_execution::nonblocking_pipe()?;
+    let (stderr_read, stderr_write) = super::private_probe_execution::nonblocking_pipe()?;
+    let challenge = case.challenge_bytes();
+    File::from(stdin_write)
+        .write_all(&challenge)
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: fault challenge pipe: {error}"))?;
+    let mut owner = case.begin_native_owner()?;
+    let startup_deadline = (Instant::now() + Duration::from_secs(5)).min(case.deadline());
+    if startup_deadline <= Instant::now() {
+        return Err("MCSEALED-PRIVATE-RELEASE: fault startup deadline expired".into());
+    }
+    let run = (|| -> Result<_, String> {
+        owner.create_boundary(None, SwapLimit::Host)?;
+        owner.spawn_namespace(
+            prelaunch,
+            mount_context,
+            work_directory.into(),
+            provider_namespace,
+            provider_namespace,
+        )?;
+        owner.start_guardian(
+            case.attempt_bytes(),
+            case.coordinator_pidfd(),
+            worker_pidfd.as_fd(),
+            startup_deadline,
+        )?;
+        let observed = owner.observe_gated_target(
+            provider_namespace,
+            provider_namespace,
+            &identity,
+            abi,
+            *case.filter_digest().bytes(),
+            startup_deadline,
+        )?;
+        let network_namespace_inode = observed.network_namespace_inode();
+        owner.prepare_relay([stdin_read, stdout_write, stderr_write])?;
+        let checkpoint = owner.commit_release_candidate_and_release(observed, case)?;
+        if !matches!(
+            owner.observe_exec(startup_deadline)?,
+            PrivateExecObservation::ArmedAndControlClosed
+        ) {
+            return Err("MCSEALED-PRIVATE-RELEASE: fault target failed exec".into());
+        }
+        if owner.monitor_release_candidate(case)? != PrivateMonitorOutcome::Completed {
+            return Err("MCSEALED-PRIVATE-RELEASE: fault target monitor incomplete".into());
+        }
+        let expected = case.expected_fixture_output(network_namespace_inode)?;
+        let response =
+            super::private_probe_execution::read_bounded_pipe(stdout_read, expected.len() + 1)?;
+        let stderr = super::private_probe_execution::read_bounded_pipe(stderr_read, 1025)?;
+        if response != expected || !stderr.is_empty() {
+            return Err("MCSEALED-PRIVATE-RELEASE: fault fixture response differs".into());
+        }
+        Ok((checkpoint, response, network_namespace_inode))
+    })();
+    let retirement = owner.retire_release_candidate_with_durable_fault(
+        &challenge,
+        Instant::now() + Duration::from_secs(30),
+    );
+    let (checkpoint, response, network_namespace_inode) = run?;
+    let retirement = retirement?;
+    if current_network_namespace()? != provider_namespace
+        || retirement.checkpoint_digest != checkpoint
+        || retirement.settlement.candidate_exit_code != Some(0)
+        || retirement.transition_error.is_empty()
+        || retirement.reuse_error.is_empty()
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: fault native settlement differs".into());
+    }
+    case.revalidate()?;
+    Ok(BlockedCandidateNativeObservationV1 {
+        attempt_id: retirement.attempt_id,
+        checkpoint_digest: checkpoint,
+        terminal_record_digest: retirement.terminal_record_digest,
+        challenge_sha256: hash_bytes(&challenge),
+        response_sha256: hash_bytes(&response),
+        response_bytes: response,
+        network_namespace_inode,
+        terminal_bytes: retirement.terminal_bytes,
+        fault_marker_bytes: retirement.fault_marker_bytes,
+        transition_error: retirement.transition_error,
+        reuse_error: retirement.reuse_error,
+        settlement: retirement.settlement,
+    })
+}
+
+/// Deliberately loses the control transport after a durable release intent.
+/// This never proves target execution or a successful candidate result.
+#[allow(dead_code)] // The protected detached verifier is not connected yet.
+pub(crate) fn execute_uncertain_candidate_case(
+    case: &ReleaseCandidateRunAuthorityV1,
+) -> Result<UncertainCandidateNativeObservationV1, String> {
+    if case.selector() != super::private_release_case::AUTHORIZATION_UNCERTAIN_SELECTOR {
+        return Err("MCSEALED-PRIVATE-RELEASE: uncertainty selector differs".into());
+    }
+    case.revalidate()?;
+    let prelaunch = case.prepare_native_prelaunch()?;
+    let (uid, gid) = case.target_ids()?;
+    let identity = super::execution_identity::ResolvedTargetIdentity::for_probe_account(uid, gid)?;
+    let abi = case.native_abi()?;
+    let mount = File::open("/proc/self/ns/mnt")
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: mount namespace: {error}"))?;
+    let root = File::open("/")
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: root descriptor: {error}"))?;
+    let mount_metadata = mount.metadata().map_err(|error| error.to_string())?;
+    let root_metadata = root.metadata().map_err(|error| error.to_string())?;
+    let mount_context = CallerMountContext {
+        mount_namespace: mount.into(),
+        root: root.into(),
+        mount_namespace_identity: NamespaceIdentity {
+            device: mount_metadata.dev(),
+            inode: mount_metadata.ino(),
+        },
+        root_identity: FileIdentity {
+            device: root_metadata.dev(),
+            inode: root_metadata.ino(),
+        },
+    };
+    let work_directory = case.work_directory()?;
+    let provider_namespace = current_network_namespace()?;
+    let worker_pidfd = super::private_execution::pidfd_for_self()?;
+    let (stdin_read, stdin_write) = super::private_probe_execution::nonblocking_pipe()?;
+    let (stdout_read, stdout_write) = super::private_probe_execution::nonblocking_pipe()?;
+    let (stderr_read, stderr_write) = super::private_probe_execution::nonblocking_pipe()?;
+    File::from(stdin_write)
+        .write_all(&case.challenge_bytes())
+        .map_err(|error| {
+            format!("MCSEALED-PRIVATE-RELEASE: uncertainty challenge pipe: {error}")
+        })?;
+    let mut owner = case.begin_native_owner()?;
+    let startup_deadline = (Instant::now() + Duration::from_secs(5)).min(case.deadline());
+    if startup_deadline <= Instant::now() {
+        return Err("MCSEALED-PRIVATE-RELEASE: uncertainty startup deadline expired".into());
+    }
+    let run = (|| -> Result<_, String> {
+        owner.create_boundary(None, SwapLimit::Host)?;
+        owner.spawn_namespace(
+            prelaunch,
+            mount_context,
+            work_directory.into(),
+            provider_namespace,
+            provider_namespace,
+        )?;
+        owner.start_guardian(
+            case.attempt_bytes(),
+            case.coordinator_pidfd(),
+            worker_pidfd.as_fd(),
+            startup_deadline,
+        )?;
+        let observed = owner.observe_gated_target(
+            provider_namespace,
+            provider_namespace,
+            &identity,
+            abi,
+            *case.filter_digest().bytes(),
+            startup_deadline,
+        )?;
+        owner.prepare_relay([stdin_read, stdout_write, stderr_write])?;
+        owner.commit_uncertain_candidate_transport_loss(observed, case)
+    })();
+    let (checkpoint, transport_errno) = run?;
+    // Even if the control observation fails, the owner still attempts
+    // bounded physical retirement; a failed observation cannot be promoted.
+    let authorization = owner.observe_exec(startup_deadline);
+    let retirement = owner.retire_uncertain_release_candidate(
+        transport_errno,
+        Instant::now() + Duration::from_secs(30),
+    )?;
+    let (authorization_failure_phase, authorization_failure_detail) = match authorization? {
+        PrivateExecObservation::Failed { phase, detail }
+            if phase == 4 && detail == "authorization packet invalid" =>
+        {
+            (phase, detail)
+        }
+        _ => {
+            return Err("MCSEALED-PRIVATE-RELEASE: uncertainty gate failure differs".into());
+        }
+    };
+    if retirement.checkpoint_digest != checkpoint
+        || retirement.settlement.transport_errno != libc::EPIPE
+        || retirement.settlement.candidate_exit_code == Some(0)
+        || current_network_namespace()? != provider_namespace
+        || !super::private_probe_execution::read_bounded_pipe(stdout_read, 1)?.is_empty()
+        || !super::private_probe_execution::read_bounded_pipe(stderr_read, 1)?.is_empty()
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: uncertainty physical observation differs".into());
+    }
+    case.revalidate()?;
+    Ok(UncertainCandidateNativeObservationV1 {
+        attempt_id: retirement.attempt_id,
+        checkpoint_digest: checkpoint,
+        terminal_record_digest: retirement.terminal_record_digest,
+        challenge_sha256: hash_bytes(&case.challenge_bytes()),
+        authorization_failure_phase,
+        authorization_failure_detail,
+        terminal_bytes: retirement.terminal_bytes,
+        settlement: retirement.settlement,
+    })
+}
+
+/// This proves only one selected native target behavior. The fixed 25-case
+/// release matrix, raw attachments, independent CI supervisor and Q gate
+/// remain separate and must reject any missing selector.
+pub(crate) fn execute_candidate_fixture_case(
+    case: &ReleaseCandidateRunAuthorityV1,
+) -> Result<CandidateNativeObservationV1, String> {
+    if !super::private_release_case::candidate_fixture_supported(case.selector()) {
+        return Err("MCSEALED-PRIVATE-RELEASE: candidate fixture unavailable".into());
+    }
+    execute_fixture_case_with_mode(case, FixtureExecutionModeV1::Ordinary)
+}
+
+/// A closed physical owner may execute the exact AF_UNIX socket-stage target
+/// without changing ordinary candidate selector support or publishing a case.
+pub(crate) fn execute_closed_unix_intent_case(
+    case: &ReleaseCandidateRunAuthorityV1,
+) -> Result<CandidateNativeObservationV1, String> {
+    if case.selector() != super::private_release_unix_intent::SELECTOR {
+        return Err("MCSEALED-PRIVATE-RELEASE: Unix intent selector differs".into());
+    }
+    execute_fixture_case_with_mode(case, FixtureExecutionModeV1::ClosedUnixIntent)
+}
+
+#[derive(Clone, Copy)]
+enum FixtureExecutionModeV1 {
+    Ordinary,
+    ClosedUnixIntent,
+}
+
+fn execute_fixture_case_with_mode(
+    case: &ReleaseCandidateRunAuthorityV1,
+    mode: FixtureExecutionModeV1,
+) -> Result<CandidateNativeObservationV1, String> {
+    case.revalidate()?;
+    let prelaunch = match mode {
+        FixtureExecutionModeV1::Ordinary => case.prepare_native_prelaunch()?,
+        FixtureExecutionModeV1::ClosedUnixIntent => case.prepare_closed_unix_intent_prelaunch()?,
+    };
+    let (uid, gid) = case.target_ids()?;
+    let identity = super::execution_identity::ResolvedTargetIdentity::for_probe_account(uid, gid)?;
+    let abi = case.native_abi()?;
+    let mount = File::open("/proc/self/ns/mnt")
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: mount namespace: {error}"))?;
+    let root = File::open("/")
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: root descriptor: {error}"))?;
+    let mount_metadata = mount.metadata().map_err(|error| error.to_string())?;
+    let root_metadata = root.metadata().map_err(|error| error.to_string())?;
+    let mount_context = CallerMountContext {
+        mount_namespace: mount.into(),
+        root: root.into(),
+        mount_namespace_identity: NamespaceIdentity {
+            device: mount_metadata.dev(),
+            inode: mount_metadata.ino(),
+        },
+        root_identity: FileIdentity {
+            device: root_metadata.dev(),
+            inode: root_metadata.ino(),
+        },
+    };
+    let work_directory = case.work_directory()?;
+    let provider_namespace = current_network_namespace()?;
+    let host_before = if case.selector() == super::private_release_host_state::SELECTOR {
+        Some(super::private_release_host_state::HostNetworkStateV1::capture()?)
+    } else {
+        None
+    };
+    let agent_path_before = if case.selector() == super::private_release_ancestor::SELECTOR {
+        Some(case.protected_agent_path_snapshot()?)
+    } else {
+        None
+    };
+    let worker_pidfd = super::private_execution::pidfd_for_self()?;
+    let (stdin_read, stdin_write) = super::private_probe_execution::nonblocking_pipe()?;
+    let (stdout_read, stdout_write) = super::private_probe_execution::nonblocking_pipe()?;
+    let (stderr_read, stderr_write) = super::private_probe_execution::nonblocking_pipe()?;
+    let challenge = case.challenge_bytes();
+    File::from(stdin_write)
+        .write_all(&challenge)
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: challenge pipe: {error}"))?;
+    let mut owner = case.begin_native_owner()?;
+    let startup_deadline = (Instant::now() + Duration::from_secs(5)).min(case.deadline());
+    if startup_deadline <= Instant::now() {
+        return Err("MCSEALED-PRIVATE-RELEASE: startup deadline expired".into());
+    }
+    let run = (|| -> Result<_, String> {
+        owner.create_boundary(None, SwapLimit::Host)?;
+        owner.spawn_namespace(
+            prelaunch,
+            mount_context,
+            work_directory.into(),
+            provider_namespace,
+            provider_namespace,
+        )?;
+        owner.start_guardian(
+            case.attempt_bytes(),
+            case.coordinator_pidfd(),
+            worker_pidfd.as_fd(),
+            startup_deadline,
+        )?;
+        let observed = owner.observe_gated_target(
+            provider_namespace,
+            provider_namespace,
+            &identity,
+            abi,
+            *case.filter_digest().bytes(),
+            startup_deadline,
+        )?;
+        let network_namespace_inode = observed.network_namespace_inode();
+        owner.prepare_relay([stdin_read, stdout_write, stderr_write])?;
+        let checkpoint = owner.commit_release_candidate_and_release(observed, case)?;
+        if !matches!(
+            owner.observe_exec(startup_deadline)?,
+            PrivateExecObservation::ArmedAndControlClosed
+        ) {
+            return Err("MCSEALED-PRIVATE-RELEASE: target failed native exec".into());
+        }
+        if owner.monitor_release_candidate(case)? != PrivateMonitorOutcome::Completed {
+            return Err("MCSEALED-PRIVATE-RELEASE: native monitor did not complete".into());
+        }
+        let expected = match mode {
+            FixtureExecutionModeV1::Ordinary => {
+                case.expected_fixture_output(network_namespace_inode)?
+            }
+            FixtureExecutionModeV1::ClosedUnixIntent => {
+                case.expected_closed_unix_intent_output()?
+            }
+        };
+        let response =
+            super::private_probe_execution::read_bounded_pipe(stdout_read, expected.len() + 1)?;
+        let stderr = super::private_probe_execution::read_bounded_pipe(stderr_read, 1025)?;
+        if response != expected || !stderr.is_empty() {
+            return Err("MCSEALED-PRIVATE-RELEASE: fixture response or stderr differs".into());
+        }
+        Ok((checkpoint, response, network_namespace_inode))
+    })();
+    let retirement = owner.retire_release_candidate(Instant::now() + Duration::from_secs(30));
+    let (checkpoint, response, network_namespace_inode) = run?;
+    let retirement = retirement?;
+    if current_network_namespace()? != provider_namespace
+        || retirement.checkpoint_digest.as_ref() != Some(&checkpoint)
+        || retirement.candidate_exit_code != Some(0)
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: native retirement differs".into());
+    }
+    case.revalidate()?;
+    let host_network_preservation = host_before
+        .map(|before| {
+            super::private_release_host_state::HostNetworkPreservationV1::complete(
+                before,
+                super::private_release_host_state::HostNetworkStateV1::capture()?,
+            )
+        })
+        .transpose()?;
+    let agent_path_preservation = agent_path_before
+        .map(|before| {
+            super::private_release_ancestor::AgentPathPreservationV1::complete(
+                before,
+                case.protected_agent_path_snapshot()?,
+            )
+        })
+        .transpose()?;
+    Ok(CandidateNativeObservationV1 {
+        attempt_id: retirement.attempt_id,
+        checkpoint_digest: checkpoint,
+        terminal_record_digest: retirement.terminal_record_digest,
+        challenge_sha256: hash_bytes(&challenge),
+        response_sha256: hash_bytes(&response),
+        candidate_exit_code: 0,
+        response_bytes: response,
+        network_namespace_inode,
+        terminal_bytes: retirement.terminal_bytes,
+        settlement: retirement.settlement,
+        host_network_preservation,
+        agent_path_preservation,
+    })
+}

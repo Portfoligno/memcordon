@@ -51,6 +51,10 @@ fn recover_records(
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
+    let probe_directory = state_root.join(super::private_qualification::PROBE_DIRECTORY_NAME);
+    ambiguous.extend(super::private_qualification::pending_records(
+        &probe_directory,
+    )?);
     let mut blocked_by_temporary = BTreeSet::new();
     for entry in &entries {
         let name = entry.file_name();
@@ -78,6 +82,9 @@ fn recover_records(
 
     for entry in entries {
         let name = entry.file_name();
+        if name == super::private_qualification::PROBE_DIRECTORY_NAME {
+            continue;
+        }
         if name.to_str().is_some_and(|name| {
             name.strip_suffix(".new")
                 .is_some_and(super::cgroup::valid_attempt_identity)

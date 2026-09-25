@@ -151,6 +151,7 @@ pub struct LaunchBrokerRequestV2 {
 pub struct NetworkLaunchBrokerRequestV4 {
     pub attempt_id: [u8; 16],
     pub request_digest: [u8; 32],
+    pub installed_generation_digest: memcordon_core::DiagnosticSha256,
     pub control_process_id: i32,
     pub control_process_start_time: u64,
     pub launch: NetworkLaunchRequestV4,
@@ -163,6 +164,7 @@ pub struct NetworkLaunchBrokerRequestV4 {
 impl NetworkLaunchBrokerRequestV4 {
     pub fn authenticated(
         attempt_id: [u8; 16],
+        installed_generation_digest: memcordon_core::DiagnosticSha256,
         control_process_id: i32,
         control_process_start_time: u64,
         launch: NetworkLaunchRequestV4,
@@ -181,6 +183,7 @@ impl NetworkLaunchBrokerRequestV4 {
         let mut request = Self {
             attempt_id,
             request_digest,
+            installed_generation_digest,
             control_process_id,
             control_process_start_time,
             launch,
@@ -199,6 +202,7 @@ impl NetworkLaunchBrokerRequestV4 {
         digest.update(b"memcordon-network-launch-broker-request-v4\0");
         digest.update(self.attempt_id);
         digest.update(self.request_digest);
+        digest.update(self.installed_generation_digest.bytes());
         digest.update(self.control_process_id.to_be_bytes());
         digest.update(self.control_process_start_time.to_be_bytes());
         digest.update(self.caller.digest());
@@ -375,6 +379,7 @@ pub fn encode_network_launch_broker_request(
     encoded.extend_from_slice(&NETWORK_LAUNCH_BROKER_REQUEST_VERSION.to_be_bytes());
     encoded.extend_from_slice(&request.attempt_id);
     encoded.extend_from_slice(&request.request_digest);
+    encoded.extend_from_slice(request.installed_generation_digest.bytes());
     encoded.extend_from_slice(&request.control_process_id.to_be_bytes());
     encoded.extend_from_slice(&request.control_process_start_time.to_be_bytes());
     put_bytes(&mut encoded, &launch)?;
@@ -408,6 +413,12 @@ pub fn decode_network_launch_broker_request(
         .take(32)?
         .try_into()
         .expect("request digest length is exact");
+    let installed_generation_digest = memcordon_core::DiagnosticSha256::from_bytes(
+        cursor
+            .take(32)?
+            .try_into()
+            .expect("installed generation digest length is exact"),
+    );
     let control_process_id = cursor.i32()?;
     let control_process_start_time = cursor.u64()?;
     let launch = decode_network_launch_request(&cursor.bytes()?)?;
@@ -450,6 +461,7 @@ pub fn decode_network_launch_broker_request(
     let request = NetworkLaunchBrokerRequestV4 {
         attempt_id,
         request_digest,
+        installed_generation_digest,
         control_process_id,
         control_process_start_time,
         launch,

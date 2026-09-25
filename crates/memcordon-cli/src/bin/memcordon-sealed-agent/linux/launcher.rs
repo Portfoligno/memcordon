@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
@@ -128,6 +129,37 @@ fn handle_network(stream: &mut UnixStream) -> Result<(), String> {
             "MCSEALED-NETWORK-LAUNCHER-REQUEST-BINDING",
             "network broker request does not match authenticated exchange",
         )
+    } else if request.kind == MessageKind::BrokerQualifyPrivateHost {
+        let response = match validate_private_probe_operation(&request, descriptors, peer) {
+            Ok(()) => Frame {
+                kind: MessageKind::PrivateProbeRunCompleted,
+                nonce: request.nonce,
+                attempt_id: request.attempt_id,
+                payload: Vec::new(),
+            },
+            Err(error) => rejected(
+                &request,
+                &RejectionV1::request_error("MCSEALED-PRIVATE-QUALIFICATION-REJECTED", &error),
+            )?,
+        };
+        let mut encoded = Vec::new();
+        write_network_frame(&mut encoded, &response).map_err(|error| error.to_string())?;
+        return super::transport::send(stream, &encoded, &[]);
+    } else if request.kind == MessageKind::BrokerReleaseCase {
+        // Broker observation alone is incomplete. Only a later, separately
+        // service-owned post-exit finalizer can publish the protected result.
+        if let Err(error) = validate_release_candidate_operation(&request, descriptors, peer) {
+            eprintln!("sealed release candidate incomplete: {error}");
+        }
+        let response = Frame {
+            kind: MessageKind::ReleaseCaseIncomplete,
+            nonce: request.nonce,
+            attempt_id: request.attempt_id,
+            payload: Vec::new(),
+        };
+        let mut encoded = Vec::new();
+        write_network_frame(&mut encoded, &response).map_err(|error| error.to_string())?;
+        return super::transport::send(stream, &encoded, &[]);
     } else if request.kind != MessageKind::BrokerLaunch {
         RejectionV1::request_error(
             "MCSEALED-NETWORK-LAUNCHER-AUTHORIZATION",
@@ -187,6 +219,345 @@ fn handle_network(stream: &mut UnixStream) -> Result<(), String> {
     };
     let response = rejected(&request, &rejection)?;
     write_network_frame(stream, &response).map_err(|error| error.to_string())
+}
+
+fn validate_release_candidate_operation(
+    request: &Frame,
+    descriptors: Vec<OwnedFd>,
+    peer: AuthenticatedPeer,
+) -> Result<(), String> {
+    if request.attempt_id == [0; 16] || descriptors.len() != 1 {
+        return Err("MCSEALED-PRIVATE-RELEASE: exact coordinator handle required".into());
+    }
+    let fixed = super::private_release_run::decode_broker_request(&request.payload)?;
+    let directory = File::from(
+        descriptors
+            .into_iter()
+            .next()
+            .expect("exact release handle count was checked"),
+    );
+    // SAFETY: pidfd_open pins the authenticated control-service peer.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, peer.pid, 0) } as i32;
+    if raw < 0 {
+        return Err(format!(
+            "MCSEALED-PRIVATE-RELEASE: coordinator pidfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: successful pidfd_open returned one owned descriptor.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let observed = super::private_attempt::ProcessIdentityV4::observe(peer.pid, pidfd.as_fd())?;
+    if observed.start_time != peer.process_start_time {
+        return Err("MCSEALED-PRIVATE-RELEASE: coordinator start identity changed".into());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+    let case = super::private_release_run::ReleaseCandidateRunAuthorityV1::begin(
+        &fixed, peer.pid, pidfd, deadline, directory,
+    )?;
+    if fixed.selector == super::private_release_case::AUTHORIZATION_UNCERTAIN_SELECTOR {
+        let observed = super::private_release_execution::execute_uncertain_candidate_case(&case)?;
+        if observed.attempt_id.is_empty()
+            || observed.checkpoint_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || observed.terminal_record_digest
+                == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || observed.challenge_sha256
+                != memcordon_core::workload_codec::hash_bytes(&fixed.challenge)
+            || observed.authorization_failure_phase != 4
+            || observed.authorization_failure_detail != "authorization packet invalid"
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: uncertainty observation differs".into());
+        }
+        let inventory = case.persist_uncertain_native_raw_observation(&observed)?;
+        if inventory.len()
+            != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL.len()
+                - 1
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: uncertainty inventory differs".into());
+        }
+        return Err("MCSEALED-PRIVATE-RELEASE: awaiting uncertainty coordinator cleanup".into());
+    }
+    if fixed.selector == super::private_release_case::RETIREMENT_FAULT_SELECTOR {
+        let observed =
+            super::private_release_execution::execute_blocked_retirement_candidate_case(&case)?;
+        if observed.attempt_id.is_empty()
+            || observed.checkpoint_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || observed.terminal_record_digest
+                == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || observed.challenge_sha256
+                != memcordon_core::workload_codec::hash_bytes(&fixed.challenge)
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: blocked retirement observation differs".into());
+        }
+        let inventory = case.persist_blocked_retirement_raw_observation(&observed)?;
+        if inventory.len()
+            != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL.len()
+                - 1
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: blocked retirement inventory differs".into());
+        }
+        return Err(
+            "MCSEALED-PRIVATE-RELEASE: awaiting blocked-retirement coordinator cleanup".into(),
+        );
+    }
+    if fixed.selector == super::private_release_guardian_loss::SELECTOR {
+        let observed =
+            super::private_release_guardian_loss::execute_guardian_loss_candidate_case(&case)?;
+        if observed.attempt_id.is_empty()
+            || observed.checkpoint_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || observed.terminal_record_digest
+                == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || observed.challenge_sha256
+                != memcordon_core::workload_codec::hash_bytes(&fixed.challenge)
+            || observed.armed_response_sha256
+                != memcordon_core::workload_codec::hash_bytes(
+                    &super::private_release_guardian_loss::armed_response(&fixed.challenge),
+                )
+            || observed.settlement.guardian_signal != libc::SIGKILL
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: guardian-loss observation differs".into());
+        }
+        let inventory = case.persist_guardian_loss_raw_observation(&observed)?;
+        if inventory.len()
+            != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL.len()
+                - 1
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: guardian-loss inventory differs".into());
+        }
+        return Err("MCSEALED-PRIVATE-RELEASE: awaiting guardian-loss coordinator cleanup".into());
+    }
+    if fixed.selector == super::private_release_frontend_loss::SELECTOR {
+        let observed =
+            super::private_release_frontend_loss::execute_frontend_loss_candidate_case(&case)?;
+        if observed.attempt_id.is_empty()
+            || observed.checkpoint_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || observed.terminal_record_digest
+                == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || observed.challenge_sha256
+                != memcordon_core::workload_codec::hash_bytes(&fixed.challenge)
+            || observed.armed_response_sha256
+                != memcordon_core::workload_codec::hash_bytes(
+                    &super::private_release_frontend_loss::armed_response(&fixed.challenge),
+                )
+            || observed.settlement.frontend_signal != libc::SIGKILL
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: frontend-loss observation differs".into());
+        }
+        let inventory = case.persist_frontend_loss_raw_observation(&observed)?;
+        if inventory.len()
+            != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL.len()
+                - 1
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: frontend-loss inventory differs".into());
+        }
+        return Err("MCSEALED-PRIVATE-RELEASE: awaiting frontend-loss coordinator cleanup".into());
+    }
+    if fixed.selector == super::private_release_case::CHECKPOINT_GATE_SELECTOR {
+        let observed = super::private_release_gate::execute_checkpoint_gate_case(&case)?;
+        let candidate = &observed.candidate;
+        if candidate.attempt_id.is_empty()
+            || candidate.checkpoint_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || candidate.terminal_record_digest
+                == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || candidate.challenge_sha256
+                != memcordon_core::workload_codec::hash_bytes(&fixed.challenge)
+            || candidate.candidate_exit_code != 0
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: checkpoint-gate observation differs".into());
+        }
+        let inventory = case.persist_checkpoint_gate_raw_observation(&observed)?;
+        if inventory.len()
+            != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL.len()
+                - 1
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: checkpoint-gate raw inventory differs".into());
+        }
+        return Err(
+            "MCSEALED-PRIVATE-RELEASE: awaiting checkpoint-gate coordinator cleanup".into(),
+        );
+    }
+    if fixed.selector == super::private_release_children::SELECTOR {
+        let observed = super::private_release_child_execution::execute_child_candidate_case(&case)?;
+        let candidate = &observed.candidate;
+        if candidate.attempt_id.is_empty()
+            || candidate.checkpoint_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || candidate.terminal_record_digest
+                == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || candidate.challenge_sha256
+                != memcordon_core::workload_codec::hash_bytes(&fixed.challenge)
+            || candidate.candidate_exit_code != 0
+            || observed.live.challenge_sha256 != candidate.challenge_sha256
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: child observation differs".into());
+        }
+        let inventory = case.persist_child_raw_observation(&observed)?;
+        if inventory.len()
+            != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL.len()
+                - 1
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: child raw inventory differs".into());
+        }
+        return Err("MCSEALED-PRIVATE-RELEASE: awaiting child coordinator cleanup".into());
+    }
+    if fixed.selector == super::private_release_socket_launder::SELECTOR {
+        let observed =
+            super::private_release_socket_execution::execute_socket_launder_candidate_case(&case)?;
+        let candidate = &observed.candidate;
+        if candidate.attempt_id.is_empty()
+            || candidate.checkpoint_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || candidate.terminal_record_digest
+                == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || candidate.challenge_sha256
+                != memcordon_core::workload_codec::hash_bytes(&fixed.challenge)
+            || candidate.candidate_exit_code != 0
+            || observed.gated_witness.sendmsg_errno != libc::EPERM
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: socket observation differs".into());
+        }
+        let inventory = case.persist_socket_raw_observation(&observed)?;
+        if inventory.len()
+            != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL.len()
+                - 1
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: socket raw inventory differs".into());
+        }
+        return Err("MCSEALED-PRIVATE-RELEASE: awaiting socket coordinator cleanup".into());
+    }
+    if fixed.selector == super::private_release_terminal_join::SELECTOR {
+        let observed =
+            super::private_release_terminal_execution::execute_terminal_join_candidate_case(&case)?;
+        let candidate = &observed.candidate;
+        if candidate.attempt_id.is_empty()
+            || candidate.checkpoint_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || candidate.terminal_record_digest
+                == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || candidate.challenge_sha256
+                != memcordon_core::workload_codec::hash_bytes(&fixed.challenge)
+            || candidate.candidate_exit_code != 0
+            || observed.target_namespace_pid == 0
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: terminal-join observation differs".into());
+        }
+        let inventory = case.persist_terminal_join_raw_observation(&observed)?;
+        if inventory.len()
+            != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL.len()
+                - 1
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: terminal-join raw inventory differs".into());
+        }
+        return Err("MCSEALED-PRIVATE-RELEASE: awaiting terminal-join coordinator cleanup".into());
+    }
+    if fixed.selector == super::private_release_dual_attempt::SELECTOR {
+        let observed = super::private_release_dual_execution::execute_dual_candidate_case(&case)?;
+        if observed.first.attempt_id == observed.second.attempt_id
+            || observed.first_namespace_inode == observed.second_namespace_inode
+            || observed.first_listener_inode == observed.second_listener_inode
+            || observed.first.candidate_exit_code != Some(0)
+            || observed.second.candidate_exit_code != Some(0)
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: dual native observation differs".into());
+        }
+        let inventory = case.persist_dual_worker_raw(&observed)?;
+        if inventory.len()
+            != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL.len()
+                - 1
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: dual worker inventory differs".into());
+        }
+        return Err("MCSEALED-PRIVATE-RELEASE: awaiting dual coordinator cleanup".into());
+    }
+    let observed = super::private_release_execution::execute_candidate_fixture_case(&case)?;
+    let namespace_inode = case.retired_native_namespace_inode()?;
+    let expected_response = case.expected_fixture_output(namespace_inode)?;
+    if observed.attempt_id.is_empty()
+        || observed.checkpoint_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+        || observed.terminal_record_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+        || observed.challenge_sha256 != memcordon_core::workload_codec::hash_bytes(&fixed.challenge)
+        || observed.network_namespace_inode != namespace_inode
+        || observed.response_sha256
+            != memcordon_core::workload_codec::hash_bytes(&expected_response)
+        || observed.candidate_exit_code != 0
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: native candidate observation differs".into());
+    }
+    let inventory = case.persist_native_raw_observation(&observed)?;
+    if inventory.len()
+        != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL.len() - 1
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: raw attachment inventory differs".into());
+    }
+    Err("MCSEALED-PRIVATE-RELEASE: awaiting independent coordinator cleanup".into())
+}
+
+fn validate_private_probe_operation(
+    request: &Frame,
+    descriptors: Vec<OwnedFd>,
+    peer: AuthenticatedPeer,
+) -> Result<(), String> {
+    if request.attempt_id == [0; 16] || descriptors.len() != 1 {
+        return Err("MCSEALED-PRIVATE-PROBE: exact run handle and attempt required".into());
+    }
+    let nonce = super::private_qualification::decode_broker_request(&request.payload)?;
+    let directory = std::fs::File::from(
+        descriptors
+            .into_iter()
+            .next()
+            .expect("exact descriptor count was checked"),
+    );
+    // SAFETY: pidfd_open binds to the authenticated live control-service peer,
+    // not a numeric PID chosen in the broker request.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, peer.pid, 0) } as i32;
+    if fd < 0 {
+        return Err(format!(
+            "MCSEALED-PRIVATE-PROBE: coordinator pidfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: successful pidfd_open returned one owned descriptor.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let observed = super::private_attempt::ProcessIdentityV4::observe(peer.pid, pidfd.as_fd())?;
+    if observed.start_time != peer.process_start_time {
+        return Err("MCSEALED-PRIVATE-PROBE: coordinator start identity changed".into());
+    }
+    let package = crate::package::acquire_verified_probe_package_lease()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+    let run = super::private_qualification::ProbeRunAuthority::begin(
+        package, peer.pid, pidfd, deadline, nonce, directory,
+    )?;
+    // The coordinator retains the package lease and pidfd while every fixed
+    // native subattempt executes. A failure leaves protected records in place
+    // for explicit recovery; it never skips ahead or issues a host receipt.
+    for index in 0..super::qualification::HOST_PROBE_CATALOG_V1.len() {
+        let case = run.case(index)?;
+        match case.kind() {
+            super::private_qualification::ProbeFixtureKindV1::FrontendGuardianLossRetirement => {
+                let frontend = super::private_probe_loss::execute_loss_subattempt(
+                    &case,
+                    super::private_qualification::ProbeLossKindV1::Frontend,
+                )?;
+                let guardian = super::private_probe_loss::execute_loss_subattempt(
+                    &case,
+                    super::private_qualification::ProbeLossKindV1::Guardian,
+                )?;
+                case.persist_loss_completion(&[frontend, guardian])?;
+            }
+            super::private_qualification::ProbeFixtureKindV1::TargetExecFailureRetirement => {
+                super::private_probe_execution::execute_failed_exec_fixture(&case)?;
+            }
+            super::private_qualification::ProbeFixtureKindV1::BaselineUnixSuccessRetirement => {
+                super::private_probe_baseline::execute_baseline_unix_fixture(&case)?;
+            }
+            _ => {
+                super::private_probe_execution::execute_success_fixture(&case)?;
+            }
+        }
+        case.verify_persisted_completion()?;
+    }
+    let live = run.verify_complete_run()?;
+    let stored = run.verify_independent_readback()?;
+    if live.native_run_digest() != stored.native_run_digest() || live.probes() != stored.probes() {
+        return Err("MCSEALED-PRIVATE-PROBE: independent run readback differs".into());
+    }
+    Ok(())
 }
 
 pub fn probe() -> Result<super::qualification::QualificationReceipt, String> {
@@ -277,10 +648,11 @@ pub fn launch_network(
     }
     match response.kind {
         MessageKind::Terminal => {
-            super::private_lifecycle::PrivateTerminalReceiptV4::parse_verified(
+            let terminal = super::private_lifecycle::PrivateTerminalReceiptV4::parse_verified(
                 &response.payload,
                 request.attempt_id,
             )?;
+            terminal.verify_broker_binding(broker_request)?;
         }
         MessageKind::Rejected => {
             let value: serde_json::Value = serde_json::from_slice(&response.payload)
@@ -310,6 +682,169 @@ pub fn launch_network(
             }
         }
         _ => unreachable!("validated network broker response kind"),
+    }
+    Ok(response)
+}
+
+pub(crate) fn qualify_private_host(
+    request: &Frame,
+    prepared: &super::private_qualification::PreparedProbeRunV1,
+) -> Result<Frame, String> {
+    let (stream, worker) = connect_network_authenticated_peer(request.nonce, request.attempt_id)?;
+    // SAFETY: pidfd_open pins the authenticated worker PID; native identity
+    // readback below rejects reuse between the credential frame and open.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, worker.pid, 0) } as i32;
+    if raw == -1 {
+        return Err(format!(
+            "MCSEALED-PRIVATE-PROBE: worker pidfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: successful pidfd_open transferred one unique descriptor.
+    let worker_pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let worker_identity =
+        super::private_attempt::ProcessIdentityV4::observe(worker.pid, worker_pidfd.as_fd())?;
+    if worker_identity.start_time != worker.process_start_time {
+        return Err("MCSEALED-PRIVATE-PROBE: authenticated worker identity changed".into());
+    }
+    let broker = Frame {
+        kind: MessageKind::BrokerQualifyPrivateHost,
+        nonce: request.nonce,
+        attempt_id: request.attempt_id,
+        payload: prepared.encode_broker_request()?,
+    };
+    let mut bytes = Vec::new();
+    write_network_frame(&mut bytes, &broker).map_err(|error| error.to_string())?;
+    set_receive_credentials(&stream, true)?;
+    super::transport::send(&stream, &bytes, &[prepared.directory.as_raw_fd()])?;
+    let (response, descriptors, credentials) =
+        super::transport::receive_network_with_credentials(&stream)?;
+    if !descriptors.is_empty() {
+        return Err("MCSEALED-PRIVATE-PROBE: worker returned unexpected descriptors".into());
+    }
+    let credentials =
+        credentials.ok_or("MCSEALED-PRIVATE-PROBE: worker completion credentials absent")?;
+    if response.nonce != request.nonce
+        || response.attempt_id != request.attempt_id
+        || credentials.pid != worker.pid
+        || credentials.uid != 0
+        || credentials.gid != 0
+    {
+        return Err("MCSEALED-PRIVATE-PROBE: worker completion binding differs".into());
+    }
+    if response.kind == MessageKind::Rejected {
+        let rejection: RejectionV1 =
+            serde_json::from_slice(&response.payload).map_err(|error| error.to_string())?;
+        rejection.validate()?;
+        return Ok(response);
+    }
+    if response.kind != MessageKind::PrivateProbeRunCompleted || !response.payload.is_empty() {
+        return Err("MCSEALED-PRIVATE-PROBE: worker completion format differs".into());
+    }
+    let mut pollfd = libc::pollfd {
+        fd: worker_pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll observes only the retained authenticated worker pidfd.
+    if unsafe { libc::poll(&raw mut pollfd, 1, 30_000) } != 1 || pollfd.revents & libc::POLLIN == 0
+    {
+        return Err("MCSEALED-PRIVATE-PROBE: worker did not exit after completion".into());
+    }
+    let package = crate::package::acquire_verified_probe_package_lease()?;
+    let stored = super::private_qualification::verify_completed_run_after_exit(
+        &prepared.nonce,
+        &prepared.directory,
+        &package,
+    )?;
+    if stored.probes().len() != super::qualification::HOST_PROBE_CATALOG_V1.len() {
+        return Err("MCSEALED-PRIVATE-PROBE: post-exit run inventory differs".into());
+    }
+    Ok(Frame {
+        kind: MessageKind::PrivateProbeRunCompleted,
+        nonce: request.nonce,
+        attempt_id: request.attempt_id,
+        payload: prepared.nonce.to_vec(),
+    })
+}
+
+pub(crate) fn execute_release_candidate_case(
+    request: &Frame,
+    prepared: &super::private_release_run::PreparedReleaseCandidateRunV1,
+) -> Result<Frame, String> {
+    let (stream, worker) = connect_network_authenticated_peer(request.nonce, request.attempt_id)?;
+    // SAFETY: pidfd_open pins the authenticated worker during the exchange.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, worker.pid, 0) } as i32;
+    if raw < 0 {
+        return Err(format!(
+            "MCSEALED-PRIVATE-RELEASE: worker pidfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: successful pidfd_open returned one owned descriptor.
+    let worker_pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let worker_identity =
+        super::private_attempt::ProcessIdentityV4::observe(worker.pid, worker_pidfd.as_fd())?;
+    if worker_identity.start_time != worker.process_start_time {
+        return Err("MCSEALED-PRIVATE-RELEASE: authenticated worker changed".into());
+    }
+    let broker = Frame {
+        kind: MessageKind::BrokerReleaseCase,
+        nonce: request.nonce,
+        attempt_id: request.attempt_id,
+        payload: prepared.encode_broker_request()?,
+    };
+    let mut bytes = Vec::new();
+    write_network_frame(&mut bytes, &broker).map_err(|error| error.to_string())?;
+    set_receive_credentials(&stream, true)?;
+    super::transport::send(&stream, &bytes, &[prepared.directory.as_raw_fd()])?;
+    let (response, descriptors, credentials) =
+        super::transport::receive_network_with_credentials(&stream)?;
+    if !descriptors.is_empty() {
+        return Err("MCSEALED-PRIVATE-RELEASE: worker returned descriptors".into());
+    }
+    let credentials = credentials.ok_or("MCSEALED-PRIVATE-RELEASE: worker credentials absent")?;
+    if response.nonce != request.nonce
+        || response.attempt_id != request.attempt_id
+        || response.kind != MessageKind::ReleaseCaseIncomplete
+        || !response.payload.is_empty()
+        || credentials.pid != worker.pid
+        || credentials.uid != 0
+        || credentials.gid != 0
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: worker response binding differs".into());
+    }
+    let mut pollfd = libc::pollfd {
+        fd: worker_pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll observes only the retained authenticated worker pidfd.
+    if unsafe { libc::poll(&raw mut pollfd, 1, 30_000) } != 1 || pollfd.revents & libc::POLLIN == 0
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: worker did not exit after observation".into());
+    }
+    if prepared.request.selector == super::private_release_case::AUTHORIZATION_UNCERTAIN_SELECTOR {
+        prepared.persist_control_uncertain_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else if prepared.request.selector == super::private_release_case::RETIREMENT_FAULT_SELECTOR {
+        prepared
+            .persist_control_blocked_retirement_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else if prepared.request.selector == super::private_release_guardian_loss::SELECTOR {
+        prepared.persist_control_guardian_loss_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else if prepared.request.selector == super::private_release_frontend_loss::SELECTOR {
+        prepared.persist_control_frontend_loss_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else if prepared.request.selector == super::private_release_case::CHECKPOINT_GATE_SELECTOR {
+        prepared.persist_control_checkpoint_gate_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else if prepared.request.selector == super::private_release_children::SELECTOR {
+        prepared.persist_control_child_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else if prepared.request.selector == super::private_release_socket_launder::SELECTOR {
+        prepared.persist_control_socket_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else if prepared.request.selector == super::private_release_terminal_join::SELECTOR {
+        prepared.persist_control_terminal_join_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else if prepared.request.selector == super::private_release_dual_attempt::SELECTOR {
+        prepared.persist_control_dual_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else {
+        prepared.persist_control_cleanup(&worker_identity, worker_pidfd.as_fd())?;
     }
     Ok(response)
 }
@@ -516,6 +1051,13 @@ fn connect_network_authenticated(
     nonce: [u8; 16],
     attempt_id: [u8; 16],
 ) -> Result<UnixStream, String> {
+    connect_network_authenticated_peer(nonce, attempt_id).map(|(stream, _)| stream)
+}
+
+fn connect_network_authenticated_peer(
+    nonce: [u8; 16],
+    attempt_id: [u8; 16],
+) -> Result<(UnixStream, AuthenticatedPeer), String> {
     let mut stream = UnixStream::connect(NETWORK_SOCKET_PATH)
         .map_err(|error| format!("MCSEALED-NETWORK-LAUNCHER-CONNECTION: {error}"))?;
     set_receive_credentials(&stream, true)?;
@@ -542,9 +1084,9 @@ fn connect_network_authenticated(
     let credentials = credentials.ok_or_else(|| {
         "MCSEALED-NETWORK-LAUNCHER-SERVICE-AUTHENTICATION: credentials missing".to_owned()
     })?;
-    let _ = authenticate_credentials(credentials, NETWORK_LAUNCHER_UNIT)?;
+    let peer = authenticate_credentials(credentials, NETWORK_LAUNCHER_UNIT)?;
     set_receive_credentials(&stream, false)?;
-    Ok(stream)
+    Ok((stream, peer))
 }
 
 fn write_authentication_response(stream: &UnixStream, response: &Frame) -> Result<(), String> {
@@ -607,6 +1149,10 @@ fn authenticate_peer(
 ) -> Result<AuthenticatedPeer, String> {
     let credentials = peer_credentials(stream)?;
     authenticate_credentials(credentials, expected_unit)
+}
+
+pub(crate) fn authenticate_control_service(stream: &UnixStream) -> Result<(), String> {
+    authenticate_peer(stream, CONTROL_UNIT).map(|_| ())
 }
 
 fn authenticate_credentials(
@@ -714,7 +1260,7 @@ fn reap_workers() {
     }
 }
 
-fn nonce() -> Result<[u8; 16], String> {
+pub(crate) fn nonce() -> Result<[u8; 16], String> {
     let mut nonce = [0_u8; 16];
     std::io::Read::read_exact(
         &mut std::fs::File::open("/dev/urandom").map_err(|error| error.to_string())?,

@@ -81,6 +81,8 @@ pub struct PrivateReadyObservation {
     pub native_abi: NativeAbi,
     pub instruction_count: u16,
     pub filter_digest: [u8; 32],
+    /// Present only for the fixed release-domain precreated-socket probe.
+    pub(crate) precreated_sendmsg_errno: Option<i32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,7 +130,8 @@ pub fn decode_private_control_packet(bytes: &[u8]) -> Result<PrivateControlObser
             detail: detail.to_owned(),
         });
     }
-    if bytes.len() != 39 || bytes[..4] != [CONTROL_VERSION, CONTROL_READY, 1, 0] {
+    let probe = bytes.len() == 43 && bytes[..4] == [CONTROL_VERSION, CONTROL_READY, 1, 1];
+    if !probe && (bytes.len() != 39 || bytes[..4] != [CONTROL_VERSION, CONTROL_READY, 1, 0]) {
         return Err("MCSEALED-PRIVATE-CONTROL: invalid ready record".into());
     }
     let native_abi = match bytes[4] {
@@ -141,11 +144,21 @@ pub fn decode_private_control_packet(bytes: &[u8]) -> Result<PrivateControlObser
         return Err("MCSEALED-PRIVATE-CONTROL: empty filter program".into());
     }
     let mut filter_digest = [0_u8; 32];
-    filter_digest.copy_from_slice(&bytes[7..]);
+    filter_digest.copy_from_slice(&bytes[7..39]);
+    let precreated_sendmsg_errno = if probe {
+        let errno = i32::from_le_bytes(bytes[39..43].try_into().expect("fixed probe errno bytes"));
+        if errno != libc::EPERM {
+            return Err("MCSEALED-PRIVATE-CONTROL: precreated sendmsg was not denied".into());
+        }
+        Some(errno)
+    } else {
+        None
+    };
     Ok(PrivateControlObservation::Ready(PrivateReadyObservation {
         native_abi,
         instruction_count,
         filter_digest,
+        precreated_sendmsg_errno,
     }))
 }
 
@@ -249,7 +262,11 @@ pub fn observe_private_gated_target(
             ));
         }
     };
-    if ready.native_abi != expected_abi || ready.filter_digest != expected_filter_digest {
+    if ready.native_abi != expected_abi
+        || ready.filter_digest != expected_filter_digest
+        || ready.precreated_sendmsg_errno.is_some()
+            != expected_descriptors.expects_precreated_probe_pair()
+    {
         return Err("MCSEALED-PRIVATE-FILTER: ready digest or ABI mismatch".into());
     }
     require_live_pidfd(pidfd)?;
@@ -408,9 +425,81 @@ pub fn prepare_private_namespace_before_target_fork(
 pub struct PrivateExecArguments {
     argv: Vec<CString>,
     environment: Vec<CString>,
+    mode: PrivateExecMode,
+}
+
+#[derive(Debug)]
+enum PrivateExecMode {
+    Pinned,
+    ProbeRejectEmptyPath,
+    ProbePrecreatedSocket,
 }
 
 impl PrivateExecArguments {
+    /// Pinned ELF target entry for the closed AF_UNIX socket-stage witness.
+    /// This is intentionally distinct from the candidate fixture eligibility
+    /// gate and cannot make the release selector publishable.
+    pub(crate) fn for_closed_unix_intent() -> Self {
+        Self {
+            argv: vec![
+                CString::new("/usr/libexec/memcordon-sealed-agent")
+                    .expect("fixed installed image path has no NUL"),
+                CString::new("private-release-unix-intent")
+                    .expect("fixed release subwitness command has no NUL"),
+            ],
+            environment: Vec::new(),
+            mode: PrivateExecMode::Pinned,
+        }
+    }
+
+    pub(crate) fn for_release_candidate_fixture(selector: &str) -> Result<Self, String> {
+        if !super::private_release_case::candidate_physical_selector_supported(selector) {
+            return Err("MCSEALED-PRIVATE-RELEASE-ARGV: candidate fixture unavailable".into());
+        }
+        Ok(Self {
+            argv: vec![
+                CString::new("/usr/libexec/memcordon-sealed-agent")
+                    .expect("fixed installed image path has no NUL"),
+                CString::new("private-release-fixture")
+                    .expect("fixed release fixture subcommand has no NUL"),
+                CString::new(selector).expect("fixed release selector has no NUL"),
+            ],
+            environment: Vec::new(),
+            mode: if selector == super::private_release_socket_launder::SELECTOR {
+                PrivateExecMode::ProbePrecreatedSocket
+            } else {
+                PrivateExecMode::Pinned
+            },
+        })
+    }
+
+    pub(crate) fn for_probe_fixture(
+        kind: super::private_qualification::ProbeFixtureKindV1,
+    ) -> Result<Self, String> {
+        let index = (0..super::qualification::HOST_PROBE_CATALOG_V1.len())
+            .find(|index| {
+                super::private_qualification::ProbeFixtureKindV1::at(*index) == Some(kind)
+            })
+            .ok_or("MCSEALED-PRIVATE-PROBE-ARGV: unknown case")?;
+        let name = super::qualification::HOST_PROBE_CATALOG_V1[index].1;
+        Ok(Self {
+            argv: vec![
+                CString::new("/usr/libexec/memcordon-sealed-agent")
+                    .expect("fixed installed image path has no NUL"),
+                CString::new("private-probe-fixture").expect("fixed fixture subcommand has no NUL"),
+                CString::new(name).expect("closed fixture name has no NUL"),
+            ],
+            environment: Vec::new(),
+            mode: if kind
+                == super::private_qualification::ProbeFixtureKindV1::TargetExecFailureRetirement
+            {
+                PrivateExecMode::ProbeRejectEmptyPath
+            } else {
+                PrivateExecMode::Pinned
+            },
+        })
+    }
+
     pub fn from_request(request: &NetworkLaunchRequestV4) -> Result<Self, String> {
         if request.launch.program.is_empty() {
             return Err("MCSEALED-PRIVATE-ARGV: empty executable name".into());
@@ -438,7 +527,11 @@ impl PrivateExecArguments {
             environment
                 .push(CString::new(entry).map_err(|_| "MCSEALED-PRIVATE-ENV: NUL in environment")?);
         }
-        Ok(Self { argv, environment })
+        Ok(Self {
+            argv,
+            environment,
+            mode: PrivateExecMode::Pinned,
+        })
     }
 
     pub fn argv(&self) -> &[CString] {
@@ -447,6 +540,10 @@ impl PrivateExecArguments {
 
     pub fn environment(&self) -> &[CString] {
         &self.environment
+    }
+
+    pub(crate) fn probes_precreated_socket(&self) -> bool {
+        matches!(self.mode, PrivateExecMode::ProbePrecreatedSocket)
     }
 }
 
@@ -484,6 +581,14 @@ impl PrivateGatedTarget {
         if let Err(error) = apply_target_identity(&self.identity) {
             fail(&mut control, FAILURE_IDENTITY, &error);
         }
+        let probe_pair = if matches!(self.command.mode, PrivateExecMode::ProbePrecreatedSocket) {
+            match super::private_release_socket_launder::precreate_pair() {
+                Ok(pair) => Some(pair),
+                Err(error) => fail(&mut control, FAILURE_FILTER, &error),
+            }
+        } else {
+            None
+        };
         let filter =
             match install_gated_private_filter(self.native_abi, self.expected_filter_digest) {
                 Ok(filter) => filter,
@@ -496,15 +601,31 @@ impl PrivateGatedTarget {
                 "filter gate transition failed",
             );
         }
-        let mut ready = [0_u8; 39];
+        let probe_errno = match probe_pair.as_ref() {
+            Some(pair) => {
+                match super::private_release_socket_launder::observe_scm_rights_denied(pair) {
+                    Ok(errno) => Some(errno),
+                    Err(error) => fail(&mut control, FAILURE_FILTER, &error),
+                }
+            }
+            None => None,
+        };
+        let mut ready = [0_u8; 43];
         ready[..4].copy_from_slice(&[CONTROL_VERSION, CONTROL_READY, 1, 0]);
+        if probe_errno.is_some() {
+            ready[3] = 1;
+        }
         ready[4] = match filter.abi {
             NativeAbi::X86_64 => 1,
             NativeAbi::Aarch64 => 2,
         };
         ready[5..7].copy_from_slice(&filter.instruction_count.to_be_bytes());
-        ready[7..].copy_from_slice(&filter.instruction_digest);
-        if control.write_all(&ready).is_err() {
+        ready[7..39].copy_from_slice(&filter.instruction_digest);
+        if let Some(errno) = probe_errno {
+            ready[39..43].copy_from_slice(&errno.to_le_bytes());
+        }
+        let ready_length = if probe_errno.is_some() { 43 } else { 39 };
+        if control.write_all(&ready[..ready_length]).is_err() {
             child_exit(125);
         }
         if gate.advance(PrivateGateEvent::ReadyReported).is_err() {
@@ -531,13 +652,26 @@ impl PrivateGatedTarget {
                 "authorization gate transition failed",
             );
         }
+        // The exceptional probe pair is never inherited by the pinned image.
+        drop(probe_pair);
         if control.write_all(&PRIVATE_EXEC_ARMED_PACKET).is_err() {
             child_exit(125);
         }
         if gate.advance(PrivateGateEvent::ExecArmed).is_err() {
             fail(&mut control, FAILURE_EXEC, "exec gate transition failed");
         }
-        if let Err(error) = entrypoint.execveat(self.command.argv(), self.command.environment()) {
+        let execution = match self.command.mode {
+            PrivateExecMode::Pinned => {
+                entrypoint.execveat(self.command.argv(), self.command.environment())
+            }
+            PrivateExecMode::ProbeRejectEmptyPath => {
+                entrypoint.execveat_probe_rejected(self.command.argv(), self.command.environment())
+            }
+            PrivateExecMode::ProbePrecreatedSocket => {
+                entrypoint.execveat(self.command.argv(), self.command.environment())
+            }
+        };
+        if let Err(error) = execution {
             fail(&mut control, FAILURE_EXEC, &error);
         }
         // `execveat` must either replace this process or return an error.

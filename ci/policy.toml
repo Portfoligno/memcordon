@@ -71,6 +71,10 @@ allowed_run_commands = [
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release verify-crates",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate",
+  "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-candidate",
+  "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage final-public --target native",
 ]
 
 [[workflow.environment_allowlist]]
@@ -89,7 +93,7 @@ steps = ["Certify packaged Cargo channel"]
 file = ".github/workflows/release.yml"
 variable = "GITHUB_TOKEN"
 source = "${{ github.token }}"
-steps = ["Stage GitHub draft and assets", "Finalize GitHub release"]
+steps = ["Stage GitHub draft and assets", "Finalize GitHub release", "Private candidate suite"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"

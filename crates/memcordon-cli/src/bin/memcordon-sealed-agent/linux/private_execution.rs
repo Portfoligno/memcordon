@@ -177,6 +177,14 @@ pub fn execute_private_broker(
                 reason_code: "MCSEALED-NETWORK-LAUNCHER-UNQUALIFIED",
             }
         })?;
+    let installed_generation_digest = installed.generation_digest().clone();
+    let installed_qualification_digest = installed.qualification_digest().clone();
+    if broker.installed_generation_digest != installed_generation_digest {
+        return Err(fail(
+            "MCSEALED-PRIVATE-BROKER: installed generation differs from authenticated control request"
+                .into(),
+        ));
+    }
     let launch = broker.launch;
     let invocation = encode_network_launch_request(&launch).map_err(|error| {
         fail(format!(
@@ -197,6 +205,14 @@ pub fn execute_private_broker(
             error.code
         ))
     })?;
+    if launch.registry_digest != admission.registry_digest
+        || launch.qualification_digest != admission.qualification_digest
+        || admission.package_generation_digest != installed_generation_digest
+    {
+        return Err(fail(
+            "MCSEALED-PRIVATE-BROKER: public request and frozen authority differ".into(),
+        ));
+    }
     let provider_uid = unsafe { libc::getuid() };
     let guardian_uid = unsafe { libc::geteuid() };
     let pinned = pin_private_prelaunch_authority(
@@ -302,14 +318,22 @@ pub fn execute_private_broker(
                         cleanup_complete: false,
                         reason_code: "MCSEALED-NETWORK-LAUNCHER-NATIVE-FAILURE",
                     })?;
-            PrivateTerminalReceiptV4::observed(attempt_binding, checkpoint, exec, monitor, retired)
-                .and_then(|receipt| receipt.encode())
-                .map_err(|detail| PrivateExecutionError {
-                    detail,
-                    possibly_released: true,
-                    cleanup_complete: true,
-                    reason_code: "MCSEALED-NETWORK-LAUNCHER-NATIVE-FAILURE",
-                })
+            PrivateTerminalReceiptV4::observed(
+                installed_generation_digest,
+                installed_qualification_digest,
+                attempt_binding,
+                checkpoint,
+                exec,
+                monitor,
+                retired,
+            )
+            .and_then(|receipt| receipt.encode())
+            .map_err(|detail| PrivateExecutionError {
+                detail,
+                possibly_released: true,
+                cleanup_complete: true,
+                reason_code: "MCSEALED-NETWORK-LAUNCHER-NATIVE-FAILURE",
+            })
         }
         Err(detail) => {
             let possibly_released = owner.possibly_released();
@@ -328,7 +352,7 @@ pub fn execute_private_broker(
     }
 }
 
-fn pidfd_for_self() -> Result<OwnedFd, String> {
+pub(super) fn pidfd_for_self() -> Result<OwnedFd, String> {
     // SAFETY: getpid names only this one accepted broker worker.
     let pid = unsafe { libc::getpid() };
     // SAFETY: pidfd_open returns an owned descriptor bound to the live worker.

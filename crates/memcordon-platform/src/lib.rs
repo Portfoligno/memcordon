@@ -32,6 +32,16 @@ pub use macos_launch::helper as macos_helper;
 pub use macos_launch::inspector_helper as macos_inspector;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod sealed;
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+#[doc(hidden)]
+pub use sealed::client::private_response_disposition_for_test;
+#[cfg(target_os = "linux")]
+pub use sealed::client::{
+    PrivateAuthenticatedTerminalV2, PrivateExpectedResultV2, PrivateLaunchErrorV2,
+    PrivatePlanExchangeV2, PrivateReleaseKnowledgeV2, PrivateReplayDispositionV2,
+    PrivateResponseFailureV2, PrivateServiceResultV2, execute_private_v2, private_plan_exchange_v2,
+    private_plan_v2, receive_private_result, run_private_v2,
+};
 mod signal;
 mod supervisor;
 /// Resolve an exact workload declaration with the authenticated provider without

@@ -2,6 +2,27 @@ use std::ffi::OsStr;
 use std::process::Command;
 
 #[test]
+fn private_native_command_explicitly_removes_actions_token() {
+    use memcordon_ci::command::CommandSpec;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let command = CommandSpec::new(
+        "/usr/libexec/memcordon-sealed-agent",
+        root,
+        std::time::Duration::from_secs(1),
+    )
+    .remove_github_token()
+    .args(["package", "verify", "--json"])
+    .materialize(None)
+    .unwrap();
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new("GITHUB_TOKEN")),
+        Some((OsStr::new("GITHUB_TOKEN"), None))
+    );
+}
+
+#[test]
 fn workspace_metadata_removes_registry_credentials_with_and_without_a_context() {
     use memcordon_ci::{build_context::ValidatedBuildContext, policy::workspace_metadata_command};
     use std::fs;

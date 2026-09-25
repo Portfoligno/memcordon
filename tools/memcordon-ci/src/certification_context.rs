@@ -134,7 +134,7 @@ impl CertificationContext {
                 || !valid_workflow_ref(&p.repository, &p.workflow_ref)
                 || p.runner_environment != "github-hosted"
                 || !matches!(p.runner_os.as_str(), "Linux" | "Windows")
-                || p.runner_arch != "X64")
+                || !matches!(p.runner_arch.as_str(), "X64" | "ARM64"))
         {
             return Err(CiError::Message(
                 "invalid hosted certification provenance".into(),

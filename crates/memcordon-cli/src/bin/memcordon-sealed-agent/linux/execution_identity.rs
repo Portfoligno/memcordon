@@ -21,6 +21,20 @@ pub struct ResolvedTargetIdentity {
 }
 
 impl ResolvedTargetIdentity {
+    /// The fixed qualification account is pinned by the protected root run,
+    /// never selected from an administrator profile or consumer request.
+    pub(crate) fn for_probe_account(uid: u32, gid: u32) -> Result<Self, String> {
+        if uid == 0 || gid == 0 {
+            return Err("MCSEALED-PRIVATE-PROBE-IDENTITY: nonroot account required".into());
+        }
+        Ok(Self {
+            uid,
+            gid,
+            groups: Vec::new(),
+            delegated: false,
+        })
+    }
+
     pub const fn uid(&self) -> libc::uid_t {
         self.uid
     }

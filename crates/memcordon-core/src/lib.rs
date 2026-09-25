@@ -9,6 +9,8 @@
 
 pub mod diagnostics;
 pub mod package_inspection_v6;
+pub mod private_release_case_v1;
+pub mod provider_rejection_wire;
 pub mod runtime_evidence;
 pub mod runtime_manifest;
 pub mod runtime_manifest_v3;
@@ -22,6 +24,7 @@ pub mod workload_discovery_v2;
 pub mod workload_evidence;
 pub mod workload_evidence_v2;
 pub mod workload_limits;
+pub mod workload_plan_v2;
 pub mod workload_qualification_v2;
 pub mod workload_registry;
 pub mod workload_registry_v2;

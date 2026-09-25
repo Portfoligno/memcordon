@@ -56,6 +56,38 @@ pub fn seal_ticket_for_test(identity: EntrypointObjectIdentity) -> EntrypointSea
 }
 
 impl VerifiedEntrypoint {
+    /// Qualification alone may consume the installed agent image pinned by
+    /// the candidate package lease. It is not an administrator-approved
+    /// workload entrypoint and cannot be obtained from a caller descriptor.
+    pub(crate) fn from_probe_package_image(
+        file: File,
+        expected_digest: &memcordon_core::DiagnosticSha256,
+    ) -> Result<Self, String> {
+        let before = stat(file.as_raw_fd())?;
+        verify_executable_metadata(file.as_raw_fd(), &before)?;
+        let limit =
+            u64::try_from(before.st_size).map_err(|_| error("negative probe image size"))?;
+        let (digest, count) = hash_opened_file(&file, limit)?;
+        let after = stat(file.as_raw_fd())?;
+        if !same_change_metadata(&before, &after)
+            || count != limit
+            || digest != *expected_digest.bytes()
+        {
+            return Err(error(
+                "pinned probe image changed or differs from installed package",
+            ));
+        }
+        Ok(Self {
+            file,
+            identity: EntrypointObjectIdentity {
+                device: after.st_dev,
+                inode: after.st_ino,
+                size: count,
+                sha256: digest,
+            },
+        })
+    }
+
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.file.as_fd()
     }
@@ -130,6 +162,27 @@ impl VerifiedEntrypoint {
     /// this after arranging the reviewed fd inventory and target credentials.
     /// No pathname is selected and no shell interprets the argv/environment.
     pub fn execveat(&self, argv: &[CString], environment: &[CString]) -> Result<(), String> {
+        self.execveat_inner(argv, environment, libc::AT_EMPTY_PATH, false)
+    }
+
+    /// The fixed host fault case reaches the same target-side syscall after
+    /// the ordinary gate, but omits AT_EMPTY_PATH for the empty path. Linux
+    /// must reject this with ENOENT; no alternate executable is selected.
+    pub(crate) fn execveat_probe_rejected(
+        &self,
+        argv: &[CString],
+        environment: &[CString],
+    ) -> Result<(), String> {
+        self.execveat_inner(argv, environment, 0, true)
+    }
+
+    fn execveat_inner(
+        &self,
+        argv: &[CString],
+        environment: &[CString],
+        flags: i32,
+        expect_probe_enoent: bool,
+    ) -> Result<(), String> {
         if argv.is_empty() {
             return Err(error("execveat requires argv[0]"));
         }
@@ -159,10 +212,15 @@ impl VerifiedEntrypoint {
                 c"".as_ptr(),
                 argv_ptrs.as_ptr(),
                 env_ptrs.as_ptr(),
-                libc::AT_EMPTY_PATH,
+                flags,
             )
         };
         if result == -1 {
+            if expect_probe_enoent
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+            {
+                return Err("MCSEALED-PROBE-EXECVEAT-ENOENT".into());
+            }
             Err(native_error("execveat"))
         } else {
             Err(error("execveat unexpectedly returned"))

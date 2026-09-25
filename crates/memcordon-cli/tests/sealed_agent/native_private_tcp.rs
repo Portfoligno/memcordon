@@ -278,6 +278,7 @@ fn private_ready_record_is_closed_and_binds_abi_filter_digest() {
             native_abi: NativeAbi::X86_64,
             instruction_count: 27,
             filter_digest: [0xa5; 32],
+            precreated_sendmsg_errno: None,
         })
     );
     ready[4] = 3;
@@ -287,6 +288,23 @@ fn private_ready_record_is_closed_and_binds_abi_filter_digest() {
     assert!(decode_private_control_packet(&ready).is_err());
     assert!(decode_private_control_packet(&ready[..ready.len() - 1]).is_err());
     assert!(decode_private_control_packet(&[2, 2, 0, 0]).is_err());
+    let mut probe_ready = [0_u8; 43];
+    probe_ready[..4].copy_from_slice(&[2, 3, 1, 1]);
+    probe_ready[4] = 1;
+    probe_ready[5..7].copy_from_slice(&27_u16.to_be_bytes());
+    probe_ready[7..39].fill(0xa5);
+    probe_ready[39..43].copy_from_slice(&libc::EPERM.to_le_bytes());
+    assert_eq!(
+        decode_private_control_packet(&probe_ready).unwrap(),
+        PrivateControlObservation::Ready(PrivateReadyObservation {
+            native_abi: NativeAbi::X86_64,
+            instruction_count: 27,
+            filter_digest: [0xa5; 32],
+            precreated_sendmsg_errno: Some(libc::EPERM),
+        })
+    );
+    probe_ready[39..43].copy_from_slice(&libc::EACCES.to_le_bytes());
+    assert!(decode_private_control_packet(&probe_ready).is_err());
     let failure = encode_private_failure_packet_for_test(3, "seccomp native install: EPERM");
     assert_eq!(
         decode_private_control_packet(&failure).unwrap(),

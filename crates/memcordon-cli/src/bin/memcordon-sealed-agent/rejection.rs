@@ -1,28 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+pub use memcordon_core::provider_rejection_wire::RejectionPhaseV1;
+
 const MAX_CODE_BYTES: usize = 128;
 const MAX_DETAIL_BYTES: usize = 8 * 1024;
 const MAX_CLEANUP_ERRORS: usize = 16;
 const MAX_CLEANUP_ERROR_BYTES: usize = 1024;
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RejectionPhaseV1 {
-    RequestValidation,
-    CallerEnvelopeCapture,
-    LauncherServiceAuthentication,
-    CallerMountNamespaceAdoption,
-    CallerCapabilityEnvelope,
-    CredentialTransitionPolicy,
-    BoundaryCreation,
-    GuardianStartup,
-    TargetCreation,
-    AssignmentVerification,
-    ResourceVerification,
-    Authorization,
-    Monitoring,
-    Retirement,
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -134,13 +117,40 @@ impl RejectionV1 {
 
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
-        let mut encoded = serde_json::to_vec(self)
+        let wire = self.wire();
+        wire.validate()?;
+        let mut encoded = serde_json::to_vec(&wire)
             .map_err(|error| format!("MCSEALED-PROVIDER-REJECTION: {error}"))?;
         encoded.push(b'\n');
         if encoded.len() > crate::protocol::MAX_FRAME_LENGTH {
             return Err("MCSEALED-PROVIDER-REJECTION: receipt exceeds frame bound".to_owned());
         }
         Ok(encoded)
+    }
+
+    fn wire(&self) -> memcordon_core::provider_rejection_wire::RejectionWireV1 {
+        use memcordon_core::provider_rejection_wire::{
+            RejectionCleanupV1 as Cleanup, RejectionWireV1,
+        };
+        RejectionWireV1 {
+            workload_admission: self.workload_admission.as_deref().cloned(),
+            schema_version: self.schema_version,
+            code: self.code.clone(),
+            phase: self.phase,
+            detail: self.detail.clone(),
+            os_code: self.os_code,
+            target_created: self.target_created,
+            target_released: self.target_released,
+            cleanup: Cleanup {
+                attempted: self.cleanup.attempted,
+                direct_child_reaped: self.cleanup.direct_child_reaped,
+                workload_empty: self.cleanup.workload_empty,
+                helpers_reaped: self.cleanup.helpers_reaped,
+                containment_removed: self.cleanup.containment_removed,
+                sealed_boundary_retired: self.cleanup.sealed_boundary_retired,
+                errors: self.cleanup.errors.clone(),
+            },
+        }
     }
 
     pub fn validate(&self) -> Result<(), String> {

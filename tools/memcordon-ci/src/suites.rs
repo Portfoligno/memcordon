@@ -1074,7 +1074,41 @@ fn macos_acceptance(root: &Path, stable: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn run(root: &Path, suite: Suite) -> Result<()> {
+pub fn run(
+    root: &Path,
+    suite: Suite,
+    stage: Option<crate::PrivateStage>,
+    target: Option<&str>,
+) -> Result<()> {
+    if matches!(suite, Suite::BackendLinuxPrivateV4) {
+        let stage = stage
+            .ok_or_else(|| CiError::Message("private native suite requires --stage".into()))?;
+        let target = target
+            .ok_or_else(|| CiError::Message("private native suite requires --target".into()))?;
+        let target = if target == "native" {
+            match (
+                cfg!(target_os = "linux"),
+                cfg!(target_env = "gnu"),
+                std::env::consts::ARCH,
+            ) {
+                (true, true, "x86_64") => "x86_64-unknown-linux-gnu",
+                (true, true, "aarch64") => "aarch64-unknown-linux-gnu",
+                _ => {
+                    return Err(CiError::Message(
+                        "private native target alias requires GNU Linux x64 or ARM64".into(),
+                    ));
+                }
+            }
+        } else {
+            target
+        };
+        return memcordon_ci::private_suite::run(root, stage.into(), target);
+    }
+    if stage.is_some() || target.is_some() {
+        return Err(CiError::Message(
+            "--stage and --target are private native suite options".into(),
+        ));
+    }
     let toolchains = config::toolchains(root)?;
     match suite {
         Suite::Policy => policy::run(root),
@@ -1099,6 +1133,9 @@ pub fn run(root: &Path, suite: Suite) -> Result<()> {
         Suite::Stress => stress(root, &toolchains.stable),
         Suite::BackendLinuxCgroup => launch_delegated_linux_certification(root),
         Suite::BackendLinuxSealedV2 => crate::sealed_linux::certify(root, &toolchains.stable),
+        Suite::BackendLinuxPrivateV4 => {
+            unreachable!("private suite was dispatched before legacy suites")
+        }
         Suite::BackendWindowsJob => certification(
             root,
             Path::new("rustup"),

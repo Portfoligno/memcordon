@@ -415,10 +415,14 @@ impl PrivateReleasePermit {
         if self.attempt_id.as_str() != attempt_id || &self.checkpoint_digest != checkpoint_digest {
             return Err("V4 release permit belongs to a different checkpoint".into());
         }
-        control
-            .write_all(&[1])
-            .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: {error}"))
+        send_private_release_byte(control)
     }
+}
+
+pub(super) fn send_private_release_byte(control: &mut File) -> Result<(), String> {
+    control
+        .write_all(&[1])
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: {error}"))
 }
 
 impl DurablePrivateAttempt {

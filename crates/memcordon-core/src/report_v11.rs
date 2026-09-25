@@ -10,6 +10,129 @@ use crate::workload_evidence_v2::{
 };
 use crate::{DiagnosticSha256, workload_contract, workload_limits};
 
+/// Public failure-capable CLI envelope. Its bytes are historical output, not
+/// admission authority. Only a live authenticated provider response may be
+/// used by the platform to construct `Complete` with restart proof.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivatePublicResultV11 {
+    pub schema_version: u32,
+    pub result: PrivatePublicOutcomeV11,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum PrivatePublicOutcomeV11 {
+    Complete {
+        terminal: Box<PrivateExecutionReportV11>,
+        raw_response: Vec<u8>,
+    },
+    PreallocationRejected {
+        rejection: Box<crate::ProviderRejectionEvidence>,
+        raw_response: Vec<u8>,
+    },
+    AllocatedUnverified {
+        rejection: Box<crate::ProviderRejectionEvidence>,
+        raw_response: Vec<u8>,
+    },
+    Indeterminate {
+        attempt_id: String,
+        reason_code: String,
+        raw_response: Vec<u8>,
+    },
+    BeforeSubmissionFailure {
+        reason: String,
+    },
+    TransportUnverified {
+        reason: String,
+        raw_response: Option<Vec<u8>>,
+    },
+}
+
+impl PrivatePublicResultV11 {
+    pub fn validate_structure(&self) -> Result<(), String> {
+        if self.schema_version != PRIVATE_EXECUTION_REPORT_SCHEMA_V11 {
+            return Err("V11 public result schema differs".into());
+        }
+        let bounded =
+            |bytes: &[u8]| !bytes.is_empty() && bytes.len() <= workload_limits::PUBLIC_OBJECT_BYTES;
+        match &self.result {
+            PrivatePublicOutcomeV11::Complete {
+                terminal,
+                raw_response,
+            } => {
+                if !bounded(raw_response) {
+                    return Err("V11 complete raw response is absent or oversized".into());
+                }
+                workload_contract::reject_duplicate_json_keys(raw_response)?;
+                let raw: PrivateExecutionReportV11 =
+                    serde_json::from_slice(raw_response).map_err(|error| error.to_string())?;
+                if raw != **terminal
+                    || terminal.schema_version != self.schema_version
+                    || terminal.checkpoint.native_abi != terminal.native_abi
+                    || terminal.checkpoint.attempt_binding != terminal.attempt.canonical_digest()?
+                    || !terminal.retirement.terminal_success(&terminal.checkpoint)
+                {
+                    return Err("V11 complete projection differs from raw response".into());
+                }
+            }
+            PrivatePublicOutcomeV11::PreallocationRejected {
+                rejection,
+                raw_response,
+            } => {
+                if rejection.target_created || !rejection.is_consistent() || !bounded(raw_response)
+                {
+                    return Err(
+                        "V11 preallocation rejection has allocated target or invalid raw evidence"
+                            .into(),
+                    );
+                }
+                if crate::provider_rejection_wire::RejectionWireV1::parse_evidence(raw_response)?
+                    != **rejection
+                {
+                    return Err("V11 preallocation rejection differs from raw response".into());
+                }
+            }
+            PrivatePublicOutcomeV11::AllocatedUnverified {
+                rejection,
+                raw_response,
+            } => {
+                if !rejection.target_created || !rejection.is_consistent() || !bounded(raw_response)
+                {
+                    return Err("V11 allocated failure lacks target or raw evidence".into());
+                }
+                if crate::provider_rejection_wire::RejectionWireV1::parse_evidence(raw_response)?
+                    != **rejection
+                {
+                    return Err("V11 allocated rejection differs from raw response".into());
+                }
+            }
+            PrivatePublicOutcomeV11::Indeterminate {
+                attempt_id,
+                reason_code,
+                raw_response,
+            } => {
+                if attempt_id.is_empty() || reason_code.is_empty() || !bounded(raw_response) {
+                    return Err("V11 indeterminate identity or raw evidence is absent".into());
+                }
+            }
+            PrivatePublicOutcomeV11::BeforeSubmissionFailure { reason }
+            | PrivatePublicOutcomeV11::TransportUnverified { reason, .. }
+                if reason.is_empty() || reason.len() > workload_limits::PUBLIC_OBJECT_BYTES =>
+            {
+                return Err("V11 failure reason is absent or oversized".into());
+            }
+            PrivatePublicOutcomeV11::TransportUnverified { raw_response, .. }
+                if raw_response.as_ref().is_some_and(|bytes| !bounded(bytes)) =>
+            {
+                return Err("V11 transport raw response is empty or oversized".into());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 pub const PRIVATE_EXECUTION_REPORT_SCHEMA_V11: u32 = 11;
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]

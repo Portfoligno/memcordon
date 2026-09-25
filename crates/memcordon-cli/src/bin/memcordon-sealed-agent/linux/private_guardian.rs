@@ -13,14 +13,14 @@ const READY: u8 = 1;
 const STOP: u8 = 1;
 const TERMINAL_LEN: usize = 20;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub enum GuardianTriggerV4 {
     Stopped,
     FrontendLost,
     WorkerLost,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct GuardianTerminalV4 {
     pub attempt_id: [u8; 16],
     pub trigger: GuardianTriggerV4,
@@ -74,6 +74,14 @@ pub struct PrivateGuardian {
     terminal: OwnedFd,
     attempt_id: [u8; 16],
     reaped: bool,
+}
+
+/// Exact death of the real guardian child, not a forged guardian terminal.
+/// Only the separate probe loss case may request this destructive transition.
+#[derive(serde::Serialize)]
+pub(crate) struct ProbeGuardianKilledV1 {
+    pub(crate) identity: ProcessIdentityV4,
+    pub(crate) signal: i32,
 }
 
 impl PrivateGuardian {
@@ -205,6 +213,42 @@ impl PrivateGuardian {
         wait_exact_child(self.pid, deadline)?;
         self.reaped = true;
         Ok(terminal)
+    }
+
+    pub(crate) fn kill_for_probe(
+        mut self,
+        deadline: Instant,
+    ) -> Result<ProbeGuardianKilledV1, String> {
+        if !self.is_live() {
+            return Err("MCSEALED-PRIVATE-PROBE-LOSS: guardian already exited".into());
+        }
+        let identity = self.identity()?;
+        // SAFETY: the signal targets this retained exact child pidfd, not a
+        // numeric PID supplied by a caller or by an evidence record.
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                0,
+                0,
+            )
+        } == -1
+        {
+            return Err(format!(
+                "MCSEALED-PRIVATE-PROBE-LOSS: guardian signal: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let status = wait_exact_child_status(self.pid, deadline)?;
+        self.reaped = true;
+        if !libc::WIFSIGNALED(status) || libc::WTERMSIG(status) != libc::SIGKILL {
+            return Err("MCSEALED-PRIVATE-PROBE-LOSS: guardian did not die by SIGKILL".into());
+        }
+        Ok(ProbeGuardianKilledV1 {
+            identity,
+            signal: libc::SIGKILL,
+        })
     }
 }
 
@@ -451,12 +495,21 @@ fn read_exact_until(fd: BorrowedFd<'_>, bytes: &mut [u8], deadline: Instant) -> 
 }
 
 fn wait_exact_child(pid: libc::pid_t, deadline: Instant) -> Result<(), String> {
+    wait_exact_child_status(pid, deadline).map(|_| ())
+}
+
+fn wait_exact_child_status(pid: libc::pid_t, deadline: Instant) -> Result<i32, String> {
     loop {
         let mut status = 0;
         // SAFETY: pid is the exact unreaped fork child of this worker.
         let observed = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
         if observed == pid {
-            return Ok(());
+            return Ok(status);
+        }
+        if observed == -1
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
         }
         if observed == -1 {
             return Err(format!(
