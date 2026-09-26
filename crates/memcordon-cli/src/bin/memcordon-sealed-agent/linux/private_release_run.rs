@@ -25,6 +25,590 @@ pub(crate) struct PreparedReleaseCandidateRunV1 {
     pub(crate) request: ReleaseCaseRequestV1,
 }
 
+/// Explicit owned-obstruction recovery source, not a new release or Q grant.
+pub(crate) struct IndependentReuseSourceV1 {
+    package: crate::package::VerifiedReleaseCandidatePackageLease,
+    directory: File,
+    request: ReleaseCaseRequestV1,
+    recorded: ProtectedReleaseRequestV1,
+    phase: memcordon_core::private_reuse_source_v1::ReuseSourcePhaseV1,
+    helper: ProcessIdentityV4,
+    helper_pidfd: OwnedFd,
+    admission_bytes: Vec<u8>,
+    deadline: Instant,
+}
+impl IndependentReuseSourceV1 {
+    pub(crate) fn prepare(
+        request: ReleaseCaseRequestV1,
+        revision: &DiagnosticSha256,
+        phase: memcordon_core::private_reuse_source_v1::ReuseSourcePhaseV1,
+    ) -> Result<Self, String> {
+        use memcordon_core::private_reuse_source_v1::*;
+        if unsafe { libc::geteuid() } != 0
+            || request.stage != ReleaseStageV1::CandidateCapability
+            || request.selector != REUSE_SELECTOR_V1
+            || revision != &reuse_source_revision_sha256()
+        {
+            return Err("candidate owned recovery source stage/root/revision differs".into());
+        }
+        let package = crate::package::acquire_verified_release_candidate_package_lease()?;
+        let image = std::fs::metadata(std::env::current_exe().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        if (image.dev(), image.ino()) != package.agent_file_identity()? {
+            return Err("candidate recovery requires actual installed pinned image".into());
+        }
+        let service = super::private_host_prerequisites::observe_service_generation()?;
+        super::private_host_prerequisites::require_current_worker_cgroup(&service)?;
+        let root = open_or_create_root()?;
+        let directory = open_case_directory(&root, &request.result_key(), 0)?;
+        let recorded = read_request(&directory, 0)?;
+        if recorded
+            != protected_request(
+                &request,
+                &package,
+                service.digest()?,
+                recorded.coordinator.clone(),
+            )
+        {
+            return Err("candidate recovery original current protected request differs".into());
+        }
+        require_recorded_process_exited(&recorded.coordinator)?;
+        let pidfd = super::private_execution::pidfd_for_self()?;
+        let helper = ProcessIdentityV4::observe(unsafe { libc::getpid() }, pidfd.as_fd())?;
+        let admission = ReuseSourceAdmissionV1 {
+            schema_version: 1,
+            protocol: "candidate-owned-retirement-recovery-v1".into(),
+            source_revision_sha256: revision.clone(),
+            phase,
+            selector: request.selector.into(),
+            parent_result_key: request.result_key(),
+            challenge: request.challenge,
+            original_request_sha256: memcordon_core::workload_codec::hash_bytes(
+                &super::private_release_raw::read_fixed(&directory, "request.json", 0)?,
+            ),
+            installation_epoch: package.installation_epoch.clone(),
+            candidate_manifest_sha256: package.runtime_manifest_sha256.clone(),
+            installed_inspection_sha256: memcordon_core::workload_codec::hash_bytes(
+                &package.installed_inspection_bytes()?,
+            ),
+            service_generation_sha256: service.digest()?,
+            helper: ReuseSourceProcessV1 {
+                pid: helper.pid,
+                start_time_ticks: helper.start_time,
+            },
+            admission_monotonic_ns: super::clock::monotonic_nanos()?,
+        };
+        let admission_bytes = serde_json::to_vec(&admission).map_err(|e| e.to_string())?;
+        let leaf = match phase {
+            ReuseSourcePhaseV1::Blocked => "reuse-blocked-admission-v1.json",
+            ReuseSourcePhaseV1::Recover => "reuse-recovery-admission-v1.json",
+        };
+        super::private_release_raw::persist_fixed(&directory, leaf, &admission_bytes, 0)?;
+        Ok(Self {
+            package,
+            directory,
+            request,
+            recorded,
+            phase,
+            helper,
+            helper_pidfd: pidfd,
+            admission_bytes,
+            deadline: Instant::now() + std::time::Duration::from_secs(90),
+        })
+    }
+    fn expectation(
+        &self,
+    ) -> super::private_release_attempt::ReleaseCandidateReadbackExpectationV1<'_> {
+        super::private_release_attempt::ReleaseCandidateReadbackExpectationV1 {
+            result_key: &self.recorded.result_key,
+            selector: &self.recorded.selector,
+            challenge: &self.request.challenge,
+            installation_epoch: &self.recorded.installation_epoch,
+            candidate_manifest_sha256: &self.recorded.candidate_manifest_sha256,
+            service_generation_sha256: &self.recorded.service_generation_sha256,
+            coordinator: &self.recorded.coordinator,
+        }
+    }
+    fn revalidate(&self) -> Result<(), String> {
+        if Instant::now() >= self.deadline
+            || ProcessIdentityV4::observe(self.helper.pid as i32, self.helper_pidfd.as_fd())?
+                != self.helper
+        {
+            return Err("candidate recovery helper identity/deadline changed".into());
+        }
+        crate::package::verify()?;
+        let (_, manifest) =
+            super::runtime_manifest::source_v3(self.package.agent_installation_path())?
+                .ok_or("candidate recovery current manifest absent")?;
+        let current = super::private_host_prerequisites::observe_service_generation()?;
+        super::private_host_prerequisites::require_current_worker_cgroup(&current)?;
+        if crate::package::installed_generation_epoch()? != self.package.installation_epoch
+            || memcordon_core::workload_codec::hash_bytes(&manifest)
+                != self.package.runtime_manifest_sha256
+            || current.digest()? != self.recorded.service_generation_sha256
+            || read_request(&self.directory, 0)? != self.recorded
+        {
+            return Err("candidate recovery package/service/original request changed".into());
+        }
+        let named = open_case_directory(&open_or_create_root()?, &self.request.result_key(), 0)?;
+        let a = named.metadata().map_err(|e| e.to_string())?;
+        let b = self.directory.metadata().map_err(|e| e.to_string())?;
+        if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
+            return Err("candidate recovery held directory substituted".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn run(self) -> Result<(), String> {
+        use memcordon_core::private_reuse_source_v1::*;
+        self.revalidate()?;
+        let before = super::private_release_attempt::read_blocked_retirement_candidate_journal(
+            &self.directory,
+            &self.expectation(),
+        )?;
+        let native = before.native_identities()?;
+        for process in [&native.guardian, &native.namespace_init, &native.target] {
+            require_recorded_process_exited(process)?;
+        }
+        require_candidate_cgroup_absent(&before.journal.attempt_id)?;
+        let inspection = self.package.installed_inspection_bytes()?;
+        let response = super::private_release_case::candidate_fixture_output_with_native(
+            self.request.selector,
+            &self.request.challenge,
+            native.network_namespace_inode,
+            self.package.agent_file_identity()?,
+        )?;
+        super::private_release_raw::readback_blocked_retirement_raw(
+            super::private_release_raw::CandidateRawContextV1 {
+                directory: &self.directory,
+                selector: self.request.selector,
+                result_key: &self.recorded.result_key,
+                challenge: &self.request.challenge,
+                expected_response: &response,
+                installed_inspection_bytes: &inspection,
+                agent_path_snapshot: None,
+            },
+            &before,
+            &self.recorded.coordinator,
+            &self.recorded.service_generation_sha256,
+        )?;
+        let original_observer_bytes =
+            super::private_release_raw::read_fixed(&self.directory, "observer.bin", 0)?;
+        let settlement = super::private_release_raw::read_blocked_settlement_source(
+            &self.directory,
+            &before,
+            &self.recorded.result_key,
+        )?;
+        let hold = |name: &std::ffi::CStr,
+                    expected: &[u8]|
+         -> Result<(File, ReuseSourceObjectV1), String> {
+            let raw = unsafe {
+                libc::openat(
+                    self.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            let file = unsafe { File::from_raw_fd(raw) };
+            let metadata = file.metadata().map_err(|e| e.to_string())?;
+            let mut bytes = Vec::new();
+            (&file)
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            if !metadata.is_file()
+                || metadata.uid() != 0
+                || metadata.mode() & 0o777 != 0o600
+                || metadata.nlink() != 1
+                || bytes != expected
+            {
+                return Err("candidate recovery independently held original object differs".into());
+            }
+            Ok((
+                file,
+                ReuseSourceObjectV1 {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    uid: metadata.uid(),
+                    mode: metadata.mode(),
+                    nlink: metadata.nlink(),
+                    size: metadata.len(),
+                    bytes_sha256: memcordon_core::workload_codec::hash_bytes(&bytes),
+                },
+            ))
+        };
+        let (marker, marker_source) = hold(c"attempt.json.new", &before.fault_marker_bytes)?;
+        let (record, record_source) = hold(c"attempt.json", &before.journal.terminal_bytes)?;
+        let directory = self.directory.metadata().map_err(|e| e.to_string())?;
+        let gate = ReuseSourceGateV1 {
+            schema_version: 1,
+            source_revision_sha256: reuse_source_revision_sha256(),
+            phase: self.phase,
+            selector: self.request.selector.into(),
+            parent_result_key: self.request.result_key(),
+            challenge: self.request.challenge,
+            admission_sha256: memcordon_core::workload_codec::hash_bytes(&self.admission_bytes),
+            helper: ReuseSourceProcessV1 {
+                pid: self.helper.pid,
+                start_time_ticks: self.helper.start_time,
+            },
+            directory_device: directory.dev(),
+            directory_inode: directory.ino(),
+            marker: marker_source,
+            record: record_source,
+            observed_monotonic_ns: super::clock::monotonic_nanos()?,
+        };
+        let gate_bytes = serde_json::to_vec(&gate).map_err(|e| e.to_string())?;
+        let (gate_leaf, ack_leaf, report_leaf) = match self.phase {
+            ReuseSourcePhaseV1::Blocked => (
+                "reuse-blocked-ready-v1.json",
+                "reuse-blocked-ready-v1.ack",
+                "reuse-blocked-source-v1.json",
+            ),
+            ReuseSourcePhaseV1::Recover => (
+                "reuse-recovery-ready-v1.json",
+                "reuse-recovery-ready-v1.ack",
+                "reuse-recovered-source-v1.json",
+            ),
+        };
+        super::private_release_raw::persist_fixed(&self.directory, gate_leaf, &gate_bytes, 0)?;
+        let ack_name = CString::new(ack_leaf).expect("fixed reuse ACK name");
+        loop {
+            self.revalidate()?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    self.directory.as_raw_fd(),
+                    ack_name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                let bytes = super::private_release_raw::read_fixed(&self.directory, ack_leaf, 0)?;
+                memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+                let ack: ReuseSourceAckV1 =
+                    serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                if ack.schema_version != 1
+                    || ack.phase != self.phase
+                    || ack.parent_result_key != self.request.result_key()
+                    || ack.source_revision_sha256 != reuse_source_revision_sha256()
+                    || ack.gate_sha256 != memcordon_core::workload_codec::hash_bytes(&gate_bytes)
+                {
+                    return Err("candidate recovery exact SHA ACK differs".into());
+                }
+                break;
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+                return Err("candidate recovery ACK path read failed".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if marker.metadata().map_err(|e| e.to_string())?.nlink() != 1
+            || record.metadata().map_err(|e| e.to_string())?.nlink() != 1
+            || super::private_release_raw::read_fixed(&self.directory, "attempt.json", 0)?
+                != before.journal.terminal_bytes
+            || super::private_release_raw::read_fixed(&self.directory, "attempt.json.new", 0)?
+                != before.fault_marker_bytes
+        {
+            return Err("candidate recovery held original objects changed before retry".into());
+        }
+        super::private_observer_hooks::mc_private_request_enter_v1();
+        let outcome = (|| -> Result<ReuseSourceReportV1, String> {
+            let retry_begin_monotonic_ns = super::clock::monotonic_nanos()?;
+            let retry = super::private_release_attempt::read_blocked_retirement_candidate_journal(
+                &self.directory,
+                &self.expectation(),
+            )?;
+            let retry_end_monotonic_ns = super::clock::monotonic_nanos()?;
+            if retry.journal.terminal_bytes != before.journal.terminal_bytes
+                || retry.fault_marker_bytes != before.fault_marker_bytes
+            {
+                return Err("candidate recovery actual retry changed original record".into());
+            }
+            let mut report = ReuseSourceReportV1 {
+                schema_version: 1,
+                source_revision_sha256: reuse_source_revision_sha256(),
+                phase: self.phase,
+                parent_result_key: self.request.result_key(),
+                helper: gate.helper.clone(),
+                admission_sha256: gate.admission_sha256.clone(),
+                gate_sha256: memcordon_core::workload_codec::hash_bytes(&gate_bytes),
+                before_bytes: before.journal.terminal_bytes.clone(),
+                marker_bytes: before.fault_marker_bytes.clone(),
+                original_observer_bytes,
+                retry_begin_monotonic_ns,
+                retry_end_monotonic_ns,
+                actual_reuse_error: retry.detached_reuse_error,
+                removed_monotonic_ns: None,
+                recovered_monotonic_ns: None,
+                after_bytes: None,
+            };
+            if self.phase == ReuseSourcePhaseV1::Recover {
+                let recovered =
+                    super::private_release_attempt::recover_verified_candidate_retirement_conflict(
+                        &self.directory,
+                        &self.expectation(),
+                        &before.fault_marker_bytes,
+                        settlement,
+                    )?;
+                if recovered.before_bytes != report.before_bytes
+                    || recovered.marker_bytes != report.marker_bytes
+                    || (recovered.marker_device, recovered.marker_inode)
+                        != (gate.marker.device, gate.marker.inode)
+                    || (recovered.directory_device, recovered.directory_inode)
+                        != (gate.directory_device, gate.directory_inode)
+                {
+                    return Err("candidate recovery primitive original identities changed".into());
+                }
+                report.removed_monotonic_ns = Some(recovered.removed_monotonic_ns);
+                report.recovered_monotonic_ns = Some(recovered.recovered_monotonic_ns);
+                report.after_bytes = Some(recovered.retirement.terminal_bytes);
+            }
+            validate_reuse_source_shape_v1(&gate, &report).map_err(str::to_owned)?;
+            Ok(report)
+        })();
+        super::private_observer_hooks::mc_private_request_exit_v1();
+        let report = outcome?;
+        super::private_release_raw::persist_fixed(
+            &self.directory,
+            report_leaf,
+            &serde_json::to_vec(&report).map_err(|e| e.to_string())?,
+            0,
+        )?;
+        self.revalidate()
+    }
+}
+
+/// Default-disabled independent facility source, not an allocator or Q grant.
+pub(crate) struct IndependentFacilityProbeV1 {
+    package: crate::package::VerifiedReleaseCandidatePackageLease,
+    directory: File,
+    request: ReleaseCaseRequestV1,
+    service_generation: DiagnosticSha256,
+    admission_bytes: Vec<u8>,
+    coordinator: ProcessIdentityV4,
+    coordinator_pidfd: OwnedFd,
+    deadline: Instant,
+}
+impl IndependentFacilityProbeV1 {
+    pub(crate) fn prepare(
+        request: ReleaseCaseRequestV1,
+        revision: &DiagnosticSha256,
+    ) -> Result<Self, String> {
+        use memcordon_core::private_facility_source_v1::{
+            facility_operations_v1, facility_source_revision_sha256,
+        };
+        if unsafe { libc::geteuid() } != 0
+            || request.stage != ReleaseStageV1::CandidateCapability
+            || revision != &facility_source_revision_sha256()
+        {
+            return Err("independent facility stage/root/reviewed source revision differs".into());
+        }
+        facility_operations_v1(request.selector).map_err(str::to_owned)?;
+        let package = crate::package::acquire_verified_release_candidate_package_lease()?;
+        let image = std::fs::metadata(std::env::current_exe().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        if (image.dev(), image.ino()) != package.agent_file_identity()? {
+            return Err("independent facility requires installed pinned image".into());
+        }
+        let service_generation =
+            super::private_host_prerequisites::observe_service_generation()?.digest()?;
+        let root = open_or_create_root()?;
+        if unsafe { libc::mkdirat(root.as_raw_fd(), c"facility-controls-v1".as_ptr(), 0o700) } != 0
+            && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        root.sync_all().map_err(|e| e.to_string())?;
+        let fd = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                c"facility-controls-v1".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let subtree = unsafe { File::from_raw_fd(fd) };
+        protected_directory(&subtree, 0)?;
+        let directory = create_case_directory(&subtree, &request.result_key(), 0)?;
+        let pidfd = super::private_execution::pidfd_for_self()?;
+        let coordinator = ProcessIdentityV4::observe(unsafe { libc::getpid() }, pidfd.as_fd())?;
+        let admission_bytes=serde_json::to_vec(&serde_json::json!({
+            "schema_version":1,"protocol":"candidate-independent-facility-source-v1","source_revision_sha256":revision,
+            "parent_result_key":request.result_key(),"selector":request.selector,"challenge":request.challenge,
+            "installation_epoch":package.installation_epoch,"candidate_manifest_sha256":package.runtime_manifest_sha256,
+            "filter_sha256":package.filter_sha256,"installed_inspection_sha256":memcordon_core::workload_codec::hash_bytes(&package.installed_inspection_bytes()?),
+            "service_generation_sha256":service_generation,"coordinator":coordinator,"admission_monotonic_ns":super::clock::monotonic_nanos()?
+        })).map_err(|e|e.to_string())?;
+        super::private_release_raw::persist_fixed(&directory, "request.json", &admission_bytes, 0)?;
+        Ok(Self {
+            package,
+            directory,
+            request,
+            service_generation,
+            admission_bytes,
+            coordinator,
+            coordinator_pidfd: pidfd,
+            deadline: Instant::now() + std::time::Duration::from_secs(120),
+        })
+    }
+    fn revalidate(&self) -> Result<(), String> {
+        if Instant::now() >= self.deadline
+            || ProcessIdentityV4::observe(
+                self.coordinator.pid as i32,
+                self.coordinator_pidfd.as_fd(),
+            )? != self.coordinator
+        {
+            return Err("facility coordinator/time changed".into());
+        }
+        crate::package::verify()?;
+        let (_, bytes) =
+            super::runtime_manifest::source_v3(self.package.agent_installation_path())?
+                .ok_or("facility candidate manifest absent")?;
+        if crate::package::installed_generation_epoch()? != self.package.installation_epoch
+            || memcordon_core::workload_codec::hash_bytes(&bytes)
+                != self.package.runtime_manifest_sha256
+            || super::private_host_prerequisites::observe_service_generation()?.digest()?
+                != self.service_generation
+            || super::private_release_raw::read_fixed(&self.directory, "request.json", 0)?
+                != self.admission_bytes
+        {
+            return Err("facility current package/admission/generation changed".into());
+        }
+        let root = open_or_create_root()?;
+        let fd = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                c"facility-controls-v1".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let subtree = unsafe { File::from_raw_fd(fd) };
+        protected_directory(&subtree, 0)?;
+        let named = open_case_directory(&subtree, &self.request.result_key(), 0)?;
+        let a = named.metadata().map_err(|e| e.to_string())?;
+        let b = self.directory.metadata().map_err(|e| e.to_string())?;
+        if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
+            return Err("facility protected directory replaced".into());
+        }
+        Ok(())
+    }
+    fn held(
+        &self,
+        phase: memcordon_core::private_facility_source_v1::FacilityPhaseV1,
+        helper: &memcordon_core::private_facility_source_v1::FacilityProcessV1,
+        objects: &[memcordon_core::private_facility_source_v1::FacilityObjectV1],
+        status: &[u8],
+    ) -> Result<(), String> {
+        use memcordon_core::private_facility_source_v1::FacilityPhaseV1;
+        self.revalidate()?;
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, helper.pid, 0) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        let process = ProcessIdentityV4::observe(helper.pid as i32, pidfd.as_fd())?;
+        if process.start_time != helper.start_time_ticks {
+            return Err("facility held helper start changed".into());
+        }
+        let (gate, ack) = match phase {
+            FacilityPhaseV1::Outer => (
+                "facility-helper-outer-v1.json",
+                "facility-helper-outer-v1.ack",
+            ),
+            FacilityPhaseV1::Private => (
+                "facility-helper-private-v1.json",
+                "facility-helper-private-v1.ack",
+            ),
+        };
+        let bytes=serde_json::to_vec(&serde_json::json!({"schema_version":1,"phase":phase,"parent_result_key":self.request.result_key(),"source_revision_sha256":memcordon_core::private_facility_source_v1::facility_source_revision_sha256(),
+            "admission_sha256":memcordon_core::workload_codec::hash_bytes(&self.admission_bytes),"helper":helper,"objects":objects,"status":status,"observed_monotonic_ns":super::clock::monotonic_nanos()?})).map_err(|e|e.to_string())?;
+        super::private_release_raw::persist_fixed(&self.directory, gate, &bytes, 0)?;
+        let digest = memcordon_core::workload_codec::hash_bytes(&bytes);
+        let leaf = CString::new(ack).expect("fixed facility ACK name");
+        loop {
+            self.revalidate()?;
+            if ProcessIdentityV4::observe(helper.pid as i32, pidfd.as_fd())? != process {
+                return Err("facility held helper changed before root ACK".into());
+            }
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    self.directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Ack {
+                    schema_version: u8,
+                    phase: FacilityPhaseV1,
+                    parent_result_key: DiagnosticSha256,
+                    source_revision_sha256: DiagnosticSha256,
+                    gate_sha256: DiagnosticSha256,
+                }
+                let bytes = super::private_release_raw::read_fixed(&self.directory, ack, 0)?;
+                memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+                let parsed: Ack = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                if parsed.schema_version!=1 || parsed.phase!=phase || parsed.parent_result_key!=self.request.result_key() || parsed.source_revision_sha256!=memcordon_core::private_facility_source_v1::facility_source_revision_sha256() || parsed.gate_sha256!=digest {return Err("facility root SHA ACK exact subject differs".into());}
+                return Ok(());
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+                return Err("facility ACK path read failed".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    pub(crate) fn run(self) -> Result<(), String> {
+        self.revalidate()?;
+        let abi = match self.package.target.as_str() {
+            "x86_64-unknown-linux-gnu" => super::network_filter::NativeAbi::X86_64,
+            "aarch64-unknown-linux-gnu" => super::network_filter::NativeAbi::Aarch64,
+            _ => return Err("facility native GNU ABI differs".into()),
+        };
+        let outcome = super::private_release_facility_controls::run_owned(
+            self.request.selector,
+            &self.request.result_key(),
+            abi,
+            &self.package.filter_sha256,
+            |phase, helper, objects, status| self.held(phase, helper, objects, status),
+        );
+        match outcome {
+            Ok(report) => {
+                let bytes = serde_json::to_vec(&report).map_err(|e| e.to_string())?;
+                super::private_release_raw::persist_fixed(
+                    &self.directory,
+                    "facility-source-v1.json",
+                    &bytes,
+                    0,
+                )?;
+                self.revalidate()
+            }
+            Err(error) => {
+                let bytes=serde_json::to_vec(&serde_json::json!({"schema_version":1,"parent_result_key":self.request.result_key(),"error":error,"observed_monotonic_ns":super::clock::monotonic_nanos()?})).map_err(|e|e.to_string())?;
+                super::private_release_raw::persist_fixed(
+                    &self.directory,
+                    "facility-failure-v1.json",
+                    &bytes,
+                    0,
+                )?;
+                Err(error)
+            }
+        }
+    }
+}
+
 /// Decision-only policy custody. It pins M0 and a request-scoped protected
 /// directory but has no native attempt owner, launcher handle, or H1 grant.
 pub(crate) struct PolicyDecisionRunAuthorityV1 {
@@ -2290,6 +2874,268 @@ pub(crate) fn run_historical_epoch_replay(request: ReleaseCaseRequestV1) -> Resu
 /// production authority. A future physical candidate case runner must borrow
 /// it and persist raw native observations before any result can be published.
 #[allow(dead_code)]
+/// Versioned root-owned caller decision custody. It cannot allocate an
+/// attempt, release a target, or reuse an ordinary case coordinator.
+pub(crate) struct IndependentCallerProbeV2 {
+    package: crate::package::VerifiedReleaseCandidatePackageLease,
+    directory: File,
+    request: ReleaseCaseRequestV1,
+    service_generation: DiagnosticSha256,
+    admission_bytes: Vec<u8>,
+    coordinator: ProcessIdentityV4,
+    coordinator_pidfd: OwnedFd,
+    decision_started: std::cell::Cell<bool>,
+    deadline: Instant,
+}
+impl IndependentCallerProbeV2 {
+    pub(crate) fn prepare(request: ReleaseCaseRequestV1) -> Result<Self, String> {
+        // SAFETY: effective UID is a scalar kernel observation.
+        if unsafe { libc::geteuid() } != 0
+            || request.stage != ReleaseStageV1::CandidateCapability
+            || request.selector != super::private_release_caller::SELECTOR
+        {
+            return Err("independent caller probe stage/identity differs".into());
+        }
+        let package = crate::package::acquire_verified_release_candidate_package_lease()?;
+        let current = std::fs::metadata(std::env::current_exe().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        if (current.dev(), current.ino()) != package.agent_file_identity()? {
+            return Err("independent caller probe must use installed pinned image".into());
+        }
+        let generation =
+            super::private_host_prerequisites::observe_service_generation()?.digest()?;
+        let root = open_or_create_root()?;
+        // A separate fixed subtree never aliases an ordinary result key.
+        let name = c"caller-spoof-v1";
+        // SAFETY: one fixed leaf beneath the pinned protected state root.
+        if unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) } != 0
+            && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        root.sync_all().map_err(|e| e.to_string())?;
+        // SAFETY: retained root, fixed leaf, no symlink traversal.
+        let fd = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        // SAFETY: successful openat transfers exclusive descriptor ownership.
+        let subtree = unsafe { File::from_raw_fd(fd) };
+        protected_directory(&subtree, 0)?;
+        let directory = create_case_directory(&subtree, &request.result_key(), 0)?;
+        let pidfd = super::private_execution::pidfd_for_self()?;
+        // SAFETY: getpid supplies the process matched by the retained pidfd.
+        let coordinator = ProcessIdentityV4::observe(unsafe { libc::getpid() }, pidfd.as_fd())?;
+        let (uid, gid) = super::private_qualification::fixed_probe_account()?;
+        let spoof_challenge = super::private_release_caller::spoof_challenge(&request.challenge);
+        let spoof = ReleaseCaseRequestV1 {
+            stage: request.stage,
+            selector: request.selector,
+            challenge: spoof_challenge,
+        };
+        let admission_bytes=serde_json::to_vec(&serde_json::json!({
+            "schema_version":2,"protocol":"candidate-independent-caller-probe-v2",
+            "parent_result_key":request.result_key(),"challenge":request.challenge,
+            "spoof_result_key":spoof.result_key(),"spoof_challenge":spoof_challenge,
+            "installation_epoch":package.installation_epoch,"candidate_manifest_sha256":package.runtime_manifest_sha256,
+            "installed_inspection_sha256":memcordon_core::workload_codec::hash_bytes(&package.installed_inspection_bytes()?),
+            "service_generation_sha256":generation,"coordinator":coordinator,"caller_uid":uid,"caller_gid":gid
+            ,"admission_monotonic_ns":super::clock::monotonic_nanos()?
+        })).map_err(|e|e.to_string())?;
+        super::private_release_raw::persist_fixed(&directory, "request.json", &admission_bytes, 0)?;
+        Ok(Self {
+            package,
+            directory,
+            request,
+            service_generation: generation,
+            admission_bytes,
+            coordinator,
+            coordinator_pidfd: pidfd,
+            decision_started: std::cell::Cell::new(false),
+            deadline: Instant::now() + std::time::Duration::from_secs(45),
+        })
+    }
+    pub(crate) fn run(self) -> Result<(), String> {
+        use super::private_release_caller::CallerDecisionContextV2;
+        self.revalidate()?;
+        let observed =
+            super::private_release_caller::observe_nonroot_caller_rejection_context(&self);
+        if self.decision_started.replace(false) {
+            super::private_observer_hooks::mc_private_request_exit_v1();
+        }
+        let witness = observed?;
+        let bytes = serde_json::to_vec(&witness).map_err(|e| e.to_string())?;
+        super::private_release_raw::persist_fixed(
+            &self.directory,
+            "caller-rejection-v1.json",
+            &bytes,
+            0,
+        )?;
+        self.revalidate()
+    }
+}
+impl super::private_release_caller::CallerDecisionContextV2 for IndependentCallerProbeV2 {
+    fn selector(&self) -> &'static str {
+        self.request.selector
+    }
+    fn challenge_bytes(&self) -> [u8; 32] {
+        self.request.challenge
+    }
+    fn target_ids(&self) -> Result<(u32, u32), String> {
+        super::private_qualification::fixed_probe_account()
+    }
+    fn revalidate(&self) -> Result<(), String> {
+        if Instant::now() >= self.deadline {
+            return Err("independent caller probe deadline expired".into());
+        }
+        if ProcessIdentityV4::observe(
+            self.coordinator.pid as libc::pid_t,
+            self.coordinator_pidfd.as_fd(),
+        )? != self.coordinator
+        {
+            return Err("independent caller actual coordinator changed".into());
+        }
+        crate::package::verify()?;
+        let (_, manifest) =
+            super::runtime_manifest::source_v3(self.package.agent_installation_path())?
+                .ok_or("independent caller probe manifest absent")?;
+        if crate::package::installed_generation_epoch()? != self.package.installation_epoch
+            || memcordon_core::workload_codec::hash_bytes(&manifest)
+                != self.package.runtime_manifest_sha256
+            || super::private_host_prerequisites::observe_service_generation()?.digest()?
+                != self.service_generation
+            || super::private_release_raw::read_fixed(&self.directory, "request.json", 0)?
+                != self.admission_bytes
+        {
+            return Err("independent caller admission/domain/generation changed".into());
+        }
+        let root = open_or_create_root()?;
+        // SAFETY: exact fixed auxiliary subtree beneath the pinned root.
+        let fd = unsafe {
+            libc::openat(
+                root.as_raw_fd(),
+                c"caller-spoof-v1".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        // SAFETY: successful openat returned an exclusively owned directory.
+        let subtree = unsafe { File::from_raw_fd(fd) };
+        protected_directory(&subtree, 0)?;
+        let reopened = open_case_directory(&subtree, &self.request.result_key(), 0)?;
+        let current = reopened.metadata().map_err(|e| e.to_string())?;
+        let held = self.directory.metadata().map_err(|e| e.to_string())?;
+        if (current.dev(), current.ino()) != (held.dev(), held.ino()) {
+            return Err("independent caller protected directory replaced".into());
+        }
+        Ok(())
+    }
+    fn require_unallocated_result_key(&self, key: &DiagnosticSha256) -> Result<(), String> {
+        self.revalidate()?;
+        let expected = ReleaseCaseRequestV1 {
+            stage: self.request.stage,
+            selector: self.request.selector,
+            challenge: super::private_release_caller::spoof_challenge(&self.request.challenge),
+        }
+        .result_key();
+        if key != &expected || key == &self.request.result_key() {
+            return Err("independent caller spoof domain differs".into());
+        }
+        let root = open_or_create_root()?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: one digest leaf under pinned root; stat only used on success.
+        if unsafe {
+            libc::fstatat(
+                root.as_raw_fd(),
+                key_name(key).as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT)
+        {
+            return Err("independent caller spoof allocated protected ordinary case".into());
+        }
+        Ok(())
+    }
+    fn hold_ready_caller(
+        &self,
+        caller: &ProcessIdentityV4,
+        uid: u32,
+        gid: u32,
+        control_gid: u32,
+        request: &[u8],
+    ) -> Result<(), String> {
+        self.revalidate()?;
+        if (uid, gid) != self.target_ids()? {
+            return Err("independent caller actual identity differs".into());
+        }
+        let bytes=serde_json::to_vec(&serde_json::json!({"schema_version":1,"protocol":"candidate-independent-caller-ready-v1",
+            "parent_result_key":self.request.result_key(),"admission_sha256":memcordon_core::workload_codec::hash_bytes(&self.admission_bytes),
+            "caller":caller,"caller_uid":uid,"caller_gid":gid,"control_group_gid":control_gid,
+            "request_frame_sha256":memcordon_core::workload_codec::hash_bytes(request),
+            "ready_monotonic_ns":super::clock::monotonic_nanos()?})).map_err(|e|e.to_string())?;
+        super::private_release_raw::persist_fixed(
+            &self.directory,
+            "caller-ready-v1.json",
+            &bytes,
+            0,
+        )?;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Ack {
+            schema_version: u8,
+            gate_sha256: DiagnosticSha256,
+        }
+        loop {
+            self.revalidate()?;
+            // SAFETY: a fixed leaf existence check; the subsequent protected
+            // open independently rejects symlinks and verifies owner/mode.
+            let status = unsafe {
+                libc::faccessat(
+                    self.directory.as_raw_fd(),
+                    c"caller-ready-v1.ack".as_ptr(),
+                    libc::F_OK,
+                    libc::AT_EACCESS,
+                )
+            };
+            if status == 0 {
+                let ack_bytes = super::private_release_raw::read_fixed(
+                    &self.directory,
+                    "caller-ready-v1.ack",
+                    0,
+                )?;
+                memcordon_core::workload_contract::reject_duplicate_json_keys(&ack_bytes)?;
+                let ack: Ack = serde_json::from_slice(&ack_bytes).map_err(|e| e.to_string())?;
+                if ack.schema_version != 1
+                    || ack.gate_sha256 != memcordon_core::workload_codec::hash_bytes(&bytes)
+                {
+                    return Err("independent caller SHAACK differs".into());
+                }
+                if self.decision_started.replace(true) {
+                    return Err("independent caller request scope already entered".into());
+                }
+                // The auxiliary fork and root sample precede this exact
+                // genuine admission exchange; no Allocate owner is created.
+                super::private_observer_hooks::mc_private_request_enter_v1();
+                return Ok(());
+            }
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 pub(crate) struct ReleaseCandidateRunAuthorityV1 {
     package: crate::package::VerifiedReleaseCandidatePackageLease,
     coordinator_pidfd: OwnedFd,
@@ -2305,6 +3151,22 @@ pub(crate) struct ReleaseCandidateRunAuthorityV1 {
 
 #[allow(dead_code)]
 impl ReleaseCandidateRunAuthorityV1 {
+    pub(crate) fn persist_caller_subwitness(
+        &self,
+        witness: &super::private_release_caller::NonrootCallerRejectionV1,
+    ) -> Result<(), String> {
+        if self.selector != super::private_release_caller::SELECTOR {
+            return Err("caller subwitness selector differs".into());
+        }
+        self.revalidate()?;
+        let bytes = serde_json::to_vec(witness).map_err(|error| error.to_string())?;
+        super::private_release_raw::persist_fixed(
+            &self.case_directory,
+            "caller-rejection.raw.json",
+            &bytes,
+            0,
+        )
+    }
     /// The helper is a separately inventoried B component on ARM64 GNU.
     /// This read remains under the same package-generation lease as the case.
     #[allow(dead_code)] // Consumed by the closed ARM32 physical subwitness.

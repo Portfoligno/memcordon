@@ -334,9 +334,17 @@ pub(crate) fn tcp_listener_client_competitor(challenge: &[u8; 32]) -> Result<(),
 }
 
 pub(crate) fn tcp_listener_client_competitor_observed(challenge: &[u8; 32]) -> Result<i32, String> {
+    tcp_listener_client_competitor_held(challenge, None, |_| Ok(()))
+}
+
+pub(crate) fn tcp_listener_client_competitor_held(
+    challenge: &[u8; 32],
+    port: Option<u16>,
+    held: impl FnOnce(i32) -> Result<(), String>,
+) -> Result<i32, String> {
     use std::time::Duration;
 
-    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port.unwrap_or(0)))
         .map_err(|error| format!("MCSEALED-PRIVATE-PROBE-FIXTURE: TCP bind: {error}"))?;
     let address = listener
         .local_addr()
@@ -355,7 +363,9 @@ pub(crate) fn tcp_listener_client_competitor_observed(challenge: &[u8; 32]) -> R
             errno
         }
     };
-    let mut client = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+    // This reviewed private loopback control must expose an actual successful
+    // connect syscall, rather than connect_timeout's EINPROGRESS projection.
+    let mut client = TcpStream::connect(address)
         .map_err(|error| format!("MCSEALED-PRIVATE-PROBE-FIXTURE: TCP connect: {error}"))?;
     let (mut accepted, peer) = listener
         .accept()
@@ -388,6 +398,12 @@ pub(crate) fn tcp_listener_client_competitor_observed(challenge: &[u8; 32]) -> R
     if observed != *challenge {
         return Err("MCSEALED-PRIVATE-PROBE-FIXTURE: TCP echo differs".into());
     }
+    let free = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| format!("candidate collision free-port control: {error}"))?;
+    if free.local_addr().map_err(|error| error.to_string())?.port() == address.port() {
+        return Err("candidate free-port control reused listener port".into());
+    }
+    held(collision_errno)?;
     Ok(collision_errno)
 }
 

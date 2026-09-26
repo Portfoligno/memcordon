@@ -399,6 +399,7 @@ pub(crate) fn run_target_fixture() -> Result<(), String> {
         .map_err(|error| {
             format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: Unix intent challenge: {error}")
         })?;
+    super::private_release_case::hold_post_exec_baseline(&challenge)?;
     let observed = observe_target_denials(&challenge)?;
     std::io::stdout().write_all(&observed).map_err(|error| {
         format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: Unix intent output: {error}")

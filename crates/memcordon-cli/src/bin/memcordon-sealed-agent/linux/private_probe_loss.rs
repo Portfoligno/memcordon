@@ -377,7 +377,15 @@ impl FrontendProxy {
     }
 
     pub(crate) fn start(&self, challenge: [u8; 32]) -> Result<(), String> {
+        write_exact(self.control.as_fd(), &[0])?;
         write_exact(self.control.as_fd(), &challenge)
+    }
+    pub(crate) fn start_with_candidate_baseline(&self, challenge: [u8; 32]) -> Result<(), String> {
+        write_exact(self.control.as_fd(), &[1])?;
+        write_exact(self.control.as_fd(), &challenge)
+    }
+    pub(crate) fn baseline_endpoint(&self) -> BorrowedFd<'_> {
+        self.control.as_fd()
     }
 
     pub(crate) fn wait_armed(&self, expected: [u8; 32], deadline: Instant) -> Result<(), String> {
@@ -484,9 +492,22 @@ fn proxy_loop(
             return Err(());
         }
     }
+    let mut mode = [0_u8; 1];
+    read_exact(control, &mut mode).map_err(|_| ())?;
+    if mode[0] > 1 {
+        return Err(());
+    }
     let mut challenge = [0_u8; 32];
     read_exact(control, &mut challenge).map_err(|_| ())?;
     write_exact(stdin, &challenge).map_err(|_| ())?;
+    if mode == [1] {
+        let mut baseline = [0_u8; 48];
+        read_exact(stdout, &mut baseline).map_err(|_| ())?;
+        write_exact(control, &baseline).map_err(|_| ())?;
+        let mut ack = [0_u8; 32];
+        read_exact(control, &mut ack).map_err(|_| ())?;
+        write_exact(stdin, &ack).map_err(|_| ())?;
+    }
     let mut response = [0_u8; 32];
     read_exact(stdout, &mut response).map_err(|_| ())?;
     if response != armed_response(&challenge) {

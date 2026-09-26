@@ -75,6 +75,51 @@ struct RawV1 {
     branches: Vec<BranchV1>,
 }
 
+/// Exact independently held helper-image metadata. Parsing this diagnostic
+/// carrier does not confer origin, installation, or ABI authority.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicAbiHelperImageV1 {
+    pub device: u64,
+    pub inode: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+    pub nlink: u64,
+    pub size: u64,
+    pub sha256: DiagnosticSha256,
+}
+
+/// Validate original held bytes against an independently approved H1 image
+/// pin. The result is an object identity, not a semantic capability.
+pub fn validate_public_abi_helper_image_v1(
+    bytes: &[u8],
+    metadata: &[u8],
+    expected: &DiagnosticSha256,
+) -> Result<(u64, u64)> {
+    let image: PublicAbiHelperImageV1 =
+        crate::private_observer_session::strict_json(metadata, 4096)?;
+    if bytes.is_empty()
+        || bytes.len() > 8 * 1024 * 1024
+        || image.device == 0
+        || image.inode == 0
+        || image.uid != 0
+        || image.gid != 0
+        || image.mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFREG)
+        || image.mode & 0o022 != 0
+        || image.mode & 0o111 == 0
+        || image.nlink != 1
+        || image.size != bytes.len() as u64
+        || image.sha256 != *expected
+        || hash_bytes(bytes) != *expected
+    {
+        return Err(CiError::Message(
+            "public ABI original held helper image or object protection differs".into(),
+        ));
+    }
+    Ok((image.device, image.inode))
+}
+
 pub struct ExpectedPublicAbiOuterV1<'a> {
     pub target: &'a str,
     pub challenge: &'a [u8; 32],
@@ -328,6 +373,11 @@ pub(crate) fn join_public_abi_outer_kernel_v1(
     if observed.len() != structural.branches.len() {
         return Err(CiError::Message(
             "public ABI outer kernel inventory differs".into(),
+        ));
+    }
+    if !interval.retired_task(worker) {
+        return Err(CiError::Message(
+            "public ABI actual outer worker exit/reap absent".into(),
         ));
     }
     Ok(VerifiedPublicAbiOuterKernelV1 {

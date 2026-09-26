@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -224,12 +224,42 @@ impl AttemptCgroup {
     }
 
     pub fn kill_and_retire(self, deadline: Instant) -> Result<(), String> {
+        self.kill_and_retire_observed(deadline).map(|_| ())
+    }
+
+    pub(crate) fn kill_and_retire_observed(
+        self,
+        deadline: Instant,
+    ) -> Result<CgroupRetirementRawV1, String> {
+        let inode = fs::metadata(&self.path)
+            .map_err(|error| error.to_string())?
+            .ino();
+        if inode == 0 {
+            return Err("retiring cgroup inode is zero".into());
+        }
         write_control(&self.path.join("cgroup.kill"), b"1")?;
         while Instant::now() < deadline {
             if !populated(&self.path)? {
+                let last_members = self.member_pids()?;
+                if !last_members.is_empty() {
+                    return Err("retiring cgroup populated/member snapshot differs".into());
+                }
+                let empty_monotonic_ns = super::clock::monotonic_nanos()?;
                 fs::remove_dir(&self.path)
                     .map_err(|error| format!("MCSEALED-BOUNDARY-NOT-RETIRED: {error}"))?;
-                return Ok(());
+                let removed_monotonic_ns = super::clock::monotonic_nanos()?;
+                if !matches!(fs::symlink_metadata(&self.path),Err(error) if error.kind()==io::ErrorKind::NotFound)
+                {
+                    return Err("retired cgroup path remained present".into());
+                }
+                return Ok(CgroupRetirementRawV1 {
+                    schema_version: 1,
+                    cgroup_path: self.path,
+                    cgroup_inode: inode,
+                    last_members,
+                    empty_monotonic_ns,
+                    removed_monotonic_ns,
+                });
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -263,6 +293,17 @@ impl AttemptCgroup {
             Err(error) => Err(format!("MCSEALED-BOUNDARY-NOT-RETIRED: {error}")),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CgroupRetirementRawV1 {
+    schema_version: u8,
+    cgroup_path: PathBuf,
+    cgroup_inode: u64,
+    last_members: Vec<libc::pid_t>,
+    empty_monotonic_ns: u64,
+    removed_monotonic_ns: u64,
 }
 
 fn populated(path: &Path) -> Result<bool, String> {

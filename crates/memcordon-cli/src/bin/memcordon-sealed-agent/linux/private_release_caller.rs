@@ -1,6 +1,6 @@
 //! Closed physical caller-authentication subwitness for the release matrix.
-//! The distinct stale-installation-epoch half is not implemented, so this
-//! module cannot publish a case result or qualification by itself.
+//! Historical epoch replay is a separately retained suite-owned subwitness;
+//! this caller observation alone cannot publish qualification.
 
 use std::ffi::CString;
 use std::fs;
@@ -26,6 +26,7 @@ const PROCEED: u8 = 0x72;
 const SEND_REQUEST: u8 = 0x73;
 const SOCKET_HANDOFF: &[u8] = b"connected-public-service-v1";
 
+#[derive(serde::Serialize)]
 pub(crate) struct NonrootCallerRejectionV1 {
     pub(crate) caller: ProcessIdentityV4,
     pub(crate) caller_uid: u32,
@@ -33,6 +34,8 @@ pub(crate) struct NonrootCallerRejectionV1 {
     pub(crate) control_group_gid: u32,
     pub(crate) spoof_result_key: DiagnosticSha256,
     pub(crate) rejection_sha256: DiagnosticSha256,
+    pub(crate) request_frame_bytes: Vec<u8>,
+    pub(crate) response_frame_bytes: Vec<u8>,
 }
 
 struct ForkedCallerGuard {
@@ -72,9 +75,58 @@ impl Drop for ForkedCallerGuard {
 /// privileged inherited descriptors and no root UID/GID/capability set; the
 /// service must reject before allocating the alternate protected result key.
 /// No caller-authored credential field is accepted as the observation.
-#[allow(dead_code)] // The full selector awaits a physical stale-epoch replay.
 pub(crate) fn observe_nonroot_caller_rejection(
     case: &ReleaseCandidateRunAuthorityV1,
+) -> Result<NonrootCallerRejectionV1, String> {
+    observe_nonroot_caller_rejection_context(case)
+}
+
+/// No allocator or release operation is exposed by this decision-only seam.
+pub(crate) trait CallerDecisionContextV2 {
+    fn selector(&self) -> &'static str;
+    fn revalidate(&self) -> Result<(), String>;
+    fn target_ids(&self) -> Result<(u32, u32), String>;
+    fn challenge_bytes(&self) -> [u8; 32];
+    fn require_unallocated_result_key(&self, key: &DiagnosticSha256) -> Result<(), String>;
+    fn hold_ready_caller(
+        &self,
+        caller: &ProcessIdentityV4,
+        uid: u32,
+        gid: u32,
+        control_gid: u32,
+        request_frame: &[u8],
+    ) -> Result<(), String>;
+}
+impl CallerDecisionContextV2 for ReleaseCandidateRunAuthorityV1 {
+    fn selector(&self) -> &'static str {
+        self.selector()
+    }
+    fn revalidate(&self) -> Result<(), String> {
+        self.revalidate()
+    }
+    fn target_ids(&self) -> Result<(u32, u32), String> {
+        self.target_ids()
+    }
+    fn challenge_bytes(&self) -> [u8; 32] {
+        self.challenge_bytes()
+    }
+    fn require_unallocated_result_key(&self, key: &DiagnosticSha256) -> Result<(), String> {
+        self.require_unallocated_result_key(key)
+    }
+    fn hold_ready_caller(
+        &self,
+        _: &ProcessIdentityV4,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: &[u8],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub(crate) fn observe_nonroot_caller_rejection_context(
+    case: &impl CallerDecisionContextV2,
 ) -> Result<NonrootCallerRejectionV1, String> {
     if unsafe { libc::geteuid() } != 0 || case.selector() != SELECTOR {
         return Err("MCSEALED-PRIVATE-RELEASE: caller witness authority differs".into());
@@ -103,6 +155,8 @@ pub(crate) fn observe_nonroot_caller_rejection(
         attempt_id,
         payload: super::private_release_run::encode_control_request(&spoof)?,
     };
+    let mut request_frame_bytes = Vec::new();
+    write_network_frame(&mut request_frame_bytes, &request).map_err(|error| error.to_string())?;
     let (mut parent, child) = UnixStream::pair().map_err(|error| error.to_string())?;
     parent
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -147,6 +201,7 @@ pub(crate) fn observe_nonroot_caller_rejection(
             return Err("MCSEALED-PRIVATE-RELEASE: caller ready marker differs".into());
         }
         require_nonroot_proc_identity(pid, uid, gid, control_gid)?;
+        case.hold_ready_caller(&caller, uid, gid, control_gid, &request_frame_bytes)?;
         parent
             .write_all(&[PROCEED])
             .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: caller proceed: {error}"))?;
@@ -180,7 +235,10 @@ pub(crate) fn observe_nonroot_caller_rejection(
         let rejection: RejectionV1 =
             serde_json::from_slice(&response.payload).map_err(|error| error.to_string())?;
         validate_spoof_rejection(&rejection)?;
-        Ok(hash_bytes(&response.payload))
+        let mut response_frame_bytes = Vec::new();
+        write_network_frame(&mut response_frame_bytes, &response)
+            .map_err(|error| error.to_string())?;
+        Ok((hash_bytes(&response.payload), response_frame_bytes))
     })();
     if exchange.is_err() {
         // SAFETY: pidfd_send_signal addresses only the retained child identity.
@@ -204,7 +262,7 @@ pub(crate) fn observe_nonroot_caller_rejection(
     if waited == pid {
         child_guard.reaped = true;
     }
-    let rejection_sha256 = exchange?;
+    let (rejection_sha256, response_frame_bytes) = exchange?;
     if waited != pid || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
         return Err("MCSEALED-PRIVATE-RELEASE: caller child not cleanly reaped".into());
     }
@@ -217,6 +275,8 @@ pub(crate) fn observe_nonroot_caller_rejection(
         control_group_gid: control_gid,
         spoof_result_key: key,
         rejection_sha256,
+        request_frame_bytes,
+        response_frame_bytes,
     })
 }
 
@@ -402,7 +462,7 @@ fn pidfd_open(pid: libc::pid_t) -> Result<OwnedFd, String> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn spoof_challenge(challenge: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn spoof_challenge(challenge: &[u8; 32]) -> [u8; 32] {
     let mut bytes =
         Vec::with_capacity(b"memcordon-private-caller-spoof-v1\0".len() + challenge.len());
     bytes.extend_from_slice(b"memcordon-private-caller-spoof-v1\0");

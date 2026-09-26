@@ -235,7 +235,6 @@ pub fn readback_public_abi_filtered_v1(
 
 /// Returns only after each claimed filtered child has an exact fork, actual
 /// alternate-ABI KILL decision, SIGSYS exit and reap in one loss-free capture.
-#[cfg(target_os = "linux")]
 pub(crate) fn join_public_abi_filtered_kernel_v1(
     structural: &StructuralPublicAbiFilteredV1,
     interval: &crate::private_kernel_observer::VerifiedKernelIntervalV1,

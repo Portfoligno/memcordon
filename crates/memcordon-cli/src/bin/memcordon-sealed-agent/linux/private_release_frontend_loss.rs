@@ -112,7 +112,12 @@ pub(crate) fn execute_frontend_loss_candidate_case(
         )?;
         let namespace_inode = observed.network_namespace_inode();
         owner.prepare_relay(proxy.take_relay()?)?;
-        proxy.start(challenge)?;
+        super::private_release_live_gate::wait_pre_for_candidate(
+            case,
+            &mut owner,
+            observed.target_identity(),
+        )?;
+        proxy.start_with_candidate_baseline(challenge)?;
         let checkpoint = owner.commit_release_candidate_and_release(observed, case)?;
         if !matches!(
             owner.observe_exec(startup_deadline)?,
@@ -120,6 +125,13 @@ pub(crate) fn execute_frontend_loss_candidate_case(
         ) {
             return Err("MCSEALED-PRIVATE-RELEASE: frontend-loss target did not exec".into());
         }
+        super::private_release_live_gate::wait_baseline_for_candidate(
+            case,
+            &mut owner,
+            proxy.baseline_endpoint(),
+            proxy.baseline_endpoint(),
+            None,
+        )?;
         owner.pump_release_frontend_until_armed(case, &proxy, response, startup_deadline)?;
         Ok((checkpoint, namespace_inode))
     })();

@@ -142,7 +142,8 @@ pub(crate) fn execute_guardian_loss_candidate_case(
     let (stdout_read, stdout_write) = super::private_probe_execution::nonblocking_pipe()?;
     let (stderr_read, stderr_write) = super::private_probe_execution::nonblocking_pipe()?;
     let challenge = case.challenge_bytes();
-    File::from(stdin_write)
+    let mut baseline_input = File::from(stdin_write);
+    baseline_input
         .write_all(&challenge)
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: guardian-loss challenge: {error}"))?;
     let mut owner = case.begin_native_owner()?;
@@ -175,6 +176,11 @@ pub(crate) fn execute_guardian_loss_candidate_case(
         )?;
         let namespace_inode = observed.network_namespace_inode();
         owner.prepare_relay([stdin_read, stdout_write, stderr_write])?;
+        super::private_release_live_gate::wait_pre_for_candidate(
+            case,
+            &mut owner,
+            observed.target_identity(),
+        )?;
         let checkpoint = owner.commit_release_candidate_and_release(observed, case)?;
         if !matches!(
             owner.observe_exec(startup_deadline)?,
@@ -182,6 +188,13 @@ pub(crate) fn execute_guardian_loss_candidate_case(
         ) {
             return Err("MCSEALED-PRIVATE-RELEASE: guardian-loss target did not exec".into());
         }
+        super::private_release_live_gate::wait_baseline_for_candidate(
+            case,
+            &mut owner,
+            stdout_read.as_fd(),
+            baseline_input.as_fd(),
+            None,
+        )?;
         owner.await_release_guardian_loss_armed(
             case,
             stdout_read.as_fd(),

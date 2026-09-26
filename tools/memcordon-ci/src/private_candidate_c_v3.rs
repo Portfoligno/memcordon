@@ -23,6 +23,7 @@ const MAX_ZIP_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MEMBER_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_INDEX_BYTES: usize = 128 * 1024;
 const INDEX: &str = "candidate-c-v3/index.json";
+pub(crate) const REPLAY_BUNDLE_LEAF: &str = "replay-bundle.v1.bin";
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +53,8 @@ pub struct CandidateEvidenceIndexV3 {
     pub release_version: String,
     pub collector_intent_sha256: DiagnosticSha256,
     pub cases: Vec<CandidateCaseV3>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observer_raw: Vec<CandidateRawMemberV3>,
 }
 
 /// Exact bytes retained from the protected native producer and independent
@@ -75,6 +78,36 @@ impl ParsedCandidateC3V1 {
     pub(crate) fn member(&self, path: &str) -> Option<&[u8]> {
         self.members.get(path).map(Vec::as_slice)
     }
+    pub(crate) fn payload_members(&self) -> BTreeMap<String, Vec<u8>> {
+        self.members
+            .iter()
+            .filter(|(path, _)| path.as_str() != INDEX && !origin_leaf(path))
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect()
+    }
+    pub(crate) fn origin_member(&self, leaf: &str) -> Result<&[u8]> {
+        let members: Vec<_> = self
+            .members
+            .iter()
+            .filter(|(path, _)| path.rsplit('/').next() == Some(leaf))
+            .collect();
+        let [(_, bytes)] = members.as_slice() else {
+            return Err(CiError::Message(
+                "candidate origin carrier absent/ambiguous".into(),
+            ));
+        };
+        Ok(bytes)
+    }
+}
+fn origin_leaf(path: &str) -> bool {
+    matches!(
+        path.rsplit('/').next(),
+        Some(
+            crate::private_observer_session::PAYLOAD_INDEX_LEAF
+                | crate::private_observer_session::ORIGIN_COMMITMENT_LEAF
+                | crate::private_observer_session::ORIGIN_RECEIPT_LEAF
+        )
+    )
 }
 
 fn member(path: String, bytes: &[u8]) -> Result<CandidateRawMemberV3> {
@@ -91,7 +124,7 @@ fn member(path: String, bytes: &[u8]) -> Result<CandidateRawMemberV3> {
 }
 
 fn valid_member_path(path: &str) -> bool {
-    path.starts_with("candidate-c-v3/cases/")
+    (path.starts_with("candidate-c-v3/cases/") || valid_observer_path(path))
         && path.len() <= 256
         && path
             .split('/')
@@ -99,6 +132,67 @@ fn valid_member_path(path: &str) -> bool {
         && path
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+}
+
+fn valid_observer_path(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix("candidate-c-v3/observer/") else {
+        return false;
+    };
+    let parts = relative.split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["intervals", id, leaf] => {
+            id.len() == 64
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && matches!(
+                    *leaf,
+                    "capture.bin"
+                        | "clock.json"
+                        | "control-output.raw"
+                        | "request.json"
+                        | "attempt.json"
+                        | "result.json"
+                        | "replay-rejection.json"
+                        | "pre-samples.json"
+                        | "second-pre-samples.json"
+                        | "baseline-samples.json"
+                        | "second-baseline-samples.json"
+                        | "second-after-retirement-samples.json"
+                        | "post-samples.json"
+                        | "namespace-closes.json"
+                        | "stdout.raw"
+                        | "stderr.raw"
+                        | "pre-gate.json"
+                        | "first-pre-gate.json"
+                        | "second-pre-gate.json"
+                        | "post-gate.json"
+                        | "baseline-gate.json"
+                        | "first-baseline-gate.json"
+                        | "second-baseline-gate.json"
+                        | "second-after-retirement-gate.json"
+                        | "request.bin"
+                        | "report.bin"
+                        | "stdio.bin"
+                        | "observer.bin"
+                        | "cleanup.bin"
+                )
+        }
+        ["generations", generation, leaf] => {
+            matches!(*generation, "0" | "1")
+                && matches!(
+                    *leaf,
+                    "installation-epoch.json"
+                        | "installed-receipt.json"
+                        | "manifest.json"
+                        | "service.json"
+                        | "broker.json"
+                        | "transaction.json"
+                        | "observer-map.json"
+                )
+        }
+        _ => false,
+    }
 }
 
 fn case_prefix(key: &DiagnosticSha256) -> String {
@@ -149,7 +243,12 @@ fn validate_index(
     index: &CandidateEvidenceIndexV3,
     members: &BTreeMap<String, Vec<u8>>,
 ) -> Result<()> {
-    if index.schema_version != 3
+    if members.len() > 256 {
+        return Err(CiError::Message(
+            "candidate C exceeds reviewed 256-member budget".into(),
+        ));
+    }
+    if !matches!(index.schema_version, 3 | 4 | 5 | 6)
         || index.cases.len() != REQUIRED_PRIVATE_RELEASE_SELECTORS_V1.len()
         || index.collector_intent_sha256 == hash_bytes(&[])
         || index.source_commit.len() != 40
@@ -166,6 +265,32 @@ fn validate_index(
         return Err(CiError::Message("candidate C index subject differs".into()));
     }
     let mut required = BTreeSet::from([INDEX.to_owned()]);
+    if index.schema_version < 5 && !index.observer_raw.is_empty() {
+        return Err(CiError::Message(
+            "legacy candidate C cannot carry observer metadata".into(),
+        ));
+    }
+    if index.observer_raw.len() > 256 {
+        return Err(CiError::Message(
+            "candidate observer metadata inventory exceeds closed interval budget".into(),
+        ));
+    }
+    for raw in &index.observer_raw {
+        let bytes = members
+            .get(&raw.path)
+            .ok_or_else(|| CiError::Message("candidate observer raw member absent".into()))?;
+        if !valid_observer_path(&raw.path)
+            || bytes.is_empty()
+            || bytes.len() as u64 > MAX_MEMBER_BYTES
+            || raw.size != bytes.len() as u64
+            || raw.sha256 != hash_bytes(bytes)
+            || !required.insert(raw.path.clone())
+        {
+            return Err(CiError::Message(
+                "candidate observer raw inventory path/size/digest differs".into(),
+            ));
+        }
+    }
     let mut keys = BTreeSet::new();
     for (case, selector) in index
         .cases
@@ -245,6 +370,52 @@ fn validate_index(
                 "candidate C family leaf path differs".into(),
             ));
         }
+        if index.schema_version >= 4 {
+            let mut expected = required_case_family_leaves_v4(selector, &index.target)
+                .into_iter()
+                .map(|leaf| format!("{prefix}/family/{leaf}"))
+                .collect::<BTreeSet<_>>();
+            if index.schema_version == 6 {
+                expected.insert(format!("{prefix}/family/source-carrier.v1.bin"));
+                crate::private_source_carrier::parse_source_carrier(
+                    members
+                        .get(&format!("{prefix}/family/source-carrier.v1.bin"))
+                        .ok_or_else(|| {
+                            CiError::Message("candidate exact source carrier absent".into())
+                        })?,
+                )?;
+            }
+            if case
+                .family_raw
+                .iter()
+                .map(|raw| raw.path.clone())
+                .collect::<BTreeSet<_>>()
+                != expected
+            {
+                return Err(CiError::Message(
+                    "candidate C4 exact replay/origin/family inventory differs".into(),
+                ));
+            }
+            let bundle = members
+                .get(&format!("{prefix}/family/{REPLAY_BUNDLE_LEAF}"))
+                .ok_or_else(|| CiError::Message("candidate replay bundle absent".into()))?;
+            let leaves = crate::private_candidate_replay::parse_replay_bundle(bundle)?;
+            for role in [
+                crate::private_candidate_replay::ReplayLeafRoleV1::Facts,
+                crate::private_candidate_replay::ReplayLeafRoleV1::Request,
+                crate::private_candidate_replay::ReplayLeafRoleV1::Clock,
+                crate::private_candidate_replay::ReplayLeafRoleV1::Controls,
+            ] {
+                if !leaves
+                    .iter()
+                    .any(|leaf| leaf.role == role && leaf.ordinal == 0)
+                {
+                    return Err(CiError::Message(
+                        "candidate required raw replay role absent".into(),
+                    ));
+                }
+            }
+        }
         if let Some(leaf) = required_family_leaf(selector, &index.target) {
             if !case
                 .family_raw
@@ -256,7 +427,9 @@ fn validate_index(
                 ));
             }
         }
-        if selector == "private_tcp::wrong_grant_profile_and_port_rejected" {
+        if index.schema_version == 3
+            && selector == "private_tcp::wrong_grant_profile_and_port_rejected"
+        {
             let expected = POLICY_FAMILY_LEAVES_V3
                 .iter()
                 .map(|leaf| format!("{prefix}/family/{leaf}"))
@@ -283,12 +456,13 @@ fn validate_index(
                 .iter()
                 .map(|leaf| format!("{prefix}/family/{leaf}"))
                 .collect::<BTreeSet<_>>();
-            if case
-                .family_raw
-                .iter()
-                .map(|raw| raw.path.clone())
-                .collect::<BTreeSet<_>>()
-                != expected
+            if index.schema_version == 3
+                && case
+                    .family_raw
+                    .iter()
+                    .map(|raw| raw.path.clone())
+                    .collect::<BTreeSet<_>>()
+                    != expected
             {
                 return Err(CiError::Message(
                     "candidate C ABI protected request/subwitness inventory differs".into(),
@@ -357,7 +531,50 @@ fn validate_index(
     if members.keys().cloned().collect::<BTreeSet<_>>() != required {
         return Err(CiError::Message("candidate C member set differs".into()));
     }
+    if index.schema_version >= 4 {
+        let expected_entries = if index.target == "x86_64-unknown-linux-gnu" {
+            226
+        } else {
+            225
+        };
+        let source_carriers = if index.schema_version == 6 { 25 } else { 0 };
+        if index.schema_version == 6 && !index.observer_raw.is_empty() {
+            return Err(CiError::Message(
+                "packed candidate still declares standalone source aliases".into(),
+            ));
+        }
+        if members.len() != expected_entries + index.observer_raw.len() + source_carriers {
+            return Err(CiError::Message(
+                "candidate C4 reviewed entry arithmetic differs".into(),
+            ));
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn required_case_family_leaves_v4(selector: &str, target: &str) -> Vec<&'static str> {
+    let mut leaves = vec![REPLAY_BUNDLE_LEAF];
+    match selector {
+        "private_tcp::wrong_grant_profile_and_port_rejected" => {
+            leaves.extend(POLICY_FAMILY_LEAVES_V3)
+        }
+        "private_tcp::abi_alternate_entry_denied" => {
+            if target == "x86_64-unknown-linux-gnu" {
+                leaves.extend(X86_ABI_FAMILY_LEAVES_V3);
+            } else {
+                leaves.extend(ARM_ABI_FAMILY_LEAVES_V3);
+            }
+            leaves.extend([
+                crate::private_observer_session::PAYLOAD_INDEX_LEAF,
+                crate::private_observer_session::ORIGIN_COMMITMENT_LEAF,
+                crate::private_observer_session::ORIGIN_RECEIPT_LEAF,
+            ]);
+        }
+        "private_tcp::caller_identity_and_epoch_bound" => leaves.push("historical-epoch.raw.json"),
+        _ => (),
+    }
+    leaves.sort();
+    leaves
 }
 
 /// Parses exact C bytes, including the dual-branch result without flattening
@@ -380,6 +597,13 @@ pub(crate) fn parse_candidate_c_v3_full(bytes: &[u8]) -> Result<ParsedCandidateC
         let mut file = archive.by_index(index)?;
         let path = file.name().to_owned();
         if file.is_dir()
+            || file
+                .unix_mode()
+                .is_some_and(|mode| mode & 0o170000 != 0 && mode & 0o170000 != 0o100000)
+            || !matches!(
+                file.compression(),
+                zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
+            )
             || path != INDEX && !valid_member_path(&path)
             || file.size() == 0
             || file.size() > MAX_MEMBER_BYTES
@@ -438,9 +662,14 @@ pub(crate) fn produce_candidate_c_v3(
     release_version: &str,
     collector_intent_sha256: DiagnosticSha256,
     cases: &[CandidateCaseBytesV3],
+    observer_raw: &BTreeMap<String, Vec<u8>>,
 ) -> Result<Vec<u8>> {
     if cases.len() != REQUIRED_PRIVATE_RELEASE_SELECTORS_V1.len()
         || semantics.result_digests.len() != cases.len()
+        || semantics.inventory_digests.len() != cases.len()
+        || semantics.subject.target != target
+        || semantics.subject.source_commit != source_commit
+        || semantics.subject.release_version != release_version
     {
         return Err(CiError::Message(
             "candidate C semantic case set differs".into(),
@@ -504,13 +733,38 @@ pub(crate) fn produce_candidate_c_v3(
             family_raw,
         });
     }
+    let mut observer_records = Vec::new();
+    for (path, bytes) in observer_raw {
+        if !valid_observer_path(path) {
+            return Err(CiError::Message(
+                "candidate observer producer path differs".into(),
+            ));
+        }
+        observer_records.push(member(path.clone(), bytes)?);
+        if members.insert(path.clone(), bytes.clone()).is_some() {
+            return Err(CiError::Message(
+                "candidate observer producer duplicates member".into(),
+            ));
+        }
+    }
     let index = CandidateEvidenceIndexV3 {
-        schema_version: 3,
+        schema_version: if observer_records.is_empty()
+            && cases
+                .iter()
+                .all(|case| case.family_raw.contains_key("source-carrier.v1.bin"))
+        {
+            6
+        } else if observer_records.is_empty() {
+            4
+        } else {
+            5
+        },
         target: target.into(),
         source_commit: source_commit.into(),
         release_version: release_version.into(),
         collector_intent_sha256,
         cases: records,
+        observer_raw: observer_records,
     };
     let index_bytes = serde_json::to_vec(&index)?;
     if index_bytes.len() > MAX_INDEX_BYTES {
@@ -518,6 +772,19 @@ pub(crate) fn produce_candidate_c_v3(
     }
     members.insert(INDEX.into(), index_bytes);
     validate_index(&index, &members)?;
+    let payload: BTreeMap<_, _> = members
+        .iter()
+        .filter(|(path, _)| path.as_str() != INDEX && !origin_leaf(path))
+        .map(|(path, bytes)| (path.clone(), bytes.clone()))
+        .collect();
+    let payload_index = crate::private_observer_session::canonical_bytes(
+        &crate::private_observer_session::canonical_payload_index(&semantics.subject, &payload)?,
+    )?;
+    if hash_bytes(&payload_index) != semantics.payload_index_sha256 {
+        return Err(CiError::Message(
+            "candidate complete raw payload substituted after semantic verification".into(),
+        ));
+    }
     let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored)
@@ -543,6 +810,7 @@ pub(crate) fn export_candidate_c_v3(
     release_version: &str,
     collector_intent_sha256: DiagnosticSha256,
     cases: &[CandidateCaseBytesV3],
+    observer_raw: &BTreeMap<String, Vec<u8>>,
     output_dir: &Path,
 ) -> Result<()> {
     let bytes = produce_candidate_c_v3(
@@ -552,6 +820,7 @@ pub(crate) fn export_candidate_c_v3(
         release_version,
         collector_intent_sha256,
         cases,
+        observer_raw,
     )?;
     parse_candidate_c_v3(&bytes)?;
     if output_dir.exists() || !output_dir.is_absolute() {
@@ -559,27 +828,98 @@ pub(crate) fn export_candidate_c_v3(
             "candidate C export destination is not fresh absolute".into(),
         ));
     }
+    let parsed = parse_candidate_c_v3_full(&bytes)?;
+    let parent = output_dir
+        .parent()
+        .ok_or_else(|| CiError::Message("candidate C export parent absent".into()))?;
+    if !parent.is_dir() {
+        return Err(CiError::Message(
+            "candidate C export parent is absent".into(),
+        ));
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| CiError::Message("candidate C export clock differs".into()))?
+        .as_nanos();
+    let name = output_dir
+        .file_name()
+        .ok_or_else(|| CiError::Message("candidate C export name absent".into()))?;
+    let mut staging_name = name.to_os_string();
+    staging_name.push(format!(".pending-{}-{nonce}", std::process::id()));
+    let staging = parent.join(staging_name);
+    std::fs::create_dir(&staging)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let mut directories = BTreeSet::from([staging.clone()]);
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
-    std::fs::create_dir_all(output_dir)?;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
-        let name = file.name();
-        if name != INDEX && !valid_member_path(name) {
+        let name = file.name().to_owned();
+        if name != INDEX && !valid_member_path(&name) {
             return Err(CiError::Message(
                 "candidate C export member path differs".into(),
             ));
         }
-        let path = output_dir.join(name);
+        let path = staging.join(&name);
         std::fs::create_dir_all(
             path.parent()
                 .ok_or_else(|| CiError::Message("candidate C export parent absent".into()))?,
         )?;
-        let mut output = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let mut directory = path
+            .parent()
+            .ok_or_else(|| CiError::Message("candidate C export leaf parent absent".into()))?;
+        while directory.starts_with(&staging) {
+            directories.insert(directory.to_path_buf());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+            }
+            let Some(ancestor) = directory.parent() else {
+                break;
+            };
+            directory = ancestor;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut output = options.open(&path)?;
         std::io::copy(&mut file, &mut output)?;
         output.sync_all()?;
+        let exact = crate::private_observer_session::read_bounded_file(&path, MAX_MEMBER_BYTES)?;
+        if parsed.member(&name) != Some(exact.as_slice()) {
+            return Err(CiError::Message(
+                "candidate C export exact leaf readback differs".into(),
+            ));
+        }
     }
+    for directory in directories.iter().rev() {
+        std::fs::File::open(directory)?.sync_all()?;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &staging,
+        rustix::fs::CWD,
+        output_dir,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        return Err(CiError::Message(
+            "candidate C export requires atomic no-replace directory rename".into(),
+        ));
+    }
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }

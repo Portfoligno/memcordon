@@ -30,6 +30,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopLevel {
+    /// Serve only administrator-enrolled observer sessions; never provision keys.
+    ServeCustodianController {
+        #[arg(long)]
+        intent: PathBuf,
+        #[arg(long)]
+        credential_fd: u32,
+    },
     #[command(hide = true)]
     PublicChildGate {
         #[arg(long)]
@@ -93,6 +100,10 @@ enum TopLevel {
         collector_intent_sha256: Option<String>,
         #[arg(long)]
         policy_intent_sha256: Option<String>,
+        #[arg(long)]
+        observer_intent: Option<PathBuf>,
+        #[arg(long)]
+        observer_intent_sha256: Option<String>,
     },
     Release {
         #[command(subcommand)]
@@ -173,6 +184,30 @@ enum ReleaseCommand {
         #[arg(long)]
         output: PathBuf,
     },
+    CollectPrivateQCertificate {
+        #[arg(long)]
+        intent: PathBuf,
+        #[arg(long)]
+        build: PathBuf,
+        #[arg(long)]
+        signing_intent: PathBuf,
+        #[arg(long)]
+        credential_fd: u32,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    CollectPrivateP {
+        #[arg(long)]
+        intent: PathBuf,
+        #[arg(long)]
+        build: PathBuf,
+        #[arg(long)]
+        signing_intent: PathBuf,
+        #[arg(long)]
+        credential_fd: u32,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
     InstallPrivateFinal {
         #[arg(long)]
         intent: PathBuf,
@@ -219,6 +254,15 @@ fn workspace_root(start: &Path) -> Result<PathBuf> {
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
     match cli.command.take() {
+        Some(TopLevel::ServeCustodianController {
+            intent,
+            credential_fd,
+        }) if cli.build_context.is_none() && !cli.cargo_plugin => {
+            return memcordon_ci::private_observer_session::serve_custodian_controller(
+                &intent,
+                credential_fd,
+            );
+        }
         Some(TopLevel::PublicChildGate {
             fd,
             working_directory,
@@ -242,6 +286,9 @@ fn run() -> Result<()> {
         )?;
     }
     let result = match (cli.cargo_plugin, cli.command) {
+        (false, Some(TopLevel::ServeCustodianController { .. })) => Err(CiError::Message(
+            "custodian service forbids build-context/credential-plugin mode".into(),
+        )),
         (false, Some(TopLevel::BuildPrivateKernelProbe)) => private_probe_build::run(&root),
         (false, Some(TopLevel::InventoryProfile { plan, output })) => {
             memcordon_ci::inventory_profile::profile(&plan, &output, &root)
@@ -290,6 +337,8 @@ fn run() -> Result<()> {
                 target,
                 collector_intent_sha256,
                 policy_intent_sha256,
+                observer_intent,
+                observer_intent_sha256,
             }),
         ) => suites::run(
             &root,
@@ -298,6 +347,8 @@ fn run() -> Result<()> {
             target.as_deref(),
             collector_intent_sha256.as_deref(),
             policy_intent_sha256.as_deref(),
+            observer_intent.as_deref(),
+            observer_intent_sha256.as_deref(),
         ),
         (false, Some(TopLevel::Release { command })) => release::run(&root, command),
         (

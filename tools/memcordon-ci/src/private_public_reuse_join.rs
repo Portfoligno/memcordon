@@ -9,6 +9,10 @@ use serde::Deserialize;
 
 use crate::{CiError, Result};
 
+/// Diagnostic validation of original held namespace descriptor bytes.
+/// This does not construct a retirement or qualification capability.
+pub use crate::private_public_reuse_live::validate_holder_fd_source;
+
 fn fail(message: &'static str) -> CiError {
     CiError::Message(message.into())
 }
@@ -141,7 +145,6 @@ pub fn validate_protected_public_reuse_v1(
     })
 }
 
-#[cfg(target_os = "linux")]
 pub struct ExpectedPublicReuseLiveV1<'a> {
     pub protected_record_bytes: &'a [u8],
     pub detached_stdout: &'a [u8],
@@ -154,7 +157,6 @@ pub struct ExpectedPublicReuseLiveV1<'a> {
     pub recovery_interval: &'a crate::private_kernel_observer::VerifiedKernelIntervalV1,
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) struct VerifiedPublicReuseV1 {
     transcript_sha256: DiagnosticSha256,
     observer_sha256: DiagnosticSha256,
@@ -163,7 +165,6 @@ pub(crate) struct VerifiedPublicReuseV1 {
     recovered_cleanup_sha256: DiagnosticSha256,
 }
 
-#[cfg(target_os = "linux")]
 impl VerifiedPublicReuseV1 {
     pub(crate) fn transcript_sha256(&self) -> &DiagnosticSha256 {
         &self.transcript_sha256
@@ -182,7 +183,6 @@ impl VerifiedPublicReuseV1 {
     }
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn join_public_reuse_v1(
     input: &ExpectedPublicReuseLiveV1<'_>,
 ) -> Result<VerifiedPublicReuseV1> {

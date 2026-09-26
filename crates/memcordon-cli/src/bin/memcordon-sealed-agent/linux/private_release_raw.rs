@@ -574,6 +574,45 @@ pub(crate) fn readback_blocked_retirement_worker_raw(
     readback_blocked_retirement_worker_raw_with_owner(context, blocked, 0)
 }
 
+/// Returns only the original typed physical settlement, before marker
+/// deletion or durable recovery. The caller first joins all five originals;
+/// this accessor repeats the exact attempt/checkpoint/marker and primitive
+/// validation rather than rebuilding settlement from post-deletion absence.
+pub(crate) fn read_blocked_settlement_source(
+    directory: &File,
+    blocked: &super::private_release_attempt::ReadbackBlockedCandidateAttemptV1,
+    result_key: &DiagnosticSha256,
+) -> Result<super::private_lifecycle::ReleaseCandidateSettlementFactsV1, String> {
+    let bytes = read_fixed(directory, "observer.bin", 0)?;
+    memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+    let trace: NativeBlockedRetirementObserverV1 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let settlement = &trace.settlement;
+    let guardian = super::private_guardian::GuardianTerminalV4::decode(
+        settlement.guardian_terminal,
+        super::private_release_attempt::candidate_attempt_bytes(result_key),
+    )?;
+    if trace.schema_version != 1
+        || trace.attempt_id != blocked.journal.attempt_id
+        || trace.checkpoint_sha256 != blocked.journal.checkpoint_digest
+        || trace.terminal_record_digest != blocked.journal.terminal_record_digest
+        || trace.fault_marker_sha256 != hash_bytes(&blocked.fault_marker_bytes)
+        || settlement.schema_version != 1
+        || settlement.monitor_outcome != super::private_lifecycle::PrivateMonitorOutcome::Completed
+        || !settlement.cgroup_empty_before_cleanup
+        || !settlement.containment_removed
+        || !settlement.target_pidfd_exited
+        || !settlement.namespace_init_reaped
+        || settlement.candidate_exit_code != Some(0)
+        || settlement.cgroup_retirement_raw.is_none()
+        || guardian.trigger != super::private_guardian::GuardianTriggerV4::Stopped
+        || guardian.boundary_retired
+    {
+        return Err("candidate recovery original physical settlement source differs".into());
+    }
+    Ok(trace.settlement)
+}
+
 fn readback_blocked_retirement_worker_raw_with_owner(
     context: CandidateRawContextV1<'_>,
     blocked: &super::private_release_attempt::ReadbackBlockedCandidateAttemptV1,

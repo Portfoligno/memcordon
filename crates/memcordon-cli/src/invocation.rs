@@ -879,6 +879,7 @@ pub struct ExecutionArgs {
     pub expected_private_plan: Option<PathBuf>,
     pub frozen_private_contract: Option<PathBuf>,
     pub reuse_private_two_attempts: bool,
+    pub concurrent_private_two_attempts: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1056,6 +1057,7 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
     let mut expected_private_plan = None;
     let mut frozen_private_contract = None;
     let mut reuse_private_two_attempts = false;
+    let mut concurrent_private_two_attempts = false;
     let mut index = 0;
     let mut budgets = BudgetSet::default();
     while index < argv.len() {
@@ -1133,6 +1135,15 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
                 }
                 reuse_private_two_attempts = true;
             }
+            "--concurrent-private-two-attempts" if inline_value.is_none() => {
+                if concurrent_private_two_attempts {
+                    return Err(CliError::new(
+                        "MCUSAGE-DUAL-PRIVATE-TWO-ATTEMPTS",
+                        "concurrent mode may be supplied once",
+                    ));
+                }
+                concurrent_private_two_attempts = true;
+            }
             _ => parse_policy_option(name, inline_value, argv, &mut index, &mut policy)?,
         }
         index += 1;
@@ -1169,7 +1180,7 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
             "--frozen-private-contract requires --sealed, an exact V2 contract and --expected-private-plan",
         ));
     }
-    if reuse_private_two_attempts
+    if (reuse_private_two_attempts || concurrent_private_two_attempts)
         && (!cfg!(target_os = "linux")
             || policy.boundary != BoundaryRequirement::Sealed
             || policy.private_workload_contract().is_none()
@@ -1178,6 +1189,12 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
         return Err(CliError::new(
             "MCUSAGE-REUSE-PRIVATE-TWO-ATTEMPTS",
             "--reuse-private-two-attempts requires Linux, --sealed, an exact V2 contract and no frozen contract",
+        ));
+    }
+    if reuse_private_two_attempts && concurrent_private_two_attempts {
+        return Err(CliError::new(
+            "MCUSAGE-PRIVATE-TWO-ATTEMPTS",
+            "reuse and concurrent modes are exclusive",
         ));
     }
     Ok(ExecutionArgs {
@@ -1192,6 +1209,7 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
         expected_private_plan,
         frozen_private_contract,
         reuse_private_two_attempts,
+        concurrent_private_two_attempts,
     })
 }
 

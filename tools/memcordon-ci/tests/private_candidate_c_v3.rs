@@ -212,6 +212,7 @@ fn fixture() -> (CandidateEvidenceIndexV3, BTreeMap<String, Vec<u8>>) {
     }
     let index = CandidateEvidenceIndexV3 {
         schema_version: 3,
+        observer_raw: Vec::new(),
         target: "x86_64-unknown-linux-gnu".into(),
         source_commit: hex::encode([3_u8; 20]),
         release_version: "0.5.7".into(),

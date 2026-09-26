@@ -41,6 +41,7 @@ Usage:
   memcordon-sealed-agent package verify-public-epoch-handoff --selector private_tcp::caller_identity_and_epoch_bound --e0-challenge E0_HEX --e1-challenge E1_HEX --json
   memcordon-sealed-agent package qualify-private
   memcordon-sealed-agent package release-case --stage STAGE --selector SELECTOR --challenge HEX
+  memcordon-sealed-agent package release-case-caller-spoof --stage candidate-capability --selector private_tcp::caller_identity_and_epoch_bound --challenge HEX
   memcordon-sealed-agent package release-case-abi-raw --stage candidate-capability --selector private_tcp::abi_alternate_entry_denied --challenge HEX
   memcordon-sealed-agent package release-case-epoch-replay --stage candidate-capability --selector private_tcp::native_tcp_bind_listen_connect --challenge HEX
   memcordon-sealed-agent package install [--ephemeral-ci [--archive-path A --archive-certificate CERT]]
@@ -94,6 +95,117 @@ fn main() {
         #[cfg(target_os = "linux")]
         [command, selector] if command == "private-release-fixture" => {
             linux::private_release_case::run_candidate_fixture(selector)
+        }
+        #[cfg(target_os = "linux")]
+        [command, selector, challenge_flag, challenge]
+            if command == "public-release-fixture" && challenge_flag == "--challenge" =>
+        {
+            linux::private_release_case::run_public_fixture(selector, challenge)
+        }
+        #[cfg(target_os = "linux")]
+        [
+            command,
+            selector,
+            challenge_flag,
+            challenge,
+            port_flag,
+            port,
+        ] if command == "public-release-fixture"
+            && challenge_flag == "--challenge"
+            && port_flag == "--port" =>
+        {
+            linux::private_release_case::run_public_fixture_with_port(
+                selector,
+                challenge,
+                Some(port),
+            )
+        }
+        #[cfg(target_os = "linux")]
+        [command, selector, key, attempt] if command == "public-fault-recover-v1" => (|| {
+            linux::private_public_provider::recover_public_fault(
+                selector.to_str().ok_or("fault selector UTF-8")?,
+                key.to_str().ok_or("fault key UTF-8")?,
+                attempt.to_str().ok_or("fault attempt UTF-8")?,
+            )
+        })(),
+        #[cfg(target_os = "linux")]
+        [command, selector, key] if command == "public-descriptor-auxiliary-v1" => (|| {
+            linux::private_public_descriptor_auxiliary::run(
+                selector.to_str().ok_or("aux selector UTF-8")?,
+                key.to_str().ok_or("aux key UTF-8")?,
+            )
+        })(),
+        #[cfg(target_os = "linux")]
+        [
+            command,
+            stage,
+            selector,
+            challenge,
+            revision_flag,
+            revision,
+            phase_flag,
+            phase,
+        ] if command == "release-case-reuse-source"
+            && stage == "candidate-capability"
+            && revision_flag == "--source-revision"
+            && phase_flag == "--phase" =>
+        {
+            (|| {
+                let request = linux::private_release_case::ReleaseCaseRequestV1::parse(
+                    stage.as_os_str(),
+                    selector.as_os_str(),
+                    challenge.as_os_str(),
+                )?;
+                let encoded = revision.to_str().ok_or("Reuse revision UTF-8")?;
+                let digest: memcordon_core::DiagnosticSha256 =
+                    memcordon_core::BoundedText::<64>::new(encoded)
+                        .map_err(str::to_owned)?
+                        .try_into()?;
+                let phase = match phase.to_str().ok_or("Reuse phase UTF-8")? {
+                    "blocked" => {
+                        memcordon_core::private_reuse_source_v1::ReuseSourcePhaseV1::Blocked
+                    }
+                    "recover" => {
+                        memcordon_core::private_reuse_source_v1::ReuseSourcePhaseV1::Recover
+                    }
+                    _ => return Err("Reuse phase differs".into()),
+                };
+                linux::private_release_case::run_reuse_source(request, &digest, phase)
+            })()
+        }
+        #[cfg(target_os = "linux")]
+        [command, stage, selector, challenge, revision_flag, revision]
+            if command == "release-facility-controls"
+                && stage == "final-public"
+                && revision_flag == "--source-revision" =>
+        {
+            (|| {
+                linux::private_public_provider::run_prepared_facility_controls(
+                    selector.to_str().ok_or("Facility selector UTF-8")?,
+                    challenge.to_str().ok_or("Facility challenge UTF-8")?,
+                    revision.to_str().ok_or("Facility revision UTF-8")?,
+                )
+            })()
+        }
+        #[cfg(target_os = "linux")]
+        [command, stage, selector, challenge, revision_flag, revision]
+            if command == "release-facility-controls"
+                && stage == "candidate-capability"
+                && revision_flag == "--source-revision" =>
+        {
+            (|| {
+                let request = linux::private_release_case::ReleaseCaseRequestV1::parse(
+                    stage.as_os_str(),
+                    selector.as_os_str(),
+                    challenge.as_os_str(),
+                )?;
+                let encoded = revision.to_str().ok_or("Facility revision UTF-8")?;
+                let digest: memcordon_core::DiagnosticSha256 =
+                    memcordon_core::BoundedText::<64>::new(encoded)
+                        .map_err(str::to_owned)?
+                        .try_into()?;
+                linux::private_release_case::run_facility_controls(request, &digest)
+            })()
         }
         #[cfg(target_os = "linux")]
         [
@@ -155,6 +267,14 @@ fn main() {
             && start_flag == "--start-time-ticks" =>
         {
             package::register_public_release_case(selector, challenge, pid, start)
+        }
+        #[cfg(target_os = "linux")]
+        [command, operation, json]
+            if command == "package"
+                && operation == "public-preparation-context-v2"
+                && json == "--json" =>
+        {
+            package::public_preparation_context_v2()
         }
         #[cfg(target_os = "linux")]
         [
@@ -296,6 +416,29 @@ fn main() {
                 challenge.as_os_str(),
             )
             .and_then(linux::private_release_case::run)
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            stage_flag,
+            stage,
+            selector_flag,
+            selector,
+            challenge_flag,
+            challenge,
+        ] if package == "package"
+            && operation == "release-case-caller-spoof"
+            && stage_flag == "--stage"
+            && selector_flag == "--selector"
+            && challenge_flag == "--challenge" =>
+        {
+            linux::private_release_case::ReleaseCaseRequestV1::parse(
+                stage.as_os_str(),
+                selector.as_os_str(),
+                challenge.as_os_str(),
+            )
+            .and_then(linux::private_release_case::run_caller_spoof)
         }
         #[cfg(target_os = "linux")]
         [

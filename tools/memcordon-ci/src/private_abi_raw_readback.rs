@@ -157,6 +157,19 @@ struct PositiveSettlement {
     namespace_init_reaped: bool,
     guardian_terminal: [u8; 20],
     candidate_exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cgroup_retirement_raw: Option<PositiveCgroupRetirementRawV1>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PositiveCgroupRetirementRawV1 {
+    schema_version: u8,
+    path: String,
+    inode: u64,
+    last_members: Vec<u32>,
+    empty_monotonic_ns: u64,
+    removed_monotonic_ns: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -247,6 +260,22 @@ pub(crate) fn readback_abi_positive_raw(
     }
     let report: PositiveReport = checked_json(report_bytes, 16 * 1024)?;
     let observer: PositiveObserver = checked_json(observer_bytes, 16 * 1024)?;
+    if observer
+        .settlement
+        .cgroup_retirement_raw
+        .as_ref()
+        .is_some_and(|raw| {
+            raw.schema_version != 1
+                || raw.path.is_empty()
+                || !raw.path.starts_with('/')
+                || raw.inode == 0
+                || !raw.last_members.is_empty()
+                || raw.empty_monotonic_ns == 0
+                || raw.empty_monotonic_ns > raw.removed_monotonic_ns
+        })
+    {
+        return Err(fail("ABI positive actual cgroup retirement source differs"));
+    }
     let cleanup: PositiveCleanup = checked_json(cleanup_bytes, 16 * 1024)?;
     let _: ProtectedCandidateAttemptV1 = checked_json(attempt_bytes, 16 * 1024)?;
     let mut response = b"memcordon-private-release-candidate-fixture-v1\0".to_vec();
@@ -605,8 +634,8 @@ pub(crate) fn readback_x86_abi_raw(
         || x32.witness.filter_sha256 != *filter_sha256
         || i386.witness.challenge_sha256 != hash_bytes(challenge)
         || i386.witness.filter_sha256 != *filter_sha256
-        || x32.witness.alternate_signal != libc::SIGSYS
-        || i386.witness.filtered_signal != libc::SIGSYS
+        || x32.witness.alternate_signal != 31 // Linux UAPI SIGSYS, not verifier-host libc.
+        || i386.witness.filtered_signal != 31
         || x32.witness.native_response_sha256
             != response_digest(
                 b"memcordon-private-release-native-getpid-v1\0",
@@ -710,7 +739,7 @@ pub(crate) fn readback_arm64_abi_raw(
         || !arm.witness.control_exec_observed
         || !arm.witness.filtered_exec_observed
         || !arm.witness.control_returned
-        || arm.witness.filtered_signal != libc::SIGSYS
+        || arm.witness.filtered_signal != 31
     {
         return Err(fail("ARM ABI subwitness differs"));
     }

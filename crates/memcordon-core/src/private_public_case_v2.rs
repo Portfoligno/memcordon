@@ -18,6 +18,10 @@ use crate::workload_codec::hash_bytes;
 use crate::workload_contract::reject_duplicate_json_keys;
 use crate::{BoundedText, DiagnosticSha256};
 
+/// Final-public raw capture uses its reviewed fixed 100,000-event budget.
+/// This is a transport bound, never permission to trust a capture.
+pub const MAX_FINAL_PUBLIC_OBSERVER_BYTES_V3: u64 = 40 + 192 * 100_000;
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalPublicInstalledBindingV2 {
@@ -87,8 +91,13 @@ impl FinalPublicCaseEvidenceV2 {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_version(2)
+    }
+
+    fn validate_version(&self, version: u8) -> Result<(), String> {
         let zero = DiagnosticSha256::from_bytes([0; 32]);
-        if self.schema_version != 2
+        if self.schema_version != version
+            || !matches!(version, 2 | 3)
             || !REQUIRED_PRIVATE_RELEASE_SELECTORS_V1.contains(&self.selector.as_str())
             || self.challenge == [0; 32]
             || self.source_commit.len() != [0_u8; 20].len() * 2
@@ -138,6 +147,32 @@ impl FinalPublicCaseEvidenceV2 {
             &self.observation,
         )?;
         let observation_digests: Vec<&DiagnosticSha256> = match &self.observation {
+            PrivateReleaseObservationV1::PublicFaultRejectedRetiredV2 {
+                checkpoint_file_sha256,
+                original_rejection_sha256,
+                fault_trigger_sha256,
+                fault_failure_sha256,
+                retirement_sha256,
+                recovery_sha256,
+                native_observer_sha256,
+                ..
+            } => {
+                if version != 3 {
+                    return Err(
+                        "versioned nonterminal fault evidence requires public V3 transport".into(),
+                    );
+                }
+                let mut digests = vec![
+                    checkpoint_file_sha256,
+                    original_rejection_sha256,
+                    fault_trigger_sha256,
+                    retirement_sha256,
+                    native_observer_sha256,
+                ];
+                digests.extend(fault_failure_sha256.iter());
+                digests.extend(recovery_sha256.iter());
+                digests
+            }
             PrivateReleaseObservationV1::PolicyComposite { .. }
             | PrivateReleaseObservationV1::AbiComposite { .. } => {
                 return Err("candidate composite is not final-public evidence".into());
@@ -192,6 +227,30 @@ impl FinalPublicCaseEvidenceV2 {
             return Err("final-public protected observation digest is absent".into());
         }
         self.report.validate_structure()?;
+        if let PublicCliReportEvidenceV2::AbsentFrontendRejectedV3 {
+            original_rejection_sha256,
+            ..
+        } = &self.report
+        {
+            if version != 3
+                || !matches!(&self.observation,PrivateReleaseObservationV1::PublicFaultRejectedRetiredV2 {outcome:PrivateReleaseAllocatedOutcomeV1::FrontendLost,original_rejection_sha256:original,..} if original==original_rejection_sha256)
+            {
+                return Err(
+                    "V3 absent frontend report differs from actual nonterminal rejection".into(),
+                );
+            }
+        }
+        if matches!(
+            self.report,
+            PublicCliReportEvidenceV2::AbsentFrontendLoss { .. }
+        ) && matches!(
+            self.observation,
+            PrivateReleaseObservationV1::PublicFaultRejectedRetiredV2 { .. }
+        ) {
+            return Err(
+                "nonterminal frontend rejection cannot claim authenticated Terminal".into(),
+            );
+        }
         match (&self.observation, &self.positive_control_terminal_sha256) {
             (
                 PrivateReleaseObservationV1::PreallocationRejected { rejection_code, .. },
@@ -250,7 +309,14 @@ impl FinalPublicCaseEvidenceV2 {
                 .zip(expected_roles)
                 .any(|(actual, role)| {
                     actual.role != *role
-                        || actual.size > MAX_PRIVATE_RELEASE_ATTACHMENT_BYTES_V1
+                        || actual.size
+                            > if version == 3
+                                && actual.role == PrivateReleaseAttachmentRoleV1::Observer
+                            {
+                                MAX_FINAL_PUBLIC_OBSERVER_BYTES_V3
+                            } else {
+                                MAX_PRIVATE_RELEASE_ATTACHMENT_BYTES_V1
+                            }
                         || actual.sha256 == zero
                 })
         {
@@ -262,6 +328,10 @@ impl FinalPublicCaseEvidenceV2 {
             .find(|attachment| attachment.role == PrivateReleaseAttachmentRoleV1::Observer)
             .expect("fixed attachment roles contain observer");
         let observed = match &self.observation {
+            PrivateReleaseObservationV1::PublicFaultRejectedRetiredV2 {
+                native_observer_sha256,
+                ..
+            } => native_observer_sha256,
             PrivateReleaseObservationV1::PolicyComposite { .. }
             | PrivateReleaseObservationV1::AbiComposite { .. } => {
                 return Err("candidate composite is not final-public evidence".into());
@@ -308,6 +378,46 @@ impl FinalPublicCaseEvidenceV2 {
                 }
                 _ => Err("final-public CLI report bytes differ".into()),
             },
+        }
+    }
+}
+
+/// Versioned structural transport, not a proof constructor. The independent
+/// public verifier must reconstruct every original response/wait/retirement.
+/// Legacy V2 retains its rejection of nonterminal fault evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct FinalPublicCaseEvidenceV3(pub FinalPublicCaseEvidenceV2);
+impl FinalPublicCaseEvidenceV3 {
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.is_empty() || bytes.len() > MAX_PRIVATE_RELEASE_RESULT_BYTES_V1 {
+            return Err("public V3 case byte bound differs".into());
+        }
+        reject_duplicate_json_keys(bytes)?;
+        let case: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        case.validate()?;
+        Ok(case)
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        self.0.validate_version(3)
+    }
+    pub fn result_key(&self) -> Result<DiagnosticSha256, String> {
+        self.0.result_key()
+    }
+    pub fn validate_report_bytes(&self, report_bytes: Option<&[u8]>) -> Result<(), String> {
+        self.validate()?;
+        match (&self.0.report, report_bytes) {
+            (PublicCliReportEvidenceV2::Present { size, sha256 }, Some(bytes))
+                if *size == bytes.len() as u64 && *sha256 == hash_bytes(bytes) =>
+            {
+                Ok(())
+            }
+            (
+                PublicCliReportEvidenceV2::AbsentFrontendLoss { .. }
+                | PublicCliReportEvidenceV2::AbsentFrontendRejectedV3 { .. },
+                None,
+            ) => Ok(()),
+            _ => Err("public V3 original report presence differs".into()),
         }
     }
 }

@@ -60,7 +60,7 @@ fn complete_inventory<'a>(value: &'a Value, field: &str) -> Result<&'a [Value]> 
     Ok(members)
 }
 
-fn read_complete_inventory(
+pub(crate) fn read_complete_inventory(
     url: &str,
     field: &str,
     mut read: impl FnMut(&str, usize, &str) -> Result<Vec<u8>>,
@@ -238,7 +238,12 @@ pub fn validate_running_candidate_actions_with(
     Ok(job_id)
 }
 
-fn fetch_actions_url(token: &str, url: &str, limit: usize, accept: &str) -> Result<Vec<u8>> {
+pub(crate) fn fetch_actions_url(
+    token: &str,
+    url: &str,
+    limit: usize,
+    accept: &str,
+) -> Result<Vec<u8>> {
     if token.is_empty() || !url.starts_with(&format!("{API_ROOT}/")) {
         return Err(fail("GitHub Actions request origin or token differs"));
     }

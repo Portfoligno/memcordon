@@ -4,6 +4,8 @@ pub use memcordon_ci::{CiError, Result};
 mod private_abi_composite;
 #[path = "../src/private_kernel_observer.rs"]
 mod private_kernel_observer;
+#[path = "../src/private_kernel_replay.rs"]
+mod private_kernel_replay;
 #[path = "../src/private_probe_bundle.rs"]
 mod private_probe_bundle;
 #[path = "../src/private_process_clock.rs"]
@@ -83,12 +85,7 @@ fn x86_composite_requires_both_compat_denials_and_live_controls() {
             0x4000_0027,
             SeccompActionV1::Allow,
         ),
-        returned(
-            x32_control,
-            0xc000_003e,
-            0x4000_0027,
-            -i64::from(libc::ENOSYS),
-        ),
+        returned(x32_control, 0xc000_003e, 0x4000_0027, -38),
         decision(
             x32_filtered,
             0xc000_003e,
@@ -103,7 +100,7 @@ fn x86_composite_requires_both_compat_denials_and_live_controls() {
         terminal(&mut events, branch, 0);
     }
     for branch in [x32_filtered, i386_filtered] {
-        terminal(&mut events, branch, libc::SIGSYS);
+        terminal(&mut events, branch, 31);
     }
     let intent = AbiCompositeIntentV1::X86 {
         native,
@@ -159,7 +156,7 @@ fn arm32_composite_requires_exact_helper_exec_for_both_children() {
     for branch in [native, control] {
         terminal(&mut events, branch, 0);
     }
-    terminal(&mut events, filtered, libc::SIGSYS);
+    terminal(&mut events, filtered, 31);
     let intent = AbiCompositeIntentV1::Arm64 {
         native,
         arm32_control: control,

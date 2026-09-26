@@ -1,18 +1,13 @@
 //! Versioned native release semantics. A structural artifact is never an
 //! independent observation, and an absent kernel interval is a failed case.
 
+use crate::{CiError, Result};
 use memcordon_core::DiagnosticSha256;
 use memcordon_core::private_release_case_v1::{
-    PrivateReleaseCaseResultV1, PrivateReleaseObservationV1, PrivateReleaseStageV1,
-    REQUIRED_PRIVATE_RELEASE_SELECTORS_V1, private_release_case_key_v1,
+    PrivateReleaseCaseResultV1, PrivateReleaseStageV1, REQUIRED_PRIVATE_RELEASE_SELECTORS_V1,
+    private_release_case_key_v1,
 };
 use memcordon_core::workload_codec::hash_bytes;
-use std::collections::BTreeSet;
-
-use crate::private_kernel_observer::{
-    AllocationBoundaryKindV1, KernelEventV1, VerifiedKernelIntervalV1,
-};
-use crate::{CiError, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaseEvidenceFamilyV1 {
@@ -68,7 +63,7 @@ pub fn case_evidence_requirements_v1(selector: &str) -> Option<CaseEvidenceRequi
             (F::SyscallDenial, D::AllocatedAndRetired, true, true)
         }
         "private_tcp::authorization_uncertainty_retired" => {
-            (F::Authorization, D::AllocatedAndRetired, true, true)
+            (F::Authorization, D::AllocatedAndRetired, false, true)
         }
         // V1 describes the positive/retired branch. The E0->E1 stale
         // preallocation rejection requires a new typed subrecord; this row
@@ -146,142 +141,94 @@ pub fn case_evidence_requirements_v1(selector: &str) -> Option<CaseEvidenceRequi
 /// An observer record is deliberately not Deserialize. Only the reviewed
 /// independent kernel/host adapter may eventually construct it; no current
 /// artifact reader can do so. Its fields are private to the verifier module.
-pub(crate) struct IndependentCaseObservationV1 {
-    selector: String,
-    result_sha256: DiagnosticSha256,
-    kernel_interval: VerifiedKernelIntervalV1,
-    required_decisions: Vec<crate::private_kernel_observer::KnownActionTupleV1>,
-    live_barrier_observed: bool,
-    retirement_complete: bool,
-}
-
 pub(crate) struct VerifiedCandidateSemanticsV2 {
     pub(crate) result_digests: Vec<DiagnosticSha256>,
+    pub(crate) inventory_digests: Vec<DiagnosticSha256>,
+    pub(crate) subject: crate::private_observer_session::ObserverSubjectV1,
+    pub(crate) payload_index_sha256: DiagnosticSha256,
+    pub(crate) origin_commitment_sha256: DiagnosticSha256,
+    pub(crate) generation_timeline_sha256: DiagnosticSha256,
+    pub(crate) completed_origin: bool,
 }
 
-/// Checks detached result identity and interval-level independent facts. The
-/// family-specific kernel adapter must also check syscall tuples, endpoint
-/// identities, ordering and controls before it can supply its private sample.
+/// Aggregates only closed family proofs reconstructed from exact enrolled
+/// observer custody. No booleans, caller-chosen decisions or JSON token can
+/// enter this boundary. Candidate and public capabilities remain distinct.
 pub(crate) fn verify_candidate_semantics(
+    session: &impl crate::private_observer_session::ObserverEvidenceV1,
     results: &[(Vec<u8>, PrivateReleaseCaseResultV1)],
-    independent: &[IndependentCaseObservationV1],
+    independent: &[crate::private_candidate_replay::VerifiedNativeCaseV1],
 ) -> Result<VerifiedCandidateSemanticsV2> {
-    if results.len() != REQUIRED_PRIVATE_RELEASE_SELECTORS_V1.len()
+    use crate::private_observer_session::ObserverStageV1;
+    if session.descriptor().subject.stage != ObserverStageV1::Candidate
+        || results.len() != REQUIRED_PRIVATE_RELEASE_SELECTORS_V1.len()
         || independent.len() != REQUIRED_PRIVATE_RELEASE_SELECTORS_V1.len()
     {
         return Err(CiError::Message(
-            "native 25-case evidence is incomplete".into(),
+            "native 25-case origin/semantic inventory is incomplete".into(),
         ));
     }
-    let mut digests = Vec::with_capacity(results.len());
-    let mut boots = BTreeSet::new();
-    for ((bytes, result), (selector, sample)) in results.iter().zip(
+    let mut result_digests = Vec::with_capacity(results.len());
+    let mut inventory_digests = Vec::with_capacity(results.len());
+    for ((bytes, result), (selector, proof)) in results.iter().zip(
         REQUIRED_PRIVATE_RELEASE_SELECTORS_V1
             .iter()
             .zip(independent),
     ) {
-        let requirements = case_evidence_requirements_v1(selector)
-            .ok_or_else(|| CiError::Message("native selector has no semantic contract".into()))?;
         let parsed = PrivateReleaseCaseResultV1::parse(bytes).map_err(CiError::Message)?;
-        let challenge = result.challenge_bytes().map_err(CiError::Message)?;
-        let result_key = private_release_case_key_v1(
+        let key = private_release_case_key_v1(
             PrivateReleaseStageV1::CandidateCapability,
             selector,
-            &challenge,
+            &result.challenge_bytes().map_err(CiError::Message)?,
         )
         .map_err(CiError::Message)?;
-        let events = sample.kernel_interval.events();
-        let allocated = events.iter().any(|event| {
-            matches!(event,
-            KernelEventV1::AllocationBoundary {
-                request_key,
-                kind: AllocationBoundaryKindV1::Allocate,
-                ..
-            } if *request_key == result_key)
-        });
-        let decisions_required = matches!(
-            requirements.family,
-            CaseEvidenceFamilyV1::SyscallDenial | CaseEvidenceFamilyV1::AlternateAbi
-        );
-        let decisions_joined = (!decisions_required || !sample.required_decisions.is_empty())
-            && sample.required_decisions.iter().all(|decision| {
-                sample.kernel_interval.seccomp_decision(
-                    decision.task,
-                    decision.arch,
-                    decision.syscall,
-                    decision.action,
-                )
-            });
-        let exec = events
-            .iter()
-            .any(|event| matches!(event, KernelEventV1::Exec { .. }));
-        let policy_decision_only =
-            requirements.disposition == RequiredDispositionV1::PolicyComposite;
+        let spec = crate::private_case_semantics::closed_candidate_case_spec(
+            selector,
+            &session.descriptor().subject.target,
+        )?;
+        let generation = session
+            .descriptor()
+            .generations
+            .get(proof.generation() as usize)
+            .ok_or_else(|| CiError::Message("native case generation is absent".into()))?;
+        let installed = match &result.installed {
+            memcordon_core::private_release_case_v1::PrivateReleaseInstalledBindingV1::CandidateCapability {
+                installation_epoch,candidate_manifest_sha256,installed_inspection_sha256 } =>
+                installation_epoch == &generation.installation_epoch
+                    && candidate_manifest_sha256 == &generation.installed_manifest_sha256
+                    && installed_inspection_sha256 == &generation.installed_receipt_sha256,
+            _ => false,
+        };
         if parsed != *result
             || result.selector != *selector
-            || sample.selector != *selector
-            || sample.result_sha256 != hash_bytes(bytes)
-            || sample.kernel_interval.boot_id().is_empty()
-            || sample.kernel_interval.trace_sha256() == &hash_bytes(&[])
-            || sample.kernel_interval.result_key() != &result_key
-            || !decisions_joined && !policy_decision_only
-            || !sample.kernel_interval.has_allocation_boundary()
-            || requirements.requires_exec_event && !exec
-            || requirements.requires_live_barrier && !sample.live_barrier_observed
-            || !sample.retirement_complete
-                && !policy_decision_only
-                && requirements.disposition != RequiredDispositionV1::PreallocationDenied
-            || ((requirements.disposition == RequiredDispositionV1::PreallocationDenied
-                || policy_decision_only)
-                && !sample.kernel_interval.no_allocation())
-            || (requirements.disposition != RequiredDispositionV1::PreallocationDenied
-                && !policy_decision_only
-                && !allocated)
-            || !matches!(result.installed, memcordon_core::private_release_case_v1::PrivateReleaseInstalledBindingV1::CandidateCapability { .. })
+            || proof.selector() != *selector
+            || result.target != session.descriptor().subject.target
+            || proof.result_key() != &key
+            || proof.result_hash() != &hash_bytes(bytes)
+            || proof.stage() != ObserverStageV1::Candidate
+            || proof.origin_commitment_sha256 != *session.origin_commitment_sha256()
+            || proof
+                .branch_set()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                != spec.branches
+            || !installed
         {
-            return Err(CiError::Message("native independent case semantics differ".into()));
+            return Err(CiError::Message(
+                "native all-25 exact family proof/installed subject differs".into(),
+            ));
         }
-        let actual_disposition = match result.observation {
-            PrivateReleaseObservationV1::PreallocationRejected { .. } => {
-                RequiredDispositionV1::PreallocationDenied
-            }
-            PrivateReleaseObservationV1::PolicyComposite { .. } => {
-                RequiredDispositionV1::PolicyComposite
-            }
-            PrivateReleaseObservationV1::AllocatedRetired { .. } => {
-                RequiredDispositionV1::AllocatedAndRetired
-            }
-            PrivateReleaseObservationV1::AbiComposite { .. } => {
-                RequiredDispositionV1::AllocatedAndRetired
-            }
-            PrivateReleaseObservationV1::DualAttemptsRetired { .. } => {
-                RequiredDispositionV1::DualAllocatedAndRetired
-            }
-            PrivateReleaseObservationV1::RetirementFailureBlockedReuse { .. } => {
-                RequiredDispositionV1::ReuseBlockedThenRetired
-            }
-        };
-        if actual_disposition != requirements.disposition {
-            return Err(CiError::Message("native case disposition differs".into()));
-        }
-        if matches!(
-            requirements.family,
-            CaseEvidenceFamilyV1::AlternateAbi | CaseEvidenceFamilyV1::HistoricalEpoch
-        ) || *selector == "private_tcp::wrong_grant_profile_and_port_rejected"
-        {
-            return Err(CiError::Message(format!(
-                "native {selector} lacks a joined independent branch transcript and complete kernel interval"
-            )));
-        }
-        boots.insert(sample.kernel_interval.boot_id());
-        digests.push(hash_bytes(bytes));
-    }
-    if boots.len() != 1 {
-        return Err(CiError::Message(
-            "native host session differs across cases".into(),
-        ));
+        result_digests.push(hash_bytes(bytes));
+        inventory_digests.push(proof.raw_commitment().clone());
     }
     Ok(VerifiedCandidateSemanticsV2 {
-        result_digests: digests,
+        result_digests,
+        inventory_digests,
+        subject: session.descriptor().subject.clone(),
+        payload_index_sha256: session.payload_index_sha256().clone(),
+        origin_commitment_sha256: session.origin_commitment_sha256().clone(),
+        generation_timeline_sha256: session.generation_timeline_sha256().clone(),
+        completed_origin: session.completed(),
     })
 }

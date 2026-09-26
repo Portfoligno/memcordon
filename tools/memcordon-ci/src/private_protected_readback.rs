@@ -105,6 +105,57 @@ pub fn expected_protected_candidate_leaves_for_selector(
     observation: &PrivateReleaseObservationV1,
 ) -> Result<std::collections::BTreeSet<String>> {
     let mut leaves = expected_protected_candidate_leaves(observation);
+    if !matches!(
+        observation,
+        PrivateReleaseObservationV1::PreallocationRejected { .. }
+            | PrivateReleaseObservationV1::DualAttemptsRetired { .. }
+    ) {
+        leaves.extend(
+            [
+                "checkpoint-committed-v1.json",
+                "release-intent-v1.json",
+                "candidate-live-pre-v1.json",
+                "candidate-live-pre-v1.ack",
+                "candidate-live-release-intent-v1.json",
+                "candidate-live-release-intent-v1.ack",
+            ]
+            .map(str::to_owned),
+        );
+        if selector == "private_tcp::authorization_uncertainty_retired" {
+            leaves.extend(
+                [
+                    "uncertain-stdout-v1.bin",
+                    "uncertain-stderr-v1.bin",
+                    "uncertain-streams-v1.json",
+                ]
+                .map(str::to_owned),
+            );
+        } else {
+            leaves.extend(
+                [
+                    "execution-observed-v1.json",
+                    "candidate-live-baseline-v1.json",
+                    "candidate-live-baseline-v1.ack",
+                ]
+                .map(str::to_owned),
+            );
+            if !matches!(
+                selector,
+                CHILD_RUNTIME_SELECTOR
+                    | SOCKET_SELECTOR
+                    | TERMINAL_JOIN_SELECTOR
+                    | UNIX_INTENT_SELECTOR
+                    | RETIREMENT_FAULT_SELECTOR
+                    | "private_tcp::frontend_loss_retired"
+                    | "private_tcp::guardian_loss_retired"
+            ) {
+                leaves.extend(
+                    ["candidate-live-post-v1.json", "candidate-live-post-v1.ack"]
+                        .map(str::to_owned),
+                );
+            }
+        }
+    }
     if matches!(
         observation,
         PrivateReleaseObservationV1::RetirementFailureBlockedReuse { .. }
@@ -192,6 +243,21 @@ pub fn expected_protected_candidate_leaves_for_selector(
             "dual-second-midflight.json",
             "dual-live-gate.json",
             "dual-live-ack.json",
+            "dual-second-post-retirement.json",
+            "candidate-first-pre-v1.json",
+            "candidate-first-pre-v1.ack",
+            "candidate-second-pre-v1.json",
+            "candidate-second-pre-v1.ack",
+            "candidate-first-release-intent-v1.json",
+            "candidate-first-release-intent-v1.ack",
+            "candidate-second-release-intent-v1.json",
+            "candidate-second-release-intent-v1.ack",
+            "candidate-first-baseline-v1.json",
+            "candidate-first-baseline-v1.ack",
+            "candidate-second-baseline-v1.json",
+            "candidate-second-baseline-v1.ack",
+            "candidate-second-post-retirement-v1.json",
+            "candidate-second-post-retirement-v1.ack",
         ] {
             leaves.insert(leaf.into());
         }
@@ -418,6 +484,93 @@ pub struct ProtectedCandidateAttemptV1 {
 }
 
 impl ProtectedCandidateAttemptV1 {
+    /// The recovery source is a normal durable transition of the original
+    /// journal, not a new attempt or a normalized successful result.
+    pub fn validate_owned_retirement_recovery(&self, bytes: &[u8]) -> Result<()> {
+        let recovered: Self = crate::private_observer_session::strict_json(bytes, 16 * 1024)?;
+        if self.phase != ProtectedAttemptPhaseV1::Retiring
+            || self.release_knowledge != ProtectedReleaseKnowledgeV1::ExecObserved
+            || self.candidate_exit_code.is_some()
+            || self.cleanup_error.is_some()
+        {
+            return Err(CiError::Message(
+                "original recovery journal is not retiring".into(),
+            ));
+        }
+        let mut expected = self.clone();
+        expected.phase = ProtectedAttemptPhaseV1::Retired;
+        expected.candidate_exit_code = Some(0);
+        expected.record_digest = expected.canonical_digest()?;
+        if recovered != expected || serde_json::to_vec(&recovered)? != bytes {
+            return Err(CiError::Message(
+                "normal recovered journal changes original attempt authority".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_prior_release_intent(&self, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() || bytes.len() > 16 * 1024 {
+            return Err(CiError::Message("prior release-intent size differs".into()));
+        }
+        reject_duplicate_json_keys(bytes).map_err(CiError::Message)?;
+        let prior: Self = serde_json::from_slice(bytes)?;
+        if serde_json::to_vec(&prior)? != bytes
+            || prior.record_digest != prior.canonical_digest()?
+            || prior.schema_version != 1
+            || prior.phase != ProtectedAttemptPhaseV1::ReleaseIntent
+            || prior.release_knowledge != ProtectedReleaseKnowledgeV1::PossiblyReleased
+            || prior.attempt_id != self.attempt_id
+            || prior.result_key != self.result_key
+            || prior.selector != self.selector
+            || prior.challenge_sha256 != self.challenge_sha256
+            || prior.installation_epoch != self.installation_epoch
+            || prior.candidate_manifest_sha256 != self.candidate_manifest_sha256
+            || prior.service_generation_sha256 != self.service_generation_sha256
+            || prior.coordinator != self.coordinator
+            || prior.frontend_proxy != self.frontend_proxy
+            || prior.guardian != self.guardian
+            || prior.namespace_init != self.namespace_init
+            || prior.target != self.target
+            || prior.checkpoint_binding != self.checkpoint_binding
+            || prior.checkpoint_digest != self.checkpoint_digest
+            || prior.network_namespace_inode != self.network_namespace_inode
+            || prior.cleanup_error.is_some()
+            || prior.candidate_exit_code.is_some()
+        {
+            return Err(CiError::Message(
+                "original prior release-intent canonical state differs".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+    pub(crate) fn phase(&self) -> ProtectedAttemptPhaseV1 {
+        self.phase
+    }
+    pub(crate) fn release_knowledge(&self) -> ProtectedReleaseKnowledgeV1 {
+        self.release_knowledge
+    }
+    pub(crate) fn target_identity(&self) -> Option<&ProtectedCoordinatorIdentityV1> {
+        self.target.as_ref()
+    }
+    pub(crate) fn frontend_identity(&self) -> Option<&ProtectedCoordinatorIdentityV1> {
+        self.frontend_proxy.as_ref()
+    }
+    pub(crate) fn guardian_identity(&self) -> Option<&ProtectedCoordinatorIdentityV1> {
+        self.guardian.as_ref()
+    }
+    pub(crate) fn checkpoint_bytes(&self) -> Result<Vec<u8>> {
+        self.checkpoint_binding
+            .as_ref()
+            .map(serde_json::to_vec)
+            .transpose()?
+            .ok_or_else(|| CiError::Message("actual checkpoint binding absent".into()))
+    }
+    pub(crate) fn checkpoint_digest(&self) -> Option<&DiagnosticSha256> {
+        self.checkpoint_digest.as_ref()
+    }
     pub fn canonical_digest(&self) -> Result<DiagnosticSha256> {
         let mut canonical = self.clone();
         canonical.record_digest = DiagnosticSha256::from_bytes([0; 32]);
@@ -428,6 +581,11 @@ impl ProtectedCandidateAttemptV1 {
         self.checkpoint_binding
             .as_ref()
             .map(|binding| &binding.filter_sha256)
+    }
+    pub(crate) fn checkpoint_fixture_sha256(&self) -> Option<&DiagnosticSha256> {
+        self.checkpoint_binding
+            .as_ref()
+            .map(|binding| &binding.fixture_sha256)
     }
 
     pub fn checkpoint_network_namespace_inode(&self) -> Option<u64> {
@@ -768,6 +926,7 @@ pub fn parse_protected_candidate_attempt(
         _ => false,
     };
     let terminal_matches = match observation {
+        PrivateReleaseObservationV1::PublicFaultRejectedRetiredV2 { .. } => false,
         PrivateReleaseObservationV1::PreallocationRejected { .. } => false,
         PrivateReleaseObservationV1::PolicyComposite { .. } => false,
         PrivateReleaseObservationV1::DualAttemptsRetired { .. } => false,
@@ -1144,6 +1303,19 @@ struct CandidateKernelSettlementV1 {
     namespace_init_reaped: bool,
     guardian_terminal: [u8; 20],
     candidate_exit_code: Option<i32>,
+    #[serde(default)]
+    cgroup_retirement_raw: Option<CandidateCgroupRetirementRawV1>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateCgroupRetirementRawV1 {
+    schema_version: u8,
+    path: String,
+    inode: u64,
+    last_members: Vec<u32>,
+    empty_monotonic_ns: u64,
+    removed_monotonic_ns: u64,
 }
 
 #[derive(Deserialize)]
@@ -1272,6 +1444,8 @@ struct CandidateUncertainSettlementV1 {
     namespace_init_reaped: bool,
     guardian_terminal: [u8; 20],
     candidate_exit_code: Option<i32>,
+    #[serde(default)]
+    cgroup_retirement_raw: Option<CandidateCgroupRetirementRawV1>,
 }
 
 #[derive(Deserialize)]
@@ -1533,6 +1707,8 @@ struct CandidateGuardianLossSettlementV1 {
     target_pidfd_exited: bool,
     namespace_init_reaped: bool,
     candidate_exit_code: Option<i32>,
+    #[serde(default)]
+    cgroup_retirement_raw: Option<CandidateCgroupRetirementRawV1>,
 }
 
 #[derive(Deserialize)]
@@ -1741,6 +1917,8 @@ struct CandidateFrontendLossSettlementV1 {
     target_pidfd_exited: bool,
     namespace_init_reaped: bool,
     candidate_exit_code: Option<i32>,
+    #[serde(default)]
+    cgroup_retirement_raw: Option<CandidateCgroupRetirementRawV1>,
 }
 
 #[derive(Deserialize)]
@@ -3302,7 +3480,17 @@ pub fn read_structural_protected_native_case(
                     .ok_or_else(|| CiError::Message("dual child leaf is not UTF-8".into()))?;
                 leaves.insert(leaf.to_owned());
             }
-            if leaves != std::collections::BTreeSet::from(["attempt.json".to_owned()]) {
+            if leaves
+                != [
+                    "attempt.json",
+                    "checkpoint-committed-v1.json",
+                    "release-intent-v1.json",
+                    "execution-observed-v1.json",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+            {
                 return Err(CiError::Message("dual child inventory differs".into()));
             }
         }

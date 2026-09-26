@@ -527,6 +527,12 @@ fn handle(
         (NETWORK_PROTOCOL_VERSION, MessageKind::PrivatePlan) => {
             super::private_observer_hooks::mc_private_request_enter_v1();
             let observed = (|| {
+                super::private_public_provider::hold_prepared_caller_spoof(
+                    &request,
+                    credentials.pid,
+                    credentials.uid,
+                    credentials.gid,
+                )?;
                 let response = private_plan_response(
                     &request,
                     descriptors.len(),

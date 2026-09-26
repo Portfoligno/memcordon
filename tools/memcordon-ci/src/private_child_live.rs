@@ -239,6 +239,13 @@ mod linux {
     pub fn sample_and_ack_if_ready(
         challenge: [u8; 32],
     ) -> Result<Option<IndependentChildLiveObservationV1>> {
+        sample_and_ack_if_ready_with_source(challenge, |_, _, _, _| Ok(()))
+    }
+
+    pub(crate) fn sample_and_ack_if_ready_with_source(
+        challenge: [u8; 32],
+        mut retain: impl FnMut(u32, u64, u32, u64) -> Result<()>,
+    ) -> Result<Option<IndependentChildLiveObservationV1>> {
         let key = private_release_case_key_v1(
             PrivateReleaseStageV1::CandidateCapability,
             CHILD_RUNTIME_SELECTOR,
@@ -273,6 +280,12 @@ mod linux {
         }
         let attempt_id = candidate_attempt_id(&key);
         let (cgroup_procs, cgroup_threads) = sample_live(&gate.live, &attempt_id)?;
+        retain(
+            gate.live.target.pid,
+            gate.live.target.start_time,
+            gate.live.child.pid,
+            gate.live.child.start_time,
+        )?;
         let ack = LiveAckV1 {
             schema_version: 1,
             selector: CHILD_RUNTIME_SELECTOR.into(),
@@ -382,6 +395,16 @@ pub fn sample_and_ack_if_ready(
 ) -> crate::Result<Option<IndependentChildLiveObservationV1>> {
     Err(crate::CiError::Message(
         "independent child live observation requires native Linux".into(),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn sample_and_ack_if_ready_with_source(
+    _challenge: [u8; 32],
+    _retain: impl FnMut(u32, u64, u32, u64) -> crate::Result<()>,
+) -> crate::Result<Option<IndependentChildLiveObservationV1>> {
+    Err(crate::CiError::Message(
+        "independent child raw sampling requires native Linux".into(),
     ))
 }
 

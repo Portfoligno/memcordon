@@ -225,6 +225,223 @@ impl PublicQualificationCertificateV1 {
     }
 }
 
+fn validate_public_certificate_subject(
+    payload: &PublicQualificationCertificateV1,
+    policy: &VerifiedReleaseTrustPolicyV1,
+    expected: &ExpectedPublicQualificationV1<'_>,
+    high_water: &TrustHighWaterV1,
+    now_unix: u64,
+) -> Result<VerifyingKey, String> {
+    payload.canonical_bytes()?;
+    let trust = policy.policy();
+    if payload.policy_version != trust.policy_version
+        || payload.release_sequence != expected.release_sequence
+        || payload.release_sequence < trust.minimum_release_sequence
+        || payload.release_sequence < high_water.release_sequence
+        || now_unix < high_water.last_accepted_wall_unix
+        || now_unix < payload.issued_at_unix
+        || now_unix >= payload.expires_at_unix
+        || now_unix >= trust.expires_at_unix
+        || payload.repository_id != trust.repository_id
+        || payload.repository_id != expected.repository_id
+        || payload.repository != trust.repository
+        || payload.repository != expected.repository
+        || payload.workflow_path != trust.workflow_path
+        || payload.workflow_path != expected.workflow_path
+        || payload.workflow_revision != trust.workflow_revision
+        || payload.workflow_revision != expected.workflow_revision
+        || payload.run_id != expected.run_id
+        || payload.run_attempt != expected.run_attempt
+        || payload.producer_job_id != expected.producer_job_id
+        || payload.artifact_id != expected.artifact_id
+        || payload.verifier_sha256 != trust.verifier_sha256
+        || payload.verifier_sha256 != expected.verifier_sha256
+        || payload.verifier_source_commit != expected.verifier_source_commit
+        || payload.verifier_policy_sha256 != trust.verifier_policy_sha256
+        || payload.catalogue_sha256 != trust.catalogue_sha256
+        || payload.target != expected.target
+        || payload.native_machine != expected.native_machine
+        || payload.source_commit != expected.source_commit
+        || payload.release_version != expected.release_version
+        || payload.build_sha256 != expected.build_sha256
+        || payload.qualification_sha256 != expected.qualification_sha256
+        || payload.qualification_certificate_sha256 != expected.qualification_certificate_sha256
+        || payload.archive_sha256 != expected.archive_sha256
+        || payload.manifest_sha256 != expected.manifest_sha256
+        || payload.host_receipt_sha256 != expected.host_receipt_sha256
+        || payload.public_evidence_sha256
+            != String::from(hash_bytes(expected.public_evidence_bytes))
+        || payload.public_evidence_size != expected.public_evidence_bytes.len() as u64
+        || payload.raw_index_sha256 != expected.raw_index_sha256
+        || payload.completed_provenance_sha256 != expected.completed_provenance_sha256
+        || payload.accepted_case_set_sha256 != expected.accepted_case_set_sha256
+        || trust.revoked_key_ids.binary_search(&payload.key_id).is_ok()
+        || trust
+            .revoked_build_sha256
+            .binary_search(&payload.build_sha256)
+            .is_ok()
+        || trust
+            .revoked_qualification_sha256
+            .binary_search(&payload.qualification_sha256)
+            .is_ok()
+    {
+        return Err("public certificate subject or policy differs".into());
+    }
+    let key = trust
+        .delegated_keys
+        .iter()
+        .find(|key| key.key_id == payload.key_id)
+        .ok_or("public certificate key is not delegated")?;
+    if !key.roles.contains(&ReleaseSigningRoleV1::PublicP)
+        || payload.issued_at_unix < key.not_before_unix
+        || payload.expires_at_unix > key.expires_at_unix
+    {
+        return Err("public certificate key role or validity differs".into());
+    }
+    let verifying = VerifyingKey::from_bytes(&decode_fixed::<32>(&key.public_key_hex)?)
+        .map_err(|_| "public certificate key differs")?;
+    Ok(verifying)
+}
+
+/// CP V2 keeps the existing PublicP subject/role contract and separately binds
+/// physical payload, origin custody and the producer's installed timeline.
+/// The inner V1 schema is an explicitly versioned subject, not a V1 signature.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicQualificationCertificateV2 {
+    pub schema_version: u8,
+    pub subject: PublicQualificationCertificateV1,
+    pub payload_index_sha256: String,
+    pub origin_commitment_sha256: String,
+    pub custody_receipt_sha256: String,
+    pub generation_timeline_sha256: String,
+    pub qualification_certificate_file_sha256: String,
+    pub semantics_sha256: String,
+}
+
+impl PublicQualificationCertificateV2 {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        if self.schema_version != 2 {
+            return Err("public V2 certificate schema differs".into());
+        }
+        let subject = self.subject.canonical_bytes()?;
+        let mut out = b"memcordon/public-qualification/v2\0".to_vec();
+        out.extend_from_slice(&(subject.len() as u64).to_be_bytes());
+        out.extend_from_slice(&subject);
+        for digest in [
+            &self.payload_index_sha256,
+            &self.origin_commitment_sha256,
+            &self.custody_receipt_sha256,
+            &self.generation_timeline_sha256,
+            &self.qualification_certificate_file_sha256,
+            &self.semantics_sha256,
+        ] {
+            hex_digest(digest)?;
+            if digest.bytes().all(|byte| byte == b'0') {
+                return Err("public V2 certificate has an empty origin digest".into());
+            }
+            out.extend_from_slice(&decode_fixed::<32>(digest)?);
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedPublicQualificationCertificateV2 {
+    pub payload: PublicQualificationCertificateV2,
+    pub signature_hex: String,
+}
+
+pub struct ExpectedPublicQualificationV2<'a> {
+    pub subject: ExpectedPublicQualificationV1<'a>,
+    pub payload_index_sha256: &'a str,
+    pub origin_commitment_sha256: &'a str,
+    pub custody_receipt_sha256: &'a str,
+    pub generation_timeline_sha256: &'a str,
+    pub qualification_certificate_file_sha256: &'a str,
+    pub semantics_sha256: &'a str,
+}
+
+pub struct VerifiedPublicQualificationV2 {
+    certificate_sha256: String,
+    release_sequence: u64,
+    payload_index_sha256: String,
+    origin_commitment_sha256: String,
+}
+
+impl VerifiedPublicQualificationV2 {
+    pub fn certificate_sha256(&self) -> &str {
+        &self.certificate_sha256
+    }
+    pub fn release_sequence(&self) -> u64 {
+        self.release_sequence
+    }
+    pub fn payload_index_sha256(&self) -> &str {
+        &self.payload_index_sha256
+    }
+    pub fn origin_commitment_sha256(&self) -> &str {
+        &self.origin_commitment_sha256
+    }
+}
+
+impl SignedPublicQualificationCertificateV2 {
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.is_empty() || bytes.len() > MAX_DOCUMENT {
+            return Err("public V2 certificate byte bound differs".into());
+        }
+        crate::workload_contract::reject_duplicate_json_keys(bytes)?;
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+    }
+
+    pub fn verify(
+        &self,
+        policy: &VerifiedReleaseTrustPolicyV1,
+        expected: &ExpectedPublicQualificationV2<'_>,
+        high_water: &TrustHighWaterV1,
+        now_unix: u64,
+    ) -> Result<VerifiedPublicQualificationV2, String> {
+        let payload = &self.payload;
+        let canonical = payload.canonical_bytes()?;
+        if payload.payload_index_sha256 != expected.payload_index_sha256
+            || payload.origin_commitment_sha256 != expected.origin_commitment_sha256
+            || payload.custody_receipt_sha256 != expected.custody_receipt_sha256
+            || payload.generation_timeline_sha256 != expected.generation_timeline_sha256
+            || payload.qualification_certificate_file_sha256
+                != expected.qualification_certificate_file_sha256
+            || payload.semantics_sha256 != expected.semantics_sha256
+        {
+            return Err("public V2 certificate physical provenance differs".into());
+        }
+        let verifying = validate_public_certificate_subject(
+            &payload.subject,
+            policy,
+            &expected.subject,
+            high_water,
+            now_unix,
+        )?;
+        let signature = Signature::from_bytes(&decode_fixed::<64>(&self.signature_hex)?);
+        verifying
+            .verify_strict(&canonical, &signature)
+            .map_err(|_| "public V2 certificate signature differs")?;
+        let certificate_sha256 = String::from(hash_bytes(&canonical));
+        if policy
+            .policy()
+            .revoked_certificate_sha256
+            .binary_search(&certificate_sha256)
+            .is_ok()
+        {
+            return Err("public V2 certificate is revoked".into());
+        }
+        Ok(VerifiedPublicQualificationV2 {
+            certificate_sha256,
+            release_sequence: payload.subject.release_sequence,
+            payload_index_sha256: payload.payload_index_sha256.clone(),
+            origin_commitment_sha256: payload.origin_commitment_sha256.clone(),
+        })
+    }
+}
+
 impl SignedPublicQualificationCertificateV1 {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         if bytes.is_empty() || bytes.len() > MAX_DOCUMENT {
@@ -243,73 +460,9 @@ impl SignedPublicQualificationCertificateV1 {
     ) -> Result<VerifiedPublicQualificationV1, String> {
         let payload = &self.payload;
         let canonical = payload.canonical_bytes()?;
+        let verifying =
+            validate_public_certificate_subject(payload, policy, expected, high_water, now_unix)?;
         let trust = policy.policy();
-        if payload.policy_version != trust.policy_version
-            || payload.release_sequence != expected.release_sequence
-            || payload.release_sequence < trust.minimum_release_sequence
-            || payload.release_sequence < high_water.release_sequence
-            || now_unix < high_water.last_accepted_wall_unix
-            || now_unix < payload.issued_at_unix
-            || now_unix >= payload.expires_at_unix
-            || now_unix >= trust.expires_at_unix
-            || payload.repository_id != trust.repository_id
-            || payload.repository_id != expected.repository_id
-            || payload.repository != trust.repository
-            || payload.repository != expected.repository
-            || payload.workflow_path != trust.workflow_path
-            || payload.workflow_path != expected.workflow_path
-            || payload.workflow_revision != trust.workflow_revision
-            || payload.workflow_revision != expected.workflow_revision
-            || payload.run_id != expected.run_id
-            || payload.run_attempt != expected.run_attempt
-            || payload.producer_job_id != expected.producer_job_id
-            || payload.artifact_id != expected.artifact_id
-            || payload.verifier_sha256 != trust.verifier_sha256
-            || payload.verifier_sha256 != expected.verifier_sha256
-            || payload.verifier_source_commit != expected.verifier_source_commit
-            || payload.verifier_policy_sha256 != trust.verifier_policy_sha256
-            || payload.catalogue_sha256 != trust.catalogue_sha256
-            || payload.target != expected.target
-            || payload.native_machine != expected.native_machine
-            || payload.source_commit != expected.source_commit
-            || payload.release_version != expected.release_version
-            || payload.build_sha256 != expected.build_sha256
-            || payload.qualification_sha256 != expected.qualification_sha256
-            || payload.qualification_certificate_sha256 != expected.qualification_certificate_sha256
-            || payload.archive_sha256 != expected.archive_sha256
-            || payload.manifest_sha256 != expected.manifest_sha256
-            || payload.host_receipt_sha256 != expected.host_receipt_sha256
-            || payload.public_evidence_sha256
-                != String::from(hash_bytes(expected.public_evidence_bytes))
-            || payload.public_evidence_size != expected.public_evidence_bytes.len() as u64
-            || payload.raw_index_sha256 != expected.raw_index_sha256
-            || payload.completed_provenance_sha256 != expected.completed_provenance_sha256
-            || payload.accepted_case_set_sha256 != expected.accepted_case_set_sha256
-            || trust.revoked_key_ids.binary_search(&payload.key_id).is_ok()
-            || trust
-                .revoked_build_sha256
-                .binary_search(&payload.build_sha256)
-                .is_ok()
-            || trust
-                .revoked_qualification_sha256
-                .binary_search(&payload.qualification_sha256)
-                .is_ok()
-        {
-            return Err("public certificate subject or policy differs".into());
-        }
-        let key = trust
-            .delegated_keys
-            .iter()
-            .find(|key| key.key_id == payload.key_id)
-            .ok_or("public certificate key is not delegated")?;
-        if !key.roles.contains(&ReleaseSigningRoleV1::PublicP)
-            || payload.issued_at_unix < key.not_before_unix
-            || payload.expires_at_unix > key.expires_at_unix
-        {
-            return Err("public certificate key role or validity differs".into());
-        }
-        let verifying = VerifyingKey::from_bytes(&decode_fixed::<32>(&key.public_key_hex)?)
-            .map_err(|_| "public certificate key differs")?;
         let signature = Signature::from_bytes(&decode_fixed::<64>(&self.signature_hex)?);
         verifying
             .verify_strict(&canonical, &signature)

@@ -996,6 +996,7 @@ fn prctl_checks() -> Vec<sock_filter> {
         libc::PR_GET_NAME as u32,
         libc::PR_SET_NAME as u32,
         libc::PR_GET_SECCOMP as u32,
+        libc::PR_GET_SECUREBITS as u32,
         libc::PR_GET_TIMERSLACK as u32,
     ])
 }

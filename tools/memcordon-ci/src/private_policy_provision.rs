@@ -23,6 +23,62 @@ const ACTIVATION: &str = "/var/lib/memcordon/policy/policy-activation.json";
 const LOCK: &str = "/var/lib/memcordon/policy/policy.lock";
 const MAX_INTENT_BYTES: usize = 256 * 1024;
 
+/// Reviewed recipes contain explicit empty dynamic slots. Only independently
+/// observed H0/epoch and a controller-derived challenge may fill those slots.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticCandidatePolicyIntentV2 {
+    pub schema_version: u8,
+    pub recipe: PrivatePolicyReleaseIntentV1,
+}
+
+impl StaticCandidatePolicyIntentV2 {
+    pub(crate) fn prepare_from_actual_h0(
+        &self,
+        live: &PolicyLiveExpectationV1,
+        epoch: &PolicyEpoch,
+        challenge: [u8; 32],
+    ) -> Result<PrivatePolicyReleaseIntentV1> {
+        let r = &self.recipe;
+        if self.schema_version != 2
+            || r.schema_version != 1
+            || r.installed_inspection_sha256.bytes() != &[0; 32]
+            || r.installation_epoch_sha256.bytes() != &[0; 32]
+            || r.base_challenge != [0; 32]
+            || challenge == [0; 32]
+            || r.target != live.target
+            || r.candidate_build_sha256 != live.candidate_build_sha256
+            || r.observer.agent_sha256 != live.agent_sha256
+            || [&r.accepted, &r.changed_port, &r.committed_tamper]
+                .iter()
+                .any(|c| {
+                    c.expected_epoch.service_instance.0 != [0; 16]
+                        || c.expected_epoch.revision.get() != 1
+                })
+            || epoch.service_instance.0 == [0; 16]
+            || live.installed_inspection_sha256.bytes() == &[0; 32]
+            || live.installation_epoch_sha256.bytes() == &[0; 32]
+        {
+            return Err(fail(
+                "static policy recipe or actual H0/epoch/challenge differs",
+            ));
+        }
+        let mut prepared = r.clone();
+        prepared.installed_inspection_sha256 = live.installed_inspection_sha256.clone();
+        prepared.installation_epoch_sha256 = live.installation_epoch_sha256.clone();
+        prepared.base_challenge = challenge;
+        for contract in [
+            &mut prepared.accepted,
+            &mut prepared.changed_port,
+            &mut prepared.committed_tamper,
+        ] {
+            contract.expected_epoch = epoch.clone();
+        }
+        prepared.validate().map_err(CiError::Message)?;
+        Ok(prepared)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PolicyLiveExpectationV1 {
     pub(crate) target: String,
@@ -104,13 +160,30 @@ pub(crate) fn provision_policy_fixture(
     expected_digest: &DiagnosticSha256,
     live: &PolicyLiveExpectationV1,
 ) -> Result<ProvisionedPolicyFixtureV1> {
+    provision_policy_fixture_inner(expected_digest, live, None)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn provision_static_policy_fixture(
+    expected_digest: &DiagnosticSha256,
+    live: &PolicyLiveExpectationV1,
+    controller_challenge: [u8; 32],
+) -> Result<ProvisionedPolicyFixtureV1> {
+    provision_policy_fixture_inner(expected_digest, live, Some(controller_challenge))
+}
+
+#[cfg(target_os = "linux")]
+fn provision_policy_fixture_inner(
+    expected_digest: &DiagnosticSha256,
+    live: &PolicyLiveExpectationV1,
+    controller_challenge: Option<[u8; 32]>,
+) -> Result<ProvisionedPolicyFixtureV1> {
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::time::{Duration, Instant};
 
-    if unsafe { libc::geteuid() } != 0 || expected_digest.bytes() == &[0; 32] {
+    if !rustix::process::geteuid().is_root() || expected_digest.bytes() == &[0; 32] {
         return Err(fail(
             "policy provisioning requires root and reviewed digest",
         ));
@@ -120,10 +193,25 @@ pub(crate) fn provision_policy_fixture(
         return Err(fail("policy release intent differs from workflow digest"));
     }
     reject_duplicate_json_keys(&bytes).map_err(CiError::Message)?;
-    let intent: PrivatePolicyReleaseIntentV1 = serde_json::from_slice(&bytes)?;
+    let intent: PrivatePolicyReleaseIntentV1 = if let Some(challenge) = controller_challenge {
+        let reviewed: StaticCandidatePolicyIntentV2 = serde_json::from_slice(&bytes)?;
+        if serde_json::to_vec(&reviewed)? != bytes {
+            return Err(fail("static policy intent is not canonical"));
+        }
+        let activation_raw =
+            crate::private_protected_readback::read_protected_raw_case_file(Path::new(ACTIVATION))?;
+        let activation: LiveActivationV2 =
+            crate::private_observer_session::strict_json(&activation_raw, MAX_INTENT_BYTES)?;
+        reviewed.prepare_from_actual_h0(live, &activation.epoch, challenge)?
+    } else {
+        let legacy: PrivatePolicyReleaseIntentV1 = serde_json::from_slice(&bytes)?;
+        if serde_json::to_vec(&legacy)? != bytes {
+            return Err(fail("legacy policy intent is not canonical"));
+        }
+        legacy
+    };
     intent.validate().map_err(CiError::Message)?;
-    if serde_json::to_vec(&intent)? != bytes
-        || intent.target != live.target
+    if intent.target != live.target
         || intent.candidate_build_sha256 != live.candidate_build_sha256
         || intent.installed_inspection_sha256 != live.installed_inspection_sha256
         || intent.installation_epoch_sha256 != live.installation_epoch_sha256
@@ -161,14 +249,13 @@ pub(crate) fn provision_policy_fixture(
     }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            break;
+        match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => break,
+            Err(rustix::io::Errno::WOULDBLOCK) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return Err(fail("policy activation lease unavailable")),
         }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EWOULDBLOCK) || Instant::now() >= deadline {
-            return Err(fail("policy activation lease unavailable"));
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
     let activation_bytes =
         crate::private_protected_readback::read_protected_raw_case_file(Path::new(ACTIVATION))?;
@@ -267,6 +354,15 @@ pub(crate) fn provision_policy_fixture(
         base_challenge: intent.base_challenge,
         observer: intent.observer,
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn provision_static_policy_fixture(
+    _expected_digest: &DiagnosticSha256,
+    _live: &PolicyLiveExpectationV1,
+    _controller_challenge: [u8; 32],
+) -> Result<ProvisionedPolicyFixtureV1> {
+    Err(fail("policy provisioning requires native Linux"))
 }
 
 #[cfg(not(target_os = "linux"))]

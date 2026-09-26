@@ -141,9 +141,7 @@ fn terminal(
                 let status_matches = if expected_signal == 0 {
                     *signal == 0
                 } else {
-                    *signal == expected_signal
-                        || (libc::WIFSIGNALED(*signal)
-                            && libc::WTERMSIG(*signal) == expected_signal)
+                    (0..=255).contains(signal) && (*signal & 0x7f) == expected_signal
                 };
                 if exit_at.replace(index).is_some() || !status_matches {
                     return Err(fail("ABI branch exit status differs"));
@@ -222,7 +220,7 @@ pub(crate) fn join_abi_kernel_events(
             )?;
             let expected = match x32_result {
                 X32ControlResultV1::Pid => i64::from(x32_control.producer_pid),
-                X32ControlResultV1::Enosys => -i64::from(libc::ENOSYS),
+                X32ControlResultV1::Enosys => -38, // Linux UAPI ENOSYS.
             };
             if !returned(interval, x32_control, X86_64, X32_GETPID, expected) {
                 return Err(fail("x32 outer-control return absent"));
@@ -264,7 +262,7 @@ pub(crate) fn join_abi_kernel_events(
                 terminal(interval, branch, 0)?;
             }
             for branch in [x32_filtered, i386_filtered] {
-                terminal(interval, branch, libc::SIGSYS)?;
+                terminal(interval, branch, 31)?;
             }
             5
         }
@@ -334,7 +332,7 @@ pub(crate) fn join_abi_kernel_events(
             for branch in [native, arm32_control] {
                 terminal(interval, branch, 0)?;
             }
-            terminal(interval, arm32_filtered, libc::SIGSYS)?;
+            terminal(interval, arm32_filtered, 31)?;
             3
         }
     };

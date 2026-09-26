@@ -88,6 +88,49 @@ pub enum ExpectedPublicV2Outcome {
     FrontendLost,
 }
 
+/// Source transport for a deliberately injected fault. The returned value is
+/// diagnostic only: completed replay must compare its original response to
+/// the protected provider checkpoint/failure/retirement and kernel interval.
+pub(crate) fn read_original_public_fault_report(
+    path: &Path,
+    observed: &SupervisedProcessV2,
+    expected: &ExpectedPublicV2Readback<'_>,
+) -> Result<StructuralPublicV2Readback> {
+    let bytes = read_public_v2_report_bytes(path, expected.report_owner_uid)?;
+    let report: memcordon_core::report_v11::PrivatePublicResultV11 =
+        crate::private_observer_session::strict_json(&bytes, 1024 * 1024)?;
+    report.validate_structure().map_err(CiError::Message)?;
+    use memcordon_core::report_v11::{
+        PrivatePublicOutcomeV11 as O, PrivateTerminalOutcomeV11 as T,
+    };
+    let actual = match &report.result {
+        O::Complete { terminal, .. } => match terminal.outcome {
+            T::NativeFailure { .. } => ExpectedPublicV2Outcome::NativeFailure,
+            T::Interrupted { .. } => ExpectedPublicV2Outcome::Interrupted,
+            T::Exited { code } => ExpectedPublicV2Outcome::Exited(code),
+        },
+        O::AllocatedUnverified { .. } => ExpectedPublicV2Outcome::AllocatedUnverified,
+        O::Indeterminate { .. } => ExpectedPublicV2Outcome::Indeterminate,
+        O::TransportUnverified { .. } => ExpectedPublicV2Outcome::TransportUnverified,
+        _ => {
+            return Err(CiError::Message(
+                "fault source lacks an original submitted execution response".into(),
+            ));
+        }
+    };
+    let actual_expected = ExpectedPublicV2Readback {
+        source_commit: expected.source_commit,
+        native_abi: expected.native_abi,
+        archive_sha256: expected.archive_sha256,
+        runtime_manifest_sha256: expected.runtime_manifest_sha256,
+        qualification_sha256: expected.qualification_sha256,
+        host_receipt_sha256: expected.host_receipt_sha256,
+        report_owner_uid: expected.report_owner_uid,
+        outcome: actual,
+    };
+    validate_structural_public_v2_readback(observed, &bytes, &actual_expected)
+}
+
 /// Every hash must come from an independently reopened final installation or
 /// release archive, never from the submitted public report. This is still a
 /// structural expectation, not a trust token.
@@ -108,6 +151,119 @@ pub struct StructuralPublicV2Readback {
     pub report_sha256: DiagnosticSha256,
     pub child_pid: u32,
     pub child_start_time_ticks: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicDualAttemptV12 {
+    pub ordinal: u8,
+    pub terminal: memcordon_core::report_v11::PrivateExecutionReportV11,
+    pub raw_response: Vec<u8>,
+}
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicDualReportV12 {
+    pub schema_version: u8,
+    pub evidence_scope: String,
+    pub attempts: Vec<PublicDualAttemptV12>,
+}
+/// Structural only: protected provider, overlap and held-target facts remain
+/// required. Both raw authenticated terminal responses are retained verbatim.
+pub struct StructuralPublicDualV12Readback {
+    pub report_sha256: DiagnosticSha256,
+    pub child_pid: u32,
+    pub child_start_time_ticks: u64,
+    pub attempts: [PublicDualAttemptV12; 2],
+}
+
+pub fn validate_structural_public_dual_v12_readback(
+    observed: &SupervisedProcessV2,
+    bytes: &[u8],
+    expected: &ExpectedPublicV2Readback<'_>,
+) -> Result<StructuralPublicDualV12Readback> {
+    validate_public_expected_identity(expected)?;
+    if bytes.len() > PUBLIC_OBJECT_BYTES
+        || bytes.is_empty()
+        || !observed.status.success()
+        || expected.outcome != ExpectedPublicV2Outcome::Exited(0)
+    {
+        return Err(CiError::Message(
+            "dual public report bound or actual CLI outcome differs".into(),
+        ));
+    }
+    let report: PublicDualReportV12 =
+        crate::private_observer_session::strict_json(bytes, PUBLIC_OBJECT_BYTES)?;
+    if report.schema_version != 12
+        || report.evidence_scope != "two-authenticated-public-launches"
+        || report.attempts.len() != 2
+        || report.attempts[0].ordinal != 0
+        || report.attempts[1].ordinal != 1
+    {
+        return Err(CiError::Message(
+            "dual public schema/closed attempt ordinals differ".into(),
+        ));
+    }
+    for attempt in &report.attempts {
+        let envelope = PrivatePublicResultV11 {
+            schema_version: 11,
+            result: PrivatePublicOutcomeV11::Complete {
+                terminal: Box::new(attempt.terminal.clone()),
+                raw_response: attempt.raw_response.clone(),
+            },
+        };
+        envelope.validate_structure().map_err(CiError::Message)?;
+        let terminal = &attempt.terminal;
+        if terminal.source_commit != expected.source_commit
+            || terminal.native_abi != expected.native_abi
+            || terminal.runtime_manifest_sha256 != *expected.runtime_manifest_sha256
+            || terminal.installed_qualification_sha256 != *expected.qualification_sha256
+            || terminal.outcome != (PrivateTerminalOutcomeV11::Exited { code: 0 })
+        {
+            return Err(CiError::Message(
+                "dual terminal M1/Q/actual outcome differs".into(),
+            ));
+        }
+    }
+    if report.attempts[0].terminal.attempt == report.attempts[1].terminal.attempt
+        || report.attempts[0]
+            .terminal
+            .checkpoint
+            .target_network_namespace
+            .target_network_inode
+            == report.attempts[1]
+                .terminal
+                .checkpoint
+                .target_network_namespace
+                .target_network_inode
+    {
+        return Err(CiError::Message(
+            "dual public report repeats attempt or network namespace".into(),
+        ));
+    }
+    let child = observed
+        .linux_child
+        .filter(|child| child.pid != 0 && child.start_time_ticks != 0)
+        .ok_or_else(|| CiError::Message("dual owned CLI identity absent".into()))?;
+    let attempts: [PublicDualAttemptV12; 2] = report
+        .attempts
+        .try_into()
+        .map_err(|_| CiError::Message("dual attempt count differs".into()))?;
+    Ok(StructuralPublicDualV12Readback {
+        report_sha256: hash_bytes(bytes),
+        child_pid: child.pid,
+        child_start_time_ticks: child.start_time_ticks,
+        attempts,
+    })
+}
+
+#[cfg(unix)]
+pub fn read_structural_public_dual_v12_report(
+    path: &Path,
+    observed: &SupervisedProcessV2,
+    expected: &ExpectedPublicV2Readback<'_>,
+) -> Result<StructuralPublicDualV12Readback> {
+    let bytes = read_public_v2_report_bytes(path, expected.report_owner_uid)?;
+    validate_structural_public_dual_v12_readback(observed, &bytes, expected)
 }
 
 /// Replacement facts obtained from protected terminal, transport and recovery
@@ -313,6 +469,11 @@ pub fn read_structural_public_v2_report_presence(
                     ));
                 }
             }
+        }
+        PublicCliReportEvidenceV2::AbsentFrontendRejectedV3 { .. } => {
+            return Err(CiError::Message(
+                "V3 rejected frontend report cannot enter legacy V2 readback".into(),
+            ));
         }
     };
     validate_public_v2_report_presence(

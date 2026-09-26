@@ -1,12 +1,28 @@
 use memcordon_ci::private_public_dispatch::{
     ExpectedHistoricalPublicEpochReplayV1, canonical_public_stdio_v1,
-    validate_historical_public_epoch_replay_v1, validate_provider_frame_record_v2,
+    validate_detached_public_provider_sources, validate_historical_public_epoch_replay_v1,
+    validate_provider_frame_record_v2,
 };
 use memcordon_core::DiagnosticSha256;
 use memcordon_core::workload_codec::hash_bytes;
 
 fn digest(byte: u8) -> DiagnosticSha256 {
     DiagnosticSha256::from_bytes([byte; 32])
+}
+
+#[test]
+fn detached_provider_map_restores_protocol_order_without_accepting_extra_roles() {
+    let (record, leaves) = fixture(0);
+    let mut mapped = leaves
+        .into_iter()
+        .rev()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    validate_detached_public_provider_sources(&record, &mapped).unwrap();
+    mapped.insert("unreviewed-extra.bin".into(), b"not a frame".to_vec());
+    assert!(validate_detached_public_provider_sources(&record, &mapped).is_err());
+    mapped.remove("unreviewed-extra.bin");
+    mapped.remove("request.bin");
+    assert!(validate_detached_public_provider_sources(&record, &mapped).is_err());
 }
 
 fn fixture(cap: u8) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {

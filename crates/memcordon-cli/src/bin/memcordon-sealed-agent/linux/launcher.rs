@@ -554,6 +554,10 @@ fn validate_release_candidate_operation(
         }
         return Err("MCSEALED-PRIVATE-RELEASE: awaiting Unix intent coordinator cleanup".into());
     }
+    if fixed.selector == super::private_release_caller::SELECTOR {
+        let witness = super::private_release_caller::observe_nonroot_caller_rejection(&case)?;
+        case.persist_caller_subwitness(&witness)?;
+    }
     let observed = super::private_release_execution::execute_candidate_fixture_case(&case)?;
     let namespace_inode = case.retired_native_namespace_inode()?;
     let expected_response = case.expected_fixture_output(namespace_inode)?;

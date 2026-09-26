@@ -52,6 +52,17 @@ pub(crate) fn join_public_case_kernel_targets(
     result_key: &DiagnosticSha256,
     targets: &[ProtectedPublicTargetExpectationV1],
 ) -> Result<VerifiedPublicCaseKernelJoinV1> {
+    join_public_case_kernel_targets_v2(interval, clock, result_key, targets, &BTreeSet::new())
+}
+
+/// Versioned pre-exec fault policy. The legacy adapter always requires exec.
+pub(crate) fn join_public_case_kernel_targets_v2(
+    interval: &VerifiedKernelIntervalV1,
+    clock: &VerifiedProcClockCalibrationV1,
+    result_key: &DiagnosticSha256,
+    targets: &[ProtectedPublicTargetExpectationV1],
+    preexec_attempts: &BTreeSet<String>,
+) -> Result<VerifiedPublicCaseKernelJoinV1> {
     interval.capture_bytes()?;
     if interval.result_key() != result_key {
         return Err(fail("public kernel interval or installed image differs"));
@@ -73,6 +84,12 @@ pub(crate) fn join_public_case_kernel_targets(
     let mut seen_attempts = BTreeSet::new();
     let mut seen_pids = BTreeSet::new();
     let mut joined = Vec::with_capacity(targets.len());
+    if preexec_attempts
+        .iter()
+        .any(|attempt| !targets.iter().any(|target| &target.attempt_id == attempt))
+    {
+        return Err(fail("pre-exec public fault names an absent attempt"));
+    }
     for target in targets {
         if target.attempt_id.is_empty()
             || target.pid == 0
@@ -90,6 +107,7 @@ pub(crate) fn join_public_case_kernel_targets(
             ));
         }
         let mut selected = None;
+        let preexec = preexec_attempts.contains(&target.attempt_id);
         for event in interval.events() {
             if let KernelEventV1::Exec {
                 task,
@@ -99,6 +117,9 @@ pub(crate) fn join_public_case_kernel_targets(
             } = event
             {
                 if task.pid == target.pid && clock.matches(*task, target.start_ticks) {
+                    if preexec {
+                        return Err(fail("authorization-loss target unexpectedly executed"));
+                    }
                     if selected.replace(*task).is_some()
                         || *image_dev != target.entrypoint_device
                         || *image_inode != target.entrypoint_inode
@@ -108,7 +129,20 @@ pub(crate) fn join_public_case_kernel_targets(
                 }
             }
         }
-        let task = selected.ok_or_else(|| fail("protected public target absent from BPF exec"))?;
+        if preexec {
+            for event in interval.events() {
+                if let KernelEventV1::Exit { task, .. } = event
+                    && task.pid == target.pid
+                    && clock.matches(*task, target.start_ticks)
+                {
+                    if selected.replace(*task).is_some() {
+                        return Err(fail("pre-exec target exit identity is ambiguous"));
+                    }
+                }
+            }
+        }
+        let task =
+            selected.ok_or_else(|| fail("protected public target absent from BPF lifecycle"))?;
         if !interval.retired_task(task) {
             return Err(fail("public target exit/reap absent"));
         }
@@ -143,7 +177,7 @@ pub(crate) fn join_public_case_kernel_targets(
                 if joined.iter().any(|(_, selected)| selected == task))
         })
         .count();
-    if observed_target_execs != targets.len() {
+    if observed_target_execs != targets.len() - preexec_attempts.len() {
         return Err(fail("public target exec inventory differs"));
     }
     Ok(VerifiedPublicCaseKernelJoinV1 {

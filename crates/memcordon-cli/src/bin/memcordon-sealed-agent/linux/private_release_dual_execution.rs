@@ -60,7 +60,10 @@ pub(crate) fn execute_dual_candidate_case(
     let mut first_readback = None;
     let mut second_readback = None;
     let mut gate_readback = None;
+    let mut first_retired_early = None;
+    let mut first_slot = Some(first);
     let run = (|| -> Result<(), String> {
+        let mut first = first_slot.as_mut().ok_or("dual first owner absent")?;
         let first_target = prepare_target(case, &mut first, &first_key, provider_namespace)?;
         let first_inode = first_target.observed.network_namespace_inode();
         let first_checkpoint = first.commit_dual_candidate_and_release(
@@ -69,8 +72,18 @@ pub(crate) fn execute_dual_candidate_case(
             DualAttemptRoleV1::First,
         )?;
         require_exec(&mut first, case)?;
+        super::private_release_live_gate::wait_baseline_for_candidate(
+            case,
+            &mut first,
+            first_target.stdout_reader.as_fd(),
+            first_target.stdin_writer.as_fd(),
+            Some(0),
+        )?;
         let first_live = first.observe_live_terminal_join_target()?;
-        let first_frame = read_frame(first_target.stdout_reader.as_fd(), case.deadline())?;
+        let first_frame =
+            read_fixed_frame::<42>(first_target.stdout_reader.as_fd(), case.deadline(), || {
+                first.tick_relay_for_unix_observer()
+            })?;
         let first_listener_inode =
             require_live_frame(case, &first, &first_live, first_inode, &first_frame)?;
 
@@ -82,8 +95,18 @@ pub(crate) fn execute_dual_candidate_case(
             DualAttemptRoleV1::Second,
         )?;
         require_exec(&mut second, case)?;
+        super::private_release_live_gate::wait_baseline_for_candidate(
+            case,
+            &mut second,
+            second_target.stdout_reader.as_fd(),
+            second_target.stdin_writer.as_fd(),
+            Some(1),
+        )?;
         let second_live = second.observe_live_terminal_join_target()?;
-        let second_frame = read_frame(second_target.stdout_reader.as_fd(), case.deadline())?;
+        let second_frame =
+            read_fixed_frame::<42>(second_target.stdout_reader.as_fd(), case.deadline(), || {
+                second.tick_relay_for_unix_observer()
+            })?;
         let second_listener_inode =
             require_live_frame(case, &second, &second_live, second_inode, &second_frame)?;
         if first_inode == second_inode
@@ -128,12 +151,68 @@ pub(crate) fn execute_dual_candidate_case(
         let mut second_writer = second_target.stdin_writer;
         first_writer
             .write_all(&private_release_dual_attempt::target_ack())
-            .and_then(|()| second_writer.write_all(&private_release_dual_attempt::target_ack()))
             .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: dual target ACK: {error}"))?;
-        if first.monitor_release_candidate(case)? != PrivateMonitorOutcome::Completed
-            || second.monitor_release_candidate(case)? != PrivateMonitorOutcome::Completed
-        {
+        if first.monitor_release_candidate(case)? != PrivateMonitorOutcome::Completed {
             return Err("MCSEALED-PRIVATE-RELEASE: dual native monitor differs".into());
+        }
+        let retired = first_slot
+            .take()
+            .ok_or("dual first retirement owner absent")?
+            .retire_release_candidate(Instant::now() + Duration::from_secs(30))?;
+        let retired_ns = super::clock::monotonic_nanos()?;
+        first_retired_early = Some(retired);
+        second.require_live_target_identity(&second_live)?;
+        second_writer
+            .write_all(&[2])
+            .map_err(|error| error.to_string())?;
+        let response =
+            read_fixed_frame::<82>(second_target.stdout_reader.as_fd(), case.deadline(), || {
+                second.tick_relay_for_unix_observer()
+            })?;
+        let response_ns = super::clock::monotonic_nanos()?;
+        let mut next = sha2::Sha256::new();
+        use sha2::Digest;
+        next.update(b"memcordon/private-dual-second-exchange/v1\0");
+        next.update(case.challenge_bytes());
+        let next: [u8; 32] = next.finalize().into();
+        if response
+            != private_release_dual_attempt::post_retirement_frame(
+                &case.challenge_bytes(),
+                &next,
+                private_release_dual_attempt::fixed_port(&case.challenge_bytes()),
+                second_inode,
+            )
+            || response_ns <= retired_ns
+        {
+            return Err("dual genuine second post-retirement response differs".into());
+        }
+        let first_retired = first_retired_early
+            .as_ref()
+            .expect("actual retirement retained");
+        let record = serde_json::to_vec(&serde_json::json!({"schema_version":1,"protocol":"candidate-dual-second-exchange-v1","first_attempt_id":first_retired.attempt_id,"first_terminal_sha256":memcordon_core::workload_codec::hash_bytes(&first_retired.terminal_bytes),"first_retirement_monotonic_ns":retired_ns,"second_response_monotonic_ns":response_ns,"second_target":second_live,"frame":response.to_vec()})).map_err(|error|error.to_string())?;
+        super::private_release_child_gate::persist_atomic(
+            case.protected_case_directory()?,
+            "dual-second-post-retirement.pending",
+            "dual-second-post-retirement.json",
+            &record,
+        )?;
+        super::private_release_live_gate::wait_for_sample_with_role(
+            case.protected_case_directory()?,
+            case.selector(),
+            case.protected_result_key()?,
+            &case.challenge_bytes(),
+            &second_live,
+            true,
+            &response,
+            case.deadline(),
+            || second.require_live_target_identity(&second_live),
+            Some(1),
+        )?;
+        second_writer
+            .write_all(&private_release_dual_attempt::target_ack())
+            .map_err(|error| error.to_string())?;
+        if second.monitor_release_candidate(case)? != PrivateMonitorOutcome::Completed {
+            return Err("dual second native monitor differs".into());
         }
         let first_stdout =
             super::private_probe_execution::read_bounded_pipe(first_target.stdout_reader, 1)?;
@@ -166,7 +245,13 @@ pub(crate) fn execute_dual_candidate_case(
         Ok(())
     })();
     let retire_deadline = Instant::now() + Duration::from_secs(30);
-    let first_retired = first.retire_release_candidate(retire_deadline);
+    let first_retired = match first_retired_early {
+        Some(retired) => Ok(retired),
+        None => first_slot
+            .take()
+            .ok_or_else(|| "dual first retirement failed".to_owned())
+            .and_then(|owner| owner.retire_release_candidate(retire_deadline)),
+    };
     let second_retired = second.retire_release_candidate(retire_deadline);
     run?;
     let first_retired = first_retired?;
@@ -258,6 +343,27 @@ fn prepare_target(
         startup_deadline,
     )?;
     owner.prepare_relay([stdin_read, stdout_write, stderr_write])?;
+    let role = if *subkey
+        == super::private_release_dual_attempt::subattempt_key(
+            case.protected_result_key()?,
+            super::private_release_dual_attempt::DualAttemptRoleV1::First,
+        ) {
+        0
+    } else {
+        1
+    };
+    super::private_release_live_gate::wait_for_sample_with_role(
+        case.protected_case_directory()?,
+        case.selector(),
+        case.protected_result_key()?,
+        &case.challenge_bytes(),
+        observed.target_identity(),
+        false,
+        &[],
+        case.deadline(),
+        || owner.require_live_target_identity(observed.target_identity()),
+        Some(role),
+    )?;
     Ok(PreparedTargetV1 {
         observed,
         stdin_writer,
@@ -378,14 +484,19 @@ pub(crate) fn parse_loopback_listener_inode(table: &str, port: u16) -> Result<u6
     found.ok_or_else(|| "MCSEALED-PRIVATE-RELEASE: dual TCP listener absent".into())
 }
 
-fn read_frame(fd: BorrowedFd<'_>, deadline: Instant) -> Result<[u8; 42], String> {
-    let mut frame = [0_u8; 42];
+fn read_fixed_frame<const N: usize>(
+    fd: BorrowedFd<'_>,
+    deadline: Instant,
+    mut tick: impl FnMut() -> Result<(), String>,
+) -> Result<[u8; N], String> {
+    let mut frame = [0_u8; N];
     let mut offset = 0;
     while offset < frame.len() {
+        tick()?;
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or("MCSEALED-PRIVATE-RELEASE: dual frame deadline expired")?;
-        let timeout = i32::try_from(remaining.as_millis().min(i32::MAX as u128))
+        let timeout = i32::try_from(remaining.as_millis().min(10))
             .map_err(|_| "MCSEALED-PRIVATE-RELEASE: dual frame deadline differs")?;
         let mut poll = libc::pollfd {
             fd: fd.as_raw_fd(),
@@ -393,7 +504,11 @@ fn read_frame(fd: BorrowedFd<'_>, deadline: Instant) -> Result<[u8; 42], String>
             revents: 0,
         };
         // SAFETY: poll borrows only the fixed target stdout descriptor.
-        if unsafe { libc::poll(&raw mut poll, 1, timeout) } != 1
+        let ready = unsafe { libc::poll(&raw mut poll, 1, timeout) };
+        if ready == 0 {
+            continue;
+        }
+        if ready != 1
             || poll.revents & libc::POLLIN == 0
             || poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0
         {

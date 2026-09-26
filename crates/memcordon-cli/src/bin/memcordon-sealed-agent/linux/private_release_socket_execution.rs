@@ -2,7 +2,7 @@
 //! This is unrouted until protected raw, detached and CI joins exist.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
@@ -57,9 +57,11 @@ pub(crate) fn execute_socket_launder_candidate_case(
     let worker_pidfd = super::private_execution::pidfd_for_self()?;
     let (stdin_read, stdin_write) = super::private_probe_execution::nonblocking_pipe()?;
     let (stdout_read, stdout_write) = super::private_probe_execution::nonblocking_pipe()?;
+    let mut stdout_pipe = File::from(stdout_read);
     let (stderr_read, stderr_write) = super::private_probe_execution::nonblocking_pipe()?;
     let challenge = case.challenge_bytes();
-    File::from(stdin_write)
+    let mut baseline_input = File::from(stdin_write);
+    baseline_input
         .write_all(&challenge)
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: socket challenge pipe: {error}"))?;
     let mut owner = case.begin_native_owner()?;
@@ -94,11 +96,17 @@ pub(crate) fn execute_socket_launder_candidate_case(
             return Err("MCSEALED-PRIVATE-RELEASE: gated SCM_RIGHTS denial absent".into());
         }
         let network_namespace_inode = observed.network_namespace_inode();
+        let sampled_target = observed.target_identity().clone();
         let witness = observed.precreated_socket_witness()?;
         let gate_sha256 = case.persist_socket_gate(&witness)?;
         case.wait_socket_ack(&gate_sha256, Instant::now() + Duration::from_secs(15))?;
         owner.revalidate_precreated_socket_before_release(&observed)?;
         owner.prepare_relay([stdin_read, stdout_write, stderr_write])?;
+        super::private_release_live_gate::wait_pre_for_candidate(
+            case,
+            &mut owner,
+            observed.target_identity(),
+        )?;
         let checkpoint = owner.commit_release_candidate_and_release(observed, case)?;
         let exec_deadline = (Instant::now() + Duration::from_secs(5)).min(case.deadline());
         if !matches!(
@@ -107,14 +115,53 @@ pub(crate) fn execute_socket_launder_candidate_case(
         ) {
             return Err("MCSEALED-PRIVATE-RELEASE: socket target failed pinned exec".into());
         }
+        super::private_release_live_gate::wait_baseline_for_candidate(
+            case,
+            &mut owner,
+            stdout_pipe.as_fd(),
+            baseline_input.as_fd(),
+            None,
+        )?;
+        let expected = case.expected_fixture_output(network_namespace_inode)?;
+        let mut response = vec![0u8; expected.len()];
+        let mut offset = 0;
+        while offset < response.len() {
+            owner.tick_relay_for_unix_observer()?;
+            match stdout_pipe.read(&mut response[offset..]) {
+                Ok(0) => return Err("held SCM fixture output EOF".into()),
+                Ok(count) => offset += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= case.deadline() {
+                        return Err("held SCM fixture output deadline".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        super::private_release_live_gate::wait_for_sample(
+            case.protected_case_directory()?,
+            case.selector(),
+            case.protected_result_key()?,
+            &case.challenge_bytes(),
+            &sampled_target,
+            true,
+            &response,
+            case.deadline(),
+            || owner.require_live_target_identity(&sampled_target),
+        )?;
+        baseline_input
+            .write_all(
+                super::private_release_unix_intent::observer_ack_digest(&case.challenge_bytes())
+                    .bytes(),
+            )
+            .map_err(|error| error.to_string())?;
         if owner.monitor_release_candidate(case)? != PrivateMonitorOutcome::Completed {
             return Err("MCSEALED-PRIVATE-RELEASE: socket monitor incomplete".into());
         }
-        let expected = case.expected_fixture_output(network_namespace_inode)?;
-        let response =
-            super::private_probe_execution::read_bounded_pipe(stdout_read, expected.len() + 1)?;
+        let extra = super::private_probe_execution::read_bounded_pipe(stdout_pipe.into(), 1)?;
         let stderr = super::private_probe_execution::read_bounded_pipe(stderr_read, 1025)?;
-        if response != expected || !stderr.is_empty() {
+        if response != expected || !extra.is_empty() || !stderr.is_empty() {
             return Err("MCSEALED-PRIVATE-RELEASE: socket target response differs".into());
         }
         Ok((

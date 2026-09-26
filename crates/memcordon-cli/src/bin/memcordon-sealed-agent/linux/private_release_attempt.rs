@@ -109,6 +109,8 @@ pub(crate) struct UncertainCandidateSettlementFactsV1 {
     pub(crate) namespace_init_reaped: bool,
     pub(crate) guardian_terminal: [u8; 20],
     pub(crate) candidate_exit_code: Option<i32>,
+    #[serde(default)]
+    pub(crate) cgroup_retirement_raw: Option<super::cgroup::CgroupRetirementRawV1>,
 }
 
 pub(crate) struct UncertainCandidateRetirementObservationV1 {
@@ -129,6 +131,8 @@ pub(crate) struct GuardianLossCandidateSettlementFactsV1 {
     pub(crate) target_pidfd_exited: bool,
     pub(crate) namespace_init_reaped: bool,
     pub(crate) candidate_exit_code: Option<i32>,
+    #[serde(default)]
+    pub(crate) cgroup_retirement_raw: Option<super::cgroup::CgroupRetirementRawV1>,
 }
 
 pub(crate) struct GuardianLossCandidateRetirementObservationV1 {
@@ -150,6 +154,8 @@ pub(crate) struct FrontendLossCandidateSettlementFactsV1 {
     pub(crate) target_pidfd_exited: bool,
     pub(crate) namespace_init_reaped: bool,
     pub(crate) candidate_exit_code: Option<i32>,
+    #[serde(default)]
+    pub(crate) cgroup_retirement_raw: Option<super::cgroup::CgroupRetirementRawV1>,
 }
 
 pub(crate) struct FrontendLossCandidateRetirementObservationV1 {
@@ -345,6 +351,166 @@ pub(crate) struct ReadbackBlockedCandidateAttemptV1 {
     pub(crate) journal: ReadbackRetiredCandidateAttemptV1,
     pub(crate) fault_marker_bytes: Vec<u8>,
     pub(crate) detached_reuse_error: String,
+}
+
+/// Native recovery sources, not a release or qualification capability. The
+/// closed observer adapter must independently join the retry, exact unlink,
+/// normal durable replacement and original physical retirement.
+pub(crate) struct RecoveredCandidateRetirementConflictV1 {
+    pub(crate) before_bytes: Vec<u8>,
+    pub(crate) marker_bytes: Vec<u8>,
+    pub(crate) marker_device: u64,
+    pub(crate) marker_inode: u64,
+    pub(crate) directory_device: u64,
+    pub(crate) directory_inode: u64,
+    pub(crate) removed_monotonic_ns: u64,
+    pub(crate) recovered_monotonic_ns: u64,
+    pub(crate) retirement: ReleaseCandidateRetirementObservationV1,
+}
+
+pub(crate) fn recover_verified_candidate_retirement_conflict(
+    directory: &File,
+    expected: &ReleaseCandidateReadbackExpectationV1<'_>,
+    expected_marker: &[u8],
+    settlement: super::private_lifecycle::ReleaseCandidateSettlementFactsV1,
+) -> Result<RecoveredCandidateRetirementConflictV1, String> {
+    // SAFETY: geteuid reads the actual process credential without pointers.
+    if unsafe { libc::geteuid() } != 0
+        || expected_marker.is_empty()
+        || settlement.monitor_outcome != super::private_lifecycle::PrivateMonitorOutcome::Completed
+        || !settlement.cgroup_empty_before_cleanup
+        || !settlement.containment_removed
+        || !settlement.target_pidfd_exited
+        || !settlement.namespace_init_reaped
+        || settlement.candidate_exit_code != Some(0)
+        || settlement.cgroup_retirement_raw.is_none()
+    {
+        return Err("candidate retirement recovery authority/physical source differs".into());
+    }
+    let blocked = read_blocked_retirement_candidate_journal(directory, expected)?;
+    if blocked.fault_marker_bytes != expected_marker {
+        return Err("candidate retirement recovery owned marker differs".into());
+    }
+    let (record, before_bytes) = read_record_in(directory, 0)?;
+    if before_bytes != blocked.journal.terminal_bytes {
+        return Err("candidate retirement recovery original record changed".into());
+    }
+    for process in [
+        Some(&record.coordinator),
+        record.frontend_proxy.as_ref(),
+        record.guardian.as_ref(),
+        record.namespace_init.as_ref(),
+        record.target.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        super::private_release_run::require_recorded_process_exited(process)?;
+    }
+    super::private_release_run::require_candidate_cgroup_absent(&record.attempt_id)?;
+    let terminal = super::private_guardian::GuardianTerminalV4::decode(
+        settlement.guardian_terminal,
+        candidate_attempt_bytes(&record.result_key),
+    )?;
+    if terminal.trigger != super::private_guardian::GuardianTriggerV4::Stopped
+        || terminal.boundary_retired
+    {
+        return Err("candidate retirement recovery original guardian outcome differs".into());
+    }
+    let directory_metadata = directory.metadata().map_err(|error| error.to_string())?;
+    if !directory_metadata.is_dir()
+        || directory_metadata.uid() != 0
+        || directory_metadata.mode() & 0o777 != 0o700
+    {
+        return Err("candidate retirement recovery directory protection differs".into());
+    }
+    // SAFETY: only the exact fixed marker beneath the independently held case
+    // directory is opened; it remains held through the checked unlink.
+    let raw = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"attempt.json.new".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let marker = unsafe { File::from_raw_fd(raw) };
+    let metadata = marker.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.len() != expected_marker.len() as u64
+    {
+        return Err("candidate retirement recovery held marker protection differs".into());
+    }
+    let mut bytes = Vec::new();
+    (&marker)
+        .take(MAX_FAULT_MARKER_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes != expected_marker
+        || read_fault_marker_in(directory, 0)?.1 != bytes
+        || read_record_in(directory, 0)?.1 != before_bytes
+    {
+        return Err("candidate retirement recovery held marker/record changed".into());
+    }
+    // SAFETY: fstatat observes the exact no-follow directory-relative marker;
+    // compare it to the still-held object immediately before deletion.
+    let mut path_metadata: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            c"attempt.json.new".as_ptr(),
+            &raw mut path_metadata,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+        || path_metadata.st_dev != metadata.dev()
+        || path_metadata.st_ino != metadata.ino()
+    {
+        return Err("candidate retirement recovery marker alias/substitution detected".into());
+    }
+    // SAFETY: this deletes only the verified owned probe obstruction; it never
+    // removes the canonical attempt or any cgroup/namespace/production path.
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), c"attempt.json.new".as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    directory.sync_all().map_err(|error| error.to_string())?;
+    let removed_monotonic_ns = super::clock::monotonic_nanos()?;
+    if marker
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .nlink()
+        != 0
+    {
+        return Err("candidate retirement recovery obstruction remains linked".into());
+    }
+    let mut durable = DurableReleaseCandidateAttemptV1 {
+        directory: directory.try_clone().map_err(|error| error.to_string())?,
+        record,
+        owner_uid: 0,
+    };
+    // Use the existing checked canonical transition, fsync, rename and readback.
+    // A failure after marker removal remains an explicit incomplete attempt.
+    let retirement = durable.retired_after_native_cleanup(settlement)?;
+    let recovered_monotonic_ns = super::clock::monotonic_nanos()?;
+    if removed_monotonic_ns >= recovered_monotonic_ns || retirement.terminal_bytes == before_bytes {
+        return Err("candidate retirement recovery transition/clock differs".into());
+    }
+    Ok(RecoveredCandidateRetirementConflictV1 {
+        before_bytes,
+        marker_bytes: bytes,
+        marker_device: metadata.dev(),
+        marker_inode: metadata.ino(),
+        directory_device: directory_metadata.dev(),
+        directory_inode: directory_metadata.ino(),
+        removed_monotonic_ns,
+        recovered_monotonic_ns,
+        retirement,
+    })
 }
 
 #[allow(dead_code)] // Consumed by the detached retirement-fault verifier.
@@ -971,6 +1137,14 @@ impl DurableReleaseCandidateAttemptV1 {
         next.checkpoint_digest = Some(digest.clone());
         next.checkpoint_binding = Some(binding);
         self.replace(next)?;
+        if self.owner_uid == 0 {
+            super::private_release_child_gate::persist_atomic(
+                &self.directory,
+                "checkpoint-committed-v1.pending",
+                "checkpoint-committed-v1.json",
+                &self.record.encode()?,
+            )?;
+        }
         Ok(digest)
     }
 
@@ -987,6 +1161,14 @@ impl DurableReleaseCandidateAttemptV1 {
         next.phase = PrivateAttemptPhase::ReleaseIntent;
         next.release_knowledge = ReleaseKnowledge::PossiblyReleased;
         self.replace(next)?;
+        if self.owner_uid == 0 {
+            super::private_release_child_gate::persist_atomic(
+                &self.directory,
+                "release-intent-v1.pending",
+                "release-intent-v1.json",
+                &self.record.encode()?,
+            )?;
+        }
         Ok(ReleaseCandidatePermitV1 {
             attempt_id: self.record.attempt_id.clone(),
             checkpoint_digest: digest.clone(),
@@ -1524,7 +1706,16 @@ impl PrivateNativeJournal for DurableReleaseCandidateAttemptV1 {
         let mut next = self.record.clone();
         next.phase = PrivateAttemptPhase::ExecutionObserved;
         next.release_knowledge = ReleaseKnowledge::ExecObserved;
-        self.replace(next)
+        self.replace(next)?;
+        if self.owner_uid == 0 {
+            super::private_release_child_gate::persist_atomic(
+                &self.directory,
+                "execution-observed-v1.pending",
+                "execution-observed-v1.json",
+                &self.record.encode()?,
+            )?;
+        }
+        Ok(())
     }
     fn retiring(&mut self) -> Result<(), String> {
         if matches!(

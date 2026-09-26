@@ -1,11 +1,13 @@
-//! Exact private native suite admission. This is not a completion producer.
+//! Exact private native suite admission and enrolled raw-evidence production.
 //!
 //! The suite cannot succeed until each declared case has a compiled native
 //! implementation and the supervising runner can issue authenticated raw
-//! observations. In particular, parsing a catalogue never creates a trusted
-//! completion or qualification capability.
+//! observations. Live origin can authorize bounded C export only after full
+//! replay; completed Actions custody remains mandatory for qualification.
+//! Parsing a catalogue never creates a trusted completion capability.
 
 use std::collections::BTreeMap;
+const POLICY_SELECTOR: &str = "private_tcp::wrong_grant_profile_and_port_rejected";
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
@@ -27,12 +29,8 @@ use crate::command::CommandSpec;
 use crate::private_agent_path::{
     AGENT_PATH_SELECTOR, AgentPathSnapshotV1, validate_agent_path_observer,
 };
-use crate::private_child_live::{
-    CHILD_RUNTIME_SELECTOR, join_live_sample_to_result, sample_and_ack_if_ready,
-};
-use crate::private_dual_live::{
-    DUAL_SELECTOR, join_sampled_dual_to_result, sample_and_ack_if_ready as sample_dual_gate,
-};
+use crate::private_child_live::{CHILD_RUNTIME_SELECTOR, join_live_sample_to_result};
+use crate::private_dual_live::{DUAL_SELECTOR, join_sampled_dual_to_result};
 use crate::private_host_state::{
     HOST_PRESERVATION_SELECTOR, HostNetworkStateV1, validate_host_preservation_observer,
 };
@@ -66,9 +64,7 @@ use crate::private_terminal_live::{
     TERMINAL_JOIN_SELECTOR, join_sampled_midpoint_to_result,
     sample_and_ack_if_ready as sample_terminal_midpoint,
 };
-use crate::private_unix_live::{
-    UNIX_INTENT_SELECTOR, join_sampled_unix_to_result, sample_and_ack_if_ready as sample_unix_gate,
-};
+use crate::private_unix_live::{UNIX_INTENT_SELECTOR, join_sampled_unix_to_result};
 use crate::release_private::{
     PreparedPrivateCandidateV2, PrivateCandidateInputs, prepare_private_candidate,
     validate_private_candidate_record,
@@ -111,6 +107,8 @@ fn run_candidate_epoch_choreography(
     target: &str,
     downloaded: &DownloadedCandidateV2,
     e0: &CandidateInstalledH0V1,
+    mut journal: Option<&mut crate::private_candidate_producer::CandidateProducerJournalV1>,
+    plan: Option<&crate::private_candidate_producer::StaticCandidateProducerIntentV1>,
 ) -> Result<CandidateInstalledH0V1> {
     const CONTROL: &str = "private_tcp::native_tcp_bind_listen_connect";
     let target_id = match target {
@@ -118,9 +116,28 @@ fn run_candidate_epoch_choreography(
         "aarch64-unknown-linux-gnu" => "linux-arm64",
         _ => return Err(CiError::Message("historical epoch target differs".into())),
     };
-    let run_control = |challenge: [u8; 32]| -> Result<
+    let run_control = |journal: Option<
+        &mut crate::private_candidate_producer::CandidateProducerJournalV1,
+    >,
+                       ordinal: u32|
+     -> Result<(
+        [u8; 32],
         crate::private_protected_readback::StructuralProtectedNativeCaseV1,
-    > {
+    )> {
+        let prepared = journal
+            .as_ref()
+            .map(|journal| {
+                journal.prepare_case(
+                    CONTROL,
+                    crate::private_kernel_replay::IntervalPurposeV1::Historical,
+                    ordinal,
+                )
+            })
+            .transpose()?;
+        let challenge = prepared
+            .as_ref()
+            .map(|case| case.challenge)
+            .map_or_else(fresh_challenge, Ok)?;
         let result_path =
             release_case_result_path(NativeRunStageV2::CandidateCapability, CONTROL, challenge)?;
         match std::fs::symlink_metadata(&result_path) {
@@ -142,24 +159,82 @@ fn run_candidate_epoch_choreography(
             OsString::from("--challenge"),
             OsString::from(hex::encode(challenge)),
         ];
-        let process =
-            supervise_private_case_process(Path::new(AGENT), &args, Duration::from_secs(120))?;
-        if !process.status.success() {
-            return Err(CiError::Message(
-                "historical TCP control did not complete".into(),
-            ));
-        }
-        let structural = read_structural_protected_native_case(
-            NativeRunStageV2::CandidateCapability,
-            target,
-            CONTROL,
-            challenge,
-        )?;
-        verify_candidate_worker_exited(&structural)?;
-        Ok(structural)
+        let mut phases = crate::private_candidate_producer::CandidateLivePhasesV1::default();
+        let mut execute =
+            || -> Result<crate::private_protected_readback::StructuralProtectedNativeCaseV1> {
+                let process = if let Some(prepared) = &prepared {
+                    let plan = plan
+                        .ok_or_else(|| CiError::Message("historical live recipe absent".into()))?;
+                    let directory = Path::new(PRIVATE_RELEASE_RESULT_ROOT_V1)
+                        .join(String::from(prepared.key.clone()));
+                    supervise_private_case_process_with_observer(
+                        Path::new(AGENT),
+                        &args,
+                        Duration::from_secs(120),
+                        || {
+                            match std::fs::symlink_metadata(&directory) {
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    return Ok(None);
+                                }
+                                Err(error) => return Err(error.into()),
+                                Ok(_) => {}
+                            }
+                            if crate::private_candidate_producer::sample_candidate_phases_if_ready(
+                                &directory,
+                                CONTROL,
+                                target,
+                                &challenge,
+                                &plan.observer.agent_sha256,
+                                &prepared.recipe,
+                                &prepared.argv,
+                                &mut phases,
+                            )? {
+                                Ok(Some(()))
+                            } else {
+                                Ok(None)
+                            }
+                        },
+                    )?
+                    .0
+                } else {
+                    supervise_private_case_process(
+                        Path::new(AGENT),
+                        &args,
+                        Duration::from_secs(120),
+                    )?
+                };
+                if !process.status.success() {
+                    return Err(CiError::Message(
+                        "historical TCP control did not complete".into(),
+                    ));
+                }
+                let structural = read_structural_protected_native_case(
+                    NativeRunStageV2::CandidateCapability,
+                    target,
+                    CONTROL,
+                    challenge,
+                )?;
+                verify_candidate_worker_exited(&structural)?;
+                phases.close_observer_namespaces()?;
+                Ok(structural)
+            };
+        let structural = if let (Some(journal), Some(prepared)) = (journal, prepared.as_ref()) {
+            let (raw, detached) = run_candidate_journal_interval(
+                journal,
+                &plan
+                    .ok_or_else(|| CiError::Message("historical enrolled observer absent".into()))?
+                    .observer,
+                prepared,
+                execute,
+            )?;
+            retain_candidate_raw_interval(journal, prepared, &detached, &raw, &phases, None)?;
+            raw
+        } else {
+            execute()?
+        };
+        Ok((challenge, structural))
     };
-    let e0_challenge = fresh_challenge()?;
-    let accepted_e0 = run_control(e0_challenge)?;
+    let (e0_challenge, accepted_e0) = run_control(journal.as_deref_mut(), 0)?;
     let PrivateReleaseInstalledBindingV1::CandidateCapability {
         installation_epoch: e0_recorded_epoch,
         candidate_manifest_sha256: e0_manifest,
@@ -199,19 +274,87 @@ fn run_candidate_epoch_choreography(
             "historical E1 did not advance byte-identical B".into(),
         ));
     }
-    let replay = CommandSpec::new(AGENT, root, Duration::from_secs(30))
-        .remove_github_token()
-        .args([
-            "package",
-            "release-case-epoch-replay",
-            "--stage",
-            "candidate-capability",
-            "--selector",
+    if let Some(journal) = journal.as_deref_mut() {
+        let (generation, raw, _) = crate::private_candidate_producer::observe_candidate_generation(
+            plan.ok_or_else(|| CiError::Message("historical generation recipe absent".into()))?,
+            1,
+            e1.manifest_sha256.clone(),
+            e1.inspection_sha256.clone(),
+            &e1.inspection_bytes,
+            e1.installation_epoch.clone(),
+        )?;
+        journal.observe_upgrade(generation)?;
+        journal.queue_generation_raw(raw)?;
+    }
+    let replay_operation = || {
+        CommandSpec::new(AGENT, root, Duration::from_secs(30))
+            .remove_github_token()
+            .args([
+                "package",
+                "release-case-epoch-replay",
+                "--stage",
+                "candidate-capability",
+                "--selector",
+                CONTROL,
+                "--challenge",
+                &hex::encode(e0_challenge),
+            ])
+            .run()
+    };
+    let replay = if let Some(journal) = journal.as_deref_mut() {
+        let mut case = journal.prepare_case(
             CONTROL,
-            "--challenge",
-            &hex::encode(e0_challenge),
-        ])
-        .run()?;
+            crate::private_kernel_replay::IntervalPurposeV1::Historical,
+            1,
+        )?;
+        case.challenge = e0_challenge;
+        case.key = accepted_e0.result.result_key().map_err(CiError::Message)?;
+        case.interval_id.logical_case_key = case.key.clone();
+        let (replay, detached) = run_candidate_journal_interval(
+            journal,
+            &plan
+                .ok_or_else(|| CiError::Message("historical replay observer absent".into()))?
+                .observer,
+            &case,
+            replay_operation,
+        )?;
+        let prefix = Path::new("candidate-c-v3/observer/intervals")
+            .join(String::from(case.interval_id.storage_sha256()));
+        let capture = prefix.join("capture.bin").to_string_lossy().into_owned();
+        let clock = prefix.join("clock.json").to_string_lossy().into_owned();
+        journal.append_raw(capture.clone(), detached.interval.capture_bytes()?.to_vec())?;
+        journal.append_raw(
+            clock.clone(),
+            crate::private_observer_session::canonical_bytes(
+                detached.interval.clock_inputs().ok_or_else(|| {
+                    CiError::Message("historical replay original clock inputs absent".into())
+                })?,
+            )?,
+        )?;
+        journal.append_raw(
+            prefix.join("request.json").to_string_lossy().into_owned(),
+            accepted_e0.candidate_request_bytes.clone(),
+        )?;
+        journal.append_raw(
+            prefix
+                .join("replay-rejection.json")
+                .to_string_lossy()
+                .into_owned(),
+            replay.clone(),
+        )?;
+        journal.close_after_detach(
+            &case,
+            &detached.interval,
+            capture,
+            vec![detached.controls_path],
+            vec![clock],
+            detached.arm_monotonic_ns,
+            detached.detach_monotonic_ns,
+        )?;
+        replay
+    } else {
+        replay_operation()?
+    };
     if replay.len() > 16 * 1024 {
         return Err(CiError::Message(
             "historical E1 replay readback exceeds bound".into(),
@@ -233,7 +376,7 @@ fn run_candidate_epoch_choreography(
             "historical E1 replay mismatch differs".into(),
         ));
     }
-    let fresh_e1 = run_control(fresh_challenge()?)?;
+    let (_, fresh_e1) = run_control(journal.as_deref_mut(), 2)?;
     let PrivateReleaseInstalledBindingV1::CandidateCapability {
         installation_epoch: fresh_epoch,
         candidate_manifest_sha256: fresh_manifest,
@@ -623,6 +766,8 @@ fn run_candidate_policy_branches(
     h0: &CandidateInstalledH0V1,
     target: &str,
     native_machine: &str,
+    mut journal: Option<&mut crate::private_candidate_producer::CandidateProducerJournalV1>,
+    collector: Option<&DiagnosticSha256>,
 ) -> Result<crate::private_candidate_c_v3::CandidateCaseBytesV3> {
     use crate::private_kernel_observer::{
         ExpectedKernelAdapterV1, InstalledObserverRoleV1,
@@ -670,10 +815,16 @@ fn run_candidate_policy_branches(
                 broker_cgroup_inode: secondary.cgroup_inode,
             }
         };
-    let controls = crate::private_probe_controls::run_fixed_known_action_controls(
-        &probe,
-        expected(pinned.control_result_key.clone(), reader, service),
-    )?;
+    let controls = if journal.is_none() {
+        Some(
+            crate::private_probe_controls::run_fixed_known_action_controls(
+                &probe,
+                expected(pinned.control_result_key.clone(), reader, service),
+            )?,
+        )
+    } else {
+        None
+    };
     let mut keys = Vec::with_capacity(5);
     let mut expected_intervals = Vec::with_capacity(5);
     for branch in PolicyOperationBranchV1::ALL {
@@ -693,26 +844,192 @@ fn run_candidate_policy_branches(
         .map_err(|_| CiError::Message("policy branch interval count differs".into()))?;
     let base_hex = hex::encode(fixture.base_challenge());
     let mut supervised = Vec::with_capacity(5);
-    let intervals = crate::private_policy_intervals::run_policy_intervals(
-        &probe,
-        controls.controls(),
-        expected_intervals,
-        |branch| {
-            let output = CommandSpec::new(AGENT, root, Duration::from_secs(120))
-                .remove_github_token()
-                .args([
-                    "package",
-                    "release-case-policy-branches",
-                    "--challenge",
-                    base_hex.as_str(),
-                    "--branch",
-                    branch.as_str(),
-                ])
-                .run()?;
+    let mut enrolled_policy = Vec::new();
+    let intervals = if let Some(journal) = journal.as_deref_mut() {
+        let base = journal.prepare_case(
+            POLICY_SELECTOR,
+            crate::private_kernel_replay::IntervalPurposeV1::Policy,
+            0,
+        )?;
+        if &base.challenge != fixture.base_challenge() || collector.is_none() {
+            return Err(CiError::Message(
+                "policy live base challenge/collector absent or different".into(),
+            ));
+        }
+        let mut detached_intervals = Vec::with_capacity(5);
+        for (index, branch) in PolicyOperationBranchV1::ALL.into_iter().enumerate() {
+            let mut prepared = journal.prepare_case(
+                POLICY_SELECTOR,
+                crate::private_kernel_replay::IntervalPurposeV1::Policy,
+                0,
+            )?;
+            prepared.challenge = policy_branch_challenge_v1(fixture.base_challenge(), branch)
+                .map_err(|error| CiError::Message(error.into()))?;
+            prepared.key = keys[index].clone();
+            prepared.interval_id.logical_case_key = prepared.key.clone();
+            prepared.interval_id.ordinal = index as u32;
+            let (expected_key, expected_id) =
+                crate::private_candidate_replay::candidate_policy_interval_identity_v1(
+                    &journal.descriptor().session_nonce,
+                    prepared.interval_id.generation,
+                    fixture.base_challenge(),
+                    branch,
+                )?;
+            if prepared.key != expected_key || prepared.interval_id.storage_sha256() != expected_id
+            {
+                return Err(CiError::Message(
+                    "policy independent branch physical recipe differs".into(),
+                ));
+            }
+            let (output, detached) =
+                run_candidate_journal_interval(journal, pinned, &prepared, || {
+                    CommandSpec::new(AGENT, root, Duration::from_secs(120))
+                        .remove_github_token()
+                        .args([
+                            "package",
+                            "release-case-policy-branches",
+                            "--challenge",
+                            base_hex.as_str(),
+                            "--branch",
+                            branch.as_str(),
+                        ])
+                        .run()
+                })?;
             supervised.push(output);
-            Ok(())
-        },
-    )?;
+            let prefix = Path::new("candidate-c-v3/observer/intervals")
+                .join(String::from(prepared.interval_id.storage_sha256()));
+            let path = |leaf: &str| prefix.join(leaf).to_string_lossy().into_owned();
+            let case_directory =
+                Path::new(PRIVATE_RELEASE_RESULT_ROOT_V1).join(String::from(prepared.key.clone()));
+            let request = crate::private_protected_readback::read_protected_raw_case_file(
+                &case_directory.join("request.json"),
+            )?;
+            let raw = crate::private_protected_readback::read_protected_raw_case_file(
+                &case_directory.join("policy-branches.raw.json"),
+            )?;
+            let raw_record = ProtectedPolicyBranchRawV1::parse(&raw, fixture.base_challenge())
+                .map_err(CiError::Message)?;
+            let protected = crate::private_protected_readback::parse_protected_candidate_request(
+                &request,
+                POLICY_SELECTOR,
+                prepared.challenge,
+                &prepared.key,
+            )?;
+            if raw_record.branch != branch
+                || raw_record.result_key != prepared.key
+                || protected.result_key != prepared.key
+            {
+                return Err(CiError::Message(
+                    "policy live branch original key differs".into(),
+                ));
+            }
+            let capture_path = if index == 0 {
+                Path::new("candidate-c-v3/cases")
+                    .join(String::from(base.key.clone()))
+                    .join(format!(
+                        "kernel-{}.capture.bin",
+                        String::from(collector.expect("checked collector").clone())
+                    ))
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                path("capture.bin")
+            };
+            let clock_path = path("clock.json");
+            let original_clock = detached
+                .interval
+                .clock_inputs()
+                .ok_or_else(|| CiError::Message("policy original reader clock absent".into()))?;
+            journal.append_raw(
+                capture_path.clone(),
+                detached.interval.capture_bytes()?.to_vec(),
+            )?;
+            journal.append_raw(
+                clock_path.clone(),
+                crate::private_observer_session::canonical_bytes(original_clock)?,
+            )?;
+            journal.append_raw(path("request.json"), request)?;
+            journal.append_raw(path("policy-branches.raw.json"), raw)?;
+            if index == 0 {
+                let fixture_bytes =
+                    crate::private_protected_readback::read_protected_raw_case_file(Path::new(
+                        "/var/lib/memcordon/sealed/private-release-policy-v1.json",
+                    ))?;
+                if hash_bytes(&fixture_bytes) != *fixture.fixture_sha256() {
+                    return Err(CiError::Message(
+                        "policy retained actual fixture digest differs".into(),
+                    ));
+                }
+                let activation_bytes =
+                    crate::private_protected_readback::read_protected_raw_case_file(Path::new(
+                        "/var/lib/memcordon/policy/policy-activation.json",
+                    ))?;
+                let activation: serde_json::Value = serde_json::from_slice(&activation_bytes)?;
+                let registry: memcordon_core::workload_registry_v2::PolicyRegistryV2 =
+                    serde_json::from_value(
+                        activation
+                            .get("registry")
+                            .ok_or_else(|| {
+                                CiError::Message("policy activation registry absent".into())
+                            })?
+                            .clone(),
+                    )?;
+                if registry.canonical_digest().map_err(CiError::Message)?
+                    != *fixture.registry_sha256()
+                {
+                    return Err(CiError::Message(
+                        "policy retained actual registry digest differs".into(),
+                    ));
+                }
+                journal.append_raw(path("fixture.json"), fixture_bytes)?;
+                journal.append_raw(path("activation.json"), activation_bytes)?;
+                journal.append_raw(path("registry.json"), serde_json::to_vec(&registry)?)?;
+            }
+            journal.close_after_detach(
+                &prepared,
+                &detached.interval,
+                capture_path.clone(),
+                vec![detached.controls_path.clone()],
+                vec![clock_path.clone()],
+                detached.arm_monotonic_ns,
+                detached.detach_monotonic_ns,
+            )?;
+            enrolled_policy.push((
+                prepared,
+                prefix,
+                capture_path,
+                clock_path,
+                detached.controls_path,
+            ));
+            detached_intervals.push(detached.interval);
+        }
+        crate::private_policy_intervals::VerifiedPolicyIntervalsV1::from_detached(
+            detached_intervals
+                .try_into()
+                .map_err(|_| CiError::Message("policy detached interval count differs".into()))?,
+        )?
+    } else {
+        crate::private_policy_intervals::run_policy_intervals(
+            &probe,
+            controls.as_ref().expect("diagnostic controls").controls(),
+            expected_intervals,
+            |branch| {
+                let output = CommandSpec::new(AGENT, root, Duration::from_secs(120))
+                    .remove_github_token()
+                    .args([
+                        "package",
+                        "release-case-policy-branches",
+                        "--challenge",
+                        base_hex.as_str(),
+                        "--branch",
+                        branch.as_str(),
+                    ])
+                    .run()?;
+                supervised.push(output);
+                Ok(())
+            },
+        )?
+    };
     let mut raws = Vec::with_capacity(5);
     let mut raw_bytes = Vec::with_capacity(5);
     let mut request_bytes = Vec::with_capacity(5);
@@ -958,12 +1275,165 @@ fn run_candidate_policy_branches(
             captures[index].clone(),
         );
     }
-    Ok(crate::private_candidate_c_v3::CandidateCaseBytesV3 {
+    let case_bytes = crate::private_candidate_c_v3::CandidateCaseBytesV3 {
         result: serde_json::to_vec(&result)?,
         attachments,
         kernel_capture: captures[0].clone(),
         family_raw,
-    })
+    };
+    if let Some(journal) = journal.as_deref_mut() {
+        use crate::private_candidate_replay::{
+            CaseFactV1, CaseReplayFactsV1, PolicyBranchV1 as ReplayPolicyBranch, ReplayLeafRoleV1,
+            ReplayLeafV1, ReplayTaskV1,
+        };
+        let base = journal.prepare_case(
+            POLICY_SELECTOR,
+            crate::private_kernel_replay::IntervalPurposeV1::Policy,
+            0,
+        )?;
+        let case_prefix = Path::new("candidate-c-v3/cases").join(String::from(base.key.clone()));
+        let case_path = |leaf: &str| case_prefix.join(leaf).to_string_lossy().into_owned();
+        let mut replay_branches = Vec::with_capacity(5);
+        for (index, (prepared, prefix, capture_path, _, _)) in enrolled_policy.iter().enumerate() {
+            let events =
+                crate::private_kernel_replay::parse_capture_v2(&captures[index], &prepared.key)?;
+            let request: ProtectedCandidateReleaseRequestV1 =
+                serde_json::from_slice(&request_bytes[index])?;
+            let clock = intervals
+                .positive()
+                .clock_inputs()
+                .ok_or_else(|| CiError::Message("policy original branch clock absent".into()))?;
+            let clock = if index == 0 {
+                clock
+            } else {
+                intervals.rejected()[index - 1]
+                    .clock_inputs()
+                    .ok_or_else(|| CiError::Message("policy original branch clock absent".into()))?
+            };
+            let calibrated =
+                crate::private_process_clock::ParsedProcClockCalibrationV1::parse(clock)?;
+            let callers: Vec<_> = events
+                .events()
+                .iter()
+                .filter(|event| {
+                    event.kind == 1
+                        && event.task.tid == request.coordinator.pid
+                        && calibrated.matches(
+                            crate::private_kernel_observer::KernelTaskIdentityV1 {
+                                pid: event.task.tid,
+                                start_time: event.task.start_boottime_ns,
+                                cgroup_inode: event.task.cgroup_inode,
+                                time_ns_inode: event.task.time_ns_inode,
+                            },
+                            request.coordinator.start_time,
+                        )
+                })
+                .collect();
+            let [caller] = callers.as_slice() else {
+                return Err(CiError::Message(
+                    "policy exact actual request caller absent or duplicated".into(),
+                ));
+            };
+            let (name, predicate) = match index {
+                0 => ("accepted", None),
+                1 => ("wrong-grant", Some("grant-caller")),
+                2 => ("wrong-profile", Some("profile-digest")),
+                3 => ("unapproved-port", Some("plan-membership")),
+                4 => ("frozen-tamper", Some("frozen-binding")),
+                _ => unreachable!("closed policy branch count"),
+            };
+            let source_path = |leaf: &str| prefix.join(leaf).to_string_lossy().into_owned();
+            replay_branches.push(ReplayPolicyBranch {
+                branch: name.into(),
+                capture_path: capture_path.clone(),
+                request_path: source_path("request.json"),
+                response_path: source_path("policy-branches.raw.json"),
+                caller_uid: fixture.authenticated_caller_uid(),
+                caller_task: ReplayTaskV1 {
+                    tid: caller.task.tid,
+                    tgid: caller.task.tgid,
+                    start_boottime_ns: caller.task.start_boottime_ns,
+                    cgroup_inode: caller.task.cgroup_inode,
+                    time_ns_inode: caller.task.time_ns_inode,
+                },
+                rejection_predicate: predicate.map(str::to_owned),
+                registry_sha256: fixture.registry_sha256().clone(),
+                fixture_sha256: fixture.fixture_sha256().clone(),
+                raw_path: source_path("policy-branches.raw.json"),
+            });
+        }
+        let (accepted, prefix, _, clock_path, controls_path) = enrolled_policy
+            .first()
+            .ok_or_else(|| CiError::Message("policy enrolled accepted capture absent".into()))?;
+        let sources =
+            crate::private_candidate_replay::expand_replay_payload(journal.raw_payload())?;
+        let source = |path: &str| {
+            sources
+                .get(path)
+                .cloned()
+                .ok_or_else(|| CiError::Message("policy original custody leaf absent".into()))
+        };
+        let facts = CaseReplayFactsV1 {
+            schema_version: 1,
+            selector: POLICY_SELECTOR.into(),
+            result_key: base.key.clone(),
+            generation: accepted.interval_id.generation,
+            interval_id: accepted.interval_id.storage_sha256(),
+            target: replay_branches[0].caller_task.clone(),
+            facts: vec![CaseFactV1::Policy {
+                branches: replay_branches,
+                accepted_registry_path: prefix.join("registry.json").to_string_lossy().into_owned(),
+                fixture_path: prefix.join("fixture.json").to_string_lossy().into_owned(),
+            }],
+            clock_path: clock_path.clone(),
+            held_sample_paths: Vec::new(),
+        };
+        let bundle = crate::private_candidate_replay::encode_replay_bundle(&[
+            ReplayLeafV1 {
+                role: ReplayLeafRoleV1::Facts,
+                ordinal: 0,
+                bytes: crate::private_observer_session::canonical_bytes(&facts)?,
+            },
+            ReplayLeafV1 {
+                role: ReplayLeafRoleV1::Request,
+                ordinal: 0,
+                bytes: request_bytes[0].clone(),
+            },
+            ReplayLeafV1 {
+                role: ReplayLeafRoleV1::Clock,
+                ordinal: 0,
+                bytes: source(clock_path)?,
+            },
+            ReplayLeafV1 {
+                role: ReplayLeafRoleV1::Controls,
+                ordinal: 0,
+                bytes: source(controls_path)?,
+            },
+        ])?;
+        journal.append_representation(case_path("result.json"), case_bytes.result.clone())?;
+        for (role, bytes) in
+            memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL
+                .into_iter()
+                .zip(&case_bytes.attachments)
+        {
+            journal.append_representation(case_path(role.leaf()), bytes.clone())?;
+        }
+        for (leaf, bytes) in &case_bytes.family_raw {
+            journal.append_representation(
+                case_path(&Path::new("family").join(leaf).to_string_lossy()),
+                bytes.clone(),
+            )?;
+        }
+        journal.append_representation(case_path("family/replay-bundle.v1.bin"), bundle)?;
+        let original_paths = journal
+            .raw_payload()
+            .keys()
+            .filter(|path| path.starts_with("candidate-c-v3/observer/"))
+            .cloned()
+            .collect();
+        journal.repack_sources(case_path("family/source-carrier.v1.bin"), original_paths)?;
+    }
+    Ok(case_bytes)
 }
 
 /// The raw-only ABI command has no producer-signed `result.json`. CI composes
@@ -971,13 +1441,19 @@ fn run_candidate_policy_branches(
 /// loss-free kernel interval.
 
 #[cfg(target_os = "linux")]
-fn installed_arm_helper_identity() -> Result<(u64, u64)> {
+fn observe_installed_arm_helper(
+    operation: impl FnOnce() -> Result<()>,
+) -> Result<(
+    crate::private_candidate_abi_facts::ArmHelperMeasurementV1,
+    Vec<u8>,
+)> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let path = Path::new("/usr/libexec/memcordon-arm32-abi-helper");
     let mut file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)?;
+    let begin_monotonic_ns = memcordon_platform::test_support::private_observer_monotonic_ns()?;
     let before = file.metadata()?;
     if !before.is_file() || before.uid() != 0 || before.mode() & 0o022 != 0 || before.nlink() != 1 {
         return Err(CiError::Message(
@@ -986,9 +1462,19 @@ fn installed_arm_helper_identity() -> Result<(u64, u64)> {
     }
     let mut bytes = Vec::new();
     (&mut file).take(1024 * 1024).read_to_end(&mut bytes)?;
+    operation()?;
     let after = file.metadata()?;
+    let end_monotonic_ns = memcordon_platform::test_support::private_observer_monotonic_ns()?;
     if before.dev() != after.dev()
         || before.ino() != after.ino()
+        || before.uid() != after.uid()
+        || before.mode() != after.mode()
+        || before.nlink() != after.nlink()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
         || before.len() != bytes.len() as u64
         || hash_bytes(&bytes) != hash_bytes(&crate::arm32_abi_helper::static_aarch32_helper())
     {
@@ -996,11 +1482,30 @@ fn installed_arm_helper_identity() -> Result<(u64, u64)> {
             "installed ARM32 helper differs from reviewed B".into(),
         ));
     }
-    Ok((before.dev(), before.ino()))
+    Ok((
+        crate::private_candidate_abi_facts::ArmHelperMeasurementV1 {
+            schema_version: 1,
+            device: before.dev(),
+            inode: before.ino(),
+            uid: before.uid(),
+            mode: before.mode(),
+            nlink: before.nlink(),
+            size: before.len(),
+            sha256: hash_bytes(&bytes),
+            begin_monotonic_ns,
+            end_monotonic_ns,
+        },
+        bytes,
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn installed_arm_helper_identity() -> Result<(u64, u64)> {
+fn observe_installed_arm_helper(
+    _operation: impl FnOnce() -> Result<()>,
+) -> Result<(
+    crate::private_candidate_abi_facts::ArmHelperMeasurementV1,
+    Vec<u8>,
+)> {
     Err(CiError::Message(
         "ARM32 ABI helper identity requires Linux".into(),
     ))
@@ -1012,6 +1517,9 @@ fn run_candidate_abi_subwitness(
     downloaded: &DownloadedCandidateV2,
     h0: &CandidateInstalledH0V1,
     challenge: [u8; 32],
+    mut journal: Option<&mut crate::private_candidate_producer::CandidateProducerJournalV1>,
+    prepared: Option<&crate::private_candidate_producer::PreparedCandidateCaseV1>,
+    collector: Option<&DiagnosticSha256>,
 ) -> Result<crate::private_candidate_c_v3::CandidateCaseBytesV3> {
     const ABI: &str = "private_tcp::abi_alternate_entry_denied";
     let result_key =
@@ -1026,21 +1534,93 @@ fn run_candidate_abi_subwitness(
         ));
     }
     let challenge_hex = hex::encode(challenge);
-    let (_, interval) = run_candidate_case_interval(fixture, result_key.clone(), || {
-        CommandSpec::new(AGENT, root, Duration::from_secs(180))
-            .remove_github_token()
-            .args([
-                "package",
-                "release-case-abi-raw",
-                "--stage",
-                "candidate-capability",
-                "--selector",
-                ABI,
-                "--challenge",
-                challenge_hex.as_str(),
-            ])
-            .run()
-    })?;
+    let mut phases = crate::private_candidate_producer::CandidateLivePhasesV1::default();
+    let mut arm_helper = None;
+    let operation = || -> Result<()> {
+        let mut produce = || -> Result<()> {
+            if let Some(case) = prepared {
+                let arguments = [
+                    "package",
+                    "release-case-abi-raw",
+                    "--stage",
+                    "candidate-capability",
+                    "--selector",
+                    ABI,
+                    "--challenge",
+                    challenge_hex.as_str(),
+                ]
+                .map(OsString::from);
+                let (process, _) = supervise_private_case_process_with_observer(
+                    Path::new(AGENT),
+                    &arguments,
+                    Duration::from_secs(180),
+                    || {
+                        match std::fs::symlink_metadata(&directory) {
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(error.into()),
+                            Ok(_) => (),
+                        }
+                        let sampled =
+                            crate::private_candidate_producer::sample_candidate_phases_if_ready(
+                                &directory,
+                                ABI,
+                                &downloaded.prepared.manifest.target,
+                                &challenge,
+                                &fixture.observer().agent_sha256,
+                                &case.recipe,
+                                &case.argv,
+                                &mut phases,
+                            )?;
+                        Ok(sampled.then_some(()))
+                    },
+                )?;
+                if !process.status.success() {
+                    return Err(CiError::Message(
+                        "candidate ABI supervised native producer failed".into(),
+                    ));
+                }
+                phases.close_observer_namespaces()?;
+            } else {
+                CommandSpec::new(AGENT, root, Duration::from_secs(180))
+                    .remove_github_token()
+                    .args([
+                        "package",
+                        "release-case-abi-raw",
+                        "--stage",
+                        "candidate-capability",
+                        "--selector",
+                        ABI,
+                        "--challenge",
+                        challenge_hex.as_str(),
+                    ])
+                    .run()?;
+            }
+            Ok(())
+        };
+        if downloaded.prepared.manifest.target == "aarch64-unknown-linux-gnu" {
+            let (measurement, bytes) = observe_installed_arm_helper(produce)?;
+            phases.source_leaves.insert("abi-helper.raw".into(), bytes);
+            phases.source_leaves.insert(
+                "abi-helper-metadata.json".into(),
+                crate::private_observer_session::canonical_bytes(&measurement)?,
+            );
+            arm_helper = Some((measurement.device, measurement.inode));
+        } else {
+            produce()?;
+        }
+        Ok(())
+    };
+    let captured = if let (Some(journal), Some(case)) = (journal.as_deref_mut(), prepared) {
+        let (_, detached) =
+            run_candidate_journal_interval(journal, fixture.observer(), case, operation)?;
+        CandidateCapturedIntervalV1::Enrolled(detached)
+    } else {
+        let (_, interval) = run_candidate_case_interval(fixture, result_key.clone(), operation)?;
+        CandidateCapturedIntervalV1::Diagnostic(interval)
+    };
+    let interval = captured.interval();
     interval.verify_allocation(&result_key)?;
     let request = crate::private_protected_readback::read_protected_raw_case_file(
         &directory.join("request.json"),
@@ -1246,7 +1826,9 @@ fn run_candidate_abi_subwitness(
             arm32_filtered,
             ..
         } => {
-            let (helper_dev, helper_inode) = installed_arm_helper_identity()?;
+            let (helper_dev, helper_inode) = arm_helper.ok_or_else(|| {
+                CiError::Message("actual held ARM ABI helper source absent".into())
+            })?;
             AbiCompositeIntentV1::Arm64 {
                 native: task(native)?,
                 arm32_control: task(arm32_control)?,
@@ -1338,12 +1920,65 @@ fn run_candidate_abi_subwitness(
     let attachments: [Vec<u8>; 5] = attachment_bytes
         .try_into()
         .map_err(|_| CiError::Message("ABI positive attachment count differs".into()))?;
-    Ok(crate::private_candidate_c_v3::CandidateCaseBytesV3 {
+    let bytes = crate::private_candidate_c_v3::CandidateCaseBytesV3 {
         result: serde_json::to_vec(&result)?,
         attachments,
         kernel_capture: interval.capture_bytes()?.to_vec(),
         family_raw,
-    })
+    };
+    if let (Some(journal), Some(case), CandidateCapturedIntervalV1::Enrolled(detached)) =
+        (journal.as_deref_mut(), prepared, &captured)
+    {
+        for (name, raw) in &bytes.family_raw {
+            journal.append_raw(
+                Path::new("candidate-c-v3/cases")
+                    .join(String::from(case.key.clone()))
+                    .join("family")
+                    .join(name)
+                    .to_string_lossy()
+                    .into_owned(),
+                raw.clone(),
+            )?;
+        }
+        let result = PrivateReleaseCaseResultV1::parse(&bytes.result).map_err(CiError::Message)?;
+        let attempt_bytes = bytes
+            .family_raw
+            .get("attempt.json")
+            .ok_or_else(|| CiError::Message("candidate ABI actual native terminal absent".into()))?
+            .clone();
+        let attempt = crate::private_protected_readback::parse_protected_candidate_attempt(
+            &attempt_bytes,
+            &protected,
+            &result.observation,
+            challenge,
+        )?;
+        let raw = crate::private_protected_readback::StructuralProtectedNativeCaseV1 {
+            result,
+            candidate_request: protected,
+            candidate_request_bytes: request,
+            attempt_record: Some(attempt),
+            attempt_record_bytes: Some(attempt_bytes),
+            fault_marker_bytes: None,
+            checkpoint_gate_bytes: None,
+            attachments: bytes.attachments.to_vec(),
+        };
+        retain_candidate_raw_interval(journal, case, detached, &raw, &phases, collector)?;
+        let sources = journal
+            .raw_payload()
+            .keys()
+            .filter(|path| path.starts_with("candidate-c-v3/observer/"))
+            .cloned()
+            .collect();
+        journal.repack_sources(
+            Path::new("candidate-c-v3/cases")
+                .join(String::from(case.key.clone()))
+                .join("family/source-carrier.v1.bin")
+                .to_string_lossy()
+                .into_owned(),
+            sources,
+        )?;
+    }
+    Ok(bytes)
 }
 
 fn run_candidate_case_interval<T>(
@@ -1418,6 +2053,1784 @@ fn run_candidate_case_interval<T>(
     ))
 }
 
+struct CandidateDetachedIntervalV1 {
+    interval: crate::private_kernel_observer::VerifiedKernelIntervalV1,
+    controls_path: String,
+    arm_monotonic_ns: u64,
+    detach_monotonic_ns: u64,
+    host_sources: Option<BTreeMap<String, Vec<u8>>>,
+}
+
+enum CandidateCapturedIntervalV1 {
+    Enrolled(CandidateDetachedIntervalV1),
+    Diagnostic(crate::private_kernel_observer::VerifiedKernelIntervalV1),
+}
+impl CandidateCapturedIntervalV1 {
+    fn interval(&self) -> &crate::private_kernel_observer::VerifiedKernelIntervalV1 {
+        match self {
+            Self::Enrolled(value) => &value.interval,
+            Self::Diagnostic(value) => value,
+        }
+    }
+    fn into_interval(self) -> crate::private_kernel_observer::VerifiedKernelIntervalV1 {
+        match self {
+            Self::Enrolled(value) => value.interval,
+            Self::Diagnostic(value) => value,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn candidate_monotonic_ns() -> Result<u64> {
+    Ok(memcordon_platform::test_support::private_observer_monotonic_ns()?)
+}
+#[cfg(not(target_os = "linux"))]
+fn candidate_monotonic_ns() -> Result<u64> {
+    Err(CiError::Message(
+        "candidate interval clock requires native Linux".into(),
+    ))
+}
+
+/// Each actual BPF interval is independently enrolled before execution. The
+/// known-action interval closes with its immutable bytes before the product
+/// interval is armed; no future per-case bundle is needed to calibrate it.
+fn run_candidate_journal_interval<T>(
+    journal: &mut crate::private_candidate_producer::CandidateProducerJournalV1,
+    pinned: &memcordon_core::private_release_branch_v1::PrivatePolicyObserverIntentV1,
+    case: &crate::private_candidate_producer::PreparedCandidateCaseV1,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<(T, CandidateDetachedIntervalV1)> {
+    run_candidate_journal_interval_with_reuse(journal, pinned, case, None, operation)
+}
+
+fn run_candidate_journal_interval_with_reuse<T>(
+    journal: &mut crate::private_candidate_producer::CandidateProducerJournalV1,
+    pinned: &memcordon_core::private_release_branch_v1::PrivatePolicyObserverIntentV1,
+    case: &crate::private_candidate_producer::PreparedCandidateCaseV1,
+    reuse_pins: Option<&[(u64, u64); 3]>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<(T, CandidateDetachedIntervalV1)> {
+    use crate::private_kernel_observer::*;
+    use crate::private_kernel_replay::IntervalPurposeV1;
+    let probe = crate::private_probe_bundle::verify_probe_bundle(
+        crate::private_probe_bundle::ExpectedProbeBundleV1 {
+            bpf_source_sha256: pinned.bpf_source_sha256.clone(),
+            loader_source_sha256: pinned.loader_source_sha256.clone(),
+            object_sha256: pinned.object_sha256.clone(),
+            loader_sha256: pinned.loader_sha256.clone(),
+            agent_sha256: pinned.agent_sha256.clone(),
+            agent_build_id: pinned.agent_build_id.clone(),
+            request_entry_offset: pinned.request_entry_offset,
+            request_exit_offset: pinned.request_exit_offset,
+            allocation_entry_offset: pinned.allocation_entry_offset,
+        },
+    )?;
+    let reader = observe_live_kernel_subject(std::process::id())?;
+    let service = observe_installed_observer_subject(InstalledObserverRoleV1::SealedService)?;
+    let broker = activate_installed_network_broker_for_observation()?;
+    let expected = |key: DiagnosticSha256,
+                    primary: LiveKernelSubjectV1,
+                    secondary: LiveKernelSubjectV1| ExpectedKernelAdapterV1 {
+        boot_id: pinned.boot_id.clone(),
+        kernel_release: pinned.kernel_release.clone(),
+        btf_sha256: pinned.btf_sha256.clone(),
+        probe_map_sha256: probe.attestation_digest(),
+        result_key: key,
+        coordinator_pid: primary.pid,
+        coordinator_start_time: 0,
+        coordinator_start_ticks: primary.start_ticks,
+        cgroup_inode: primary.cgroup_inode,
+        broker_pid: secondary.pid,
+        broker_start_ticks: secondary.start_ticks,
+        broker_cgroup_inode: secondary.cgroup_inode,
+    };
+    let control = journal.prepare_case(
+        &case.selector,
+        IntervalPurposeV1::KnownControls,
+        case.interval_id.ordinal,
+    )?;
+    let arm = candidate_monotonic_ns()?;
+    journal.arm_before_execution(&control)?;
+    let controls = crate::private_probe_controls::run_fixed_known_action_controls_with_id(
+        &probe,
+        expected(control.key.clone(), reader, service),
+        control.interval_id.clone(),
+    )?;
+    let detach = candidate_monotonic_ns()?;
+    let prefix = Path::new("candidate-c-v3/observer/intervals")
+        .join(String::from(control.interval_id.storage_sha256()));
+    let control_path = prefix.join("capture.bin").to_string_lossy().into_owned();
+    let clock_path = prefix.join("clock.json").to_string_lossy().into_owned();
+    journal.append_raw(
+        control_path.clone(),
+        controls.interval().capture_bytes()?.to_vec(),
+    )?;
+    journal.append_raw(
+        clock_path.clone(),
+        crate::private_observer_session::canonical_bytes(
+            controls.interval().clock_inputs().ok_or_else(|| {
+                CiError::Message("native control original clock inputs absent".into())
+            })?,
+        )?,
+    )?;
+    journal.append_raw(
+        prefix
+            .join("control-output.raw")
+            .to_string_lossy()
+            .into_owned(),
+        controls.command_output().to_vec(),
+    )?;
+    journal.close_after_detach(
+        &control,
+        controls.interval(),
+        control_path.clone(),
+        vec![control_path.clone()],
+        vec![clock_path],
+        arm,
+        detach,
+    )?;
+    let host_watch = if let Some(revision) = &case.recipe.host_preservation_source_sha256 {
+        if revision
+            != &crate::private_candidate_host_facts::host_preservation_source_revision_sha256()
+        {
+            return Err(CiError::Message(
+                "host continuity source revision not approved".into(),
+            ));
+        }
+        Some(memcordon_platform::test_support::HostNetworkWatchV1::start()?)
+    } else {
+        None
+    };
+    let arm_monotonic_ns = candidate_monotonic_ns()?;
+    journal.arm_before_execution(case)?;
+    let mut output = None;
+    let operation = || {
+        output = Some(operation()?);
+        Ok(())
+    };
+    let interval = if let Some(pins) = reuse_pins {
+        if case.recipe.reuse_source_sha256.as_ref()
+            != Some(&memcordon_core::private_reuse_source_v1::reuse_source_revision_sha256())
+            || !matches!(
+                case.interval_id.purpose,
+                IntervalPurposeV1::ReuseBlocked | IntervalPurposeV1::Recovery
+            )
+            || host_watch.is_some()
+            || case.recipe.filter_install_source_sha256.is_some()
+        {
+            return Err(CiError::Message(
+                "Reuse operand capture lacks exact reviewed source purpose".into(),
+            ));
+        }
+        run_probe_interval_raw_with_reuse_sources(
+            &probe,
+            expected(case.key.clone(), reader, broker),
+            controls.controls(),
+            case.interval_id.clone(),
+            pins,
+            operation,
+        )?
+    } else if let Some(watch) = &host_watch {
+        if case.recipe.filter_install_source_sha256.as_ref().is_some_and(|revision|revision!=&crate::private_candidate_filter_facility_facts::filter_install_source_revision_sha256()){return Err(CiError::Message("filter source revision not approved".into()));}
+        run_probe_interval_raw_with_host_sources(
+            &probe,
+            expected(case.key.clone(), reader, broker),
+            controls.controls(),
+            case.interval_id.clone(),
+            crate::private_kernel_replay::CaptureStageV2::Candidate,
+            case.recipe.filter_install_source_sha256.is_some(),
+            watch.object_pins(),
+            operation,
+        )?
+    } else if case.recipe.filter_install_source_sha256.as_ref()
+        == Some(
+            &crate::private_candidate_filter_facility_facts::filter_install_source_revision_sha256(
+            ),
+        )
+    {
+        run_probe_interval_raw_with_filter_sources(
+            &probe,
+            expected(case.key.clone(), reader, broker),
+            controls.controls(),
+            case.interval_id.clone(),
+            crate::private_kernel_replay::CaptureStageV2::Candidate,
+            operation,
+        )?
+    } else {
+        if case.recipe.filter_install_source_sha256.is_some() {
+            return Err(CiError::Message(
+                "candidate filter source opt-in is not the reviewed revision".into(),
+            ));
+        }
+        run_probe_interval_raw_with_id(
+            &probe,
+            expected(case.key.clone(), reader, broker),
+            controls.controls(),
+            case.interval_id.clone(),
+            operation,
+        )?
+    };
+    let detach_monotonic_ns = candidate_monotonic_ns()?;
+    let host_sources = host_watch.map(|watch| watch.finish()).transpose()?;
+    Ok((
+        output.ok_or_else(|| {
+            CiError::Message("enrolled candidate operation was not invoked".into())
+        })?,
+        CandidateDetachedIntervalV1 {
+            interval,
+            controls_path: control_path,
+            arm_monotonic_ns,
+            detach_monotonic_ns,
+            host_sources,
+        },
+    ))
+}
+
+/// Retains parsed measurements, never a semantic success bit. Completed
+/// verification still demands every closed family and reopens every source.
+fn record_candidate_replay_sources(
+    journal: &mut crate::private_candidate_producer::CandidateProducerJournalV1,
+    case: &crate::private_candidate_producer::PreparedCandidateCaseV1,
+    detached: &CandidateDetachedIntervalV1,
+    raw: &crate::private_protected_readback::StructuralProtectedNativeCaseV1,
+    phases: &crate::private_candidate_producer::CandidateLivePhasesV1,
+    prefix: &Path,
+) -> Result<()> {
+    use crate::private_candidate_replay::{CaseReplayFactsV1, ReplayLeafRoleV1, ReplayLeafV1};
+    let path = |leaf: &str| prefix.join(leaf).to_string_lossy().into_owned();
+    let capture = detached.interval.capture_bytes()?;
+    let clock = detached
+        .interval
+        .clock_inputs()
+        .ok_or_else(|| CiError::Message("candidate original clock source absent".into()))?;
+    let clock_bytes = crate::private_observer_session::canonical_bytes(clock)?;
+    let before = phases.pre.as_ref().ok_or_else(|| {
+        CiError::Message("candidate independently held pre-exec source absent".into())
+    })?;
+    let parsed = crate::private_kernel_replay::parse_capture_v2_with_budget(
+        capture,
+        &case.key,
+        crate::private_kernel_replay::CaptureStageV2::Candidate,
+    )?;
+    let authorization_rejected = case.selector == "private_tcp::authorization_uncertainty_retired";
+    let after = if authorization_rejected {
+        before
+    } else {
+        phases.baseline.as_ref().ok_or_else(|| {
+            CiError::Message("candidate independently held early baseline source absent".into())
+        })?
+    };
+    let stdio = raw
+        .attachments
+        .get(2)
+        .ok_or_else(|| CiError::Message("candidate actual stdio source absent".into()))?;
+    let mut common = if authorization_rejected {
+        let calibrated = crate::private_process_clock::ParsedProcClockCalibrationV1::parse(clock)?;
+        let event = parsed
+            .events()
+            .iter()
+            .find(|event| {
+                event.task.tid == before.pid
+                    && calibrated.matches(
+                        crate::private_kernel_observer::KernelTaskIdentityV1 {
+                            pid: event.task.tid,
+                            start_time: event.task.start_boottime_ns,
+                            cgroup_inode: event.task.cgroup_inode,
+                            time_ns_inode: event.task.time_ns_inode,
+                        },
+                        before.start_time_ticks,
+                    )
+            })
+            .ok_or_else(|| {
+                CiError::Message("candidate rejected target original kernel identity absent".into())
+            })?;
+        crate::private_live_fact_recording::CommonSourceFactsV1 {
+            target: crate::private_candidate_replay::ReplayTaskV1 {
+                tid: event.task.tid,
+                tgid: event.task.tgid,
+                start_boottime_ns: event.task.start_boottime_ns,
+                cgroup_inode: event.task.cgroup_inode,
+                time_ns_inode: event.task.time_ns_inode,
+            },
+            facts: Vec::new(),
+        }
+    } else {
+        let netns = after
+            .tasks
+            .iter()
+            .find(|task| task.tid == after.pid)
+            .and_then(|task| task.namespace_inodes.get("net").copied());
+        let expected =
+            memcordon_core::private_release_case_v1::candidate_fixture_expected_response_v1(
+                &raw.result.target,
+                &case.selector,
+                &case.challenge,
+                netns,
+                Some((after.executable_device, after.executable_inode)),
+            )
+            .map_err(|error| CiError::Message(error.into()))?;
+        let response = if case.selector == DUAL_SELECTOR {
+            let second = phases.second_baseline.as_ref().ok_or_else(|| {
+                CiError::Message("dual independent second baseline absent".into())
+            })?;
+            let second_netns = second
+                .tasks
+                .iter()
+                .find(|task| task.tid == second.pid)
+                .and_then(|task| task.namespace_inodes.get("net").copied());
+            let second_expected =
+                memcordon_core::private_release_case_v1::candidate_fixture_expected_response_v1(
+                    &raw.result.target,
+                    &case.selector,
+                    &case.challenge,
+                    second_netns,
+                    Some((second.executable_device, second.executable_inode)),
+                )
+                .map_err(|error| CiError::Message(error.into()))?;
+            let mut exact = case.challenge.to_vec();
+            exact.extend_from_slice(&expected);
+            exact.extend_from_slice(&second_expected);
+            if *stdio != exact {
+                return Err(CiError::Message(
+                    "dual original stdout differs from both independent READY codecs".into(),
+                ));
+            }
+            journal.append_raw(
+                path("second-response.raw"),
+                stdio[case.challenge.len() + expected.len()..].to_vec(),
+            )?;
+            &stdio[case.challenge.len()..case.challenge.len() + expected.len()]
+        } else {
+            if expected.is_empty()
+                || !stdio.starts_with(&case.challenge)
+                || !stdio.ends_with(&expected)
+            {
+                return Err(CiError::Message(
+                "candidate actual stdout does not end with independently derived fixture response"
+                    .into(),
+            ));
+            }
+            &stdio[stdio.len() - expected.len()..]
+        };
+        journal.append_raw(path("response.raw"), response.to_vec())?;
+        crate::private_live_fact_recording::record_common_source_facts(
+            capture,
+            &case.key,
+            crate::private_kernel_replay::CaptureStageV2::Candidate,
+            &raw.result.target,
+            &clock_bytes,
+            before,
+            after,
+            path("response.raw"),
+        )?
+    };
+    if !authorization_rejected {
+        let image_path = journal.retain_shared_image(
+            after
+                .leaves
+                .get("image.raw")
+                .ok_or_else(|| CiError::Message("candidate held ELF bytes absent".into()))?
+                .clone(),
+        )?;
+        for leaf in ["ancestors-before.json", "ancestors-after.json"] {
+            journal.append_raw(
+                path(leaf),
+                after
+                    .leaves
+                    .get(leaf)
+                    .ok_or_else(|| {
+                        CiError::Message("candidate actual ELF ancestor source absent".into())
+                    })?
+                    .clone(),
+            )?;
+        }
+        common
+            .facts
+            .push(crate::private_live_fact_recording::record_elf_source_fact(
+                after,
+                image_path,
+                path("ancestors-before.json"),
+                path("ancestors-after.json"),
+            )?);
+    }
+    let retirement_target = if case.selector == CHILD_RUNTIME_SELECTOR {
+        phases.post.as_ref().ok_or_else(|| {
+            CiError::Message("candidate simultaneous held parent/thread source absent".into())
+        })?
+    } else {
+        after
+    };
+    let mut held = vec![("target", retirement_target)];
+    if let Some(second) = &phases.second_baseline {
+        held.push(("target", second));
+    }
+    held.extend(phases.held_roles.iter().map(|(role, sample)| {
+        (
+            role.rsplit('/').next().expect("held role is nonempty"),
+            sample,
+        )
+    }));
+    let observer: serde_json::Value = crate::private_observer_session::strict_json(
+        raw.attachments
+            .get(3)
+            .ok_or_else(|| CiError::Message("candidate raw observer absent".into()))?,
+        1024 * 1024,
+    )?;
+    let branches: &[&str] = if case.selector == DUAL_SELECTOR {
+        &["first", "second"]
+    } else {
+        &["settlement"]
+    };
+    let mut cgroup_bytes = Vec::new();
+    for branch in branches {
+        let cgroup = observer
+            .get(*branch)
+            .and_then(|value| value.get("cgroup_retirement_raw"))
+            .filter(|value| !value.is_null())
+            .ok_or_else(|| {
+                CiError::Message("candidate actual cgroup retirement source absent".into())
+            })?;
+        let bytes = crate::private_observer_session::canonical_bytes(cgroup)?;
+        let name = if case.selector == DUAL_SELECTOR {
+            Path::new(if *branch == "first" {
+                "dual-first"
+            } else {
+                "dual-second"
+            })
+            .join("cgroup-retirement-v1.json")
+        } else {
+            PathBuf::from("cgroup-retirement-v1.json")
+        };
+        journal.append_raw(
+            path(name.to_str().expect("fixed source path is UTF-8")),
+            bytes.clone(),
+        )?;
+        cgroup_bytes.push(bytes);
+    }
+    let mut retirement = crate::private_live_fact_recording::record_retirement_source_fact(
+        parsed.events(),
+        clock,
+        &held,
+        &cgroup_bytes,
+        &crate::private_observer_session::canonical_bytes(&phases.namespace_closes)?,
+        path("attempt.json"),
+    )?;
+    if case.selector == DUAL_SELECTOR {
+        let crate::private_candidate_replay::CaseFactV1::Retirement { tasks, .. } = &mut retirement
+        else {
+            unreachable!("retirement recorder returns Retirement")
+        };
+        for task in tasks
+            .iter_mut()
+            .filter(|task| matches!(task.role.as_str(), "guardian" | "frontend"))
+        {
+            let branch = phases
+                .held_roles
+                .iter()
+                .find(|(role, sample)| {
+                    role.rsplit('/').next() == Some(task.role.as_str())
+                        && sample.pid == task.task.tid
+                })
+                .and_then(|(role, _)| role.split_once('/').map(|(branch, _)| branch))
+                .filter(|branch| matches!(*branch, "dual-first" | "dual-second"))
+                .ok_or_else(|| {
+                    CiError::Message("actual dual role child journal branch absent".into())
+                })?;
+            task.terminal_source_path = Some(path(
+                &Path::new("journal")
+                    .join(branch)
+                    .join("attempt.json")
+                    .to_string_lossy(),
+            ));
+        }
+    }
+    common.facts.push(retirement);
+    if case.selector == "private_tcp::caller_identity_and_epoch_bound" {
+        common.facts.push(
+            crate::private_candidate_caller_facts::record_candidate_caller_fact(
+                journal.descriptor(),
+                path("request.json"),
+            )?,
+        );
+    }
+    let raw_leaves = crate::private_candidate_replay::expand_replay_payload(journal.raw_payload())?;
+    let optional = |leaf: &str| raw_leaves.contains_key(&path(leaf)).then(|| path(leaf));
+    let causal = crate::private_candidate_causal_facts::CandidateCausalPathsV1 {
+        raw_leaves: raw_leaves.clone(),
+        result_path: path("result.json"),
+        request_path: path("request.json"),
+        attempt_path: optional("attempt.json"),
+        checkpoint_path: optional("journal/release-intent-v1.json"),
+        checkpoint_metadata_path: optional("journal/release-intent-v1.json.metadata.json"),
+        midpoint_path: optional("journal/terminal-join-midflight.json"),
+        observer_path: path("observer.bin"),
+        cleanup_path: path("cleanup.bin"),
+        stdout_path: path("uncertain-stdout-v1.bin"),
+        stderr_path: path("uncertain-stderr-v1.bin"),
+        clock_path: path("clock.json"),
+        dual: (case.selector == DUAL_SELECTOR).then(|| {
+            crate::private_candidate_causal_facts::NativeDualPathsV1 {
+                result_path: path("result.json"),
+                request_path: path("request.json"),
+                first_midpoint_path: path("journal/dual-first-midflight.json"),
+                second_midpoint_path: path("journal/dual-second-midflight.json"),
+                first_terminal_path: path("journal/dual-first/attempt.json"),
+                second_terminal_path: path("journal/dual-second/attempt.json"),
+                post_retirement_path: path("journal/dual-second-post-retirement.json"),
+                first_sample_path: path("first-ready-samples.json"),
+                second_sample_path: path("second-ready-samples.json"),
+                post_sample_path: path("second-after-retirement-samples.json"),
+                clock_path: path("clock.json"),
+            }
+        }),
+    };
+    let mut causal_sample_paths = Vec::new();
+    for (leaf, sample) in [
+        ("pre-samples.json", &phases.pre),
+        ("baseline-samples.json", &phases.baseline),
+        ("second-baseline-samples.json", &phases.second_baseline),
+        ("first-ready-samples.json", &phases.first_ready),
+        ("second-ready-samples.json", &phases.second_ready),
+        ("post-samples.json", &phases.post),
+        (
+            "second-after-retirement-samples.json",
+            &phases.second_after_retirement,
+        ),
+    ] {
+        if let Some(sample) = sample {
+            causal_sample_paths.push((path(leaf), sample));
+        }
+    }
+    for (role, sample) in &phases.held_roles {
+        causal_sample_paths.push((
+            prefix
+                .join("roles")
+                .join(role)
+                .join("held-samples.v1.bin")
+                .to_string_lossy()
+                .into_owned(),
+            sample,
+        ));
+    }
+    let causal_held = causal_sample_paths
+        .iter()
+        .map(|(path, sample)| (path.as_str(), *sample))
+        .collect::<Vec<_>>();
+    common.facts.extend(
+        crate::private_candidate_causal_facts::record_candidate_causal_facts(
+            raw,
+            parsed.events(),
+            clock,
+            &common.target,
+            &causal_held,
+            &causal,
+        )?,
+    );
+    if case.selector == "private_tcp::abi_alternate_entry_denied" {
+        let family_prefix = Path::new("candidate-c-v3/cases")
+            .join(String::from(case.key.clone()))
+            .join("family");
+        let family = |leaf: &str| family_prefix.join(leaf).to_string_lossy().into_owned();
+        let branches = if raw.result.target == "x86_64-unknown-linux-gnu" {
+            crate::private_candidate_abi_facts::NativeAbiBranchesV1::X86 {
+                x32_path: family("x32-alternate.raw.json"),
+                i386_path: family("i386-entry.raw.json"),
+            }
+        } else {
+            crate::private_candidate_abi_facts::NativeAbiBranchesV1::Arm64 {
+                arm32_path: family("arm32-alternate.raw.json"),
+                helper_bytes_path: path("journal/abi-helper.raw"),
+                helper_metadata_path: path("journal/abi-helper-metadata.json"),
+            }
+        };
+        let sources = crate::private_candidate_abi_facts::NativeAbiSourcesV1 {
+            result_path: path("result.json"),
+            request_path: path("request.json"),
+            attempt_path: path("attempt.json"),
+            attachments:
+                memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL
+                    .map(|role| path(role.leaf())),
+            branches,
+        };
+        common.facts.push(
+            crate::private_candidate_abi_facts::record_candidate_abi_fact(
+                sources,
+                parsed.events(),
+                clock,
+                &common.target,
+                raw.attempt_record
+                    .as_ref()
+                    .and_then(|attempt| attempt.checkpoint_filter_sha256())
+                    .ok_or_else(|| {
+                        CiError::Message("ABI original checkpoint filter absent".into())
+                    })?,
+                detached.interval.trace_sha256(),
+                |path| {
+                    raw_leaves.get(path).map(Vec::as_slice).ok_or_else(|| {
+                        CiError::Message(format!("original ABI source absent: {path}"))
+                    })
+                },
+            )?,
+        );
+    }
+    let late = if case.selector == DUAL_SELECTOR {
+        phases.first_ready.as_ref()
+    } else {
+        phases.post.as_ref()
+    };
+    let late_path = path(if case.selector == DUAL_SELECTOR {
+        "first-ready-samples.json"
+    } else {
+        "post-samples.json"
+    });
+    let init_path = phases
+        .held_roles
+        .keys()
+        .find(|role| {
+            role.rsplit('/').next() == Some("namespace-init")
+                && (case.selector != DUAL_SELECTOR || role.starts_with("dual-first/"))
+        })
+        .map(|role| {
+            prefix
+                .join("roles")
+                .join(role)
+                .join("held-samples.v1.bin")
+                .to_string_lossy()
+                .into_owned()
+        });
+    let network = crate::private_candidate_network_facts::CandidateNetworkPathsV1 {
+        raw_leaves: raw_leaves.clone(),
+        request_path: path("request.json"),
+        response_path: path("response.raw"),
+        held_sample_path: late_path.clone(),
+        host_sample_path: late_path.clone(),
+        init_sample_path: init_path,
+    };
+    let network_held = late
+        .map(|sample| vec![(late_path.as_str(), sample)])
+        .unwrap_or_default();
+    common.facts.extend(
+        crate::private_candidate_network_facts::record_candidate_network_facts(
+            raw,
+            parsed.events(),
+            clock,
+            &common.target,
+            &network_held,
+            &network,
+        )?,
+    );
+    let spec = crate::private_case_semantics::closed_candidate_case_spec(
+        &case.selector,
+        &raw.result.target,
+    )?;
+    if spec
+        .facts
+        .contains(&crate::private_case_semantics::CaseFactKindV1::FacilityControls)
+    {
+        let record = journal
+            .descriptor()
+            .intervals
+            .iter()
+            .filter(|record| {
+                record.logical_case_key == case.key
+                    && record.generation == case.interval_id.generation
+                    && record.purpose == "facility-controls"
+            })
+            .collect::<Vec<_>>();
+        let [record] = record.as_slice() else {
+            return Err(CiError::Message(
+                "candidate Facility original physical interval absent or duplicated".into(),
+            ));
+        };
+        let facility_prefix = Path::new(&record.capture_path)
+            .parent()
+            .ok_or_else(|| CiError::Message("Facility capture parent absent".into()))?;
+        let facility_path = |leaf: &str| facility_prefix.join(leaf).to_string_lossy().into_owned();
+        let sources = crate::private_candidate_facility_replay::NativeFacilitySourcesV1 {
+            schema_version: 1,
+            capture_path: record.capture_path.clone(),
+            clock_path: facility_path("clock.json"),
+            admission_path: facility_path("request.json"),
+            report_path: facility_path("facility-source-v1.json"),
+            outer_gate_path: facility_path("facility-helper-outer-v1.json"),
+            outer_ack_path: facility_path("facility-helper-outer-v1.ack"),
+            outer_held_path: facility_path("outer-held.v1.bin"),
+            private_gate_path: facility_path("facility-helper-private-v1.json"),
+            private_ack_path: facility_path("facility-helper-private-v1.ack"),
+            private_held_path: facility_path("private-held.v1.bin"),
+            source_outer_held_path: (case.selector
+                == "private_tcp::io_uring_and_pidfd_import_denied")
+                .then(|| facility_path("source-outer-held.v1.bin")),
+            source_private_held_path: (case.selector
+                == "private_tcp::io_uring_and_pidfd_import_denied")
+                .then(|| facility_path("source-private-held.v1.bin")),
+            product_request_path: Some(path("request.json")),
+        };
+        let filter = raw
+            .attempt_record
+            .as_ref()
+            .and_then(|attempt| attempt.checkpoint_filter_sha256())
+            .ok_or_else(|| {
+                CiError::Message("Facility product original checkpoint filter absent".into())
+            })?;
+        let exact_response = raw_leaves
+            .get(&path("response.raw"))
+            .ok_or_else(|| CiError::Message("Facility product actual response absent".into()))?;
+        let expected = crate::private_candidate_replay::ExpectedCaseSubjectV1 {
+            selector: &case.selector,
+            result_key: &case.key,
+            fixture_sha256: &case.recipe.fixture_sha256,
+            filter_sha256: filter,
+            fixture_argv: &case.argv,
+            uid: case.recipe.uid,
+            gid: case.recipe.gid,
+            groups: &case.recipe.groups,
+            port: case.port,
+            challenge: &case.challenge,
+            auxiliary_semantics_sha256: case.recipe.auxiliary_semantics_sha256.as_ref(),
+            filter_install_source_sha256: case.recipe.filter_install_source_sha256.as_ref(),
+            facility_source_sha256: case.recipe.facility_source_sha256.as_ref(),
+            host_preservation_source_sha256: case.recipe.host_preservation_source_sha256.as_ref(),
+            reuse_source_sha256: case.recipe.reuse_source_sha256.as_ref(),
+            exact_response,
+        };
+        let facility_events = crate::private_kernel_replay::parse_capture_v2(
+            raw_leaves.get(&sources.capture_path).ok_or_else(|| {
+                CiError::Message("Facility actual original capture absent".into())
+            })?,
+            &case.key,
+        )?;
+        common.facts.extend(
+            crate::private_candidate_facility_replay::record_facility_source_facts(
+                journal.descriptor(),
+                &expected,
+                &common.target,
+                &record.capture_path,
+                case.interval_id.generation,
+                sources,
+                facility_events.events(),
+                |path| {
+                    raw_leaves.get(path).cloned().ok_or_else(|| {
+                        CiError::Message(format!("Facility original source absent: {path}"))
+                    })
+                },
+            )?,
+        );
+    }
+    if spec
+        .facts
+        .contains(&crate::private_case_semantics::CaseFactKindV1::HostState)
+    {
+        if case.recipe.host_preservation_source_sha256.as_ref()
+            != Some(
+                &crate::private_candidate_host_facts::host_preservation_source_revision_sha256(),
+            )
+        {
+            return Err(CiError::Message(
+                "host preservation requires explicitly approved continuity source revision".into(),
+            ));
+        }
+        let source = detached
+            .host_sources
+            .as_ref()
+            .ok_or_else(|| CiError::Message("actual host continuity source absent".into()))?;
+        let timing = detached
+            .interval
+            .observation_timing()
+            .ok_or_else(|| CiError::Message("host interval measured endpoints absent".into()))?;
+        crate::private_candidate_host_facts::verify_host_sources(
+            source,
+            parsed.events(),
+            timing.armed_monotonic_ns,
+            timing.detached_monotonic_ns,
+        )?;
+        crate::private_candidate_host_facts::verify_host_reader_clock(
+            source,
+            parsed.events(),
+            clock,
+        )?;
+        common
+            .facts
+            .push(crate::private_candidate_replay::CaseFactV1::NativeHostV1 {
+                sources: crate::private_candidate_host_facts::NativeHostSourcesV1 {
+                    schema_version: 1,
+                    source_path: path("host-continuity.v1.bin"),
+                },
+            });
+    }
+    if spec
+        .facts
+        .contains(&crate::private_case_semantics::CaseFactKindV1::Filter)
+    {
+        if case.recipe.filter_install_source_sha256.as_ref()!=Some(&crate::private_candidate_filter_facility_facts::filter_install_source_revision_sha256()){return Err(CiError::Message("installed filter source requires explicitly approved revision".into()));}
+        let sources = crate::private_candidate_filter_facility_facts::NativeFilterSourcesV1 {
+            schema_version: 1,
+            pre_path: path("pre-samples.json"),
+            baseline_path: path("baseline-samples.json"),
+            instruction_path: path("installed-filter.raw"),
+        };
+        let filter = raw
+            .attempt_record
+            .as_ref()
+            .and_then(|attempt| attempt.checkpoint_filter_sha256())
+            .ok_or_else(|| {
+                CiError::Message("installed filter actual checkpoint pin absent".into())
+            })?;
+        let (facts, bytes) =
+            crate::private_candidate_filter_facility_facts::record_filter_source_facts(
+                parsed.events(),
+                clock,
+                &common.target,
+                before,
+                after,
+                sources,
+                filter,
+            )?;
+        journal.append_raw(path("installed-filter.raw"), bytes)?;
+        common.facts.extend(facts);
+    }
+    if case.selector == UNIX_INTENT_SELECTOR {
+        let sources = crate::private_candidate_unix_facts::NativeUnixSourcesV1 {
+            result_path: path("result.json"),
+            request_path: path("request.json"),
+            gate_path: path("unix-intent-gate.json"),
+            ack_path: path("unix-intent-ack.json"),
+            held_sample_path: path("post-samples.json"),
+            response_path: path("response.raw"),
+        };
+        crate::private_candidate_unix_facts::verify_native_unix_sources(
+            &sources,
+            &common.target,
+            parsed.events(),
+            clock,
+            |path| {
+                raw_leaves
+                    .get(path)
+                    .map(Vec::as_slice)
+                    .ok_or_else(|| CiError::Message(format!("original Unix source absent: {path}")))
+            },
+        )?;
+        common
+            .facts
+            .push(crate::private_candidate_replay::CaseFactV1::NativeUnixV1 { sources });
+    }
+    let mut closed_facts = Vec::with_capacity(spec.facts.len());
+    for required in spec.facts {
+        if required == crate::private_case_semantics::CaseFactKindV1::Reuse
+            && case.selector == memcordon_core::private_reuse_source_v1::REUSE_SELECTOR_V1
+            && case.recipe.reuse_source_sha256.as_ref()
+                == Some(&memcordon_core::private_reuse_source_v1::reuse_source_revision_sha256())
+        {
+            continue;
+        }
+        let positions = common
+            .facts
+            .iter()
+            .enumerate()
+            .filter(|(_, fact)| fact.kind() == required)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [position] = positions.as_slice() else {
+            return Err(CiError::Message(format!(
+                "candidate actual source family {required:?} is missing or duplicated for {}",
+                case.selector
+            )));
+        };
+        closed_facts.push(common.facts.remove(*position));
+    }
+    let facts = CaseReplayFactsV1 {
+        schema_version: 1,
+        selector: case.selector.clone(),
+        result_key: case.key.clone(),
+        generation: case.interval_id.generation,
+        interval_id: case.interval_id.storage_sha256(),
+        target: common.target,
+        facts: closed_facts,
+        clock_path: path("clock.json"),
+        held_sample_paths: if authorization_rejected {
+            Vec::new()
+        } else {
+            vec![path("baseline-samples.json")]
+        },
+    };
+    if case.selector == memcordon_core::private_reuse_source_v1::REUSE_SELECTOR_V1 {
+        if case.interval_id.purpose != crate::private_kernel_replay::IntervalPurposeV1::ReuseFirst
+            || case.recipe.reuse_source_sha256.as_ref()
+                != Some(&memcordon_core::private_reuse_source_v1::reuse_source_revision_sha256())
+        {
+            return Err(CiError::Message(
+                "Reuse first source is not explicitly approved".into(),
+            ));
+        }
+        // This is visibly pending measurement data, never a family bundle or
+        // proof. Only the three closed physical intervals can complete it.
+        journal.append_raw(
+            path("pending-facts.json"),
+            crate::private_observer_session::canonical_bytes(&facts)?,
+        )?;
+        return Ok(());
+    }
+    if case.interval_id.purpose == crate::private_kernel_replay::IntervalPurposeV1::Historical {
+        // Historical helpers are source operands of the one all25 caller
+        // case, not additional candidate cases or nested semantic carriers.
+        journal.append_raw(
+            path("facts.json"),
+            crate::private_observer_session::canonical_bytes(&facts)?,
+        )?;
+        return Ok(());
+    }
+    let controls = raw_leaves
+        .get(&detached.controls_path)
+        .ok_or_else(|| CiError::Message("candidate original known-action controls absent".into()))?
+        .clone();
+    let leaves = vec![
+        ReplayLeafV1 {
+            role: ReplayLeafRoleV1::Facts,
+            ordinal: 0,
+            bytes: crate::private_observer_session::canonical_bytes(&facts)?,
+        },
+        ReplayLeafV1 {
+            role: ReplayLeafRoleV1::Request,
+            ordinal: 0,
+            bytes: raw.candidate_request_bytes.clone(),
+        },
+        ReplayLeafV1 {
+            role: ReplayLeafRoleV1::Clock,
+            ordinal: 0,
+            bytes: clock_bytes,
+        },
+        ReplayLeafV1 {
+            role: ReplayLeafRoleV1::Controls,
+            ordinal: 0,
+            bytes: controls,
+        },
+    ];
+    let bundle = crate::private_candidate_replay::encode_replay_bundle(&leaves)?;
+    let bundle_path = Path::new("candidate-c-v3/cases")
+        .join(String::from(case.key.clone()))
+        .join("family/replay-bundle.v1.bin");
+    journal.append_raw(bundle_path.to_string_lossy().into_owned(), bundle)?;
+    Ok(())
+}
+
+/// A separately armed decision-only source interval. The ordinary positive
+/// capture cannot stand in for absence of allocation in this rejection.
+fn run_candidate_caller_spoof_source(
+    journal: &mut crate::private_candidate_producer::CandidateProducerJournalV1,
+    plan: &crate::private_candidate_producer::StaticCandidateProducerIntentV1,
+    parent: &crate::private_candidate_producer::PreparedCandidateCaseV1,
+) -> Result<()> {
+    use crate::private_kernel_replay::IntervalPurposeV1;
+    const SELECTOR: &str = "private_tcp::caller_identity_and_epoch_bound";
+    let spoof =
+        crate::private_candidate_caller_frames::caller_spoof_challenge_v1(&parent.challenge);
+    let mut case = journal.prepare_case(SELECTOR, IntervalPurposeV1::CallerSpoof, 0)?;
+    case.challenge = parent.challenge;
+    case.key =
+        private_release_case_key_v1(PrivateReleaseStageV1::CandidateCapability, SELECTOR, &spoof)
+            .map_err(CiError::Message)?;
+    case.interval_id.logical_case_key = case.key.clone();
+    let directory = Path::new(PRIVATE_RELEASE_RESULT_ROOT_V1)
+        .join("caller-spoof-v1")
+        .join(String::from(parent.key.clone()));
+    if !matches!(fs::symlink_metadata(&directory),Err(error) if error.kind()==std::io::ErrorKind::NotFound)
+    {
+        return Err(CiError::Message(
+            "independent caller auxiliary key already exists".into(),
+        ));
+    }
+    let arguments = [
+        OsString::from("package"),
+        OsString::from("release-case-caller-spoof"),
+        OsString::from("--stage"),
+        OsString::from("candidate-capability"),
+        OsString::from("--selector"),
+        OsString::from(SELECTOR),
+        OsString::from("--challenge"),
+        OsString::from(hex::encode(parent.challenge)),
+    ];
+    let mut sampled = crate::private_candidate_producer::CandidateCallerSourcesV1::default();
+    let (witness, detached) =
+        run_candidate_journal_interval(journal, &plan.observer, &case, || {
+            let (process, _) = supervise_private_case_process_with_observer(
+                Path::new(AGENT),
+                &arguments,
+                Duration::from_secs(60),
+                || {
+                    if crate::private_candidate_producer::sample_candidate_caller_if_ready(
+                        &directory,
+                        parent,
+                        &plan.observer.agent_sha256,
+                        &mut sampled,
+                    )? {
+                        Ok(Some(()))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )?;
+            if !process.status.success() {
+                return Err(CiError::Message(
+                    "independent caller native producer failed".into(),
+                ));
+            }
+            let bytes = crate::private_protected_readback::read_protected_raw_case_file(
+                &directory.join("caller-rejection-v1.json"),
+            )?;
+            crate::private_candidate_caller_frames::parse_candidate_caller_frames_v1(
+                &bytes,
+                &parent.challenge,
+                parent.recipe.uid,
+                parent.recipe.gid,
+            )?;
+            Ok(bytes)
+        })?;
+    let prefix = Path::new("candidate-c-v3/observer/intervals")
+        .join(String::from(case.interval_id.storage_sha256()));
+    let path = |leaf: &str| prefix.join(leaf).to_string_lossy().into_owned();
+    let capture = path("capture.bin");
+    journal.append_raw(capture.clone(), detached.interval.capture_bytes()?.to_vec())?;
+    let clock = path("clock.json");
+    journal.append_raw(
+        clock.clone(),
+        crate::private_observer_session::canonical_bytes(
+            detached
+                .interval
+                .clock_inputs()
+                .ok_or_else(|| CiError::Message("caller original reader clock absent".into()))?,
+        )?,
+    )?;
+    let admission = sampled
+        .admission
+        .ok_or_else(|| CiError::Message("caller independently observed admission absent".into()))?;
+    let ready = sampled
+        .ready
+        .ok_or_else(|| CiError::Message("caller independently observed ready absent".into()))?;
+    let sample = sampled.sample.ok_or_else(|| {
+        CiError::Message("caller independently held credential source absent".into())
+    })?;
+    let image = journal.retain_shared_image(
+        sample
+            .leaves
+            .get("image.raw")
+            .ok_or_else(|| CiError::Message("caller original held ELF absent".into()))?
+            .clone(),
+    )?;
+    let mut sources = vec![clock.clone()];
+    for (name, bytes) in [
+        ("request.json", admission),
+        ("caller-ready-v1.json", ready),
+        ("caller-rejection-v1.json", witness),
+        (
+            "caller-held.v1.bin",
+            crate::private_source_carrier::encode_held_source(&sample, image)?,
+        ),
+        (
+            "caller-ready-v1.ack",
+            crate::private_protected_readback::read_protected_raw_case_file(
+                &directory.join("caller-ready-v1.ack"),
+            )?,
+        ),
+    ] {
+        let name = path(name);
+        journal.append_raw(name.clone(), bytes)?;
+        sources.push(name);
+    }
+    journal.close_after_detach(
+        &case,
+        &detached.interval,
+        capture,
+        vec![detached.controls_path],
+        sources,
+        detached.arm_monotonic_ns,
+        detached.detach_monotonic_ns,
+    )
+}
+
+/// The disposable valid-context helper is observed in its own physical
+/// interval, before any ordinary product target is admitted. It is not a
+/// clean-FD exception for that later target.
+fn run_candidate_facility_source(
+    journal: &mut crate::private_candidate_producer::CandidateProducerJournalV1,
+    plan: &crate::private_candidate_producer::StaticCandidateProducerIntentV1,
+    parent: &crate::private_candidate_producer::PreparedCandidateCaseV1,
+) -> Result<()> {
+    use crate::private_kernel_replay::IntervalPurposeV1;
+    let revision = memcordon_core::private_facility_source_v1::facility_source_revision_sha256();
+    if parent.recipe.facility_source_sha256.as_ref() != Some(&revision) {
+        return Err(CiError::Message(
+            "candidate Facility source requires explicitly protected revision".into(),
+        ));
+    }
+    let ordinal = parent
+        .interval_id
+        .ordinal
+        .checked_add(1000)
+        .ok_or_else(|| CiError::Message("Facility controls ordinal overflow".into()))?;
+    let mut case = journal.prepare_case(
+        &parent.selector,
+        IntervalPurposeV1::FacilityControls,
+        ordinal,
+    )?;
+    case.challenge = parent.challenge;
+    case.key = parent.key.clone();
+    case.interval_id.logical_case_key = parent.key.clone();
+    // The explicitly approved Facility protocol requires two actual installed
+    // programs; its own physical capture requests source16 independently of
+    // whether the later product selector needs a Filter family.
+    case.recipe.filter_install_source_sha256 = Some(
+        crate::private_candidate_filter_facility_facts::filter_install_source_revision_sha256(),
+    );
+    case.recipe.host_preservation_source_sha256 = None;
+    let generation = journal
+        .descriptor()
+        .generations
+        .iter()
+        .find(|generation| generation.generation == case.interval_id.generation)
+        .ok_or_else(|| CiError::Message("Facility enrolled generation absent".into()))?
+        .clone();
+    let directory = Path::new(PRIVATE_RELEASE_RESULT_ROOT_V1)
+        .join("facility-controls-v1")
+        .join(String::from(parent.key.clone()));
+    if !matches!(fs::symlink_metadata(&directory),Err(error)if error.kind()==std::io::ErrorKind::NotFound)
+    {
+        return Err(CiError::Message(
+            "candidate Facility auxiliary directory already exists".into(),
+        ));
+    }
+    let arguments = [
+        OsString::from("release-facility-controls"),
+        OsString::from("candidate-capability"),
+        OsString::from(&parent.selector),
+        OsString::from(hex::encode(parent.challenge)),
+        OsString::from("--source-revision"),
+        OsString::from(String::from(revision)),
+    ];
+    let mut sampled =
+        crate::private_candidate_facility_live::CandidateFacilityLiveSourcesV1::default();
+    let (report, detached) =
+        run_candidate_journal_interval(journal, &plan.observer, &case, || {
+            let (process, observed) = supervise_private_case_process_with_observer(
+                Path::new(AGENT),
+                &arguments,
+                Duration::from_secs(120),
+                || {
+                    if crate::private_candidate_facility_live::sample_candidate_facility_if_ready(
+                        &directory,
+                        parent,
+                        &generation,
+                        &plan.observer.agent_sha256,
+                        &mut sampled,
+                    )? {
+                        Ok(Some(()))
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )?;
+            if !process.status.success() || observed.is_none() {
+                return Err(CiError::Message(
+                    "candidate Facility actual helper failed or missed held phases".into(),
+                ));
+            }
+            crate::private_protected_readback::read_protected_raw_case_file(
+                &directory.join("facility-source-v1.json"),
+            )
+        })?;
+    let prefix = Path::new("candidate-c-v3/observer/intervals")
+        .join(String::from(case.interval_id.storage_sha256()));
+    let path = |leaf: &str| prefix.join(leaf).to_string_lossy().into_owned();
+    let capture = path("capture.bin");
+    let clock = path("clock.json");
+    journal.append_raw(capture.clone(), detached.interval.capture_bytes()?.to_vec())?;
+    journal.append_raw(
+        clock.clone(),
+        crate::private_observer_session::canonical_bytes(
+            detached
+                .interval
+                .clock_inputs()
+                .ok_or_else(|| CiError::Message("Facility original reader clock absent".into()))?,
+        )?,
+    )?;
+    let mut sources = vec![clock];
+    sampled
+        .originals
+        .insert("facility-source-v1.json".into(), report);
+    for (name, bytes) in sampled.originals {
+        let name = path(&name);
+        journal.append_raw(name.clone(), bytes)?;
+        sources.push(name);
+    }
+    for (name, sample) in sampled.held {
+        let image = journal.retain_shared_image(
+            sample
+                .leaves
+                .get("image.raw")
+                .ok_or_else(|| CiError::Message("Facility held original ELF absent".into()))?
+                .clone(),
+        )?;
+        let name = path(&name);
+        journal.append_raw(
+            name.clone(),
+            crate::private_source_carrier::encode_held_source(&sample, image)?,
+        )?;
+        sources.push(name);
+    }
+    journal.close_after_detach(
+        &case,
+        &detached.interval,
+        capture,
+        vec![detached.controls_path],
+        sources,
+        detached.arm_monotonic_ns,
+        detached.detach_monotonic_ns,
+    )
+}
+
+/// Actual first physical retirement is already closed. Both subsequent
+/// helpers use its original owned objects, never a fresh attempt directory.
+fn run_candidate_reuse_sources(
+    journal: &mut crate::private_candidate_producer::CandidateProducerJournalV1,
+    plan: &crate::private_candidate_producer::StaticCandidateProducerIntentV1,
+    parent: &crate::private_candidate_producer::PreparedCandidateCaseV1,
+    original: &crate::private_protected_readback::StructuralProtectedNativeCaseV1,
+) -> Result<()> {
+    use crate::private_candidate_replay::{
+        CaseReplayFactsV1, ExpectedCaseSubjectV1, ReplayLeafRoleV1, ReplayLeafV1,
+    };
+    use crate::private_candidate_reuse_facts::{NativeReuseSourcesV1, ReusePhaseSourcesV1};
+    use crate::private_kernel_replay::IntervalPurposeV1;
+    use memcordon_core::private_reuse_source_v1::*;
+    let revision = reuse_source_revision_sha256();
+    if parent.selector != REUSE_SELECTOR_V1
+        || parent.recipe.reuse_source_sha256.as_ref() != Some(&revision)
+        || parent.interval_id.purpose != IntervalPurposeV1::ReuseFirst
+    {
+        return Err(CiError::Message(
+            "candidate three-interval Reuse is not explicitly approved".into(),
+        ));
+    }
+    let marker = original
+        .fault_marker_bytes
+        .as_ref()
+        .ok_or_else(|| CiError::Message("Reuse original owned marker absent".into()))?;
+    let record = original
+        .attempt_record_bytes
+        .as_ref()
+        .ok_or_else(|| CiError::Message("Reuse original retiring journal absent".into()))?;
+    let directory =
+        Path::new(PRIVATE_RELEASE_RESULT_ROOT_V1).join(String::from(parent.key.clone()));
+    let mut held = crate::private_candidate_reuse_live::CandidateReuseLiveV1::hold(
+        &directory, marker, record,
+    )?;
+    let generation = journal
+        .descriptor()
+        .generations
+        .iter()
+        .find(|entry| entry.generation == parent.interval_id.generation)
+        .ok_or_else(|| CiError::Message("Reuse original enrolled generation absent".into()))?
+        .clone();
+    let mut phase_sources = Vec::new();
+    for (phase, purpose, offset) in [
+        (
+            ReuseSourcePhaseV1::Blocked,
+            IntervalPurposeV1::ReuseBlocked,
+            2000_u32,
+        ),
+        (
+            ReuseSourcePhaseV1::Recover,
+            IntervalPurposeV1::Recovery,
+            3000_u32,
+        ),
+    ] {
+        let ordinal = parent
+            .interval_id
+            .ordinal
+            .checked_add(offset)
+            .ok_or_else(|| CiError::Message("Reuse source ordinal overflow".into()))?;
+        let mut case = journal.prepare_case(&parent.selector, purpose, ordinal)?;
+        case.challenge = parent.challenge;
+        case.key = parent.key.clone();
+        case.interval_id.logical_case_key = parent.key.clone();
+        case.recipe.host_preservation_source_sha256 = None;
+        case.recipe.filter_install_source_sha256 = None;
+        held.helper = None;
+        held.originals.clear();
+        let args = [
+            OsString::from("release-case-reuse-source"),
+            OsString::from("candidate-capability"),
+            OsString::from(&parent.selector),
+            OsString::from(hex::encode(parent.challenge)),
+            OsString::from("--source-revision"),
+            OsString::from(String::from(revision.clone())),
+            OsString::from("--phase"),
+            OsString::from(match phase {
+                ReuseSourcePhaseV1::Blocked => "blocked",
+                ReuseSourcePhaseV1::Recover => "recover",
+            }),
+        ];
+        let pins = held.pins;
+        let (_, detached) = run_candidate_journal_interval_with_reuse(
+            journal,
+            &plan.observer,
+            &case,
+            Some(&pins),
+            || {
+                let (process, sampled) = supervise_private_case_process_with_observer(
+                    Path::new(AGENT),
+                    &args,
+                    Duration::from_secs(120),
+                    || {
+                        if held.sample_if_ready(
+                            phase,
+                            &case,
+                            &generation,
+                            &plan.observer.agent_sha256,
+                        )? {
+                            Ok(Some(()))
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )?;
+                if !process.status.success() || sampled.is_none() {
+                    return Err(CiError::Message(
+                        "actual Reuse helper failed or never reached independent held gate".into(),
+                    ));
+                }
+                // This independent readback is inside operation_end/detach.
+                held.retain_after(phase)?;
+                Ok(())
+            },
+        )?;
+        let prefix = Path::new("candidate-c-v3/observer/intervals")
+            .join(String::from(case.interval_id.storage_sha256()));
+        let path = |name: &str| prefix.join(name).to_string_lossy().into_owned();
+        let capture = path("capture.bin");
+        let clock = path("clock.json");
+        journal.append_raw(capture.clone(), detached.interval.capture_bytes()?.to_vec())?;
+        journal.append_raw(
+            clock.clone(),
+            crate::private_observer_session::canonical_bytes(
+                detached
+                    .interval
+                    .clock_inputs()
+                    .ok_or_else(|| CiError::Message("Reuse original reader clock absent".into()))?,
+            )?,
+        )?;
+        let mut sample_paths = vec![clock.clone()];
+        for (name, bytes) in std::mem::take(&mut held.originals) {
+            let name = path(&name);
+            journal.append_raw(name.clone(), bytes)?;
+            sample_paths.push(name);
+        }
+        let helper = held
+            .helper
+            .take()
+            .ok_or_else(|| CiError::Message("Reuse actual root helper sample absent".into()))?;
+        let image = journal.retain_shared_image(
+            helper
+                .leaves
+                .get("image.raw")
+                .ok_or_else(|| CiError::Message("Reuse held helper ELF source absent".into()))?
+                .clone(),
+        )?;
+        let helper_path = path("helper-held.v1.bin");
+        journal.append_raw(
+            helper_path.clone(),
+            crate::private_source_carrier::encode_held_source(&helper, image)?,
+        )?;
+        sample_paths.push(helper_path.clone());
+        journal.close_after_detach(
+            &case,
+            &detached.interval,
+            capture.clone(),
+            vec![detached.controls_path],
+            sample_paths,
+            detached.arm_monotonic_ns,
+            detached.detach_monotonic_ns,
+        )?;
+        phase_sources.push(ReusePhaseSourcesV1 {
+            capture_path: capture,
+            clock_path: clock,
+            admission_path: path("admission.json"),
+            gate_path: path("gate.json"),
+            ack_path: path("ack.json"),
+            helper_path,
+            objects_path: path("objects.json"),
+            report_path: path("report.json"),
+            after_path: path("after.json"),
+        });
+    }
+    let first = journal
+        .descriptor()
+        .intervals
+        .iter()
+        .find(|entry| entry.interval_id == parent.interval_id.storage_sha256())
+        .ok_or_else(|| CiError::Message("Reuse first physical enrollment absent".into()))?
+        .clone();
+    let prefix = Path::new("candidate-c-v3/observer/intervals")
+        .join(String::from(parent.interval_id.storage_sha256()));
+    let path = |name: &str| prefix.join(name).to_string_lossy().into_owned();
+    let mut phases = phase_sources.into_iter();
+    let sources = NativeReuseSourcesV1 {
+        result_path: path("result.json"),
+        request_path: path("request.json"),
+        attempt_path: path("attempt.json"),
+        marker_path: path("attempt.json.new"),
+        attachments: memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL
+            .map(|role| path(role.leaf())),
+        first_capture_path: first.capture_path.clone(),
+        blocked: phases.next().expect("two literal Reuse phases"),
+        recovery: phases.next().expect("two literal Reuse phases"),
+    };
+    let raw = crate::private_source_carrier::expand_source_payload(journal.raw_payload())?;
+    let leaf = |path: &str| {
+        raw.get(path).cloned().ok_or_else(|| {
+            CiError::Message(format!("Reuse actual acknowledged source absent: {path}"))
+        })
+    };
+    let mut facts: CaseReplayFactsV1 = crate::private_observer_session::strict_json(
+        &leaf(&path("pending-facts.json"))?,
+        8 * 1024 * 1024,
+    )?;
+    let filter = original
+        .attempt_record
+        .as_ref()
+        .and_then(|attempt| attempt.checkpoint_filter_sha256())
+        .ok_or_else(|| CiError::Message("Reuse original checkpoint filter absent".into()))?;
+    let response = leaf(&path("response.raw"))?;
+    let expected = ExpectedCaseSubjectV1 {
+        selector: &parent.selector,
+        result_key: &parent.key,
+        fixture_sha256: &parent.recipe.fixture_sha256,
+        filter_sha256: filter,
+        fixture_argv: &parent.argv,
+        uid: parent.recipe.uid,
+        gid: parent.recipe.gid,
+        groups: &parent.recipe.groups,
+        port: parent.port,
+        challenge: &parent.challenge,
+        auxiliary_semantics_sha256: parent.recipe.auxiliary_semantics_sha256.as_ref(),
+        filter_install_source_sha256: parent.recipe.filter_install_source_sha256.as_ref(),
+        facility_source_sha256: parent.recipe.facility_source_sha256.as_ref(),
+        host_preservation_source_sha256: parent.recipe.host_preservation_source_sha256.as_ref(),
+        reuse_source_sha256: parent.recipe.reuse_source_sha256.as_ref(),
+        exact_response: &response,
+    };
+    facts.facts.extend(
+        crate::private_candidate_reuse_facts::record_reuse_source_facts(
+            journal.descriptor(),
+            &expected,
+            parent.interval_id.generation,
+            sources,
+            leaf,
+        )?,
+    );
+    let spec =
+        crate::private_case_semantics::closed_case_spec(&parent.selector, &plan.subject.target)?;
+    let mut ordered = Vec::new();
+    for kind in spec.facts {
+        let indexes = facts
+            .facts
+            .iter()
+            .enumerate()
+            .filter(|(_, fact)| fact.kind() == kind)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [index] = indexes.as_slice() else {
+            return Err(CiError::Message(
+                "Reuse completed source family missing or duplicated".into(),
+            ));
+        };
+        ordered.push(facts.facts.remove(*index));
+    }
+    if !facts.facts.is_empty() {
+        return Err(CiError::Message(
+            "Reuse pending source invents additional family".into(),
+        ));
+    }
+    facts.facts = ordered;
+    let controls = first
+        .controls_paths
+        .first()
+        .ok_or_else(|| CiError::Message("Reuse original known controls absent".into()))?;
+    let leaves = [
+        ReplayLeafV1 {
+            role: ReplayLeafRoleV1::Facts,
+            ordinal: 0,
+            bytes: crate::private_observer_session::canonical_bytes(&facts)?,
+        },
+        ReplayLeafV1 {
+            role: ReplayLeafRoleV1::Request,
+            ordinal: 0,
+            bytes: original.candidate_request_bytes.clone(),
+        },
+        ReplayLeafV1 {
+            role: ReplayLeafRoleV1::Clock,
+            ordinal: 0,
+            bytes: raw
+                .get(&path("clock.json"))
+                .ok_or_else(|| CiError::Message("Reuse first original clock absent".into()))?
+                .clone(),
+        },
+        ReplayLeafV1 {
+            role: ReplayLeafRoleV1::Controls,
+            ordinal: 0,
+            bytes: raw
+                .get(controls)
+                .ok_or_else(|| {
+                    CiError::Message("Reuse first original controls bytes absent".into())
+                })?
+                .clone(),
+        },
+    ];
+    let bundle = crate::private_candidate_replay::encode_replay_bundle(&leaves)?;
+    journal.append_representation(
+        Path::new("candidate-c-v3/cases")
+            .join(String::from(parent.key.clone()))
+            .join("family/replay-bundle.v1.bin")
+            .to_string_lossy()
+            .into_owned(),
+        bundle,
+    )
+}
+
+fn retain_candidate_raw_interval(
+    journal: &mut crate::private_candidate_producer::CandidateProducerJournalV1,
+    case: &crate::private_candidate_producer::PreparedCandidateCaseV1,
+    detached: &CandidateDetachedIntervalV1,
+    raw: &crate::private_protected_readback::StructuralProtectedNativeCaseV1,
+    phases: &crate::private_candidate_producer::CandidateLivePhasesV1,
+    collector: Option<&DiagnosticSha256>,
+) -> Result<()> {
+    let prefix = Path::new("candidate-c-v3/observer/intervals")
+        .join(String::from(case.interval_id.storage_sha256()));
+    let path = |leaf: &str| prefix.join(leaf).to_string_lossy().into_owned();
+    let case_prefix = Path::new("candidate-c-v3/cases").join(String::from(case.key.clone()));
+    let capture = if let Some(collector) = collector {
+        case_prefix
+            .join(format!(
+                "kernel-{}.capture.bin",
+                String::from(collector.clone())
+            ))
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        path("capture.bin")
+    };
+    let clock = path("clock.json");
+    journal.append_raw(capture.clone(), detached.interval.capture_bytes()?.to_vec())?;
+    journal.append_raw(
+        clock.clone(),
+        crate::private_observer_session::canonical_bytes(
+            detached.interval.clock_inputs().ok_or_else(|| {
+                CiError::Message("native candidate original clock inputs absent".into())
+            })?,
+        )?,
+    )?;
+    journal.append_raw(path("request.json"), raw.candidate_request_bytes.clone())?;
+    journal.append_raw(path("result.json"), serde_json::to_vec(&raw.result)?)?;
+    if collector.is_some() {
+        journal.append_raw(
+            case_prefix
+                .join("result.json")
+                .to_string_lossy()
+                .into_owned(),
+            serde_json::to_vec(&raw.result)?,
+        )?;
+    }
+    if let Some(bytes) = &raw.attempt_record_bytes {
+        journal.append_raw(path("attempt.json"), bytes.clone())?;
+    }
+    if let Some(bytes) = &raw.fault_marker_bytes {
+        journal.append_raw(path("attempt.json.new"), bytes.clone())?;
+    }
+    if let Some(bytes) = &raw.checkpoint_gate_bytes {
+        journal.append_raw(path("checkpoint-gate.json"), bytes.clone())?;
+    }
+    for (role, bytes) in
+        memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL
+            .into_iter()
+            .zip(&raw.attachments)
+    {
+        journal.append_raw(path(role.leaf()), bytes.clone())?;
+        if collector.is_some() {
+            journal.append_raw(
+                case_prefix.join(role.leaf()).to_string_lossy().into_owned(),
+                bytes.clone(),
+            )?;
+        }
+    }
+    let mut samples = vec![clock, path("request.json")];
+    if case.selector == memcordon_core::private_reuse_source_v1::REUSE_SELECTOR_V1 {
+        samples.extend([
+            path("result.json"),
+            path("attempt.json"),
+            path("attempt.json.new"),
+        ]);
+        samples.extend(
+            memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL
+                .into_iter()
+                .map(|role| path(role.leaf())),
+        );
+    }
+    if let Some(source) = &detached.host_sources {
+        let name = path("host-continuity.v1.bin");
+        journal.append_raw(
+            name.clone(),
+            crate::private_source_carrier::encode_source_carrier(source)?,
+        )?;
+        samples.push(name);
+    }
+    if !phases.namespace_closes.is_empty() {
+        let name = path("namespace-closes.json");
+        journal.append_raw(
+            name.clone(),
+            crate::private_observer_session::canonical_bytes(&phases.namespace_closes)?,
+        )?;
+        samples.push(name);
+    }
+    for (leaf, sample) in [
+        ("pre-samples.json", &phases.pre),
+        ("second-pre-samples.json", &phases.second_pre),
+        ("release-intent-samples.json", &phases.release_intent),
+        (
+            "second-release-intent-samples.json",
+            &phases.second_release_intent,
+        ),
+        ("baseline-samples.json", &phases.baseline),
+        ("second-baseline-samples.json", &phases.second_baseline),
+        ("first-ready-samples.json", &phases.first_ready),
+        ("second-ready-samples.json", &phases.second_ready),
+        (
+            "second-after-retirement-samples.json",
+            &phases.second_after_retirement,
+        ),
+        ("post-samples.json", &phases.post),
+    ] {
+        if let Some(sample) = sample {
+            let name = path(leaf);
+            let image = journal.retain_shared_image(
+                sample
+                    .leaves
+                    .get("image.raw")
+                    .ok_or_else(|| CiError::Message("held original ELF bytes absent".into()))?
+                    .clone(),
+            )?;
+            journal.append_raw(
+                name.clone(),
+                crate::private_source_carrier::encode_held_source(sample, image)?,
+            )?;
+            samples.push(name);
+        }
+    }
+    for (role, sample) in &phases.held_roles {
+        let name = prefix
+            .join("roles")
+            .join(role)
+            .join("held-samples.v1.bin")
+            .to_string_lossy()
+            .into_owned();
+        let image = journal.retain_shared_image(
+            sample
+                .leaves
+                .get("image.raw")
+                .ok_or_else(|| CiError::Message("actual held role ELF bytes absent".into()))?
+                .clone(),
+        )?;
+        journal.append_raw(
+            name.clone(),
+            crate::private_source_carrier::encode_held_source(sample, image)?,
+        )?;
+        samples.push(name);
+    }
+    for (leaf, bytes) in &phases.source_leaves {
+        journal.append_raw(
+            prefix
+                .join("journal")
+                .join(leaf)
+                .to_string_lossy()
+                .into_owned(),
+            bytes.clone(),
+        )?;
+    }
+    if case.selector == DUAL_SELECTOR {
+        let native = Path::new(PRIVATE_RELEASE_RESULT_ROOT_V1).join(String::from(case.key.clone()));
+        for branch in ["dual-first", "dual-second"] {
+            let bytes = crate::private_protected_readback::read_protected_raw_case_file(
+                &native.join(branch).join("attempt.json"),
+            )?;
+            journal.append_raw(
+                prefix
+                    .join("journal")
+                    .join(branch)
+                    .join("attempt.json")
+                    .to_string_lossy()
+                    .into_owned(),
+                bytes,
+            )?;
+        }
+    }
+    for (leaf, bytes) in &phases.gates {
+        let leaf = match leaf.as_str() {
+            "candidate-live-pre-v1.json" => "pre-gate.json",
+            "candidate-first-pre-v1.json" => "first-pre-gate.json",
+            "candidate-second-pre-v1.json" => "second-pre-gate.json",
+            "candidate-live-release-intent-v1.json" => "release-intent-gate.json",
+            "candidate-first-release-intent-v1.json" => "first-release-intent-gate.json",
+            "candidate-second-release-intent-v1.json" => "second-release-intent-gate.json",
+            "candidate-live-post-v1.json" => "post-gate.json",
+            "candidate-live-baseline-v1.json" => "baseline-gate.json",
+            "candidate-first-baseline-v1.json" => "first-baseline-gate.json",
+            "candidate-second-baseline-v1.json" => "second-baseline-gate.json",
+            "candidate-second-post-retirement-v1.json" => "second-after-retirement-gate.json",
+            _ => {
+                return Err(CiError::Message(
+                    "candidate phase gate path is not closed".into(),
+                ));
+            }
+        };
+        journal.append_raw(path(leaf), bytes.clone())?;
+    }
+    if case.selector == "private_tcp::authorization_uncertainty_retired" {
+        let native = Path::new(PRIVATE_RELEASE_RESULT_ROOT_V1).join(String::from(case.key.clone()));
+        for leaf in [
+            "uncertain-stdout-v1.bin",
+            "uncertain-stderr-v1.bin",
+            "uncertain-streams-v1.json",
+        ] {
+            journal.append_raw(
+                path(leaf),
+                crate::private_protected_readback::read_protected_raw_case_file(
+                    &native.join(leaf),
+                )?,
+            )?;
+        }
+    }
+    if case.selector == UNIX_INTENT_SELECTOR {
+        let native = Path::new(PRIVATE_RELEASE_RESULT_ROOT_V1).join(String::from(case.key.clone()));
+        for leaf in ["unix-intent-gate.json", "unix-intent-ack.json"] {
+            journal.append_raw(
+                path(leaf),
+                crate::private_protected_readback::read_protected_raw_case_file(
+                    &native.join(leaf),
+                )?,
+            )?;
+        }
+    }
+    record_candidate_replay_sources(journal, case, detached, raw, phases, &prefix)?;
+    journal.close_after_detach(
+        case,
+        &detached.interval,
+        capture,
+        vec![detached.controls_path.clone()],
+        samples,
+        detached.arm_monotonic_ns,
+        detached.detach_monotonic_ns,
+    )
+}
+
 pub fn run(
     root: &Path,
     stage: NativeRunStageV2,
@@ -1425,7 +3838,36 @@ pub fn run(
     collector_intent_sha256: Option<&str>,
     policy_intent_sha256: Option<&str>,
 ) -> Result<()> {
-    let _collector_intent_digest = match (stage, collector_intent_sha256) {
+    run_with_observer_intent(
+        root,
+        stage,
+        target,
+        collector_intent_sha256,
+        policy_intent_sha256,
+        None,
+    )
+}
+
+pub fn run_with_observer_intent(
+    root: &Path,
+    stage: NativeRunStageV2,
+    target: &str,
+    collector_intent_sha256: Option<&str>,
+    policy_intent_sha256: Option<&str>,
+    observer_intent: Option<&Path>,
+) -> Result<()> {
+    let observed_plan = observer_intent
+        .filter(|_| stage == NativeRunStageV2::CandidateCapability)
+        .map(crate::private_candidate_producer::StaticCandidateProducerIntentV1::read_protected)
+        .transpose()?;
+    if observed_plan.as_ref().is_some_and(|plan| {
+        stage != NativeRunStageV2::CandidateCapability || plan.subject.target != target
+    }) {
+        return Err(CiError::Message(
+            "candidate observer intent stage/target differs".into(),
+        ));
+    }
+    let collector_intent_digest = match (stage, collector_intent_sha256) {
         (NativeRunStageV2::CandidateCapability, Some(value)) => {
             Some(parse_collector_intent_digest(value)?)
         }
@@ -1460,7 +3902,24 @@ pub fn run(
     let producer = producer_for_host(stage, target)?;
     let context = CertificationContext::capture(root, "backend-linux-private-v4")?;
     validate_private_job_context(&context, &producer)?;
+    if let Some(plan) = &observed_plan {
+        let provenance = context
+            .provenance
+            .as_ref()
+            .ok_or_else(|| CiError::Message("observed candidate has no Actions context".into()))?;
+        if plan.subject.source_commit != context.source_commit
+            || plan.subject.run_id != provenance.run_id.get()
+            || plan.subject.run_attempt != provenance.run_attempt.get()
+        {
+            return Err(CiError::Message(
+                "candidate observer static subject differs from live Actions context".into(),
+            ));
+        }
+    }
     if stage == NativeRunStageV2::FinalPublic {
+        if let Some(path) = observer_intent {
+            return crate::private_public_driver::run(root, target, path);
+        }
         return crate::private_public_dispatch::run_final_public_suite(root, target);
     }
     let mut candidate_h0 = if stage == NativeRunStageV2::CandidateCapability {
@@ -1475,23 +3934,71 @@ pub fn run(
     } else {
         None
     };
+    let mut live_journal =
+        if let (Some(plan), Some((downloaded, h0))) = (&observed_plan, &candidate_h0) {
+            if plan.subject.build_sha256 != downloaded.build_sha256
+                || plan.observer.agent_sha256 != hash_bytes(&h0.agent_bytes)
+            {
+                return Err(CiError::Message(
+                    "candidate observed B/agent differs from protected static plan".into(),
+                ));
+            }
+            let (generation, raw, exe) =
+                crate::private_candidate_producer::observe_candidate_generation(
+                    plan,
+                    0,
+                    h0.manifest_sha256.clone(),
+                    h0.inspection_sha256.clone(),
+                    &h0.inspection_bytes,
+                    h0.installation_epoch.clone(),
+                )?;
+            let mut journal = crate::private_candidate_producer::CandidateProducerJournalV1::begin(
+                plan.clone(),
+                plan.observer.boot_id.clone(),
+                plan.observer.btf_sha256.clone(),
+                exe,
+                generation,
+            )?;
+            journal.queue_generation_raw(raw)?;
+            Some(journal)
+        } else {
+            None
+        };
     if let Some((downloaded, h0)) = candidate_h0.as_mut() {
-        *h0 = run_candidate_epoch_choreography(root, target, downloaded, h0)?;
+        *h0 = run_candidate_epoch_choreography(
+            root,
+            target,
+            downloaded,
+            h0,
+            live_journal.as_mut(),
+            observed_plan.as_ref(),
+        )?;
     }
     let policy_fixture = if let Some((downloaded, h0)) = &candidate_h0 {
         let digest = policy_intent_digest.as_ref().ok_or_else(|| {
             CiError::Message("candidate policy release-intent digest is absent".into())
         })?;
-        Some(crate::private_policy_provision::provision_policy_fixture(
-            digest,
-            &crate::private_policy_provision::PolicyLiveExpectationV1 {
-                target: target.to_owned(),
-                candidate_build_sha256: downloaded.build_sha256.clone(),
-                installed_inspection_sha256: h0.inspection_sha256.clone(),
-                installation_epoch_sha256: h0.installation_epoch.clone(),
-                agent_sha256: hash_bytes(&h0.agent_bytes),
-            },
-        )?)
+        let live = crate::private_policy_provision::PolicyLiveExpectationV1 {
+            target: target.to_owned(),
+            candidate_build_sha256: downloaded.build_sha256.clone(),
+            installed_inspection_sha256: h0.inspection_sha256.clone(),
+            installation_epoch_sha256: h0.installation_epoch.clone(),
+            agent_sha256: hash_bytes(&h0.agent_bytes),
+        };
+        Some(if let Some(journal) = &live_journal {
+            let prepared = journal.prepare_case(
+                "private_tcp::wrong_grant_profile_and_port_rejected",
+                crate::private_kernel_replay::IntervalPurposeV1::Policy,
+                0,
+            )?;
+            crate::private_policy_provision::provision_static_policy_fixture(
+                digest,
+                &live,
+                prepared.challenge,
+            )?
+        } else {
+            crate::private_policy_provision::provision_policy_fixture(digest, &live)?
+        })
     } else {
         None
     };
@@ -1499,7 +4006,47 @@ pub fn run(
     let mut structural_results = Vec::with_capacity(REQUIRED_CASES.len());
     let mut policy_case = None;
     let mut abi_subwitness = None;
-    for selector in REQUIRED_CASES {
+    for (ordinal, selector) in REQUIRED_CASES.into_iter().enumerate() {
+        let prepared_case = live_journal
+            .as_ref()
+            .map(|journal| {
+                journal.prepare_case(
+                    selector,
+                    if selector == DUAL_SELECTOR {
+                        crate::private_kernel_replay::IntervalPurposeV1::DualContinuous
+                    } else if selector == memcordon_core::private_reuse_source_v1::REUSE_SELECTOR_V1
+                    {
+                        crate::private_kernel_replay::IntervalPurposeV1::ReuseFirst
+                    } else {
+                        crate::private_kernel_replay::IntervalPurposeV1::Ordinary
+                    },
+                    u32::try_from(ordinal).map_err(|_| {
+                        CiError::Message("candidate ordinal exceeds native width".into())
+                    })?,
+                )
+            })
+            .transpose()?;
+        let challenge = prepared_case
+            .as_ref()
+            .map_or(challenge, |case| case.challenge);
+        if memcordon_core::private_facility_source_v1::facility_operations_v1(selector).is_ok() {
+            if let (Some(journal), Some(case), Some(plan)) = (
+                live_journal.as_mut(),
+                prepared_case.as_ref(),
+                observed_plan.as_ref(),
+            ) {
+                run_candidate_facility_source(journal, plan, case)?;
+            }
+        }
+        if selector == "private_tcp::caller_identity_and_epoch_bound" {
+            if let (Some(journal), Some(case), Some(plan)) = (
+                live_journal.as_mut(),
+                prepared_case.as_ref(),
+                observed_plan.as_ref(),
+            ) {
+                run_candidate_caller_spoof_source(journal, plan, case)?;
+            }
+        }
         if selector == "private_tcp::abi_alternate_entry_denied" {
             let fixture = policy_fixture.as_ref().ok_or_else(|| {
                 CiError::Message("candidate ABI observer intent is absent".into())
@@ -1508,7 +4055,14 @@ pub fn run(
                 CiError::Message("candidate ABI installed B/M0/H0 is absent".into())
             })?;
             abi_subwitness = Some(run_candidate_abi_subwitness(
-                root, fixture, downloaded, h0, challenge,
+                root,
+                fixture,
+                downloaded,
+                h0,
+                challenge,
+                live_journal.as_mut(),
+                prepared_case.as_ref(),
+                collector_intent_digest.as_ref(),
             )?);
             continue;
         }
@@ -1525,6 +4079,8 @@ pub fn run(
                 h0,
                 target,
                 producer.native_machine,
+                live_journal.as_mut(),
+                collector_intent_digest.as_ref(),
             )?);
             continue;
         }
@@ -1580,16 +4136,71 @@ pub fn run(
         let fixture = policy_fixture
             .as_ref()
             .ok_or_else(|| CiError::Message("candidate kernel observer intent is absent".into()))?;
-        let (
-            (observed, child_live, socket_live, terminal_live, dual_live, unix_live),
-            kernel_interval,
-        ) = run_candidate_case_interval(fixture, result_key.clone(), || {
+        let mut phases = crate::private_candidate_producer::CandidateLivePhasesV1::default();
+        let operation = || {
+            let sample_general = |state:&mut crate::private_candidate_producer::CandidateLivePhasesV1| -> Result<bool> {
+                let Some(case) = &prepared_case else {
+                    return Ok(false);
+                };
+                let directory =
+                    Path::new(PRIVATE_RELEASE_RESULT_ROOT_V1).join(String::from(case.key.clone()));
+                match std::fs::symlink_metadata(&directory) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {}
+                }
+                crate::private_candidate_producer::sample_candidate_phases_if_ready(
+                    &directory,
+                    selector,
+                    target,
+                    &challenge,
+                    &observed_plan
+                        .as_ref()
+                        .ok_or_else(|| {
+                            CiError::Message("candidate phase static plan absent".into())
+                        })?
+                        .observer
+                        .agent_sha256,
+                    &case.recipe,
+                    &case.argv,
+                    state,
+                )
+            };
             let value = if selector == CHILD_RUNTIME_SELECTOR {
                 let (process, sampled) = supervise_private_case_process_with_observer(
                     Path::new(AGENT),
                     &arguments,
                     Duration::from_secs(120),
-                    || sample_and_ack_if_ready(challenge),
+                    || {
+                        sample_general(&mut phases)?;
+                        crate::private_child_live::sample_and_ack_if_ready_with_source(
+                            challenge,
+                            |parent, parent_ticks, child, child_ticks| {
+                                let Some(case) = prepared_case.as_ref() else {
+                                    return Ok(());
+                                };
+                                let parent_sample =
+                                    crate::private_public_live::sample_held_target_raw(
+                                        parent,
+                                        parent_ticks,
+                                        &case.recipe.fixture_sha256,
+                                    )?;
+                                let child_sample =
+                                    crate::private_public_live::sample_held_target_raw(
+                                        child,
+                                        child_ticks,
+                                        &case.recipe.fixture_sha256,
+                                    )?;
+                                if phases.post.is_some() {
+                                    return Err(CiError::Message(
+                                        "candidate child held parent source duplicated".into(),
+                                    ));
+                                }
+                                phases.post = Some(parent_sample);
+                                phases.retain_held_role("child".into(), child_sample)
+                            },
+                        )
+                    },
                 )?;
                 (process, sampled, None, None, None, None)
             } else if selector == SOCKET_SELECTOR {
@@ -1601,7 +4212,10 @@ pub fn run(
                     Path::new(AGENT),
                     &arguments,
                     Duration::from_secs(120),
-                    || sample_socket_gate(challenge, &filter),
+                    || {
+                        sample_general(&mut phases)?;
+                        sample_socket_gate(challenge, &filter)
+                    },
                 )?;
                 (process, None, sampled, None, None, None)
             } else if selector == TERMINAL_JOIN_SELECTOR {
@@ -1616,7 +4230,10 @@ pub fn run(
                     Path::new(AGENT),
                     &arguments,
                     Duration::from_secs(120),
-                    || sample_terminal_midpoint(challenge, &filter, image),
+                    || {
+                        sample_general(&mut phases)?;
+                        sample_terminal_midpoint(challenge, &filter, image)
+                    },
                 )?;
                 (process, None, None, sampled, None, None)
             } else if selector == DUAL_SELECTOR {
@@ -1631,7 +4248,51 @@ pub fn run(
                     Path::new(AGENT),
                     &arguments,
                     Duration::from_secs(120),
-                    || sample_dual_gate(challenge, &filter, image),
+                    || {
+                        sample_general(&mut phases)?;
+                        crate::private_dual_live::sample_and_ack_if_ready_with_source(
+                            challenge,
+                            &filter,
+                            image,
+                            |first, first_ticks, second, second_ticks| {
+                                let Some(case) = prepared_case.as_ref() else {
+                                    return Ok(());
+                                };
+                                if phases.first_ready.is_some() || phases.second_ready.is_some() {
+                                    return Err(CiError::Message(
+                                        "dual independently held READY sources repeated".into(),
+                                    ));
+                                }
+                                let mut first_sample =
+                                    crate::private_public_live::sample_held_public_target(
+                                        first,
+                                        first_ticks,
+                                        case.recipe.uid,
+                                        case.recipe.gid,
+                                        &case.recipe.fixture_sha256,
+                                        &case.argv,
+                                    )?;
+                                let mut second_sample =
+                                    crate::private_public_live::sample_held_public_target(
+                                        second,
+                                        second_ticks,
+                                        case.recipe.uid,
+                                        case.recipe.gid,
+                                        &case.recipe.fixture_sha256,
+                                        &case.argv,
+                                    )?;
+                                crate::private_public_live::sample_held_network_source(
+                                    &mut first_sample,
+                                )?;
+                                crate::private_public_live::sample_held_network_source(
+                                    &mut second_sample,
+                                )?;
+                                phases.first_ready = Some(first_sample);
+                                phases.second_ready = Some(second_sample);
+                                Ok(())
+                            },
+                        )
+                    },
                 )?;
                 (process, None, None, None, sampled, None)
             } else if selector == UNIX_INTENT_SELECTOR {
@@ -1639,16 +4300,54 @@ pub fn run(
                     Path::new(AGENT),
                     &arguments,
                     Duration::from_secs(120),
-                    || sample_unix_gate(challenge),
+                    || {
+                        sample_general(&mut phases)?;
+                        crate::private_unix_live::sample_and_ack_if_ready_with_source(
+                            challenge,
+                            |pid, ticks| {
+                                let Some(case) = prepared_case.as_ref() else {
+                                    return Ok(());
+                                };
+                                if phases.post.is_some() {
+                                    return Err(CiError::Message(
+                                        "held Unix source duplicated".into(),
+                                    ));
+                                }
+                                let mut sample =
+                                    crate::private_public_live::sample_held_public_target(
+                                        pid,
+                                        ticks,
+                                        case.recipe.uid,
+                                        case.recipe.gid,
+                                        &case.recipe.fixture_sha256,
+                                        &case.argv,
+                                    )?;
+                                crate::private_candidate_unix_facts::sample_held_unix_source(
+                                    &mut sample,
+                                    challenge,
+                                )?;
+                                phases.post = Some(sample);
+                                Ok(())
+                            },
+                        )
+                    },
                 )?;
                 (process, None, None, None, None, sampled)
             } else {
                 (
-                    supervise_private_case_process(
+                    supervise_private_case_process_with_observer(
                         Path::new(AGENT),
                         &arguments,
                         Duration::from_secs(120),
-                    )?,
+                        || {
+                            if sample_general(&mut phases)? {
+                                Ok(Some(()))
+                            } else {
+                                Ok(None)
+                            }
+                        },
+                    )?
+                    .0,
                     None,
                     None,
                     None,
@@ -1656,8 +4355,20 @@ pub fn run(
                     None,
                 )
             };
+            phases.close_observer_namespaces()?;
             Ok(value)
-        })?;
+        };
+        let ((observed, child_live, socket_live, terminal_live, dual_live, unix_live), captured) =
+            if let (Some(journal), Some(case)) = (live_journal.as_mut(), prepared_case.as_ref()) {
+                let (output, detached) =
+                    run_candidate_journal_interval(journal, fixture.observer(), case, operation)?;
+                (output, CandidateCapturedIntervalV1::Enrolled(detached))
+            } else {
+                let (output, interval) =
+                    run_candidate_case_interval(fixture, result_key.clone(), operation)?;
+                (output, CandidateCapturedIntervalV1::Diagnostic(interval))
+            };
+        let kernel_interval = captured.interval();
         if kernel_interval.result_key() != &result_key
             || !kernel_interval.has_allocation_boundary()
             || kernel_interval.capture_bytes()?.is_empty()
@@ -1727,7 +4438,7 @@ pub fn run(
             memcordon_core::private_release_case_v1::PrivateReleaseObservationV1::AllocatedRetired { .. }
             | memcordon_core::private_release_case_v1::PrivateReleaseObservationV1::DualAttemptsRetired { .. }
             | memcordon_core::private_release_case_v1::PrivateReleaseObservationV1::RetirementFailureBlockedReuse { .. }
-        ) {
+        ) && matches!(captured,CandidateCapturedIntervalV1::Diagnostic(_)) {
             kernel_interval.verify_allocation(&result_key)?;
         }
         let observer = structural.attachments.get(3).ok_or_else(|| {
@@ -1926,7 +4637,55 @@ pub fn run(
                 verify_blocked_candidate_worker_exited(&structural)?;
             }
         }
-        structural_results.push((structural, kernel_interval));
+        if let (Some(journal), Some(case), CandidateCapturedIntervalV1::Enrolled(detached)) =
+            (live_journal.as_mut(), prepared_case.as_ref(), &captured)
+        {
+            retain_candidate_raw_interval(
+                journal,
+                case,
+                detached,
+                &structural,
+                &phases,
+                collector_intent_digest.as_ref(),
+            )?;
+            if case.selector == memcordon_core::private_reuse_source_v1::REUSE_SELECTOR_V1 {
+                run_candidate_reuse_sources(
+                    journal,
+                    observed_plan.as_ref().ok_or_else(|| {
+                        CiError::Message("Reuse static source plan absent".into())
+                    })?,
+                    case,
+                    &structural,
+                )?;
+            }
+            let sources = journal
+                .raw_payload()
+                .keys()
+                .filter(|path| path.starts_with("candidate-c-v3/observer/"))
+                .cloned()
+                .collect::<Vec<_>>();
+            let carrier = Path::new("candidate-c-v3/cases")
+                .join(String::from(case.key.clone()))
+                .join("family/source-carrier.v1.bin")
+                .to_string_lossy()
+                .into_owned();
+            journal.repack_sources(carrier, sources)?;
+        }
+        structural_results.push((structural, captured.into_interval()));
+    }
+    if let (Some(journal), Some(plan), Some(collector)) = (
+        live_journal,
+        observed_plan.as_ref(),
+        collector_intent_digest,
+    ) {
+        let filter = candidate_h0
+            .as_ref()
+            .ok_or_else(|| CiError::Message("candidate independent build readback absent".into()))?
+            .0
+            .prepared
+            .filter_sha256
+            .clone();
+        return finalize_candidate_custody_export(root, journal, plan, collector, filter);
     }
     Err(CiError::Message(format!(
         "private native {stage:?} suite structurally read {} protected results, composed policy aggregate {} and ABI positive/branch aggregate {}, but the full 25-case independent supervisor semantics and completed C export remain absent; no Q or P was produced",
@@ -1938,6 +4697,249 @@ pub fn run(
                 && !value.kernel_capture.is_empty()
         )
     )))
+}
+
+fn finalize_candidate_custody_export(
+    root: &Path,
+    journal: crate::private_candidate_producer::CandidateProducerJournalV1,
+    plan: &crate::private_candidate_producer::StaticCandidateProducerIntentV1,
+    collector: DiagnosticSha256,
+    filter_sha256: DiagnosticSha256,
+) -> Result<()> {
+    use crate::private_candidate_replay::{
+        CaseReplayFactsV1, ExpectedCaseSubjectV1, ReplayLeafRoleV1,
+    };
+    use crate::private_observer_session::{
+        ORIGIN_COMMITMENT_LEAF, ORIGIN_RECEIPT_LEAF, ObserverEvidenceV1, PAYLOAD_INDEX_LEAF,
+    };
+    const POLICY_SELECTOR: &str = "private_tcp::wrong_grant_profile_and_port_rejected";
+    let payload = journal.raw_payload().clone();
+    let views = crate::private_candidate_replay::expand_replay_payload(&payload)?;
+    let mut indexed = BTreeMap::new();
+    for (path, bytes) in payload.iter().filter(|(path, _)| {
+        path.starts_with("candidate-c-v3/cases/") && path.ends_with("/result.json")
+    }) {
+        let result =
+            memcordon_core::private_release_case_v1::PrivateReleaseCaseResultV1::parse(bytes)
+                .map_err(CiError::Message)?;
+        if indexed
+            .insert(
+                result.selector.clone(),
+                (path.clone(), bytes.clone(), result),
+            )
+            .is_some()
+        {
+            return Err(CiError::Message(
+                "candidate duplicate completed selector".into(),
+            ));
+        }
+    }
+    if indexed.len() != REQUIRED_CASES.len()
+        || REQUIRED_CASES
+            .iter()
+            .any(|selector| !indexed.contains_key(*selector))
+    {
+        return Err(CiError::Message(
+            "candidate literal all-25 custody source inventory is incomplete".into(),
+        ));
+    }
+    let cleanup_sources = views
+        .iter()
+        .filter(|(path, _)| {
+            path.ends_with("/cgroup-retirement-v1.json") || path.ends_with("/namespace-closes.json")
+        })
+        .map(|(path, bytes)| (path.clone(), hash_bytes(bytes)))
+        .collect::<BTreeMap<_, _>>();
+    if cleanup_sources.is_empty() {
+        return Err(CiError::Message(
+            "candidate observed cleanup source inventory absent".into(),
+        ));
+    }
+    let cleanup = hash_bytes(&crate::private_observer_session::canonical_bytes(
+        &cleanup_sources,
+    )?);
+    let (origin, receipt) = journal.seal(cleanup, candidate_monotonic_ns()?)?;
+    let mut proofs = Vec::with_capacity(REQUIRED_CASES.len());
+    let mut results = Vec::with_capacity(REQUIRED_CASES.len());
+    let mut cases = Vec::with_capacity(REQUIRED_CASES.len());
+    for (ordinal, selector) in REQUIRED_CASES.iter().enumerate() {
+        let (result_path, result_bytes, result) = indexed
+            .get(*selector)
+            .expect("closed selector inventory checked");
+        let prefix = Path::new(result_path)
+            .parent()
+            .expect("closed result path has parent");
+        let case_path = |leaf: &str| prefix.join(leaf).to_string_lossy().into_owned();
+        let bundle_path = case_path("family/replay-bundle.v1.bin");
+        let facts_path = crate::private_candidate_replay::replay_role_path(
+            &bundle_path,
+            ReplayLeafRoleV1::Facts,
+            0,
+        )?;
+        let facts: CaseReplayFactsV1 = crate::private_observer_session::strict_json(
+            origin.leaf(&facts_path)?,
+            8 * 1024 * 1024,
+        )?;
+        let purpose = if *selector == POLICY_SELECTOR {
+            crate::private_kernel_replay::IntervalPurposeV1::Policy
+        } else if *selector == DUAL_SELECTOR {
+            crate::private_kernel_replay::IntervalPurposeV1::DualContinuous
+        } else if *selector == memcordon_core::private_reuse_source_v1::REUSE_SELECTOR_V1 {
+            crate::private_kernel_replay::IntervalPurposeV1::ReuseFirst
+        } else {
+            crate::private_kernel_replay::IntervalPurposeV1::Ordinary
+        };
+        let recipe = crate::private_candidate_producer::prepared_candidate_case_recipe_v1(
+            plan,
+            &origin.descriptor().session_nonce,
+            facts.generation,
+            selector,
+            purpose,
+            if *selector == POLICY_SELECTOR {
+                0
+            } else {
+                ordinal as u32
+            },
+        )?;
+        if result.challenge_bytes().map_err(CiError::Message)? != recipe.challenge {
+            return Err(CiError::Message(
+                "candidate completed challenge differs from actual enrolled preparation".into(),
+            ));
+        }
+        let capture_path = case_path(&format!(
+            "kernel-{}.capture.bin",
+            String::from(collector.clone())
+        ));
+        let capture = origin.leaf(&capture_path)?;
+        let interval_key = &origin
+            .descriptor()
+            .intervals
+            .iter()
+            .find(|interval| {
+                interval.interval_id == facts.interval_id && interval.capture_path == capture_path
+            })
+            .ok_or_else(|| {
+                CiError::Message("candidate exact physical replay interval absent".into())
+            })?
+            .logical_case_key;
+        let parsed = crate::private_kernel_replay::parse_capture_v2(capture, interval_key)?;
+        let image = parsed
+            .events()
+            .iter()
+            .find(|event| {
+                event.kind == 6
+                    && event.task.tid == facts.target.tid
+                    && event.task.start_boottime_ns == facts.target.start_boottime_ns
+            })
+            .map(|event| (event.image_dev, event.image_inode));
+        let netns = facts
+            .held_sample_paths
+            .iter()
+            .map(|path| {
+                crate::private_source_carrier::decode_held_source(origin.leaf(path)?, |image| {
+                    origin.leaf(image).map(ToOwned::to_owned)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .find_map(|sample| {
+                sample
+                    .tasks
+                    .iter()
+                    .find(|task| task.tid == facts.target.tid)
+                    .and_then(|task| task.namespace_inodes.get("net").copied())
+            });
+        let response = if matches!(
+            *selector,
+            "private_tcp::authorization_uncertainty_retired" | POLICY_SELECTOR
+        ) {
+            Vec::new()
+        } else {
+            memcordon_core::private_release_case_v1::candidate_fixture_expected_response_v1(
+                &plan.subject.target,
+                selector,
+                &recipe.challenge,
+                netns,
+                image,
+            )
+            .map_err(|error| CiError::Message(error.into()))?
+        };
+        let expected = ExpectedCaseSubjectV1 {
+            selector,
+            result_key: &recipe.key,
+            fixture_sha256: &recipe.recipe.fixture_sha256,
+            filter_sha256: &filter_sha256,
+            fixture_argv: &recipe.argv,
+            uid: recipe.recipe.uid,
+            gid: recipe.recipe.gid,
+            groups: &recipe.recipe.groups,
+            port: recipe.port,
+            challenge: &recipe.challenge,
+            auxiliary_semantics_sha256: recipe.recipe.auxiliary_semantics_sha256.as_ref(),
+            filter_install_source_sha256: recipe.recipe.filter_install_source_sha256.as_ref(),
+            facility_source_sha256: recipe.recipe.facility_source_sha256.as_ref(),
+            host_preservation_source_sha256: recipe.recipe.host_preservation_source_sha256.as_ref(),
+            reuse_source_sha256: recipe.recipe.reuse_source_sha256.as_ref(),
+            exact_response: &response,
+        };
+        proofs.push(crate::private_candidate_replay::verify_origin_bound_case(
+            &origin,
+            &expected,
+            &facts_path,
+            result_bytes,
+            &capture_path,
+        )?);
+        let mut family = BTreeMap::new();
+        for leaf in crate::private_candidate_c_v3::required_case_family_leaves_v4(
+            selector,
+            &plan.subject.target,
+        )
+        .into_iter()
+        .chain(["source-carrier.v1.bin"])
+        {
+            let bytes = match leaf {
+                PAYLOAD_INDEX_LEAF => receipt.payload_index.clone(),
+                ORIGIN_COMMITMENT_LEAF => receipt.origin_commitment.clone(),
+                ORIGIN_RECEIPT_LEAF => receipt.origin_receipt.clone(),
+                _ => origin.leaf(&case_path(&format!("family/{leaf}")))?.to_vec(),
+            };
+            family.insert(leaf.into(), bytes);
+        }
+        let attachments =
+            memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL
+                .map(|role| origin.leaf(&case_path(role.leaf())).map(ToOwned::to_owned));
+        let attachments = attachments
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| CiError::Message("candidate exact five attachments differ".into()))?;
+        cases.push(crate::private_candidate_c_v3::CandidateCaseBytesV3 {
+            result: result_bytes.clone(),
+            attachments,
+            kernel_capture: capture.to_vec(),
+            family_raw: family,
+        });
+        results.push((result_bytes.clone(), result.clone()));
+    }
+    let semantics =
+        crate::private_native_verify::verify_candidate_semantics(&origin, &results, &proofs)?;
+    let target_id = match plan.subject.target.as_str() {
+        "x86_64-unknown-linux-gnu" => "linux-x64",
+        "aarch64-unknown-linux-gnu" => "linux-arm64",
+        _ => return Err(CiError::Message("candidate export target differs".into())),
+    };
+    let parent = root.join("target/ci/reports/private-candidate-c-v3");
+    std::fs::create_dir_all(&parent)?;
+    crate::private_candidate_c_v3::export_candidate_c_v3(
+        &semantics,
+        &plan.subject.target,
+        &plan.subject.source_commit,
+        &plan.subject.release_version,
+        collector,
+        &cases,
+        &BTreeMap::new(),
+        &parent.join(target_id),
+    )
 }
 
 /// Root-only release-case fixtures cannot prove the installed public V2

@@ -27,6 +27,7 @@ pub(crate) struct VerifiedFixedProbeControlsV1 {
     interval: VerifiedKernelIntervalV1,
     controls: VerifiedKnownActionControlsV1,
     command_output_sha256: DiagnosticSha256,
+    command_output: Vec<u8>,
 }
 
 impl VerifiedFixedProbeControlsV1 {
@@ -38,6 +39,9 @@ impl VerifiedFixedProbeControlsV1 {
     }
     pub(crate) fn command_output_sha256(&self) -> &DiagnosticSha256 {
         &self.command_output_sha256
+    }
+    pub(crate) fn command_output(&self) -> &[u8] {
+        &self.command_output
     }
 }
 
@@ -84,8 +88,54 @@ pub(crate) fn run_fixed_known_action_controls(
     bundle: &VerifiedProbeBundleV1,
     expected: ExpectedKernelAdapterV1,
 ) -> Result<VerifiedFixedProbeControlsV1> {
+    run_fixed_known_action_controls_internal(
+        bundle,
+        expected,
+        None,
+        crate::private_kernel_replay::CaptureStageV2::Candidate,
+    )
+}
+
+pub(crate) fn run_fixed_known_action_controls_with_id(
+    bundle: &VerifiedProbeBundleV1,
+    expected: ExpectedKernelAdapterV1,
+    interval_id: crate::private_kernel_replay::IntervalIdV1,
+) -> Result<VerifiedFixedProbeControlsV1> {
+    if interval_id.purpose != crate::private_kernel_replay::IntervalPurposeV1::KnownControls
+        || interval_id.logical_case_key != expected.result_key
+    {
+        return Err(fail("known control physical interval subject differs"));
+    }
+    run_fixed_known_action_controls_with_stage(
+        bundle,
+        expected,
+        interval_id,
+        crate::private_kernel_replay::CaptureStageV2::Candidate,
+    )
+}
+
+pub(crate) fn run_fixed_known_action_controls_with_stage(
+    bundle: &VerifiedProbeBundleV1,
+    expected: ExpectedKernelAdapterV1,
+    interval_id: crate::private_kernel_replay::IntervalIdV1,
+    stage: crate::private_kernel_replay::CaptureStageV2,
+) -> Result<VerifiedFixedProbeControlsV1> {
+    if interval_id.purpose != crate::private_kernel_replay::IntervalPurposeV1::KnownControls
+        || interval_id.logical_case_key != expected.result_key
+    {
+        return Err(fail("known control physical interval subject differs"));
+    }
+    run_fixed_known_action_controls_internal(bundle, expected, Some(interval_id), stage)
+}
+
+fn run_fixed_known_action_controls_internal(
+    bundle: &VerifiedProbeBundleV1,
+    expected: ExpectedKernelAdapterV1,
+    interval_id: Option<crate::private_kernel_replay::IntervalIdV1>,
+    stage: crate::private_kernel_replay::CaptureStageV2,
+) -> Result<VerifiedFixedProbeControlsV1> {
     let mut observed = None;
-    let interval = run_probe_control_interval(bundle, expected, || {
+    let operation = || {
         let child = Command::new(bundle.agent_path())
             .args(["package", "private-kernel-known-actions"])
             .stdout(Stdio::piped())
@@ -105,10 +155,16 @@ pub(crate) fn run_fixed_known_action_controls(
         {
             return Err(fail("installed probe control output differs"));
         }
-        observed = Some((parent_pid, pids, hash_bytes(&output.stdout)));
+        observed = Some((parent_pid, pids, output.stdout));
         Ok(())
-    })?;
-    let (parent_pid, pids, output_sha) =
+    };
+    let interval = match interval_id {
+        Some(id) => crate::private_kernel_observer::run_probe_interval_with_stage(
+            bundle, expected, None, id, stage, operation,
+        )?,
+        None => run_probe_control_interval(bundle, expected, operation)?,
+    };
+    let (parent_pid, pids, output_bytes) =
         observed.ok_or_else(|| fail("probe control command absent"))?;
     let ordinary = exact_child(&interval, parent_pid, pids.ordinary_pid)?;
     let killed = exact_child(&interval, parent_pid, pids.killed_pid)?;
@@ -153,6 +209,7 @@ pub(crate) fn run_fixed_known_action_controls(
     Ok(VerifiedFixedProbeControlsV1 {
         interval,
         controls,
-        command_output_sha256: output_sha,
+        command_output_sha256: hash_bytes(&output_bytes),
+        command_output: output_bytes,
     })
 }

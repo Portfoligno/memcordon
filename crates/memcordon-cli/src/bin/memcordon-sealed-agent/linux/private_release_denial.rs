@@ -67,16 +67,12 @@ pub(crate) fn expected_namespace_errno_bytes() -> [u8; 8] {
 }
 
 pub(crate) fn observe_import_denials() -> Result<[u8; 8], String> {
-    // SAFETY: the fixed seccomp policy must reject this syscall before the
-    // kernel can read the deliberately invalid parameters. A nonnegative
+    // Linux io_uring_params is a 120-byte aligned UAPI structure. A real
+    // zero-filled structure requests ordinary defaults, unlike a null pointer.
+    // SAFETY: the fixed seccomp policy must reject this syscall. A nonnegative
     // result is an unexpected owned ring descriptor, closed before failure.
-    let ring = unsafe {
-        libc::syscall(
-            libc::SYS_io_uring_setup,
-            1_u32,
-            std::ptr::null_mut::<libc::c_void>(),
-        )
-    };
+    let mut parameters = [0_u64; 15];
+    let ring = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1_u32, parameters.as_mut_ptr()) };
     let ring_error = std::io::Error::last_os_error().raw_os_error();
     if ring >= 0 {
         // SAFETY: an unexpected successful setup returned one owned fd.
@@ -107,9 +103,24 @@ pub(crate) fn observe_import_denials() -> Result<[u8; 8], String> {
 }
 
 pub(crate) fn observe_namespace_denials() -> Result<[u8; 8], String> {
-    // SAFETY: the fixed filter must deny setns before it resolves this
-    // deliberately invalid descriptor. No descriptor ownership is created.
-    let reentry = unsafe { libc::setns(-1, libc::CLONE_NEWNET) };
+    observe_namespace_denials_held().map(|(observed, _namespace)| observed)
+}
+
+// Public source protocol retains the actual setns operand through the root
+// held-target ACK. Legacy callers retain their original close-on-return shape.
+pub(crate) fn observe_namespace_denials_held() -> Result<([u8; 8], std::fs::File), String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let namespace = std::fs::File::open("/proc/self/ns/net").map_err(|error| error.to_string())?;
+    let before = namespace
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .ino();
+    if before == 0 {
+        return Err("namespace fixture handle inode absent".into());
+    }
+    // SAFETY: a live NSFS network namespace fd and exact namespace flag.
+    let reentry = unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) };
     let reentry_error = std::io::Error::last_os_error().raw_os_error();
     if reentry != -1 || reentry_error != Some(libc::EPERM) {
         return Err(format!(
@@ -125,7 +136,25 @@ pub(crate) fn observe_namespace_denials() -> Result<[u8; 8], String> {
             "MCSEALED-PRIVATE-RELEASE-FIXTURE: unshare result {creation} errno {creation_error:?} differs"
         ));
     }
-    Ok(expected_namespace_errno_bytes())
+    if std::fs::metadata("/proc/self/ns/net")
+        .map_err(|error| error.to_string())?
+        .ino()
+        != before
+    {
+        return Err("namespace fixture changed its namespace".into());
+    }
+    let mut observed = [0; 8];
+    observed[..4].copy_from_slice(
+        &reentry_error
+            .ok_or("namespace reentry errno absent")?
+            .to_le_bytes(),
+    );
+    observed[4..].copy_from_slice(
+        &creation_error
+            .ok_or("namespace creation errno absent")?
+            .to_le_bytes(),
+    );
+    Ok((observed, namespace))
 }
 
 pub(crate) fn expected_port_collision_errno_bytes() -> [u8; 4] {

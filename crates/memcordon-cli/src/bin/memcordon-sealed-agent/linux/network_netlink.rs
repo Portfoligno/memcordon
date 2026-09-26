@@ -481,7 +481,9 @@ pub fn verify_loopback_routes(routes: &[Vec<u8>], index: i32) -> Result<(), Stri
     if routes.is_empty() || routes.len() > DumpKind::Routes.max_objects() {
         return Err("MCSEALED-PRIVATE-NETLINK: incomplete route inventory".into());
     }
-    let mut link_route_seen = false;
+    // Linux fib_add_ifaddr installs a LOCAL prefix for IFF_LOOPBACK,
+    // not a main-table UNICAST prefix. See Linux v6.12 fib_frontend.c.
+    let mut observed = std::collections::BTreeSet::new();
     for bytes in routes {
         if bytes.len() < 12 || bytes[0] != libc::AF_INET as u8 {
             return Err("MCSEALED-PRIVATE-NETLINK: non-IPv4 route".into());
@@ -491,11 +493,15 @@ pub fn verify_loopback_routes(routes: &[Vec<u8>], index: i32) -> Result<(), Stri
         let route_kind = bytes[7];
         if !(8..=32).contains(&prefix)
             || bytes[2] != 0
-            || !matches!(table, libc::RT_TABLE_LOCAL | libc::RT_TABLE_MAIN)
-            || !matches!(
-                route_kind,
-                libc::RTN_LOCAL | libc::RTN_BROADCAST | libc::RTN_UNICAST
-            )
+            || table != libc::RT_TABLE_LOCAL
+            || bytes[5] != libc::RTPROT_KERNEL
+            || !matches!(route_kind, libc::RTN_LOCAL | libc::RTN_BROADCAST)
+            || bytes[6]
+                != if route_kind == libc::RTN_LOCAL {
+                    libc::RT_SCOPE_HOST
+                } else {
+                    libc::RT_SCOPE_LINK
+                }
         {
             return Err("MCSEALED-PRIVATE-NETLINK: route scope mismatch".into());
         }
@@ -542,12 +548,24 @@ pub fn verify_loopback_routes(routes: &[Vec<u8>], index: i32) -> Result<(), Stri
         if destination.len() != 4 || destination[0] != 127 || output != Some(index as u32) {
             return Err("MCSEALED-PRIVATE-NETLINK: route escapes loopback".into());
         }
-        if prefix == 8 && destination == [127, 0, 0, 0] && route_kind == libc::RTN_UNICAST {
-            link_route_seen = true;
+        if !observed.insert((
+            prefix,
+            route_kind,
+            <[u8; 4]>::try_from(destination).expect("checked address"),
+        )) {
+            return Err("MCSEALED-PRIVATE-NETLINK: duplicate loopback route".into());
         }
     }
-    if !link_route_seen {
-        return Err("MCSEALED-PRIVATE-NETLINK: 127/8 link route absent".into());
+    if observed
+        != std::collections::BTreeSet::from([
+            (8, libc::RTN_LOCAL, [127, 0, 0, 0]),
+            (32, libc::RTN_LOCAL, [127, 0, 0, 1]),
+            (32, libc::RTN_BROADCAST, [127, 255, 255, 255]),
+        ])
+    {
+        return Err(
+            "MCSEALED-PRIVATE-NETLINK: exact automatic loopback route inventory differs".into(),
+        );
     }
     Ok(())
 }

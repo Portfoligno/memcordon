@@ -167,4 +167,78 @@ fn public_certificate_requires_independent_archive_host_and_p_subject() {
             .verify(&verified_policy, &expected, &high_water, 900)
             .is_err()
     );
+    use memcordon_core::public_release_trust::{
+        ExpectedPublicQualificationV2, PublicQualificationCertificateV2,
+        SignedPublicQualificationCertificateV2,
+    };
+    let extension = PublicQualificationCertificateV2 {
+        schema_version: 2,
+        subject: certificate.payload.clone(),
+        payload_index_sha256: digest(21),
+        origin_commitment_sha256: digest(22),
+        custody_receipt_sha256: digest(23),
+        generation_timeline_sha256: digest(24),
+        qualification_certificate_file_sha256: digest(25),
+        semantics_sha256: digest(26),
+    };
+    let cp2 = SignedPublicQualificationCertificateV2 {
+        signature_hex: hex(&delegated
+            .sign(&extension.canonical_bytes().unwrap())
+            .to_bytes()),
+        payload: extension,
+    };
+    let expected2 = ExpectedPublicQualificationV2 {
+        subject: expected,
+        payload_index_sha256: &digest(21),
+        origin_commitment_sha256: &digest(22),
+        custody_receipt_sha256: &digest(23),
+        generation_timeline_sha256: &digest(24),
+        qualification_certificate_file_sha256: &digest(25),
+        semantics_sha256: &digest(26),
+    };
+    assert!(
+        cp2.verify(&verified_policy, &expected2, &high_water, 300)
+            .is_ok()
+    );
+    for field in 0..6 {
+        let mut mutation = cp2.clone();
+        match field {
+            0 => mutation.payload.payload_index_sha256 = digest(27),
+            1 => mutation.payload.origin_commitment_sha256 = digest(27),
+            2 => mutation.payload.custody_receipt_sha256 = digest(27),
+            3 => mutation.payload.generation_timeline_sha256 = digest(27),
+            4 => mutation.payload.qualification_certificate_file_sha256 = digest(27),
+            5 => mutation.payload.semantics_sha256 = digest(27),
+            _ => unreachable!(),
+        }
+        // A valid delegated signature cannot override independent expected
+        // physical provenance, including CQ file vs canonical payload hash.
+        mutation.signature_hex = hex(&delegated
+            .sign(&mutation.payload.canonical_bytes().unwrap())
+            .to_bytes());
+        assert!(
+            mutation
+                .verify(&verified_policy, &expected2, &high_water, 300)
+                .is_err()
+        );
+    }
+    let mut old_domain = cp2.clone();
+    old_domain.signature_hex = certificate.signature_hex;
+    assert!(
+        old_domain
+            .verify(&verified_policy, &expected2, &high_water, 300)
+            .is_err()
+    );
+    assert!(
+        cp2.verify(&verified_policy, &expected2, &high_water, 900)
+            .is_err()
+    );
+    let bytes = serde_json::to_vec(&cp2).unwrap();
+    assert!(SignedPublicQualificationCertificateV2::parse(&bytes).is_ok());
+    let duplicate = format!(
+        "{{\"signature_hex\":\"{}\",{}",
+        cp2.signature_hex,
+        String::from_utf8(bytes).unwrap().strip_prefix('{').unwrap()
+    );
+    assert!(SignedPublicQualificationCertificateV2::parse(duplicate.as_bytes()).is_err());
 }

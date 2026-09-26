@@ -4,6 +4,10 @@
 /// frontend and privileged provider. A clock read failure is never converted
 /// into a plausible timestamp.
 pub fn monotonic_millis() -> Result<u64, String> {
+    monotonic_nanos().map(|value| value / 1_000_000)
+}
+
+pub(crate) fn monotonic_nanos() -> Result<u64, String> {
     let mut value = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -23,7 +27,8 @@ pub fn monotonic_millis() -> Result<u64, String> {
         .map_err(|_| "MCSEALED-CLOCK-MONOTONIC: seconds are not representable".to_owned())?;
     let nanoseconds = u64::try_from(value.tv_nsec)
         .map_err(|_| "MCSEALED-CLOCK-MONOTONIC: nanoseconds are not representable".to_owned())?;
-    Ok(seconds
-        .saturating_mul(1_000)
-        .saturating_add(nanoseconds / 1_000_000))
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .ok_or_else(|| "MCSEALED-CLOCK-MONOTONIC: clock overflow".into())
 }

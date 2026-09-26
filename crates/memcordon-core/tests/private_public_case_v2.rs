@@ -1,5 +1,7 @@
 use memcordon_core::DiagnosticSha256;
-use memcordon_core::private_public_case_v2::FinalPublicCaseEvidenceV2;
+use memcordon_core::private_public_case_v2::{
+    FinalPublicCaseEvidenceV2, FinalPublicCaseEvidenceV3, MAX_FINAL_PUBLIC_OBSERVER_BYTES_V3,
+};
 use memcordon_core::workload_codec::hash_bytes;
 
 fn digest(byte: u8) -> DiagnosticSha256 {
@@ -167,4 +169,85 @@ fn final_public_decoder_rejects_ambiguous_or_oversized_records() {
         ])
         .is_err()
     );
+}
+
+fn rejected_frontend_case_v3() -> serde_json::Value {
+    let mut value = case();
+    value["schema_version"] = serde_json::json!(3);
+    value["selector"] = serde_json::json!("private_tcp::frontend_loss_retired");
+    value["observation"] = serde_json::json!({
+        "phase": "public-fault-rejected-retired-v2",
+        "outcome": "frontend-lost",
+        "attempt_id": "ab".repeat([0_u8; 16].len()),
+        "checkpoint_file_sha256": digest(13),
+        "original_rejection_sha256": digest(14),
+        "fault_trigger_sha256": digest(27),
+        "fault_failure_sha256": null,
+        "retirement_sha256": digest(15),
+        "recovery_sha256": null,
+        "release_knowledge": "exec-observed",
+        "exec": "succeeded",
+        "native_observer_sha256": digest(9),
+    });
+    value["report"] = serde_json::json!({
+        "state": "absent-frontend-rejected-v3",
+        "original_rejection_sha256": digest(14),
+        "supervised_transport_sha256": digest(19),
+        "supervisor_wait_sha256": digest(28),
+        "independent_recovery_sha256": digest(20),
+    });
+    value["attachments"].as_array_mut().unwrap().remove(1);
+    value
+}
+
+#[test]
+fn public_v3_preserves_original_rejection_without_claiming_terminal() {
+    let value = rejected_frontend_case_v3();
+    let bytes = serde_json::to_vec(&value).unwrap();
+    let parsed = FinalPublicCaseEvidenceV3::parse(&bytes).unwrap();
+    parsed.validate_report_bytes(None).unwrap();
+    assert!(
+        parsed
+            .validate_report_bytes(Some(b"fabricated report"))
+            .is_err()
+    );
+    assert!(FinalPublicCaseEvidenceV2::parse(&bytes).is_err());
+    let mut legacy = value.clone();
+    legacy["schema_version"] = serde_json::json!(2);
+    assert!(parse(&legacy).is_err());
+    for (field, replacement) in [
+        ("original_rejection_sha256", digest(99)),
+        ("supervisor_wait_sha256", digest(0)),
+    ] {
+        let mut changed = value.clone();
+        changed["report"][field] = serde_json::json!(replacement);
+        assert!(FinalPublicCaseEvidenceV3::parse(&serde_json::to_vec(&changed).unwrap()).is_err());
+    }
+    let mut fabricated_terminal = value;
+    fabricated_terminal["report"] = serde_json::json!({
+        "state": "absent-frontend-loss",
+        "authenticated_terminal_sha256": digest(14),
+        "supervised_transport_sha256": digest(19),
+        "independent_recovery_sha256": digest(20),
+    });
+    assert!(
+        FinalPublicCaseEvidenceV3::parse(&serde_json::to_vec(&fabricated_terminal).unwrap())
+            .is_err()
+    );
+}
+
+#[test]
+fn only_public_v3_observer_receives_fixed_stage_capture_budget() {
+    let mut value = case();
+    value["schema_version"] = serde_json::json!(3);
+    value["attachments"][3]["size"] = serde_json::json!(MAX_FINAL_PUBLIC_OBSERVER_BYTES_V3);
+    assert!(FinalPublicCaseEvidenceV3::parse(&serde_json::to_vec(&value).unwrap()).is_ok());
+    value["attachments"][3]["size"] = serde_json::json!(MAX_FINAL_PUBLIC_OBSERVER_BYTES_V3 + 1);
+    assert!(FinalPublicCaseEvidenceV3::parse(&serde_json::to_vec(&value).unwrap()).is_err());
+    value["attachments"][3]["size"] = serde_json::json!(MAX_FINAL_PUBLIC_OBSERVER_BYTES_V3);
+    value["schema_version"] = serde_json::json!(2);
+    assert!(parse(&value).is_err());
+    value["schema_version"] = serde_json::json!(3);
+    value["attachments"][0]["size"] = serde_json::json!(MAX_FINAL_PUBLIC_OBSERVER_BYTES_V3);
+    assert!(FinalPublicCaseEvidenceV3::parse(&serde_json::to_vec(&value).unwrap()).is_err());
 }

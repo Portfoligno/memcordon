@@ -318,6 +318,12 @@ pub fn execute_private_broker(
         let checkpoint = owner.commit_and_release(observed, &installed)?;
         drop(installed);
         let exec = owner.observe_exec(startup_deadline)?;
+        if matches!(exec, PrivateExecObservation::ArmedAndControlClosed) {
+            // The owner has persisted ExecutionObserved before this hook.
+            super::private_public_provider::trigger_public_live_fault(&identity, || {
+                owner.tick_relay_for_unix_observer()
+            })?;
+        }
         let monitor = if matches!(exec, PrivateExecObservation::ArmedAndControlClosed) {
             Some(owner.monitor(frontend_pidfd.as_fd(), attempt_deadline)?)
         } else {
@@ -332,7 +338,12 @@ pub fn execute_private_broker(
                 owner
                     .retire(retirement_deadline)
                     .map_err(|error| PrivateExecutionError {
-                        detail: error,
+                        detail: match super::private_public_provider::retain_public_fault_failure(
+                            &identity, &error, true, false,
+                        ) {
+                            Ok(()) => error,
+                            Err(custody) => format!("{error}; fault custody: {custody}"),
+                        },
                         possibly_released: true,
                         cleanup_complete: false,
                         reason_code: "MCSEALED-NETWORK-LAUNCHER-NATIVE-FAILURE",
@@ -360,6 +371,15 @@ pub fn execute_private_broker(
             let (detail, cleanup_complete) = match cleanup {
                 Ok(_) => (detail, true),
                 Err(cleanup) => (format!("{detail}; cleanup: {cleanup}"), false),
+            };
+            let detail = match super::private_public_provider::retain_public_fault_failure(
+                &identity,
+                &detail,
+                possibly_released,
+                cleanup_complete,
+            ) {
+                Ok(()) => detail,
+                Err(error) => format!("{detail}; fault custody: {error}"),
             };
             Err(PrivateExecutionError {
                 detail,

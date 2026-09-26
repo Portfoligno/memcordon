@@ -9,14 +9,17 @@
 
 pub mod diagnostics;
 pub mod package_inspection_v6;
+pub mod private_facility_source_v1;
 pub mod private_public_abi_composite_v1;
 pub mod private_public_case_v2;
 pub mod private_public_policy_composite_v1;
+pub mod private_public_preparation_v2;
 pub mod private_public_report_v2;
 pub mod private_public_reuse_composite_v1;
 pub mod private_release_branch_v1;
 pub mod private_release_build_v2;
 pub mod private_release_case_v1;
+pub mod private_reuse_source_v1;
 pub mod provider_rejection_wire;
 pub mod public_release_trust;
 pub mod release_archive_trust;

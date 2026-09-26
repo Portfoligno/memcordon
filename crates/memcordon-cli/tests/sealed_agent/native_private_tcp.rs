@@ -679,6 +679,7 @@ fn initial_closed_filter_limits_process_control_scalars() {
             libc::PR_GET_NAME,
             libc::PR_SET_NAME,
             libc::PR_GET_SECCOMP,
+            libc::PR_GET_SECUREBITS,
             libc::PR_GET_TIMERSLACK,
         ] {
             assert_eq!(
@@ -689,6 +690,8 @@ fn initial_closed_filter_limits_process_control_scalars() {
         for command in [
             libc::PR_SET_NO_NEW_PRIVS as u64,
             libc::PR_SET_SECCOMP as u64,
+            libc::PR_SET_SECUREBITS as u64,
+            (libc::PR_GET_SECUREBITS as u64) | (1_u64 << 32),
             (libc::PR_GET_DUMPABLE as u64) | (1_u64 << 32),
         ] {
             assert_eq!(evaluate_filter(&filter, arch, prctl, [command, 0, 0]), DENY);
@@ -912,19 +915,23 @@ fn loopback_address() -> Vec<u8> {
     bytes
 }
 
-fn loopback_route() -> Vec<u8> {
+fn loopback_route(prefix: u8, kind: u8, destination: [u8; 4]) -> Vec<u8> {
     let mut bytes = vec![
         libc::AF_INET as u8,
-        8,
+        prefix,
         0,
         0,
-        libc::RT_TABLE_MAIN,
+        libc::RT_TABLE_LOCAL,
         libc::RTPROT_KERNEL,
-        libc::RT_SCOPE_LINK,
-        libc::RTN_UNICAST,
+        if kind == libc::RTN_LOCAL {
+            libc::RT_SCOPE_HOST
+        } else {
+            libc::RT_SCOPE_LINK
+        },
+        kind,
     ];
     bytes.extend_from_slice(&0_u32.to_ne_bytes());
-    bytes.extend_from_slice(&attribute(libc::RTA_DST, &[127, 0, 0, 0]));
+    bytes.extend_from_slice(&attribute(libc::RTA_DST, &destination));
     bytes.extend_from_slice(&attribute(libc::RTA_OIF, &1_u32.to_ne_bytes()));
     bytes.extend_from_slice(&attribute(libc::RTA_PREFSRC, &[127, 0, 0, 1]));
     bytes
@@ -934,25 +941,32 @@ fn loopback_route() -> Vec<u8> {
 fn private_topology_rejects_hidden_links_addresses_and_routes() {
     let link = loopback_link();
     let address = loopback_address();
-    let route = loopback_route();
+    let routes = vec![
+        loopback_route(8, libc::RTN_LOCAL, [127, 0, 0, 0]),
+        loopback_route(32, libc::RTN_LOCAL, [127, 0, 0, 1]),
+        loopback_route(32, libc::RTN_BROADCAST, [127, 255, 255, 255]),
+    ];
     assert_eq!(loopback_index(std::slice::from_ref(&link), true), Ok(1));
     assert_eq!(
         verify_loopback_addresses(std::slice::from_ref(&address), 1),
         Ok(true)
     );
-    assert_eq!(
-        verify_loopback_routes(std::slice::from_ref(&route), 1),
-        Ok(())
-    );
+    assert_eq!(verify_loopback_routes(&routes, 1), Ok(()));
     assert!(loopback_index(&[link.clone(), link], true).is_err());
 
     let mut ipv6 = address;
     ipv6[0] = libc::AF_INET6 as u8;
     assert!(verify_loopback_addresses(&[ipv6], 1).is_err());
 
-    let mut external_route = route;
-    external_route[1] = 0;
-    assert!(verify_loopback_routes(&[external_route], 1).is_err());
+    let mut external_routes = routes.clone();
+    external_routes[0][1] = 0;
+    assert!(verify_loopback_routes(&external_routes, 1).is_err());
+    let mut unicast_routes = routes.clone();
+    unicast_routes[0][4] = libc::RT_TABLE_MAIN;
+    unicast_routes[0][6] = libc::RT_SCOPE_LINK;
+    unicast_routes[0][7] = libc::RTN_UNICAST;
+    assert!(verify_loopback_routes(&unicast_routes, 1).is_err());
+    assert!(verify_loopback_routes(&routes[..2], 1).is_err());
 }
 
 #[test]

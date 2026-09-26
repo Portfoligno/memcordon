@@ -168,7 +168,6 @@ pub fn validate_protected_public_spoof_v1(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 pub struct PublicEpochPositiveV1<'a> {
     pub selector: &'a str,
     pub challenge: &'a str,
@@ -178,7 +177,6 @@ pub struct PublicEpochPositiveV1<'a> {
     pub interval: &'a crate::private_kernel_observer::VerifiedKernelIntervalV1,
 }
 
-#[cfg(target_os = "linux")]
 pub struct ExpectedPublicEpochTransitionV1<'a> {
     pub e0: PublicEpochPositiveV1<'a>,
     pub e1: PublicEpochPositiveV1<'a>,
@@ -196,15 +194,17 @@ pub struct ExpectedPublicEpochTransitionV1<'a> {
     pub spoof_interval: &'a crate::private_kernel_observer::VerifiedKernelIntervalV1,
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) struct VerifiedPublicEpochTransitionV1 {
     transcript_sha256: DiagnosticSha256,
+    transcript_bytes: Vec<u8>,
     e1_installation_epoch: DiagnosticSha256,
     e1_h1_receipt_sha256: DiagnosticSha256,
 }
 
-#[cfg(target_os = "linux")]
 impl VerifiedPublicEpochTransitionV1 {
+    pub(crate) fn transcript_bytes(&self) -> &[u8] {
+        &self.transcript_bytes
+    }
     pub(crate) fn transcript_sha256(&self) -> &DiagnosticSha256 {
         &self.transcript_sha256
     }
@@ -216,7 +216,6 @@ impl VerifiedPublicEpochTransitionV1 {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn positive(input: &PublicEpochPositiveV1<'_>) -> Result<DiagnosticSha256> {
     let challenge: [u8; 32] = hex::decode(input.challenge)
         .map_err(|_| fail("public epoch control challenge differs"))?
@@ -259,7 +258,6 @@ fn positive(input: &PublicEpochPositiveV1<'_>) -> Result<DiagnosticSha256> {
     Ok(hash_bytes(&input.provider.record_bytes))
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn join_public_epoch_transition_v1(
     input: &ExpectedPublicEpochTransitionV1<'_>,
 ) -> Result<VerifiedPublicEpochTransitionV1> {
@@ -355,6 +353,7 @@ pub(crate) fn join_public_epoch_transition_v1(
     ))?;
     Ok(VerifiedPublicEpochTransitionV1 {
         transcript_sha256: hash_bytes(&joined),
+        transcript_bytes: joined,
         e1_installation_epoch: input.e1.host.installation_epoch().clone(),
         e1_h1_receipt_sha256: input.e1.host.active_h1_receipt_sha256().clone(),
     })

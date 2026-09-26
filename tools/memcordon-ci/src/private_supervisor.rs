@@ -35,49 +35,16 @@ pub struct LinuxChildIdentityV1 {
 /// This is a narrow OS observation, not proof of target exec or retirement.
 #[cfg(target_os = "linux")]
 pub fn verify_recorded_process_exited(identity: LinuxChildIdentityV1) -> Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
     if identity.pid == 0 || identity.start_time_ticks == 0 {
         return Err(CiError::Message(
             "recorded private process identity is incomplete".into(),
         ));
     }
-    // SAFETY: pidfd_open observes exactly one positive numeric PID and does
-    // not signal or mutate the process.
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid as libc::pid_t, 0) } as i32;
-    if raw == -1 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
-        }
-        return Err(error.into());
-    }
-    // SAFETY: successful pidfd_open returned a unique owned descriptor.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
-    let path = Path::new("/proc")
-        .join(identity.pid.to_string())
-        .join("stat");
-    let stat = match std::fs::read_to_string(path) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let current = parse_linux_child_stat(&stat, identity.pid)?;
-    if current != identity {
+    if memcordon_platform::test_support::private_recorded_process_exited(
+        identity.pid,
+        identity.start_time_ticks,
+    )? {
         return Ok(());
-    }
-    let mut pollfd = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: poll reads the retained pidfd without changing process state.
-    let ready = unsafe { libc::poll(&raw mut pollfd, 1, 0) };
-    if ready == 1 && pollfd.revents & libc::POLLIN != 0 {
-        return Ok(());
-    }
-    if ready == -1 {
-        return Err(std::io::Error::last_os_error().into());
     }
     Err(CiError::Message(
         "recorded private process is still live".into(),

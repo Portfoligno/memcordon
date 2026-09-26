@@ -6,15 +6,11 @@
 
 use crate::{CiError, Result};
 use memcordon_core::DiagnosticSha256;
-#[cfg(target_os = "linux")]
 use memcordon_core::workload_codec::hash_bytes;
-#[cfg(target_os = "linux")]
 use memcordon_core::workload_contract::reject_duplicate_json_keys;
-#[cfg(target_os = "linux")]
 use serde::{Deserialize, Serialize};
 
 use crate::private_protected_readback::UnixAbsenceSnapshotV1;
-#[cfg(target_os = "linux")]
 use crate::private_protected_readback::{
     UnixIntentSupervisorAbsenceV1, validate_unix_supervisor_absence,
 };
@@ -22,27 +18,25 @@ use crate::private_protected_readback::{
 pub const UNIX_INTENT_SELECTOR: &str = "private_tcp::af_unix_abstract_and_pathname_denied";
 const MAX_PROC_UNIX_BYTES: usize = 1024 * 1024;
 
-#[cfg(target_os = "linux")]
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct UnixIntentGateV1 {
+pub(crate) struct UnixIntentGateV1 {
     schema_version: u8,
     selector: String,
     result_key: DiagnosticSha256,
     challenge_sha256: DiagnosticSha256,
-    witness: UnixIntentSupervisorAbsenceV1,
+    pub(crate) witness: UnixIntentSupervisorAbsenceV1,
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct UnixIntentAckV1 {
-    schema_version: u8,
-    selector: String,
-    result_key: DiagnosticSha256,
-    challenge_sha256: DiagnosticSha256,
-    gate_sha256: DiagnosticSha256,
-    observed: UnixAbsenceSnapshotV1,
+pub(crate) struct UnixIntentAckV1 {
+    pub(crate) schema_version: u8,
+    pub(crate) selector: String,
+    pub(crate) result_key: DiagnosticSha256,
+    pub(crate) challenge_sha256: DiagnosticSha256,
+    pub(crate) gate_sha256: DiagnosticSha256,
+    pub(crate) observed: UnixAbsenceSnapshotV1,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -53,8 +47,7 @@ pub struct IndependentUnixLiveSampleV1 {
     observed: UnixAbsenceSnapshotV1,
 }
 
-#[cfg(target_os = "linux")]
-fn parse_gate(
+pub(crate) fn parse_gate(
     bytes: &[u8],
     key: &DiagnosticSha256,
     challenge: [u8; 32],
@@ -282,6 +275,13 @@ mod linux {
     pub fn sample_and_ack_if_ready(
         challenge: [u8; 32],
     ) -> Result<Option<IndependentUnixLiveSampleV1>> {
+        sample_and_ack_if_ready_with_source(challenge, |_, _| Ok(()))
+    }
+
+    pub fn sample_and_ack_if_ready_with_source(
+        challenge: [u8; 32],
+        source: impl FnOnce(u32, u64) -> Result<()>,
+    ) -> Result<Option<IndependentUnixLiveSampleV1>> {
         let key = private_release_case_key_v1(
             PrivateReleaseStageV1::CandidateCapability,
             UNIX_INTENT_SELECTOR,
@@ -300,6 +300,14 @@ mod linux {
             };
         let gate = parse_gate(&gate_bytes, &key, challenge)?;
         let observed = sample(&gate, challenge)?;
+        source(gate.witness.target.pid, gate.witness.target.start_time)?;
+        if sample(&gate, challenge)? != observed
+            || read_protected_raw_case_file(&directory.join("unix-intent-gate.json"))? != gate_bytes
+        {
+            return Err(CiError::Message(
+                "Unix target/gate changed before ACK".into(),
+            ));
+        }
         let gate_sha256 = hash_bytes(&gate_bytes);
         let ack = UnixIntentAckV1 {
             schema_version: 1,
@@ -372,6 +380,16 @@ pub use linux::*;
 #[cfg(not(target_os = "linux"))]
 pub fn sample_and_ack_if_ready(
     _challenge: [u8; 32],
+) -> Result<Option<IndependentUnixLiveSampleV1>> {
+    Err(CiError::Message(
+        "Unix live observation requires native Linux".into(),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn sample_and_ack_if_ready_with_source(
+    _challenge: [u8; 32],
+    _source: impl FnOnce(u32, u64) -> Result<()>,
 ) -> Result<Option<IndependentUnixLiveSampleV1>> {
     Err(CiError::Message(
         "Unix live observation requires native Linux".into(),

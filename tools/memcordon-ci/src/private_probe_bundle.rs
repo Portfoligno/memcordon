@@ -16,7 +16,7 @@ const OBJECT: &str = "/run/memcordon-private-observer/private_kernel_v1.bpf.o";
 const LOADER: &str = "/run/memcordon-private-observer/private_kernel_v1_loader";
 const AGENT: &str = "/usr/libexec/memcordon-sealed-agent";
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExpectedProbeBundleV1 {
     pub(crate) bpf_source_sha256: DiagnosticSha256,

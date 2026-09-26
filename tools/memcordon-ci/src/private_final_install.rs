@@ -453,7 +453,7 @@ mod linux {
         operation: &str,
         prior_epoch: Option<&DiagnosticSha256>,
     ) -> Result<super::FinalHostReadbackV1> {
-        if unsafe { libc::geteuid() } != 0 {
+        if !rustix::process::geteuid().is_root() {
             return Err(CiError::Message("final A install requires root".into()));
         }
         if let Some(epoch) = prior_epoch {

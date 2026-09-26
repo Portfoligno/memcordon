@@ -2,6 +2,8 @@ pub use memcordon_ci::{CiError, Result};
 
 #[path = "../src/private_kernel_observer.rs"]
 mod private_kernel_observer;
+#[path = "../src/private_kernel_replay.rs"]
+mod private_kernel_replay;
 #[path = "../src/private_probe_bundle.rs"]
 mod private_probe_bundle;
 #[path = "../src/private_process_clock.rs"]

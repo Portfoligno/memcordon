@@ -6774,6 +6774,26 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         } => memcordon_ci::private_completed_run::collect_private_q_after_completed_producer(
             &intent, &build, &output,
         ),
+        ReleaseCommand::CollectPrivateQCertificate {
+            intent,
+            build,
+            signing_intent,
+            credential_fd,
+            output_dir,
+        } => {
+            memcordon_ci::private_completed_run::collect_signed_private_q_after_completed_producer(
+                &intent,
+                &build,
+                &signing_intent,
+                credential_fd,
+                &output_dir,
+            )
+        }
+        ReleaseCommand::CollectPrivateP { intent, build, signing_intent, credential_fd, output_dir } => {
+            memcordon_ci::private_public_completion::collect_signed_private_p_after_completed_producer(
+                &intent, &build, &signing_intent, credential_fd, &output_dir,
+            )
+        }
         ReleaseCommand::InstallPrivateFinal { intent, archive } => {
             memcordon_ci::private_final_install::install_final_same_host(root, &intent, &archive)
         }

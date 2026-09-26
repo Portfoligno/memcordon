@@ -1388,6 +1388,50 @@ fn execute_private_v2(
         None => None,
     };
 
+    if args.concurrent_private_two_attempts {
+        let policy = args.policy.policy(&args.budgets);
+        let result = memcordon_platform::execute_private_v2_dual_pair(
+            &policy,
+            command,
+            contract,
+            memcordon_platform::AttemptContext::default(),
+            expected_plan.as_ref(),
+            4,
+        );
+        return match result {
+            Ok([first, second]) => {
+                let report = serde_json::json!({"schema_version":12,"evidence_scope":"two-authenticated-public-launches",
+                    "attempts":[{"ordinal":0,"terminal":first.report(),"raw_response":first.raw_response()},
+                    {"ordinal":1,"terminal":second.report(),"raw_response":second.raw_response()}]});
+                if let Some(path) = &args.output.report_path {
+                    if let Err(error) = write_private_result_atomic(path, &report) {
+                        presentation::write_runtime_error(&mut presentation.stderr(), error)
+                            .expect("dual error should be writable");
+                        return 125;
+                    }
+                }
+                if matches!(
+                    first.report().outcome,
+                    PrivateTerminalOutcomeV11::Exited { code: 0 }
+                ) && matches!(
+                    second.report().outcome,
+                    PrivateTerminalOutcomeV11::Exited { code: 0 }
+                ) {
+                    0
+                } else {
+                    125
+                }
+            }
+            Err(error) => {
+                presentation::write_runtime_error(
+                    &mut presentation.stderr(),
+                    format!("dual private launch failed: {error:?}"),
+                )
+                .expect("dual error should be writable");
+                125
+            }
+        };
+    }
     let (result, exit_code, diagnostic) = if args.policy.restart || args.policy.restart_on.is_some()
     {
         (
@@ -1548,10 +1592,7 @@ fn execute_private_v2(
 }
 
 #[cfg(target_os = "linux")]
-fn write_private_result_atomic(
-    path: &Path,
-    report: &memcordon_core::report_v11::PrivatePublicResultV11,
-) -> Result<(), String> {
+fn write_private_result_atomic<T: serde::Serialize>(path: &Path, report: &T) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|value| !value.as_os_str().is_empty())

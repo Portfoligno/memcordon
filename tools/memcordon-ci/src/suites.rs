@@ -1081,8 +1081,21 @@ pub fn run(
     target: Option<&str>,
     collector_intent_sha256: Option<&str>,
     policy_intent_sha256: Option<&str>,
+    observer_intent: Option<&Path>,
+    observer_intent_sha256: Option<&str>,
 ) -> Result<()> {
     if matches!(suite, Suite::BackendLinuxPrivateV4) {
+        match (observer_intent,observer_intent_sha256) {
+            (Some(path),Some(expected)) => {
+                let bytes=memcordon_ci::private_protected_readback::read_protected_raw_case_file(path)?;
+                if expected.len()!=64 || hex::decode(expected).ok().is_none_or(|bytes|bytes.len()!=32 || hex::encode(&bytes)!=expected)
+                    || String::from(memcordon_core::workload_codec::hash_bytes(&bytes))!=expected {
+                    return Err(CiError::Message("protected static observer intent differs from stage/target workflow digest".into()));
+                }
+            },
+            (None,None)=>{},
+            _=>return Err(CiError::Message("observer intent path and independently pinned static digest must be supplied together".into())),
+        }
         let stage = stage
             .ok_or_else(|| CiError::Message("private native suite requires --stage".into()))?;
         let target = target
@@ -1104,18 +1117,21 @@ pub fn run(
         } else {
             target
         };
-        return memcordon_ci::private_suite::run(
+        return memcordon_ci::private_suite::run_with_observer_intent(
             root,
             stage.into(),
             target,
             collector_intent_sha256,
             policy_intent_sha256,
+            observer_intent,
         );
     }
     if stage.is_some()
         || target.is_some()
         || collector_intent_sha256.is_some()
         || policy_intent_sha256.is_some()
+        || observer_intent.is_some()
+        || observer_intent_sha256.is_some()
     {
         return Err(CiError::Message(
             "--stage, --target, --collector-intent-sha256 and --policy-intent-sha256 are private native suite options"

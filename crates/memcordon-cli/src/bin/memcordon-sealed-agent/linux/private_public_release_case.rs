@@ -381,16 +381,118 @@ pub(crate) struct FinalPublicTcpFixtureObservationV1 {
     pub(crate) client_port: u16,
     pub(crate) challenge_sha256: DiagnosticSha256,
     pub(crate) response_sha256: DiagnosticSha256,
+    pub(crate) observed_response_bytes: [u8; 32],
 }
 
-#[allow(dead_code)] // Protected final-public fixture dispatch is not yet installed.
 pub(crate) fn run_final_public_tcp_fixture(
     challenge: [u8; 32],
+    port: u16,
+    dual: bool,
+    mut held: impl FnMut(&FinalPublicTcpFixtureObservationV1) -> Result<(), String>,
 ) -> Result<FinalPublicTcpFixtureObservationV1, String> {
-    if challenge == [0; 32] {
+    let mut response_bytes = Vec::with_capacity(64);
+    response_bytes.extend_from_slice(b"memcordon-final-public-tcp-fixture-v1\0");
+    response_bytes.extend_from_slice(&challenge);
+    response_bytes.extend_from_slice(&port.to_be_bytes());
+    run_final_public_tcp_fixture_with_response(
+        challenge,
+        port,
+        dual,
+        memcordon_core::workload_codec::hash_bytes(&response_bytes),
+        held,
+    )
+}
+
+#[derive(Serialize)]
+pub(crate) struct FinalPublicTopologyFixtureObservationV1 {
+    pub(crate) schema_version: u8,
+    pub(crate) tcp: FinalPublicTcpFixtureObservationV1,
+    pub(crate) namespace_reentry_errno: Option<i32>,
+    pub(crate) namespace_creation_errno: Option<i32>,
+    pub(crate) namespace_operand: Option<FinalPublicNamespaceOperandV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FinalPublicNamespaceOperandV1 {
+    pub(crate) descriptor: i32,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+pub(crate) fn run_final_public_topology_fixture(
+    selector: &str,
+    challenge: [u8; 32],
+    port: u16,
+    mut held: impl FnMut(&FinalPublicTopologyFixtureObservationV1) -> Result<(), String>,
+) -> Result<FinalPublicTopologyFixtureObservationV1, String> {
+    let denials = match selector {
+        super::private_release_case::TOPOLOGY_SELECTOR => None,
+        super::private_release_denial::NAMESPACE_SELECTOR => {
+            Some(super::private_release_denial::observe_namespace_denials_held()?)
+        }
+        _ => return Err("public topology selector outside reviewed protocol".into()),
+    };
+    let response = memcordon_core::private_release_case_v1::public_fixture_expected_response_v1(
+        selector, &challenge, port,
+    )?;
+    let response: [u8; 32] = response
+        .try_into()
+        .map_err(|_| "public topology response width differs")?;
+    let namespace_reentry_errno = denials.as_ref().map(|(bytes, _)| {
+        i32::from_le_bytes(bytes[..4].try_into().expect("fixed native errno width"))
+    });
+    let namespace_creation_errno = denials.as_ref().map(|(bytes, _)| {
+        i32::from_le_bytes(bytes[4..].try_into().expect("fixed native errno width"))
+    });
+    let namespace_operand = denials
+        .as_ref()
+        .map(|(_, namespace)| {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::MetadataExt;
+            let metadata = namespace.metadata().map_err(|error| error.to_string())?;
+            Ok::<_, String>(FinalPublicNamespaceOperandV1 {
+                descriptor: namespace.as_raw_fd(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        })
+        .transpose()?;
+    let tcp = run_final_public_tcp_fixture_with_response(
+        challenge,
+        port,
+        false,
+        DiagnosticSha256::from_bytes(response),
+        |tcp| {
+            held(&FinalPublicTopologyFixtureObservationV1 {
+                schema_version: 3,
+                tcp: tcp.clone(),
+                namespace_reentry_errno,
+                namespace_creation_errno,
+                namespace_operand: namespace_operand.clone(),
+            })
+        },
+    )?;
+    Ok(FinalPublicTopologyFixtureObservationV1 {
+        schema_version: 3,
+        tcp,
+        namespace_reentry_errno,
+        namespace_creation_errno,
+        namespace_operand,
+    })
+}
+
+fn run_final_public_tcp_fixture_with_response(
+    challenge: [u8; 32],
+    port: u16,
+    dual: bool,
+    response_sha256: DiagnosticSha256,
+    mut held: impl FnMut(&FinalPublicTcpFixtureObservationV1) -> Result<(), String>,
+) -> Result<FinalPublicTcpFixtureObservationV1, String> {
+    if challenge == [0; 32] || port == 0 {
         return Err("MCSEALED-PRIVATE-RELEASE: zero TCP fixture challenge".into());
     }
-    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: TCP bind: {error}"))?;
     let listener_addr = listener.local_addr().map_err(|error| error.to_string())?;
     if !listener_addr.ip().is_ipv4()
@@ -399,7 +501,26 @@ pub(crate) fn run_final_public_tcp_fixture(
     {
         return Err("MCSEALED-PRIVATE-RELEASE: TCP listener address differs".into());
     }
-    let mut client = TcpStream::connect_timeout(&listener_addr, Duration::from_secs(5))
+    match TcpListener::bind(listener_addr) {
+        Err(error) if error.raw_os_error() == Some(libc::EADDRINUSE) => {}
+        Err(error) => {
+            return Err(format!(
+                "MCSEALED-PRIVATE-RELEASE: occupied-port control: {error}"
+            ));
+        }
+        Ok(_) => return Err("MCSEALED-PRIVATE-RELEASE: occupied-port control was admitted".into()),
+    }
+    let free_control = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: free-port control: {error}"))?;
+    if free_control
+        .local_addr()
+        .map_err(|error| error.to_string())?
+        .port()
+        == listener_addr.port()
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: free-port control aliases occupied listener".into());
+    }
+    let mut client = TcpStream::connect(listener_addr)
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: TCP connect: {error}"))?;
     let (mut accepted, peer_addr) = listener
         .accept()
@@ -426,11 +547,6 @@ pub(crate) fn run_final_public_tcp_fixture(
     if received != challenge {
         return Err("MCSEALED-PRIVATE-RELEASE: TCP challenge differs".into());
     }
-    let mut response_bytes = Vec::with_capacity(64);
-    response_bytes.extend_from_slice(b"memcordon-final-public-tcp-fixture-v1\0");
-    response_bytes.extend_from_slice(&challenge);
-    response_bytes.extend_from_slice(&listener_addr.port().to_be_bytes());
-    let response_sha256 = memcordon_core::workload_codec::hash_bytes(&response_bytes);
     accepted
         .write_all(response_sha256.bytes())
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: TCP response send: {error}"))?;
@@ -447,14 +563,42 @@ pub(crate) fn run_final_public_tcp_fixture(
     if network_namespace_inode == 0 {
         return Err("MCSEALED-PRIVATE-RELEASE: netns identity is zero".into());
     }
-    Ok(FinalPublicTcpFixtureObservationV1 {
-        schema_version: 1,
+    let mut observed = FinalPublicTcpFixtureObservationV1 {
+        schema_version: 2,
         network_namespace_inode,
         listener_port: listener_addr.port(),
         client_port: client_addr.port(),
         challenge_sha256: memcordon_core::workload_codec::hash_bytes(&challenge),
         response_sha256,
-    })
+        observed_response_bytes: observed_response,
+    };
+    held(&observed)?;
+    if dual {
+        // The first ACK is supplied only after the root observer's overlap
+        // sample. This second real exchange can be scheduled after R1 while
+        // retaining the second attempt's original listener and connection.
+        client
+            .write_all(&challenge)
+            .map_err(|error| error.to_string())?;
+        accepted
+            .read_exact(&mut received)
+            .map_err(|error| error.to_string())?;
+        if received != challenge {
+            return Err("dual post-retirement challenge differs".into());
+        }
+        accepted
+            .write_all(observed.response_sha256.bytes())
+            .map_err(|error| error.to_string())?;
+        client
+            .read_exact(&mut observed_response)
+            .map_err(|error| error.to_string())?;
+        if observed_response != *observed.response_sha256.bytes() {
+            return Err("dual post-retirement response differs".into());
+        }
+        observed.observed_response_bytes = observed_response;
+        held(&observed)?;
+    }
+    Ok(observed)
 }
 
 /// A separate final-public attempt for the fixed same-namespace collision
@@ -468,16 +612,18 @@ pub(crate) struct FinalPublicPortCollisionObservationV1 {
     pub(crate) bound_port: u16,
     pub(crate) challenge_sha256: DiagnosticSha256,
     pub(crate) collision_os_code: i32,
+    pub(crate) observed_response_bytes: [u8; 32],
 }
 
-#[allow(dead_code)] // Protected final-public fixture dispatch is not yet installed.
 pub(crate) fn run_final_public_port_collision_fixture(
     challenge: [u8; 32],
+    port: u16,
+    held: impl FnOnce(&FinalPublicPortCollisionObservationV1) -> Result<(), String>,
 ) -> Result<FinalPublicPortCollisionObservationV1, String> {
-    if challenge == [0; 32] {
+    if challenge == [0; 32] || port == 0 {
         return Err("MCSEALED-PRIVATE-RELEASE: zero collision challenge".into());
     }
-    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: collision first bind: {error}"))?;
     let address = listener.local_addr().map_err(|error| error.to_string())?;
     if !address.ip().is_ipv4() || !address.ip().is_loopback() || address.port() == 0 {
@@ -498,17 +644,58 @@ pub(crate) fn run_final_public_port_collision_fixture(
     if collision_os_code != libc::EADDRINUSE {
         return Err("MCSEALED-PRIVATE-RELEASE: collision errno differs".into());
     }
+    // Collision is not an invalid-operand control: the original occupied
+    // listener remains usable for an exact bidirectional challenge exchange.
+    let mut client = TcpStream::connect(address).map_err(|error| error.to_string())?;
+    let (mut accepted, peer) = listener.accept().map_err(|error| error.to_string())?;
+    if peer != client.local_addr().map_err(|error| error.to_string())? {
+        return Err("collision peer differs".into());
+    }
+    for stream in [&client, &accepted] {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| error.to_string())?;
+    }
+    client
+        .write_all(&challenge)
+        .map_err(|error| error.to_string())?;
+    let mut received = [0_u8; 32];
+    accepted
+        .read_exact(&mut received)
+        .map_err(|error| error.to_string())?;
+    if received != challenge {
+        return Err("collision listener challenge differs".into());
+    }
+    accepted
+        .write_all(&challenge)
+        .map_err(|error| error.to_string())?;
+    client
+        .read_exact(&mut received)
+        .map_err(|error| error.to_string())?;
+    if received != challenge {
+        return Err("collision original listener response differs".into());
+    }
+    // A valid free-port control is held alongside the occupied listener;
+    // replay joins its actual checked port-zero bind and sampled socket FD.
+    let free = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .map_err(|error| format!("collision free-bind control: {error}"))?;
+    if free.local_addr().map_err(|error| error.to_string())?.port() == address.port() {
+        return Err("collision free-bind control aliases occupied port".into());
+    }
     let network_namespace_inode = std::fs::metadata("/proc/self/ns/net")
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: netns readback: {error}"))?
         .ino();
     if network_namespace_inode == 0 {
         return Err("MCSEALED-PRIVATE-RELEASE: netns identity is zero".into());
     }
-    Ok(FinalPublicPortCollisionObservationV1 {
-        schema_version: 1,
+    let observed = FinalPublicPortCollisionObservationV1 {
+        schema_version: 2,
         network_namespace_inode,
         bound_port: address.port(),
         challenge_sha256: memcordon_core::workload_codec::hash_bytes(&challenge),
         collision_os_code,
-    })
+        observed_response_bytes: received,
+    };
+    held(&observed)?;
+    Ok(observed)
 }

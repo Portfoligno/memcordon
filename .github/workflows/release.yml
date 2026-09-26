@@ -15,12 +15,36 @@ on:
         required: false
         type: boolean
         default: false
-      collector_intent_sha256:
-        description: Digest only of the verifier host's protected candidate collector intent; no signing key or root policy
+      collector_intent_sha256_x64:
+        description: x64 static protected candidate collector digest; no signing key or root policy
         required: false
         type: string
-      policy_intent_sha256:
-        description: Digest only of the independently provisioned protected private-policy release intent
+      collector_intent_sha256_arm64:
+        description: ARM64 static protected candidate collector digest
+        required: false
+        type: string
+      policy_intent_sha256_x64:
+        description: x64 static approved policy recipe digest; no future H0 or epoch
+        required: false
+        type: string
+      policy_intent_sha256_arm64:
+        description: ARM64 static approved policy recipe digest; no future H0 or epoch
+        required: false
+        type: string
+      observer_intent_sha256_x64:
+        description: x64 static administrator-enrolled candidate observer plan digest
+        required: false
+        type: string
+      observer_intent_sha256_arm64:
+        description: ARM64 static administrator-enrolled candidate observer plan digest
+        required: false
+        type: string
+      public_observer_intent_sha256_x64:
+        description: x64 static independently enrolled installed public producer intent digest
+        required: false
+        type: string
+      public_observer_intent_sha256_arm64:
+        description: ARM64 static independently enrolled installed public producer intent digest
         required: false
         type: string
 
@@ -521,11 +545,12 @@ jobs:
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate
       - run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-candidate
       - name: Private candidate suite
-        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native --collector-intent-sha256 "$COLLECTOR_INTENT_SHA256" --policy-intent-sha256 "$POLICY_INTENT_SHA256"
+        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native --collector-intent-sha256 "$COLLECTOR_INTENT_SHA256" --policy-intent-sha256 "$POLICY_INTENT_SHA256" --observer-intent /etc/memcordon/release-trust/candidate-observer.v1.json --observer-intent-sha256 "$OBSERVER_INTENT_SHA256"
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          COLLECTOR_INTENT_SHA256: ${{ inputs.collector_intent_sha256 }}
-          POLICY_INTENT_SHA256: ${{ inputs.policy_intent_sha256 }}
+          COLLECTOR_INTENT_SHA256: ${{ inputs[format('collector_intent_sha256_{0}', matrix.id)] }}
+          POLICY_INTENT_SHA256: ${{ inputs[format('policy_intent_sha256_{0}', matrix.id)] }}
+          OBSERVER_INTENT_SHA256: ${{ inputs[format('observer_intent_sha256_{0}', matrix.id)] }}
       - name: Upload completed private candidate C V3
         if: success()
         uses: ./.github/actions/upload-artifact
@@ -604,10 +629,20 @@ jobs:
         run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-final --intent /etc/memcordon/release-trust/final-install-intent.v1.json --archive "$PRIVATE_FINAL_ARCHIVE"
         env:
           PRIVATE_FINAL_ARCHIVE: target/ci/release-inputs/private-final-a-${{ matrix.id }}/memcordon-private-final-${{ matrix.id }}.tar.gz
-      - name: Final installed public V2 suite on the same host
-        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage final-public --target native
+      - name: Final installed public source suite on the same enrolled host
+        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage final-public --target native --observer-intent /etc/memcordon/release-trust/public-observer.v2.json --observer-intent-sha256 "$PUBLIC_OBSERVER_INTENT_SHA256"
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          PUBLIC_OBSERVER_INTENT_SHA256: ${{ inputs[format('public_observer_intent_sha256_{0}', matrix.id)] }}
+      - name: Retain origin-backed public raw evidence only after exact all25 replay
+        if: success()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: release-private-public-raw-${{ matrix.id }}
+          path: target/ci/reports/private-public-raw-v1/linux-${{ matrix.id }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
       - id: build-context-audit
         if: always() && steps.build-context-prepare.outcome == 'success'
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin

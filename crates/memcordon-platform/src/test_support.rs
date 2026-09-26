@@ -1,4 +1,327 @@
 //! Native containment used only by black-box process tests.
+
+#[cfg(target_os = "linux")]
+#[path = "private_network_source.rs"]
+mod private_network_source;
+
+#[cfg(target_os = "linux")]
+#[path = "private_unix_detector.rs"]
+mod private_unix_detector;
+
+#[cfg(target_os = "linux")]
+#[path = "private_host_network_source.rs"]
+mod private_host_network_source;
+
+#[cfg(target_os = "linux")]
+pub use private_host_network_source::HostNetworkWatchV1;
+
+#[cfg(not(target_os = "linux"))]
+pub struct HostNetworkWatchV1 {
+    pins: [(u64, u64); 4],
+}
+#[cfg(not(target_os = "linux"))]
+impl HostNetworkWatchV1 {
+    pub fn start() -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "host continuity observation requires native GNU Linux",
+        ))
+    }
+    pub fn object_pins(&self) -> &[(u64, u64); 4] {
+        &self.pins
+    }
+    pub fn finish(self) -> std::io::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "host continuity observation requires native GNU Linux",
+        ))
+    }
+}
+
+/// Actual bounded positive detector sources from isolated observer namespaces.
+#[cfg(target_os = "linux")]
+pub fn private_sample_unix_detector(
+    challenge: [u8; 32],
+) -> std::io::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    private_unix_detector::sample(challenge)
+}
+
+#[cfg(target_os = "linux")]
+pub fn private_sample_network_namespace(
+    pid: u32,
+    start_ticks: u64,
+) -> std::io::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    private_network_source::sample(pid, start_ticks)
+}
+
+#[cfg(unix)]
+pub fn private_observer_monotonic_ns() -> std::io::Result<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes one valid timespec owned by this call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut time) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let seconds = u64::try_from(time.tv_sec).map_err(std::io::Error::other)?;
+    let nanos = u64::try_from(time.tv_nsec).map_err(std::io::Error::other)?;
+    if nanos >= 1_000_000_000 {
+        return Err(std::io::Error::other(
+            "native monotonic clock nanoseconds differ",
+        ));
+    }
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanos))
+        .ok_or_else(|| std::io::Error::other("native monotonic clock overflow"))
+}
+
+#[cfg(target_os = "linux")]
+pub fn private_observer_clock_ticks_per_second() -> std::io::Result<u64> {
+    // SAFETY: sysconf queries one supported scalar without pointer operands.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    u64::try_from(ticks)
+        .ok()
+        .filter(|ticks| *ticks > 0)
+        .ok_or_else(|| std::io::Error::other("native clock ticks query failed"))
+}
+
+/// Spawn the root-controlled public CLI gate with exact nonroot credentials
+/// and retained control endpoints. Ownership ends immediately after spawn,
+/// so the root parent cannot accidentally mask a child's control-socket EOF.
+#[cfg(target_os = "linux")]
+pub fn spawn_private_public_child(
+    mut command: std::process::Command,
+    uid: u32,
+    gid: u32,
+    gate_reader: std::os::fd::OwnedFd,
+    gate_writer: std::os::fd::OwnedFd,
+    reuse: Option<std::os::fd::OwnedFd>,
+) -> std::io::Result<std::process::Child> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    if uid == 0
+        || gid == 0
+        || gate_reader.as_raw_fd() < 3
+        || gate_writer.as_raw_fd() < 3
+        || reuse.as_ref().is_some_and(|fd| fd.as_raw_fd() < 3)
+    {
+        return Err(std::io::Error::other(
+            "public child credential/control identity differs",
+        ));
+    }
+    // Duplicate all endpoints away from fixed destinations before fork. This
+    // prevents a destination mapping from clobbering another source endpoint.
+    let duplicate = |fd: &std::os::fd::OwnedFd| -> std::io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: fd is held throughout this call, and successful fcntl returns
+        // a new exclusively owned descriptor with close-on-exec set.
+        let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+    };
+    let reader = duplicate(&gate_reader)?;
+    let reuse = reuse.as_ref().map(duplicate).transpose()?;
+    let writer = gate_writer.as_raw_fd();
+    // SAFETY: child setup uses only async-signal-safe native operations. The
+    // closure owns every referenced descriptor until this single spawn ends.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setgroups(0, std::ptr::null()) != 0
+                || libc::setresgid(gid, gid, gid) != 0
+                || libc::setresuid(uid, uid, uid) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(reader.as_raw_fd(), 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if writer != 3 {
+                libc::close(writer);
+            }
+            if let Some(fd) = &reuse {
+                if libc::dup2(fd.as_raw_fd(), 4) < 0 || libc::fcntl(4, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    command.spawn()
+}
+
+#[cfg(target_os = "linux")]
+pub fn private_public_gate_byte(fd: i32) -> std::io::Result<u8> {
+    if fd != 3 {
+        return Err(std::io::Error::other("public gate descriptor differs"));
+    }
+    // SAFETY: read is given a valid one-byte mutable buffer. Descriptor 3 is
+    // not closed here; CLOEXEC retires it at the dedicated child's exec.
+    unsafe {
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut byte = 0_u8;
+        let count = libc::read(fd, (&raw mut byte).cast(), 1);
+        let error = std::io::Error::last_os_error();
+        if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if count != 1 {
+            return Err(error);
+        }
+        Ok(byte)
+    }
+}
+
+/// Retain a pidfd while independently reading the matching process starttime.
+/// Duplicate one exact live descriptor and measure its socket metadata. The
+/// retained pidfd and two starttime checks reject PID reuse; failure is not a
+/// guessed socket type. The copied descriptor is closed on every return.
+#[cfg(target_os = "linux")]
+pub fn private_observe_process_socket(
+    pid: u32,
+    start_time: u64,
+    target_fd: i32,
+) -> std::io::Result<(u64, i32, i32)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::MetadataExt;
+    if pid == 0 || start_time == 0 || target_fd < 0 {
+        return Err(std::io::Error::other("socket source identity incomplete"));
+    }
+    let stat_path = std::path::Path::new("/proc")
+        .join(pid.to_string())
+        .join("stat");
+    let check = || -> std::io::Result<()> {
+        let stat = std::fs::read_to_string(&stat_path)?;
+        let (head, fields) = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| std::io::Error::other("socket source stat malformed"))?;
+        let (observed_pid, _) = head
+            .split_once(" (")
+            .ok_or_else(|| std::io::Error::other("socket source PID absent"))?;
+        let observed_start = fields
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| std::io::Error::other("socket source start absent"))?;
+        if observed_pid.parse::<u32>().map_err(std::io::Error::other)? != pid
+            || observed_start
+                .parse::<u64>()
+                .map_err(std::io::Error::other)?
+                != start_time
+        {
+            return Err(std::io::Error::other("socket source identity changed"));
+        }
+        Ok(())
+    };
+    // SAFETY: each successful syscall creates one exclusively owned descriptor.
+    let raw_pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if raw_pidfd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+    check()?;
+    let raw_copy =
+        unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), target_fd, 0) } as i32;
+    if raw_copy < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let copy = unsafe { OwnedFd::from_raw_fd(raw_copy) };
+    let file = std::fs::File::from(copy);
+    let inode = file.metadata()?.ino();
+    let measure = |option| -> std::io::Result<i32> {
+        let mut value = 0_i32;
+        let mut size = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: getsockopt writes only the live scalar and length slots.
+        if unsafe {
+            libc::getsockopt(
+                file.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&raw mut value).cast(),
+                &raw mut size,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if size as usize != std::mem::size_of_val(&value) {
+            return Err(std::io::Error::other("socket option scalar size differs"));
+        }
+        Ok(value)
+    };
+    let kind = measure(libc::SO_TYPE)?;
+    let domain = measure(libc::SO_DOMAIN)?;
+    check()?;
+    if inode == 0 {
+        return Err(std::io::Error::other("socket source inode is zero"));
+    }
+    Ok((inode, kind, domain))
+}
+
+/// Retain a pidfd while independently reading the matching process starttime.
+/// ESRCH, disappearance, reuse, or readiness proves that recorded identity is
+/// no longer running; a live matching identity returns false.
+#[cfg(target_os = "linux")]
+pub fn private_recorded_process_exited(pid: u32, start_time: u64) -> std::io::Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if pid == 0 || start_time == 0 {
+        return Err(std::io::Error::other("process identity incomplete"));
+    }
+    // SAFETY: pidfd_open reads one positive PID without signalling it.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
+    if raw < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(true);
+        }
+        return Err(error);
+    }
+    // SAFETY: the successful syscall returned a new exclusively owned fd.
+    let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let stat = match std::fs::read_to_string(
+        std::path::Path::new("/proc")
+            .join(pid.to_string())
+            .join("stat"),
+    ) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    let (header, fields) = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| std::io::Error::other("proc stat delimiter differs"))?;
+    let (observed_pid, _) = header
+        .split_once(" (")
+        .ok_or_else(|| std::io::Error::other("proc stat header differs"))?;
+    let observed_pid = observed_pid.parse::<u32>().map_err(std::io::Error::other)?;
+    let observed_start = fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| std::io::Error::other("proc starttime absent"))?
+        .parse::<u64>()
+        .map_err(std::io::Error::other)?;
+    if observed_pid != pid {
+        return Err(std::io::Error::other("proc stat PID differs"));
+    }
+    if observed_start != start_time {
+        return Ok(true);
+    }
+    let mut poll = libc::pollfd {
+        fd: descriptor.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll receives one valid retained descriptor and writable record.
+    let ready = unsafe { libc::poll(&raw mut poll, 1, 0) };
+    if ready < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ready == 1 && poll.revents & libc::POLLIN != 0)
+}
 #[cfg(target_os = "macos")]
 pub use crate::macos_launch::control_fixture::{
     buffered_child_status_does_not_delay_inventory,

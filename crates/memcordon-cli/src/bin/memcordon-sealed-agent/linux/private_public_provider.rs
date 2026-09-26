@@ -9,6 +9,601 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+/// Actual installed preparation operands. This root-only diagnostic readback
+/// cannot authorize a contract or enroll a controller; admission still checks
+/// the independently protected approval and the exact pinned preparer image.
+pub(crate) fn preparation_context_v2() -> Result<String, String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("public preparation context requires root".into());
+    }
+    let installed = crate::package::acquire_verified_private_qualification_lease()?;
+    let policy = crate::policy_registry::native::Lease::acquire()?;
+    let activation = policy
+        .read_v2()?
+        .ok_or("active public V2 registry absent")?;
+    installed.revalidate_release_boundary()?;
+    serde_json::to_string(&serde_json::json!({
+        "schema_version": 2,
+        "installation_epoch": installed.generation_digest(),
+        "active_h1_receipt_sha256": installed.active_host_receipt_sha256(),
+        "manifest_sha256": installed.runtime_manifest_sha256(),
+        "qualification_sha256": installed.qualification_digest(),
+        "policy_epoch": activation.epoch,
+        "registry_sha256": activation.registry.canonical_digest()?,
+    }))
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PublicFaultPlanV1 {
+    DropAuthorizationAtDurableIntent,
+    KillPinnedFrontendAtTargetLive,
+    KillPinnedGuardianAtTargetLive,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PublicFaultTriggerV1 {
+    schema_version: u8,
+    fault: PublicFaultPlanV1,
+    attempt_id: String,
+    result_key: DiagnosticSha256,
+    request_sha256: DiagnosticSha256,
+    checkpoint_sha256: DiagnosticSha256,
+    victim: super::private_attempt::ProcessIdentityV4,
+    target: super::private_attempt::ProcessIdentityV4,
+    durable_attempt_bytes: Vec<u8>,
+    target_tcp_bytes: Vec<u8>,
+    target_socket_inodes: Vec<u64>,
+    operation_errno: Option<i32>,
+}
+
+fn fault_plan(selector: &str) -> Option<PublicFaultPlanV1> {
+    match selector {
+        "private_tcp::authorization_uncertainty_retired" => {
+            Some(PublicFaultPlanV1::DropAuthorizationAtDurableIntent)
+        }
+        "private_tcp::frontend_loss_retired" => {
+            Some(PublicFaultPlanV1::KillPinnedFrontendAtTargetLive)
+        }
+        "private_tcp::guardian_loss_retired" => {
+            Some(PublicFaultPlanV1::KillPinnedGuardianAtTargetLive)
+        }
+        _ => None,
+    }
+}
+
+fn fault_context(
+    attempt_id: &str,
+    phase: super::private_attempt::PrivateAttemptPhase,
+) -> Result<Option<(PathBuf, PublicFaultTriggerV1)>, String> {
+    if !Path::new(ROOT).exists() {
+        return Ok(None);
+    }
+    let root = root()?;
+    let _lock = lock(&root)?;
+    let Some(record) = read_pending(&root)? else {
+        return Ok(None);
+    };
+    let Some(fault) = fault_plan(&record.selector) else {
+        return Ok(None);
+    };
+    let Some(reservation) = record
+        .inflight
+        .iter()
+        .find(|entry| entry.attempt_id == attempt_id)
+    else {
+        return Ok(None);
+    };
+    verify_installed(&record)?;
+    let directory = root
+        .join(String::from(record.result_key.clone()))
+        .join(format!("{}-{attempt_id}", reservation.ordinal));
+    let bytes = read_file(
+        &Path::new(super::STATE_ROOT).join(attempt_id),
+        super::private_attempt::MAX_PRIVATE_RECORD_BYTES as u64,
+        0o600,
+    )?
+    .ok_or("public fault durable attempt absent")?;
+    reject_duplicate_json_keys(&bytes)?;
+    let durable: super::private_attempt::PrivateAttemptRecordV4 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    durable.validate()?;
+    if durable.attempt_id.as_str() != attempt_id
+        || durable.phase != phase
+        || durable.frontend.pid != record.peer_pid
+        || durable.frontend.start_time != record.peer_start_time_ticks
+    {
+        return Err("public fault durable phase/actor differs".into());
+    }
+    let target = durable
+        .target
+        .as_ref()
+        .ok_or("public fault target absent")?
+        .clone();
+    let victim = match fault {
+        PublicFaultPlanV1::KillPinnedGuardianAtTargetLive => durable
+            .guardian
+            .as_ref()
+            .ok_or("public fault guardian absent")?
+            .clone(),
+        PublicFaultPlanV1::KillPinnedFrontendAtTargetLive => durable.frontend.clone(),
+        PublicFaultPlanV1::DropAuthorizationAtDurableIntent => target.clone(),
+    };
+    Ok(Some((
+        directory,
+        PublicFaultTriggerV1 {
+            schema_version: 1,
+            fault,
+            attempt_id: attempt_id.into(),
+            result_key: record.result_key,
+            request_sha256: reservation.request_sha256.clone(),
+            checkpoint_sha256: durable
+                .checkpoint_digest
+                .ok_or("public fault checkpoint absent")?,
+            victim,
+            target,
+            durable_attempt_bytes: bytes,
+            target_tcp_bytes: Vec::new(),
+            target_socket_inodes: Vec::new(),
+            operation_errno: None,
+        },
+    )))
+}
+
+fn pin_fault_process(
+    identity: &super::private_attempt::ProcessIdentityV4,
+) -> Result<std::os::fd::OwnedFd, String> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) } as i32;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    if super::private_attempt::ProcessIdentityV4::observe(identity.pid as i32, fd.as_fd())?
+        != *identity
+    {
+        return Err("public fault process identity changed".into());
+    }
+    Ok(fd)
+}
+
+/// Called after exact durable ReleaseIntent, before the one-byte permit send.
+/// Shutdown targets the owner-held transport, never an artifact-selected fd.
+pub(crate) fn interrupt_public_authorization(
+    attempt_id: &str,
+    control: &File,
+) -> Result<bool, String> {
+    let Some((directory, mut trigger)) = fault_context(
+        attempt_id,
+        super::private_attempt::PrivateAttemptPhase::ReleaseIntent,
+    )?
+    else {
+        return Ok(false);
+    };
+    if trigger.fault != PublicFaultPlanV1::DropAuthorizationAtDurableIntent {
+        return Ok(false);
+    }
+    let _target = pin_fault_process(&trigger.target)?;
+    if unsafe { libc::shutdown(control.as_raw_fd(), libc::SHUT_WR) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let release = [1_u8];
+    let sent = unsafe {
+        libc::send(
+            control.as_raw_fd(),
+            release.as_ptr().cast(),
+            release.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    };
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    if sent != -1 || errno != Some(libc::EPIPE) {
+        return Err("public authorization fault did not produce EPIPE".into());
+    }
+    trigger.operation_errno = errno;
+    write_new(
+        &directory.join("fault-trigger-v1.json"),
+        &serde_json::to_vec(&trigger).map_err(|error| error.to_string())?,
+    )?;
+    Ok(true)
+}
+
+/// Fixed signal fault at independently measured executed-target TCP liveness.
+/// Pidfd identity and the held durable generation are checked before signaling.
+pub(crate) fn trigger_public_live_fault(
+    attempt_id: &str,
+    mut tick_relay: impl FnMut() -> Result<(), String>,
+) -> Result<bool, String> {
+    let Some((directory, mut trigger)) = fault_context(
+        attempt_id,
+        super::private_attempt::PrivateAttemptPhase::ExecutionObserved,
+    )?
+    else {
+        return Ok(false);
+    };
+    if trigger.fault == PublicFaultPlanV1::DropAuthorizationAtDurableIntent {
+        return Ok(false);
+    }
+    let target = pin_fault_process(&trigger.target)?;
+    let victim = pin_fault_process(&trigger.victim)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        tick_relay()?;
+        let proc = Path::new("/proc").join(trigger.target.pid.to_string());
+        let mut sockets = Vec::new();
+        for entry in fs::read_dir(proc.join("fd")).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if let Ok(link) = fs::read_link(entry.path()) {
+                if let Some(inode) = link
+                    .to_str()
+                    .and_then(|text| text.strip_prefix("socket:["))
+                    .and_then(|text| text.strip_suffix(']'))
+                    .and_then(|text| text.parse::<u64>().ok())
+                {
+                    sockets.push(inode);
+                }
+            }
+        }
+        let tcp = fs::read(proc.join("net/tcp")).map_err(|error| error.to_string())?;
+        if tcp.len() > 16 * 1024 {
+            return Err("public target TCP snapshot too large".into());
+        }
+        let text = std::str::from_utf8(&tcp).map_err(|error| error.to_string())?;
+        let mut listener = false;
+        let mut established = false;
+        for line in text.lines().skip(1) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() > 9
+                && fields[9]
+                    .parse::<u64>()
+                    .ok()
+                    .is_some_and(|inode| sockets.contains(&inode))
+            {
+                listener |= fields[3] == "0A";
+                established |= fields[3] == "01";
+            }
+        }
+        if listener && established {
+            trigger.target_tcp_bytes = tcp;
+            trigger.target_socket_inodes = sockets;
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("public fault target did not establish TCP barrier".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Persist the measured live fault context before the signal. Independent
+    // root CI must retain its held-target raw measurements and acknowledge the
+    // exact canonical gate, while the relay continues forwarding real output.
+    let gate_bytes = serde_json::to_vec(&trigger).map_err(|error| error.to_string())?;
+    write_new(&directory.join("fault-live-gate-v1.json"), &gate_bytes)?;
+    let gate_digest = hash_bytes(&gate_bytes);
+    let ack_path = directory.join("fault-live-gate-v1.ack");
+    loop {
+        tick_relay()?;
+        match fs::symlink_metadata(&ack_path) {
+            Ok(_) => {
+                let ack = read_file(&ack_path, 32, 0o600)?.ok_or("public fault ACK disappeared")?;
+                if ack.as_slice() != gate_digest.bytes() {
+                    return Err("public fault live sampler ACK differs".into());
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("public fault independent live sampler ACK timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if super::private_attempt::ProcessIdentityV4::observe(
+        trigger.target.pid as i32,
+        target.as_fd(),
+    )? != trigger.target
+        || super::private_attempt::ProcessIdentityV4::observe(
+            trigger.victim.pid as i32,
+            victim.as_fd(),
+        )? != trigger.victim
+    {
+        return Err("public fault pinned subject changed".into());
+    }
+    let signaled = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            victim.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if signaled != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    write_new(
+        &directory.join("fault-trigger-v1.json"),
+        &serde_json::to_vec(&trigger).map_err(|error| error.to_string())?,
+    )?;
+    Ok(true)
+}
+
+pub(crate) fn observe_public_cgroup_retirement(
+    attempt_id: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if !Path::new(ROOT).exists() {
+        return Ok(());
+    }
+    let root = root()?;
+    let _lock = lock(&root)?;
+    let Some(provider) = read_pending(&root)? else {
+        return Ok(());
+    };
+    let Some(reservation) = provider
+        .inflight
+        .iter()
+        .find(|entry| entry.attempt_id == attempt_id)
+    else {
+        return Ok(());
+    };
+    verify_installed(&provider)?;
+    let directory = root
+        .join(String::from(provider.result_key))
+        .join(format!("{}-{attempt_id}", reservation.ordinal));
+    write_new(&directory.join("cgroup-retirement-v1.json"), bytes)
+}
+
+pub(crate) fn observe_public_durable_phase(
+    record: &super::private_attempt::PrivateAttemptRecordV4,
+) -> Result<(), String> {
+    if !Path::new(ROOT).exists() {
+        return Ok(());
+    }
+    let root = root()?;
+    let _lock = lock(&root)?;
+    let Some(provider) = read_pending(&root)? else {
+        return Ok(());
+    };
+    let Some(reservation) = provider
+        .inflight
+        .iter()
+        .find(|entry| entry.attempt_id == record.attempt_id.as_str())
+    else {
+        return Ok(());
+    };
+    let leaf = match record.phase {
+        super::private_attempt::PrivateAttemptPhase::CheckpointCommitted => {
+            "checkpoint-committed-v4.bin"
+        }
+        super::private_attempt::PrivateAttemptPhase::ReleaseIntent => "release-intent-v4.bin",
+        super::private_attempt::PrivateAttemptPhase::ExecutionObserved => {
+            "execution-observed-v4.bin"
+        }
+        _ => return Err("public durable phase outside declared observation".into()),
+    };
+    let bytes = read_file(
+        &Path::new(super::STATE_ROOT).join(record.attempt_id.as_str()),
+        super::private_attempt::MAX_PRIVATE_RECORD_BYTES as u64,
+        0o600,
+    )?
+    .ok_or("public durable phase readback absent")?;
+    let actual: super::private_attempt::PrivateAttemptRecordV4 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if actual != *record {
+        return Err("public durable phase readback changed".into());
+    }
+    let directory = root.join(String::from(provider.result_key)).join(format!(
+        "{}-{}",
+        reservation.ordinal,
+        record.attempt_id.as_str()
+    ));
+    write_new(&directory.join(leaf), &bytes)
+}
+
+/// Explicitly enrolled prepared-public sampling barrier. It exposes original
+/// native state before exec/GO, never a pass verdict. Legacy runs without the
+/// independently protected preparation policy do not gain a new barrier.
+pub(crate) fn wait_public_phase_gate(
+    record: &super::private_attempt::PrivateAttemptRecordV4,
+    phase: &str,
+    mut require_live: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    use memcordon_core::private_public_preparation_v2::{
+        ApprovedPublicPreparationPolicyV2, PreparedPublicDispatchRecordV2,
+    };
+    if !Path::new(ROOT).exists()
+        || matches!(fs::symlink_metadata(PREPARATION_POLICY_V2),Err(error) if error.kind()==std::io::ErrorKind::NotFound)
+    {
+        return Ok(());
+    }
+    let selected = {
+        let root = root()?;
+        let _lock = lock(&root)?;
+        read_pending(&root)?
+    };
+    let Some(provider) = selected else {
+        return Ok(());
+    };
+    let Some(reservation) = provider
+        .inflight
+        .iter()
+        .find(|entry| entry.attempt_id == record.attempt_id.as_str())
+    else {
+        return Ok(());
+    };
+    let policy = super::installed_release_qualification::read_protected_absolute(
+        Path::new(PREPARATION_POLICY_V2),
+        MAX_RECORD,
+        Some(0o600),
+    )?;
+    reject_duplicate_json_keys(&policy)?;
+    let approved: ApprovedPublicPreparationPolicyV2 =
+        serde_json::from_slice(&policy).map_err(|error| error.to_string())?;
+    let admission_path = Path::new("/run/memcordon-final-public/prepared-v2")
+        .join(String::from(provider.result_key.clone()))
+        .join("admission.json");
+    let admission = super::installed_release_qualification::read_protected_absolute(
+        &admission_path,
+        MAX_RECORD * 8,
+        Some(0o600),
+    )?;
+    reject_duplicate_json_keys(&admission)?;
+    let prepared: PreparedPublicDispatchRecordV2 =
+        serde_json::from_slice(&admission).map_err(|error| error.to_string())?;
+    let contract = pinned_contract(
+        Path::new(&prepared.contract_path),
+        &prepared.contract_file_sha256,
+    )?;
+    prepared.validate(&approved, &contract)?;
+    if prepared.result_key != provider.result_key
+        || prepared.selector != provider.selector
+        || prepared.challenge != decode_challenge(&provider.challenge)?
+        || prepared.installation_epoch != provider.installation_epoch
+        || prepared.active_h1_receipt_sha256 != provider.active_h1_receipt_sha256
+        || !matches!(
+            (phase, record.phase),
+            (
+                "pre-exec",
+                super::private_attempt::PrivateAttemptPhase::TargetGated
+            ) | (
+                "release-intent",
+                super::private_attempt::PrivateAttemptPhase::ReleaseIntent
+            )
+        )
+    {
+        return Err("prepared public phase gate differs from actual admitted case/phase".into());
+    }
+    let target = record
+        .target
+        .as_ref()
+        .ok_or("public phase gate actual target absent")?;
+    let directory = root()?
+        .join(String::from(provider.result_key.clone()))
+        .join(format!(
+            "{}-{}",
+            reservation.ordinal,
+            record.attempt_id.as_str()
+        ));
+    let durable = read_file(
+        &Path::new(super::STATE_ROOT).join(record.attempt_id.as_str()),
+        super::private_attempt::MAX_PRIVATE_RECORD_BYTES as u64,
+        0o600,
+    )?
+    .ok_or("public phase gate durable original absent")?;
+    let actual: super::private_attempt::PrivateAttemptRecordV4 =
+        serde_json::from_slice(&durable).map_err(|error| error.to_string())?;
+    if actual != *record {
+        return Err("public phase gate reopened native record differs".into());
+    }
+    let source_name = if phase == "pre-exec" {
+        "public-pre-exec-source-v3.bin"
+    } else {
+        "public-release-intent-source-v3.bin"
+    };
+    let gate_name = if phase == "pre-exec" {
+        "public-pre-exec-gate-v3.json"
+    } else {
+        "public-release-intent-gate-v3.json"
+    };
+    let ack_name = if phase == "pre-exec" {
+        "public-pre-exec-gate-v3.ack"
+    } else {
+        "public-release-intent-gate-v3.ack"
+    };
+    let gate=serde_json::to_vec(&serde_json::json!({"schema_version":3,"selector":provider.selector,"result_key":provider.result_key,"attempt_id":record.attempt_id,"ordinal":reservation.ordinal,"phase":phase,"target":target,"boot_identity":record.boot_identity,"durable_source_sha256":hash_bytes(&durable),"prepared_admission_sha256":hash_bytes(&admission)})).map_err(|error|error.to_string())?;
+    write_new(&directory.join(source_name), &durable)?;
+    write_new(&directory.join(gate_name), &gate)?;
+    let expected = hash_bytes(&gate);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        require_live()?;
+        if let Some(ack) = read_file(&directory.join(ack_name), 32, 0o600)? {
+            if ack.as_slice() != expected.bytes() {
+                return Err("public phase sampler ACK differs from exact original gate".into());
+            }
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("public prepared phase source sampling deadline expired".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+pub(crate) fn observe_public_fault_retirement(
+    attempt_id: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if !Path::new(ROOT).exists() {
+        return Ok(());
+    }
+    let root = root()?;
+    let _lock = lock(&root)?;
+    let Some(provider) = read_pending(&root)? else {
+        return Ok(());
+    };
+    let Some(reservation) = provider
+        .inflight
+        .iter()
+        .find(|entry| entry.attempt_id == attempt_id)
+    else {
+        return Ok(());
+    };
+    if fault_plan(&provider.selector).is_none() {
+        return Ok(());
+    }
+    let directory = root
+        .join(String::from(provider.result_key))
+        .join(format!("{}-{attempt_id}", reservation.ordinal));
+    if read_file(&directory.join("fault-trigger-v1.json"), MAX_RECORD, 0o600)?.is_none() {
+        return Err("fault retirement lacks trigger".into());
+    }
+    if fs::symlink_metadata(Path::new(super::STATE_ROOT).join(attempt_id)).is_ok() {
+        return Err("fault retirement left durable active record".into());
+    }
+    write_new(&directory.join("fault-retirement-v1.json"), bytes)
+}
+
+pub(crate) fn retain_public_fault_failure(
+    attempt_id: &str,
+    detail: &str,
+    possibly_released: bool,
+    cleanup_complete: bool,
+) -> Result<(), String> {
+    if !Path::new(ROOT).exists() {
+        return Ok(());
+    }
+    let root = root()?;
+    let _lock = lock(&root)?;
+    let Some(provider) = read_pending(&root)? else {
+        return Ok(());
+    };
+    let Some(reservation) = provider
+        .inflight
+        .iter()
+        .find(|entry| entry.attempt_id == attempt_id)
+    else {
+        return Ok(());
+    };
+    if fault_plan(&provider.selector).is_none() {
+        return Ok(());
+    }
+    let directory = root
+        .join(String::from(provider.result_key))
+        .join(format!("{}-{attempt_id}", reservation.ordinal));
+    if read_file(&directory.join("fault-trigger-v1.json"), MAX_RECORD, 0o600)?.is_none() {
+        return Err("fault failure lacks authenticated trigger".into());
+    }
+    let bytes = serde_json::to_vec(
+        &serde_json::json!({"schema_version":1,"attempt_id":attempt_id,"detail":detail,
+        "possibly_released":possibly_released,"cleanup_complete":cleanup_complete}),
+    )
+    .map_err(|error| error.to_string())?;
+    write_new(&directory.join("fault-failure-v1.json"), &bytes)
+}
+
 use memcordon_core::private_release_branch_v1::{
     PolicyOperationBranchV1, one_policy_port_changed, policy_branch_challenge_v1,
 };
@@ -21,9 +616,168 @@ use crate::protocol::{Frame, MessageKind};
 
 const ROOT: &str = "/var/lib/memcordon/sealed/private-public-cases";
 const INTENT: &str = "/etc/memcordon/release-trust/final-public-dispatch.v1.json";
+const PREPARATION_POLICY_V2: &str = "/etc/memcordon/release-trust/final-public-preparation.v2.json";
 const PENDING: &str = "pending.v2.json";
 const MAX_RECORD: u64 = 128 * 1024;
 const MAX_RAW: u64 = crate::protocol::MAX_FRAME_LENGTH as u64;
+
+pub(crate) fn retain_descriptor_auxiliary(
+    selector: &str,
+    key: &DiagnosticSha256,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let root = root()?;
+    let _lock = lock(&root)?;
+    let record = read_pending(&root)?.ok_or("descriptor auxiliary pending case absent")?;
+    if record.selector != selector
+        || record.result_key != *key
+        || !record.inflight.is_empty()
+        || !record.attempts.is_empty()
+        || !matches!(record.phase.as_str(), "registered" | "plan-accepted")
+        || bytes.is_empty()
+        || bytes.len() > 16384
+    {
+        return Err("descriptor auxiliary exact registered case differs".into());
+    }
+    verify_installed(&record)?;
+    write_new(
+        &root
+            .join(String::from(key.clone()))
+            .join("descriptor-auxiliary-v1.json"),
+        bytes,
+    )
+}
+
+/// Versioned, case-linked controls under independently installed static
+/// approval. The helper is disposable and grants neither product origin nor
+/// launch authority; its two real held phases must be sampled before ACK.
+pub(crate) fn run_prepared_facility_controls(
+    selector: &str,
+    challenge_hex: &str,
+    revision_hex: &str,
+) -> Result<(), String> {
+    use memcordon_core::private_facility_source_v1::{
+        FacilityPhaseV1, facility_source_revision_sha256,
+    };
+    use memcordon_core::private_public_preparation_v2::{
+        ApprovedPublicPreparationPolicyV2, PreparedPublicDispatchRecordV2, PublicPreparedRoleV2,
+    };
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("public Facility source requires root".into());
+    }
+    // Includes independently pinned parent supervisor executable admission.
+    read_admitted_dispatch_intent(selector, challenge_hex)?;
+    let revision = DiagnosticSha256::from_bytes(decode_challenge(revision_hex)?);
+    if revision != facility_source_revision_sha256() {
+        return Err("public Facility source revision differs".into());
+    }
+    let policy = super::installed_release_qualification::read_protected_absolute(
+        Path::new(PREPARATION_POLICY_V2),
+        MAX_RECORD,
+        Some(0o600),
+    )?;
+    reject_duplicate_json_keys(&policy)?;
+    let approved: ApprovedPublicPreparationPolicyV2 =
+        serde_json::from_slice(&policy).map_err(|error| error.to_string())?;
+    approved.validate()?;
+    let root = root()?;
+    let _lock = lock(&root)?;
+    let record = read_pending(&root)?.ok_or("public Facility source pending case absent")?;
+    if record.selector != selector
+        || record.challenge != challenge_hex
+        || !record.attempts.is_empty()
+        || !record.inflight.is_empty()
+        || record.phase != "registered"
+    {
+        return Err("public Facility source is not the exact pre-launch registered case".into());
+    }
+    let key = String::from(record.result_key.clone());
+    let admission = super::installed_release_qualification::read_protected_absolute(
+        &Path::new("/run/memcordon-final-public/prepared-v2")
+            .join(&key)
+            .join("admission.json"),
+        MAX_RECORD * 8,
+        Some(0o600),
+    )?;
+    reject_duplicate_json_keys(&admission)?;
+    let prepared: PreparedPublicDispatchRecordV2 =
+        serde_json::from_slice(&admission).map_err(|error| error.to_string())?;
+    prepared.validate(
+        &approved,
+        &pinned_contract(
+            Path::new(&prepared.contract_path),
+            &prepared.contract_file_sha256,
+        )?,
+    )?;
+    if prepared.role != PublicPreparedRoleV2::Ordinary
+        || prepared.result_key != record.result_key
+        || prepared.selector != selector
+        || prepared.challenge != decode_challenge(challenge_hex)?
+        || prepared.installation_epoch != record.installation_epoch
+        || prepared.active_h1_receipt_sha256 != record.active_h1_receipt_sha256
+        || approved
+            .cases
+            .iter()
+            .find(|case| case.selector == selector)
+            .and_then(|case| case.facility_source_sha256.as_ref())
+            != Some(&revision)
+    {
+        return Err("public Facility source exact preparation/opt-in differs".into());
+    }
+    let lease = crate::package::acquire_verified_private_qualification_lease()?;
+    verify_installed(&record)?;
+    let abi = match approved.target.as_str() {
+        "x86_64-unknown-linux-gnu" => super::network_filter::NativeAbi::X86_64,
+        "aarch64-unknown-linux-gnu" => super::network_filter::NativeAbi::Aarch64,
+        _ => return Err("public Facility ABI unsupported".into()),
+    };
+    let directory = root.join(&key);
+    check_directory(&directory, Some(0o700))?;
+    let report = super::private_release_facility_controls::run_owned(
+        selector,
+        &record.result_key,
+        abi,
+        lease.filter_digest(),
+        |phase, helper, objects, status| {
+            lease.revalidate_release_boundary()?;
+            let (gate_name, ack_name) = match phase {
+                FacilityPhaseV1::Outer => (
+                    "facility-helper-outer-v1.json",
+                    "facility-helper-outer-v1.ack",
+                ),
+                FacilityPhaseV1::Private => (
+                    "facility-helper-private-v1.json",
+                    "facility-helper-private-v1.ack",
+                ),
+            };
+            let gate=serde_json::to_vec(&serde_json::json!({"schema_version":1,"selector":selector,"parent_result_key":record.result_key,
+            "prepared_admission_sha256":hash_bytes(&admission),"installation_epoch":record.installation_epoch,
+            "active_h1_receipt_sha256":record.active_h1_receipt_sha256,"manifest_sha256":record.manifest_sha256,
+            "qualification_sha256":record.qualification_sha256,"source_revision_sha256":revision,"phase":phase,
+            "helper":helper,"objects":objects,"status":status,"observed_monotonic_ns":super::clock::monotonic_nanos()?})).map_err(|error|error.to_string())?;
+            write_new(&directory.join(gate_name), &gate)?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(ack) = read_file(&directory.join(ack_name), 32, 0o600)? {
+                    if ack.as_slice() != hash_bytes(&gate).bytes() {
+                        return Err("public Facility gate ACK differs".into());
+                    }
+                    lease.revalidate_release_boundary()?;
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("public Facility gate sampling deadline expired".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        },
+    )?;
+    lease.revalidate_release_boundary()?;
+    write_new(
+        &directory.join("facility-source-v1.json"),
+        &serde_json::to_vec(&report).map_err(|error| error.to_string())?,
+    )
+}
 
 #[derive(Deserialize)]
 struct DispatchIntent {
@@ -121,7 +875,7 @@ struct ProviderRecordV2 {
     grant_decision_sha256: Option<DiagnosticSha256>,
     expected_launch_exchanges: u8,
     attempts: Vec<ProviderAttemptV2>,
-    inflight: Option<ProviderInflightV2>,
+    inflight: Vec<ProviderInflightV2>,
     terminal_sha256: Option<DiagnosticSha256>,
     phase: String,
 }
@@ -137,6 +891,15 @@ struct ProviderAttemptV2 {
     terminal_sha256: Option<DiagnosticSha256>,
     cleanup_sha256: Option<DiagnosticSha256>,
     target_identity_sha256: Option<DiagnosticSha256>,
+    fault_trigger_sha256: Option<DiagnosticSha256>,
+    fault_failure_sha256: Option<DiagnosticSha256>,
+    fault_retirement_sha256: Option<DiagnosticSha256>,
+    fault_recovery_sha256: Option<DiagnosticSha256>,
+    checkpoint_committed_sha256: Option<DiagnosticSha256>,
+    release_intent_sha256: Option<DiagnosticSha256>,
+    execution_observed_sha256: Option<DiagnosticSha256>,
+    #[serde(default)]
+    cgroup_retirement_sha256: Option<DiagnosticSha256>,
     phase: String,
 }
 
@@ -180,7 +943,7 @@ pub(crate) fn current_reuse_binding(
     if let Some(attempt_id) = attempt_id {
         let inflight = record
             .inflight
-            .as_ref()
+            .first()
             .ok_or("final-public reuse attempt not reserved")?;
         if inflight.ordinal != ordinal || inflight.attempt_id != attempt_id {
             return Err("final-public reuse attempt binding differs".into());
@@ -199,6 +962,39 @@ pub(crate) fn current_reuse_binding(
     })
 }
 
+pub(crate) fn reuse_holder_registration_pending(key: &DiagnosticSha256) -> Result<bool, String> {
+    let directory = root()?;
+    let _lock = lock(&directory)?;
+    let record = read_pending(&directory)?.ok_or("reuse holder registration absent")?;
+    verify_installed(&record)?;
+    if record.result_key != *key
+        || record.selector != "private_tcp::retirement_failure_blocks_reuse"
+        || record.expected_launch_exchanges != 2
+    {
+        return Err("reuse holder initial registration key/selector differs".into());
+    }
+    Ok(record.phase == "registered" && record.attempts.is_empty() && record.inflight.is_empty())
+}
+
+/// New prepared helper path shares the independently admitted CI parent and
+/// immutable current-H1 case recipe; legacy installations retain their gate.
+pub(crate) fn verify_prepared_reuse_helper_admission(
+    selector: &str,
+    challenge: &str,
+) -> Result<(), String> {
+    match std::fs::symlink_metadata(PREPARATION_POLICY_V2) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+        Ok(_) => {
+            if selector != "private_tcp::retirement_failure_blocks_reuse" {
+                return Err("prepared reuse helper selector differs".into());
+            }
+            read_admitted_dispatch_intent(selector, challenge)?;
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn reuse_binding_for_attempt(
     attempt_id: &str,
 ) -> Result<Option<ReuseProviderBindingV1>, String> {
@@ -213,7 +1009,7 @@ pub(crate) fn reuse_binding_for_attempt(
     if record.selector != "private_tcp::retirement_failure_blocks_reuse" {
         return Ok(None);
     }
-    let Some(inflight) = record.inflight.as_ref() else {
+    let Some(inflight) = record.inflight.first() else {
         return Ok(None);
     };
     if inflight.attempt_id != attempt_id {
@@ -261,7 +1057,7 @@ pub(crate) fn abi_filtered_binding_for_attempt(
     }
     let inflight = record
         .inflight
-        .as_ref()
+        .first()
         .ok_or("final-public ABI launch reservation absent")?;
     if record.expected_launch_exchanges != 1
         || record.attempts.len() != 0
@@ -693,8 +1489,16 @@ fn read_pending(root: &Path) -> Result<Option<ProviderRecordV2>, String> {
     reject_duplicate_json_keys(&bytes)?;
     let record: ProviderRecordV2 =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if record.schema_version != 2 || record.evidence_scope != "provider-frames-only" {
+    if record.schema_version != 3 || record.evidence_scope != "provider-frames-only" {
         return Err("final-public provider pending schema differs".into());
+    }
+    if record.expected_launch_exchanges > 2
+        || record.attempts.len() + record.inflight.len()
+            > usize::from(record.expected_launch_exchanges)
+        || (record.inflight.len() > 1
+            && record.selector != "private_tcp::dual_attempt_namespace_isolation")
+    {
+        return Err("public provider reservation bound differs".into());
     }
     Ok(Some(record))
 }
@@ -727,6 +1531,179 @@ fn observed_child(pid: libc::pid_t) -> Result<(u32, u64), String> {
     Ok((identity.pid, identity.start_time))
 }
 
+/// Explicit opt-in keeps legacy admission unchanged. A runtime preparation
+/// cannot enable this policy, choose a new grant, or become observer origin.
+fn read_admitted_dispatch_intent(
+    selector: &str,
+    challenge_hex: &str,
+) -> Result<DispatchIntent, String> {
+    use memcordon_core::private_public_preparation_v2::{
+        ApprovedPublicPreparationPolicyV2, PreparedPublicDispatchRecordV2, PublicPreparedRoleV2,
+    };
+    if !matches!(fs::symlink_metadata(PREPARATION_POLICY_V2),Err(error) if error.kind()==std::io::ErrorKind::NotFound)
+    {
+        let bytes = super::installed_release_qualification::read_protected_absolute(
+            Path::new(PREPARATION_POLICY_V2),
+            MAX_RECORD,
+            Some(0o600),
+        )?;
+        reject_duplicate_json_keys(&bytes)?;
+        let approved: ApprovedPublicPreparationPolicyV2 =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        approved.validate()?;
+        let parent = unsafe { libc::getppid() };
+        let parent_before = observed_child(parent)?;
+        let image = File::open(Path::new("/proc").join(parent.to_string()).join("exe"))
+            .map_err(|error| error.to_string())?;
+        let metadata = image.metadata().map_err(|error| error.to_string())?;
+        if metadata.uid() != 0
+            || !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err("public preparer executable is not an enrolled protected image".into());
+        }
+        let mut image_bytes = Vec::new();
+        (&image)
+            .take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut image_bytes)
+            .map_err(|error| error.to_string())?;
+        let image_after = image.metadata().map_err(|error| error.to_string())?;
+        if image_bytes.len() > 64 * 1024 * 1024
+            || image_bytes.len() as u64 != metadata.len()
+            || image_after.dev() != metadata.dev()
+            || image_after.ino() != metadata.ino()
+            || image_after.len() != metadata.len()
+            || image_after.ctime() != metadata.ctime()
+            || image_after.ctime_nsec() != metadata.ctime_nsec()
+            || hash_bytes(&image_bytes) != approved.preparer_image_sha256
+            || observed_child(parent)? != parent_before
+        {
+            return Err("public preparer pinned executable/process changed".into());
+        }
+        let challenge = decode_challenge(challenge_hex)?;
+        let key =
+            super::private_public_release_case::FinalPublicCaseSpecV1::new(selector, challenge)?
+                .result_key();
+        let path = Path::new("/run/memcordon-final-public/prepared-v2")
+            .join(String::from(key.clone()))
+            .join("admission.json");
+        let bytes = super::installed_release_qualification::read_protected_absolute(
+            &path,
+            MAX_RECORD * 8,
+            Some(0o600),
+        )?;
+        reject_duplicate_json_keys(&bytes)?;
+        let prepared: PreparedPublicDispatchRecordV2 =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let contract = pinned_contract(
+            Path::new(&prepared.contract_path),
+            &prepared.contract_file_sha256,
+        )?;
+        prepared.validate(&approved, &contract)?;
+        if prepared.selector != selector
+            || prepared.challenge != challenge
+            || prepared.result_key != key
+        {
+            return Err("public preparation is not the selected exact case".into());
+        }
+        let lease = crate::package::acquire_verified_private_qualification_lease()?;
+        if prepared.installation_epoch != *lease.generation_digest()
+            || prepared.active_h1_receipt_sha256 != *lease.active_host_receipt_sha256()
+            || approved.source_commit != lease.source_commit()
+            || approved.manifest_sha256 != *lease.runtime_manifest_sha256()
+            || approved.qualification_sha256 != *lease.qualification_digest()
+        {
+            return Err("public preparation differs from actual installed H1 generation".into());
+        }
+        reject_duplicate_json_keys(&prepared.dispatch_bytes)?;
+        let intent: DispatchIntent =
+            serde_json::from_slice(&prepared.dispatch_bytes).map_err(|error| error.to_string())?;
+        if intent.schema_version != 1
+            || intent.source_commit != approved.source_commit
+            || intent.target != approved.target
+            || intent.manifest_sha256 != approved.manifest_sha256
+            || intent.qualification_sha256 != approved.qualification_sha256
+            || intent.public_cli_sha256 != approved.public_cli_sha256
+            || intent.public_uid != approved.public_uid
+            || intent.public_gid != approved.public_gid
+        {
+            return Err("prepared diagnostic routing changed static release/caller pins".into());
+        }
+        let selected = match prepared.role {
+            PublicPreparedRoleV2::Ordinary => intent
+                .cases
+                .iter()
+                .find(|case| case.selector == selector && case.challenge == challenge_hex),
+            PublicPreparedRoleV2::HistoricalE0 => intent
+                .historical_e0
+                .as_ref()
+                .filter(|entry| {
+                    entry.e0_installation_epoch_sha256 == prepared.installation_epoch
+                        && entry.e0_h1_receipt_sha256 == prepared.active_h1_receipt_sha256
+                })
+                .map(|entry| &entry.case),
+            PublicPreparedRoleV2::CallerSpoof => intent
+                .historical_spoof
+                .as_ref()
+                .filter(|entry| {
+                    entry.unauthorized_uid == approved.historical_spoof_uid
+                        && entry.unauthorized_gid == approved.historical_spoof_gid
+                })
+                .map(|entry| &entry.case),
+            PublicPreparedRoleV2::Policy { branch } => intent
+                .policy
+                .as_ref()
+                .and_then(|policy| {
+                    policy
+                        .branches
+                        .iter()
+                        .find(|entry| entry.policy_branch == branch)
+                })
+                .map(|entry| &entry.case),
+        }
+        .ok_or("prepared exact diagnostic routing role absent")?;
+        if selected.selector != prepared.selector
+            || selected.challenge != challenge_hex
+            || selected.contract_path != Path::new(&prepared.contract_path)
+            || selected.contract_sha256 != prepared.contract_file_sha256
+        {
+            return Err("prepared routing selected a different exact contract".into());
+        }
+        // A policy preparation never accepts an artifact-chosen base nonce.
+        if let PublicPreparedRoleV2::Policy { branch } = prepared.role {
+            let base = approved.challenge(
+                prepared.session_nonce,
+                prepared.generation,
+                selector,
+                PublicPreparedRoleV2::Ordinary,
+            )?;
+            let policy = intent.policy.as_ref().ok_or("prepared policy absent")?;
+            if policy.base_challenge != String::from(DiagnosticSha256::from_bytes(base))
+                || policy.branches.len() != 5
+                || policy
+                    .branches
+                    .iter()
+                    .filter(|entry| entry.policy_branch == branch)
+                    .count()
+                    != 1
+            {
+                return Err("prepared policy base/branch inventory differs".into());
+            }
+        }
+        lease.revalidate_release_boundary()?;
+        Ok(intent)
+    } else {
+        let bytes = super::installed_release_qualification::read_protected_absolute(
+            Path::new(INTENT),
+            MAX_RECORD,
+            Some(0o600),
+        )?;
+        reject_duplicate_json_keys(&bytes)?;
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+    }
+}
+
 pub(crate) fn register(
     selector: &str,
     challenge_hex: &str,
@@ -750,14 +1727,7 @@ pub(crate) fn register(
     if observed_start != child_start_time_ticks {
         return Err("final-public child identity changed before registration".into());
     }
-    let intent_bytes = super::installed_release_qualification::read_protected_absolute(
-        Path::new(INTENT),
-        MAX_RECORD,
-        Some(0o600),
-    )?;
-    reject_duplicate_json_keys(&intent_bytes)?;
-    let intent: DispatchIntent =
-        serde_json::from_slice(&intent_bytes).map_err(|error| error.to_string())?;
+    let intent = read_admitted_dispatch_intent(selector, challenge_hex)?;
     if intent.schema_version != 1 || intent.public_uid == 0 || intent.public_gid == 0 {
         return Err("final-public dispatch peer identity differs".into());
     }
@@ -865,7 +1835,7 @@ pub(crate) fn register(
         return Err("final-public dispatch differs from installed release".into());
     }
     let record = ProviderRecordV2 {
-        schema_version: 2,
+        schema_version: 3,
         evidence_scope: "provider-frames-only".into(),
         selector: selector.into(),
         challenge: challenge_hex.into(),
@@ -897,7 +1867,7 @@ pub(crate) fn register(
             )?
         },
         attempts: Vec::new(),
-        inflight: None,
+        inflight: Vec::new(),
         terminal_sha256: None,
         phase: "registered".into(),
     };
@@ -1046,6 +2016,101 @@ fn finalize(root: &Path, record: &ProviderRecordV2) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Only an independently admitted, versioned CallerSpoof case may hold the
+/// authenticated original peer before policy resolution. The old route has
+/// no implicit gate and this source protocol grants no launch authority.
+pub(crate) fn hold_prepared_caller_spoof(
+    request: &Frame,
+    pid: libc::pid_t,
+    uid: u32,
+    gid: u32,
+) -> Result<(), String> {
+    use memcordon_core::private_public_preparation_v2::{
+        ApprovedPublicPreparationPolicyV2, PreparedPublicDispatchRecordV2, PublicPreparedRoleV2,
+    };
+    if matches!(fs::symlink_metadata(PREPARATION_POLICY_V2),Err(error) if error.kind()==std::io::ErrorKind::NotFound)
+    {
+        return Ok(());
+    }
+    let root = root()?;
+    let _lock = lock(&root)?;
+    let Some(record) = read_pending(&root)? else {
+        return Ok(());
+    };
+    if record.spoof_authorized_uid.is_none() || !matching_contract(request, &record, false)? {
+        return Ok(());
+    }
+    check_peer(&record, pid, uid, gid)?;
+    verify_installed(&record)?;
+    let approval = super::installed_release_qualification::read_protected_absolute(
+        Path::new(PREPARATION_POLICY_V2),
+        MAX_RECORD,
+        Some(0o600),
+    )?;
+    reject_duplicate_json_keys(&approval)?;
+    let approved: ApprovedPublicPreparationPolicyV2 =
+        serde_json::from_slice(&approval).map_err(|error| error.to_string())?;
+    approved.validate()?;
+    let admission_path = Path::new("/run/memcordon-final-public/prepared-v2")
+        .join(String::from(record.result_key.clone()))
+        .join("admission.json");
+    let admission = super::installed_release_qualification::read_protected_absolute(
+        &admission_path,
+        MAX_RECORD * 8,
+        Some(0o600),
+    )?;
+    reject_duplicate_json_keys(&admission)?;
+    let prepared: PreparedPublicDispatchRecordV2 =
+        serde_json::from_slice(&admission).map_err(|error| error.to_string())?;
+    let contract = pinned_contract(
+        Path::new(&prepared.contract_path),
+        &prepared.contract_file_sha256,
+    )?;
+    prepared.validate(&approved, &contract)?;
+    if prepared.role != PublicPreparedRoleV2::CallerSpoof
+        || prepared.result_key != record.result_key
+        || prepared.selector != record.selector
+        || prepared.challenge != decode_challenge(&record.challenge)?
+        || prepared.installation_epoch != record.installation_epoch
+        || prepared.active_h1_receipt_sha256 != record.active_h1_receipt_sha256
+        || prepared.contract_file_sha256 != hash_bytes(&request.payload)
+        || uid != approved.historical_spoof_uid
+        || gid != approved.historical_spoof_gid
+        || uid == approved.public_uid
+        || record.phase != "registered"
+        || !record.attempts.is_empty()
+        || !record.inflight.is_empty()
+        || record.expected_launch_exchanges != 0
+        || request.kind != MessageKind::PrivatePlan
+        || request.attempt_id != [0; 16]
+    {
+        return Err("prepared CallerSpoof exact original admission/peer differs".into());
+    }
+    let directory = root.join(String::from(record.result_key.clone()));
+    check_directory(&directory, Some(0o700))?;
+    let gate=serde_json::to_vec(&serde_json::json!({"schema_version":1,"selector":record.selector,"result_key":record.result_key,
+        "prepared_admission_sha256":hash_bytes(&admission),"installation_epoch":record.installation_epoch,"active_h1_receipt_sha256":record.active_h1_receipt_sha256,
+        "runtime_manifest_sha256":record.manifest_sha256,"installed_qualification_sha256":record.qualification_sha256,
+        "request_sha256":hash_bytes(&request.payload),"caller":{"pid":record.peer_pid,"start_time_ticks":record.peer_start_time_ticks,"uid":uid,"gid":gid},
+        "observed_monotonic_ns":super::clock::monotonic_nanos()?})).map_err(|error|error.to_string())?;
+    write_new(&directory.join("caller-spoof-ready-v1.json"), &gate)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(ack) = read_file(&directory.join("caller-spoof-ready-v1.ack"), 32, 0o600)? {
+            if ack.as_slice() != hash_bytes(&gate).bytes() {
+                return Err("prepared CallerSpoof root ACK differs".into());
+            }
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("prepared CallerSpoof original peer observation absent".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    check_peer(&record, pid, uid, gid)?;
+    verify_installed(&record)
+}
+
 pub(crate) fn observe_plan(
     request: &Frame,
     response: &Frame,
@@ -1079,7 +2144,7 @@ pub(crate) fn observe_plan(
             || request.attempt_id != [0; 16]
             || record.expected_launch_exchanges != 0
             || !record.attempts.is_empty()
-            || record.inflight.is_some()
+            || !record.inflight.is_empty()
             || rejection.code != "MCSEALED-PRIVATE-PUBLIC-GRANT-REJECTED"
             || rejection.phase
                 != memcordon_core::provider_rejection_wire::RejectionPhaseV1::RequestValidation
@@ -1360,6 +2425,75 @@ fn read_grant_decision(
 
 /// Reserve the exact launch frame before any broker allocation. This is the
 /// only bridge from the authenticated public actor to a later live target.
+fn verify_prepared_launch_argv(
+    record: &ProviderRecordV2,
+    request: &Frame,
+    ordinal: u8,
+) -> Result<(), String> {
+    use memcordon_core::private_public_preparation_v2::{
+        ApprovedPublicPreparationPolicyV2, PreparedPublicDispatchRecordV2,
+    };
+    if matches!(fs::symlink_metadata(PREPARATION_POLICY_V2),Err(error) if error.kind()==std::io::ErrorKind::NotFound)
+    {
+        return Ok(()); // Legacy diagnostic route; no new prepared approval.
+    }
+    let approval = super::installed_release_qualification::read_protected_absolute(
+        Path::new(PREPARATION_POLICY_V2),
+        MAX_RECORD,
+        Some(0o600),
+    )?;
+    reject_duplicate_json_keys(&approval)?;
+    let approved: ApprovedPublicPreparationPolicyV2 =
+        serde_json::from_slice(&approval).map_err(|error| error.to_string())?;
+    approved.validate()?;
+    let path = Path::new("/run/memcordon-final-public/prepared-v2")
+        .join(String::from(record.result_key.clone()))
+        .join("admission.json");
+    let bytes = super::installed_release_qualification::read_protected_absolute(
+        &path,
+        MAX_RECORD * 8,
+        Some(0o600),
+    )?;
+    reject_duplicate_json_keys(&bytes)?;
+    let prepared: PreparedPublicDispatchRecordV2 =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let contract = pinned_contract(
+        Path::new(&prepared.contract_path),
+        &prepared.contract_file_sha256,
+    )?;
+    prepared.validate(&approved, &contract)?;
+    if prepared.result_key != record.result_key
+        || prepared.selector != record.selector
+        || prepared.installation_epoch != record.installation_epoch
+        || prepared.active_h1_receipt_sha256 != record.active_h1_receipt_sha256
+        || prepared.challenge != decode_challenge(&record.challenge)?
+    {
+        return Err("prepared launch argv subject differs from active registered case".into());
+    }
+    let expected = approved.fixture_argv(
+        prepared.session_nonce,
+        prepared.generation,
+        &prepared.selector,
+        prepared.role,
+        ordinal,
+    )?;
+    let actual = crate::request::decode_network_launch_request(&request.payload)
+        .map_err(|error| format!("prepared exact launch argv decode: {error:?}"))?;
+    if actual.launch.program != expected[0].as_bytes()
+        || actual
+            .launch
+            .arguments
+            .iter()
+            .map(Vec::as_slice)
+            .ne(expected.iter().skip(1).map(|argument| argument.as_bytes()))
+    {
+        return Err(
+            "prepared launch argv or dual ordinal challenge was not independently approved".into(),
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn begin_launch(
     request: &Frame,
     pid: libc::pid_t,
@@ -1376,7 +2510,9 @@ pub(crate) fn begin_launch(
     }
     check_peer(&record, pid, uid, gid)?;
     verify_installed(&record)?;
-    let ordinal = u8::try_from(record.attempts.len()).map_err(|error| error.to_string())?;
+    let ordinal = u8::try_from(record.attempts.len() + record.inflight.len())
+        .map_err(|error| error.to_string())?;
+    verify_prepared_launch_argv(&record, request, ordinal)?;
     let attempt_id = request
         .attempt_id
         .iter()
@@ -1384,11 +2520,17 @@ pub(crate) fn begin_launch(
         .collect::<String>();
     if request.kind != MessageKind::PrivateLaunch
         || record.phase != "plan-accepted"
-        || record.inflight.is_some()
+        || (!record.inflight.is_empty()
+            && record.selector != "private_tcp::dual_attempt_namespace_isolation")
+        || record.inflight.len() >= 2
         || ordinal >= record.expected_launch_exchanges
         || request.attempt_id == [0; 16]
         || record
             .attempts
+            .iter()
+            .any(|entry| entry.attempt_id == attempt_id)
+        || record
+            .inflight
             .iter()
             .any(|entry| entry.attempt_id == attempt_id)
     {
@@ -1403,7 +2545,7 @@ pub(crate) fn begin_launch(
         .map_err(|error| error.to_string())?;
     check_directory(&attempt_directory, Some(0o700))?;
     write_new(&attempt_directory.join("request.bin"), &request.payload)?;
-    record.inflight = Some(ProviderInflightV2 {
+    record.inflight.push(ProviderInflightV2 {
         ordinal,
         attempt_id,
         nonce: request
@@ -1433,7 +2575,11 @@ pub(crate) fn observe_gated_target(
     let Some(record) = read_pending(&root)? else {
         return Ok(());
     };
-    let Some(inflight) = record.inflight.as_ref() else {
+    let Some(inflight) = record
+        .inflight
+        .iter()
+        .find(|entry| entry.attempt_id == attempt_id)
+    else {
         return Ok(());
     };
     if inflight.attempt_id != attempt_id {
@@ -1478,6 +2624,12 @@ pub(crate) fn observe_gated_target(
         .join(String::from(record.result_key))
         .join(format!("{}-{}", inflight.ordinal, attempt_id));
     check_directory(&attempt_directory, Some(0o700))?;
+    // Retain the exact synced TargetGated checkpoint, not a wrapper digest.
+    // The private attempt owner has already synced it before this callback.
+    write_new(
+        &attempt_directory.join("gated-attempt-v4.bin"),
+        &durable_bytes,
+    )?;
     write_new(
         &attempt_directory.join("target-identity.pending.json"),
         &serde_json::to_vec(&identity).map_err(|error| error.to_string())?,
@@ -1502,7 +2654,11 @@ pub(crate) fn observe_gated_entrypoint(
     let Some(record) = read_pending(&root)? else {
         return Ok(());
     };
-    let Some(inflight) = record.inflight.as_ref() else {
+    let Some(inflight) = record
+        .inflight
+        .iter()
+        .find(|entry| entry.attempt_id == attempt_id)
+    else {
         return Ok(());
     };
     if inflight.attempt_id != attempt_id || device == 0 || inode == 0 {
@@ -1595,7 +2751,6 @@ pub(crate) fn observe_launch(
     if !matching_contract(request, &record, true)? {
         return Ok(());
     }
-    check_peer(&record, pid, uid, gid)?;
     verify_installed(&record)?;
     if record.phase != "plan-accepted" || request.kind != MessageKind::PrivateLaunch {
         return Err("final-public provider launch without exact plan".into());
@@ -1613,7 +2768,12 @@ pub(crate) fn observe_launch(
     }
     let directory = root.join(String::from(record.result_key.clone()));
     check_directory(&directory, Some(0o700))?;
-    let ordinal = u8::try_from(record.attempts.len()).map_err(|error| error.to_string())?;
+    let ordinal = record
+        .inflight
+        .iter()
+        .find(|entry| entry.attempt_id == attempt_id)
+        .ok_or("final-public launch not reserved")?
+        .ordinal;
     if ordinal >= record.expected_launch_exchanges
         || record
             .attempts
@@ -1624,7 +2784,8 @@ pub(crate) fn observe_launch(
     }
     let inflight = record
         .inflight
-        .as_ref()
+        .iter()
+        .find(|entry| entry.attempt_id == attempt_id)
         .ok_or("final-public launch was not reserved before allocation")?;
     if inflight.ordinal != ordinal
         || inflight.attempt_id != attempt_id
@@ -1664,6 +2825,64 @@ pub(crate) fn observe_launch(
         return Err("final-public terminal lacks live target identity".into());
     }
     let reuse = record.selector == "private_tcp::retirement_failure_blocks_reuse";
+    let fault = fault_plan(&record.selector);
+    let fault_trigger = read_file(
+        &attempt_directory.join("fault-trigger-v1.json"),
+        MAX_RAW,
+        0o600,
+    )?;
+    let fault_failure = read_file(
+        &attempt_directory.join("fault-failure-v1.json"),
+        MAX_RAW,
+        0o600,
+    )?;
+    let fault_retirement = read_file(
+        &attempt_directory.join("fault-retirement-v1.json"),
+        MAX_RAW,
+        0o600,
+    )?;
+    if let Some(plan) = fault {
+        let trigger_bytes = fault_trigger
+            .as_ref()
+            .ok_or("final-public fault lacks physical trigger")?;
+        reject_duplicate_json_keys(trigger_bytes)?;
+        let trigger: PublicFaultTriggerV1 =
+            serde_json::from_slice(trigger_bytes).map_err(|error| error.to_string())?;
+        if trigger.schema_version != 1
+            || trigger.fault != plan
+            || trigger.attempt_id != attempt_id
+            || trigger.result_key != record.result_key
+            || trigger.request_sha256 != hash_bytes(&request.payload)
+            || plan == PublicFaultPlanV1::DropAuthorizationAtDurableIntent
+                && trigger.operation_errno != Some(libc::EPIPE)
+            || plan != PublicFaultPlanV1::DropAuthorizationAtDurableIntent
+                && (trigger.target_tcp_bytes.is_empty() || trigger.target_socket_inodes.len() < 2)
+        {
+            return Err("final-public fault physical trigger differs".into());
+        }
+        if plan == PublicFaultPlanV1::KillPinnedFrontendAtTargetLive {
+            // begin_launch authenticated the live executable before reservation;
+            // this exact pidfd signal intentionally removes that peer. Do not
+            // require /proc/exe to survive its death or accept a replacement PID.
+            if trigger.victim.pid != record.peer_pid
+                || trigger.victim.start_time != record.peer_start_time_ticks
+                || pid as u32 != record.peer_pid
+                || uid != record.peer_uid
+                || gid != record.peer_gid
+            {
+                return Err("final-public fault frontend credentials differ".into());
+            }
+        } else {
+            check_peer(&record, pid, uid, gid)?;
+        }
+        if fault_retirement.is_none() && fault_failure.is_none() {
+            return Err("final-public fault lacks observed outcome".into());
+        }
+    } else if fault_trigger.is_some() || fault_failure.is_some() || fault_retirement.is_some() {
+        return Err("final-public ordinary attempt contains undeclared fault".into());
+    } else {
+        check_peer(&record, pid, uid, gid)?;
+    }
     if response.kind == MessageKind::Rejected {
         let rejection =
             memcordon_core::provider_rejection_wire::RejectionWireV1::parse(&response.payload)?;
@@ -1686,6 +2905,16 @@ pub(crate) fn observe_launch(
                 || target_identity_bytes.is_some()
             {
                 return Err("final-public reuse second allocation was not blocked".into());
+            }
+        } else if fault.is_some() {
+            if !rejection.target_created
+                || !rejection.target_released
+                || !rejection.cleanup.attempted
+                || target_identity_bytes.is_none()
+                || rejection.cleanup.sealed_boundary_retired != fault_retirement.is_some()
+                || fault_failure.is_none()
+            {
+                return Err("final-public fault rejection actual cleanup differs".into());
             }
         } else if rejection.target_created
             || rejection.target_released
@@ -1722,6 +2951,38 @@ pub(crate) fn observe_launch(
         target_identity_sha256: target_identity_bytes
             .as_ref()
             .map(|bytes| hash_bytes(bytes)),
+        fault_trigger_sha256: fault_trigger.as_ref().map(|bytes| hash_bytes(bytes)),
+        fault_failure_sha256: fault_failure.as_ref().map(|bytes| hash_bytes(bytes)),
+        fault_retirement_sha256: fault_retirement.as_ref().map(|bytes| hash_bytes(bytes)),
+        fault_recovery_sha256: None,
+        checkpoint_committed_sha256: read_file(
+            &attempt_directory.join("checkpoint-committed-v4.bin"),
+            MAX_RAW,
+            0o600,
+        )?
+        .as_ref()
+        .map(|bytes| hash_bytes(bytes)),
+        release_intent_sha256: read_file(
+            &attempt_directory.join("release-intent-v4.bin"),
+            MAX_RAW,
+            0o600,
+        )?
+        .as_ref()
+        .map(|bytes| hash_bytes(bytes)),
+        execution_observed_sha256: read_file(
+            &attempt_directory.join("execution-observed-v4.bin"),
+            MAX_RAW,
+            0o600,
+        )?
+        .as_ref()
+        .map(|bytes| hash_bytes(bytes)),
+        cgroup_retirement_sha256: read_file(
+            &attempt_directory.join("cgroup-retirement-v1.json"),
+            MAX_RAW,
+            0o600,
+        )?
+        .as_ref()
+        .map(|bytes| hash_bytes(bytes)),
         phase: "nonterminal-observed".into(),
     };
     if reuse && ordinal == 0 {
@@ -1760,7 +3021,7 @@ pub(crate) fn observe_launch(
         let cleanup = ProviderCleanupObservationV1 {
             schema_version: 1,
             evidence_scope: "post-terminal-state-readback".into(),
-            attempt_id,
+            attempt_id: attempt_id.clone(),
             terminal_sha256: hash_bytes(&response.payload),
             provider_response_kind: response.kind as u16,
             durable_attempt_record_absent: true,
@@ -1773,9 +3034,29 @@ pub(crate) fn observe_launch(
         attempt.cleanup_sha256 = Some(hash_bytes(&cleanup_bytes));
         attempt.phase = "terminal-observed".into();
     }
+    if fault.is_some() {
+        attempt.phase = if fault_retirement.is_some() {
+            "fault-retired-observed"
+        } else {
+            "fault-cleanup-incomplete-observed"
+        }
+        .into();
+        if response.kind == MessageKind::Rejected
+            && let Some(bytes) = &fault_retirement
+        {
+            write_new(&attempt_directory.join("cleanup.bin"), bytes)?;
+            attempt.cleanup_sha256 = Some(hash_bytes(bytes));
+        }
+    }
     record.attempts.push(attempt);
-    record.inflight = None;
-    if reuse && record.attempts.len() == usize::from(record.expected_launch_exchanges) {
+    record
+        .inflight
+        .retain(|entry| entry.attempt_id != attempt_id);
+    record.attempts.sort_by_key(|entry| entry.ordinal);
+    if fault.is_some() && fault_retirement.is_none() {
+        record.phase = "awaiting-fault-recovery".into();
+        replace_pending(&root, &record)
+    } else if reuse && record.attempts.len() == usize::from(record.expected_launch_exchanges) {
         record.phase = "awaiting-reuse-recovery".into();
         replace_pending(&root, &record)
     } else if record.attempts.len() == usize::from(record.expected_launch_exchanges) {
@@ -1790,6 +3071,76 @@ pub(crate) fn observe_launch(
 /// recovery operation has removed the exact durable incomplete V4 record.
 /// The first response remains a rejection; this attaches later cleanup, not
 /// a fabricated first terminal.
+/// A separate root recovery operation. It cannot change the original response
+/// or create a terminal; it removes only an exact inactive incomplete record.
+pub(crate) fn recover_public_fault(
+    selector: &str,
+    key_hex: &str,
+    attempt_id: &str,
+) -> Result<(), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("public fault recovery requires root".into());
+    }
+    let key: DiagnosticSha256 =
+        serde_json::from_value(serde_json::Value::String(key_hex.to_owned()))
+            .map_err(|error| error.to_string())?;
+    let root = root()?;
+    let _lock = lock(&root)?;
+    let mut record = read_pending(&root)?.ok_or("public fault recovery pending absent")?;
+    if record.result_key != key
+        || record.selector != selector
+        || fault_plan(selector).is_none()
+        || record.phase != "awaiting-fault-recovery"
+        || record.attempts.len() != 1
+        || !record.inflight.is_empty()
+        || record.attempts[0].attempt_id != attempt_id
+        || record.attempts[0].phase != "fault-cleanup-incomplete-observed"
+        || record.attempts[0].launch_response_kind != MessageKind::Rejected as u16
+        || record.attempts[0].fault_trigger_sha256.is_none()
+        || record.attempts[0].fault_failure_sha256.is_none()
+        || record.attempts[0].terminal_sha256.is_some()
+    {
+        return Err("public fault recovery exact pending outcome differs".into());
+    }
+    verify_installed(&record)?;
+    let directory = root
+        .join(String::from(key.clone()))
+        .join(format!("0-{attempt_id}"));
+    let bytes = read_file(
+        &Path::new(super::STATE_ROOT).join(attempt_id),
+        super::private_attempt::MAX_PRIVATE_RECORD_BYTES as u64,
+        0o600,
+    )?
+    .ok_or("public fault recovery incomplete durable record absent")?;
+    let incomplete = super::private_attempt::PrivateAttemptRecordV4::parse(&bytes)?;
+    let trigger_bytes = read_file(&directory.join("fault-trigger-v1.json"), MAX_RAW, 0o600)?
+        .ok_or("public fault recovery trigger absent")?;
+    if record.attempts[0].fault_trigger_sha256.as_ref() != Some(&hash_bytes(&trigger_bytes)) {
+        return Err("public fault recovery trigger changed".into());
+    }
+    let trigger: PublicFaultTriggerV1 =
+        serde_json::from_slice(&trigger_bytes).map_err(|error| error.to_string())?;
+    if trigger.request_sha256 != record.attempts[0].launch_request_sha256
+        || incomplete.target.as_ref() != Some(&trigger.target)
+        || incomplete.checkpoint_digest.as_ref() != Some(&trigger.checkpoint_sha256)
+    {
+        return Err("public fault recovery request/target/checkpoint differs".into());
+    }
+    // This shared inactive-record primitive independently checks absent cgroup,
+    // absent exact process generations, live policy reference and unchanged
+    // owner-only durable file before unlink + parent sync.
+    super::private_attempt::recover_exact_reuse_incomplete(attempt_id, &incomplete)?;
+    let recovered=serde_json::to_vec(&serde_json::json!({"schema_version":1,"evidence_scope":"post-fault-exact-incomplete-recovery",
+        "result_key":key,"attempt_id":attempt_id,"original_incomplete_bytes":bytes,"durable_attempt_record_absent":true})).map_err(|error|error.to_string())?;
+    write_new(&directory.join("fault-recovery-v1.json"), &recovered)?;
+    record.attempts[0].fault_recovery_sha256 = Some(hash_bytes(&recovered));
+    record.attempts[0].cleanup_sha256 = Some(hash_bytes(&recovered));
+    write_new(&directory.join("cleanup.bin"), &recovered)?;
+    record.attempts[0].phase = "fault-recovered-after-incomplete".into();
+    record.phase = "launch-exchanges-complete".into();
+    finalize(&root, &record)
+}
+
 pub(crate) fn preflight_reuse_recovery(
     result_key: &DiagnosticSha256,
     first_attempt_id: &str,
@@ -1814,7 +3165,7 @@ pub(crate) fn preflight_reuse_recovery(
         || record.attempts[1].target_identity_sha256.is_some()
         || record.attempts[1].terminal_sha256.is_some()
         || record.attempts[1].cleanup_sha256.is_some()
-        || record.inflight.is_some()
+        || !record.inflight.is_empty()
     {
         return Err("final-public reuse provider not ready for recovery".into());
     }
@@ -1848,7 +3199,7 @@ pub(crate) fn complete_reuse_recovery(
         || record.attempts[0].target_identity_sha256.is_none()
         || record.attempts[1].launch_response_kind != MessageKind::Rejected as u16
         || record.attempts[1].target_identity_sha256.is_some()
-        || record.inflight.is_some()
+        || !record.inflight.is_empty()
     {
         return Err("final-public reuse provider recovery phase differs".into());
     }
@@ -1897,14 +3248,7 @@ pub(crate) fn verify_public_spoof(selector: &str, challenge_hex: &str) -> Result
     }
     let challenge = decode_challenge(challenge_hex)?;
     let case = super::private_public_release_case::FinalPublicCaseSpecV1::new(selector, challenge)?;
-    let intent_bytes = super::installed_release_qualification::read_protected_absolute(
-        Path::new(INTENT),
-        MAX_RECORD,
-        Some(0o600),
-    )?;
-    reject_duplicate_json_keys(&intent_bytes)?;
-    let intent: DispatchIntent =
-        serde_json::from_slice(&intent_bytes).map_err(|error| error.to_string())?;
+    let intent = read_admitted_dispatch_intent(selector, challenge_hex)?;
     let entry = intent
         .historical_spoof
         .as_ref()
@@ -1977,7 +3321,7 @@ pub(crate) fn verify_public_spoof(selector: &str, challenge_hex: &str) -> Result
         .ok_or("final-public spoof rejection absent")?;
     let rejection =
         memcordon_core::provider_rejection_wire::RejectionWireV1::parse(&rejection_bytes)?;
-    if record.schema_version != 2
+    if record.schema_version != 3
         || record.evidence_scope != "provider-frames-only"
         || record.phase != "spoof-rejected"
         || record.selector != selector
@@ -1994,7 +3338,7 @@ pub(crate) fn verify_public_spoof(selector: &str, challenge_hex: &str) -> Result
         || record.tampered_contract_digest.is_some()
         || record.expected_launch_exchanges != 0
         || !record.attempts.is_empty()
-        || record.inflight.is_some()
+        || !record.inflight.is_empty()
         || record.terminal_sha256.is_some()
         || record.plan_request_sha256 != Some(hash_bytes(&request))
         || record.plan_response_sha256 != Some(hash_bytes(&rejection_bytes))
@@ -2360,14 +3704,14 @@ fn verify_completed_inner(
     reject_duplicate_json_keys(&bytes)?;
     let record: ProviderRecordV2 =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    if record.schema_version != 2
+    if record.schema_version != 3
         || record.evidence_scope != "provider-frames-only"
         || record.selector != selector
         || record.challenge != challenge_hex
         || record.result_key != case.result_key()
         || record.expected_launch_exchanges
             != expected_launch_exchanges(selector, record.policy_branch)?
-        || record.inflight.is_some()
+        || !record.inflight.is_empty()
         || record.plan_request_sha256.is_none()
         || record.plan_response_sha256.is_none()
         || record.grant_decision_sha256.is_none()
@@ -2379,14 +3723,7 @@ fn verify_completed_inner(
         return Err("final-public provider completion identity differs".into());
     }
     if selector == "private_tcp::wrong_grant_profile_and_port_rejected" {
-        let intent_bytes = super::installed_release_qualification::read_protected_absolute(
-            Path::new(INTENT),
-            MAX_RECORD,
-            Some(0o600),
-        )?;
-        reject_duplicate_json_keys(&intent_bytes)?;
-        let intent: DispatchIntent =
-            serde_json::from_slice(&intent_bytes).map_err(|error| error.to_string())?;
+        let intent = read_admitted_dispatch_intent(selector, challenge_hex)?;
         let (entry, base_digest) = policy_dispatch_branch(&intent, selector, challenge_hex)?
             .ok_or("final-public policy branch intent absent at readback")?;
         let pinned = pinned_contract(&entry.case.contract_path, &entry.case.contract_sha256)?;
@@ -2516,6 +3853,38 @@ fn verify_completed_inner(
                 "target-identity.json",
                 attempt.target_identity_sha256.as_ref(),
             ),
+            (
+                "fault-trigger-v1.json",
+                attempt.fault_trigger_sha256.as_ref(),
+            ),
+            (
+                "fault-failure-v1.json",
+                attempt.fault_failure_sha256.as_ref(),
+            ),
+            (
+                "fault-retirement-v1.json",
+                attempt.fault_retirement_sha256.as_ref(),
+            ),
+            (
+                "fault-recovery-v1.json",
+                attempt.fault_recovery_sha256.as_ref(),
+            ),
+            (
+                "checkpoint-committed-v4.bin",
+                attempt.checkpoint_committed_sha256.as_ref(),
+            ),
+            (
+                "release-intent-v4.bin",
+                attempt.release_intent_sha256.as_ref(),
+            ),
+            (
+                "execution-observed-v4.bin",
+                attempt.execution_observed_sha256.as_ref(),
+            ),
+            (
+                "cgroup-retirement-v1.json",
+                attempt.cgroup_retirement_sha256.as_ref(),
+            ),
         ] {
             let actual = read_file(&attempt_directory.join(leaf), MAX_RAW, 0o600)?;
             match (actual.as_deref(), expected) {
@@ -2569,6 +3938,82 @@ fn verify_completed_inner(
             }
         }
         let reuse = record.selector == super::private_public_reuse::SELECTOR;
+        if let Some(plan) = fault_plan(&record.selector) {
+            if !matches!(
+                attempt.phase.as_str(),
+                "fault-retired-observed" | "fault-recovered-after-incomplete"
+            ) || attempt.fault_trigger_sha256.is_none()
+                || attempt.cleanup_sha256.is_none()
+                || attempt.target_identity_sha256.is_none()
+                || attempt.checkpoint_committed_sha256.is_none()
+                || attempt.release_intent_sha256.is_none()
+                || fs::symlink_metadata(Path::new(super::STATE_ROOT).join(&attempt.attempt_id))
+                    .is_ok()
+            {
+                return Err("final-public completed fault settlement differs".into());
+            }
+            let trigger_bytes = read_file(
+                &attempt_directory.join("fault-trigger-v1.json"),
+                MAX_RAW,
+                0o600,
+            )?
+            .ok_or("fault trigger absent")?;
+            reject_duplicate_json_keys(&trigger_bytes)?;
+            let trigger: PublicFaultTriggerV1 =
+                serde_json::from_slice(&trigger_bytes).map_err(|error| error.to_string())?;
+            let durable = super::private_attempt::PrivateAttemptRecordV4::parse(
+                &trigger.durable_attempt_bytes,
+            )?;
+            if trigger.schema_version != 1
+                || trigger.fault != plan
+                || trigger.attempt_id != attempt.attempt_id
+                || trigger.result_key != record.result_key
+                || trigger.request_sha256 != attempt.launch_request_sha256
+                || durable.target.as_ref() != Some(&trigger.target)
+                || durable.checkpoint_digest.as_ref() != Some(&trigger.checkpoint_sha256)
+                || plan == PublicFaultPlanV1::DropAuthorizationAtDurableIntent
+                    && (trigger.operation_errno != Some(libc::EPIPE)
+                        || durable.phase
+                            != super::private_attempt::PrivateAttemptPhase::ReleaseIntent
+                        || attempt.execution_observed_sha256.is_some()
+                        || attempt.launch_response_kind != MessageKind::Rejected as u16
+                        || attempt.terminal_sha256.is_some())
+                || plan != PublicFaultPlanV1::DropAuthorizationAtDurableIntent
+                    && (trigger.target_tcp_bytes.is_empty()
+                        || trigger.target_socket_inodes.len() < 2
+                        || durable.phase
+                            != super::private_attempt::PrivateAttemptPhase::ExecutionObserved
+                        || attempt.execution_observed_sha256.is_none())
+                || attempt.phase == "fault-retired-observed"
+                    && attempt.fault_retirement_sha256.is_none()
+                || attempt.phase == "fault-recovered-after-incomplete"
+                    && (attempt.fault_recovery_sha256.is_none()
+                        || attempt.fault_failure_sha256.is_none()
+                        || attempt.launch_response_kind != MessageKind::Rejected as u16
+                        || attempt.terminal_sha256.is_some())
+            {
+                return Err("final-public completed fault trigger/outcome differs".into());
+            }
+            if attempt.launch_response_kind == MessageKind::Rejected as u16 {
+                let response = read_file(&attempt_directory.join("response.bin"), MAX_RAW, 0o600)?
+                    .ok_or("fault rejection absent")?;
+                let rejection =
+                    memcordon_core::provider_rejection_wire::RejectionWireV1::parse(&response)?;
+                if !rejection.target_created
+                    || !rejection.target_released
+                    || !rejection.cleanup.attempted
+                    || rejection.cleanup.sealed_boundary_retired
+                        != (attempt.phase == "fault-retired-observed")
+                {
+                    return Err("final-public original fault rejection differs".into());
+                }
+            } else if attempt.launch_response_kind != MessageKind::Terminal as u16
+                || attempt.terminal_sha256.as_ref() != Some(&attempt.launch_response_sha256)
+            {
+                return Err("final-public original fault response differs".into());
+            }
+            continue;
+        }
         if reuse && ordinal == 0 {
             if attempt.phase != "recovered-after-incomplete"
                 || attempt.launch_response_kind != MessageKind::Rejected as u16

@@ -189,3 +189,178 @@ fn fixed_result_key_matches_the_native_and_ci_domains() {
         "2fd68a0c106ed6322f1b3494812268015c9634b5bf1dabcab3e1b5d78ce41944"
     );
 }
+#[test]
+fn candidate_response_codec_requires_independent_dynamic_operands() {
+    use memcordon_core::private_release_case_v1::candidate_fixture_expected_response_v1 as response;
+    let challenge = [7; 32];
+    assert!(
+        response(
+            "x86_64-unknown-linux-gnu",
+            "private_tcp::private_namespace_topology_exact",
+            &challenge,
+            None,
+            None
+        )
+        .is_err()
+    );
+    let topology = response(
+        "x86_64-unknown-linux-gnu",
+        "private_tcp::private_namespace_topology_exact",
+        &challenge,
+        Some(8765),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        &topology[topology.len() - std::mem::size_of::<u64>()..],
+        &8765_u64.to_le_bytes()
+    );
+    assert!(
+        response(
+            "x86_64-unknown-linux-gnu",
+            "private_tcp::target_exec_and_fd_leak_observed",
+            &challenge,
+            None,
+            None
+        )
+        .is_err()
+    );
+    let image = response(
+        "x86_64-unknown-linux-gnu",
+        "private_tcp::target_exec_and_fd_leak_observed",
+        &challenge,
+        None,
+        Some((19, 23)),
+    )
+    .unwrap();
+    let mut suffix = 19_u64.to_le_bytes().to_vec();
+    suffix.extend_from_slice(&23_u64.to_le_bytes());
+    suffix.extend_from_slice(&[3, 1, 1, 1]);
+    assert!(image.ends_with(&suffix));
+    assert!(
+        response(
+            "x86_64-unknown-linux-gnu",
+            "private_tcp::authorization_uncertainty_retired",
+            &challenge,
+            None,
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        response(
+            "x86_64-unknown-linux-gnu",
+            "private_tcp::native_tcp_bind_listen_connect",
+            &[0; 32],
+            None,
+            None
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn candidate_response_codec_retains_exact_native_suffixes_and_abi() {
+    use memcordon_core::private_release_case_v1::candidate_fixture_expected_response_v1 as response;
+    let challenge = [11; 32];
+    let x64 = response(
+        "x86_64-unknown-linux-gnu",
+        "private_tcp::native_filter_digest_and_abi_bound",
+        &challenge,
+        None,
+        None,
+    )
+    .unwrap();
+    let arm = response(
+        "aarch64-unknown-linux-gnu",
+        "private_tcp::native_filter_digest_and_abi_bound",
+        &challenge,
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(x64.ends_with(&[2, 1]));
+    assert!(arm.ends_with(&[2, 2]));
+    let denied = response(
+        "aarch64-unknown-linux-gnu",
+        "private_tcp::af_unix_socketpair_denied",
+        &challenge,
+        None,
+        None,
+    )
+    .unwrap();
+    let mut suffix = 97_i32.to_le_bytes().to_vec();
+    suffix.extend_from_slice(&1_i32.to_le_bytes());
+    assert!(denied.ends_with(&suffix));
+    let other = response(
+        "aarch64-unknown-linux-gnu",
+        "private_tcp::af_unix_socketpair_denied",
+        &[12; 32],
+        None,
+        None,
+    )
+    .unwrap();
+    assert_ne!(denied, other);
+}
+#[test]
+fn candidate_prepared_port_matches_reviewed_challenge_domain() {
+    use sha2::{Digest, Sha256};
+    for seed in 0..=u8::MAX {
+        let challenge = [seed; 32];
+        let mut hash = Sha256::new();
+        hash.update(b"memcordon-private-release-dual-port-v1\0");
+        hash.update(challenge);
+        let digest = hash.finalize();
+        let expected = 20_000 + u16::from_le_bytes([digest[0], digest[1]]) % 30_000;
+        let actual = memcordon_core::private_release_case_v1::candidate_fixture_port_v1(&challenge);
+        assert_eq!(actual, expected);
+        assert!((20_000..50_000).contains(&actual));
+    }
+}
+
+#[test]
+fn candidate_dual_codec_requires_independent_namespace_and_retains_real_frame() {
+    use memcordon_core::private_release_case_v1::{
+        candidate_fixture_expected_response_v1 as response, candidate_fixture_port_v1,
+    };
+    use sha2::{Digest, Sha256};
+    let challenge = [17; 32];
+    let selector = "private_tcp::dual_attempt_namespace_isolation";
+    assert!(response("x86_64-unknown-linux-gnu", selector, &challenge, None, None).is_err());
+    assert!(
+        response(
+            "x86_64-unknown-linux-gnu",
+            selector,
+            &challenge,
+            Some(0),
+            None
+        )
+        .is_err()
+    );
+    let actual = response(
+        "x86_64-unknown-linux-gnu",
+        selector,
+        &challenge,
+        Some(907),
+        None,
+    )
+    .unwrap();
+    let mut hash = Sha256::new();
+    hash.update(b"memcordon-private-release-dual-ready-v1\0");
+    hash.update(challenge);
+    let mut expected = hash.finalize().to_vec();
+    expected.extend_from_slice(&candidate_fixture_port_v1(&challenge).to_le_bytes());
+    expected.extend_from_slice(&907u64.to_le_bytes());
+    assert_eq!(actual, expected);
+    assert_ne!(
+        actual,
+        response(
+            "aarch64-unknown-linux-gnu",
+            selector,
+            &challenge,
+            Some(908),
+            None
+        )
+        .unwrap()
+    );
+}

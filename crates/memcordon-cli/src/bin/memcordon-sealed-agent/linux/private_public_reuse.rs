@@ -394,9 +394,29 @@ fn live_holder(open: &HolderOpenV1, expected_ns: u64) -> Result<(), String> {
 /// command asks it to close the exact fd after the second refusal.
 pub(crate) fn hold(selector: &str, challenge_hex: &str, dispatch_hex: &str) -> Result<(), String> {
     installed_root()?;
+    super::private_public_provider::verify_prepared_reuse_helper_admission(
+        selector,
+        challenge_hex,
+    )?;
     let (challenge, key) = parse_case(selector, challenge_hex, dispatch_hex)?;
     let lease = crate::package::acquire_verified_private_qualification_lease()?;
-    let provider = super::private_public_provider::current_reuse_binding(Some(&key), None)?;
+    // The CI starts the holder while the public CLI is still gated. Only the
+    // exact authenticated empty registration may wait for its actual accepted
+    // plan; wrong keys/phases/installation fail immediately, never downgrade.
+    let plan_deadline = Instant::now() + Duration::from_secs(30);
+    let provider = loop {
+        match super::private_public_provider::current_reuse_binding(Some(&key), None) {
+            Ok(binding) => break binding,
+            Err(error) => {
+                if !super::private_public_provider::reuse_holder_registration_pending(&key)?
+                    || Instant::now() >= plan_deadline
+                {
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    };
     if provider.challenge != challenge_hex
         || provider.ordinal != 0
         || provider.first_attempt_id.is_some()
@@ -445,12 +465,20 @@ pub(crate) fn hold(selector: &str, challenge_hex: &str, dispatch_hex: &str) -> R
     if observe(gate.target.pid as libc::pid_t)? != gate.target {
         return Err("MCSEALED-PUBLIC-REUSE: gated target PID reused".into());
     }
+    // Namespace entries are proc magic links: follow this exact live task's
+    // entry, then independently bind the opened object and task identity.
+    let namespace_path = Path::new("/proc")
+        .join(gate.target.pid.to_string())
+        .join("ns")
+        .join("net");
     let fd = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(format!("/proc/{}/ns/net", gate.target.pid))
+        .custom_flags(libc::O_CLOEXEC)
+        .open(namespace_path)
         .map_err(|e| e.to_string())?;
-    if fd.metadata().map_err(|e| e.to_string())?.ino() != gate.namespace_inode {
+    if fd.metadata().map_err(|e| e.to_string())?.ino() != gate.namespace_inode
+        || observe(gate.target.pid as libc::pid_t)? != gate.target
+    {
         return Err("MCSEALED-PUBLIC-REUSE: gated network namespace differs".into());
     }
     let open = HolderOpenV1 {
@@ -555,6 +583,10 @@ pub(crate) fn release_and_recover(
     key_hex: &str,
 ) -> Result<(), String> {
     installed_root()?;
+    super::private_public_provider::verify_prepared_reuse_helper_admission(
+        selector,
+        challenge_hex,
+    )?;
     let (challenge, key) = parse_case(selector, challenge_hex, key_hex)?;
     let dir = directory(&key)?;
     let intent: ReuseIntentV1 = read(&dir, "intent.json", "intent.json.new")?;
@@ -641,13 +673,37 @@ pub(crate) fn gated_target(
     if provider.ordinal != 0 {
         return Err("MCSEALED-PUBLIC-REUSE: second target was allocated".into());
     }
+    // The CLI and holder start concurrently after registration. Wait only
+    // for an absent immutable intent; malformed/existing records fail closed.
+    let intent_path = root()?
+        .join(String::from(provider.result_key.clone()))
+        .join("intent.json");
+    let deadline = Instant::now() + LIMIT;
+    loop {
+        super::private_public_provider::current_reuse_binding(
+            Some(&provider.result_key),
+            Some(attempt_id),
+        )?;
+        match fs::symlink_metadata(&intent_path) {
+            Ok(_) => break,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
     let dir = directory(&provider.result_key)?;
     let intent: ReuseIntentV1 = read(&dir, "intent.json", "intent.json.new")?;
-    if intent.result_key != provider.result_key
+    if intent.schema_version != 1
+        || intent.selector != SELECTOR
+        || intent.result_key != provider.result_key
         || String::from(intent.challenge.clone()) != provider.challenge
         || intent.installation_epoch != provider.installation_epoch
         || intent.active_h1_receipt_sha256 != provider.active_h1_receipt_sha256
         || intent.boot_id != boot_id()?
+        || observe(intent.holder.pid as libc::pid_t)? != intent.holder
     {
         return Err("MCSEALED-PUBLIC-REUSE: held intent differs".into());
     }

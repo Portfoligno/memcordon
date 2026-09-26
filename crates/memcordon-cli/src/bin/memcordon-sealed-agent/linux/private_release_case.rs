@@ -98,6 +98,25 @@ pub(crate) fn run(request: ReleaseCaseRequestV1) -> Result<(), String> {
     run_candidate_transport(request, false)
 }
 
+pub(crate) fn run_caller_spoof(request: ReleaseCaseRequestV1) -> Result<(), String> {
+    super::private_release_run::IndependentCallerProbeV2::prepare(request)?.run()
+}
+
+pub(crate) fn run_facility_controls(
+    request: ReleaseCaseRequestV1,
+    revision: &DiagnosticSha256,
+) -> Result<(), String> {
+    super::private_release_run::IndependentFacilityProbeV1::prepare(request, revision)?.run()
+}
+
+pub(crate) fn run_reuse_source(
+    request: ReleaseCaseRequestV1,
+    revision: &DiagnosticSha256,
+    phase: memcordon_core::private_reuse_source_v1::ReuseSourcePhaseV1,
+) -> Result<(), String> {
+    super::private_release_run::IndependentReuseSourceV1::prepare(request, revision, phase)?.run()
+}
+
 pub(crate) fn run_abi_raw(request: ReleaseCaseRequestV1) -> Result<(), String> {
     if request.stage != ReleaseStageV1::CandidateCapability
         || request.selector != super::private_release_alt_abi::SELECTOR
@@ -182,10 +201,70 @@ pub(crate) fn run_policy_branch_raw(base_challenge: &OsStr, branch: &OsStr) -> R
 /// Fixed target fixtures emit challenge-bound raw observations, never native
 /// case results or qualification authority.
 pub(crate) fn run_candidate_fixture(selector: &OsStr) -> Result<(), String> {
+    run_fixture(selector, None, None)
+}
+
+/// Fixed unprivileged target entry; argv carries only catalogue selector and
+/// challenge. Faults and allocation authority remain supervisor-owned.
+pub(crate) fn run_public_fixture(selector: &OsStr, challenge_hex: &OsStr) -> Result<(), String> {
+    run_public_fixture_with_port(selector, challenge_hex, None)
+}
+
+pub(crate) fn run_public_fixture_with_port(
+    selector: &OsStr,
+    challenge_hex: &OsStr,
+    port: Option<&OsStr>,
+) -> Result<(), String> {
+    let text = challenge_hex
+        .to_str()
+        .ok_or("public fixture challenge is not UTF-8")?;
+    let mut challenge = [0_u8; 32];
+    if text.len() != challenge.len() * 2
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("public fixture challenge syntax differs".into());
+    }
+    for (output, pair) in challenge.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .ok_or("challenge digit invalid")?;
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .ok_or("challenge digit invalid")?;
+        *output = ((high << 4) | low) as u8;
+    }
+    if challenge == [0; 32] {
+        return Err("public fixture challenge is zero".into());
+    }
+    let port = port
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or("public port UTF-8")?
+                .parse::<u16>()
+                .map_err(|_| "public port syntax differs")
+        })
+        .transpose()?;
+    if port == Some(0) {
+        return Err("public port zero".into());
+    }
+    run_fixture(selector, Some(challenge), port)
+}
+
+fn run_fixture(
+    selector: &OsStr,
+    supplied_challenge: Option<[u8; 32]>,
+    public_port: Option<u16>,
+) -> Result<(), String> {
     let selector = selector
         .to_str()
         .ok_or("MCSEALED-PRIVATE-RELEASE-FIXTURE: selector is not UTF-8")?;
-    if !candidate_executable_fixture_supported(selector) {
+    if !candidate_executable_fixture_supported(selector)
+        && !(supplied_challenge.is_some()
+            && selector == super::private_release_unix_intent::SELECTOR)
+    {
         return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: selector unavailable".into());
     }
     let (mut real_uid, mut effective_uid, mut saved_uid) = (0, 0, 0);
@@ -206,10 +285,147 @@ pub(crate) fn run_candidate_fixture(selector: &OsStr) -> Result<(), String> {
     {
         return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: target credentials differ".into());
     }
-    let mut challenge = [0_u8; 32];
+    let mut challenge = supplied_challenge.unwrap_or([0; 32]);
+    if supplied_challenge.is_none() {
+        std::io::stdin()
+            .read_exact(&mut challenge)
+            .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: challenge: {error}"))?;
+    }
+    hold_post_exec_baseline(&challenge)?;
+    run_fixture_operations(selector, supplied_challenge, public_port, challenge)
+}
+
+pub(crate) fn hold_post_exec_baseline(challenge: &[u8; 32]) -> Result<(), String> {
+    // Retain the actual scalar syscall return in the independent observer.
+    // The target never sets securebits here; a failed query is not a value.
+    let securebits = unsafe { libc::prctl(libc::PR_GET_SECUREBITS, 0, 0, 0, 0) };
+    if securebits != 3 {
+        return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: actual securebits differ".into());
+    }
+    // The first post-exec observation precedes sockets, children, namespace
+    // probes, descriptor projection, and other selector operations. It does
+    // not claim clean entry: the root observer samples that independently.
+    let mut baseline = b"MCBL\x01\0\0\0".to_vec();
+    baseline.extend_from_slice(challenge);
+    baseline.extend_from_slice(&securebits.to_le_bytes());
+    baseline.extend_from_slice(&0_u32.to_le_bytes());
+    std::io::stdout()
+        .write_all(&baseline)
+        .and_then(|()| std::io::stdout().flush())
+        .map_err(|error| error.to_string())?;
+    let mut baseline_ack = [0_u8; 32];
     std::io::stdin()
-        .read_exact(&mut challenge)
-        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: challenge: {error}"))?;
+        .read_exact(&mut baseline_ack)
+        .map_err(|error| format!("fixture baseline ACK: {error}"))?;
+    let mut ack_input = b"memcordon/private-fixture-baseline-ack/v1\0".to_vec();
+    ack_input.extend_from_slice(&baseline);
+    if baseline_ack != *memcordon_core::workload_codec::hash_bytes(&ack_input).bytes() {
+        return Err("fixture baseline ACK differs".into());
+    }
+    Ok(())
+}
+
+fn run_fixture_operations(
+    selector: &str,
+    supplied_challenge: Option<[u8; 32]>,
+    public_port: Option<u16>,
+    challenge: [u8; 32],
+) -> Result<(), String> {
+    if supplied_challenge.is_some() {
+        if matches!(
+            selector,
+            super::private_release_unix_intent::SELECTOR
+                | super::private_release_children::SELECTOR
+                | super::private_release_terminal_join::SELECTOR
+        ) {
+            // This public-only versioned target emission supplies the exec
+            // response independently of the following operation transcript.
+            // The original special operation frames and ACKs are unchanged.
+            let response =
+                memcordon_core::private_release_case_v1::public_fixture_expected_response_v1(
+                    selector, &challenge, 0,
+                )?;
+            if response.len() != challenge.len() {
+                return Err("public exec response width differs".into());
+            }
+            std::io::stdout()
+                .write_all(b"MCEX\x01\0\0\0")
+                .and_then(|()| std::io::stdout().write_all(&response))
+                .and_then(|()| std::io::stdout().flush())
+                .map_err(|error| format!("public exec response emission: {error}"))?;
+        }
+        if selector == super::private_release_unix_intent::SELECTOR {
+            let bytes = super::private_release_unix_intent::observe_target_denials(&challenge)?;
+            return write_public_held_fixture(&bytes, &challenge);
+        }
+        if selector == super::private_release_socket_launder::SELECTOR {
+            let port = public_port
+                .ok_or("public SCM clean-entry fixture requires exact request --port")?;
+            let projection = super::private_release_descriptors::observe_target_projection()?;
+            if projection != super::private_release_socket_launder::expected_target_suffix() {
+                return Err("public SCM clean-entry socket projection differs".into());
+            }
+            super::private_qualification::tcp_listener_client_competitor_held(
+                &challenge,
+                Some(port),
+                |_| {
+                    let mut output = candidate_fixture_response(selector, &challenge).to_vec();
+                    output.extend_from_slice(&projection);
+                    write_public_held_fixture(&output, &challenge)
+                },
+            )?;
+            return Ok(());
+        }
+        if matches!(
+            selector,
+            TOPOLOGY_SELECTOR | super::private_release_denial::NAMESPACE_SELECTOR
+        ) {
+            let port =
+                public_port.ok_or("public topology fixture requires exact request --port")?;
+            super::private_public_release_case::run_final_public_topology_fixture(
+                selector,
+                challenge,
+                port,
+                |observed| {
+                    let bytes = serde_json::to_vec(observed).map_err(|error| error.to_string())?;
+                    write_public_held_fixture(&bytes, &challenge)
+                },
+            )?;
+            return Ok(());
+        }
+        if matches!(
+            selector,
+            "private_tcp::native_tcp_bind_listen_connect"
+                | "private_tcp::frontend_loss_retired"
+                | "private_tcp::guardian_loss_retired"
+                | "private_tcp::dual_attempt_namespace_isolation"
+        ) {
+            let port = public_port.ok_or("public TCP fixture requires exact request --port")?;
+            super::private_public_release_case::run_final_public_tcp_fixture(
+                challenge,
+                port,
+                selector == "private_tcp::dual_attempt_namespace_isolation",
+                |observed| {
+                    let bytes = serde_json::to_vec(observed).map_err(|error| error.to_string())?;
+                    write_public_held_fixture(&bytes, &challenge)
+                },
+            )?;
+            return Ok(());
+        }
+        if selector == super::private_release_denial::PORT_COLLISION_SELECTOR {
+            let port =
+                public_port.ok_or("public collision fixture requires exact request --port")?;
+            super::private_public_release_case::run_final_public_port_collision_fixture(
+                challenge,
+                port,
+                |observed| {
+                    let bytes = serde_json::to_vec(observed).map_err(|error| error.to_string())?;
+                    write_public_held_fixture(&bytes, &challenge)
+                },
+            )?;
+            return Ok(());
+        }
+    }
     if selector == super::private_release_guardian_loss::SELECTOR {
         return super::private_release_guardian_loss::run_target(&challenge);
     }
@@ -225,9 +441,53 @@ pub(crate) fn run_candidate_fixture(selector: &OsStr) -> Result<(), String> {
     if selector == super::private_release_dual_attempt::SELECTOR {
         return super::private_release_dual_attempt::run_target(&challenge);
     }
+    if supplied_challenge.is_none()
+        && matches!(
+            selector,
+            "private_tcp::native_tcp_bind_listen_connect"
+                | super::private_release_denial::PORT_COLLISION_SELECTOR
+                | super::private_release_socket_launder::SELECTOR
+                | TOPOLOGY_SELECTOR
+        )
+    {
+        let socket_projection = if selector == super::private_release_socket_launder::SELECTOR {
+            let projection = super::private_release_descriptors::observe_target_projection()?;
+            if projection != super::private_release_socket_launder::expected_target_suffix() {
+                return Err("candidate exceptional socket survived exec".into());
+            }
+            Some(projection)
+        } else {
+            None
+        };
+        return super::private_qualification::tcp_listener_client_competitor_held(
+            &challenge,
+            Some(memcordon_core::private_release_case_v1::candidate_fixture_port_v1(&challenge)),
+            |errno| {
+                let mut output = candidate_fixture_response(selector, &challenge).to_vec();
+                if selector == super::private_release_denial::PORT_COLLISION_SELECTOR {
+                    output.extend_from_slice(&errno.to_le_bytes());
+                }
+                if selector == TOPOLOGY_SELECTOR {
+                    use std::os::unix::fs::MetadataExt;
+                    output.extend_from_slice(
+                        &std::fs::metadata("/proc/self/ns/net")
+                            .map_err(|error| error.to_string())?
+                            .ino()
+                            .to_le_bytes(),
+                    );
+                }
+                if let Some(projection) = socket_projection {
+                    output.extend_from_slice(&projection);
+                }
+                write_candidate_held_response(&output, &challenge)
+            },
+        )
+        .map(|_| ());
+    }
     let mut output = candidate_fixture_response(selector, &challenge).to_vec();
     match selector {
         "private_tcp::native_tcp_bind_listen_connect"
+        | super::private_release_caller::SELECTOR
         | super::private_release_alt_abi::SELECTOR
         | RETIREMENT_FAULT_SELECTOR
         | CHECKPOINT_GATE_SELECTOR => {
@@ -287,15 +547,69 @@ pub(crate) fn run_candidate_fixture(selector: &OsStr) -> Result<(), String> {
         }
         _ => return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: selector unavailable".into()),
     }
+    if supplied_challenge.is_some() {
+        return write_public_held_fixture(&output, &challenge);
+    }
+    if selector == RETIREMENT_FAULT_SELECTOR {
+        std::io::stdout()
+            .write_all(&output)
+            .and_then(|()| std::io::stdout().flush())
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    write_candidate_held_response(&output, &challenge)
+}
+
+fn write_candidate_held_response(output: &[u8], challenge: &[u8; 32]) -> Result<(), String> {
     let mut stdout = std::io::stdout().lock();
     stdout
         .write_all(&output)
         .and_then(|()| stdout.flush())
-        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: response: {error}"))
+        .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: response: {error}"))?;
+    let mut waiting = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: fixed stdin is the reviewed one-shot observer ACK channel.
+    if unsafe { libc::poll(&raw mut waiting, 1, 45_000) } != 1
+        || waiting.revents & libc::POLLIN == 0
+        || waiting.revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP) != 0
+    {
+        return Err("candidate fixture observer ACK timed out".into());
+    }
+    let mut ack = [0_u8; 32];
+    std::io::stdin().read_exact(&mut ack).map_err(|error| {
+        format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: candidate observer ACK: {error}")
+    })?;
+    if ack != *super::private_release_unix_intent::observer_ack_digest(&challenge).bytes() {
+        return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: candidate observer ACK differs".into());
+    }
+    Ok(())
+}
+
+fn write_public_held_fixture(bytes: &[u8], challenge: &[u8; 32]) -> Result<(), String> {
+    let size = u32::try_from(bytes.len()).map_err(|_| "public fixture response size overflow")?;
+    let mut frame = b"MCPH\x01\0\0\0".to_vec();
+    frame.extend_from_slice(&size.to_le_bytes());
+    frame.extend_from_slice(bytes);
+    std::io::stdout()
+        .write_all(&frame)
+        .and_then(|()| std::io::stdout().flush())
+        .map_err(|error| error.to_string())?;
+    let mut ack = [0_u8; 32];
+    std::io::stdin()
+        .read_exact(&mut ack)
+        .map_err(|error| format!("public observer ACK: {error}"))?;
+    if ack != *super::private_release_unix_intent::observer_ack_digest(challenge).bytes() {
+        return Err("public observer ACK differs".into());
+    }
+    Ok(())
 }
 
 pub(crate) fn candidate_fixture_supported(selector: &str) -> bool {
     selector == "private_tcp::native_tcp_bind_listen_connect"
+        || selector == super::private_release_caller::SELECTOR
         || selector == super::private_release_alt_abi::SELECTOR
         || selector == super::private_release_denial::SELECTOR
         || selector == super::private_release_denial::IMPORT_SELECTOR
@@ -349,22 +663,14 @@ pub(crate) fn candidate_fixture_output_with_native(
     if !candidate_executable_fixture_supported(selector) || gated_namespace_inode == 0 {
         return Err("MCSEALED-PRIVATE-RELEASE: gated namespace identity unavailable".into());
     }
-    if selector == TOPOLOGY_SELECTOR {
-        let mut output = candidate_fixture_response(selector, challenge).to_vec();
-        output.extend_from_slice(&gated_namespace_inode.to_le_bytes());
-        Ok(output)
-    } else if selector == super::private_release_exec::SELECTOR
-        || selector == super::private_release_ancestor::SELECTOR
-    {
-        let mut output = candidate_fixture_response(selector, challenge).to_vec();
-        output.extend_from_slice(&super::private_release_exec::expected_projection(
-            pinned_image_identity.0,
-            pinned_image_identity.1,
-        )?);
-        Ok(output)
-    } else {
-        Ok(candidate_fixture_output(selector, challenge))
-    }
+    memcordon_core::private_release_case_v1::candidate_fixture_expected_response_v1(
+        super::runtime_manifest::target()?,
+        selector,
+        challenge,
+        Some(gated_namespace_inode),
+        Some(pinned_image_identity),
+    )
+    .map_err(str::to_owned)
 }
 
 pub(crate) fn candidate_fixture_output(selector: &str, challenge: &[u8; 32]) -> Vec<u8> {
@@ -377,29 +683,14 @@ pub(crate) fn candidate_fixture_output(selector: &str, challenge: &[u8; 32]) -> 
             && selector != super::private_release_ancestor::SELECTOR,
         "pinned executable identity required"
     );
-    let mut output = candidate_fixture_response(selector, challenge).to_vec();
-    if selector == super::private_release_denial::SELECTOR {
-        output.extend_from_slice(&super::private_release_denial::expected_errno_bytes());
-    } else if selector == super::private_release_denial::IMPORT_SELECTOR {
-        output.extend_from_slice(&super::private_release_denial::expected_import_errno_bytes());
-    } else if selector == super::private_release_denial::NAMESPACE_SELECTOR {
-        output.extend_from_slice(&super::private_release_denial::expected_namespace_errno_bytes());
-    } else if selector == super::private_release_denial::PORT_COLLISION_SELECTOR {
-        output.extend_from_slice(
-            &super::private_release_denial::expected_port_collision_errno_bytes(),
-        );
-    } else if selector == super::private_release_identity::SELECTOR {
-        output.extend_from_slice(&super::private_release_identity::expected_projection());
-    } else if selector == super::private_release_filter::SELECTOR {
-        output.extend_from_slice(&super::private_release_filter::expected_projection());
-    } else if selector == super::private_release_descriptors::SELECTOR {
-        output.extend_from_slice(&super::private_release_descriptors::expected_projection());
-    } else if selector == super::private_release_socket_launder::SELECTOR {
-        output.extend_from_slice(&super::private_release_socket_launder::expected_target_suffix());
-    } else if selector == super::private_release_host_state::SELECTOR {
-        output.extend_from_slice(&super::private_release_host_state::expected_private_projection());
-    }
-    output
+    memcordon_core::private_release_case_v1::candidate_fixture_expected_response_v1(
+        super::runtime_manifest::target().expect("reviewed native candidate target"),
+        selector,
+        challenge,
+        None,
+        None,
+    )
+    .expect("fixed executable fixture uses the reviewed non-dynamic codec")
 }
 
 pub(crate) fn candidate_fixture_response(selector: &str, challenge: &[u8; 32]) -> [u8; 32] {

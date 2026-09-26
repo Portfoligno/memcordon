@@ -214,7 +214,7 @@ fn protected_inventory_distinguishes_preallocation_from_allocated_attempts() {
         &allocated,
     )
     .unwrap();
-    assert_eq!(unix_leaves.len(), 9);
+    assert_eq!(unix_leaves.len(), 18);
     assert!(unix_leaves.contains("unix-intent-gate.json"));
     assert!(unix_leaves.contains("unix-intent-ack.json"));
     assert!(!unix_leaves.contains("unix-intent-ack.pending"));
@@ -230,7 +230,7 @@ fn protected_inventory_distinguishes_preallocation_from_allocated_attempts() {
         &allocated,
     )
     .unwrap();
-    assert_eq!(child_leaves.len(), 9);
+    assert_eq!(child_leaves.len(), 18);
     assert!(child_leaves.contains("live-gate.json"));
     assert!(child_leaves.contains("live-ack.json"));
     assert!(!child_leaves.contains("live-gate.pending"));
@@ -247,7 +247,7 @@ fn protected_inventory_distinguishes_preallocation_from_allocated_attempts() {
         &allocated,
     )
     .unwrap();
-    assert_eq!(socket_leaves.len(), 9);
+    assert_eq!(socket_leaves.len(), 18);
     assert!(socket_leaves.contains("socket-gate.json"));
     assert!(socket_leaves.contains("socket-ack.json"));
     assert!(!socket_leaves.contains("socket-ack.pending"));
@@ -263,7 +263,7 @@ fn protected_inventory_distinguishes_preallocation_from_allocated_attempts() {
         &allocated,
     )
     .unwrap();
-    assert_eq!(terminal_leaves.len(), 10);
+    assert_eq!(terminal_leaves.len(), 19);
     assert!(terminal_leaves.contains("terminal-join-midflight.json"));
     assert!(terminal_leaves.contains("terminal-join-gate.json"));
     assert!(terminal_leaves.contains("terminal-join-ack.json"));
@@ -297,7 +297,7 @@ fn protected_inventory_distinguishes_preallocation_from_allocated_attempts() {
         &dual,
     )
     .unwrap();
-    assert_eq!(dual_leaves.len(), 12);
+    assert_eq!(dual_leaves.len(), 27);
     assert!(dual_leaves.contains("dual-first"));
     assert!(dual_leaves.contains("dual-second"));
     assert!(dual_leaves.contains("dual-live-ack.json"));
@@ -342,7 +342,7 @@ fn protected_inventory_distinguishes_preallocation_from_allocated_attempts() {
         &blocked,
     )
     .unwrap();
-    assert_eq!(blocked_leaves.len(), 8);
+    assert_eq!(blocked_leaves.len(), 17);
     assert!(blocked_leaves.contains("attempt.json.new"));
     assert!(
         expected_protected_candidate_leaves_for_selector(
@@ -946,6 +946,43 @@ fn blocked_retirement_requires_retiring_journal_marker_and_exact_raw_joins() {
         &inspection_digest,
     )
     .unwrap();
+    // Recovery is the exact normal transition of this original journal, not
+    // a fabricated AllocatedRetired observation or a replacement attempt.
+    let original = structural.attempt_record.as_ref().unwrap();
+    let encode_recovered = |value: serde_json::Value| {
+        let typed: memcordon_ci::private_protected_readback::ProtectedCandidateAttemptV1 =
+            serde_json::from_value(value).unwrap();
+        let digest = typed.canonical_digest().unwrap();
+        let mut value = serde_json::to_value(&typed).unwrap();
+        value["record_digest"] = serde_json::to_value(digest).unwrap();
+        let typed: memcordon_ci::private_protected_readback::ProtectedCandidateAttemptV1 =
+            serde_json::from_value(value).unwrap();
+        serde_json::to_vec(&typed).unwrap()
+    };
+    let mut normal = serde_json::to_value(original).unwrap();
+    normal["phase"] = json!("retired");
+    normal["candidate_exit_code"] = json!(0);
+    original
+        .validate_owned_retirement_recovery(&encode_recovered(normal.clone()))
+        .unwrap();
+    for field in ["release_knowledge", "cleanup_error", "installation_epoch"] {
+        let mut wrong = normal.clone();
+        wrong[field] = match field {
+            "release_knowledge" => json!("possibly-released"),
+            "cleanup_error" => json!("ignored cleanup failure"),
+            _ => serde_json::to_value(DiagnosticSha256::from_bytes([99; 32])).unwrap(),
+        };
+        assert!(
+            original
+                .validate_owned_retirement_recovery(&encode_recovered(wrong))
+                .is_err()
+        );
+    }
+    assert!(
+        original
+            .validate_owned_retirement_recovery(structural.attempt_record_bytes.as_ref().unwrap())
+            .is_err()
+    );
     assert!(
         parse_protected_candidate_attempt(
             structural.attempt_record_bytes.as_ref().unwrap(),

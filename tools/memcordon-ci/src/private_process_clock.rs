@@ -5,12 +5,122 @@
 use crate::private_kernel_observer::KernelTaskIdentityV1;
 use crate::{CiError, Result};
 
+/// Exact original-reader bytes. This carrier has no observer-origin authority.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProcClockInputsV1 {
+    pub(crate) schema_version: u32,
+    pub(crate) reader_pid: u32,
+    pub(crate) reader_start_ticks: u64,
+    pub(crate) stat_before: String,
+    pub(crate) stat_after: String,
+    pub(crate) time_namespace_before: String,
+    pub(crate) time_namespace_after: String,
+    pub(crate) timens_offsets: String,
+    pub(crate) clk_tck_stdout: Vec<u8>,
+    pub(crate) clk_tck_exit_success: bool,
+}
+
+pub(crate) struct ParsedProcClockCalibrationV1 {
+    pub(crate) reader_pid: u32,
+    pub(crate) reader_start_ticks: u64,
+    pub(crate) time_ns_inode: u64,
+    pub(crate) boottime_offset_ns: i128,
+    pub(crate) clock_ticks_per_second: u64,
+}
+impl ParsedProcClockCalibrationV1 {
+    pub(crate) fn parse(inputs: &ProcClockInputsV1) -> Result<Self> {
+        if inputs.schema_version != 1
+            || inputs.reader_pid == 0
+            || inputs.reader_start_ticks == 0
+            || inputs.stat_before.len() > 64 * 1024
+            || inputs.stat_after.len() > 64 * 1024
+            || inputs.timens_offsets.len() > 4096
+            || inputs.time_namespace_before.len() > 128
+            || inputs.time_namespace_after.len() > 128
+            || !inputs.clk_tck_exit_success
+            || inputs.clk_tck_stdout.len() > 32
+            || inputs.time_namespace_before != inputs.time_namespace_after
+            || parse_start_ticks(&inputs.stat_before)? != inputs.reader_start_ticks
+            || parse_start_ticks(&inputs.stat_after)? != inputs.reader_start_ticks
+        {
+            return Err(fail("archived proc clock input identity differs"));
+        }
+        for stat in [&inputs.stat_before, &inputs.stat_after] {
+            if stat
+                .split_whitespace()
+                .next()
+                .and_then(|text| text.parse::<u32>().ok())
+                != Some(inputs.reader_pid)
+            {
+                return Err(fail("archived clock reader PID differs"));
+            }
+        }
+        let time_ns_inode = parse_time_ns_inode(&inputs.time_namespace_before)?;
+        let hz = std::str::from_utf8(&inputs.clk_tck_stdout)
+            .ok()
+            .and_then(|text| text.strip_suffix('\n'))
+            .and_then(|text| text.parse::<u64>().ok())
+            .filter(|hz| *hz > 0 && *hz <= 1_000_000_000)
+            .ok_or_else(|| fail("archived proc USER_HZ differs"))?;
+        if time_ns_inode == 0 {
+            return Err(fail("archived clock namespace absent"));
+        }
+        Ok(Self {
+            reader_pid: inputs.reader_pid,
+            reader_start_ticks: inputs.reader_start_ticks,
+            time_ns_inode,
+            boottime_offset_ns: parse_boottime_offset(&inputs.timens_offsets)?,
+            clock_ticks_per_second: hz,
+        })
+    }
+    pub(crate) fn reader_identity(&self) -> (u32, u64) {
+        (self.reader_pid, self.reader_start_ticks)
+    }
+    pub(crate) fn matches(&self, task: KernelTaskIdentityV1, ticks: u64) -> bool {
+        calibrated_match(
+            self.time_ns_inode,
+            self.boottime_offset_ns,
+            self.clock_ticks_per_second,
+            task,
+            ticks,
+        )
+    }
+}
+
+fn calibrated_match(
+    time_ns_inode: u64,
+    offset: i128,
+    hz: u64,
+    task: KernelTaskIdentityV1,
+    ticks: u64,
+) -> bool {
+    if time_ns_inode == 0
+        || task.time_ns_inode != time_ns_inode
+        || task.start_time == 0
+        || ticks == 0
+    {
+        return false;
+    }
+    let Some(total) = i128::from(task.start_time).checked_add(offset) else {
+        return false;
+    };
+    total >= 0
+        && hz > 0
+        && total
+            .checked_mul(i128::from(hz))
+            .and_then(|scaled| u64::try_from(scaled / 1_000_000_000).ok())
+            == Some(ticks)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedProcClockCalibrationV1 {
-    reader_pid: u32,
-    reader_start_ticks: u64,
-    time_ns_inode: u64,
-    boottime_offset_ns: i128,
+    pub(crate) reader_pid: u32,
+    pub(crate) reader_start_ticks: u64,
+    pub(crate) time_ns_inode: u64,
+    pub(crate) boottime_offset_ns: i128,
+    pub(crate) clock_ticks_per_second: u64,
+    pub(crate) inputs: Option<ProcClockInputsV1>,
 }
 
 fn fail(message: &'static str) -> CiError {
@@ -114,17 +224,30 @@ impl VerifiedProcClockCalibrationV1 {
         {
             return Err(fail("reader identity changed during clock calibration"));
         }
-        let hz = std::process::Command::new("/usr/bin/getconf")
-            .arg("CLK_TCK")
-            .output()?;
-        if !hz.status.success() || hz.stdout != b"100\n" {
+        let hz = memcordon_platform::test_support::private_observer_clock_ticks_per_second()?;
+        if hz == 0 || hz > 1_000_000_000 {
             return Err(fail("unsupported proc USER_HZ for clock calibration"));
         }
+        let mut hz_bytes = hz.to_string().into_bytes();
+        hz_bytes.push(b'\n');
         Ok(Self {
             reader_pid,
             reader_start_ticks,
             time_ns_inode: parse_time_ns_inode(&link_before)?,
             boottime_offset_ns: parse_boottime_offset(&offsets)?,
+            clock_ticks_per_second: hz,
+            inputs: Some(ProcClockInputsV1 {
+                schema_version: 1,
+                reader_pid,
+                reader_start_ticks,
+                stat_before,
+                stat_after,
+                time_namespace_before: link_before,
+                time_namespace_after: link_after,
+                timens_offsets: offsets,
+                clk_tck_stdout: hz_bytes,
+                clk_tck_exit_success: true,
+            }),
         })
     }
 
@@ -138,17 +261,17 @@ impl VerifiedProcClockCalibrationV1 {
     }
 
     pub(crate) fn matches(&self, task: KernelTaskIdentityV1, producer_start_ticks: u64) -> bool {
-        if self.time_ns_inode == 0
-            || task.time_ns_inode != self.time_ns_inode
-            || task.start_time == 0
-            || producer_start_ticks == 0
-        {
-            return false;
-        }
-        let Some(total) = i128::from(task.start_time).checked_add(self.boottime_offset_ns) else {
-            return false;
-        };
-        total >= 0 && u64::try_from(total / 10_000_000).ok() == Some(producer_start_ticks)
+        calibrated_match(
+            self.time_ns_inode,
+            self.boottime_offset_ns,
+            self.clock_ticks_per_second,
+            task,
+            producer_start_ticks,
+        )
+    }
+
+    pub(crate) fn inputs(&self) -> Option<&ProcClockInputsV1> {
+        self.inputs.as_ref()
     }
 
     #[cfg(test)]
@@ -163,6 +286,8 @@ impl VerifiedProcClockCalibrationV1 {
             reader_start_ticks,
             time_ns_inode,
             boottime_offset_ns,
+            clock_ticks_per_second: 100,
+            inputs: None,
         }
     }
 }

@@ -1617,6 +1617,14 @@ pub fn run_private_v2(
     encoded_request: &[u8],
     expected: &PrivateExpectedResultV2<'_>,
 ) -> Result<PrivateServiceResultV2, PrivateLaunchErrorV2> {
+    run_private_v2_with_owned_stdio(encoded_request, expected, None)
+}
+
+fn run_private_v2_with_owned_stdio(
+    encoded_request: &[u8],
+    expected: &PrivateExpectedResultV2<'_>,
+    stdio: Option<[OwnedFd; 3]>,
+) -> Result<PrivateServiceResultV2, PrivateLaunchErrorV2> {
     verify_endpoint().map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
     let mut stream = UnixStream::connect(Path::new(ENDPOINT))
         .map_err(|error| PrivateLaunchErrorV2::BeforeSubmission(error.to_string()))?;
@@ -1639,13 +1647,24 @@ pub fn run_private_v2(
     let cwd = fs::File::open(".")
         .map_err(|error| PrivateLaunchErrorV2::BeforeSubmission(error.to_string()))?;
     let frontend_pidfd = pidfd_self().map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
-    let descriptors = [cwd.as_raw_fd(), 0, 1, 2, frontend_pidfd.as_raw_fd()];
+    let streams = stdio
+        .as_ref()
+        .map(|fds| fds.each_ref().map(AsRawFd::as_raw_fd))
+        .unwrap_or([0, 1, 2]);
+    let descriptors = [
+        cwd.as_raw_fd(),
+        streams[0],
+        streams[1],
+        streams[2],
+        frontend_pidfd.as_raw_fd(),
+    ];
     send_with_descriptors(&stream, &frame, &descriptors).map_err(|detail| {
         PrivateLaunchErrorV2::AfterSubmission(PrivateResponseFailureV2 {
             detail,
             raw_response: None,
         })
     })?;
+    drop(stdio);
     receive_private_result(&mut stream, request_nonce, attempt, expected)
         .map_err(PrivateLaunchErrorV2::AfterSubmission)
 }
@@ -1886,6 +1905,318 @@ fn encode_private_v2_with_plan(
         encoded.extend_from_slice(precondition.generation_digest.bytes());
     }
     Ok(encoded)
+}
+
+/// One authenticated actor and Plan, two fresh concurrent Launch exchanges.
+/// FD4 is a supervisor-owned barrier: the second exchange begins only after
+/// the supervisor has independently observed the first target live. Full
+/// namespace overlap/retirement semantics are verified from observer custody.
+pub fn execute_private_v2_dual_pair(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    context: crate::AttemptContext,
+    expected_plan: Option<&memcordon_core::workload_plan_v2::PrivatePlanReceiptV2>,
+    barrier_fd: RawFd,
+) -> Result<[PrivateAuthenticatedTerminalV2; 2], PrivateLaunchErrorV2> {
+    if barrier_fd != 4
+        || policy.boundary() != memcordon_core::BoundaryRequirement::Sealed
+        || contract.authorized_profile.id.as_str() != "linux-tcp4-private-v1"
+    {
+        return Err(PrivateLaunchErrorV2::BeforeSubmission(
+            "dual pair requires sealed private contract and FD4".into(),
+        ));
+    }
+    verify_reuse_barrier_peer(barrier_fd).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    contract
+        .validate()
+        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let plan = private_plan_v2(contract).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    if let Some(expected) = expected_plan {
+        expected
+            .validate_for_contract(contract)
+            .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+        expected
+            .validate_for_caller(unsafe { libc::geteuid() })
+            .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+        if expected != &plan {
+            return Err(PrivateLaunchErrorV2::BeforeSubmission(
+                "dual Plan differs".into(),
+            ));
+        }
+    }
+    let precondition =
+        memcordon_core::workload_plan_v2::PrivatePlanPreconditionV1::from_receipt(&plan)
+            .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let position = command
+        .arguments()
+        .iter()
+        .position(|arg| arg == "--challenge")
+        .ok_or_else(|| {
+            PrivateLaunchErrorV2::BeforeSubmission("dual challenge argument absent".into())
+        })?;
+    if command.arguments().len() != 6
+        || position != 2
+        || command.arguments()[0] != "public-release-fixture"
+        || command.arguments()[1] != "private_tcp::dual_attempt_namespace_isolation"
+        || command.arguments()[4] != "--port"
+    {
+        return Err(PrivateLaunchErrorV2::BeforeSubmission(
+            "dual fixed fixture argv differs".into(),
+        ));
+    }
+    let base: memcordon_core::DiagnosticSha256 = memcordon_core::BoundedText::<64>::new(
+        command.arguments()[position + 1].to_str().ok_or_else(|| {
+            PrivateLaunchErrorV2::BeforeSubmission("dual challenge encoding differs".into())
+        })?,
+    )
+    .map_err(|error| PrivateLaunchErrorV2::BeforeSubmission(error.into()))?
+    .try_into()
+    .map_err(|error: &str| PrivateLaunchErrorV2::BeforeSubmission(error.into()))?;
+    let mut encoded = Vec::new();
+    for ordinal in [0, 1] {
+        let challenge = memcordon_core::private_release_case_v1::public_dual_challenge_v1(
+            base.bytes(),
+            ordinal,
+        )
+        .map_err(|error| PrivateLaunchErrorV2::BeforeSubmission(error.into()))?;
+        let mut args = command.arguments().to_vec();
+        args[position + 1] =
+            String::from(memcordon_core::DiagnosticSha256::from_bytes(challenge)).into();
+        let branch_command = memcordon_core::CommandSpec::new(command.program()).args(args);
+        encoded.push(encode_private_v2_with_plan(
+            policy,
+            &branch_command,
+            contract,
+            context,
+            Duration::ZERO,
+            &plan,
+            Some(&precondition),
+        )?);
+    }
+    let expected = PrivateExpectedResultV2 {
+        source_commit: &plan.source_commit,
+        native_abi: plan.native_abi,
+        runtime_manifest_sha256: &plan.runtime_manifest_sha256,
+        installed_qualification_sha256: &plan.installed_qualification_sha256,
+    };
+    // FD4 is one owned control stream for the whole experiment, never shared
+    // with target stdin. Root commands route a fixed32byte ACK to one branch.
+    let mut barrier = unsafe { UnixStream::from_raw_fd(barrier_fd) };
+    barrier
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .map_err(|error| PrivateLaunchErrorV2::BeforeSubmission(error.to_string()))?;
+    barrier
+        .set_write_timeout(Some(Duration::from_secs(120)))
+        .map_err(|error| PrivateLaunchErrorV2::BeforeSubmission(error.to_string()))?;
+    let (first_stdio, mut first_input, first_output, first_error) =
+        dual_pipe_streams().map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let (second_stdio, mut second_input, second_output, second_error) =
+        dual_pipe_streams().map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let output_lock = std::sync::Mutex::new(());
+    let launch = |request: &[u8], stdio, ordinal| {
+        let result = run_private_v2_with_owned_stdio(request, &expected, Some(stdio));
+        if let Ok(PrivateServiceResultV2::Complete(ref terminal)) = result {
+            write_dual_frame(ordinal, 2, terminal.raw_response(), &output_lock)
+                .map_err(|error| reuse_after_submission(&error, None))?;
+        }
+        result
+    };
+    std::thread::scope(|scope| {
+        let readers = [
+            scope.spawn(|| forward_dual_stream(first_output, 0, 0, &output_lock)),
+            scope.spawn(|| forward_dual_stream(first_error, 0, 1, &output_lock)),
+            scope.spawn(|| forward_dual_stream(second_output, 1, 0, &output_lock)),
+            scope.spawn(|| forward_dual_stream(second_error, 1, 1, &output_lock)),
+        ];
+        let first = scope.spawn(|| launch(&encoded[0], first_stdio, 0));
+        let barrier_result = (|| -> Result<(), String> {
+            barrier.write_all(b"D").map_err(|error| error.to_string())?;
+            let mut baseline_packet = [0_u8; 33];
+            barrier
+                .read_exact(&mut baseline_packet)
+                .map_err(|error| error.to_string())?;
+            let first_challenge =
+                memcordon_core::private_release_case_v1::public_dual_challenge_v1(base.bytes(), 0)
+                    .map_err(str::to_owned)?;
+            let mut first_baseline = b"MCBL\x01\0\0\0".to_vec();
+            first_baseline.extend_from_slice(&first_challenge);
+            first_baseline.extend_from_slice(&3_i32.to_le_bytes());
+            first_baseline.extend_from_slice(&0_u32.to_le_bytes());
+            let mut first_ack = b"memcordon/private-fixture-baseline-ack/v1\0".to_vec();
+            first_ack.extend_from_slice(&first_baseline);
+            if baseline_packet[0] != 0
+                || baseline_packet[1..]
+                    != memcordon_core::workload_codec::hash_bytes(&first_ack).bytes()[..]
+            {
+                return Err("dual first baseline ACK differs".into());
+            }
+            first_input
+                .write_all(&baseline_packet[1..])
+                .map_err(|error| error.to_string())?;
+            let mut release = [0];
+            barrier
+                .read_exact(&mut release)
+                .map_err(|error| error.to_string())?;
+            if release != *b"G" {
+                return Err("dual second-launch release differs".into());
+            }
+            Ok(())
+        })();
+        let second = barrier_result
+            .is_ok()
+            .then(|| scope.spawn(|| launch(&encoded[1], second_stdio, 1)));
+        let controls = if barrier_result.is_ok() {
+            let mut counts = [1_u8, 0_u8];
+            (|| -> Result<(), String> {
+                for _ in 0..5 {
+                    let mut packet = [0_u8; 33];
+                    barrier
+                        .read_exact(&mut packet)
+                        .map_err(|error| error.to_string())?;
+                    let ordinal = usize::from(packet[0]);
+                    if ordinal > 1 || counts[ordinal] >= 3 {
+                        return Err("dual ACK branch/count differs".into());
+                    }
+                    let expected_ack = memcordon_core::workload_codec::hash_bytes(&{
+                        let challenge =
+                            memcordon_core::private_release_case_v1::public_dual_challenge_v1(
+                                base.bytes(),
+                                packet[0],
+                            )
+                            .map_err(str::to_owned)?;
+                        let bytes = if counts[ordinal] == 0 {
+                            let mut bytes = b"memcordon/private-fixture-baseline-ack/v1\0".to_vec();
+                            bytes.extend_from_slice(b"MCBL\x01\0\0\0");
+                            bytes.extend_from_slice(&challenge);
+                            bytes.extend_from_slice(&3_i32.to_le_bytes());
+                            bytes.extend_from_slice(&0_u32.to_le_bytes());
+                            bytes
+                        } else {
+                            let mut bytes = b"memcordon-private-unix-observer-ack-v1\0".to_vec();
+                            bytes.extend_from_slice(&challenge);
+                            bytes
+                        };
+                        bytes
+                    });
+                    if packet[1..] != expected_ack.bytes()[..] {
+                        return Err("dual challenge-bound ACK differs".into());
+                    }
+                    if ordinal == 0 {
+                        first_input.write_all(&packet[1..])
+                    } else {
+                        second_input.write_all(&packet[1..])
+                    }
+                    .map_err(|error| error.to_string())?;
+                    counts[ordinal] += 1;
+                }
+                Ok(())
+            })()
+        } else {
+            Err("dual second launch not released".into())
+        };
+        drop(first_input);
+        drop(second_input);
+        // Always settle the first exchange before returning; never leave a
+        // launch thread detached after a failed barrier or second exchange.
+        let first = first
+            .join()
+            .map_err(|_| reuse_after_submission("dual launch thread panicked", None))?;
+        let second = second
+            .map(|thread| {
+                thread
+                    .join()
+                    .map_err(|_| reuse_after_submission("dual second thread panicked", None))
+            })
+            .transpose()?;
+        for reader in readers {
+            reader
+                .join()
+                .map_err(|_| reuse_after_submission("dual output reader panicked", None))?
+                .map_err(|error| reuse_after_submission(&error, None))?;
+        }
+        barrier_result.map_err(|error| reuse_after_submission(&error, None))?;
+        controls.map_err(|error| reuse_after_submission(&error, None))?;
+        let first = first?;
+        let second =
+            second.ok_or_else(|| reuse_after_submission("dual second exchange absent", None))??;
+        match (first, second) {
+            (PrivateServiceResultV2::Complete(first), PrivateServiceResultV2::Complete(second)) => {
+                if first.raw_response() == second.raw_response() {
+                    return Err(reuse_after_submission(
+                        "dual exchanges have identical terminal bytes",
+                        None,
+                    ));
+                }
+                Ok([*first, *second])
+            }
+            _ => Err(reuse_after_submission(
+                "dual exchange did not return two authenticated terminals",
+                None,
+            )),
+        }
+    })
+}
+
+fn dual_pipe_streams() -> Result<([OwnedFd; 3], std::fs::File, std::fs::File, std::fs::File), String>
+{
+    let pipe = || -> Result<(OwnedFd, OwnedFd), String> {
+        let mut pair = [-1; 2];
+        if unsafe { libc::pipe2(pair.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) })
+    };
+    let (stdin_read, stdin_write) = pipe()?;
+    let (stdout_read, stdout_write) = pipe()?;
+    let (stderr_read, stderr_write) = pipe()?;
+    Ok((
+        [stdin_read, stdout_write, stderr_write],
+        stdin_write.into(),
+        stdout_read.into(),
+        stderr_read.into(),
+    ))
+}
+
+fn write_dual_frame(
+    ordinal: u8,
+    kind: u8,
+    bytes: &[u8],
+    lock: &std::sync::Mutex<()>,
+) -> Result<(), String> {
+    let size = u32::try_from(bytes.len()).map_err(|_| "dual frame size overflow")?;
+    let _guard = lock.lock().map_err(|_| "dual output lock poisoned")?;
+    let mut output = std::io::stdout().lock();
+    output
+        .write_all(b"MCDS\x01\0\0\0")
+        .and_then(|()| output.write_all(&[ordinal, kind]))
+        .and_then(|()| output.write_all(&size.to_le_bytes()))
+        .and_then(|()| output.write_all(bytes))
+        .and_then(|()| output.flush())
+        .map_err(|error| error.to_string())
+}
+
+fn forward_dual_stream(
+    mut input: std::fs::File,
+    ordinal: u8,
+    kind: u8,
+    lock: &std::sync::Mutex<()>,
+) -> Result<(), String> {
+    let mut buffer = [0_u8; 8192];
+    let mut count = 0_usize;
+    loop {
+        let size = input.read(&mut buffer).map_err(|error| error.to_string())?;
+        if size == 0 {
+            return Ok(());
+        }
+        count = count
+            .checked_add(size)
+            .ok_or("dual stream count overflow")?;
+        if count > 1024 * 1024 {
+            return Err("dual stream exceeds fixed1MiB budget".into());
+        }
+        write_dual_frame(ordinal, kind, &buffer[..size], lock)?;
+    }
 }
 
 /// A final-public reuse experiment, never an ordinary retry. One installed

@@ -732,6 +732,15 @@ pub(crate) fn verify_public_release_provider(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn public_preparation_context_v2() -> Result<(), String> {
+    println!(
+        "{}",
+        crate::linux::private_public_provider::preparation_context_v2()?
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) fn verify_public_spoof(
     selector: &std::ffi::OsStr,
     challenge: &std::ffi::OsStr,

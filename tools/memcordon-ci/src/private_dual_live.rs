@@ -463,6 +463,22 @@ mod linux {
         expected_filter: &DiagnosticSha256,
         expected_image: (u64, u64),
     ) -> Result<Option<IndependentDualLiveObservationV1>> {
+        sample_and_ack_if_ready_with_source(
+            challenge,
+            expected_filter,
+            expected_image,
+            |_, _, _, _| Ok(()),
+        )
+    }
+
+    /// The additional observer runs while both exact READY targets remain
+    /// held. An error cannot publish the live ACK or release either target.
+    pub fn sample_and_ack_if_ready_with_source(
+        challenge: [u8; 32],
+        expected_filter: &DiagnosticSha256,
+        expected_image: (u64, u64),
+        mut retain: impl FnMut(u32, u64, u32, u64) -> Result<()>,
+    ) -> Result<Option<IndependentDualLiveObservationV1>> {
         let key = private_release_case_key_v1(
             PrivateReleaseStageV1::CandidateCapability,
             DUAL_SELECTOR,
@@ -521,6 +537,12 @@ mod linux {
                 "dual simultaneous live interval differs".into(),
             ));
         }
+        retain(
+            gate.first.target.pid,
+            gate.first.target.start_time,
+            gate.second.target.pid,
+            gate.second.target.start_time,
+        )?;
         let gate_sha256 = hash_bytes(&gate_bytes);
         let ack = DualAckV1 {
             schema_version: 1,
@@ -852,5 +874,17 @@ pub fn join_sampled_dual_to_result(
 ) -> Result<()> {
     Err(CiError::Message(
         "dual live observation requires native Linux".into(),
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn sample_and_ack_if_ready_with_source(
+    _challenge: [u8; 32],
+    _expected_filter: &DiagnosticSha256,
+    _expected_image: (u64, u64),
+    _retain: impl FnMut(u32, u64, u32, u64) -> Result<()>,
+) -> Result<Option<IndependentDualLiveObservationV1>> {
+    Err(CiError::Message(
+        "dual live source observation requires native Linux".into(),
     ))
 }

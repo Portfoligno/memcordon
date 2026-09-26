@@ -36,6 +36,191 @@ pub const REQUIRED_PRIVATE_RELEASE_SELECTORS_V1: [&str; 25] = [
     "private_tcp::wrong_grant_profile_and_port_rejected",
 ];
 
+/// Independently derived challenge response, distinct from dynamic stdout
+/// transcript fields (PID, inode, ephemeral client port and sampled metadata).
+/// The installed fixture uses this reviewed recipe; it conveys no authority.
+pub fn public_fixture_expected_response_v1(
+    selector: &str,
+    challenge: &[u8; 32],
+    port: u16,
+) -> Result<[u8; 32], &'static str> {
+    if !REQUIRED_PRIVATE_RELEASE_SELECTORS_V1.contains(&selector) || *challenge == [0; 32] {
+        return Err("public fixture selector/challenge differs");
+    }
+    if selector == "private_tcp::port_collision_same_namespace" {
+        if port == 0 {
+            return Err("public fixture exact port absent");
+        }
+        return Ok(*challenge);
+    }
+    let mut bytes = Vec::new();
+    if matches!(
+        selector,
+        "private_tcp::native_tcp_bind_listen_connect"
+            | "private_tcp::dual_attempt_namespace_isolation"
+            | "private_tcp::frontend_loss_retired"
+            | "private_tcp::guardian_loss_retired"
+    ) {
+        if port == 0 {
+            return Err("public fixture exact port absent");
+        }
+        bytes.extend_from_slice(b"memcordon-final-public-tcp-fixture-v1\0");
+        bytes.extend_from_slice(challenge);
+        bytes.extend_from_slice(&port.to_be_bytes());
+    } else {
+        bytes.extend_from_slice(b"memcordon-private-release-candidate-fixture-v1\0");
+        bytes.extend_from_slice(selector.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(challenge);
+    }
+    Ok(*hash_bytes(&bytes).bytes())
+}
+
+pub fn public_dual_challenge_v1(base: &[u8; 32], ordinal: u8) -> Result<[u8; 32], &'static str> {
+    if *base == [0; 32] || ordinal > 1 {
+        return Err("public dual challenge identity differs");
+    }
+    let mut bytes = b"memcordon-final-public-dual-challenge-v1\0".to_vec();
+    bytes.extend_from_slice(base);
+    bytes.push(ordinal);
+    Ok(*hash_bytes(&bytes).bytes())
+}
+
+/// Pure reviewed candidate fixture codec. Dynamic operands must come from
+/// independent held namespace/image readback, never the claimed stdout.
+/// This is an expected-byte recipe and conveys no execution authority.
+/// Fresh private test ports are prepared from the authenticated challenge;
+/// they are not future values guessed by a static administrator document.
+pub fn candidate_fixture_port_v1(challenge: &[u8; 32]) -> u16 {
+    let mut bytes = b"memcordon-private-release-dual-port-v1\0".to_vec();
+    bytes.extend_from_slice(challenge);
+    let digest = crate::workload_codec::hash_bytes(&bytes);
+    20_000 + u16::from_le_bytes([digest.bytes()[0], digest.bytes()[1]]) % 30_000
+}
+
+pub fn candidate_fixture_expected_response_v1(
+    target: &str,
+    selector: &str,
+    challenge: &[u8; 32],
+    network_namespace_inode: Option<u64>,
+    image_identity: Option<(u64, u64)>,
+) -> Result<Vec<u8>, &'static str> {
+    let abi = match target {
+        "x86_64-unknown-linux-gnu" => 1,
+        "aarch64-unknown-linux-gnu" => 2,
+        _ => return Err("candidate fixture target differs"),
+    };
+    if !REQUIRED_PRIVATE_RELEASE_SELECTORS_V1.contains(&selector)
+        || *challenge == [0; 32]
+        || matches!(
+            selector,
+            "private_tcp::authorization_uncertainty_retired"
+                | "private_tcp::wrong_grant_profile_and_port_rejected"
+        )
+    {
+        return Err("selector does not use the executable candidate fixture codec");
+    }
+    if selector == "private_tcp::dual_attempt_namespace_isolation" {
+        let inode = network_namespace_inode
+            .filter(|inode| *inode != 0)
+            .ok_or("independent dual namespace identity absent")?;
+        let mut seed = b"memcordon-private-release-dual-ready-v1\0".to_vec();
+        seed.extend_from_slice(challenge);
+        let mut frame = hash_bytes(&seed).bytes().to_vec();
+        frame.extend_from_slice(&candidate_fixture_port_v1(challenge).to_le_bytes());
+        frame.extend_from_slice(&inode.to_le_bytes());
+        return Ok(frame);
+    }
+    if selector == "private_tcp::af_unix_abstract_and_pathname_denied" {
+        use std::fmt::Write as _;
+        let mut nonce = String::new();
+        for byte in challenge {
+            write!(&mut nonce, "{byte:02x}").expect("String write");
+        }
+        let mut output = b"memcordon-private-unix-intent-v1\0".to_vec();
+        output.extend_from_slice(challenge);
+        for (kind, suffix) in [(1_u8, "-path"), (2_u8, "-abstract")] {
+            let mut address = Vec::new();
+            if kind == 1 {
+                address.extend_from_slice(b"/tmp/");
+            } else {
+                address.push(0);
+            }
+            address.extend_from_slice(b"memcordon-private-unix-");
+            address.extend_from_slice(nonce.as_bytes());
+            address.extend_from_slice(suffix.as_bytes());
+            if kind == 1 {
+                address.push(0);
+            }
+            output.push(kind);
+            output.extend_from_slice(
+                &u16::try_from(address.len())
+                    .map_err(|_| "Unix intent length exceeds u16")?
+                    .to_le_bytes(),
+            );
+            output.extend_from_slice(&address);
+            output.extend_from_slice(&97_i32.to_le_bytes());
+            output.extend_from_slice(&[0, 0]);
+        }
+        return Ok(output);
+    }
+    let mut seed = b"memcordon-private-release-candidate-fixture-v1\0".to_vec();
+    seed.extend_from_slice(selector.as_bytes());
+    seed.push(0);
+    seed.extend_from_slice(challenge);
+    let mut output = hash_bytes(&seed).bytes().to_vec();
+    match selector {
+        "private_tcp::private_namespace_topology_exact" => {
+            let inode = network_namespace_inode
+                .filter(|inode| *inode != 0)
+                .ok_or("independent candidate namespace identity absent")?;
+            output.extend_from_slice(&inode.to_le_bytes());
+        }
+        "private_tcp::target_exec_and_fd_leak_observed"
+        | "private_tcp::elf_ancestor_and_identity_pinned" => {
+            let (device, inode) = image_identity
+                .filter(|(device, inode)| *device != 0 && *inode != 0)
+                .ok_or("independent candidate image identity absent")?;
+            output.extend_from_slice(&device.to_le_bytes());
+            output.extend_from_slice(&inode.to_le_bytes());
+            output.extend_from_slice(&[3, 1, 1, 1]);
+        }
+        // Linux UAPI errno values are fixed across the two reviewed GNU
+        // targets; this portable oracle never consults the collector host.
+        "private_tcp::af_unix_socketpair_denied" => {
+            output.extend_from_slice(&97_i32.to_le_bytes());
+            output.extend_from_slice(&1_i32.to_le_bytes());
+        }
+        "private_tcp::io_uring_and_pidfd_import_denied"
+        | "private_tcp::namespace_reentry_denied" => {
+            output.extend_from_slice(&1_i32.to_le_bytes());
+            output.extend_from_slice(&1_i32.to_le_bytes());
+        }
+        "private_tcp::port_collision_same_namespace" => {
+            output.extend_from_slice(&98_i32.to_le_bytes())
+        }
+        "private_tcp::target_credentials_and_capabilities_dropped" => {
+            for _ in 0..4 {
+                output.extend_from_slice(&0_u64.to_le_bytes());
+            }
+            output.push(1);
+        }
+        "private_tcp::native_filter_digest_and_abi_bound" => output.extend_from_slice(&[2, abi]),
+        "private_tcp::descriptor_table_and_stdio_bound"
+        | "private_tcp::scm_rights_and_precreated_socket_denied" => {
+            output.extend_from_slice(&[3, 1, 1, 1])
+        }
+        "private_tcp::host_namespace_and_sysctl_unchanged" => {
+            output.extend_from_slice(&0_u16.to_le_bytes());
+            output.extend_from_slice(&32768_u16.to_le_bytes());
+            output.extend_from_slice(&60999_u16.to_le_bytes());
+            output.push(0);
+        }
+        _ => {}
+    }
+    Ok(output)
+}
+
 pub const MAX_PRIVATE_RELEASE_RESULT_BYTES_V1: usize = 64 * 1024;
 pub const MAX_PRIVATE_RELEASE_ATTACHMENT_BYTES_V1: u64 = 1024 * 1024;
 pub const PRIVATE_RELEASE_RESULT_ROOT_V1: &str = "/var/lib/memcordon/sealed/private-release-cases";
@@ -219,6 +404,21 @@ pub enum PrivateReleaseObservationV1 {
         exec: PrivateReleaseExecV1,
         native_observer_sha256: DiagnosticSha256,
     },
+    /// Versioned final-public fault settlement preserves the original
+    /// nonterminal rejection. It is not a Terminal receipt or exec success.
+    PublicFaultRejectedRetiredV2 {
+        outcome: PrivateReleaseAllocatedOutcomeV1,
+        attempt_id: String,
+        checkpoint_file_sha256: DiagnosticSha256,
+        original_rejection_sha256: DiagnosticSha256,
+        fault_trigger_sha256: DiagnosticSha256,
+        fault_failure_sha256: Option<DiagnosticSha256>,
+        retirement_sha256: DiagnosticSha256,
+        recovery_sha256: Option<DiagnosticSha256>,
+        release_knowledge: PrivateReleaseKnowledgeV1,
+        exec: PrivateReleaseExecV1,
+        native_observer_sha256: DiagnosticSha256,
+    },
     DualAttemptsRetired {
         first: PrivateReleaseDualRetiredBranchV1,
         second: PrivateReleaseDualRetiredBranchV1,
@@ -359,6 +559,10 @@ impl PrivateReleaseCaseResultV1 {
                 native_observer_sha256,
                 ..
             }
+            | PrivateReleaseObservationV1::PublicFaultRejectedRetiredV2 {
+                native_observer_sha256,
+                ..
+            }
             | PrivateReleaseObservationV1::RetirementFailureBlockedReuse {
                 native_observer_sha256,
                 ..
@@ -417,6 +621,54 @@ pub fn validate_release_observation_v1(
         "target-completed"
     };
     match (observation, expected) {
+        (
+            PrivateReleaseObservationV1::PublicFaultRejectedRetiredV2 {
+                outcome,
+                attempt_id,
+                checkpoint_file_sha256,
+                original_rejection_sha256,
+                fault_trigger_sha256,
+                fault_failure_sha256,
+                retirement_sha256,
+                recovery_sha256,
+                release_knowledge,
+                exec,
+                native_observer_sha256,
+            },
+            expected,
+        ) if stage == PrivateReleaseStageV1::FinalPublic
+            && valid_attempt_id(attempt_id)
+            && allocated_outcome_name(*outcome) == expected
+            && [
+                checkpoint_file_sha256,
+                original_rejection_sha256,
+                fault_trigger_sha256,
+                retirement_sha256,
+                native_observer_sha256,
+            ]
+            .iter()
+            .all(|digest| digest.bytes() != &[0; 32])
+            && fault_failure_sha256
+                .as_ref()
+                .is_none_or(|digest| digest.bytes() != &[0; 32])
+            && recovery_sha256
+                .as_ref()
+                .is_none_or(|digest| digest.bytes() != &[0; 32])
+            && recovery_sha256
+                .as_ref()
+                .is_none_or(|_| fault_failure_sha256.is_some())
+            && match outcome {
+                PrivateReleaseAllocatedOutcomeV1::AuthorizationUncertain => {
+                    *release_knowledge == PrivateReleaseKnowledgeV1::PossiblyReleased
+                        && *exec == PrivateReleaseExecV1::NotObserved
+                }
+                PrivateReleaseAllocatedOutcomeV1::FrontendLost
+                | PrivateReleaseAllocatedOutcomeV1::GuardianLost => {
+                    *release_knowledge == PrivateReleaseKnowledgeV1::ExecObserved
+                        && *exec == PrivateReleaseExecV1::Succeeded
+                }
+                _ => false,
+            } => {}
         (
             PrivateReleaseObservationV1::AbiComposite {
                 attempt_id,

@@ -26,7 +26,16 @@ pub(crate) fn run_target(challenge: &[u8; 32]) -> Result<(), String> {
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
     let listener = TcpListener::bind(address)
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: dual TCP bind: {error}"))?;
-    let mut client = TcpStream::connect_timeout(&address.into(), Duration::from_secs(2))
+    match TcpListener::bind(address) {
+        Err(error) if error.raw_os_error() == Some(libc::EADDRINUSE) => {}
+        _ => return Err("dual same-namespace competitor did not return EADDRINUSE".into()),
+    }
+    let free = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| error.to_string())?;
+    if free.local_addr().map_err(|error| error.to_string())?.port() == port {
+        return Err("dual free-bind control reused live port".into());
+    }
+    let mut client = TcpStream::connect(address)
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: dual connect: {error}"))?;
     let (mut accepted, peer) = listener
         .accept()
@@ -86,6 +95,42 @@ pub(crate) fn run_target(challenge: &[u8; 32]) -> Result<(), String> {
     std::io::stdin()
         .read_exact(&mut ack)
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE-FIXTURE: dual ack: {error}"))?;
+    if ack == [2] {
+        let mut next = Sha256::new();
+        next.update(b"memcordon/private-dual-second-exchange/v1\0");
+        next.update(challenge);
+        let next: [u8; 32] = next.finalize().into();
+        client
+            .write_all(&next)
+            .and_then(|()| accepted.read_exact(&mut received))
+            .map_err(|error| format!("dual second exchange send/receive: {error}"))?;
+        if received != next {
+            return Err("dual second exchange challenge differs".into());
+        }
+        accepted
+            .write_all(&received)
+            .and_then(|()| client.read_exact(&mut received))
+            .map_err(|error| format!("dual second exchange echo: {error}"))?;
+        if received != next {
+            return Err("dual second exchange echo differs".into());
+        }
+        let response = post_retirement_frame(challenge, &received, port, inode);
+        stdout
+            .write_all(&response)
+            .and_then(|()| stdout.flush())
+            .map_err(|error| error.to_string())?;
+        waiting.revents = 0;
+        // SAFETY: fixed stdin remains the same one-shot observer ACK channel.
+        if unsafe { libc::poll(&raw mut waiting, 1, 45_000) } != 1
+            || waiting.revents & libc::POLLIN == 0
+            || waiting.revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP) != 0
+        {
+            return Err("dual final ACK timed out".into());
+        }
+        std::io::stdin()
+            .read_exact(&mut ack)
+            .map_err(|error| error.to_string())?;
+    }
     if ack[0] != TARGET_ACK {
         return Err("MCSEALED-PRIVATE-RELEASE-FIXTURE: dual ack differs".into());
     }
@@ -93,23 +138,41 @@ pub(crate) fn run_target(challenge: &[u8; 32]) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn post_retirement_frame(
+    challenge: &[u8; 32],
+    received: &[u8; 32],
+    port: u16,
+    inode: u64,
+) -> [u8; 82] {
+    let mut frame = [0_u8; 82];
+    frame[..8].copy_from_slice(b"MCDR\x01\0\0\0");
+    frame[8..40].copy_from_slice(challenge);
+    frame[40..72].copy_from_slice(received);
+    frame[72..74].copy_from_slice(&port.to_le_bytes());
+    frame[74..].copy_from_slice(&inode.to_le_bytes());
+    frame
+}
+
 pub(crate) fn fixed_port(challenge: &[u8; 32]) -> u16 {
-    let mut digest = Sha256::new();
-    digest.update(b"memcordon-private-release-dual-port-v1\0");
-    digest.update(challenge);
-    let bytes = digest.finalize();
-    20_000 + u16::from_le_bytes([bytes[0], bytes[1]]) % 30_000
+    memcordon_core::private_release_case_v1::candidate_fixture_port_v1(challenge)
 }
 
 pub(crate) fn ready_frame(challenge: &[u8; 32], port: u16, inode: u64) -> [u8; 42] {
-    let mut frame = [0_u8; 42];
-    let mut digest = Sha256::new();
-    digest.update(b"memcordon-private-release-dual-ready-v1\0");
-    digest.update(challenge);
-    frame[..32].copy_from_slice(&digest.finalize());
-    frame[32..34].copy_from_slice(&port.to_le_bytes());
-    frame[34..].copy_from_slice(&inode.to_le_bytes());
-    frame
+    assert_eq!(port, fixed_port(challenge), "reviewed dual fixture port");
+    memcordon_core::private_release_case_v1::candidate_fixture_expected_response_v1(
+        if cfg!(target_arch = "x86_64") {
+            "x86_64-unknown-linux-gnu"
+        } else {
+            "aarch64-unknown-linux-gnu"
+        },
+        SELECTOR,
+        challenge,
+        Some(inode),
+        None,
+    )
+    .expect("reviewed dual operands")
+    .try_into()
+    .expect("reviewed dual ready frame")
 }
 
 pub(crate) fn target_ack() -> [u8; 1] {

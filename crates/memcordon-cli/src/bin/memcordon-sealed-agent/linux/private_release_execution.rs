@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
 
@@ -101,7 +101,8 @@ pub(crate) fn execute_blocked_retirement_candidate_case(
     let (stdout_read, stdout_write) = super::private_probe_execution::nonblocking_pipe()?;
     let (stderr_read, stderr_write) = super::private_probe_execution::nonblocking_pipe()?;
     let challenge = case.challenge_bytes();
-    File::from(stdin_write)
+    let mut baseline_input = File::from(stdin_write);
+    baseline_input
         .write_all(&challenge)
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: fault challenge pipe: {error}"))?;
     let mut owner = case.begin_native_owner()?;
@@ -134,6 +135,11 @@ pub(crate) fn execute_blocked_retirement_candidate_case(
         )?;
         let network_namespace_inode = observed.network_namespace_inode();
         owner.prepare_relay([stdin_read, stdout_write, stderr_write])?;
+        super::private_release_live_gate::wait_pre_for_candidate(
+            case,
+            &mut owner,
+            observed.target_identity(),
+        )?;
         let checkpoint = owner.commit_release_candidate_and_release(observed, case)?;
         if !matches!(
             owner.observe_exec(startup_deadline)?,
@@ -141,6 +147,13 @@ pub(crate) fn execute_blocked_retirement_candidate_case(
         ) {
             return Err("MCSEALED-PRIVATE-RELEASE: fault target failed exec".into());
         }
+        super::private_release_live_gate::wait_baseline_for_candidate(
+            case,
+            &mut owner,
+            stdout_read.as_fd(),
+            baseline_input.as_fd(),
+            None,
+        )?;
         if owner.monitor_release_candidate(case)? != PrivateMonitorOutcome::Completed {
             return Err("MCSEALED-PRIVATE-RELEASE: fault target monitor incomplete".into());
         }
@@ -256,6 +269,11 @@ pub(crate) fn execute_uncertain_candidate_case(
             startup_deadline,
         )?;
         owner.prepare_relay([stdin_read, stdout_write, stderr_write])?;
+        super::private_release_live_gate::wait_pre_for_candidate(
+            case,
+            &mut owner,
+            observed.target_identity(),
+        )?;
         owner.commit_uncertain_candidate_transport_loss(observed, case)
     })();
     let (checkpoint, transport_errno) = run?;
@@ -276,15 +294,58 @@ pub(crate) fn execute_uncertain_candidate_case(
             return Err("MCSEALED-PRIVATE-RELEASE: uncertainty gate failure differs".into());
         }
     };
+    let stdout_fd = stdout_read.as_raw_fd();
+    let stderr_fd = stderr_read.as_raw_fd();
+    let stdout_identity =
+        std::fs::metadata(std::path::Path::new("/proc/self/fd").join(stdout_fd.to_string()))
+            .map_err(|error| error.to_string())?;
+    let stderr_identity =
+        std::fs::metadata(std::path::Path::new("/proc/self/fd").join(stderr_fd.to_string()))
+            .map_err(|error| error.to_string())?;
+    let drain_begin = super::clock::monotonic_nanos()?;
+    let stdout = super::private_probe_execution::read_bounded_pipe(stdout_read, 1)?;
+    let stderr = super::private_probe_execution::read_bounded_pipe(stderr_read, 1)?;
+    let drain_end = super::clock::monotonic_nanos()?;
     if retirement.checkpoint_digest != checkpoint
         || retirement.settlement.transport_errno != libc::EPIPE
         || retirement.settlement.candidate_exit_code == Some(0)
         || current_network_namespace()? != provider_namespace
-        || !super::private_probe_execution::read_bounded_pipe(stdout_read, 1)?.is_empty()
-        || !super::private_probe_execution::read_bounded_pipe(stderr_read, 1)?.is_empty()
+        || !stdout.is_empty()
+        || !stderr.is_empty()
     {
         return Err("MCSEALED-PRIVATE-RELEASE: uncertainty physical observation differs".into());
     }
+    let encode_stream = |bytes: &[u8]| {
+        let mut framed = (bytes.len() as u64).to_be_bytes().to_vec();
+        framed.extend_from_slice(bytes);
+        framed
+    };
+    let directory = case.protected_case_directory()?;
+    let stdout = encode_stream(&stdout);
+    let stderr = encode_stream(&stderr);
+    super::private_release_child_gate::persist_atomic(
+        directory,
+        "uncertain-stdout-v1.pending",
+        "uncertain-stdout-v1.bin",
+        &stdout,
+    )?;
+    super::private_release_child_gate::persist_atomic(
+        directory,
+        "uncertain-stderr-v1.pending",
+        "uncertain-stderr-v1.bin",
+        &stderr,
+    )?;
+    let reader = super::private_attempt::ProcessIdentityV4::observe(
+        std::process::id() as libc::pid_t,
+        worker_pidfd.as_fd(),
+    )?;
+    let bytes=serde_json::to_vec(&serde_json::json!({"schema_version":1,"reader":reader,"stdout_fd":stdout_fd,"stderr_fd":stderr_fd,"stdout_inode":stdout_identity.ino(),"stderr_inode":stderr_identity.ino(),"stdout_dev":stdout_identity.dev(),"stderr_dev":stderr_identity.dev(),"stdout_sha256":hash_bytes(&stdout),"stderr_sha256":hash_bytes(&stderr),"begin_monotonic_ns":drain_begin,"end_monotonic_ns":drain_end})).map_err(|error|error.to_string())?;
+    super::private_release_child_gate::persist_atomic(
+        directory,
+        "uncertain-streams-v1.pending",
+        "uncertain-streams-v1.json",
+        &bytes,
+    )?;
     case.revalidate()?;
     Ok(UncertainCandidateNativeObservationV1 {
         attempt_id: retirement.attempt_id,
@@ -378,13 +439,7 @@ fn execute_fixture_case_with_mode(
     challenge_writer
         .write_all(&challenge)
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: challenge pipe: {error}"))?;
-    let mut observer_input = match mode {
-        FixtureExecutionModeV1::Ordinary => {
-            drop(challenge_writer);
-            None
-        }
-        FixtureExecutionModeV1::ClosedUnixIntent => Some(challenge_writer),
-    };
+    let mut observer_input = Some(challenge_writer);
     let mut stdout_pipe = File::from(stdout_read);
     let mut owner = case.begin_native_owner()?;
     let startup_deadline = (Instant::now() + Duration::from_secs(5)).min(case.deadline());
@@ -415,6 +470,7 @@ fn execute_fixture_case_with_mode(
             startup_deadline,
         )?;
         let network_namespace_inode = observed.network_namespace_inode();
+        let sampled_target = observed.target_identity().clone();
         let unix_target = (matches!(mode, FixtureExecutionModeV1::ClosedUnixIntent))
             .then(|| observed.target_identity().clone());
         let unix_before = unix_target
@@ -429,6 +485,17 @@ fn execute_fixture_case_with_mode(
             })
             .transpose()?;
         owner.prepare_relay([stdin_read, stdout_write, stderr_write])?;
+        super::private_release_live_gate::wait_for_sample(
+            case.protected_case_directory()?,
+            case.selector(),
+            case.protected_result_key()?,
+            &challenge,
+            &sampled_target,
+            false,
+            &[],
+            case.deadline(),
+            || owner.require_live_target_identity(&sampled_target),
+        )?;
         let checkpoint = owner.commit_release_candidate_and_release(observed, case)?;
         if !matches!(
             owner.observe_exec(startup_deadline)?,
@@ -436,6 +503,16 @@ fn execute_fixture_case_with_mode(
         ) {
             return Err("MCSEALED-PRIVATE-RELEASE: target failed native exec".into());
         }
+        super::private_release_live_gate::wait_baseline_for_candidate(
+            case,
+            &mut owner,
+            stdout_pipe.as_fd(),
+            observer_input
+                .as_ref()
+                .ok_or("baseline stdin missing")?
+                .as_fd(),
+            None,
+        )?;
         let expected = match mode {
             FixtureExecutionModeV1::Ordinary => {
                 case.expected_fixture_output(network_namespace_inode)?
@@ -490,12 +567,49 @@ fn execute_fixture_case_with_mode(
             drop(observer_input.take());
             (response, Some(witness))
         } else {
-            (Vec::new(), None)
+            let mut response = vec![0; expected.len()];
+            let mut offset = 0;
+            while offset < response.len() {
+                owner.tick_relay_for_unix_observer()?;
+                match stdout_pipe.read(&mut response[offset..]) {
+                    Ok(0) => return Err("MCSEALED-PRIVATE-RELEASE: held fixture EOF".into()),
+                    Ok(count) => offset += count,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= case.deadline() {
+                            return Err(
+                                "MCSEALED-PRIVATE-RELEASE: held fixture output deadline".into()
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            super::private_release_live_gate::wait_for_sample(
+                case.protected_case_directory()?,
+                case.selector(),
+                case.protected_result_key()?,
+                &challenge,
+                &sampled_target,
+                true,
+                &response,
+                case.deadline(),
+                || owner.require_live_target_identity(&sampled_target),
+            )?;
+            observer_input
+                .as_mut()
+                .ok_or("candidate observer input absent")?
+                .write_all(
+                    super::private_release_unix_intent::observer_ack_digest(&challenge).bytes(),
+                )
+                .map_err(|error| error.to_string())?;
+            drop(observer_input.take());
+            (response, None)
         };
         if owner.monitor_release_candidate(case)? != PrivateMonitorOutcome::Completed {
             return Err("MCSEALED-PRIVATE-RELEASE: native monitor did not complete".into());
         }
-        let response = if unix_absence.is_some() {
+        let response = {
             let mut extra = Vec::new();
             (&mut stdout_pipe)
                 .take(1)
@@ -507,11 +621,6 @@ fn execute_fixture_case_with_mode(
                 return Err("MCSEALED-PRIVATE-RELEASE: Unix target emitted trailing output".into());
             }
             response
-        } else {
-            super::private_probe_execution::read_bounded_pipe(
-                stdout_pipe.into(),
-                expected.len() + 1,
-            )?
         };
         let stderr = super::private_probe_execution::read_bounded_pipe(stderr_read, 1025)?;
         if response != expected || !stderr.is_empty() {

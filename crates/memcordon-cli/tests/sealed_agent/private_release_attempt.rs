@@ -256,6 +256,7 @@ fn uncertain_retirement_rejects_missing_physical_settlement_without_reverting_re
             namespace_init_reaped: false,
             guardian_terminal: [0; 20],
             candidate_exit_code: None,
+            cgroup_retirement_raw: None,
         },
     );
     assert!(result.is_err());
@@ -305,6 +306,7 @@ fn injected_retired_transition_collision_blocks_actual_same_key_allocator() {
         .force_retirement_transition_conflict(
             &challenge,
             crate::linux::private_lifecycle::ReleaseCandidateSettlementFactsV1 {
+                cgroup_retirement_raw: None,
                 schema_version: 1,
                 monitor_outcome: crate::linux::private_lifecycle::PrivateMonitorOutcome::Completed,
                 cgroup_empty_before_cleanup: true,
@@ -372,6 +374,7 @@ fn guardian_loss_journal_rejects_wrong_signal_and_zero_exit() {
         target_pidfd_exited: true,
         namespace_init_reaped: true,
         candidate_exit_code: None,
+        cgroup_retirement_raw: None,
     };
     assert!(journal.retired_after_guardian_loss(facts.clone()).is_err());
     facts.guardian_signal = libc::SIGKILL;

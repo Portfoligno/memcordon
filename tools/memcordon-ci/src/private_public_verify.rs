@@ -37,11 +37,11 @@ use crate::private_native::NativeRunStageV2;
 use crate::private_native_verify::{RequiredDispositionV1, case_evidence_requirements_v1};
 use crate::private_process_clock::VerifiedProcClockCalibrationV1;
 use crate::private_public_case_readback::StructuralFinalPublicCaseReadbackV2;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+use crate::private_public_dispatch::OwnedPublicRawAttachmentV2;
 use crate::private_public_dispatch::{
-    ObservedInstalledPublicCaseV3, OwnedPublicRawAttachmentV2, StructuralProviderFrameReadbackV2,
+    ObservedInstalledPublicCaseV3, StructuralProviderFrameReadbackV2,
 };
-#[cfg(target_os = "linux")]
 use crate::private_public_kernel_join::VerifiedPublicCaseKernelJoinV1;
 use crate::{CiError, Result};
 
@@ -81,7 +81,6 @@ pub(crate) struct VerifiedHistoricalPublicEpochV1 {
     transcript_sha256: DiagnosticSha256,
 }
 
-#[cfg(target_os = "linux")]
 impl VerifiedHistoricalPublicEpochV1 {
     pub(crate) fn transcript_sha256(&self) -> &DiagnosticSha256 {
         &self.transcript_sha256
@@ -155,7 +154,227 @@ pub(crate) struct VerifiedPublicAbiCompositeV1 {
     host_receipt_sha256: DiagnosticSha256,
 }
 
-#[cfg(target_os = "linux")]
+/// These capabilities remain mandatory until a completed portable replay
+/// implements every existing specialist predicate. Origin alone cannot
+/// replace the ABI/policy/reuse or historical semantic join.
+pub(crate) struct PublicSpecialistProofsV1 {
+    pub(crate) abi: VerifiedPublicAbiCompositeV1,
+    pub(crate) policy: VerifiedPublicPolicyCompositeV1,
+    pub(crate) reuse: VerifiedPublicReuseCompositeV1,
+    pub(crate) historical: VerifiedHistoricalPublicEpochV1,
+}
+
+impl PublicSpecialistProofsV1 {
+    pub(crate) fn verify_completed_links(
+        &self,
+        intent: &crate::private_public_plan::StaticPublicSuiteIntentV1,
+        origin: &impl crate::private_observer_session::ObserverEvidenceV1,
+        _cases: &[crate::private_candidate_replay::VerifiedNativeCaseV1],
+    ) -> Result<()> {
+        let generation =
+            origin.descriptor().generations.last().ok_or_else(|| {
+                CiError::Message("public specialist final generation absent".into())
+            })?;
+        let checks = [
+            (
+                "private_tcp::abi_alternate_entry_denied",
+                &self.abi.case_sha256,
+                &self.abi.result_key,
+                &self.abi.target,
+                &self.abi.source_commit,
+                &self.abi.release_version,
+                &self.abi.boot_identity,
+                &self.abi.installation_epoch,
+                &self.abi.archive_sha256,
+                &self.abi.manifest_sha256,
+                &self.abi.qualification_sha256,
+                &self.abi.host_receipt_sha256,
+            ),
+            (
+                "private_tcp::wrong_grant_profile_and_port_rejected",
+                &self.policy.case_sha256,
+                &self.policy.result_key,
+                &self.policy.target,
+                &self.policy.source_commit,
+                &self.policy.release_version,
+                &self.policy.boot_identity,
+                &self.policy.installation_epoch,
+                &self.policy.archive_sha256,
+                &self.policy.manifest_sha256,
+                &self.policy.qualification_sha256,
+                &self.policy.host_receipt_sha256,
+            ),
+            (
+                "private_tcp::retirement_failure_blocks_reuse",
+                &self.reuse.case_sha256,
+                &self.reuse.result_key,
+                &self.reuse.target,
+                &self.reuse.source_commit,
+                &self.reuse.release_version,
+                &self.reuse.boot_identity,
+                &self.reuse.installation_epoch,
+                &self.reuse.archive_sha256,
+                &self.reuse.manifest_sha256,
+                &self.reuse.qualification_sha256,
+                &self.reuse.host_receipt_sha256,
+            ),
+        ];
+        for (
+            selector,
+            digest,
+            key,
+            target,
+            source,
+            version,
+            boot,
+            epoch,
+            archive,
+            manifest,
+            q,
+            h1,
+        ) in checks
+        {
+            let scenario = intent
+                .scenarios
+                .iter()
+                .find(|scenario| scenario.selector == selector)
+                .ok_or_else(|| {
+                    CiError::Message("public specialist protected recipe absent".into())
+                })?;
+            let family = match selector {
+                "private_tcp::abi_alternate_entry_denied" => "abi",
+                "private_tcp::wrong_grant_profile_and_port_rejected" => "policy",
+                _ => "reuse",
+            };
+            let case_path = std::path::Path::new("composites")
+                .join(family)
+                .join("composite.json");
+            let actual_generation = origin
+                .descriptor()
+                .generations
+                .iter()
+                .find(|entry| &entry.installation_epoch == epoch)
+                .ok_or_else(|| CiError::Message("public specialist generation absent".into()))?;
+            let (challenge, _) = crate::private_public_plan::prepared_public_case_recipe_v1(
+                intent,
+                &origin.descriptor().session_nonce,
+                actual_generation.generation,
+                &scenario.selector,
+            )?;
+            let expected_key =
+                memcordon_core::private_release_case_v1::private_release_case_key_v1(
+                    memcordon_core::private_release_case_v1::PrivateReleaseStageV1::FinalPublic,
+                    selector,
+                    &challenge,
+                )
+                .map_err(CiError::Message)?;
+            if hash_bytes(origin.leaf(&case_path.to_string_lossy())?) != *digest
+                || &expected_key != key
+                || target != &intent.observer_subject.target
+                || source != &intent.observer_subject.source_commit
+                || version != &intent.observer_subject.release_version
+                || boot != &origin.descriptor().boot_id
+                || epoch != &actual_generation.installation_epoch
+                || archive != &intent.archive_sha256
+                || manifest != &intent.manifest_sha256
+                || q != &intent.qualification_sha256
+                || h1 != &actual_generation.installed_receipt_sha256
+            {
+                return Err(CiError::Message(
+                    "public specialist origin/subject/case linkage differs".into(),
+                ));
+            }
+        }
+        if self.historical.e1_installation_epoch != generation.installation_epoch
+            || self.historical.e1_host_receipt_sha256 != generation.installed_receipt_sha256
+            || self.historical.boot_identity != origin.descriptor().boot_id
+            || self.historical.transcript_sha256
+                != hash_bytes(origin.leaf("historical/epoch-transition.json")?)
+        {
+            return Err(CiError::Message(
+                "public specialist historical origin linkage differs".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rows(
+        &self,
+        completed: &crate::private_public_completion::AuthenticatedCompletedPublicEvidenceV2,
+    ) -> Result<Vec<crate::private_public_completion::PublicCaseDigestV3>> {
+        use crate::private_public_completion::{
+            PublicCaseDigestV3, PublicCaseEvidenceFormatV3 as F,
+        };
+        let mut rows = Vec::new();
+        for (selector, family, format, digest, key, epoch) in [
+            (
+                "private_tcp::abi_alternate_entry_denied",
+                "abi",
+                F::AbiCompositeV1,
+                &self.abi.case_sha256,
+                &self.abi.result_key,
+                &self.abi.installation_epoch,
+            ),
+            (
+                "private_tcp::retirement_failure_blocks_reuse",
+                "reuse",
+                F::ReuseCompositeV1,
+                &self.reuse.case_sha256,
+                &self.reuse.result_key,
+                &self.reuse.installation_epoch,
+            ),
+            (
+                "private_tcp::wrong_grant_profile_and_port_rejected",
+                "policy",
+                F::PolicyCompositeV1,
+                &self.policy.case_sha256,
+                &self.policy.result_key,
+                &self.policy.installation_epoch,
+            ),
+        ] {
+            let prefix = std::path::Path::new("composites")
+                .join(family)
+                .to_string_lossy()
+                .into_owned();
+            let raw = completed
+                .transport_index()
+                .leaves
+                .iter()
+                .filter(|leaf| {
+                    leaf.path
+                        .strip_prefix(&prefix)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                })
+                .collect::<Vec<_>>();
+            if raw.is_empty() {
+                return Err(CiError::Message(
+                    "public specialist raw physical inventory absent".into(),
+                ));
+            }
+            let generation = completed
+                .origin()
+                .descriptor()
+                .generations
+                .iter()
+                .find(|generation| &generation.installation_epoch == epoch)
+                .ok_or_else(|| {
+                    CiError::Message("public specialist raw generation absent".into())
+                })?;
+            rows.push(PublicCaseDigestV3 {
+                selector: selector.into(),
+                evidence_format: format,
+                case_sha256: digest.clone(),
+                result_key: key.clone(),
+                generation_ref: generation.generation,
+                raw_case_commitment_sha256: hash_bytes(&crate::private_public_raw::canonical_json(
+                    &raw,
+                )?),
+            });
+        }
+        Ok(rows)
+    }
+}
+
 pub(crate) fn verify_public_reuse_composite(
     bytes: &[u8],
     joined: &crate::private_public_reuse_join::VerifiedPublicReuseV1,
@@ -195,7 +414,6 @@ pub(crate) fn verify_public_reuse_composite(
     })
 }
 
-#[cfg(target_os = "linux")]
 pub(crate) fn verify_public_abi_composite(
     bytes: &[u8],
     observed: &ObservedInstalledPublicCaseV3,
@@ -289,7 +507,7 @@ pub(crate) fn verify_public_abi_composite(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) struct PublicPolicyBranchLiveV1 {
     pub(crate) observed: ObservedInstalledPublicCaseV3,
     pub(crate) provider: StructuralProviderFrameReadbackV2,
@@ -304,6 +522,7 @@ pub(crate) struct PublicPolicyBranchLiveV1 {
 pub(crate) struct AuthenticatedCompletedPublicEvidenceV1 {
     completed: AuthenticatedCompletedProducerV2,
     public_index_bytes: Vec<u8>,
+    raw_index_bytes: Vec<u8>,
     raw_index_sha256: DiagnosticSha256,
 }
 
@@ -483,7 +702,7 @@ impl PublicEvidenceIndexV2 {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) fn verify_public_policy_composite(
     bytes: &[u8],
     live: &[PublicPolicyBranchLiveV1; 5],
@@ -736,6 +955,8 @@ pub(crate) fn verify_public_semantics(
             ));
         }
         let actual_disposition = match case.observation {
+            memcordon_core::private_release_case_v1::PrivateReleaseObservationV1::PublicFaultRejectedRetiredV2 { .. } =>
+                return Err(CiError::Message("versioned fault rejection requires origin-bound public V3 evidence".into())),
             memcordon_core::private_release_case_v1::PrivateReleaseObservationV1::PolicyComposite { .. } => {
                 return Err(CiError::Message("candidate policy composite is not public evidence".into()));
             }
@@ -994,7 +1215,7 @@ pub(crate) fn sign_public_qualification_certificate(
         .as_ref()
         .ok_or_else(|| CiError::Message("completed P producer lacks final H1".into()))?;
     if completed.public_index_bytes != p_bytes
-        || completed.raw_index_sha256 != hash_bytes(&p_bytes)
+        || completed.raw_index_sha256 != hash_bytes(&completed.raw_index_bytes)
         || completed_run.artifact.producer.stage != NativeRunStageV2::FinalPublic
         || completed_run.artifact.producer.target != verified.target
         || completed_run.artifact.envelope.target != verified.target

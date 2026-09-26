@@ -85,6 +85,26 @@ struct OutputReader {
     worker: thread::JoinHandle<io::Result<()>>,
 }
 
+#[derive(Clone)]
+pub struct OutputSnapshot {
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+}
+impl OutputSnapshot {
+    pub fn stdout(&self) -> io::Result<Vec<u8>> {
+        self.stdout
+            .lock()
+            .map(|bytes| bytes.clone())
+            .map_err(|_| io::Error::other("stdout snapshot lock poisoned"))
+    }
+    pub fn stderr(&self) -> io::Result<Vec<u8>> {
+        self.stderr
+            .lock()
+            .map(|bytes| bytes.clone())
+            .map_err(|_| io::Error::other("stderr snapshot lock poisoned"))
+    }
+}
+
 impl OutputReader {
     fn snapshot(&self) -> Vec<u8> {
         self.bytes
@@ -167,8 +187,71 @@ fn run_with_deadline_after_limit(
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     OuterTestBoundary::configure(command).map_err(ProcessTestError::Spawn)?;
     let started = Instant::now();
-    let mut child = command.spawn().map_err(ProcessTestError::Spawn)?;
+    let child = command.spawn().map_err(ProcessTestError::Spawn)?;
     let spawn_returned = started.elapsed();
+    observe_deadline_child(
+        child,
+        started,
+        spawn_returned,
+        deadline,
+        move |pid, _, _| after_spawn(pid),
+        output_limit,
+    )
+}
+
+/// Own the command and its native descriptor setup through exactly one spawn.
+/// The spawning adapter must return a child with the configured piped streams.
+pub fn run_with_deadline_owned_spawn_after_output_limit(
+    mut command: Command,
+    deadline: Duration,
+    limit: usize,
+    spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
+    after_spawn: impl FnOnce(u32) -> io::Result<()> + Send + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    OuterTestBoundary::configure(&mut command).map_err(ProcessTestError::Spawn)?;
+    let started = Instant::now();
+    let child = spawn(command).map_err(ProcessTestError::Spawn)?;
+    let spawn_returned = started.elapsed();
+    observe_deadline_child(
+        child,
+        started,
+        spawn_returned,
+        deadline,
+        move |pid, _, _| after_spawn(pid),
+        Some(limit),
+    )
+}
+
+/// Snapshot access is observational only. Streams remain bounded and owned
+/// by joined readers; callback stdin is the exact sole configured child pipe.
+pub fn run_with_deadline_owned_spawn_with_io_output_limit(
+    mut command: Command,
+    deadline: Duration,
+    limit: usize,
+    spawn: impl FnOnce(Command) -> io::Result<std::process::Child>,
+    after_spawn: impl FnOnce(u32, Option<std::process::ChildStdin>, OutputSnapshot) -> io::Result<()>
+    + Send
+    + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    OuterTestBoundary::configure(&mut command).map_err(ProcessTestError::Spawn)?;
+    let started = Instant::now();
+    let child = spawn(command).map_err(ProcessTestError::Spawn)?;
+    let returned = started.elapsed();
+    observe_deadline_child(child, started, returned, deadline, after_spawn, Some(limit))
+}
+
+fn observe_deadline_child(
+    mut child: std::process::Child,
+    started: Instant,
+    spawn_returned: Duration,
+    deadline: Duration,
+    after_spawn: impl FnOnce(u32, Option<std::process::ChildStdin>, OutputSnapshot) -> io::Result<()>
+    + Send
+    + 'static,
+    output_limit: Option<usize>,
+) -> Result<ObservedOutput, ProcessTestError> {
     let boundary = match OuterTestBoundary::after_spawn(&child) {
         Ok(boundary) => boundary,
         Err(error) => {
@@ -188,8 +271,13 @@ fn run_with_deadline_after_limit(
     );
     let (callback_sender, callback_receiver) = mpsc::sync_channel(1);
     let child_id = child.id();
+    let child_stdin = child.stdin.take();
+    let snapshot = OutputSnapshot {
+        stdout: Arc::clone(&stdout_reader.bytes),
+        stderr: Arc::clone(&stderr_reader.bytes),
+    };
     let callback = thread::spawn(move || {
-        let _ = callback_sender.send(after_spawn(child_id));
+        let _ = callback_sender.send(after_spawn(child_id, child_stdin, snapshot));
     });
     let mut callback_result = None;
     let mut observed_status = None;

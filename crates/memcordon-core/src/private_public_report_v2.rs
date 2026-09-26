@@ -24,6 +24,14 @@ pub enum PublicCliReportEvidenceV2 {
         supervised_transport_sha256: DiagnosticSha256,
         independent_recovery_sha256: DiagnosticSha256,
     },
+    /// V3 only. Preserve a real nonterminal rejection; never rename it a
+    /// Terminal to satisfy the legacy frontend-loss envelope.
+    AbsentFrontendRejectedV3 {
+        original_rejection_sha256: DiagnosticSha256,
+        supervised_transport_sha256: DiagnosticSha256,
+        supervisor_wait_sha256: DiagnosticSha256,
+        independent_recovery_sha256: DiagnosticSha256,
+    },
 }
 
 impl PublicCliReportEvidenceV2 {
@@ -33,6 +41,11 @@ impl PublicCliReportEvidenceV2 {
         }
         reject_duplicate_json_keys(bytes)?;
         let evidence: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if matches!(evidence, Self::AbsentFrontendRejectedV3 { .. }) {
+            return Err(
+                "nonterminal frontend report replacement requires public V3 case transport".into(),
+            );
+        }
         evidence.validate_structure()?;
         Ok(evidence)
     }
@@ -59,6 +72,24 @@ impl PublicCliReportEvidenceV2 {
                 .any(|digest| *digest == zero)
                 {
                     return Err("frontend-loss replacement evidence is incomplete".into());
+                }
+            }
+            Self::AbsentFrontendRejectedV3 {
+                original_rejection_sha256,
+                supervised_transport_sha256,
+                supervisor_wait_sha256,
+                independent_recovery_sha256,
+            } => {
+                if [
+                    original_rejection_sha256,
+                    supervised_transport_sha256,
+                    supervisor_wait_sha256,
+                    independent_recovery_sha256,
+                ]
+                .into_iter()
+                .any(|digest| *digest == zero)
+                {
+                    return Err("V3 nonterminal frontend replacement is incomplete".into());
                 }
             }
         }

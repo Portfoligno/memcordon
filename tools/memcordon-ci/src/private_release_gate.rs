@@ -22,10 +22,7 @@ use memcordon_core::workload_registry_v2::ProfileKindV2;
 use memcordon_core::{BoundedText, BoundedVec, DiagnosticSha256};
 
 use crate::private_completed_run::{AuthenticatedCandidateC3, AuthenticatedCompletedProducerV2};
-use crate::private_native::{
-    ExpectedFinalPublicJoinV2, NativeRunEnvelopeV2, NativeRunStageV2,
-    validate_final_public_structural_join,
-};
+use crate::private_native::{ExpectedFinalPublicJoinV2, NativeRunEnvelopeV2, NativeRunStageV2};
 use crate::private_native_verify::VerifiedCandidateSemanticsV2;
 use crate::private_suite::REQUIRED_CASES;
 use crate::release_private::PrivateCandidateRecordV2;
@@ -43,7 +40,69 @@ pub struct IndependentlyVerifiedCandidateRunV2 {
 
 /// The final public pass must be distinct from candidate capability evidence.
 pub struct IndependentlyVerifiedFinalPublicRunV2 {
-    envelope: NativeRunEnvelopeV2,
+    public_index: crate::private_public_completion::PublicEvidenceIndexV3,
+    public_index_sha256: DiagnosticSha256,
+}
+
+/// Constructed only after the independently authenticated Actions upload and
+/// origin-bound family replay agree. A parsed P or a successful job is not enough.
+pub(crate) fn complete_final_public_run(
+    completed: &crate::private_public_completion::AuthenticatedCompletedPublicEvidenceV2,
+    verified: &crate::private_public_completion::VerifiedPublicSemanticsV3,
+) -> Result<IndependentlyVerifiedFinalPublicRunV2> {
+    use crate::private_observer_session::ObserverStageV1;
+    let origin = completed.origin();
+    let subject = &origin.descriptor().subject;
+    let provenance = completed.provenance();
+    let index = verified.index();
+    let generation = origin.descriptor().generations.last().ok_or_else(|| {
+        CiError::Message("final public origin lacks installation generation".into())
+    })?;
+    if subject.stage != ObserverStageV1::Public
+        || index.schema_version != 3
+        || index.source_commit != subject.source_commit
+        || index.release_version != subject.release_version
+        || index.target != subject.target
+        || index.build_sha256 != subject.build_sha256
+        || index.catalogue_sha256 != subject.catalogue_sha256
+        || index.origin_commitment_sha256 != *origin.origin_commitment_sha256()
+        || index.custody_receipt_sha256 != *origin.receipt_sha256()
+        || index.payload_index_sha256 != *origin.payload_index_sha256()
+        || index.generation_timeline_sha256 != *origin.generation_timeline_sha256()
+        || index.raw_index_sha256 != *completed.raw_index_sha256()
+        || index.completed_provenance_sha256 != *completed.provenance_sha256()
+        || index.installation_epoch != generation.installation_epoch
+        || index.manifest_sha256 != generation.installed_manifest_sha256
+        || index.host_receipt_sha256 != generation.installed_receipt_sha256
+        || index.boot_identity != origin.descriptor().boot_id
+        || provenance.repository_id != subject.repository_id
+        || provenance.run_id != subject.run_id
+        || provenance.run_attempt != subject.run_attempt
+        || provenance.producer_job_id != subject.job_id
+        || provenance.runner_id != subject.runner_id
+        || origin.upload().is_none_or(|upload| {
+            upload.archive_sha256 != provenance.archive_sha256
+                || upload.archive_size != provenance.archive_size
+                || upload.artifact_id != provenance.artifact_id
+                || upload.uploaded_job_id != provenance.producer_job_id
+                || upload.uploaded_run_attempt != provenance.run_attempt
+        })
+    {
+        return Err(CiError::Message(
+            "final P differs from completed Actions custody/build/install subject".into(),
+        ));
+    }
+    let bytes = verified.public_index_bytes()?;
+    let parsed = crate::private_public_completion::PublicEvidenceIndexV3::parse(&bytes)?;
+    if parsed != *index {
+        return Err(CiError::Message(
+            "final P canonical readback differs".into(),
+        ));
+    }
+    Ok(IndependentlyVerifiedFinalPublicRunV2 {
+        public_index: parsed,
+        public_index_sha256: hash_bytes(&bytes),
+    })
 }
 
 pub struct IndependentBuildIdentityV2<'a> {
@@ -69,6 +128,7 @@ fn verify_candidate_c3_semantics(
     build: &IndependentBuildIdentityV2<'_>,
 ) -> Result<()> {
     if semantics.result_digests.len() != REQUIRED_CASES.len()
+        || !semantics.completed_origin
         || completed.index.cases.len() != REQUIRED_CASES.len()
         || completed.index.target != build.target
         || completed.index.source_commit != build.source_commit
@@ -78,6 +138,22 @@ fn verify_candidate_c3_semantics(
     {
         return Err(CiError::Message(
             "completed C3 independent case subject differs from B".into(),
+        ));
+    }
+    let origin = completed.observer_origin.as_ref().ok_or_else(|| {
+        CiError::Message("candidate Q lacks completed authenticated custody".into())
+    })?;
+    if semantics.subject != origin.descriptor().subject
+        || semantics.payload_index_sha256 != *origin.payload_index_sha256()
+        || semantics.origin_commitment_sha256 != *origin.origin_commitment_sha256()
+        || semantics.generation_timeline_sha256 != *origin.generation_timeline_sha256()
+        || semantics.inventory_digests.len() != REQUIRED_CASES.len()
+        || semantics.subject.source_commit != build.source_commit
+        || semantics.subject.release_version != build.version
+        || semantics.subject.target != build.target
+    {
+        return Err(CiError::Message(
+            "candidate Q exact completed origin/replay subject differs".into(),
         ));
     }
     for ((case, selector), digest) in completed
@@ -614,6 +690,19 @@ pub fn require_final_public_private_gate(
             "private Q differs from candidate native run and final B".into(),
         ));
     }
-    validate_final_public_structural_join(&candidate.envelope, &final_public.envelope, expected)?;
+    let public = &final_public.public_index;
+    if public.source_commit != expected.source_commit
+        || public.release_version != expected.version
+        || public.target != expected.target
+        || public.qualification_sha256 != hash_bytes(&qualification.bytes)
+        || public.archive_sha256 != *expected.archive_sha256
+        || public.manifest_sha256 != *expected.runtime_manifest_sha256
+        || public.host_receipt_sha256 != *expected.installed_receipt_sha256
+        || final_public.public_index_sha256.bytes() == &[0; 32]
+    {
+        return Err(CiError::Message(
+            "final public qualification differs from candidate Q/build".into(),
+        ));
+    }
     Ok(())
 }

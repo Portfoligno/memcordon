@@ -205,14 +205,29 @@ impl PrivateGuardian {
         Ok(terminal)
     }
 
-    pub fn finish_after_loss(mut self, deadline: Instant) -> Result<GuardianTerminalV4, String> {
-        let terminal = read_terminal(self.terminal.as_fd(), self.attempt_id, deadline)?;
+    pub fn finish_after_loss(self, deadline: Instant) -> Result<GuardianTerminalV4, String> {
+        self.finish_after_loss_observed(deadline)
+            .map(|(terminal, _)| terminal)
+    }
+
+    pub(crate) fn finish_after_loss_observed(
+        mut self,
+        deadline: Instant,
+    ) -> Result<
+        (
+            GuardianTerminalV4,
+            Option<super::cgroup::CgroupRetirementRawV1>,
+        ),
+        String,
+    > {
+        let (terminal, retirement) =
+            read_terminal_observed(self.terminal.as_fd(), self.attempt_id, deadline)?;
         if terminal.trigger == GuardianTriggerV4::Stopped {
             return Err("MCSEALED-PRIVATE-GUARDIAN: loss terminal reported stop".into());
         }
         wait_exact_child(self.pid, deadline)?;
         self.reaped = true;
-        Ok(terminal)
+        Ok((terminal, retirement))
     }
 
     pub(crate) fn kill_for_probe(
@@ -368,16 +383,16 @@ fn guardian_loop(
             break GuardianTriggerV4::WorkerLost;
         }
     };
-    let retired = if trigger == GuardianTriggerV4::Stopped {
-        false
+    let retirement = if trigger == GuardianTriggerV4::Stopped {
+        None
     } else {
         // SAFETY: init is the exact transferred pidfd, never a numeric PID.
         unsafe {
             libc::syscall(libc::SYS_pidfd_send_signal, init, libc::SIGKILL, 0, 0);
         }
         cgroup
-            .kill_and_retire(Instant::now() + Duration::from_secs(30))
-            .is_ok()
+            .kill_and_retire_observed(Instant::now() + Duration::from_secs(30))
+            .ok()
     };
     if trigger == GuardianTriggerV4::FrontendLost {
         // Give the worker a bounded interval to close its namespace and pipe
@@ -398,10 +413,29 @@ fn guardian_loop(
     let frame = GuardianTerminalV4 {
         attempt_id,
         trigger,
-        boundary_retired: retired,
+        boundary_retired: retirement.is_some(),
     }
     .encode();
-    write_all(terminal, &frame)
+    write_all(terminal, &frame)?;
+    // Versioned companion retains actual measurements made by the process
+    // that removed the cgroup; the original V4 terminal bytes stay unchanged.
+    let raw = retirement
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    if raw.len() > 4096 {
+        return Err("guardian retirement source exceeds bound".into());
+    }
+    write_all(terminal, b"MCGR")?;
+    write_all(
+        terminal,
+        &u32::try_from(raw.len())
+            .map_err(|error| error.to_string())?
+            .to_be_bytes(),
+    )?;
+    write_all(terminal, &raw)
 }
 
 fn write_one(fd: i32, byte: u8) -> Result<(), String> {
@@ -443,9 +477,44 @@ fn read_terminal(
     attempt_id: [u8; 16],
     deadline: Instant,
 ) -> Result<GuardianTerminalV4, String> {
+    read_terminal_observed(fd, attempt_id, deadline).map(|(terminal, _)| terminal)
+}
+
+fn read_terminal_observed(
+    fd: BorrowedFd<'_>,
+    attempt_id: [u8; 16],
+    deadline: Instant,
+) -> Result<
+    (
+        GuardianTerminalV4,
+        Option<super::cgroup::CgroupRetirementRawV1>,
+    ),
+    String,
+> {
     let mut bytes = [0_u8; TERMINAL_LEN];
     read_exact_until(fd, &mut bytes, deadline)?;
-    GuardianTerminalV4::decode(bytes, attempt_id)
+    let terminal = GuardianTerminalV4::decode(bytes, attempt_id)?;
+    let mut header = [0u8; 8];
+    read_exact_until(fd, &mut header, deadline)?;
+    if &header[..4] != b"MCGR" {
+        return Err("guardian retirement source version differs".into());
+    }
+    let length =
+        u32::from_be_bytes(header[4..].try_into().expect("fixed retirement length")) as usize;
+    if length > 4096 {
+        return Err("guardian retirement source exceeds bound".into());
+    }
+    let mut raw = vec![0u8; length];
+    read_exact_until(fd, &mut raw, deadline)?;
+    let retirement = if raw.is_empty() {
+        None
+    } else {
+        Some(serde_json::from_slice(&raw).map_err(|error| error.to_string())?)
+    };
+    if terminal.boundary_retired != retirement.is_some() {
+        return Err("guardian retirement source/terminal disagree".into());
+    }
+    Ok((terminal, retirement))
 }
 
 fn read_exact_until(fd: BorrowedFd<'_>, bytes: &mut [u8], deadline: Instant) -> Result<(), String> {

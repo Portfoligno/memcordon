@@ -143,7 +143,7 @@ pub(crate) fn activate_installed_network_broker_for_observation() -> Result<Live
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
     const SOCKET: &str = "/run/memcordon/sealed-network-launcher.sock";
-    if unsafe { libc::geteuid() } != 0 {
+    if !rustix::process::geteuid().is_root() {
         return Err(fail("broker observer preflight requires root"));
     }
     let metadata = std::fs::symlink_metadata(SOCKET)?;
@@ -277,17 +277,45 @@ pub(crate) fn observe_live_kernel_subject(_pid: u32) -> Result<LiveKernelSubject
 }
 
 pub(crate) struct VerifiedKernelIntervalV1 {
-    boot_id: String,
-    kernel_release: String,
-    btf_sha256: DiagnosticSha256,
-    probe_map_sha256: DiagnosticSha256,
-    trace_sha256: DiagnosticSha256,
-    coordinator_pid: u32,
-    coordinator_start_time: u64,
-    cgroup_inode: u64,
-    result_key: DiagnosticSha256,
-    events: Vec<KernelEventV1>,
-    capture_bytes: Option<Vec<u8>>,
+    pub(crate) boot_id: String,
+    pub(crate) kernel_release: String,
+    pub(crate) btf_sha256: DiagnosticSha256,
+    pub(crate) probe_map_sha256: DiagnosticSha256,
+    pub(crate) trace_sha256: DiagnosticSha256,
+    pub(crate) coordinator_pid: u32,
+    pub(crate) coordinator_start_time: u64,
+    pub(crate) cgroup_inode: u64,
+    pub(crate) result_key: DiagnosticSha256,
+    pub(crate) events: Vec<KernelEventV1>,
+    pub(crate) capture_bytes: Option<Vec<u8>>,
+    pub(crate) physical_interval_id: Option<crate::private_kernel_replay::IntervalIdV1>,
+    pub(crate) raw_candidate_only: bool,
+    pub(crate) clock_inputs: Option<crate::private_process_clock::ProcClockInputsV1>,
+    pub(crate) original_clock: Option<crate::private_process_clock::VerifiedProcClockCalibrationV1>,
+    pub(crate) loader_stderr: Option<Vec<u8>>,
+    pub(crate) observation_timing: Option<KernelObservationTimingV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KernelObservationTimingV1 {
+    pub(crate) armed_monotonic_ns: u64,
+    pub(crate) operation_begin_monotonic_ns: u64,
+    pub(crate) operation_end_monotonic_ns: u64,
+    pub(crate) detached_monotonic_ns: u64,
+    pub(crate) drained_monotonic_ns: u64,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KernelIntervalReplayMetadataV1 {
+    pub(crate) schema_version: u8,
+    pub(crate) kernel_release: String,
+    pub(crate) probe_map_sha256: DiagnosticSha256,
+    pub(crate) coordinator_pid: u32,
+    pub(crate) coordinator_start_time: u64,
+    pub(crate) cgroup_inode: u64,
+    pub(crate) observation_timing: Option<KernelObservationTimingV1>,
 }
 
 pub(crate) struct VerifiedNoAllocationIntervalV1 {
@@ -320,6 +348,36 @@ impl VerifiedNoAllocationIntervalV1 {
 
 #[allow(dead_code)] // Consumed by the semantic verifier when the host adapter is provisioned.
 impl VerifiedKernelIntervalV1 {
+    pub(crate) fn replay_metadata(&self) -> KernelIntervalReplayMetadataV1 {
+        KernelIntervalReplayMetadataV1 {
+            schema_version: 1,
+            kernel_release: self.kernel_release.clone(),
+            probe_map_sha256: self.probe_map_sha256.clone(),
+            coordinator_pid: self.coordinator_pid,
+            coordinator_start_time: self.coordinator_start_time,
+            cgroup_inode: self.cgroup_inode,
+            observation_timing: self.observation_timing.clone(),
+        }
+    }
+    pub(crate) fn clock_inputs(&self) -> Option<&crate::private_process_clock::ProcClockInputsV1> {
+        self.clock_inputs.as_ref()
+    }
+    pub(crate) fn original_clock(
+        &self,
+    ) -> Option<&crate::private_process_clock::VerifiedProcClockCalibrationV1> {
+        self.original_clock.as_ref()
+    }
+    pub(crate) fn loader_stderr(&self) -> Option<&[u8]> {
+        self.loader_stderr.as_deref()
+    }
+    pub(crate) fn observation_timing(&self) -> Option<&KernelObservationTimingV1> {
+        self.observation_timing.as_ref()
+    }
+    pub(crate) fn physical_interval_id(
+        &self,
+    ) -> Option<&crate::private_kernel_replay::IntervalIdV1> {
+        self.physical_interval_id.as_ref()
+    }
     pub(crate) fn boot_id(&self) -> &str {
         &self.boot_id
     }
@@ -365,6 +423,11 @@ impl VerifiedKernelIntervalV1 {
         expected_result_key: &DiagnosticSha256,
     ) -> Result<VerifiedNoAllocationIntervalV1> {
         self.capture_bytes()?;
+        if self.raw_candidate_only {
+            return Err(fail(
+                "raw candidate projection cannot issue a legacy allocation capability",
+            ));
+        }
         if &self.result_key != expected_result_key
             || !self.has_allocation_boundary()
             || !self.no_allocation()
@@ -381,6 +444,11 @@ impl VerifiedKernelIntervalV1 {
         expected_result_key: &DiagnosticSha256,
     ) -> Result<VerifiedAllocationIntervalV1> {
         self.capture_bytes()?;
+        if self.raw_candidate_only {
+            return Err(fail(
+                "raw candidate projection cannot issue a legacy allocation capability",
+            ));
+        }
         if &self.result_key != expected_result_key
             || !self.has_allocation_boundary()
             || self.no_allocation()
@@ -494,6 +562,12 @@ impl VerifiedKernelIntervalV1 {
             result_key,
             events,
             capture_bytes: Some(vec![1]),
+            physical_interval_id: None,
+            raw_candidate_only: false,
+            clock_inputs: None,
+            original_clock: None,
+            loader_stderr: None,
+            observation_timing: None,
         }
     }
 }
@@ -970,6 +1044,12 @@ mod live {
                 result_key: self.expected.result_key.clone(),
                 events,
                 capture_bytes: None,
+                physical_interval_id: None,
+                raw_candidate_only: false,
+                clock_inputs: None,
+                original_clock: None,
+                loader_stderr: None,
+                observation_timing: None,
             })
         }
     }
@@ -992,7 +1072,7 @@ pub(crate) use live::Armed as ArmedTracefsIntervalV1;
 #[cfg(unix)]
 mod probe_bundle_live {
     use std::fs::{self, OpenOptions};
-    use std::io::{BufRead, BufReader, Read};
+    use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -1004,6 +1084,49 @@ mod probe_bundle_live {
     use crate::private_probe_bundle::VerifiedProbeBundleV1;
 
     const CAPTURE_ROOT: &str = "/run/memcordon-private-observer";
+    struct SupervisedLoader {
+        child: std::process::Child,
+        stdout: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+        stderr: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+    }
+    impl std::ops::Deref for SupervisedLoader {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.child
+        }
+    }
+    impl std::ops::DerefMut for SupervisedLoader {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.child
+        }
+    }
+    impl Drop for SupervisedLoader {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(reader) = self.stdout.take() {
+                let _ = reader.join();
+            }
+            if let Some(reader) = self.stderr.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+    fn read_bounded_loader_stream(stream: impl Read) -> std::io::Result<Vec<u8>> {
+        let limit = 64 * 1024;
+        let mut bytes = Vec::new();
+        stream.take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit as usize {
+            return Err(std::io::Error::other("kernel loader stream overflow"));
+        }
+        Ok(bytes)
+    }
+    fn join_loader_reader(reader: thread::JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
+        reader
+            .join()
+            .map_err(|_| fail("kernel loader reader panicked"))?
+            .map_err(CiError::Io)
+    }
     const CAPTURE_MAGIC: u32 = 0x4d434b31;
     const HEADER_BYTES: usize = 24;
     const EVENT_BYTES: usize = 128;
@@ -1041,6 +1164,24 @@ mod probe_bundle_live {
         bytes: &[u8],
         expected: &ExpectedKernelAdapterV1,
     ) -> Result<Vec<KernelEventV1>> {
+        parse_capture_scope(bytes, expected, false)
+    }
+
+    fn parse_capture_scope(
+        bytes: &[u8],
+        expected: &ExpectedKernelAdapterV1,
+        raw_candidate: bool,
+    ) -> Result<Vec<KernelEventV1>> {
+        let projection;
+        let bytes = if bytes.len() >= 8 && u32_at(bytes, 4)? == 2 {
+            projection = crate::private_kernel_replay::diagnostic_v1_projection(
+                bytes,
+                &expected.result_key,
+            )?;
+            projection.as_slice()
+        } else {
+            bytes
+        };
         if bytes.len() < HEADER_BYTES
             || u32_at(bytes, 0)? != CAPTURE_MAGIC
             || u32_at(bytes, 4)? != 1
@@ -1085,7 +1226,12 @@ mod probe_bundle_live {
             {
                 return Err(fail("kernel probe PID reused in interval"));
             }
-            if cgroup_id != expected.cgroup_inode && cgroup_id != expected.broker_cgroup_inode {
+            // release_task runs in the reaper's context, possibly outside all
+            // selected cgroups. Its victim is joined to an exact prior exit.
+            if !matches!(u32_at(raw, 80)?, 7 | 9 | 10)
+                && cgroup_id != expected.cgroup_inode
+                && cgroup_id != expected.broker_cgroup_inode
+            {
                 let Some(known_start) = descendants.get_mut(&task.pid) else {
                     return Err(fail("kernel probe subject escaped known fork lineage"));
                 };
@@ -1107,7 +1253,7 @@ mod probe_bundle_live {
             sequences.push(sequence);
             let event = match u32_at(raw, 80)? {
                 1 => {
-                    if task.cgroup_inode != expected.cgroup_inode {
+                    if !raw_candidate && task.cgroup_inode != expected.cgroup_inode {
                         return Err(fail("kernel probe request entry cgroup differs"));
                     }
                     KernelEventV1::AllocationBoundary {
@@ -1117,7 +1263,7 @@ mod probe_bundle_live {
                     }
                 }
                 2 => {
-                    if task.cgroup_inode != expected.cgroup_inode {
+                    if !raw_candidate && task.cgroup_inode != expected.cgroup_inode {
                         return Err(fail("kernel probe request exit cgroup differs"));
                     }
                     KernelEventV1::AllocationBoundary {
@@ -1127,7 +1273,7 @@ mod probe_bundle_live {
                     }
                 }
                 3 => {
-                    if task.cgroup_inode != expected.broker_cgroup_inode {
+                    if !raw_candidate && task.cgroup_inode != expected.broker_cgroup_inode {
                         return Err(fail(
                             "kernel allocation did not run in pinned broker cgroup",
                         ));
@@ -1221,7 +1367,6 @@ mod probe_bundle_live {
             };
             events.push(event);
         }
-        sequences.sort_unstable();
         if sequences
             .iter()
             .enumerate()
@@ -1232,7 +1377,9 @@ mod probe_bundle_live {
         if !saw_coordinator {
             return Err(fail("kernel probe coordinator absent"));
         }
-        validate_request_pairs(&events, expected)?;
+        if !raw_candidate {
+            validate_request_pairs(&events, expected)?;
+        }
         Ok(events)
     }
 
@@ -1346,7 +1493,10 @@ mod probe_bundle_live {
         bundle.revalidate()
     }
 
-    fn read_root_capture(path: &Path) -> Result<Vec<u8>> {
+    fn read_root_capture(
+        path: &Path,
+        stage: crate::private_kernel_replay::CaptureStageV2,
+    ) -> Result<Vec<u8>> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -1359,12 +1509,12 @@ mod probe_bundle_live {
             || metadata.uid() != 0
             || metadata.nlink() != 1
             || metadata.mode() & 0o7777 != 0o600
-            || metadata.len() > (HEADER_BYTES + MAX_EVENTS * EVENT_BYTES) as u64
+            || metadata.len() > stage.max_capture_bytes() as u64
         {
             return Err(fail("kernel probe capture protection differs"));
         }
         let mut bytes = Vec::new();
-        file.take((HEADER_BYTES + MAX_EVENTS * EVENT_BYTES + 1) as u64)
+        file.take((stage.max_capture_bytes() + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|error| CiError::Message(error.to_string()))?;
         Ok(bytes)
@@ -1385,6 +1535,12 @@ mod probe_bundle_live {
         bundle: &VerifiedProbeBundleV1,
         expected: ExpectedKernelAdapterV1,
         controls: Option<&VerifiedKnownActionControlsV1>,
+        supplied_interval_id: Option<crate::private_kernel_replay::IntervalIdV1>,
+        stage: crate::private_kernel_replay::CaptureStageV2,
+        raw_candidate: bool,
+        filter_sources: bool,
+        host_pins: Option<&[(u64, u64); 4]>,
+        reuse_pins: Option<&[(u64, u64); 3]>,
         operation: impl FnOnce() -> Result<()>,
     ) -> Result<VerifiedKernelIntervalV1> {
         if controls.is_some_and(|control| {
@@ -1431,8 +1587,34 @@ mod probe_bundle_live {
         }
         host_preflight(&expected, bundle)?;
         let key = String::from(expected.result_key.clone());
-        let capture = PathBuf::from(CAPTURE_ROOT).join(format!("{key}.capture.bin"));
-        let mut child = Command::new(bundle.loader_path())
+        // A logical key intentionally repeats across controls, epoch replay
+        // and recovery. A fresh physical storage scope preserves every file.
+        let mut storage_nonce = [0_u8; 32];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut storage_nonce)?;
+        let interval_id =
+            supplied_interval_id.unwrap_or(crate::private_kernel_replay::IntervalIdV1 {
+                session_nonce: storage_nonce,
+                generation: 0,
+                logical_case_key: expected.result_key.clone(),
+                purpose: if controls.is_some() {
+                    crate::private_kernel_replay::IntervalPurposeV1::Ordinary
+                } else {
+                    crate::private_kernel_replay::IntervalPurposeV1::KnownControls
+                },
+                ordinal: 0,
+            });
+        if interval_id.session_nonce == [0; 32]
+            || interval_id.logical_case_key != expected.result_key
+        {
+            return Err(fail(
+                "physical interval identity differs from logical request",
+            ));
+        }
+        let capture = PathBuf::from(CAPTURE_ROOT)
+            .join(String::from(interval_id.storage_sha256()))
+            .with_extension("capture.bin");
+        let mut loader_command = Command::new(bundle.loader_path());
+        loader_command
             .arg(bundle.object_path())
             .arg(bundle.agent_path())
             .arg(bundle.request_entry_offset().to_string())
@@ -1442,29 +1624,80 @@ mod probe_bundle_live {
             .arg(expected.broker_cgroup_inode.to_string())
             .arg(&key)
             .arg(&capture)
+            .arg(match stage {
+                crate::private_kernel_replay::CaptureStageV2::Candidate => "candidate-v2",
+                crate::private_kernel_replay::CaptureStageV2::FinalPublic => "final-public-v2",
+            })
+            .arg(std::process::id().to_string());
+        if filter_sources {
+            loader_command.arg("filter-install-v1");
+        }
+        if let Some(pins) = host_pins {
+            loader_command.arg("host-sysctl-watch-v1");
+            for (device, inode) in pins {
+                loader_command
+                    .arg(device.to_string())
+                    .arg(inode.to_string());
+            }
+        }
+        if let Some(pins) = reuse_pins {
+            if stage != crate::private_kernel_replay::CaptureStageV2::Candidate
+                || pins.iter().any(|(dev, ino)| *dev == 0 || *ino == 0)
+                || pins[1] == pins[2]
+            {
+                return Err(fail(
+                    "reuse source stage or independently held object pins differ",
+                ));
+            }
+            loader_command.arg("reuse-journal-source-v1");
+            for (device, inode) in pins {
+                loader_command
+                    .arg(device.to_string())
+                    .arg(inode.to_string());
+            }
+        }
+        let loader_child = loader_command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| CiError::Message(error.to_string()))?;
+        let mut child = SupervisedLoader {
+            child: loader_child,
+            stdout: None,
+            stderr: None,
+        };
         let stdout = child
+            .child
             .stdout
             .take()
             .ok_or_else(|| fail("kernel probe READY pipe absent"))?;
         let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let mut line = String::new();
-            let result = BufReader::new(stdout).read_line(&mut line);
-            let _ = sender.send((result, line));
-        });
+        child.stdout = Some(thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut ready = [0_u8; b"READY\n".len()];
+            let result = stdout.read_exact(&mut ready).map(|()| ready == *b"READY\n");
+            let _ = sender.send(result);
+            read_bounded_loader_stream(stdout)
+        }));
+        let stderr = child
+            .child
+            .stderr
+            .take()
+            .ok_or_else(|| fail("kernel probe stderr pipe absent"))?;
+        child.stderr = Some(thread::spawn(move || read_bounded_loader_stream(stderr)));
         match receiver.recv_timeout(Duration::from_secs(10)) {
-            Ok((Ok(6), line)) if line == "READY\n" => {}
+            Ok(Ok(true)) => {}
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(fail("kernel probe loader did not arm before case"));
             }
         }
+        let operation_begin_monotonic_ns =
+            memcordon_platform::test_support::private_observer_monotonic_ns()?;
         let operation_result = operation();
+        let operation_end_monotonic_ns =
+            memcordon_platform::test_support::private_observer_monotonic_ns()?;
         let interrupt_result = signal_interrupt(child.id());
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
@@ -1481,13 +1714,71 @@ mod probe_bundle_live {
             }
             thread::sleep(Duration::from_millis(10));
         };
+        let trailing_stdout = join_loader_reader(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| fail("kernel loader stdout reader absent"))?,
+        )?;
+        let loader_stderr = join_loader_reader(
+            child
+                .stderr
+                .take()
+                .ok_or_else(|| fail("kernel loader stderr reader absent"))?,
+        )?;
+        if !trailing_stdout.is_empty() {
+            return Err(fail("kernel loader emitted undeclared stdout"));
+        }
         operation_result?;
         interrupt_result?;
         if !status.success() {
             return Err(fail("kernel probe loader failed or lost events"));
         }
-        let bytes = read_root_capture(&capture)?;
-        let events = parse_capture(&bytes, &expected)?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LoaderTiming {
+            armed_monotonic_ns: u64,
+            detached_monotonic_ns: u64,
+            drained_monotonic_ns: u64,
+        }
+        let timing_line = loader_stderr
+            .strip_suffix(b"\n")
+            .and_then(|bytes| bytes.rsplit(|byte| *byte == b'\n').next())
+            .and_then(|line| line.strip_prefix(b"MC_TIMING_V1 "))
+            .ok_or_else(|| fail("kernel loader original timing absent"))?;
+        memcordon_core::workload_contract::reject_duplicate_json_keys(timing_line)
+            .map_err(CiError::Message)?;
+        let native_timing: LoaderTiming = serde_json::from_slice(timing_line)?;
+        let observation_timing = KernelObservationTimingV1 {
+            armed_monotonic_ns: native_timing.armed_monotonic_ns,
+            operation_begin_monotonic_ns,
+            operation_end_monotonic_ns,
+            detached_monotonic_ns: native_timing.detached_monotonic_ns,
+            drained_monotonic_ns: native_timing.drained_monotonic_ns,
+        };
+        if observation_timing.armed_monotonic_ns == 0
+            || observation_timing.armed_monotonic_ns > operation_begin_monotonic_ns
+            || operation_begin_monotonic_ns >= operation_end_monotonic_ns
+            || operation_end_monotonic_ns > observation_timing.detached_monotonic_ns
+            || observation_timing.detached_monotonic_ns > observation_timing.drained_monotonic_ns
+        {
+            return Err(fail("kernel loader original timing order differs"));
+        }
+        let bytes = read_root_capture(&capture, stage)?;
+        let projection = crate::private_kernel_replay::diagnostic_v1_projection_with_stage(
+            &bytes,
+            &expected.result_key,
+            stage,
+        )?;
+        if raw_candidate
+            && stage == crate::private_kernel_replay::CaptureStageV2::Candidate
+            && expected.coordinator_pid != std::process::id()
+        {
+            return Err(fail(
+                "raw candidate projection requires the actually held observer root process",
+            ));
+        }
+        let events = parse_capture_scope(&projection, &expected, raw_candidate)?;
         let coordinator = events
             .iter()
             .find_map(|event| {
@@ -1542,6 +1833,12 @@ mod probe_bundle_live {
             result_key: expected.result_key,
             events,
             capture_bytes: Some(bytes),
+            physical_interval_id: Some(interval_id),
+            raw_candidate_only: raw_candidate,
+            clock_inputs: clock.inputs().cloned(),
+            original_clock: Some(clock.clone()),
+            loader_stderr: Some(loader_stderr),
+            observation_timing: Some(observation_timing),
         })
     }
 
@@ -1550,7 +1847,18 @@ mod probe_bundle_live {
         expected: ExpectedKernelAdapterV1,
         operation: impl FnOnce() -> Result<()>,
     ) -> Result<VerifiedKernelIntervalV1> {
-        run_interval(bundle, expected, None, operation)
+        run_interval(
+            bundle,
+            expected,
+            None,
+            None,
+            crate::private_kernel_replay::CaptureStageV2::Candidate,
+            false,
+            false,
+            None,
+            None,
+            operation,
+        )
     }
 
     pub(crate) fn run_case_interval(
@@ -1559,7 +1867,186 @@ mod probe_bundle_live {
         controls: &VerifiedKnownActionControlsV1,
         operation: impl FnOnce() -> Result<()>,
     ) -> Result<VerifiedKernelIntervalV1> {
-        run_interval(bundle, expected, Some(controls), operation)
+        run_interval(
+            bundle,
+            expected,
+            Some(controls),
+            None,
+            crate::private_kernel_replay::CaptureStageV2::Candidate,
+            false,
+            false,
+            None,
+            None,
+            operation,
+        )
+    }
+
+    pub(crate) fn run_interval_with_id(
+        bundle: &VerifiedProbeBundleV1,
+        expected: ExpectedKernelAdapterV1,
+        controls: Option<&VerifiedKnownActionControlsV1>,
+        interval_id: crate::private_kernel_replay::IntervalIdV1,
+        operation: impl FnOnce() -> Result<()>,
+    ) -> Result<VerifiedKernelIntervalV1> {
+        run_interval(
+            bundle,
+            expected,
+            controls,
+            Some(interval_id),
+            crate::private_kernel_replay::CaptureStageV2::Candidate,
+            false,
+            false,
+            None,
+            None,
+            operation,
+        )
+    }
+
+    pub(crate) fn run_interval_with_stage(
+        bundle: &VerifiedProbeBundleV1,
+        expected: ExpectedKernelAdapterV1,
+        controls: Option<&VerifiedKnownActionControlsV1>,
+        interval_id: crate::private_kernel_replay::IntervalIdV1,
+        stage: crate::private_kernel_replay::CaptureStageV2,
+        operation: impl FnOnce() -> Result<()>,
+    ) -> Result<VerifiedKernelIntervalV1> {
+        run_interval(
+            bundle,
+            expected,
+            controls,
+            Some(interval_id),
+            stage,
+            false,
+            false,
+            None,
+            None,
+            operation,
+        )
+    }
+
+    /// Retains bounded, loss-free raw events for concurrent authenticated
+    /// public attempts without applying the V1 scalar request grammar. This
+    /// diagnostic projection cannot mint the legacy allocation capabilities.
+    pub(crate) fn run_interval_raw_with_stage(
+        bundle: &VerifiedProbeBundleV1,
+        expected: ExpectedKernelAdapterV1,
+        controls: &VerifiedKnownActionControlsV1,
+        interval_id: crate::private_kernel_replay::IntervalIdV1,
+        stage: crate::private_kernel_replay::CaptureStageV2,
+        operation: impl FnOnce() -> Result<()>,
+    ) -> Result<VerifiedKernelIntervalV1> {
+        if stage != crate::private_kernel_replay::CaptureStageV2::FinalPublic {
+            return Err(fail(
+                "raw public interval requires explicit final-public stage",
+            ));
+        }
+        run_interval(
+            bundle,
+            expected,
+            Some(controls),
+            Some(interval_id),
+            stage,
+            true,
+            false,
+            None,
+            None,
+            operation,
+        )
+    }
+
+    /// Retains a real candidate interval whose root fixture/request owner is
+    /// an explicitly observer-forked helper. The V1 projection is diagnostic;
+    /// only the authenticated V2 raw replay may interpret these roles.
+    /// Explicit protected source opt-in; legacy callers retain header15.
+    pub(crate) fn run_interval_raw_with_filter_sources(
+        bundle: &VerifiedProbeBundleV1,
+        expected: ExpectedKernelAdapterV1,
+        controls: &VerifiedKnownActionControlsV1,
+        interval_id: crate::private_kernel_replay::IntervalIdV1,
+        stage: crate::private_kernel_replay::CaptureStageV2,
+        operation: impl FnOnce() -> Result<()>,
+    ) -> Result<VerifiedKernelIntervalV1> {
+        run_interval(
+            bundle,
+            expected,
+            Some(controls),
+            Some(interval_id),
+            stage,
+            true,
+            true,
+            None,
+            None,
+            operation,
+        )
+    }
+
+    pub(crate) fn run_interval_raw_with_id(
+        bundle: &VerifiedProbeBundleV1,
+        expected: ExpectedKernelAdapterV1,
+        controls: &VerifiedKnownActionControlsV1,
+        interval_id: crate::private_kernel_replay::IntervalIdV1,
+        operation: impl FnOnce() -> Result<()>,
+    ) -> Result<VerifiedKernelIntervalV1> {
+        run_interval(
+            bundle,
+            expected,
+            Some(controls),
+            Some(interval_id),
+            crate::private_kernel_replay::CaptureStageV2::Candidate,
+            true,
+            false,
+            None,
+            None,
+            operation,
+        )
+    }
+
+    pub(crate) fn run_interval_raw_with_host_sources(
+        bundle: &VerifiedProbeBundleV1,
+        expected: ExpectedKernelAdapterV1,
+        controls: &VerifiedKnownActionControlsV1,
+        interval_id: crate::private_kernel_replay::IntervalIdV1,
+        stage: crate::private_kernel_replay::CaptureStageV2,
+        filter_sources: bool,
+        pins: &[(u64, u64); 4],
+        operation: impl FnOnce() -> Result<()>,
+    ) -> Result<VerifiedKernelIntervalV1> {
+        run_interval(
+            bundle,
+            expected,
+            Some(controls),
+            Some(interval_id),
+            stage,
+            true,
+            filter_sources,
+            Some(pins),
+            None,
+            operation,
+        )
+    }
+
+    /// Explicit, bounded candidate journal source; the supplied objects were
+    /// held independently before arm and are checked again in kernel records.
+    pub(crate) fn run_interval_raw_with_reuse_sources(
+        bundle: &VerifiedProbeBundleV1,
+        expected: ExpectedKernelAdapterV1,
+        controls: &VerifiedKnownActionControlsV1,
+        interval_id: crate::private_kernel_replay::IntervalIdV1,
+        pins: &[(u64, u64); 3],
+        operation: impl FnOnce() -> Result<()>,
+    ) -> Result<VerifiedKernelIntervalV1> {
+        run_interval(
+            bundle,
+            expected,
+            Some(controls),
+            Some(interval_id),
+            crate::private_kernel_replay::CaptureStageV2::Candidate,
+            true,
+            false,
+            None,
+            Some(pins),
+            operation,
+        )
     }
 }
 
@@ -1569,4 +2056,11 @@ pub(crate) use probe_bundle_live::parse_capture as parse_probe_capture_for_test;
 pub(crate) use probe_bundle_live::{
     run_case_interval as run_probe_case_interval,
     run_control_interval as run_probe_control_interval,
+    run_interval_raw_with_filter_sources as run_probe_interval_raw_with_filter_sources,
+    run_interval_raw_with_host_sources as run_probe_interval_raw_with_host_sources,
+    run_interval_raw_with_id as run_probe_interval_raw_with_id,
+    run_interval_raw_with_reuse_sources as run_probe_interval_raw_with_reuse_sources,
+    run_interval_raw_with_stage as run_probe_interval_raw_with_stage,
+    run_interval_with_id as run_probe_interval_with_id,
+    run_interval_with_stage as run_probe_interval_with_stage,
 };

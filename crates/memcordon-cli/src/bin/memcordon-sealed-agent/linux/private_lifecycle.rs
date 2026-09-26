@@ -129,8 +129,11 @@ pub(crate) struct ReleaseCandidateSettlementFactsV1 {
     pub(crate) namespace_init_reaped: bool,
     pub(crate) guardian_terminal: [u8; 20],
     pub(crate) candidate_exit_code: Option<i32>,
+    #[serde(default)]
+    pub(crate) cgroup_retirement_raw: Option<super::cgroup::CgroupRetirementRawV1>,
 }
 
+#[derive(Serialize)]
 pub struct PrivateRetirementObservation {
     attempt_id: String,
     retired: Option<PrivateTcpRetiredV2>,
@@ -444,7 +447,8 @@ impl PrivateNativeJournal for DurablePrivateAttempt {
     }
 
     fn execution_observed(&mut self) -> Result<(), String> {
-        DurablePrivateAttempt::execution_observed(self)
+        DurablePrivateAttempt::execution_observed(self)?;
+        super::private_public_provider::observe_public_durable_phase(self.record())
     }
 
     fn retiring(&mut self) -> Result<(), String> {
@@ -473,6 +477,7 @@ pub struct PrivateAttemptOwner<J: PrivateNativeJournal = DurablePrivateAttempt> 
     entrypoint_device_inode: Option<(u64, u64)>,
     gated_descriptors: Option<GatedDescriptorProof>,
     monitor_outcome: Option<PrivateMonitorOutcome>,
+    cgroup_retirement_raw: Option<super::cgroup::CgroupRetirementRawV1>,
 }
 
 impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
@@ -498,6 +503,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             entrypoint_device_inode: None,
             gated_descriptors: None,
             monitor_outcome: None,
+            cgroup_retirement_raw: None,
         })
     }
 
@@ -909,6 +915,26 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
 }
 
 impl PrivateAttemptOwner<DurablePrivateAttempt> {
+    fn wait_prepared_public_phase(&mut self, phase: &str) -> Result<(), String> {
+        let record = self
+            .record
+            .as_ref()
+            .expect("owner retains native journal")
+            .record()
+            .clone();
+        let target = record
+            .target
+            .as_ref()
+            .ok_or("public phase target absent")?
+            .clone();
+        super::private_public_provider::wait_public_phase_gate(&record, phase, || {
+            self.require_live_target_identity(&target)?;
+            self.relay
+                .as_mut()
+                .ok_or("public phase sealed relay absent")?
+                .tick(Duration::from_millis(10))
+        })
+    }
     /// The caller must hold a stable installed-generation lease before the
     /// activation lease. This consumes the unforgeable native readback and
     /// gives the target exactly one release byte only after durable commit.
@@ -919,6 +945,7 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
     ) -> Result<PrivateTcpCheckpointV2, String> {
         authority.revalidate_release_boundary()?;
         self.validate_gated_native_resources(&observed)?;
+        self.wait_prepared_public_phase("pre-exec")?;
         let record = self.record.as_ref().expect("owner retains record").record();
         let admission = record
             .admission
@@ -1013,12 +1040,21 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         let digest = checkpoint.canonical_digest()?;
         let attempt_id = record.attempt_id.as_str().to_owned();
         let committed = self.record_mut().commit_checkpoint(checkpoint.clone())?;
+        super::private_public_provider::observe_public_durable_phase(self.record_mut().record())?;
         let permit = self.record_mut().release_intent(committed)?;
+        super::private_public_provider::observe_public_durable_phase(self.record_mut().record())?;
+        self.wait_prepared_public_phase("release-intent")?;
         self.gated_descriptors = Some(observed.native.descriptors);
         let control = self
             .control
             .as_mut()
             .ok_or("MCSEALED-PRIVATE-RELEASE: control absent")?;
+        if super::private_public_provider::interrupt_public_authorization(&attempt_id, control)? {
+            return Err(
+                "MCSEALED-PUBLIC-AUTHORIZATION-UNCERTAIN: EPIPE after durable release intent"
+                    .into(),
+            );
+        }
         permit.send(control, &attempt_id, &digest)?;
         drop(lease);
         Ok(checkpoint)
@@ -1586,6 +1622,7 @@ impl PrivateAttemptOwner<super::private_release_attempt::DurableReleaseCandidate
             target_pidfd_exited: true,
             namespace_init_reaped: true,
             candidate_exit_code,
+            cgroup_retirement_raw: self.cgroup_retirement_raw.take(),
         };
         let retired = self.record_mut().retired_after_guardian_loss(settlement)?;
         self.record.take();
@@ -1664,7 +1701,12 @@ impl PrivateAttemptOwner<super::private_release_attempt::DurableReleaseCandidate
                 .guardian
                 .take()
                 .ok_or("MCSEALED-PRIVATE-RELEASE: frontend-loss guardian absent")?;
-            let terminal = guardian.finish_after_loss(deadline);
+            let terminal = guardian
+                .finish_after_loss_observed(deadline)
+                .map(|(terminal, raw)| {
+                    self.cgroup_retirement_raw = raw;
+                    terminal
+                });
             if terminal
                 .as_ref()
                 .is_ok_and(|terminal| terminal.boundary_retired)
@@ -1692,6 +1734,7 @@ impl PrivateAttemptOwner<super::private_release_attempt::DurableReleaseCandidate
             target_pidfd_exited: true,
             namespace_init_reaped: true,
             candidate_exit_code,
+            cgroup_retirement_raw: self.cgroup_retirement_raw.take(),
         };
         let retired = self.record_mut().retired_after_frontend_loss(settlement)?;
         self.record.take();
@@ -1842,6 +1885,7 @@ impl PrivateAttemptOwner<super::private_release_attempt::DurableReleaseCandidate
         let permit = self.record_mut().release_intent(&digest)?;
         case.revalidate()?;
         self.gated_descriptors = Some(observed.native.descriptors);
+        super::private_release_live_gate::wait_release_intent_for_candidate(case, self, dual_role)?;
         Ok((digest, permit))
     }
 
@@ -2082,6 +2126,15 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             if pidfd_exited(frontend_pidfd)? {
                 break PrivateMonitorOutcome::FrontendLost;
             }
+            if self
+                .guardian
+                .as_ref()
+                .is_some_and(|guardian| !guardian.is_live())
+            {
+                return Err(
+                    "MCSEALED-PRIVATE-MONITOR: pinned guardian exited while target active".into(),
+                );
+            }
             if revoked()? {
                 break PrivateMonitorOutcome::Revoked;
             }
@@ -2186,11 +2239,16 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
                 PrivateTcpRetiredV2::observed(checkpoint, true, true, true, true, true, true)
             })
             .transpose()?;
-        Ok(PrivateRetirementObservation {
+        let retirement = PrivateRetirementObservation {
             attempt_id,
             retired,
             candidate_exit_code,
-        })
+        };
+        super::private_public_provider::observe_public_fault_retirement(
+            &retirement.attempt_id,
+            &serde_json::to_vec(&retirement).map_err(|error| error.to_string())?,
+        )?;
+        Ok(retirement)
     }
 }
 
@@ -2212,7 +2270,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
         if !cgroup.member_pids()?.is_empty() {
             return Err("MCSEALED-PRIVATE-RELEASE: cgroup remained populated".into());
         }
-        cgroup.clone().kill_and_retire(deadline)?;
+        let cgroup_retirement_raw = cgroup.clone().kill_and_retire_observed(deadline)?;
         self.cgroup.take();
         let target = self
             .target_pidfd
@@ -2259,6 +2317,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             namespace_init_reaped: true,
             guardian_terminal: terminal.encode(),
             candidate_exit_code,
+            cgroup_retirement_raw: Some(cgroup_retirement_raw),
         })
     }
 
@@ -2277,7 +2336,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             .cgroup
             .as_ref()
             .ok_or("MCSEALED-PRIVATE-RELEASE: uncertainty cgroup absent")?;
-        cgroup.clone().kill_and_retire(deadline)?;
+        let cgroup_retirement_raw = cgroup.clone().kill_and_retire_observed(deadline)?;
         self.cgroup.take();
         let target = self
             .target_pidfd
@@ -2326,6 +2385,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
                 namespace_init_reaped: true,
                 guardian_terminal: terminal.encode(),
                 candidate_exit_code,
+                cgroup_retirement_raw: Some(cgroup_retirement_raw),
             },
         )
     }
@@ -2334,7 +2394,13 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
     /// durable record, release a policy reference, or claim terminal success.
     fn settle_native_resources(&mut self, deadline: Instant) -> Result<Option<i32>, String> {
         if let Some(cgroup) = self.cgroup.as_ref() {
-            cgroup.clone().kill_and_retire(deadline)?;
+            let observed = cgroup.clone().kill_and_retire_observed(deadline)?;
+            let attempt_id = self.record_mut().attempt_id().to_owned();
+            super::private_public_provider::observe_public_cgroup_retirement(
+                &attempt_id,
+                &serde_json::to_vec(&observed).map_err(|error| error.to_string())?,
+            )?;
+            self.cgroup_retirement_raw = Some(observed);
             self.cgroup.take();
         }
         if let Some(target) = self.target_pidfd.as_ref() {
@@ -2363,7 +2429,11 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
         self.relay.take();
         self.network.take();
         if let Some(guardian) = self.guardian.take() {
-            guardian.stop(deadline)?;
+            if self.monitor_outcome == Some(PrivateMonitorOutcome::FrontendLost) {
+                guardian.finish_after_loss(deadline)?;
+            } else {
+                guardian.stop(deadline)?;
+            }
         }
         Ok(candidate_exit_code)
     }

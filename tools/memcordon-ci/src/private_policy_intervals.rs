@@ -18,6 +18,34 @@ pub(crate) struct VerifiedPolicyIntervalsV1 {
 }
 
 impl VerifiedPolicyIntervalsV1 {
+    /// Reconstruct the same strict decision-only join from already detached
+    /// intervals. The caller may additionally bind these to authenticated
+    /// custody; this constructor does not create custody or request authority.
+    pub(crate) fn from_detached(intervals: [VerifiedKernelIntervalV1; 5]) -> Result<Self> {
+        let mut captures = BTreeSet::new();
+        let mut keys = BTreeSet::new();
+        for interval in &intervals {
+            interval.capture_bytes()?;
+            if !captures.insert(String::from(interval.trace_sha256().clone()))
+                || !keys.insert(String::from(interval.result_key().clone()))
+            {
+                return Err(CiError::Message(
+                    "policy detached interval duplicated".into(),
+                ));
+            }
+        }
+        let all_no_allocation = [
+            intervals[0].verify_no_allocation(intervals[0].result_key())?,
+            intervals[1].verify_no_allocation(intervals[1].result_key())?,
+            intervals[2].verify_no_allocation(intervals[2].result_key())?,
+            intervals[3].verify_no_allocation(intervals[3].result_key())?,
+            intervals[4].verify_no_allocation(intervals[4].result_key())?,
+        ];
+        Ok(Self {
+            intervals,
+            all_no_allocation,
+        })
+    }
     pub(crate) fn positive(&self) -> &VerifiedKernelIntervalV1 {
         &self.intervals[0]
     }

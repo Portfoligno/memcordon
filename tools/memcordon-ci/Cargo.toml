@@ -16,8 +16,10 @@ flate2.workspace = true
 hex.workspace = true
 libc.workspace = true
 memcordon-core = { path = "../../crates/memcordon-core", version = "=0.5.7-dev" }
+memcordon-platform = { path = "../../crates/memcordon-platform", version = "=0.5.7-dev" }
 memcordon-testkit = { path = "../../crates/memcordon-testkit", version = "=0.5.7-dev" }
 memcordon-windows-launch-core = { path = "../../crates/memcordon-windows-launch-core", version = "=0.5.7-dev" }
+rustix = { version = "1.1.4", features = ["net", "process", "fs"] }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

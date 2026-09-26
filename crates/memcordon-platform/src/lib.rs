@@ -40,9 +40,9 @@ pub use sealed::client::{
     PrivateAuthenticatedTerminalV2, PrivateExpectedResultV2, PrivateLaunchErrorV2,
     PrivatePlanExchangeV2, PrivateReleaseKnowledgeV2, PrivateReplayDispositionV2,
     PrivateResponseFailureV2, PrivateServiceResultV2, execute_private_v2,
-    execute_private_v2_frozen_port_rejection, execute_private_v2_reuse_pair,
-    execute_private_v2_with_expected_plan, private_plan_exchange_v2, private_plan_v2,
-    receive_private_result, run_private_v2,
+    execute_private_v2_dual_pair, execute_private_v2_frozen_port_rejection,
+    execute_private_v2_reuse_pair, execute_private_v2_with_expected_plan, private_plan_exchange_v2,
+    private_plan_v2, receive_private_result, run_private_v2,
 };
 mod signal;
 mod supervisor;

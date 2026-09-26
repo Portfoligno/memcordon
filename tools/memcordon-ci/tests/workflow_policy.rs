@@ -101,8 +101,8 @@ fn private_native_jobs_are_explicitly_opt_in_target_exact_and_nonpublishing() {
             "  linux-private-candidate:\n    name: Release / Linux private candidate / ${{ matrix.id }}\n    if: github.event_name == 'workflow_dispatch' && inputs.private_native == true\n    needs: linux-private-candidate-inputs\n    permissions:\n      contents: read\n      actions: none",
         ),
         (
-            "      - name: Private candidate suite\n        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native --collector-intent-sha256 \"$COLLECTOR_INTENT_SHA256\" --policy-intent-sha256 \"$POLICY_INTENT_SHA256\"\n        env:\n          GITHUB_TOKEN: ${{ github.token }}\n          COLLECTOR_INTENT_SHA256: ${{ inputs.collector_intent_sha256 }}\n          POLICY_INTENT_SHA256: ${{ inputs.policy_intent_sha256 }}",
-            "      - name: Private candidate suite\n        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native --collector-intent-sha256 \"$COLLECTOR_INTENT_SHA256\" --policy-intent-sha256 \"$POLICY_INTENT_SHA256\"",
+            "          OBSERVER_INTENT_SHA256: ${{ inputs[format('observer_intent_sha256_{0}', matrix.id)] }}",
+            "          OBSERVER_INTENT_SHA256: ${{ inputs.observer_intent_sha256_x64 }}",
         ),
         (
             "name: release-native-${{ matrix.asset }}",
@@ -1041,5 +1041,5 @@ fn every_workflow_upload_uses_the_bounded_action() {
             workflow.matches(local).count()
         })
         .sum();
-    assert_eq!(count, 57, "workflow artifact upload inventory differs");
+    assert_eq!(count, 58, "workflow artifact upload inventory differs");
 }

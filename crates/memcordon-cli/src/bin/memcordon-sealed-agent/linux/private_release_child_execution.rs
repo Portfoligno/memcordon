@@ -97,6 +97,11 @@ pub(crate) fn execute_child_candidate_case(
         )?;
         let network_namespace_inode = observed.network_namespace_inode();
         owner.prepare_relay([stdin_read, stdout_write, stderr_write])?;
+        super::private_release_live_gate::wait_pre_for_candidate(
+            case,
+            &mut owner,
+            observed.target_identity(),
+        )?;
         let checkpoint = owner.commit_release_candidate_and_release(observed, case)?;
         if !matches!(
             owner.observe_exec(startup_deadline)?,
@@ -104,6 +109,13 @@ pub(crate) fn execute_child_candidate_case(
         ) {
             return Err("MCSEALED-PRIVATE-RELEASE: child target exec failed".into());
         }
+        super::private_release_live_gate::wait_baseline_for_candidate(
+            case,
+            &mut owner,
+            stdout_read.as_fd(),
+            target_stdin.as_fd(),
+            None,
+        )?;
         let custody = owner.observe_release_live_descendants(
             &challenge,
             stdout_read.as_fd(),

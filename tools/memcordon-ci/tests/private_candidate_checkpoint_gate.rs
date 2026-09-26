@@ -251,8 +251,31 @@ fn checkpoint_gate_joins_prior_release_intent_target_and_all_raw_hashes() {
     let leaves =
         expected_protected_candidate_leaves_for_selector(SELECTOR, &case.result.observation)
             .unwrap();
-    assert_eq!(leaves.len(), 8);
-    assert!(leaves.contains("checkpoint-gate.json"));
+    let expected = [
+        "request.json",
+        "attempt.json",
+        "request.bin",
+        "report.bin",
+        "stdio.bin",
+        "observer.bin",
+        "cleanup.bin",
+        "checkpoint-gate.json",
+        "checkpoint-committed-v1.json",
+        "release-intent-v1.json",
+        "execution-observed-v1.json",
+        "candidate-live-pre-v1.json",
+        "candidate-live-pre-v1.ack",
+        "candidate-live-release-intent-v1.json",
+        "candidate-live-release-intent-v1.ack",
+        "candidate-live-baseline-v1.json",
+        "candidate-live-baseline-v1.ack",
+        "candidate-live-post-v1.json",
+        "candidate-live-post-v1.ack",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(leaves, expected);
     parse_protected_checkpoint_gate_witness(
         &gate_bytes,
         &case.candidate_request,
