@@ -6,7 +6,8 @@ use memcordon_core::workload_contract::{
 };
 use memcordon_core::workload_evidence_v2::QualifiedNativeAbiV2;
 use memcordon_core::workload_plan_v2::{
-    PrivateDoctorReportV7, PrivatePlanAvailabilityV2, PrivatePlanReceiptV2, PrivatePlanReportV10,
+    PrivateDoctorReportV7, PrivatePlanAvailabilityV2, PrivatePlanPreconditionV1,
+    PrivatePlanReceiptV2, PrivatePlanReportV10,
 };
 use memcordon_core::workload_registry_v2::ProfileKindV2;
 use memcordon_core::{BoundedVec, DiagnosticSha256};
@@ -38,12 +39,14 @@ fn contract() -> WorkloadContractV2 {
 fn private_plan_receipt_binds_exact_v2_contract_and_rejects_swaps() {
     let request = contract();
     let receipt = PrivatePlanReceiptV2 {
-        schema_version: 2,
+        schema_version: 3,
         contract_digest: memcordon_core::workload_codec::contract_digest_v2(&request).unwrap(),
         registry_digest: DiagnosticSha256::from_bytes([4; 32]),
         installed_qualification_sha256: DiagnosticSha256::from_bytes([5; 32]),
         runtime_manifest_sha256: DiagnosticSha256::from_bytes([6; 32]),
         generation_digest: DiagnosticSha256::from_bytes([8; 32]),
+        caller_uid: 1000,
+        policy_epoch: request.expected_epoch.clone(),
         source_commit: "a".into(),
         native_abi: QualifiedNativeAbiV2::X86_64LinuxGnu,
     };
@@ -52,24 +55,59 @@ fn private_plan_receipt_binds_exact_v2_contract_and_rejects_swaps() {
         PrivatePlanReceiptV2::parse_for_contract(&bytes, &request).unwrap(),
         receipt
     );
+    receipt.validate_for_caller(1000).unwrap();
+    assert!(receipt.validate_for_caller(1001).is_err());
 
     let mut swapped = request.clone();
     swapped.expected_epoch.service_instance = Nonce128([9; 16]);
     assert!(PrivatePlanReceiptV2::parse_for_contract(&bytes, &swapped).is_err());
+    let mut wrong_epoch = receipt.clone();
+    wrong_epoch.policy_epoch.service_instance = Nonce128([9; 16]);
+    assert!(wrong_epoch.validate_for_contract(&request).is_err());
 
     let mut changed = serde_json::to_value(&receipt).unwrap();
-    changed["schema_version"] = serde_json::json!(3);
+    changed["schema_version"] = serde_json::json!(2);
     assert!(
         PrivatePlanReceiptV2::parse_for_contract(&serde_json::to_vec(&changed).unwrap(), &request)
             .is_err()
     );
 
     let duplicate = String::from_utf8(bytes).unwrap().replacen(
-        "\"schema_version\":2",
-        "\"schema_version\":2,\"schema_version\":2",
+        "\"schema_version\":3",
+        "\"schema_version\":3,\"schema_version\":3",
         1,
     );
     assert!(PrivatePlanReceiptV2::parse_for_contract(duplicate.as_bytes(), &request).is_err());
+}
+
+#[test]
+fn expected_private_plan_distinguishes_contract_tamper_from_installation_change() {
+    let request = contract();
+    let generation = DiagnosticSha256::from_bytes([8; 32]);
+    let receipt = PrivatePlanReceiptV2 {
+        schema_version: 3,
+        contract_digest: memcordon_core::workload_codec::contract_digest_v2(&request).unwrap(),
+        registry_digest: DiagnosticSha256::from_bytes([4; 32]),
+        installed_qualification_sha256: DiagnosticSha256::from_bytes([5; 32]),
+        runtime_manifest_sha256: DiagnosticSha256::from_bytes([6; 32]),
+        generation_digest: generation.clone(),
+        caller_uid: 1000,
+        policy_epoch: request.expected_epoch.clone(),
+        source_commit: "a".into(),
+        native_abi: QualifiedNativeAbiV2::X86_64LinuxGnu,
+    };
+    let expected = PrivatePlanPreconditionV1::from_receipt(&receipt).unwrap();
+    assert_eq!(expected.verify_current(&request, &generation), Ok(()));
+    let mut changed = request.clone();
+    changed.expected_epoch.service_instance = Nonce128([9; 16]);
+    assert_eq!(
+        expected.verify_current(&changed, &generation),
+        Err("ContractBindingMismatch")
+    );
+    assert_eq!(
+        expected.verify_current(&request, &DiagnosticSha256::from_bytes([9; 32])),
+        Err("InstallationGenerationStale")
+    );
 }
 
 #[test]

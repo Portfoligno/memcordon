@@ -28,6 +28,7 @@ pub fn baseline_catalog_digest(windows: bool) -> String {
 pub enum RuntimeComponentRole {
     PublicCli,
     SealedAgent,
+    Arm32AbiHelper,
     DesktopBootstrap,
     SessionBroker,
 }

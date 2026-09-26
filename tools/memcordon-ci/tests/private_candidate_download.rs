@@ -114,3 +114,103 @@ fn downloaded_candidate_requires_exact_native_target_inventory_and_b_m0() {
     fs::write(directory.join("memcordon-sealed-agent"), vec![8; 4096]).unwrap();
     assert!(read_downloaded_candidate(temp.path(), TARGET, SOURCE).is_err());
 }
+
+#[test]
+fn arm_candidate_requires_the_exact_reviewed_compat_elf_in_b() {
+    const ARM_TARGET: &str = "aarch64-unknown-linux-gnu";
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp
+        .path()
+        .join("target/ci/release-inputs/release-native-linux-arm64/private-candidate-linux-arm64");
+    fs::create_dir_all(&directory).unwrap();
+    let helper = memcordon_ci::arm32_abi_helper::static_aarch32_helper();
+    let components = [
+        (
+            "public-cli",
+            "memcordon",
+            RuntimeComponentRole::PublicCli,
+            vec![7; 4096],
+        ),
+        (
+            "sealed-agent",
+            "memcordon-sealed-agent",
+            RuntimeComponentRole::SealedAgent,
+            vec![8; 4096],
+        ),
+        (
+            "arm32-abi-helper",
+            "memcordon-arm32-abi-helper",
+            RuntimeComponentRole::Arm32AbiHelper,
+            helper.clone(),
+        ),
+    ];
+    let mut component_bytes = BTreeMap::new();
+    let records: Vec<_> = components
+        .into_iter()
+        .map(|(id, path, role, bytes)| {
+            fs::write(directory.join(path), &bytes).unwrap();
+            component_bytes.insert(path.into(), bytes.clone());
+            RuntimeComponentRecord {
+                id: id.into(),
+                path: path.into(),
+                role,
+                size: bytes.len() as u64,
+                mode: 0o755,
+                sha256: String::from(hash_bytes(&bytes)),
+            }
+        })
+        .collect();
+    let filter = DiagnosticSha256::from_bytes([9; 32]);
+    let hashes = units();
+    let prepared = prepare_private_candidate(PrivateCandidateInputs {
+        version: env!("CARGO_PKG_VERSION"),
+        source_commit: SOURCE,
+        target: ARM_TARGET,
+        components: &records,
+        component_bytes: &component_bytes,
+        compiled_units: &hashes,
+        filter_sha256: &filter,
+    })
+    .unwrap();
+    let SealedRuntimeV3::WorkloadV2 {
+        native_protocols,
+        profile_catalog_sha256,
+        ..
+    } = &prepared.manifest.sealed
+    else {
+        panic!("ARM candidate fixture must be workload V2");
+    };
+    let inspection = LinuxPackageInspectionV6 {
+        schema_version: InspectionVersionSix,
+        version: BoundedText::new(env!("CARGO_PKG_VERSION")).unwrap(),
+        source_commit: BoundedText::new(SOURCE).unwrap(),
+        target: BoundedText::new(ARM_TARGET).unwrap(),
+        runtime_manifest_sha256: prepared.manifest_sha256.clone(),
+        components: records,
+        native_protocols: native_protocols.clone(),
+        profile_catalog_sha256: profile_catalog_sha256.clone(),
+        private_filter_sha256: filter,
+        compiled_units: hashes,
+        compiled_metadata_valid: true,
+    };
+    fs::write(
+        directory.join("runtime-manifest.json"),
+        &prepared.manifest_bytes,
+    )
+    .unwrap();
+    fs::write(
+        directory.join("package-inspection-v6.json"),
+        serde_json::to_vec(&inspection).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        directory.join("candidate-build-v2.json"),
+        serde_json::to_vec(&prepared.record()).unwrap(),
+    )
+    .unwrap();
+    assert!(read_downloaded_candidate(temp.path(), ARM_TARGET, SOURCE).is_ok());
+    let mut changed = helper;
+    changed[4096] ^= 1;
+    fs::write(directory.join("memcordon-arm32-abi-helper"), changed).unwrap();
+    assert!(read_downloaded_candidate(temp.path(), ARM_TARGET, SOURCE).is_err());
+}

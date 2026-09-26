@@ -112,6 +112,25 @@ pub fn validate_broker_rejection(bytes: &[u8], expected_attempt: [u8; 16]) -> Re
     Ok(())
 }
 
+pub(super) fn validate_reuse_obstruction_rejection(
+    bytes: &[u8],
+    expected_attempt: [u8; 16],
+) -> Result<(), String> {
+    validate_broker_rejection(bytes, expected_attempt)?;
+    let rejection: PrivateBrokerRejectionV4 =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if rejection.code != "MCSEALED-NETWORK-LAUNCHER-POSSIBLY-RELEASED"
+        || !rejection.possibly_released
+        || rejection.cleanup_complete
+        || !rejection
+            .detail
+            .contains("MCSEALED-PUBLIC-REUSE-HELD-NAMESPACE-FD")
+    {
+        return Err("MCSEALED-PUBLIC-REUSE: broker obstruction cause differs".into());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn execute_private_broker(
     broker: NetworkLaunchBrokerRequestV4,

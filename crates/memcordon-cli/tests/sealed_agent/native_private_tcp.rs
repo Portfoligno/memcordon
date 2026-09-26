@@ -145,6 +145,7 @@ fn private_request(identity: ExecutionIdentityRequestV2, program: &[u8]) -> Netw
         },
         registry_digest: digest.clone(),
         qualification_digest: digest,
+        expected_plan: None,
         launch: LaunchRequestV2 {
             restart_attempt: 0,
             workload_contract: None,

@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 cargo_metadata.workspace = true
+ed25519-dalek.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true

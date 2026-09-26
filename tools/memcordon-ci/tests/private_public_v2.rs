@@ -1,12 +1,12 @@
 use std::path::Path;
 
-use memcordon_ci::private_public_v2::public_v2_argv;
 #[cfg(unix)]
 use memcordon_ci::private_public_v2::{
     ExpectedFrontendLossEvidenceV2, ExpectedPublicV2Outcome, ExpectedPublicV2Readback,
     StructuralPublicV2ReportPresence, read_structural_public_v2_report,
     read_structural_public_v2_report_presence, validate_structural_public_v2_readback,
 };
+use memcordon_ci::private_public_v2::{public_v2_argv, public_v2_argv_with_expected_plan};
 #[cfg(unix)]
 use memcordon_ci::private_supervisor::{LinuxChildIdentityV1, SupervisedProcessV2};
 #[cfg(unix)]
@@ -42,6 +42,36 @@ fn public_dispatch_uses_real_cli_options_not_root_release_case() {
     assert!(!visible.contains(&"release-case"));
     assert!(public_v2_argv(Path::new("relative"), Path::new("/r"), Path::new("/f")).is_err());
     assert!(public_v2_argv(Path::new("/same"), Path::new("/same"), Path::new("/f")).is_err());
+}
+
+#[test]
+fn public_replay_places_expected_plan_before_command_boundary() {
+    let argv = public_v2_argv_with_expected_plan(
+        Path::new("/protected/contract.json"),
+        Path::new("/protected/report.json"),
+        Path::new("/usr/libexec/fixed-public-fixture"),
+        Some(Path::new("/protected/old-plan.json")),
+    )
+    .unwrap();
+    let visible: Vec<_> = argv.iter().map(|arg| arg.to_str().unwrap()).collect();
+    assert_eq!(
+        &visible[5..],
+        [
+            "--expected-private-plan",
+            "/protected/old-plan.json",
+            "--",
+            "/usr/libexec/fixed-public-fixture",
+        ]
+    );
+    assert!(
+        public_v2_argv_with_expected_plan(
+            Path::new("/c"),
+            Path::new("/r"),
+            Path::new("/f"),
+            Some(Path::new("/c")),
+        )
+        .is_err()
+    );
 }
 
 #[cfg(unix)]

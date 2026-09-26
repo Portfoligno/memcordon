@@ -148,6 +148,16 @@ pub fn run_with_deadline_output_limit(
     run_with_deadline_after_limit(command, deadline, |_| Ok(()), Some(limit))
 }
 
+/// Bound output while recording an identity sampled immediately after spawn.
+pub fn run_with_deadline_after_output_limit(
+    command: &mut Command,
+    deadline: Duration,
+    limit: usize,
+    after_spawn: impl FnOnce(u32) -> io::Result<()> + Send + 'static,
+) -> Result<ObservedOutput, ProcessTestError> {
+    run_with_deadline_after_limit(command, deadline, after_spawn, Some(limit))
+}
+
 fn run_with_deadline_after_limit(
     command: &mut Command,
     deadline: Duration,

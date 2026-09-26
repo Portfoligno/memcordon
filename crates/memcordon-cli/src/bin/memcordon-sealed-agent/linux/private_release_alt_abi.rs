@@ -1,8 +1,7 @@
-//! Closed x86_64 alternate-ABI subwitness. This proves only that the reviewed
-//! native filter admits a harmless native getpid and kills the x32-numbered
-//! entry in two distinct supervised children. It never publishes the 25th
-//! release selector: AArch64 still needs a pinned AArch32 ELF and compat-kernel
-//! execution proof.
+//! Closed alternate-ABI subwitnesses. The x86 route runs native, x32, and
+//! i386 controls/denials in five distinct supervised children; the ARM route
+//! borrows the native-positive child beside its pinned AArch32 ELF probes.
+//! These observations never publish a completed ABI release result.
 
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -25,6 +24,7 @@ const MAX_CHILD_WAIT: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Branch {
     Native,
+    X32Control,
     X32,
     I386Control,
     I386Filtered,
@@ -34,6 +34,7 @@ impl Branch {
     fn byte(self) -> u8 {
         match self {
             Self::Native => 1,
+            Self::X32Control => 5,
             Self::X32 => 2,
             Self::I386Control => 3,
             Self::I386Filtered => 4,
@@ -47,8 +48,35 @@ pub(crate) struct X32AlternateAbiSubwitnessV1 {
     pub(crate) filter_sha256: DiagnosticSha256,
     pub(crate) native: ProcessIdentityV4,
     pub(crate) native_response_sha256: DiagnosticSha256,
+    pub(crate) outer_control: ProcessIdentityV4,
+    pub(crate) outer_control_outcome: X32ControlOutcomeV1,
+    pub(crate) outer_control_response_sha256: DiagnosticSha256,
     pub(crate) alternate: ProcessIdentityV4,
     pub(crate) alternate_signal: i32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum X32ControlOutcomeV1 {
+    Getpid,
+    Enosys,
+}
+
+impl X32ControlOutcomeV1 {
+    fn marker(self) -> u8 {
+        match self {
+            Self::Getpid => 1,
+            Self::Enosys => 2,
+        }
+    }
+
+    fn from_marker(marker: u8) -> Result<Self, String> {
+        match marker {
+            1 => Ok(Self::Getpid),
+            2 => Ok(Self::Enosys),
+            _ => Err("MCSEALED-PRIVATE-RELEASE: x32 control outcome differs".into()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -60,6 +88,41 @@ pub(crate) struct I386AlternateAbiSubwitnessV1 {
     pub(crate) outer_control_response_sha256: DiagnosticSha256,
     pub(crate) filtered: ProcessIdentityV4,
     pub(crate) filtered_signal: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeArm64AbiSubwitnessV1 {
+    pub(crate) native: ProcessIdentityV4,
+    pub(crate) response_sha256: DiagnosticSha256,
+}
+
+pub(crate) fn observe_native_arm64_positive(
+    case: &ReleaseCandidateRunAuthorityV1,
+) -> Result<NativeArm64AbiSubwitnessV1, String> {
+    if case.selector() != SELECTOR || case.native_abi()? != NativeAbi::Aarch64 {
+        return Err("MCSEALED-PRIVATE-RELEASE: ARM64 native positive authority differs".into());
+    }
+    let (uid, gid) = case.target_ids()?;
+    if uid == 0 || gid == 0 {
+        return Err("MCSEALED-PRIVATE-RELEASE: ARM64 native positive identity is root".into());
+    }
+    let filter = case.filter_digest().clone();
+    let observed = run_branch(
+        Branch::Native,
+        case.challenge_bytes(),
+        &filter,
+        uid,
+        gid,
+        case.deadline(),
+    )?;
+    case.revalidate()?;
+    Ok(NativeArm64AbiSubwitnessV1 {
+        native: observed.identity,
+        response_sha256: observed
+            .native_response
+            .ok_or("MCSEALED-PRIVATE-RELEASE: ARM64 native positive response absent")?,
+    })
 }
 
 impl I386AlternateAbiSubwitnessV1 {
@@ -101,15 +164,28 @@ impl X32AlternateAbiSubwitnessV1 {
     ) -> Result<(), String> {
         let native_pid = libc::pid_t::try_from(self.native.pid)
             .map_err(|_| "MCSEALED-PRIVATE-RELEASE: native x32 witness PID overflows")?;
+        let control_pid = libc::pid_t::try_from(self.outer_control.pid)
+            .map_err(|_| "MCSEALED-PRIVATE-RELEASE: control x32 witness PID overflows")?;
         if self.challenge_sha256 != hash_bytes(challenge)
             || self.filter_sha256 != *filter
             || self.native.pid == 0
             || self.native.start_time == 0
             || self.alternate.pid == 0
             || self.alternate.start_time == 0
+            || self.outer_control.pid == 0
+            || self.outer_control.start_time == 0
             || self.native == self.alternate
+            || self.native == self.outer_control
+            || self.outer_control == self.alternate
             || self.native_response_sha256
                 != native_response_digest(challenge, filter, native_pid, native_pid.into())
+            || self.outer_control_response_sha256
+                != x32_control_response_digest(
+                    challenge,
+                    filter,
+                    control_pid,
+                    self.outer_control_outcome,
+                )
             || self.alternate_signal != libc::SIGSYS
         {
             return Err("MCSEALED-PRIVATE-RELEASE: x32 witness binding differs".into());
@@ -121,6 +197,7 @@ impl X32AlternateAbiSubwitnessV1 {
 struct ChildObservation {
     identity: ProcessIdentityV4,
     native_response: Option<DiagnosticSha256>,
+    x32_control_outcome: Option<X32ControlOutcomeV1>,
     signal: Option<i32>,
 }
 
@@ -158,9 +235,8 @@ impl Drop for ChildGuard {
     }
 }
 
-/// The enclosing selector remains unsupported. This function is only a
-/// borrow of a live, installed M0 candidate authority, not a result producer.
-#[allow(dead_code)] // No AArch64 physical half or final case publication exists.
+/// This borrows a live installed candidate authority and writes only a
+/// subwitness; no completed result is produced.
 pub(crate) fn observe_x32_subwitness(
     case: &ReleaseCandidateRunAuthorityV1,
 ) -> Result<X32AlternateAbiSubwitnessV1, String> {
@@ -182,6 +258,15 @@ pub(crate) fn observe_x32_subwitness(
         case.deadline(),
     )?;
     case.revalidate()?;
+    let outer_control = run_branch(
+        Branch::X32Control,
+        challenge,
+        &filter,
+        uid,
+        gid,
+        case.deadline(),
+    )?;
+    case.revalidate()?;
     let alternate = run_branch(Branch::X32, challenge, &filter, uid, gid, case.deadline())?;
     case.revalidate()?;
     let witness = X32AlternateAbiSubwitnessV1 {
@@ -191,12 +276,23 @@ pub(crate) fn observe_x32_subwitness(
         native_response_sha256: native
             .native_response
             .ok_or("MCSEALED-PRIVATE-RELEASE: native getpid response absent")?,
+        outer_control: outer_control.identity,
+        outer_control_outcome: outer_control
+            .x32_control_outcome
+            .ok_or("MCSEALED-PRIVATE-RELEASE: x32 outer control outcome absent")?,
+        outer_control_response_sha256: outer_control
+            .native_response
+            .ok_or("MCSEALED-PRIVATE-RELEASE: x32 outer control response absent")?,
         alternate: alternate.identity,
         alternate_signal: alternate
             .signal
             .ok_or("MCSEALED-PRIVATE-RELEASE: x32 SIGSYS absent")?,
     };
-    if witness.native == witness.alternate || witness.alternate_signal != libc::SIGSYS {
+    if witness.native == witness.alternate
+        || witness.native == witness.outer_control
+        || witness.outer_control == witness.alternate
+        || witness.alternate_signal != libc::SIGSYS
+    {
         return Err("MCSEALED-PRIVATE-RELEASE: x32 child separation differs".into());
     }
     witness.verify_binding(&challenge, &witness.filter_sha256)?;
@@ -206,7 +302,6 @@ pub(crate) fn observe_x32_subwitness(
 /// The outer-policy-only control must execute the real i386 `int 0x80`
 /// entry before the reviewed private filter's architecture kill is tested.
 /// This is a closed physical subwitness, never a publishable case result.
-#[allow(dead_code)]
 pub(crate) fn observe_i386_entry_subwitness(
     case: &ReleaseCandidateRunAuthorityV1,
 ) -> Result<I386AlternateAbiSubwitnessV1, String> {
@@ -281,6 +376,15 @@ fn native_response_digest(
     hash_bytes(&bytes)
 }
 
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn native_response_digest_for_arm64(
+    challenge: &[u8; 32],
+    filter: &DiagnosticSha256,
+    pid: libc::pid_t,
+) -> DiagnosticSha256 {
+    native_response_digest(challenge, filter, pid, pid as libc::c_long)
+}
+
 fn i386_response_digest(
     challenge: &[u8; 32],
     filter: &DiagnosticSha256,
@@ -293,6 +397,30 @@ fn i386_response_digest(
     bytes.extend_from_slice(&pid.to_be_bytes());
     bytes.extend_from_slice(&returned.to_be_bytes());
     hash_bytes(&bytes)
+}
+
+fn x32_control_response_digest(
+    challenge: &[u8; 32],
+    filter: &DiagnosticSha256,
+    pid: libc::pid_t,
+    outcome: X32ControlOutcomeV1,
+) -> DiagnosticSha256 {
+    let mut bytes = b"memcordon-private-release-x32-outer-control-v1\0".to_vec();
+    bytes.extend_from_slice(challenge);
+    bytes.extend_from_slice(filter.bytes());
+    bytes.extend_from_slice(&pid.to_be_bytes());
+    bytes.push(outcome.marker());
+    hash_bytes(&bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn x32_control_response_digest_for_test(
+    challenge: &[u8; 32],
+    filter: &DiagnosticSha256,
+    pid: libc::pid_t,
+    outcome: X32ControlOutcomeV1,
+) -> DiagnosticSha256 {
+    x32_control_response_digest(challenge, filter, pid, outcome)
 }
 
 #[cfg(test)]
@@ -384,12 +512,23 @@ fn run_branch(
         uid,
         gid,
         inherited_filter_count,
-        branch != Branch::I386Control,
+        !matches!(branch, Branch::I386Control | Branch::X32Control),
     )?;
     parent
         .write_all(&[GO])
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: x32 release: {error}"))?;
-    let native_response = if matches!(branch, Branch::Native | Branch::I386Control) {
+    let (native_response, x32_control_outcome) = if branch == Branch::X32Control {
+        let mut response = [0_u8; 33];
+        parent
+            .read_exact(&mut response)
+            .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: x32 outer control: {error}"))?;
+        let outcome = X32ControlOutcomeV1::from_marker(response[0])?;
+        let expected = x32_control_response_digest(&challenge, filter, pid, outcome);
+        if response[1..] != *expected.bytes() {
+            return Err("MCSEALED-PRIVATE-RELEASE: x32 outer control response differs".into());
+        }
+        (Some(expected), Some(outcome))
+    } else if matches!(branch, Branch::Native | Branch::I386Control) {
         let mut response = [0_u8; 32];
         parent
             .read_exact(&mut response)
@@ -402,7 +541,7 @@ fn run_branch(
         if response != *expected.bytes() {
             return Err("MCSEALED-PRIVATE-RELEASE: ABI control getpid response differs".into());
         }
-        Some(expected)
+        (Some(expected), None)
     } else {
         let mut marker = [0_u8; 1];
         match parent.read_exact(&mut marker) {
@@ -417,7 +556,7 @@ fn run_branch(
                 ));
             }
         }
-        None
+        (None, None)
     };
     let status = wait_child(&mut guard, branch_deadline)?;
     match branch {
@@ -425,6 +564,7 @@ fn run_branch(
             Ok(ChildObservation {
                 identity,
                 native_response,
+                x32_control_outcome,
                 signal: None,
             })
         }
@@ -432,6 +572,15 @@ fn run_branch(
             Ok(ChildObservation {
                 identity,
                 native_response,
+                x32_control_outcome,
+                signal: None,
+            })
+        }
+        Branch::X32Control if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 => {
+            Ok(ChildObservation {
+                identity,
+                native_response,
+                x32_control_outcome,
                 signal: None,
             })
         }
@@ -439,6 +588,7 @@ fn run_branch(
             Ok(ChildObservation {
                 identity,
                 native_response: None,
+                x32_control_outcome: None,
                 signal: Some(libc::SIGSYS),
             })
         }
@@ -448,6 +598,7 @@ fn run_branch(
             Ok(ChildObservation {
                 identity,
                 native_response: None,
+                x32_control_outcome: None,
                 signal: Some(libc::SIGSYS),
             })
         }
@@ -486,8 +637,13 @@ fn child_branch(
     {
         return Err("MCSEALED-PRIVATE-RELEASE: x32 child identity drop failed".into());
     }
-    if branch != Branch::I386Control {
-        let installed = install_gated_private_filter(NativeAbi::X86_64, *filter.bytes())?;
+    if !matches!(branch, Branch::I386Control | Branch::X32Control) {
+        let native_abi = if matches!(branch, Branch::Native) && cfg!(target_arch = "aarch64") {
+            NativeAbi::Aarch64
+        } else {
+            NativeAbi::X86_64
+        };
+        let installed = install_gated_private_filter(native_abi, *filter.bytes())?;
         if installed.instruction_digest != *filter.bytes() {
             return Err("MCSEALED-PRIVATE-RELEASE: ABI installed filter differs".into());
         }
@@ -513,6 +669,31 @@ fn child_branch(
             }
             control
                 .write_all(native_response_digest(&challenge, filter, pid, returned).bytes())
+                .map_err(|error| error.to_string())
+        }
+        Branch::X32Control => {
+            // The outer unit policy alone must let this exact x32-numbered
+            // entry return. Linux may report ENOSYS when x32 is disabled.
+            // SAFETY: getpid has no pointer arguments or side effects.
+            let returned = unsafe {
+                libc::syscall((libc::SYS_getpid as u32 | X32_SYSCALL_BIT) as libc::c_long)
+            };
+            let outcome = if returned == pid as libc::c_long {
+                X32ControlOutcomeV1::Getpid
+            } else if returned == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS)
+            {
+                X32ControlOutcomeV1::Enosys
+            } else {
+                return Err(
+                    "MCSEALED-PRIVATE-RELEASE: x32 outer entry did not return expected result"
+                        .into(),
+                );
+            };
+            let digest = x32_control_response_digest(&challenge, filter, pid, outcome);
+            control
+                .write_all(&[outcome.marker()])
+                .and_then(|()| control.write_all(digest.bytes()))
                 .map_err(|error| error.to_string())
         }
         Branch::X32 => {

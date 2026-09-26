@@ -19,7 +19,8 @@ use crate::{CiError, Result};
 const API_ROOT: &str = "https://api.github.com";
 const MAX_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
-const MAX_INVENTORY: usize = 100;
+const MAX_INVENTORY: usize = 1000;
+const PAGE_SIZE: usize = 100;
 
 pub struct StructuralActionsNativeArtifactV2 {
     pub run: Value,
@@ -59,6 +60,68 @@ fn complete_inventory<'a>(value: &'a Value, field: &str) -> Result<&'a [Value]> 
     Ok(members)
 }
 
+fn read_complete_inventory(
+    url: &str,
+    field: &str,
+    mut read: impl FnMut(&str, usize, &str) -> Result<Vec<u8>>,
+) -> Result<Value> {
+    let mut members = Vec::new();
+    let mut expected_total = None;
+    let mut ids = std::collections::BTreeSet::new();
+    for page in 1..=MAX_INVENTORY / PAGE_SIZE {
+        let page_url = if page == 1 {
+            url.to_owned()
+        } else {
+            format!("{url}&page={page}")
+        };
+        let bytes = read(&page_url, MAX_METADATA_BYTES, "application/vnd.github+json")?;
+        if bytes.is_empty() || bytes.len() > MAX_METADATA_BYTES {
+            return Err(fail("GitHub Actions inventory page size differs"));
+        }
+        memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)
+            .map_err(CiError::Message)?;
+        let value: Value = serde_json::from_slice(&bytes)?;
+        let total = value
+            .get("total_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| fail("GitHub Actions inventory count absent"))?;
+        if total > MAX_INVENTORY as u64 || expected_total.is_some_and(|old| old != total) {
+            return Err(fail(
+                "GitHub Actions inventory count changed or exceeds bound",
+            ));
+        }
+        expected_total = Some(total);
+        let page_members = value
+            .get(field)
+            .and_then(Value::as_array)
+            .ok_or_else(|| fail("GitHub Actions inventory page absent"))?;
+        if page_members.len() > PAGE_SIZE || members.len() + page_members.len() > MAX_INVENTORY {
+            return Err(fail("GitHub Actions inventory page exceeds bound"));
+        }
+        for member in page_members {
+            let id = member
+                .get("id")
+                .and_then(Value::as_u64)
+                .filter(|id| *id != 0)
+                .ok_or_else(|| fail("GitHub Actions inventory member id absent"))?;
+            if !ids.insert(id) {
+                return Err(fail("GitHub Actions inventory has a duplicated id"));
+            }
+            members.push(member.clone());
+        }
+        if members.len() == total as usize {
+            let mut combined = serde_json::Map::new();
+            combined.insert("total_count".into(), Value::from(total));
+            combined.insert(field.to_owned(), Value::Array(members));
+            return Ok(Value::Object(combined));
+        }
+        if page_members.len() != PAGE_SIZE {
+            return Err(fail("GitHub Actions inventory pagination is incomplete"));
+        }
+    }
+    Err(fail("GitHub Actions inventory exceeds page bound"))
+}
+
 /// Authenticated GitHub metadata for the still-running candidate job. This
 /// confirms Actions run/job custody only, not any native case outcome or Q.
 pub fn validate_running_candidate_actions_with(
@@ -95,7 +158,7 @@ pub fn validate_running_candidate_actions_with(
         "{API_ROOT}/repos/{}/actions/runs/{}/attempts/{}",
         provenance.repository, provenance.run_id, provenance.run_attempt
     );
-    let jobs_url = format!("{run_url}/jobs?per_page={MAX_INVENTORY}");
+    let jobs_url = format!("{run_url}/jobs?per_page={PAGE_SIZE}");
     let bounded_json = |bytes: Vec<u8>| -> Result<Value> {
         if bytes.is_empty() || bytes.len() > MAX_METADATA_BYTES {
             return Err(fail("running candidate Actions metadata size differs"));
@@ -234,9 +297,9 @@ pub fn read_actions_native_artifact_with(
         "{API_ROOT}/repos/{}/actions/runs/{}/attempts/{}",
         origin.repository, origin.run_id, run_attempt
     );
-    let jobs_url = format!("{run_url}/jobs?per_page={MAX_INVENTORY}");
+    let jobs_url = format!("{run_url}/jobs?per_page={PAGE_SIZE}");
     let artifacts_url = format!(
-        "{API_ROOT}/repos/{}/actions/runs/{}/artifacts?per_page={MAX_INVENTORY}",
+        "{API_ROOT}/repos/{}/actions/runs/{}/artifacts?per_page={PAGE_SIZE}",
         origin.repository, origin.run_id
     );
     let read_json = |bytes: Vec<u8>| -> Result<Value> {
@@ -260,17 +323,9 @@ pub fn read_actions_native_artifact_with(
     {
         return Err(fail("GitHub Actions run differs from expected origin"));
     }
-    let jobs = read_json(read(
-        &jobs_url,
-        MAX_METADATA_BYTES,
-        "application/vnd.github+json",
-    )?)?;
+    let jobs = read_complete_inventory(&jobs_url, "jobs", &mut read)?;
     complete_inventory(&jobs, "jobs")?;
-    let artifacts = read_json(read(
-        &artifacts_url,
-        MAX_METADATA_BYTES,
-        "application/vnd.github+json",
-    )?)?;
+    let artifacts = read_complete_inventory(&artifacts_url, "artifacts", &mut read)?;
     let matching: Vec<_> = complete_inventory(&artifacts, "artifacts")?
         .iter()
         .filter(|artifact| artifact.get("name").and_then(Value::as_str) == Some(spec.artifact_name))

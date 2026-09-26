@@ -98,7 +98,7 @@ fn m1(q: &[u8]) -> RuntimeManifestV3 {
 fn candidate_m0_and_m1_have_distinct_non_authoritative_readbacks() {
     let unqualified = m0();
     let m0_bytes = serde_json::to_vec(&unqualified).unwrap();
-    let readback = from_exact_bytes(m0_bytes.clone(), AGENT, PUBLIC, None).unwrap();
+    let readback = from_exact_bytes(m0_bytes.clone(), AGENT, PUBLIC, None, None).unwrap();
     assert_eq!(readback.manifest, unqualified);
     assert_eq!(readback.manifest_bytes, m0_bytes);
     assert_eq!(readback.qualification_sha256, None);
@@ -107,7 +107,8 @@ fn candidate_m0_and_m1_have_distinct_non_authoritative_readbacks() {
     let q = q_bytes(&unqualified.target);
     let qualified = m1(&q);
     let m1_bytes = serde_json::to_vec(&qualified).unwrap();
-    let readback = from_exact_bytes(m1_bytes.clone(), AGENT, PUBLIC, Some(q.clone())).unwrap();
+    let readback =
+        from_exact_bytes(m1_bytes.clone(), AGENT, PUBLIC, None, Some(q.clone())).unwrap();
     assert_eq!(readback.manifest, qualified);
     assert_eq!(readback.manifest_bytes, m1_bytes);
     assert_eq!(readback.qualification_sha256, Some(hash_bytes(&q)));
@@ -129,15 +130,33 @@ fn candidate_m1_rejects_missing_substituted_or_other_target_q() {
     let target = crate::linux::runtime_manifest::target().unwrap();
     let q = q_bytes(target);
     let bytes = serde_json::to_vec(&m1(&q)).unwrap();
-    assert!(from_exact_bytes(bytes.clone(), AGENT, PUBLIC, None).is_err());
-    assert!(from_exact_bytes(bytes.clone(), AGENT, PUBLIC, Some(b"other Q".to_vec())).is_err());
-    assert!(from_exact_bytes(bytes.clone(), AGENT, b"changed public", Some(q.clone())).is_err());
+    assert!(from_exact_bytes(bytes.clone(), AGENT, PUBLIC, None, None).is_err());
+    assert!(
+        from_exact_bytes(
+            bytes.clone(),
+            AGENT,
+            PUBLIC,
+            None,
+            Some(b"other Q".to_vec())
+        )
+        .is_err()
+    );
+    assert!(
+        from_exact_bytes(
+            bytes.clone(),
+            AGENT,
+            b"changed public",
+            None,
+            Some(q.clone())
+        )
+        .is_err()
+    );
     let other = if target == "x86_64-unknown-linux-gnu" {
         "aarch64-unknown-linux-gnu"
     } else {
         "x86_64-unknown-linux-gnu"
     };
-    assert!(from_exact_bytes(bytes, AGENT, PUBLIC, Some(q_bytes(other))).is_err());
+    assert!(from_exact_bytes(bytes, AGENT, PUBLIC, None, Some(q_bytes(other))).is_err());
 }
 
 #[test]

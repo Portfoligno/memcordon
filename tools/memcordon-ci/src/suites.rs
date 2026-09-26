@@ -1079,6 +1079,8 @@ pub fn run(
     suite: Suite,
     stage: Option<crate::PrivateStage>,
     target: Option<&str>,
+    collector_intent_sha256: Option<&str>,
+    policy_intent_sha256: Option<&str>,
 ) -> Result<()> {
     if matches!(suite, Suite::BackendLinuxPrivateV4) {
         let stage = stage
@@ -1102,11 +1104,22 @@ pub fn run(
         } else {
             target
         };
-        return memcordon_ci::private_suite::run(root, stage.into(), target);
+        return memcordon_ci::private_suite::run(
+            root,
+            stage.into(),
+            target,
+            collector_intent_sha256,
+            policy_intent_sha256,
+        );
     }
-    if stage.is_some() || target.is_some() {
+    if stage.is_some()
+        || target.is_some()
+        || collector_intent_sha256.is_some()
+        || policy_intent_sha256.is_some()
+    {
         return Err(CiError::Message(
-            "--stage and --target are private native suite options".into(),
+            "--stage, --target, --collector-intent-sha256 and --policy-intent-sha256 are private native suite options"
+                .into(),
         ));
     }
     let toolchains = config::toolchains(root)?;

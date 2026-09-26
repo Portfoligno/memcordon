@@ -95,6 +95,24 @@ impl ReleaseCaseRequestV1 {
 /// canary. Only physically implemented candidate selectors can acquire a
 /// protected result after detached service-owned readback; that result is not Q.
 pub(crate) fn run(request: ReleaseCaseRequestV1) -> Result<(), String> {
+    run_candidate_transport(request, false)
+}
+
+pub(crate) fn run_abi_raw(request: ReleaseCaseRequestV1) -> Result<(), String> {
+    if request.stage != ReleaseStageV1::CandidateCapability
+        || request.selector != super::private_release_alt_abi::SELECTOR
+    {
+        return Err(
+            "MCSEALED-PRIVATE-RELEASE: ABI raw verb accepts only fixed candidate selector".into(),
+        );
+    }
+    run_candidate_transport(request, true)
+}
+
+fn run_candidate_transport(
+    request: ReleaseCaseRequestV1,
+    abi_raw_only: bool,
+) -> Result<(), String> {
     // SAFETY: geteuid has no pointer arguments and returns the kernel identity.
     if unsafe { libc::geteuid() } != 0 {
         return Err("MCSEALED-PRIVATE-RELEASE: root supervisor required".into());
@@ -124,13 +142,41 @@ pub(crate) fn run(request: ReleaseCaseRequestV1) -> Result<(), String> {
                     "MCSEALED-PRIVATE-RELEASE: start socket exited {status}"
                 ));
             }
-            super::service::request_release_candidate_case(&request)
+            if abi_raw_only {
+                super::service::request_release_candidate_abi_raw(&request)
+            } else if request.selector == "private_tcp::wrong_grant_profile_and_port_rejected" {
+                super::private_policy_decision_peer::run_root_supervised(&request)
+            } else {
+                super::service::request_release_candidate_case(&request)
+            }
         }
         ReleaseStageV1::FinalPublic => Err(
             "MCSEALED-PRIVATE-RELEASE: final public V2 lease and native case owner unavailable; no result written"
                 .into(),
         ),
     }
+}
+
+pub(crate) fn run_policy_branch_raw(base_challenge: &OsStr, branch: &OsStr) -> Result<(), String> {
+    let mut request = ReleaseCaseRequestV1::parse(
+        OsStr::new("candidate-capability"),
+        OsStr::new("private_tcp::wrong_grant_profile_and_port_rejected"),
+        base_challenge,
+    )?;
+    let branch = branch
+        .to_str()
+        .and_then(|value| {
+            memcordon_core::private_release_branch_v1::PolicyOperationBranchV1::ALL
+                .into_iter()
+                .find(|branch| branch.as_str() == value)
+        })
+        .ok_or("MCSEALED-PRIVATE-RELEASE: policy branch differs from fixed catalogue")?;
+    request.challenge = memcordon_core::private_release_branch_v1::policy_branch_challenge_v1(
+        &request.challenge,
+        branch,
+    )
+    .map_err(str::to_owned)?;
+    run(request)
 }
 
 /// Fixed target fixtures emit challenge-bound raw observations, never native
@@ -182,6 +228,7 @@ pub(crate) fn run_candidate_fixture(selector: &OsStr) -> Result<(), String> {
     let mut output = candidate_fixture_response(selector, &challenge).to_vec();
     match selector {
         "private_tcp::native_tcp_bind_listen_connect"
+        | super::private_release_alt_abi::SELECTOR
         | RETIREMENT_FAULT_SELECTOR
         | CHECKPOINT_GATE_SELECTOR => {
             super::private_qualification::tcp_listener_client_competitor(&challenge)?;
@@ -249,6 +296,7 @@ pub(crate) fn run_candidate_fixture(selector: &OsStr) -> Result<(), String> {
 
 pub(crate) fn candidate_fixture_supported(selector: &str) -> bool {
     selector == "private_tcp::native_tcp_bind_listen_connect"
+        || selector == super::private_release_alt_abi::SELECTOR
         || selector == super::private_release_denial::SELECTOR
         || selector == super::private_release_denial::IMPORT_SELECTOR
         || selector == super::private_release_denial::NAMESPACE_SELECTOR

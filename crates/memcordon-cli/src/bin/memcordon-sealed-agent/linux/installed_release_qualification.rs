@@ -1,5 +1,4 @@
-//! Candidate-only installed M1 readback. Exact bytes and protected ownership
-//! establish identity, not native-run provenance or an installed host lease.
+//! Installed M1 readback and independently anchored native Q provenance.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -36,29 +35,77 @@ impl CandidateV3Readback {
     }
 }
 
-/// No value of this type can currently be constructed. A future native-run
-/// verifier must provide it from protected raw completion provenance, never
-/// from Q, M1, or the candidate readback itself.
-#[allow(dead_code)]
-pub(crate) enum IndependentlyVerifiedNativeRunV2 {}
+pub(crate) struct IndependentlyVerifiedNativeRunV2 {
+    qualification_sha256: DiagnosticSha256,
+    certificate_sha256: String,
+    policy_sha256: String,
+    release_sequence: u64,
+}
 
-#[allow(dead_code)]
 pub(crate) struct TrustedReleaseQualification {
     _reference: QualificationArtifactReferenceV2,
+    certificate_sha256: String,
+    policy_sha256: String,
+    release_sequence: u64,
 }
 
 impl TrustedReleaseQualification {
-    #[allow(dead_code)]
     pub(crate) fn reference(&self) -> &QualificationArtifactReferenceV2 {
         &self._reference
     }
 
-    #[allow(dead_code)]
+    pub(crate) fn certificate_sha256(&self) -> &str {
+        &self.certificate_sha256
+    }
+
+    pub(crate) fn policy_sha256(&self) -> &str {
+        &self.policy_sha256
+    }
+
+    pub(crate) fn release_sequence(&self) -> u64 {
+        self.release_sequence
+    }
+
     pub(crate) fn from_independently_verified_run(
-        _candidate: &CandidateV3Readback,
+        candidate: &CandidateV3Readback,
         provenance: IndependentlyVerifiedNativeRunV2,
-    ) -> Self {
-        match provenance {}
+    ) -> Result<Self, String> {
+        let reference = qualified_reference(&candidate.manifest)?
+            .ok_or("installed release M1 has no Q reference")?;
+        if candidate.qualification_sha256.as_ref() != Some(&provenance.qualification_sha256)
+            || candidate.qualification_bytes().is_none()
+            || reference.artifact_sha256 != provenance.qualification_sha256
+        {
+            return Err("installed release Q differs from authenticated certificate".into());
+        }
+        Ok(Self {
+            _reference: reference.clone(),
+            certificate_sha256: provenance.certificate_sha256,
+            policy_sha256: provenance.policy_sha256,
+            release_sequence: provenance.release_sequence,
+        })
+    }
+}
+
+/// The installer and ordinary admission call this only with a retained shared
+/// package-generation lock. It reads the independently provisioned trust root
+/// and protected installed certificate afresh on every call.
+pub(crate) fn verify_anchored_native_qualification(
+    candidate: &CandidateV3Readback,
+) -> Result<TrustedReleaseQualification, String> {
+    let verified = super::installed_release_certificate::verify_installed_native_q(candidate)?;
+    TrustedReleaseQualification::from_independently_verified_run(candidate, verified)
+}
+
+pub(super) fn verified_native_run(
+    qualification_sha256: DiagnosticSha256,
+    verified: memcordon_core::release_trust::VerifiedNativeQualificationV1,
+) -> IndependentlyVerifiedNativeRunV2 {
+    IndependentlyVerifiedNativeRunV2 {
+        qualification_sha256,
+        certificate_sha256: verified.certificate_sha256().into(),
+        policy_sha256: verified.policy_sha256().into(),
+        release_sequence: verified.release_sequence(),
     }
 }
 
@@ -77,6 +124,7 @@ pub(crate) fn read_candidate(
     manifest_bytes: Vec<u8>,
     agent_bytes: &[u8],
     public_bytes: &[u8],
+    arm32_helper_bytes: Option<&[u8]>,
     installed: bool,
 ) -> Result<CandidateV3Readback, String> {
     let manifest = RuntimeManifestV3::parse(&manifest_bytes)?;
@@ -99,7 +147,13 @@ pub(crate) fn read_candidate(
         }
         None => None,
     };
-    from_exact_bytes(manifest_bytes, agent_bytes, public_bytes, q_bytes)
+    from_exact_bytes(
+        manifest_bytes,
+        agent_bytes,
+        public_bytes,
+        arm32_helper_bytes,
+        q_bytes,
+    )
 }
 
 /// Pure byte join used by tests and by the protected installed reader. This
@@ -109,6 +163,7 @@ pub(crate) fn from_exact_bytes(
     manifest_bytes: Vec<u8>,
     agent_bytes: &[u8],
     public_bytes: &[u8],
+    arm32_helper_bytes: Option<&[u8]>,
     qualification_bytes: Option<Vec<u8>>,
 ) -> Result<CandidateV3Readback, String> {
     let manifest = RuntimeManifestV3::parse(&manifest_bytes)?;
@@ -136,24 +191,36 @@ pub(crate) fn from_exact_bytes(
         mode: 0o755,
         sha256: String::from(hash_bytes(bytes)),
     };
+    let mut components = vec![
+        component(
+            "public-cli",
+            "memcordon",
+            RuntimeComponentRole::PublicCli,
+            public_bytes,
+        ),
+        component(
+            "sealed-agent",
+            "memcordon-sealed-agent",
+            RuntimeComponentRole::SealedAgent,
+            agent_bytes,
+        ),
+    ];
+    if manifest.target == "aarch64-unknown-linux-gnu" {
+        let helper = arm32_helper_bytes.ok_or("installed ARM32 helper absent")?;
+        components.push(component(
+            "arm32-abi-helper",
+            "memcordon-arm32-abi-helper",
+            RuntimeComponentRole::Arm32AbiHelper,
+            helper,
+        ));
+    } else if arm32_helper_bytes.is_some() {
+        return Err("installed ARM32 helper supplied for other target".into());
+    }
     let expected = RuntimeManifestV3::linux_unqualified(
         env!("CARGO_PKG_VERSION").into(),
         crate::SOURCE_COMMIT.into(),
         super::runtime_manifest::target()?.into(),
-        vec![
-            component(
-                "public-cli",
-                "memcordon",
-                RuntimeComponentRole::PublicCli,
-                public_bytes,
-            ),
-            component(
-                "sealed-agent",
-                "memcordon-sealed-agent",
-                RuntimeComponentRole::SealedAgent,
-                agent_bytes,
-            ),
-        ],
+        components,
     )?;
     if normalized != expected {
         return Err("installed M1 static fields differ from exact executable images".into());

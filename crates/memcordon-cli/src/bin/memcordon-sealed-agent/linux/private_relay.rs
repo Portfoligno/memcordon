@@ -17,6 +17,7 @@ struct Channel {
     offset: usize,
     length: usize,
     source_eof: bool,
+    capture: Option<Vec<u8>>,
 }
 
 impl Channel {
@@ -28,6 +29,7 @@ impl Channel {
             offset: 0,
             length: 0,
             source_eof: false,
+            capture: None,
         }
     }
 
@@ -47,6 +49,14 @@ impl Channel {
                 )
             };
             if count > 0 {
+                if let Some(capture) = self.capture.as_mut() {
+                    if capture.len().saturating_add(count as usize) > 4096 {
+                        return Err(
+                            "MCSEALED-PRIVATE-RELAY: ABI target stdout exceeds bound".into()
+                        );
+                    }
+                    capture.extend_from_slice(&self.pending[..count as usize]);
+                }
                 self.offset = 0;
                 self.length = count as usize;
             } else if count == 0 {
@@ -119,6 +129,20 @@ pub struct PrivateRelay {
 }
 
 impl PrivateRelay {
+    pub(crate) fn capture_public_abi_stdout(&mut self) {
+        self.stdout.capture = Some(Vec::new());
+    }
+
+    pub(crate) fn take_public_abi_stdout(&mut self) -> Result<Vec<u8>, String> {
+        if !self.stdout.completed() {
+            return Err("MCSEALED-PRIVATE-RELAY: ABI target stdout is not complete".into());
+        }
+        self.stdout
+            .capture
+            .take()
+            .ok_or("MCSEALED-PRIVATE-RELAY: ABI target stdout capture absent".into())
+    }
+
     /// Acquires all six endpoints before candidate release. Frontend FDs must
     /// already be nonblocking and pipe/socket typed; no caller flags are
     /// altered. Provider halves are private file descriptions and can be

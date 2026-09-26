@@ -152,6 +152,9 @@ where
         cgroup: cgroup.as_raw_fd() as u64,
         ..CloneArgs::default()
     };
+    // This marker is immediately before the sole clone3 target allocation
+    // boundary. It does not affect the syscall or constitute proof of it.
+    super::private_observer_hooks::mc_private_allocate_v1();
     // SAFETY: libc receives initialized scalar arguments and pointers into live owned buffers or handles; the return value governs ownership and error cleanup.
     let result = unsafe {
         libc::syscall(

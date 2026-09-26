@@ -26,6 +26,9 @@ pub(crate) struct ActiveHostReferenceV1 {
     host_prerequisites_digest: DiagnosticSha256,
     installation_epoch: DiagnosticSha256,
     release_qualification_sha256: DiagnosticSha256,
+    certificate_sha256: String,
+    trust_policy_sha256: String,
+    release_sequence: u64,
 }
 
 impl ActiveHostReferenceV1 {
@@ -35,13 +38,22 @@ impl ActiveHostReferenceV1 {
         }
         memcordon_core::workload_contract::reject_duplicate_json_keys(bytes)?;
         let active: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-        if active.schema_version != 1
+        if active.schema_version != 2
             || active.run_nonce.len() != [0_u8; 32].len() * 2
             || !active
                 .run_nonce
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || active.run_nonce.bytes().all(|byte| byte == b'0')
+            || ![&active.certificate_sha256, &active.trust_policy_sha256]
+                .iter()
+                .all(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                })
+            || active.release_sequence == 0
         {
             return Err("MCSEALED-PRIVATE-HOST: active run identity differs".into());
         }
@@ -158,6 +170,18 @@ impl VerifiedActiveHostV1 {
 
     pub(crate) fn release_qualification_sha256(&self) -> &DiagnosticSha256 {
         &self.active.release_qualification_sha256
+    }
+
+    pub(crate) fn run_nonce(&self) -> &str {
+        &self.active.run_nonce
+    }
+
+    pub(crate) fn native_run_digest(&self) -> &DiagnosticSha256 {
+        &self.active.native_run_digest
+    }
+
+    pub(crate) fn host_prerequisites_digest(&self) -> &DiagnosticSha256 {
+        &self.active.host_prerequisites_digest
     }
 }
 
@@ -427,13 +451,16 @@ pub(crate) fn publish_verified_active(
     let receipt_bytes = encode_candidate_receipt(&candidate._package, release, &current)?;
     let receipt_sha256 = hash_bytes(&receipt_bytes);
     let active = ActiveHostReferenceV1 {
-        schema_version: 1,
+        schema_version: 2,
         run_nonce: name.clone(),
         receipt_sha256,
         native_run_digest: current.native_run_digest().clone(),
         host_prerequisites_digest: current.host_prerequisites_digest().clone(),
         installation_epoch: current.installation_epoch().clone(),
         release_qualification_sha256: candidate._package.release_qualification_sha256.clone(),
+        certificate_sha256: release.certificate_sha256().into(),
+        trust_policy_sha256: release.policy_sha256().into(),
+        release_sequence: release.release_sequence(),
     };
     let active_bytes = serde_json::to_vec(&active).map_err(|error| error.to_string())?;
     if publish_receipt_then_active(&root, &name, &receipt_bytes, &active_bytes)? != active {
@@ -612,6 +639,12 @@ pub(crate) fn read_current_active(
         .read_to_end(&mut active_bytes)
         .map_err(|error| error.to_string())?;
     let active = ActiveHostReferenceV1::parse(&active_bytes)?;
+    if active.certificate_sha256 != release.certificate_sha256()
+        || active.trust_policy_sha256 != release.policy_sha256()
+        || active.release_sequence != release.release_sequence()
+    {
+        return Err("MCSEALED-PRIVATE-HOST: active H1 release trust differs".into());
+    }
     let nonce = decode_nonce(&active.run_nonce)?;
     let run_directory = open_run_directory(&root, &active.run_nonce)?;
     let verified = super::private_qualification::verify_completed_run_after_exit(

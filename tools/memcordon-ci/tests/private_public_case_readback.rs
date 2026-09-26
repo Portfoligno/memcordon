@@ -3,7 +3,8 @@
 use std::os::unix::process::ExitStatusExt;
 
 use memcordon_ci::private_public_case_readback::{
-    ExpectedFinalPublicCaseV2, RawPublicAttachmentV2, validate_structural_final_public_case,
+    ExpectedFinalPublicCaseV2, RawPublicAttachmentV2, assemble_structural_final_public_case,
+    validate_structural_final_public_case,
 };
 use memcordon_ci::private_public_v2::ExpectedFrontendLossEvidenceV2;
 use memcordon_ci::private_supervisor::{LinuxChildIdentityV1, SupervisedProcessV2};
@@ -121,6 +122,12 @@ fn final_public_case_joins_exact_independent_inputs_and_raw_bytes() {
     let result = validate_structural_final_public_case(&bytes, &expected).unwrap();
     assert_eq!(result.child_pid, 42);
     assert_eq!(result.child_start_time_ticks, 123);
+    let (assembled, assembled_readback) = assemble_structural_final_public_case(&expected).unwrap();
+    assert_eq!(assembled_readback.case_sha256, hash_bytes(&assembled));
+    assert_eq!(
+        FinalPublicCaseEvidenceV2::parse(&assembled).unwrap(),
+        parsed
+    );
     value["installed"]["archive_sha256"] = serde_json::json!(digest(30));
     assert!(
         validate_structural_final_public_case(&serde_json::to_vec(&value).unwrap(), &expected)
@@ -184,6 +191,12 @@ fn final_public_case_joins_exact_independent_inputs_and_raw_bytes() {
         ..swapped
     };
     assert!(validate_structural_final_public_case(&frontend_bytes, &frontend_expected).is_ok());
+    let (assembled_frontend, _) =
+        assemble_structural_final_public_case(&frontend_expected).unwrap();
+    assert_eq!(
+        FinalPublicCaseEvidenceV2::parse(&assembled_frontend).unwrap(),
+        frontend
+    );
     let missing_replacement = ExpectedFinalPublicCaseV2 {
         frontend_loss_replacement: None,
         ..frontend_expected

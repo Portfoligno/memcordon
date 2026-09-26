@@ -148,14 +148,23 @@ fn handle_network(stream: &mut UnixStream) -> Result<(), String> {
     } else if request.kind == MessageKind::BrokerReleaseCase {
         // Broker observation alone is incomplete. Only a later, separately
         // service-owned post-exit finalizer can publish the protected result.
-        if let Err(error) = validate_release_candidate_operation(&request, descriptors, peer) {
-            eprintln!("sealed release candidate incomplete: {error}");
-        }
+        let abi_raw_ready = match validate_release_candidate_operation(&request, descriptors, peer)
+        {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("sealed release candidate incomplete: {error}");
+                false
+            }
+        };
         let response = Frame {
             kind: MessageKind::ReleaseCaseIncomplete,
             nonce: request.nonce,
             attempt_id: request.attempt_id,
-            payload: Vec::new(),
+            payload: if abi_raw_ready {
+                b"ABI-RAW-READY-V1".to_vec()
+            } else {
+                Vec::new()
+            },
         };
         let mut encoded = Vec::new();
         write_network_frame(&mut encoded, &response).map_err(|error| error.to_string())?;
@@ -230,6 +239,9 @@ fn validate_release_candidate_operation(
         return Err("MCSEALED-PRIVATE-RELEASE: exact coordinator handle required".into());
     }
     let fixed = super::private_release_run::decode_broker_request(&request.payload)?;
+    if fixed.selector == "private_tcp::wrong_grant_profile_and_port_rejected" {
+        return Err("MCSEALED-PRIVATE-RELEASE: policy requires distinct authenticated nonroot decision endpoint".into());
+    }
     let directory = File::from(
         descriptors
             .into_iter()
@@ -254,6 +266,60 @@ fn validate_release_candidate_operation(
     let case = super::private_release_run::ReleaseCandidateRunAuthorityV1::begin(
         &fixed, peer.pid, pidfd, deadline, directory,
     )?;
+    if fixed.selector == super::private_release_alt_abi::SELECTOR {
+        let native = super::private_release_execution::execute_candidate_fixture_case(&case)?;
+        let namespace_inode = case.retired_native_namespace_inode()?;
+        let expected_response = case.expected_fixture_output(namespace_inode)?;
+        if native.attempt_id.is_empty()
+            || native.checkpoint_digest == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || native.terminal_record_digest
+                == memcordon_core::DiagnosticSha256::from_bytes([0; 32])
+            || native.challenge_sha256
+                != memcordon_core::workload_codec::hash_bytes(&fixed.challenge)
+            || native.network_namespace_inode != namespace_inode
+            || native.response_sha256
+                != memcordon_core::workload_codec::hash_bytes(&expected_response)
+            || native.candidate_exit_code != 0
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: ABI positive target differs".into());
+        }
+        let inventory = case.persist_native_raw_observation(&native)?;
+        if inventory.len()
+            != memcordon_core::private_release_case_v1::PrivateReleaseAttachmentRoleV1::ALL.len()
+                - 1
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: ABI positive raw inventory differs".into());
+        }
+        match case.native_abi()? {
+            super::network_filter::NativeAbi::X86_64 => {
+                let observed =
+                    super::private_release_alt_abi_owner::execute_closed_x32_owner(&case)?;
+                if observed.raw_sha256 == observed.i386_raw_sha256
+                    || observed.raw_sha256 == observed.witness_sha256
+                    || observed.i386_raw_sha256 == observed.witness_sha256
+                {
+                    return Err("MCSEALED-PRIVATE-RELEASE: x86 alternate-ABI raw aliases".into());
+                }
+            }
+            super::network_filter::NativeAbi::Aarch64 => {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let observed =
+                        super::private_release_arm32_abi_owner::execute_closed_arm32_owner(&case)?;
+                    if observed.raw_sha256 == observed.witness_sha256 {
+                        return Err(
+                            "MCSEALED-PRIVATE-RELEASE: ARM32 alternate-ABI raw aliases".into()
+                        );
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                return Err(
+                    "MCSEALED-PRIVATE-RELEASE: ARM32 owner unavailable on this build".into(),
+                );
+            }
+        }
+        return Ok(());
+    }
     if fixed.selector == super::private_release_case::AUTHORIZATION_UNCERTAIN_SELECTOR {
         let observed = super::private_release_execution::execute_uncertain_candidate_case(&case)?;
         if observed.attempt_id.is_empty()
@@ -830,7 +896,11 @@ pub(crate) fn execute_release_candidate_case(
     if response.nonce != request.nonce
         || response.attempt_id != request.attempt_id
         || response.kind != MessageKind::ReleaseCaseIncomplete
-        || !response.payload.is_empty()
+        || if prepared.request.selector == super::private_release_alt_abi::SELECTOR {
+            response.payload != b"ABI-RAW-READY-V1"
+        } else {
+            !response.payload.is_empty()
+        }
         || credentials.pid != worker.pid
         || credentials.uid != 0
         || credentials.gid != 0
@@ -847,7 +917,14 @@ pub(crate) fn execute_release_candidate_case(
     {
         return Err("MCSEALED-PRIVATE-RELEASE: worker did not exit after observation".into());
     }
-    if prepared.request.selector == super::private_release_case::AUTHORIZATION_UNCERTAIN_SELECTOR {
+    if prepared.request.selector == super::private_release_alt_abi::SELECTOR {
+        // The ordinary positive target receives detached coordinator cleanup;
+        // the extra ABI leaves remain raw-only until CI joins their children
+        // to the armed kernel interval. No V1 result is published here.
+        prepared.persist_control_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else if prepared.request.selector
+        == super::private_release_case::AUTHORIZATION_UNCERTAIN_SELECTOR
+    {
         prepared.persist_control_uncertain_cleanup(&worker_identity, worker_pidfd.as_fd())?;
     } else if prepared.request.selector == super::private_release_case::RETIREMENT_FAULT_SELECTOR {
         prepared
@@ -868,6 +945,8 @@ pub(crate) fn execute_release_candidate_case(
         prepared.persist_control_dual_cleanup(&worker_identity, worker_pidfd.as_fd())?;
     } else if prepared.request.selector == super::private_release_unix_intent::SELECTOR {
         prepared.persist_control_unix_intent_cleanup(&worker_identity, worker_pidfd.as_fd())?;
+    } else if prepared.request.selector == "private_tcp::wrong_grant_profile_and_port_rejected" {
+        prepared.persist_control_policy_cleanup(&worker_identity, worker_pidfd.as_fd())?;
     } else {
         prepared.persist_control_cleanup(&worker_identity, worker_pidfd.as_fd())?;
     }

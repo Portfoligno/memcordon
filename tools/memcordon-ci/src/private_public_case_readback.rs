@@ -10,7 +10,7 @@ use memcordon_core::private_public_case_v2::{
 };
 use memcordon_core::private_public_report_v2::PublicCliReportEvidenceV2;
 use memcordon_core::private_release_case_v1::{
-    PrivateReleaseAttachmentRoleV1, PrivateReleaseObservationV1,
+    PrivateReleaseAttachmentRoleV1, PrivateReleaseAttachmentV1, PrivateReleaseObservationV1,
 };
 use memcordon_core::workload_codec::hash_bytes;
 
@@ -46,6 +46,93 @@ pub struct StructuralFinalPublicCaseReadbackV2 {
     pub result_key: DiagnosticSha256,
     pub child_pid: u32,
     pub child_start_time_ticks: u64,
+}
+
+/// Assemble a structural V2 case from separately acquired inputs. The caller
+/// must obtain `terminal_observation` from authenticated provider and kernel
+/// observations; this function itself cannot confer P authority.
+pub fn assemble_structural_final_public_case(
+    expected: &ExpectedFinalPublicCaseV2<'_>,
+) -> Result<(Vec<u8>, StructuralFinalPublicCaseReadbackV2)> {
+    let absent = expected.frontend_loss_replacement.is_some();
+    let roles: &[PrivateReleaseAttachmentRoleV1] = if absent {
+        &[
+            PrivateReleaseAttachmentRoleV1::Request,
+            PrivateReleaseAttachmentRoleV1::Stdio,
+            PrivateReleaseAttachmentRoleV1::Observer,
+            PrivateReleaseAttachmentRoleV1::Cleanup,
+        ]
+    } else {
+        &PrivateReleaseAttachmentRoleV1::ALL
+    };
+    if expected.raw_attachments.len() != roles.len()
+        || expected
+            .raw_attachments
+            .iter()
+            .zip(roles)
+            .any(|(raw, role)| raw.role != *role)
+    {
+        return Err(CiError::Message(
+            "final-public assembly raw inventory differs".into(),
+        ));
+    }
+    let report = if absent {
+        None
+    } else {
+        Some(expected.raw_attachments[1].bytes)
+    };
+    if report.is_some_and(|report| report.is_empty()) {
+        return Err(CiError::Message(
+            "final-public assembly report is absent".into(),
+        ));
+    }
+    let report_evidence = match (report, expected.frontend_loss_replacement) {
+        (Some(report), None) => PublicCliReportEvidenceV2::Present {
+            size: report.len() as u64,
+            sha256: hash_bytes(report),
+        },
+        (None, Some(replacement)) => PublicCliReportEvidenceV2::AbsentFrontendLoss {
+            authenticated_terminal_sha256: replacement.authenticated_terminal_sha256.clone(),
+            supervised_transport_sha256: replacement.supervised_transport_sha256.clone(),
+            independent_recovery_sha256: replacement.independent_recovery_sha256.clone(),
+        },
+        _ => {
+            return Err(CiError::Message(
+                "final-public report presence differs".into(),
+            ));
+        }
+    };
+    let case = FinalPublicCaseEvidenceV2 {
+        schema_version: 2,
+        selector: expected.selector.into(),
+        challenge: expected.challenge,
+        source_commit: expected.source_commit.into(),
+        release_version: memcordon_core::BoundedText::<128>::new(expected.release_version)
+            .map_err(|error| CiError::Message(error.into()))?,
+        target: expected.target.into(),
+        native_machine: expected.native_machine.into(),
+        build_context_sha256: expected.build_context_sha256.clone(),
+        release_catalogue_sha256: expected.release_catalogue_sha256.clone(),
+        installed: expected.installed.clone(),
+        child: expected.child.clone(),
+        observation: expected.terminal_observation.clone(),
+        positive_control_terminal_sha256: expected.positive_control_terminal_sha256.cloned(),
+        report: report_evidence,
+        attachments: expected
+            .raw_attachments
+            .iter()
+            .map(|raw| PrivateReleaseAttachmentV1 {
+                role: raw.role,
+                size: raw.bytes.len() as u64,
+                sha256: hash_bytes(raw.bytes),
+            })
+            .collect(),
+    };
+    case.validate_report_bytes(report)
+        .map_err(CiError::Message)?;
+    let bytes = serde_json::to_vec(&case)?;
+    let readback = validate_structural_final_public_case(&bytes, expected)?;
+    Ok((bytes, readback))
 }
 
 pub fn validate_structural_final_public_case(

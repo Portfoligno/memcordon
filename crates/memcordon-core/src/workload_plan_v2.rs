@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::workload_codec::contract_digest_v2;
-use crate::workload_contract::{WorkloadContractV2, reject_duplicate_json_keys};
+use crate::workload_contract::{PolicyEpoch, WorkloadContractV2, reject_duplicate_json_keys};
 use crate::workload_evidence_v2::QualifiedNativeAbiV2;
 use crate::{DiagnosticSha256, workload_limits};
 
@@ -18,25 +18,44 @@ pub struct PrivatePlanReceiptV2 {
     pub installed_qualification_sha256: DiagnosticSha256,
     pub runtime_manifest_sha256: DiagnosticSha256,
     pub generation_digest: DiagnosticSha256,
+    /// Kernel-authenticated SO_PEERCRED uid at the provider's plan decision.
+    pub caller_uid: u32,
+    /// The admitted, current policy generation, not a caller assertion.
+    pub policy_epoch: PolicyEpoch,
     pub source_commit: String,
     pub native_abi: QualifiedNativeAbiV2,
 }
 
 impl PrivatePlanReceiptV2 {
-    pub fn parse_for_contract(bytes: &[u8], contract: &WorkloadContractV2) -> Result<Self, String> {
-        if bytes.len() > workload_limits::PUBLIC_OBJECT_BYTES {
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.is_empty() || bytes.len() > workload_limits::PUBLIC_OBJECT_BYTES {
             return Err("private plan receipt exceeds byte bound".into());
         }
         reject_duplicate_json_keys(bytes)?;
         let receipt: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if receipt.schema_version != 3
+            || receipt.source_commit.is_empty()
+            || !receipt
+                .source_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("private plan receipt identity differs".into());
+        }
+        Ok(receipt)
+    }
+
+    pub fn parse_for_contract(bytes: &[u8], contract: &WorkloadContractV2) -> Result<Self, String> {
+        let receipt = Self::parse(bytes)?;
         receipt.validate_for_contract(contract)?;
         Ok(receipt)
     }
 
     pub fn validate_for_contract(&self, contract: &WorkloadContractV2) -> Result<(), String> {
         contract.validate()?;
-        if self.schema_version != 2
+        if self.schema_version != 3
             || self.contract_digest != contract_digest_v2(contract)?
+            || self.policy_epoch != contract.expected_epoch
             || self.source_commit.is_empty()
             || !self
                 .source_commit
@@ -44,6 +63,49 @@ impl PrivatePlanReceiptV2 {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err("private plan receipt differs from exact V2 contract".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_caller(&self, caller_uid: u32) -> Result<(), String> {
+        if self.caller_uid != caller_uid {
+            return Err("private plan authenticated caller differs".into());
+        }
+        Ok(())
+    }
+}
+
+/// A plan-to-launch comparison supplied by the caller. It is never launch
+/// authority; the provider still performs current admission before allocating.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivatePlanPreconditionV1 {
+    pub contract_digest: DiagnosticSha256,
+    pub generation_digest: DiagnosticSha256,
+}
+
+impl PrivatePlanPreconditionV1 {
+    pub fn from_receipt(receipt: &PrivatePlanReceiptV2) -> Result<Self, String> {
+        if receipt.schema_version != 3 {
+            return Err("private plan receipt schema differs".into());
+        }
+        Ok(Self {
+            contract_digest: receipt.contract_digest.clone(),
+            generation_digest: receipt.generation_digest.clone(),
+        })
+    }
+
+    pub fn verify_current(
+        &self,
+        contract: &WorkloadContractV2,
+        current_generation: &DiagnosticSha256,
+    ) -> Result<(), &'static str> {
+        if contract_digest_v2(contract).map_err(|_| "ContractBindingMismatch")?
+            != self.contract_digest
+        {
+            return Err("ContractBindingMismatch");
+        }
+        if &self.generation_digest != current_generation {
+            return Err("InstallationGenerationStale");
         }
         Ok(())
     }

@@ -67,7 +67,7 @@ pub(crate) fn persist_closed_x32_raw(
         return Err("MCSEALED-PRIVATE-RELEASE: x32 raw exceeds bound".into());
     }
     let directory = case.protected_case_directory()?;
-    write_immutable(directory, &bytes)?;
+    write_immutable(directory, RAW_LEAF, TEMP_LEAF, &bytes)?;
     case.revalidate()?;
     Ok(hash_bytes(&bytes))
 }
@@ -94,7 +94,7 @@ pub(crate) fn readback_closed_x32_raw(
     if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o777 != 0o700 {
         return Err("MCSEALED-PRIVATE-RELEASE: x32 detached directory differs".into());
     }
-    let bytes = read_immutable(directory)?;
+    let bytes = read_immutable(directory, RAW_LEAF, TEMP_LEAF)?;
     let record: ProtectedX32RawV1 =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     if serde_json::to_vec(&record).map_err(|error| error.to_string())? != bytes {
@@ -112,8 +112,10 @@ pub(crate) fn readback_closed_x32_raw(
         || record.worker != *expected_worker
         || expected_worker == expected_coordinator
         || expected_worker == &record.witness.native
+        || expected_worker == &record.witness.outer_control
         || expected_worker == &record.witness.alternate
         || expected_coordinator == &record.witness.native
+        || expected_coordinator == &record.witness.outer_control
         || expected_coordinator == &record.witness.alternate
     {
         return Err("MCSEALED-PRIVATE-RELEASE: x32 detached raw binding differs".into());
@@ -131,9 +133,14 @@ fn fixed_name(name: &'static str) -> CString {
     CString::new(name).expect("fixed x32 raw leaf has no NUL")
 }
 
-fn write_immutable(directory: &File, bytes: &[u8]) -> Result<(), String> {
-    let temporary = fixed_name(TEMP_LEAF);
-    let final_name = fixed_name(RAW_LEAF);
+pub(crate) fn write_immutable(
+    directory: &File,
+    raw_leaf: &'static str,
+    temp_leaf: &'static str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let temporary = fixed_name(temp_leaf);
+    let final_name = fixed_name(raw_leaf);
     // SAFETY: fixed leaf, pinned directory and O_EXCL create exactly one
     // root-owned temporary file without following a link.
     let fd = unsafe {
@@ -178,8 +185,12 @@ fn write_immutable(directory: &File, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: x32 raw fsync: {error}"))
 }
 
-fn read_immutable(directory: &File) -> Result<Vec<u8>, String> {
-    let temporary = fixed_name(TEMP_LEAF);
+pub(crate) fn read_immutable(
+    directory: &File,
+    raw_leaf: &'static str,
+    temp_leaf: &'static str,
+) -> Result<Vec<u8>, String> {
+    let temporary = fixed_name(temp_leaf);
     // SAFETY: fstatat with NOFOLLOW only checks the fixed temporary leaf.
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     let found = unsafe {
@@ -193,7 +204,7 @@ fn read_immutable(directory: &File) -> Result<Vec<u8>, String> {
     if found == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
         return Err("MCSEALED-PRIVATE-RELEASE: x32 interrupted raw write exists".into());
     }
-    let final_name = fixed_name(RAW_LEAF);
+    let final_name = fixed_name(raw_leaf);
     // SAFETY: one fixed leaf under pinned directory; O_NOFOLLOW excludes a
     // symlink substitution even if the directory is unexpectedly writable.
     let fd = unsafe {

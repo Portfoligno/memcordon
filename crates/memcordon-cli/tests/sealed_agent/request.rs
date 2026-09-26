@@ -181,6 +181,7 @@ fn network_request() -> NetworkLaunchRequestV4 {
         },
         registry_digest: DiagnosticSha256::from_bytes([8; 32]),
         qualification_digest: DiagnosticSha256::from_bytes([9; 32]),
+        expected_plan: None,
         launch: request(),
     }
 }
@@ -200,6 +201,28 @@ fn network_v4_request_round_trips_without_legacy_fallback() {
     assert_eq!(
         encode_network_launch_request(&invalid),
         Err(RequestCodecError::InvalidValue)
+    );
+}
+
+#[test]
+fn network_v5_expected_plan_round_trips_and_rejects_truncation() {
+    let mut request = network_request();
+    request.expected_plan = Some(
+        memcordon_core::workload_plan_v2::PrivatePlanPreconditionV1 {
+            contract_digest: memcordon_core::workload_codec::contract_digest_v2(&request.contract)
+                .unwrap(),
+            generation_digest: memcordon_core::DiagnosticSha256::from_bytes([11; 32]),
+        },
+    );
+    let encoded = encode_network_launch_request(&request).unwrap();
+    assert_eq!(u16::from_be_bytes([encoded[0], encoded[1]]), 5);
+    assert_eq!(decode_network_launch_request(&encoded).unwrap(), request);
+    assert!(decode_network_launch_request(&encoded[..encoded.len() - 1]).is_err());
+    let mut extra = encoded;
+    extra.push(0);
+    assert_eq!(
+        decode_network_launch_request(&extra),
+        Err(RequestCodecError::TrailingBytes)
     );
 }
 

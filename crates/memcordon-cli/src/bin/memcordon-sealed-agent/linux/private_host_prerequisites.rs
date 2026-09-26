@@ -20,6 +20,8 @@ use super::private_attempt::ProcessIdentityV4;
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const UNIT: &str = "memcordon-sealed-network-launcher.service";
 const FRAGMENT: &str = "/usr/lib/systemd/system/memcordon-sealed-network-launcher.service";
+const SEALED_UNIT: &str = "memcordon-sealed-agent.service";
+const SEALED_FRAGMENT: &str = "/usr/lib/systemd/system/memcordon-sealed-agent.service";
 const OUTPUT_LIMIT: usize = 16 * 1024;
 const QUERY_DEADLINE: Duration = Duration::from_secs(5);
 const KERNEL_READ_LIMIT: u64 = 4096;
@@ -351,7 +353,11 @@ struct ManagerProperties<'a> {
     control_group: &'a str,
 }
 
-fn parse_manager_properties(bytes: &[u8]) -> Result<ManagerProperties<'_>, String> {
+fn parse_manager_properties<'a>(
+    bytes: &'a [u8],
+    expected_fragment: &str,
+    expected_delegate: &str,
+) -> Result<ManagerProperties<'a>, String> {
     if bytes.is_empty() || bytes.len() > OUTPUT_LIMIT {
         return Err("MCSEALED-PRIVATE-HOST: manager property output bound differs".into());
     }
@@ -389,9 +395,9 @@ fn parse_manager_properties(bytes: &[u8]) -> Result<ManagerProperties<'_>, Strin
         || value("ActiveState")? != "active"
         || value("SubState")? != "running"
         || value("NeedDaemonReload")? != "no"
-        || value("FragmentPath")? != FRAGMENT
+        || value("FragmentPath")? != expected_fragment
         || !value("DropInPaths")?.is_empty()
-        || value("Delegate")? != "yes"
+        || value("Delegate")? != expected_delegate
         || !control_group.starts_with('/')
         || control_group.len() > 512
         || control_group
@@ -407,7 +413,7 @@ fn parse_manager_properties(bytes: &[u8]) -> Result<ManagerProperties<'_>, Strin
     })
 }
 
-fn query_manager() -> Result<Vec<u8>, String> {
+fn query_manager(unit: &str) -> Result<Vec<u8>, String> {
     let metadata = std::fs::symlink_metadata(Path::new(SYSTEMCTL))
         .map_err(|error| format!("MCSEALED-PRIVATE-HOST: systemctl metadata: {error}"))?;
     if !metadata.file_type().is_file()
@@ -432,7 +438,7 @@ fn query_manager() -> Result<Vec<u8>, String> {
             "--property=ControlGroup",
             "--property=Delegate",
             "show",
-            UNIT,
+            unit,
         ])
         .env_clear()
         .stdin(Stdio::null())
@@ -514,8 +520,23 @@ fn read_bounded_manager_output(child: &mut std::process::Child) -> Result<Vec<u8
 /// Query systemd twice around an independently observed live MainPID pidfd.
 /// A manager restart or unit replacement during readback is unavailable.
 pub(crate) fn observe_service_generation() -> Result<ServiceGenerationV1, String> {
-    let first = query_manager()?;
-    let selected = parse_manager_properties(&first)?;
+    observe_fixed_service_generation(UNIT, FRAGMENT, "yes")
+}
+
+/// The decision-only policy endpoint runs in the public sealed service, not
+/// the separate network-launch broker. Its generation is measured with the
+/// same manager/PID checks but against that exact unit and nondelegated cgroup.
+pub(crate) fn observe_sealed_service_generation() -> Result<ServiceGenerationV1, String> {
+    observe_fixed_service_generation(SEALED_UNIT, SEALED_FRAGMENT, "no")
+}
+
+fn observe_fixed_service_generation(
+    unit: &str,
+    fragment: &str,
+    delegate: &str,
+) -> Result<ServiceGenerationV1, String> {
+    let first = query_manager(unit)?;
+    let selected = parse_manager_properties(&first, fragment, delegate)?;
     // SAFETY: pidfd_open receives a positive manager-supplied PID; it does
     // not grant authority until ProcessIdentityV4 independently checks fdinfo
     // and the kernel process start time.
@@ -529,11 +550,11 @@ pub(crate) fn observe_service_generation() -> Result<ServiceGenerationV1, String
     // SAFETY: successful pidfd_open transferred a unique owned descriptor.
     let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
     let main = ProcessIdentityV4::observe(selected.main_pid, pidfd.as_fd())?;
-    let second = query_manager()?;
+    let second = query_manager(unit)?;
     if second != first {
         return Err("MCSEALED-PRIVATE-HOST: service generation changed during readback".into());
     }
-    let selected = parse_manager_properties(&second)?;
+    let selected = parse_manager_properties(&second, fragment, delegate)?;
     Ok(ServiceGenerationV1 {
         invocation_id: selected.invocation_id.into(),
         main,
@@ -543,7 +564,12 @@ pub(crate) fn observe_service_generation() -> Result<ServiceGenerationV1, String
 
 #[cfg(feature = "test-support")]
 pub(crate) fn parse_manager_properties_for_test(bytes: &[u8]) -> Result<(), String> {
-    parse_manager_properties(bytes).map(|_| ())
+    parse_manager_properties(bytes, FRAGMENT, "yes").map(|_| ())
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn parse_sealed_manager_properties_for_test(bytes: &[u8]) -> Result<(), String> {
+    parse_manager_properties(bytes, SEALED_FRAGMENT, "no").map(|_| ())
 }
 
 #[cfg(feature = "test-support")]

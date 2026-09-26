@@ -2,9 +2,23 @@
 
 use crate::linux::private_host_prerequisites::{
     parse_control_tokens_for_test, parse_manager_properties_for_test, parse_proc_cgroup_for_test,
+    parse_sealed_manager_properties_for_test,
 };
 
 const MANAGER: &str = "InvocationID=0123456789abcdef0123456789abcdef\nMainPID=4321\nActiveState=active\nSubState=running\nNeedDaemonReload=no\nFragmentPath=/usr/lib/systemd/system/memcordon-sealed-network-launcher.service\nDropInPaths=\nControlGroup=/system.slice/memcordon-sealed-network-launcher.service\nDelegate=yes\n";
+
+#[test]
+fn decision_only_generation_uses_sealed_service_not_network_broker() {
+    let sealed = MANAGER
+        .replace(
+            "memcordon-sealed-network-launcher.service",
+            "memcordon-sealed-agent.service",
+        )
+        .replace("Delegate=yes", "Delegate=no");
+    assert!(parse_sealed_manager_properties_for_test(sealed.as_bytes()).is_ok());
+    assert!(parse_manager_properties_for_test(sealed.as_bytes()).is_err());
+    assert!(parse_sealed_manager_properties_for_test(MANAGER.as_bytes()).is_err());
+}
 
 #[test]
 fn manager_generation_requires_exact_current_unit_properties() {

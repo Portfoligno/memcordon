@@ -32,6 +32,15 @@ pub fn public_v2_argv(
     report_path: &Path,
     fixture_path: &Path,
 ) -> Result<Vec<OsString>> {
+    public_v2_argv_with_expected_plan(contract_path, report_path, fixture_path, None)
+}
+
+pub fn public_v2_argv_with_expected_plan(
+    contract_path: &Path,
+    report_path: &Path,
+    fixture_path: &Path,
+    expected_plan_path: Option<&Path>,
+) -> Result<Vec<OsString>> {
     if [contract_path, report_path, fixture_path]
         .into_iter()
         .any(|path| !path.is_absolute() || path.as_os_str().is_empty())
@@ -43,15 +52,27 @@ pub fn public_v2_argv(
             "public V2 contract, report and fixture paths must be distinct absolute paths".into(),
         ));
     }
-    Ok(vec![
+    if expected_plan_path.is_some_and(|path| {
+        !path.is_absolute() || [contract_path, report_path, fixture_path].contains(&path)
+    }) {
+        return Err(CiError::Message(
+            "public V2 expected plan path must be a distinct absolute path".into(),
+        ));
+    }
+    let mut argv = vec![
         OsString::from("--sealed"),
         OsString::from("--workload-contract"),
         contract_path.as_os_str().to_owned(),
         OsString::from("--report"),
         report_path.as_os_str().to_owned(),
-        OsString::from("--"),
-        fixture_path.as_os_str().to_owned(),
-    ])
+    ];
+    if let Some(path) = expected_plan_path {
+        argv.push(OsString::from("--expected-private-plan"));
+        argv.push(path.as_os_str().to_owned());
+    }
+    argv.push(OsString::from("--"));
+    argv.push(fixture_path.as_os_str().to_owned());
+    Ok(argv)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -305,7 +326,7 @@ pub fn read_structural_public_v2_report_presence(
 }
 
 #[cfg(unix)]
-fn read_public_v2_report_bytes(path: &Path, report_owner_uid: u32) -> Result<Vec<u8>> {
+pub(crate) fn read_public_v2_report_bytes(path: &Path, report_owner_uid: u32) -> Result<Vec<u8>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     if !path.is_absolute() {

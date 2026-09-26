@@ -1288,6 +1288,106 @@ fn execute_private_v2(
     };
     use memcordon_platform::{PrivateLaunchErrorV2, PrivateServiceResultV2};
 
+    let expected_plan = match args.expected_private_plan.as_ref() {
+        Some(path) => {
+            use std::io::Read;
+            let read = || -> Result<_, String> {
+                let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+                let limit = memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES;
+                if !file
+                    .metadata()
+                    .map_err(|error| error.to_string())?
+                    .is_file()
+                {
+                    return Err("expected private plan must be a regular file".into());
+                }
+                let mut bytes = Vec::new();
+                file.take(limit as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| error.to_string())?;
+                if bytes.len() > limit {
+                    return Err("expected private plan exceeds byte bound".into());
+                }
+                memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+                let report: memcordon_core::workload_plan_v2::PrivatePlanReportV10 =
+                    serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+                let memcordon_core::workload_plan_v2::PrivatePlanAvailabilityV2::Available {
+                    receipt,
+                } = report.availability
+                else {
+                    return Err("expected private plan is unavailable".into());
+                };
+                if report.schema_version != 10
+                    || report.launch_proof
+                    || report.contract_digest != receipt.contract_digest
+                    || receipt.schema_version != 3
+                {
+                    return Err("expected private plan report binding differs".into());
+                }
+                Ok(receipt)
+            };
+            match read() {
+                Ok(receipt) => Some(receipt),
+                Err(error) => {
+                    let mut out = presentation.stderr();
+                    presentation::write_runtime_error(
+                        &mut out,
+                        format!("MCUSAGE-EXPECTED-PRIVATE-PLAN: {error}"),
+                    )
+                    .expect("expected private plan diagnostic should be writable");
+                    return 125;
+                }
+            }
+        }
+        None => None,
+    };
+
+    let frozen_contract = match args.frozen_private_contract.as_ref() {
+        Some(path) => {
+            use std::io::Read;
+            let read = || -> Result<_, String> {
+                let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+                let limit = memcordon_core::workload_limits::PUBLIC_OBJECT_BYTES;
+                let metadata = file.metadata().map_err(|error| error.to_string())?;
+                if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit as u64 {
+                    return Err("frozen private contract file bound differs".into());
+                }
+                let mut bytes = Vec::new();
+                file.take(limit as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| error.to_string())?;
+                if bytes.len() as u64 != metadata.len() {
+                    return Err("frozen private contract file changed".into());
+                }
+                memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
+                let memcordon_core::workload_contract::WorkloadContract::V2(frozen) =
+                    memcordon_core::workload_contract::WorkloadContract::parse(&bytes)?
+                else {
+                    return Err("frozen private contract must be V2".into());
+                };
+                if !memcordon_core::private_release_branch_v1::one_policy_port_changed(
+                    contract, &frozen,
+                ) {
+                    return Err("frozen private contract is not one port change".into());
+                }
+                Ok(frozen)
+            };
+            match read() {
+                Ok(contract) => Some(contract),
+                Err(error) => {
+                    let mut out = presentation.stderr();
+                    presentation::write_runtime_error(
+                        &mut out,
+                        format!("MCUSAGE-FROZEN-PRIVATE-CONTRACT: {error}"),
+                    )
+                    .expect("frozen private contract diagnostic should be writable");
+                    return 125;
+                }
+            }
+        }
+        None => None,
+    };
+
     let (result, exit_code, diagnostic) = if args.policy.restart || args.policy.restart_on.is_some()
     {
         (
@@ -1298,12 +1398,38 @@ fn execute_private_v2(
             Some("MCWORKLOAD-V2-RESTART-UNAVAILABLE: automatic restart was not attempted".to_owned()),
         )
     } else {
-        match memcordon_platform::execute_private_v2(
-            &args.policy.policy(&args.budgets),
-            command,
-            contract,
-            memcordon_platform::AttemptContext::default(),
-        ) {
+        let policy = args.policy.policy(&args.budgets);
+        let result = if args.reuse_private_two_attempts {
+            memcordon_platform::execute_private_v2_reuse_pair(
+                &policy,
+                command,
+                contract,
+                memcordon_platform::AttemptContext::default(),
+                expected_plan.as_ref(),
+                4,
+            )
+        } else {
+            match frozen_contract.as_ref() {
+                Some(tampered) => memcordon_platform::execute_private_v2_frozen_port_rejection(
+                    &policy,
+                    command,
+                    contract,
+                    tampered,
+                    memcordon_platform::AttemptContext::default(),
+                    expected_plan
+                        .as_ref()
+                        .expect("CLI parser required frozen expected plan"),
+                ),
+                None => memcordon_platform::execute_private_v2_with_expected_plan(
+                    &policy,
+                    command,
+                    contract,
+                    memcordon_platform::AttemptContext::default(),
+                    expected_plan.as_ref(),
+                ),
+            }
+        };
+        match result {
             Ok(PrivateServiceResultV2::Complete(terminal)) => {
                 let exit_code = match &terminal.report().outcome {
                     PrivateTerminalOutcomeV11::Exited { code } if (0..=255).contains(code) => *code,

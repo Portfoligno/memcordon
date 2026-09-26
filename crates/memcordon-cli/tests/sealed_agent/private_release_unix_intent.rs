@@ -82,6 +82,11 @@ fn proc_unix_absence_compares_complete_endpoint_fields() {
     );
     assert!(proc_unix_endpoint_absent(&inventory, "@spaced endpoint").unwrap());
     assert!(!proc_unix_endpoint_absent(&inventory, "@other spaced endpoint").unwrap());
+    inventory.extend_from_slice(
+        b"00000003: 00000001 00000000 00000000 0001 01 44  leading space.sock\n",
+    );
+    assert!(!proc_unix_endpoint_absent(&inventory, " leading space.sock").unwrap());
+    assert!(proc_unix_endpoint_absent(&inventory, "leading space.sock").unwrap());
     inventory.pop();
     assert!(proc_unix_endpoint_absent(&inventory, "@memcordon-private-unix-name").is_err());
 }

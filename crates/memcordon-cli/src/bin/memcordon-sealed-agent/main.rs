@@ -26,10 +26,25 @@ Usage:
   memcordon-sealed-agent --version
   memcordon-sealed-agent package inspect [--json]
   memcordon-sealed-agent package verify [--json]
+  memcordon-sealed-agent package verify-private-host --json
+  memcordon-sealed-agent package register-public-release-case --selector SELECTOR --challenge HEX --pid PID --start-time-ticks TICKS
+  memcordon-sealed-agent package verify-public-release-provider --selector SELECTOR --challenge HEX --json
+  memcordon-sealed-agent package verify-public-spoof --selector private_tcp::caller_identity_and_epoch_bound --challenge HEX --json
+  memcordon-sealed-agent package public-abi-outer-control --selector private_tcp::abi_alternate_entry_denied --challenge HEX --dispatch-key HEX
+  memcordon-sealed-agent public-abi-filtered-target --challenge HEX
+  memcordon-sealed-agent package public-reuse-hold --selector private_tcp::retirement_failure_blocks_reuse --challenge HEX --dispatch-key HEX
+  memcordon-sealed-agent package public-reuse-release --selector private_tcp::retirement_failure_blocks_reuse --challenge HEX --dispatch-key HEX
+  memcordon-sealed-agent package public-reuse-recover --selector private_tcp::retirement_failure_blocks_reuse --challenge HEX --dispatch-key HEX
+  memcordon-sealed-agent package public-reuse-verify --selector private_tcp::retirement_failure_blocks_reuse --challenge HEX --dispatch-key HEX
+  memcordon-sealed-agent package public-reuse-release-and-recover --selector private_tcp::retirement_failure_blocks_reuse --challenge HEX --dispatch-key HEX
+  memcordon-sealed-agent package replay-public-release-epoch --selector private_tcp::caller_identity_and_epoch_bound --challenge E0_HEX --json
+  memcordon-sealed-agent package verify-public-epoch-handoff --selector private_tcp::caller_identity_and_epoch_bound --e0-challenge E0_HEX --e1-challenge E1_HEX --json
   memcordon-sealed-agent package qualify-private
   memcordon-sealed-agent package release-case --stage STAGE --selector SELECTOR --challenge HEX
-  memcordon-sealed-agent package install [--ephemeral-ci]
-  memcordon-sealed-agent package upgrade [--ephemeral-ci]
+  memcordon-sealed-agent package release-case-abi-raw --stage candidate-capability --selector private_tcp::abi_alternate_entry_denied --challenge HEX
+  memcordon-sealed-agent package release-case-epoch-replay --stage candidate-capability --selector private_tcp::native_tcp_bind_listen_connect --challenge HEX
+  memcordon-sealed-agent package install [--ephemeral-ci [--archive-path A --archive-certificate CERT]]
+  memcordon-sealed-agent package upgrade [--ephemeral-ci [--archive-path A --archive-certificate CERT]]
   memcordon-sealed-agent package uninstall [--ephemeral-ci]
 
 Provider installation and mutation require root. Inspection is credential-free.
@@ -53,6 +68,19 @@ fn main() {
         [command] if command == "launch-broker" => launch_broker(),
         #[cfg(target_os = "linux")]
         [command] if command == "network-launch-broker" => linux::launcher::serve_network(),
+        #[cfg(target_os = "linux")]
+        [command, flag, challenge]
+            if command == "public-abi-filtered-target" && flag == "--challenge" =>
+        {
+            challenge
+                .to_str()
+                .ok_or("public ABI challenge is not UTF-8".to_owned())
+                .and_then(linux::private_public_abi_filtered::run)
+        }
+        #[cfg(target_os = "linux")]
+        [command, challenge] if command == "policy-decision-peer" => {
+            linux::private_policy_decision_peer::run_nonroot_peer(challenge.as_os_str())
+        }
         [command] if command == "probe" => probe(),
         [command] if command == "qualify" => qualify(),
         #[cfg(target_os = "linux")]
@@ -68,8 +96,183 @@ fn main() {
             linux::private_release_case::run_candidate_fixture(selector)
         }
         #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            selector_flag,
+            selector,
+            challenge_flag,
+            challenge,
+            key_flag,
+            key,
+        ] if package == "package"
+            && (operation == "public-reuse-hold"
+                || operation == "public-reuse-release"
+                || operation == "public-reuse-recover"
+                || operation == "public-reuse-verify"
+                || operation == "public-reuse-release-and-recover")
+            && selector_flag == "--selector"
+            && challenge_flag == "--challenge"
+            && key_flag == "--dispatch-key" =>
+        {
+            package::public_reuse_operation(operation, selector, challenge, key)
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            selector_flag,
+            selector,
+            challenge_flag,
+            challenge,
+            key_flag,
+            key,
+        ] if package == "package"
+            && operation == "public-abi-outer-control"
+            && selector_flag == "--selector"
+            && challenge_flag == "--challenge"
+            && key_flag == "--dispatch-key" =>
+        {
+            package::public_abi_outer_control(selector, challenge, key)
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            selector_flag,
+            selector,
+            challenge_flag,
+            challenge,
+            pid_flag,
+            pid,
+            start_flag,
+            start,
+        ] if package == "package"
+            && operation == "register-public-release-case"
+            && selector_flag == "--selector"
+            && challenge_flag == "--challenge"
+            && pid_flag == "--pid"
+            && start_flag == "--start-time-ticks" =>
+        {
+            package::register_public_release_case(selector, challenge, pid, start)
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            selector_flag,
+            selector,
+            challenge_flag,
+            challenge,
+            json,
+        ] if package == "package"
+            && operation == "verify-public-release-provider"
+            && selector_flag == "--selector"
+            && challenge_flag == "--challenge"
+            && json == "--json" =>
+        {
+            package::verify_public_release_provider(selector, challenge)
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            selector_flag,
+            selector,
+            challenge_flag,
+            challenge,
+            json,
+        ] if package == "package"
+            && operation == "verify-public-spoof"
+            && selector_flag == "--selector"
+            && challenge_flag == "--challenge"
+            && json == "--json" =>
+        {
+            package::verify_public_spoof(selector, challenge)
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            selector_flag,
+            selector,
+            challenge_flag,
+            challenge,
+            json,
+        ] if package == "package"
+            && operation == "replay-public-release-epoch"
+            && selector_flag == "--selector"
+            && challenge_flag == "--challenge"
+            && json == "--json" =>
+        {
+            selector
+                .to_str()
+                .ok_or("final-public selector is not UTF-8".to_owned())
+                .and_then(|selector| {
+                    challenge
+                        .to_str()
+                        .ok_or("final-public challenge is not UTF-8".to_owned())
+                        .and_then(|challenge| {
+                            linux::private_public_provider::replay_public_epoch(selector, challenge)
+                        })
+                })
+                .map(|record| println!("{record}"))
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            selector_flag,
+            selector,
+            e0_flag,
+            e0,
+            e1_flag,
+            e1,
+            json,
+        ] if package == "package"
+            && operation == "verify-public-epoch-handoff"
+            && selector_flag == "--selector"
+            && e0_flag == "--e0-challenge"
+            && e1_flag == "--e1-challenge"
+            && json == "--json" =>
+        {
+            selector
+                .to_str()
+                .ok_or("final-public selector is not UTF-8".to_owned())
+                .and_then(|selector| {
+                    let e0 = e0.to_str().ok_or("E0 challenge is not UTF-8".to_owned())?;
+                    let e1 = e1.to_str().ok_or("E1 challenge is not UTF-8".to_owned())?;
+                    linux::private_public_provider::verify_public_epoch_handoff(selector, e0, e1)
+                })
+                .map(|record| println!("{record}"))
+        }
+        #[cfg(target_os = "linux")]
         [command] if command == "private-release-unix-intent" => {
             linux::private_release_unix_intent::run_target_fixture()
+        }
+        #[cfg(target_os = "linux")]
+        [package, operation]
+            if package == "package" && operation == "private-kernel-known-actions" =>
+        {
+            linux::private_probe_known_actions::run()
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            challenge_flag,
+            challenge,
+            branch_flag,
+            branch,
+        ] if package == "package"
+            && operation == "release-case-policy-branches"
+            && challenge_flag == "--challenge"
+            && branch_flag == "--branch" =>
+        {
+            linux::private_release_case::run_policy_branch_raw(
+                challenge.as_os_str(),
+                branch.as_os_str(),
+            )
         }
         #[cfg(target_os = "linux")]
         [
@@ -93,6 +296,52 @@ fn main() {
                 challenge.as_os_str(),
             )
             .and_then(linux::private_release_case::run)
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            stage_flag,
+            stage,
+            selector_flag,
+            selector,
+            challenge_flag,
+            challenge,
+        ] if package == "package"
+            && operation == "release-case-abi-raw"
+            && stage_flag == "--stage"
+            && selector_flag == "--selector"
+            && challenge_flag == "--challenge" =>
+        {
+            linux::private_release_case::ReleaseCaseRequestV1::parse(
+                stage.as_os_str(),
+                selector.as_os_str(),
+                challenge.as_os_str(),
+            )
+            .and_then(linux::private_release_case::run_abi_raw)
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            stage_flag,
+            stage,
+            selector_flag,
+            selector,
+            challenge_flag,
+            challenge,
+        ] if package == "package"
+            && operation == "release-case-epoch-replay"
+            && stage_flag == "--stage"
+            && selector_flag == "--selector"
+            && challenge_flag == "--challenge" =>
+        {
+            linux::private_release_case::ReleaseCaseRequestV1::parse(
+                stage.as_os_str(),
+                selector.as_os_str(),
+                challenge.as_os_str(),
+            )
+            .and_then(linux::private_release_run::run_historical_epoch_replay)
         }
         #[cfg(target_os = "windows")]
         [command] if command == "windows-control" => windows::control(),
@@ -233,6 +482,32 @@ fn main() {
         }
         [package, operation, option] if package == "package" && option == "--ephemeral-ci" => {
             package::run(operation, false, true, None)
+        }
+        #[cfg(target_os = "linux")]
+        [
+            package,
+            operation,
+            ephemeral,
+            archive_flag,
+            archive_path,
+            certificate_flag,
+            certificate_path,
+        ] if package == "package"
+            && (operation == "install" || operation == "upgrade")
+            && ephemeral == "--ephemeral-ci"
+            && archive_flag == "--archive-path"
+            && certificate_flag == "--archive-certificate" =>
+        {
+            package::run_with_archive(
+                operation,
+                false,
+                true,
+                None,
+                Some((
+                    std::path::Path::new(archive_path),
+                    std::path::Path::new(certificate_path),
+                )),
+            )
         }
         #[cfg(target_os = "windows")]
         [

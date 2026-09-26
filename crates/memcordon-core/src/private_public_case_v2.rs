@@ -138,6 +138,10 @@ impl FinalPublicCaseEvidenceV2 {
             &self.observation,
         )?;
         let observation_digests: Vec<&DiagnosticSha256> = match &self.observation {
+            PrivateReleaseObservationV1::PolicyComposite { .. }
+            | PrivateReleaseObservationV1::AbiComposite { .. } => {
+                return Err("candidate composite is not final-public evidence".into());
+            }
             PrivateReleaseObservationV1::PreallocationRejected {
                 observer_sha256, ..
             } => vec![observer_sha256],
@@ -258,6 +262,10 @@ impl FinalPublicCaseEvidenceV2 {
             .find(|attachment| attachment.role == PrivateReleaseAttachmentRoleV1::Observer)
             .expect("fixed attachment roles contain observer");
         let observed = match &self.observation {
+            PrivateReleaseObservationV1::PolicyComposite { .. }
+            | PrivateReleaseObservationV1::AbiComposite { .. } => {
+                return Err("candidate composite is not final-public evidence".into());
+            }
             PrivateReleaseObservationV1::PreallocationRejected {
                 observer_sha256, ..
             } => observer_sha256,

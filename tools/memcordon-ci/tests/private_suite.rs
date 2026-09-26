@@ -192,6 +192,10 @@ fn private_suite_cli_requires_exact_stage_and_target() {
             "candidate-capability",
             "--target",
             "x86_64-unknown-linux-musl",
+            "--collector-intent-sha256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--policy-intent-sha256",
+            "2222222222222222222222222222222222222222222222222222222222222222",
         ])
         .output()
         .unwrap();
@@ -209,6 +213,10 @@ fn private_suite_cli_requires_exact_stage_and_target() {
             "candidate-capability",
             "--target",
             "native",
+            "--collector-intent-sha256",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "--policy-intent-sha256",
+            "2222222222222222222222222222222222222222222222222222222222222222",
         ])
         .output()
         .unwrap();

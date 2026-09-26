@@ -470,6 +470,7 @@ pub struct PrivateAttemptOwner<J: PrivateNativeJournal = DurablePrivateAttempt> 
     status: Option<File>,
     expected_descriptors: Option<ExpectedGatedDescriptorInventory>,
     entrypoint_digest: Option<DiagnosticSha256>,
+    entrypoint_device_inode: Option<(u64, u64)>,
     gated_descriptors: Option<GatedDescriptorProof>,
     monitor_outcome: Option<PrivateMonitorOutcome>,
 }
@@ -494,6 +495,7 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             status: None,
             expected_descriptors: None,
             entrypoint_digest: None,
+            entrypoint_device_inode: None,
             gated_descriptors: None,
             monitor_outcome: None,
         })
@@ -585,6 +587,8 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
         self.control = Some(prelaunch.provider_control);
         self.expected_descriptors = Some(prelaunch.expected_descriptors);
         self.entrypoint_digest = Some(prelaunch.entrypoint_digest);
+        self.entrypoint_device_inode =
+            Some((prelaunch.entrypoint_device, prelaunch.entrypoint_inode));
         Ok(prelaunch.target)
     }
 
@@ -846,6 +850,30 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
             target.clone(),
             readback.network_namespace.inode,
         )?;
+        let (device, inode) = self
+            .entrypoint_device_inode
+            .ok_or("MCSEALED-PRIVATE-OWNER: pinned entrypoint object identity absent")?;
+        let digest = self
+            .entrypoint_digest
+            .as_ref()
+            .ok_or("MCSEALED-PRIVATE-OWNER: pinned entrypoint digest absent")?;
+        super::private_public_provider::observe_gated_entrypoint(
+            self.record
+                .as_ref()
+                .expect("durable record remains owned")
+                .attempt_id(),
+            digest,
+            device,
+            inode,
+        )?;
+        super::private_public_reuse::gated_target(
+            self.record
+                .as_ref()
+                .expect("durable record remains owned")
+                .attempt_id(),
+            &target,
+            readback.network_namespace.inode,
+        )?;
         Ok(PrivateObservedTarget {
             native: readback,
             network,
@@ -864,11 +892,18 @@ impl<J: PrivateNativeJournal> PrivateAttemptOwner<J> {
         if self.record_mut().phase() != PrivateAttemptPhase::TargetGated || self.relay.is_some() {
             return Err("MCSEALED-PRIVATE-RELAY: target is not gated".into());
         }
+        let capture_abi = super::private_public_provider::abi_filtered_attempt_reserved(
+            self.record_mut().attempt_id(),
+        )?;
         let provider = self
             .stdio
             .take()
             .ok_or("MCSEALED-PRIVATE-RELAY: provider pipes absent")?;
-        self.relay = Some(PrivateRelay::prepare(provider, frontend)?);
+        let mut relay = PrivateRelay::prepare(provider, frontend)?;
+        if capture_abi {
+            relay.capture_public_abi_stdout();
+        }
+        self.relay = Some(relay);
         Ok(())
     }
 }
@@ -882,6 +917,7 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         observed: PrivateObservedTarget,
         authority: &crate::package::VerifiedInstalledPrivateAuthorityLease,
     ) -> Result<PrivateTcpCheckpointV2, String> {
+        authority.revalidate_release_boundary()?;
         self.validate_gated_native_resources(&observed)?;
         let record = self.record.as_ref().expect("owner retains record").record();
         let admission = record
@@ -2085,7 +2121,34 @@ impl PrivateAttemptOwner<DurablePrivateAttempt> {
         self.record_mut().retiring()?;
         let checkpoint: Option<PrivateTcpCheckpointV2> =
             self.record_mut().record().checkpoint.clone();
-        let completed = self.settle_native_resources(deadline);
+        let monitored_completion = self.monitor_outcome == Some(PrivateMonitorOutcome::Completed);
+        let abi_report = (|| -> Result<Option<Vec<u8>>, String> {
+            if !monitored_completion
+                || !super::private_public_provider::abi_filtered_attempt_reserved(
+                    self.record_mut().attempt_id(),
+                )?
+            {
+                return Ok(None);
+            }
+            Ok(Some(
+                self.relay
+                    .as_mut()
+                    .ok_or("MCSEALED-PUBLIC-ABI-FILTERED: target relay absent")?
+                    .take_public_abi_stdout()?,
+            ))
+        })();
+        let completed = self.settle_native_resources(deadline).and_then(|code| {
+            if let Some(raw) = abi_report? {
+                super::private_public_abi_filtered::persist_protected_report(
+                    self.record_mut().record(),
+                    &raw,
+                )?;
+            }
+            if monitored_completion {
+                super::private_public_reuse::retire_obstructed(self.record_mut().record())?;
+            }
+            Ok(code)
+        });
         let candidate_exit_code = match completed {
             Ok(code) => code,
             Err(error) => {

@@ -30,6 +30,9 @@ pub(crate) struct VerifiedInstalledPrivateAuthority {
     filter_abi: crate::linux::network_filter::NativeAbi,
     filter_digest: DiagnosticSha256,
     active_host_receipt_sha256: DiagnosticSha256,
+    certificate_sha256: String,
+    trust_policy_sha256: String,
+    release_sequence: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -160,6 +163,35 @@ pub(crate) struct VerifiedInstalledPrivateReportBinding {
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Accessors become live when the routed V4 checkpoint producer is integrated.
 impl VerifiedInstalledPrivateAuthorityLease {
+    /// Called immediately before the durable release decision, while this
+    /// package-generation guard is still retained. A policy refresh or
+    /// revocation between admission and release closes the attempt.
+    pub(crate) fn revalidate_release_boundary(&self) -> Result<(), String> {
+        let candidate = crate::linux::runtime_manifest::source_v3_candidate(Path::new(BINARY))?
+            .ok_or("MCSEALED-PRIVATE-QUALIFICATION: M1 disappeared before release")?;
+        let release =
+            crate::linux::installed_release_qualification::verify_anchored_native_qualification(
+                &candidate,
+            )?;
+        if release.certificate_sha256() != self.authority.certificate_sha256
+            || release.policy_sha256() != self.authority.trust_policy_sha256
+            || release.release_sequence() != self.authority.release_sequence
+            || candidate.qualification_sha256.as_ref() != Some(&self.authority.qualification_digest)
+            || memcordon_core::workload_codec::hash_bytes(&candidate.manifest_bytes)
+                != self.authority.runtime_manifest_sha256
+        {
+            return Err(
+                "MCSEALED-PRIVATE-QUALIFICATION: release trust changed before release".into(),
+            );
+        }
+        let host = crate::linux::private_host_receipt::read_current_active(&release)?
+            .ok_or("MCSEALED-PRIVATE-QUALIFICATION: H1 disappeared before release")?;
+        if host.receipt_sha256() != &self.authority.active_host_receipt_sha256 {
+            return Err("MCSEALED-PRIVATE-QUALIFICATION: H1 changed before release".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn source_commit(&self) -> &str {
         &self.authority.source_commit
     }
@@ -283,9 +315,54 @@ pub(crate) struct PackageInstallationEpochV1 {
 #[cfg(target_os = "linux")]
 pub(crate) struct LinuxSourceSnapshot {
     pub(crate) agent_bytes: Vec<u8>,
+    pub(crate) arm32_helper_bytes: Option<Vec<u8>>,
     pub(crate) manifest_bytes: Vec<u8>,
     pub(crate) qualification: Option<(std::path::PathBuf, Vec<u8>)>,
+    pub(crate) release_build: Option<(std::path::PathBuf, Vec<u8>)>,
+    pub(crate) release_certificate: Option<(std::path::PathBuf, Vec<u8>)>,
     pub(crate) v3: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn release_proof_paths(target: &str) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let short = match target {
+        "x86_64-unknown-linux-gnu" => "x64",
+        "aarch64-unknown-linux-gnu" => "arm64",
+        _ => return Err("package release proof target differs".into()),
+    };
+    let root = Path::new("certification/workload");
+    Ok((
+        root.join(format!("{short}-private-build-v1.json")),
+        root.join(format!("{short}-private-cq-v1.json")),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn read_source_release_proofs(
+    root: &Path,
+    target: &str,
+    qualified: bool,
+) -> Result<
+    (
+        Option<(std::path::PathBuf, Vec<u8>)>,
+        Option<(std::path::PathBuf, Vec<u8>)>,
+    ),
+    String,
+> {
+    if !qualified {
+        return Ok((None, None));
+    }
+    let (build, certificate) = release_proof_paths(target)?;
+    let build_bytes = read_source_regular(&root.join(&build), 1024 * 1024, 0o644)?;
+    let certificate_bytes = read_source_regular(&root.join(&certificate), 64 * 1024, 0o644)?;
+    if build_bytes.is_empty() || certificate_bytes.is_empty() {
+        return Err("package release proof bytes absent".into());
+    }
+    let installed_root = Path::new(INSTALLED_QUALIFICATION_ROOT);
+    Ok((
+        Some((installed_root.join(build), build_bytes)),
+        Some((installed_root.join(certificate), certificate_bytes)),
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -356,10 +433,26 @@ pub(crate) fn linux_source_snapshot(source: &Path) -> Result<LinuxSourceSnapshot
                 }
                 None => None,
             };
+            let (release_build, release_certificate) = read_source_release_proofs(
+                Path::new(INSTALLED_QUALIFICATION_ROOT),
+                &candidate.manifest.target,
+                qualification.is_some(),
+            )?;
             return Ok(LinuxSourceSnapshot {
                 agent_bytes,
+                arm32_helper_bytes: (candidate.manifest.target == "aarch64-unknown-linux-gnu")
+                    .then(|| {
+                        read_source_regular(
+                            Path::new(crate::linux::runtime_manifest::INSTALLED_ARM32_HELPER),
+                            1024 * 1024,
+                            0o755,
+                        )
+                    })
+                    .transpose()?,
                 manifest_bytes: candidate.manifest_bytes,
                 qualification,
+                release_build,
+                release_certificate,
                 v3: true,
             });
         }
@@ -377,6 +470,15 @@ pub(crate) fn linux_source_snapshot(source: &Path) -> Result<LinuxSourceSnapshot
     if let Some(bytes) = manifest_bytes {
         if let VersionedRuntimeManifest::V3(manifest) = VersionedRuntimeManifest::parse(&bytes)? {
             let public = read_source_regular(&parent.join("memcordon"), 128 * 1024 * 1024, 0o755)?;
+            let arm32_helper_bytes = (manifest.target == "aarch64-unknown-linux-gnu")
+                .then(|| {
+                    read_source_regular(
+                        &parent.join("memcordon-arm32-abi-helper"),
+                        1024 * 1024,
+                        0o755,
+                    )
+                })
+                .transpose()?;
             let SealedRuntimeV3::WorkloadV2 { profiles, .. } = &manifest.sealed else {
                 return Err("package V3 source lacks workload protocol".into());
             };
@@ -410,16 +512,22 @@ pub(crate) fn linux_source_snapshot(source: &Path) -> Result<LinuxSourceSnapshot
                     return Err("package V3 private profile is unsupported".into());
                 }
             };
+            let (release_build, release_certificate) =
+                read_source_release_proofs(parent, &manifest.target, qualification.is_some())?;
             crate::linux::installed_release_qualification::from_exact_bytes(
                 bytes.clone(),
                 &agent_bytes,
                 &public,
+                arm32_helper_bytes.as_deref(),
                 qualification.as_ref().map(|(_, bytes)| bytes.clone()),
             )?;
             return Ok(LinuxSourceSnapshot {
                 agent_bytes,
+                arm32_helper_bytes,
                 manifest_bytes: bytes,
                 qualification,
+                release_build,
+                release_certificate,
                 v3: true,
             });
         }
@@ -427,8 +535,11 @@ pub(crate) fn linux_source_snapshot(source: &Path) -> Result<LinuxSourceSnapshot
     let legacy_manifest = crate::linux::runtime_manifest::source(source, &agent_bytes)?;
     Ok(LinuxSourceSnapshot {
         agent_bytes,
+        arm32_helper_bytes: None,
         manifest_bytes: legacy_manifest,
         qualification: None,
+        release_build: None,
+        release_certificate: None,
         v3: false,
     })
 }
@@ -439,6 +550,25 @@ pub fn run(
     ephemeral_ci: bool,
     qualification_artifact_directory: Option<&Path>,
 ) -> Result<(), String> {
+    run_with_archive(
+        operation,
+        json,
+        ephemeral_ci,
+        qualification_artifact_directory,
+        None,
+    )
+}
+
+pub fn run_with_archive(
+    operation: &OsStr,
+    json: bool,
+    ephemeral_ci: bool,
+    qualification_artifact_directory: Option<&Path>,
+    archive: Option<(&Path, &Path)>,
+) -> Result<(), String> {
+    if archive.is_some() && (operation != "install" && operation != "upgrade" || !ephemeral_ci) {
+        return Err("signed A is valid only for ephemeral final install or upgrade".into());
+    }
     if operation == "inspect" {
         if ephemeral_ci {
             return Err("--ephemeral-ci is valid only for package mutations".to_owned());
@@ -461,6 +591,13 @@ pub fn run(
         return render_installed_inspection(&installed_inspection()?, json);
     }
     #[cfg(target_os = "linux")]
+    if operation == "verify-private-host" {
+        if !json || ephemeral_ci || qualification_artifact_directory.is_some() {
+            return Err("verify-private-host requires only --json".into());
+        }
+        return verify_private_host_json();
+    }
+    #[cfg(target_os = "linux")]
     if operation == "qualify-private" {
         if json || ephemeral_ci || qualification_artifact_directory.is_some() {
             return Err("qualify-private accepts no modifiers or external artifacts".into());
@@ -477,17 +614,139 @@ pub fn run(
                 "external qualification artifacts are available only on Windows".to_owned(),
             );
         }
-        linux_mutation(operation, ephemeral_ci)
+        linux_mutation(operation, ephemeral_ci, archive)
     }
     #[cfg(target_os = "windows")]
     {
+        if archive.is_some() {
+            return Err("signed A is Linux-only".into());
+        }
         crate::windows::package::mutate(operation, ephemeral_ci, qualification_artifact_directory)
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        let _ = (ephemeral_ci, qualification_artifact_directory);
+        let _ = (ephemeral_ci, qualification_artifact_directory, archive);
         Err("provider package mutation is unavailable on this platform".to_owned())
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn register_public_release_case(
+    selector: &std::ffi::OsStr,
+    challenge: &std::ffi::OsStr,
+    pid: &std::ffi::OsStr,
+    start_time_ticks: &std::ffi::OsStr,
+) -> Result<(), String> {
+    let selector = selector
+        .to_str()
+        .ok_or("final-public selector is not UTF-8")?;
+    let challenge = challenge
+        .to_str()
+        .ok_or("final-public challenge is not UTF-8")?;
+    let pid = pid
+        .to_str()
+        .ok_or("final-public child pid is not UTF-8")?
+        .parse::<libc::pid_t>()
+        .map_err(|_| "final-public child pid syntax differs")?;
+    let start_time_ticks = start_time_ticks
+        .to_str()
+        .ok_or("final-public child start time is not UTF-8")?
+        .parse::<u64>()
+        .map_err(|_| "final-public child start time syntax differs")?;
+    crate::linux::private_public_provider::register(selector, challenge, pid, start_time_ticks)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn public_abi_outer_control(
+    selector: &std::ffi::OsStr,
+    challenge: &std::ffi::OsStr,
+    dispatch_key: &std::ffi::OsStr,
+) -> Result<(), String> {
+    crate::linux::private_public_abi_control::request_control(
+        selector
+            .to_str()
+            .ok_or("public ABI selector is not UTF-8")?,
+        challenge
+            .to_str()
+            .ok_or("public ABI challenge is not UTF-8")?,
+        dispatch_key.to_str().ok_or("public ABI key is not UTF-8")?,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn public_reuse_operation(
+    operation: &std::ffi::OsStr,
+    selector: &std::ffi::OsStr,
+    challenge: &std::ffi::OsStr,
+    dispatch_key: &std::ffi::OsStr,
+) -> Result<(), String> {
+    let selector = selector
+        .to_str()
+        .ok_or("public reuse selector is not UTF-8")?;
+    let challenge = challenge
+        .to_str()
+        .ok_or("public reuse challenge is not UTF-8")?;
+    let key = dispatch_key
+        .to_str()
+        .ok_or("public reuse key is not UTF-8")?;
+    match operation.to_str() {
+        Some("public-reuse-hold") => {
+            crate::linux::private_public_reuse::hold(selector, challenge, key)
+        }
+        Some("public-reuse-release") => {
+            crate::linux::private_public_reuse::release(selector, challenge, key)
+        }
+        Some("public-reuse-recover") => {
+            crate::linux::private_public_reuse::recover(selector, challenge, key)
+        }
+        Some("public-reuse-release-and-recover") => {
+            crate::linux::private_public_reuse::release_and_recover(selector, challenge, key)
+        }
+        Some("public-reuse-verify") => {
+            println!(
+                "{}",
+                crate::linux::private_public_reuse::verify_completed(selector, challenge, key)?
+            );
+            Ok(())
+        }
+        _ => Err("public reuse operation differs".into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_public_release_provider(
+    selector: &std::ffi::OsStr,
+    challenge: &std::ffi::OsStr,
+) -> Result<(), String> {
+    let selector = selector
+        .to_str()
+        .ok_or("final-public selector is not UTF-8")?;
+    let challenge = challenge
+        .to_str()
+        .ok_or("final-public challenge is not UTF-8")?;
+    println!(
+        "{}",
+        crate::linux::private_public_provider::verify_completed(selector, challenge)?
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_public_spoof(
+    selector: &std::ffi::OsStr,
+    challenge: &std::ffi::OsStr,
+) -> Result<(), String> {
+    let selector = selector
+        .to_str()
+        .ok_or("final-public spoof selector is not UTF-8")?;
+    let challenge = challenge
+        .to_str()
+        .ok_or("final-public spoof challenge is not UTF-8")?;
+    println!(
+        "{}",
+        crate::linux::private_public_provider::verify_public_spoof(selector, challenge)?
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -517,6 +776,130 @@ fn qualify_private_host() -> Result<(), String> {
         ));
     }
     crate::linux::service::request_private_host_qualification()
+}
+
+#[cfg(target_os = "linux")]
+fn verify_private_host_json() -> Result<(), String> {
+    use memcordon_core::release_trust::SignedNativeQualificationCertificateV1;
+    use memcordon_core::workload_codec::hash_bytes;
+    use memcordon_core::workload_qualification_v2::QualificationArtifactV2;
+    use std::os::unix::fs::MetadataExt;
+
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("MCSEALED-PRIVATE-HOST: root readback required".into());
+    }
+    let current = std::fs::metadata(std::env::current_exe().map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let installed = std::fs::symlink_metadata(BINARY).map_err(|error| error.to_string())?;
+    if !installed.is_file() || current.dev() != installed.dev() || current.ino() != installed.ino()
+    {
+        return Err("MCSEALED-PRIVATE-HOST: invoke the installed agent image".into());
+    }
+    // The lease retains the shared package-generation lock and proves current
+    // M1/Q/CQ/policy, active H1, epoch and enabled launcher before projection.
+    let lease = acquire_verified_private_qualification_lease()?;
+    let candidate = crate::linux::runtime_manifest::source_v3_candidate(Path::new(BINARY))?
+        .ok_or("MCSEALED-PRIVATE-HOST: installed M1 absent")?;
+    let release =
+        crate::linux::installed_release_qualification::verify_anchored_native_qualification(
+            &candidate,
+        )?;
+    let active = crate::linux::private_host_receipt::read_current_active(&release)?
+        .ok_or("MCSEALED-PRIVATE-HOST: active H1 absent")?;
+    let snapshot = linux_source_snapshot(Path::new(BINARY))?;
+    let qualification_bytes = candidate
+        .qualification_bytes()
+        .ok_or("MCSEALED-PRIVATE-HOST: Q absent")?;
+    let qualification: QualificationArtifactV2 =
+        serde_json::from_slice(qualification_bytes).map_err(|error| error.to_string())?;
+    let build_bytes = snapshot
+        .release_build
+        .as_ref()
+        .ok_or("MCSEALED-PRIVATE-HOST: B absent")?
+        .1
+        .as_slice();
+    let certificate_bytes = snapshot
+        .release_certificate
+        .as_ref()
+        .ok_or("MCSEALED-PRIVATE-HOST: CQ absent")?
+        .1
+        .as_slice();
+    let certificate = SignedNativeQualificationCertificateV1::parse(certificate_bytes)?;
+    if String::from(hash_bytes(&certificate.payload.canonical_bytes()?))
+        != release.certificate_sha256()
+        || certificate.payload.build_sha256 != String::from(hash_bytes(build_bytes))
+        || certificate.payload.qualification_sha256 != String::from(hash_bytes(qualification_bytes))
+        || active.receipt_sha256() != lease.active_host_receipt_sha256()
+        || active.installation_epoch() != lease.generation_digest()
+        || active.release_qualification_sha256() != lease.qualification_digest()
+    {
+        return Err("MCSEALED-PRIVATE-HOST: readback changed after trust verification".into());
+    }
+    let target = candidate.manifest.target.as_str();
+    let native_machine = match target {
+        "x86_64-unknown-linux-gnu" => "x86_64",
+        "aarch64-unknown-linux-gnu" => "aarch64",
+        _ => return Err("MCSEALED-PRIVATE-HOST: unsupported target".into()),
+    };
+    let component_hash = |id: &str| {
+        candidate
+            .manifest
+            .components
+            .iter()
+            .find(|component| component.id == id)
+            .map(|component| component.sha256.clone())
+    };
+    let public_cli_sha256 =
+        component_hash("public-cli").ok_or("MCSEALED-PRIVATE-HOST: public CLI absent")?;
+    let agent_sha256 =
+        component_hash("sealed-agent").ok_or("MCSEALED-PRIVATE-HOST: agent absent")?;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| error.to_string())?;
+    if boot_id.trim().is_empty() || boot_id.trim().len() > 64 {
+        return Err("MCSEALED-PRIVATE-HOST: boot identity differs".into());
+    }
+    lease.revalidate_release_boundary()?;
+    let final_active = crate::linux::private_host_receipt::read_current_active(&release)?
+        .ok_or("MCSEALED-PRIVATE-HOST: active H1 disappeared")?;
+    if final_active.run_nonce() != active.run_nonce()
+        || final_active.native_run_digest() != active.native_run_digest()
+        || final_active.host_prerequisites_digest() != active.host_prerequisites_digest()
+        || final_active.receipt_sha256() != active.receipt_sha256()
+    {
+        return Err("MCSEALED-PRIVATE-HOST: active H1 changed during readback".into());
+    }
+    let output = serde_json::json!({
+        "schema_version": 1,
+        "source_commit": candidate.manifest.source_commit,
+        "version": candidate.manifest.version,
+        "target": target,
+        "native_machine": native_machine,
+        "boot_id": boot_id.trim(),
+        "installation_epoch": String::from(lease.generation_digest().clone()),
+        "installed_runtime_manifest_sha256": String::from(hash_bytes(&candidate.manifest_bytes)),
+        "qualification_file_sha256": String::from(hash_bytes(qualification_bytes)),
+        "build_file_sha256": String::from(hash_bytes(build_bytes)),
+        "certificate_file_sha256": String::from(hash_bytes(certificate_bytes)),
+        "certificate_payload_sha256": release.certificate_sha256(),
+        "public_cli_sha256": public_cli_sha256,
+        "agent_sha256": agent_sha256,
+        "arm32_helper_sha256": component_hash("arm32-abi-helper"),
+        "component_sha256": String::from(qualification.component_digest),
+        "unit_sha256": String::from(qualification.unit_digest),
+        "filter_sha256": String::from(qualification.filter_digest),
+        "policy_sha256": release.policy_sha256(),
+        "policy_version": certificate.payload.policy_version,
+        "release_sequence": release.release_sequence(),
+        "active_h1_receipt_sha256": String::from(active.receipt_sha256().clone()),
+        "active_run_nonce": active.run_nonce(),
+        "native_run_digest": String::from(active.native_run_digest().clone()),
+        "host_prerequisites_digest": String::from(active.host_prerequisites_digest().clone()),
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&output).map_err(|error| error.to_string())?
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -719,39 +1102,53 @@ fn linux_installed_inspection_v6() -> Result<Option<LinuxInstalledInspectionV6>,
     Ok(Some(inspection))
 }
 
-/// The package lock stays held across installed readback and, once native host
-/// qualification is available, the caller's checkpoint and release. This
-/// constructor must use independent protected host evidence, never inspection
-/// output: inspection itself observes whether the private profile is ready.
+/// The package lock stays held across authenticated Q and current H1 readback,
+/// and through the caller's checkpoint and release decision.
 #[cfg(target_os = "linux")]
 pub(crate) fn acquire_verified_private_qualification_lease()
 -> Result<VerifiedInstalledPrivateAuthorityLease, String> {
-    let _package_lease = crate::linux::service::acquire_shared_package_lease()?;
-    verify()?;
-    let Some((_manifest, _bytes)) = crate::linux::runtime_manifest::source_v3(Path::new(BINARY))?
-    else {
-        return Err("MCSEALED-PRIVATE-QUALIFICATION: installed V3 generation absent".into());
-    };
-    if observed_network_launcher_state()? != NetworkLauncherStateV6::EnabledUnqualified {
-        return Err("MCSEALED-PRIVATE-QUALIFICATION: network launcher is not active".into());
-    }
-    Err("MCSEALED-PRIVATE-QUALIFICATION: trusted native V4 host run is absent".into())
-}
-
-/// This route cannot be called from structurally valid installed Q bytes: the
-/// release token is available only to an independent native-run verifier.
-/// The lock is retained through the caller's native release decision.
-#[cfg(target_os = "linux")]
-#[allow(dead_code)] // Independent release-Q provenance is not yet published.
-pub(crate) fn acquire_verified_private_qualification_lease_with_release(
-    release: &crate::linux::installed_release_qualification::TrustedReleaseQualification,
-) -> Result<VerifiedInstalledPrivateAuthorityLease, String> {
-    use crate::linux::network_filter::NativeAbi;
-
     let package_lease = crate::linux::service::acquire_shared_package_lease()?;
     verify()?;
     let candidate = crate::linux::runtime_manifest::source_v3_candidate(Path::new(BINARY))?
         .ok_or("MCSEALED-PRIVATE-QUALIFICATION: installed M1 absent")?;
+    let release =
+        crate::linux::installed_release_qualification::verify_anchored_native_qualification(
+            &candidate,
+        )?;
+    acquire_verified_private_qualification_lease_with_guard(package_lease, candidate, &release)
+}
+
+/// An internal caller with already authenticated release Q may enter this
+/// route; it still rechecks the exact installed generation under one guard.
+#[cfg(target_os = "linux")]
+pub(crate) fn acquire_verified_private_qualification_lease_with_release(
+    release: &crate::linux::installed_release_qualification::TrustedReleaseQualification,
+) -> Result<VerifiedInstalledPrivateAuthorityLease, String> {
+    let package_lease = crate::linux::service::acquire_shared_package_lease()?;
+    verify()?;
+    let candidate = crate::linux::runtime_manifest::source_v3_candidate(Path::new(BINARY))?
+        .ok_or("MCSEALED-PRIVATE-QUALIFICATION: installed M1 absent")?;
+    let current =
+        crate::linux::installed_release_qualification::verify_anchored_native_qualification(
+            &candidate,
+        )?;
+    if current.certificate_sha256() != release.certificate_sha256()
+        || current.policy_sha256() != release.policy_sha256()
+        || current.release_sequence() != release.release_sequence()
+    {
+        return Err("MCSEALED-PRIVATE-QUALIFICATION: release trust changed".into());
+    }
+    acquire_verified_private_qualification_lease_with_guard(package_lease, candidate, &current)
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_verified_private_qualification_lease_with_guard(
+    package_lease: std::fs::File,
+    candidate: crate::linux::installed_release_qualification::CandidateV3Readback,
+    release: &crate::linux::installed_release_qualification::TrustedReleaseQualification,
+) -> Result<VerifiedInstalledPrivateAuthorityLease, String> {
+    use crate::linux::network_filter::NativeAbi;
+
     let q_digest = candidate
         .qualification_sha256
         .as_ref()
@@ -793,6 +1190,9 @@ pub(crate) fn acquire_verified_private_qualification_lease_with_release(
             filter_abi,
             filter_digest,
             active_host_receipt_sha256: host.receipt_sha256().clone(),
+            certificate_sha256: release.certificate_sha256().into(),
+            trust_policy_sha256: release.policy_sha256().into(),
+            release_sequence: release.release_sequence(),
         },
     })
 }
@@ -2210,7 +2610,11 @@ impl PackageFileTransaction {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
+fn linux_mutation(
+    operation: &OsStr,
+    ephemeral_ci: bool,
+    archive: Option<(&Path, &Path)>,
+) -> Result<(), String> {
     use std::fs;
     use std::path::Path;
 
@@ -2247,6 +2651,32 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         Err(error) => return Err(error.to_string()),
     };
     ensure_install_preflight(operation, journal_pending, installed_before_mutation)?;
+    let preflight_source = if operation == "uninstall" {
+        None
+    } else {
+        Some(linux_source_snapshot(
+            &std::env::current_exe().map_err(|error| error.to_string())?,
+        )?)
+    };
+    if let Some(snapshot) = &preflight_source {
+        if snapshot.qualification.is_some() {
+            let (archive_path, certificate_path) = archive.ok_or(
+                "qualified M1 installation requires exact signed A and detached certificate",
+            )?;
+            crate::linux::installed_release_certificate::verify_source_archive_seal(
+                archive_path,
+                certificate_path,
+                snapshot,
+            )?;
+        } else if archive.is_some() {
+            return Err("unqualified M0 cannot claim a signed final A".into());
+        }
+    }
+    let _public_provider_mutation_guard = if installed_before_mutation || operation != "install" {
+        Some(crate::linux::private_public_provider::require_idle_for_package_mutation()?)
+    } else {
+        None
+    };
     // Revocation precedes crash recovery and any byte replacement, including
     // byte-identical upgrades. Restoring old package files never restores H1.
     crate::linux::private_host_receipt::revoke_active()?;
@@ -2260,12 +2690,7 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         Err(error) => return Err(error.to_string()),
     };
     ensure_install_is_new(operation, existing_installation)?;
-    let source_snapshot = if operation == "uninstall" {
-        None
-    } else {
-        let source = std::env::current_exe().map_err(|error| error.to_string())?;
-        Some(linux_source_snapshot(&source)?)
-    };
+    let source_snapshot = preflight_source;
     if operation == "uninstall" {
         ensure_recovery_idle("uninstall")?;
         stop_unit("memcordon-sealed-network-launcher.service")?;
@@ -2299,6 +2724,19 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.to_string()),
             }
+            let (build, certificate) = release_proof_paths(target)?;
+            for (relative, limit) in [(build, 1024 * 1024), (certificate, 64 * 1024)] {
+                let proof = Path::new(INSTALLED_QUALIFICATION_ROOT).join(relative);
+                match fs::symlink_metadata(&proof) {
+                    Ok(_) => {
+                        crate::linux::installed_release_qualification::read_protected_absolute(
+                            &proof, limit, None,
+                        )?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
         }
         let mut removals = Vec::new();
         for path in [
@@ -2310,6 +2748,7 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
             NETWORK_LAUNCHER_UNIT,
             TMPFILES_FILE,
             BINARY,
+            crate::linux::runtime_manifest::INSTALLED_ARM32_HELPER,
             crate::linux::runtime_manifest::INSTALLED,
         ] {
             match fs::symlink_metadata(path) {
@@ -2341,6 +2780,24 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.to_string()),
+            }
+            let (build, certificate) = release_proof_paths(target)?;
+            for (relative, limit) in [(build, 1024 * 1024), (certificate, 64 * 1024)] {
+                let proof = Path::new(INSTALLED_QUALIFICATION_ROOT).join(relative);
+                match fs::symlink_metadata(&proof) {
+                    Ok(_) => {
+                        crate::linux::installed_release_qualification::read_protected_absolute(
+                            &proof, limit, None,
+                        )?;
+                        removals.push(PackageFileChange {
+                            path: proof,
+                            bytes: None,
+                            mode: 0,
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.to_string()),
+                }
             }
         }
         if !removals.is_empty() {
@@ -2390,12 +2847,25 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
         ] {
             remove_uninstalled_directory(path)?;
         }
+        let retained_release_trust =
+            match fs::symlink_metadata("/var/lib/memcordon/sealed/release-trust") {
+                Ok(metadata) if metadata.is_dir() => true,
+                Ok(_) => return Err("release trust state is not a directory".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.to_string()),
+            };
         if retained_private_evidence {
             eprintln!(
                 "provider uninstall retained protected completed qualification evidence in {}",
                 crate::linux::private_qualification::PROBE_ROOT
             );
-        } else {
+        }
+        if retained_release_trust {
+            eprintln!(
+                "provider uninstall retained release trust high-water state in /var/lib/memcordon/sealed/release-trust"
+            );
+        }
+        if !retained_private_evidence && !retained_release_trust {
             remove_uninstalled_directory(crate::linux::STATE_ROOT)?;
         }
         // This is the final uninstall mutation. The open exclusive lease remains locked until
@@ -2450,17 +2920,53 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
             .qualification
             .as_ref()
             .and_then(|(source_path, bytes)| (source_path == &path).then(|| bytes.clone()));
-        if bytes.is_none() {
+        let q_present = if bytes.is_some() {
+            true
+        } else {
             match fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => return Err(error.to_string()),
-                Ok(_) => {}
+                Ok(_) => true,
             }
+        };
+        if q_present {
+            changes.push(PackageFileChange {
+                path,
+                bytes,
+                mode: 0o644,
+            });
         }
+        let (build_relative, certificate_relative) = release_proof_paths(target)?;
+        for (relative, supplied) in [
+            (build_relative, source_snapshot.release_build.as_ref()),
+            (
+                certificate_relative,
+                source_snapshot.release_certificate.as_ref(),
+            ),
+        ] {
+            let path = Path::new(INSTALLED_QUALIFICATION_ROOT).join(relative);
+            let bytes = supplied
+                .and_then(|(source_path, bytes)| (source_path == &path).then(|| bytes.clone()));
+            if bytes.is_none() {
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.to_string()),
+                    Ok(_) => {}
+                }
+            }
+            changes.push(PackageFileChange {
+                path,
+                bytes,
+                mode: 0o644,
+            });
+        }
+    }
+    let helper_path = Path::new(crate::linux::runtime_manifest::INSTALLED_ARM32_HELPER);
+    if source_snapshot.arm32_helper_bytes.is_some() || fs::symlink_metadata(helper_path).is_ok() {
         changes.push(PackageFileChange {
-            path,
-            bytes,
-            mode: 0o644,
+            path: helper_path.to_path_buf(),
+            bytes: source_snapshot.arm32_helper_bytes.clone(),
+            mode: 0o755,
         });
     }
     for (path, bytes, mode) in [
@@ -2510,6 +3016,22 @@ fn linux_mutation(operation: &OsStr, ephemeral_ci: bool) -> Result<(), String> {
                         .map(|(_, bytes)| memcordon_core::workload_codec::hash_bytes(bytes))
             {
                 return Err("installed V3/Q candidate differs from snapshotted source".into());
+            }
+            let installed_snapshot = linux_source_snapshot(Path::new(BINARY))?;
+            if installed_snapshot.arm32_helper_bytes != source_snapshot.arm32_helper_bytes
+                || installed_snapshot.release_build != source_snapshot.release_build
+                || installed_snapshot.release_certificate != source_snapshot.release_certificate
+            {
+                return Err("installed ARM32 helper or signed release proof changed".into());
+            }
+            if candidate.qualification_sha256.is_some() {
+                // Admission of a qualified M1 requires the independently
+                // provisioned root and a live, signed CQ before any service
+                // or optional network launcher is activated. The later H1
+                // operation revalidates this under the installed generation.
+                crate::linux::installed_release_qualification::verify_anchored_native_qualification(
+                    &candidate,
+                )?;
             }
         }
         systemctl(["daemon-reload"])?;

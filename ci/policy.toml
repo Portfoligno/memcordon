@@ -73,7 +73,13 @@ allowed_run_commands = [
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate",
   "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-candidate",
+  "sudo apt-get update",
+  "sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-tools-common",
+  "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin build-private-kernel-probe",
+  "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native --collector-intent-sha256 \"$COLLECTOR_INTENT_SHA256\" --policy-intent-sha256 \"$POLICY_INTENT_SHA256\"",
+  "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-final --intent /etc/memcordon/release-trust/final-install-intent.v1.json --archive \"$PRIVATE_FINAL_ARCHIVE\"",
   "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native",
+  "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage final-public --target native",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage final-public --target native",
 ]
 
@@ -93,7 +99,25 @@ steps = ["Certify packaged Cargo channel"]
 file = ".github/workflows/release.yml"
 variable = "GITHUB_TOKEN"
 source = "${{ github.token }}"
-steps = ["Stage GitHub draft and assets", "Finalize GitHub release", "Private candidate suite"]
+steps = ["Stage GitHub draft and assets", "Finalize GitHub release", "Private candidate suite", "Final installed public V2 suite on the same host"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "COLLECTOR_INTENT_SHA256"
+source = "${{ inputs.collector_intent_sha256 }}"
+steps = ["Private candidate suite"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "POLICY_INTENT_SHA256"
+source = "${{ inputs.policy_intent_sha256 }}"
+steps = ["Private candidate suite"]
+
+[[workflow.environment_allowlist]]
+file = ".github/workflows/release.yml"
+variable = "PRIVATE_FINAL_ARCHIVE"
+source = "target/ci/release-inputs/private-final-a-${{ matrix.id }}/memcordon-private-final-${{ matrix.id }}.tar.gz"
+steps = ["Install and qualify final archive on this host"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"

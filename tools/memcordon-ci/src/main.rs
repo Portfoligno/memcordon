@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod private_probe_build;
 mod release;
 mod sealed_linux;
 mod sealed_windows;
@@ -29,6 +30,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum TopLevel {
+    #[command(hide = true)]
+    PublicChildGate {
+        #[arg(long)]
+        fd: i32,
+        #[arg(long)]
+        working_directory: PathBuf,
+        #[arg(long)]
+        cli: PathBuf,
+        #[arg(last = true)]
+        argv: Vec<std::ffi::OsString>,
+    },
+    BuildPrivateKernelProbe,
     InventoryProfile {
         #[arg(long)]
         plan: PathBuf,
@@ -76,6 +89,10 @@ enum TopLevel {
         stage: Option<PrivateStage>,
         #[arg(long)]
         target: Option<String>,
+        #[arg(long)]
+        collector_intent_sha256: Option<String>,
+        #[arg(long)]
+        policy_intent_sha256: Option<String>,
     },
     Release {
         #[command(subcommand)]
@@ -142,6 +159,26 @@ enum ReleaseCommand {
     Assemble,
     VerifyPrivateCandidate,
     InstallPrivateCandidate,
+    InspectPrivateCandidate {
+        #[arg(long)]
+        intent: PathBuf,
+        #[arg(long)]
+        build: PathBuf,
+    },
+    CollectPrivateQ {
+        #[arg(long)]
+        intent: PathBuf,
+        #[arg(long)]
+        build: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    InstallPrivateFinal {
+        #[arg(long)]
+        intent: PathBuf,
+        #[arg(long)]
+        archive: PathBuf,
+    },
     StageGithub,
     AttemptOidc {
         #[arg(long)]
@@ -180,7 +217,23 @@ fn workspace_root(start: &Path) -> Result<PathBuf> {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    match cli.command.take() {
+        Some(TopLevel::PublicChildGate {
+            fd,
+            working_directory,
+            cli: executable,
+            argv,
+        }) if cli.build_context.is_none() && !cli.cargo_plugin => {
+            return memcordon_ci::private_public_dispatch::run_public_child_gate(
+                fd,
+                &working_directory,
+                &executable,
+                &argv,
+            );
+        }
+        other => cli.command = other,
+    }
     let root = workspace_root(&std::env::current_dir()?)?;
     if let Some(path) = cli.build_context {
         memcordon_ci::inventory_benchmark::require_admission(&path)?;
@@ -189,6 +242,7 @@ fn run() -> Result<()> {
         )?;
     }
     let result = match (cli.cargo_plugin, cli.command) {
+        (false, Some(TopLevel::BuildPrivateKernelProbe)) => private_probe_build::run(&root),
         (false, Some(TopLevel::InventoryProfile { plan, output })) => {
             memcordon_ci::inventory_profile::profile(&plan, &output, &root)
         }
@@ -234,8 +288,17 @@ fn run() -> Result<()> {
                 suite,
                 stage,
                 target,
+                collector_intent_sha256,
+                policy_intent_sha256,
             }),
-        ) => suites::run(&root, suite, stage, target.as_deref()),
+        ) => suites::run(
+            &root,
+            suite,
+            stage,
+            target.as_deref(),
+            collector_intent_sha256.as_deref(),
+            policy_intent_sha256.as_deref(),
+        ),
         (false, Some(TopLevel::Release { command })) => release::run(&root, command),
         (
             false,

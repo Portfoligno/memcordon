@@ -15,6 +15,14 @@ on:
         required: false
         type: boolean
         default: false
+      collector_intent_sha256:
+        description: Digest only of the verifier host's protected candidate collector intent; no signing key or root policy
+        required: false
+        type: string
+      policy_intent_sha256:
+        description: Digest only of the independently provisioned protected private-policy release intent
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -504,12 +512,29 @@ jobs:
         with:
           name: release-native-${{ matrix.asset }}
           path: target/ci/release-inputs/release-native-${{ matrix.asset }}
+      - name: Install private kernel probe toolchain
+        run: sudo apt-get update
+      - name: Install private kernel probe packages
+        run: sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-tools-common
+      - name: Build versioned private kernel probe bundle
+        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin build-private-kernel-probe
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate
       - run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-candidate
       - name: Private candidate suite
-        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native
+        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native --collector-intent-sha256 "$COLLECTOR_INTENT_SHA256" --policy-intent-sha256 "$POLICY_INTENT_SHA256"
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          COLLECTOR_INTENT_SHA256: ${{ inputs.collector_intent_sha256 }}
+          POLICY_INTENT_SHA256: ${{ inputs.policy_intent_sha256 }}
+      - name: Upload completed private candidate C V3
+        if: success()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: release-private-candidate-${{ matrix.id }}
+          path: target/ci/reports/private-candidate-c-v3/${{ matrix.id }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
       - id: build-context-audit
         if: always() && steps.build-context-prepare.outcome == 'success'
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
@@ -565,7 +590,24 @@ jobs:
         with:
           path: target/ci/bootstrap
           key: managed-v2-cargo-target-release-private-final-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', '.cargo/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'rust-toolchain.toml', '.github/workflows/**') }}
-      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage final-public --target native
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-private-final-a-${{ matrix.id }}
+          path: target/ci/release-inputs/private-final-a-${{ matrix.id }}
+      - name: Install private kernel probe toolchain
+        run: sudo apt-get update
+      - name: Install private kernel probe packages
+        run: sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-tools-common
+      - name: Build versioned private kernel probe bundle
+        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin build-private-kernel-probe
+      - name: Install and qualify final archive on this host
+        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-final --intent /etc/memcordon/release-trust/final-install-intent.v1.json --archive "$PRIVATE_FINAL_ARCHIVE"
+        env:
+          PRIVATE_FINAL_ARCHIVE: target/ci/release-inputs/private-final-a-${{ matrix.id }}/memcordon-private-final-${{ matrix.id }}.tar.gz
+      - name: Final installed public V2 suite on the same host
+        run: sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage final-public --target native
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - id: build-context-audit
         if: always() && steps.build-context-prepare.outcome == 'success'
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin

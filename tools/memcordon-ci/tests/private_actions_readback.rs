@@ -24,7 +24,7 @@ fn responses() -> Vec<Value> {
             "head_sha": "a".repeat(40),
             "repository": {"full_name": "Portfoligno/memcordon"}
         }),
-        json!({"total_count": 1, "jobs": [{"name": spec.job_name}]}),
+        json!({"total_count": 1, "jobs": [{"id": 61, "name": spec.job_name}]}),
         json!({"total_count": 1, "artifacts": [{
             "id": 71,
             "name": spec.artifact_name,
@@ -141,4 +141,65 @@ fn repository_path_injection_and_zero_length_zip_are_rejected() {
     .err()
     .unwrap();
     assert!(error.to_string().contains("empty or unbounded"));
+}
+
+#[test]
+fn completed_reader_consumes_every_jobs_and_artifact_page() {
+    let spec = PRODUCERS[1];
+    let mut pages = Vec::new();
+    let fetched = read_actions_native_artifact_with(
+        &origin(),
+        spec,
+        NonZeroU32::new(3).unwrap(),
+        |url, _, _| {
+            pages.push(url.to_owned());
+            if url.ends_with("/zip") {
+                return Ok(vec![1, 2, 3]);
+            }
+            let response = if url.ends_with("/attempts/3") {
+                responses()[0].clone()
+            } else if url.contains("/jobs?") {
+                let first = !url.contains("page=2");
+                let jobs: Vec<_> = if first {
+                    (1..=100)
+                        .map(|id| json!({"id": id, "name": format!("other-{id}")}))
+                        .collect()
+                } else {
+                    vec![json!({"id": 101, "name": spec.job_name})]
+                };
+                json!({"total_count": 101, "jobs": jobs})
+            } else if url.contains("/artifacts?") {
+                let first = !url.contains("page=2");
+                let artifacts: Vec<_> = if first {
+                    (1..=100)
+                        .map(|id| json!({"id": id, "name": format!("other-{id}")}))
+                        .collect()
+                } else {
+                    vec![json!({
+                        "id": 171,
+                        "name": spec.artifact_name,
+                        "expired": false,
+                        "workflow_run": {"id": 42}
+                    })]
+                };
+                json!({"total_count": 101, "artifacts": artifacts})
+            } else {
+                panic!("unexpected Actions URL: {url}");
+            };
+            Ok(serde_json::to_vec(&response).unwrap())
+        },
+    )
+    .unwrap();
+    assert_eq!(fetched.artifact["id"], 171);
+    assert_eq!(pages.len(), 6);
+    assert!(
+        pages
+            .iter()
+            .any(|url| url.ends_with("/jobs?per_page=100&page=2"))
+    );
+    assert!(
+        pages
+            .iter()
+            .any(|url| url.ends_with("/artifacts?per_page=100&page=2"))
+    );
 }

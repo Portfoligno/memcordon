@@ -25,13 +25,16 @@ fn detached_finalizer_refuses_a_live_recorded_coordinator() {
 fn active_host_reference_is_strict_and_never_accepts_caller_extras() {
     let digest = DiagnosticSha256::from_bytes([7; 32]);
     let value = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "run_nonce": "ab".repeat(32),
         "receipt_sha256": digest,
         "native_run_digest": digest,
         "host_prerequisites_digest": digest,
         "installation_epoch": digest,
         "release_qualification_sha256": digest,
+        "certificate_sha256": "ab".repeat(32),
+        "trust_policy_sha256": "cd".repeat(32),
+        "release_sequence": 1,
     });
     let bytes = serde_json::to_vec(&value).unwrap();
     assert!(parse_active_for_test(&bytes).is_ok());
@@ -44,8 +47,17 @@ fn active_host_reference_is_strict_and_never_accepts_caller_extras() {
     let mut upper_run = value.clone();
     upper_run["run_nonce"] = serde_json::json!("AB".repeat(32));
     assert!(parse_active_for_test(&serde_json::to_vec(&upper_run).unwrap()).is_err());
+    let mut missing_policy = value.clone();
+    missing_policy
+        .as_object_mut()
+        .unwrap()
+        .remove("trust_policy_sha256");
+    assert!(parse_active_for_test(&serde_json::to_vec(&missing_policy).unwrap()).is_err());
+    let mut zero_sequence = value.clone();
+    zero_sequence["release_sequence"] = serde_json::json!(0);
+    assert!(parse_active_for_test(&serde_json::to_vec(&zero_sequence).unwrap()).is_err());
     let text = std::str::from_utf8(&bytes).unwrap();
-    let duplicate = format!("{},\"schema_version\":1}}", text.strip_suffix('}').unwrap());
+    let duplicate = format!("{},\"schema_version\":2}}", text.strip_suffix('}').unwrap());
     assert!(parse_active_for_test(duplicate.as_bytes()).is_err());
     assert!(parse_active_for_test(&vec![b' '; 1025]).is_err());
 }
@@ -58,13 +70,16 @@ fn receipt_is_durable_before_active_and_replay_requires_exact_bytes() {
     let receipt = br#"{"candidate":"storage-order-only"}"#;
     let digest = DiagnosticSha256::from_bytes([7; 32]);
     let active = serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "run_nonce": nonce,
         "receipt_sha256": hash_bytes(receipt),
         "native_run_digest": digest,
         "host_prerequisites_digest": digest,
         "installation_epoch": digest,
         "release_qualification_sha256": digest,
+        "certificate_sha256": "ab".repeat(32),
+        "trust_policy_sha256": "cd".repeat(32),
+        "release_sequence": 1,
     }))
     .unwrap();
     persist_receipt_for_test(&root, &nonce, receipt).unwrap();
@@ -94,13 +109,16 @@ fn incomplete_receipt_temp_cannot_advance_active() {
     let receipt = br#"{"candidate":"storage-order-only"}"#;
     let digest = DiagnosticSha256::from_bytes([8; 32]);
     let active = serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "run_nonce": nonce,
         "receipt_sha256": hash_bytes(receipt),
         "native_run_digest": digest,
         "host_prerequisites_digest": digest,
         "installation_epoch": digest,
         "release_qualification_sha256": digest,
+        "certificate_sha256": "ab".repeat(32),
+        "trust_policy_sha256": "cd".repeat(32),
+        "release_sequence": 1,
     }))
     .unwrap();
     let temporary = directory.path().join(format!("receipt-{nonce}.json.new"));

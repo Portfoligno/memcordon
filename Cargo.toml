@@ -20,6 +20,7 @@ repository = "https://github.com/Portfoligno/memcordon"
 readme = "README.md"
 
 [workspace.dependencies]
+ed25519-dalek = "2.2.0"
 anstream = "1.0.0"
 anstyle = "1.0.14"
 anstyle-query = "1.1.5"

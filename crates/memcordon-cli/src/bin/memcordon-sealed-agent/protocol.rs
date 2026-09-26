@@ -28,6 +28,8 @@ pub enum MessageKind {
     ReleaseCase = 15,
     BrokerReleaseCase = 16,
     FinalizeReleaseCase = 17,
+    PolicyDecision = 18,
+    PublicAbiOuterControl = 19,
     ProbeReceipt = 101,
     LaunchPrepared = 102,
     Authorized = 103,
@@ -42,6 +44,8 @@ pub enum MessageKind {
     PrivateProbeRunCompleted = 112,
     ReleaseCaseIncomplete = 114,
     ReleaseCaseCompleted = 115,
+    PolicyDecisionRecorded = 116,
+    PublicAbiOuterRecorded = 117,
 }
 
 impl TryFrom<u16> for MessageKind {
@@ -66,6 +70,8 @@ impl TryFrom<u16> for MessageKind {
             15 => Ok(Self::ReleaseCase),
             16 => Ok(Self::BrokerReleaseCase),
             17 => Ok(Self::FinalizeReleaseCase),
+            18 => Ok(Self::PolicyDecision),
+            19 => Ok(Self::PublicAbiOuterControl),
             101 => Ok(Self::ProbeReceipt),
             102 => Ok(Self::LaunchPrepared),
             103 => Ok(Self::Authorized),
@@ -80,6 +86,8 @@ impl TryFrom<u16> for MessageKind {
             112 => Ok(Self::PrivateProbeRunCompleted),
             114 => Ok(Self::ReleaseCaseIncomplete),
             115 => Ok(Self::ReleaseCaseCompleted),
+            116 => Ok(Self::PolicyDecisionRecorded),
+            117 => Ok(Self::PublicAbiOuterRecorded),
             _ => Err(ProtocolError::UnknownKind(value)),
         }
     }

@@ -34,6 +34,21 @@ fn components() -> Vec<RuntimeComponentRecord> {
     .collect()
 }
 
+fn components_for(target: &str) -> Vec<RuntimeComponentRecord> {
+    let mut records = components();
+    if target == "aarch64-unknown-linux-gnu" {
+        records.push(RuntimeComponentRecord {
+            id: "arm32-abi-helper".into(),
+            path: "memcordon-arm32-abi-helper".into(),
+            role: RuntimeComponentRole::Arm32AbiHelper,
+            size: 4152,
+            mode: 0o755,
+            sha256: "8".repeat(64),
+        });
+    }
+    records
+}
+
 fn manifest() -> RuntimeManifestV3 {
     let mut contracts = BoundedVec::default();
     contracts.try_push(1).unwrap();
@@ -94,7 +109,7 @@ fn linux_constructor_emits_exact_unqualified_catalogue() {
             "0.5.7-dev".into(),
             SOURCE.into(),
             target.into(),
-            components(),
+            components_for(target),
         )
         .unwrap();
         let parsed = RuntimeManifestV3::parse(&serde_json::to_vec(&generated).unwrap()).unwrap();
@@ -108,6 +123,24 @@ fn linux_constructor_emits_exact_unqualified_catalogue() {
             RuntimeProfileAvailabilityV3::Unqualified
         )));
     }
+    assert!(
+        RuntimeManifestV3::linux_unqualified(
+            "0.5.7-dev".into(),
+            SOURCE.into(),
+            "aarch64-unknown-linux-gnu".into(),
+            components(),
+        )
+        .is_err()
+    );
+    assert!(
+        RuntimeManifestV3::linux_unqualified(
+            "0.5.7-dev".into(),
+            SOURCE.into(),
+            TARGET.into(),
+            components_for("aarch64-unknown-linux-gnu"),
+        )
+        .is_err()
+    );
     assert!(
         RuntimeManifestV3::linux_unqualified(
             "0.5.7-dev".into(),

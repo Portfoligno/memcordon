@@ -311,7 +311,7 @@ pub fn validate_fixed_case_observation(
 /// Native's protected admission ledger, distinct from raw `request.bin`.
 /// Parsing and cross-joining this record remains structural; the coordinator
 /// identity and service generation still need independent supervisor proof.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtectedCandidateReleaseRequestV1 {
     pub schema_version: u8,
@@ -769,7 +769,21 @@ pub fn parse_protected_candidate_attempt(
     };
     let terminal_matches = match observation {
         PrivateReleaseObservationV1::PreallocationRejected { .. } => false,
+        PrivateReleaseObservationV1::PolicyComposite { .. } => false,
         PrivateReleaseObservationV1::DualAttemptsRetired { .. } => false,
+        PrivateReleaseObservationV1::AbiComposite {
+            attempt_id,
+            checkpoint_sha256,
+            ..
+        } => {
+            attempt.phase == ProtectedAttemptPhaseV1::Retired
+                && attempt.cleanup_error.is_none()
+                && attempt.candidate_exit_code == Some(0)
+                && attempt.attempt_id == *attempt_id
+                && attempt.checkpoint_digest.as_ref() == Some(checkpoint_sha256)
+                && checkpoint_matches
+                && attempt.release_knowledge == ProtectedReleaseKnowledgeV1::ExecObserved
+        }
         PrivateReleaseObservationV1::AllocatedRetired {
             attempt_id,
             checkpoint_sha256,

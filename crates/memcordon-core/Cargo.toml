@@ -15,6 +15,7 @@ publish = ["crates-io"]
 test-support = []
 
 [dependencies]
+ed25519-dalek.workspace = true
 base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true

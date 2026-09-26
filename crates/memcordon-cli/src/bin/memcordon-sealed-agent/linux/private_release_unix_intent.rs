@@ -106,7 +106,7 @@ pub(crate) fn read_held_target_response(
                 // SAFETY: poll observes only the retained fixed stdout pipe.
                 let status = unsafe { libc::poll(&raw mut pollfd, 1, millis) };
                 if status == 0 {
-                    return Err("MCSEALED-PRIVATE-RELEASE: Unix target response timed out".into());
+                    continue;
                 }
                 if status < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
                 {
@@ -265,7 +265,7 @@ pub(crate) fn proc_unix_endpoint_absent(bytes: &[u8], endpoint: &str) -> Result<
     for line in lines {
         let mut rest = line.trim_ascii_start();
         let mut fields = Vec::with_capacity(7);
-        for _ in 0..7 {
+        for field_index in 0..7 {
             if rest.is_empty() {
                 return Err(
                     "MCSEALED-PRIVATE-RELEASE-FIXTURE: AF_UNIX inventory row differs".into(),
@@ -275,12 +275,19 @@ pub(crate) fn proc_unix_endpoint_absent(bytes: &[u8], endpoint: &str) -> Result<
                 .find(|character: char| character.is_ascii_whitespace())
                 .unwrap_or(rest.len());
             fields.push(&rest[..field_end]);
-            rest = rest[field_end..].trim_ascii_start();
+            let remaining = &rest[field_end..];
+            // The seventh separator belongs to the inode column. Consume
+            // exactly one byte so leading spaces in a pathname remain part
+            // of the endpoint rather than disappearing during normalization.
+            rest = if field_index == 6 {
+                remaining.strip_prefix(' ').unwrap_or(remaining)
+            } else {
+                remaining.trim_ascii_start()
+            };
         }
-        if !fields[0].ends_with(':')
-            || !fields[0][..fields[0].len() - 1]
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+        if fields[0]
+            .strip_suffix(':')
+            .is_none_or(|number| !number.bytes().all(|byte| byte.is_ascii_hexdigit()))
             || fields[1..6]
                 .iter()
                 .any(|field| !field.bytes().all(|byte| byte.is_ascii_hexdigit()))

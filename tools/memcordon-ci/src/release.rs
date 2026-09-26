@@ -1661,6 +1661,7 @@ fn runtime_component_id(role: RuntimeComponentRole) -> &'static str {
     match role {
         RuntimeComponentRole::PublicCli => "public-cli",
         RuntimeComponentRole::SealedAgent => "sealed-agent",
+        RuntimeComponentRole::Arm32AbiHelper => "arm32-abi-helper",
         RuntimeComponentRole::DesktopBootstrap => "target-desktop-bootstrap",
         RuntimeComponentRole::SessionBroker => "session-broker",
     }
@@ -1708,7 +1709,7 @@ fn prepare_linux_private_candidate(
     fs::create_dir_all(&output)?;
     let candidate_dir = output.join(format!("private-candidate-{}", target.id));
     fs::create_dir(&candidate_dir)?;
-    let components = runtime_components(root, target)?;
+    let mut components = runtime_components(root, target)?;
     let mut copied = BTreeMap::new();
     for component in &target.executable {
         let source = built_executable_path(root, target, component);
@@ -1725,6 +1726,27 @@ fn prepare_linux_private_candidate(
             }
         }
         copied.insert(component.archive_path.clone(), fs::read(&destination)?);
+    }
+    if target.rust_target == "aarch64-unknown-linux-gnu" {
+        use memcordon_core::workload_codec::hash_bytes;
+        let helper = memcordon_ci::arm32_abi_helper::static_aarch32_helper();
+        let path = "memcordon-arm32-abi-helper";
+        let destination = candidate_dir.join(path);
+        fs::write(&destination, &helper)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))?;
+        }
+        components.push(RuntimeComponentRecord {
+            id: "arm32-abi-helper".into(),
+            path: path.into(),
+            role: RuntimeComponentRole::Arm32AbiHelper,
+            size: helper.len() as u64,
+            mode: 0o755,
+            sha256: String::from(hash_bytes(&helper)),
+        });
+        copied.insert(path.into(), helper);
     }
     let manifest = RuntimeManifestV3::linux_unqualified(
         identity.version.to_string(),
@@ -1837,6 +1859,9 @@ fn verify_linux_private_candidate(root: &Path) -> Result<()> {
             .iter()
             .map(|component| PathBuf::from(&component.archive_path)),
     );
+    if target.rust_target == "aarch64-unknown-linux-gnu" {
+        expected_files.insert(PathBuf::from("memcordon-arm32-abi-helper"));
+    }
     let mut observed_files = BTreeSet::new();
     for entry in WalkDir::new(&input).min_depth(1) {
         let entry = entry.map_err(|error| failure(error.to_string()))?;
@@ -1876,7 +1901,9 @@ fn verify_linux_private_candidate(root: &Path) -> Result<()> {
     if manifest.version != identity.version.to_string()
         || manifest.source_commit != identity.commit
         || manifest.target != target.rust_target
-        || manifest.components.len() != target.executable.len()
+        || manifest.components.len()
+            != target.executable.len()
+                + usize::from(target.rust_target == "aarch64-unknown-linux-gnu")
     {
         return Err(failure("private candidate M0 identity differs"));
     }
@@ -1899,6 +1926,23 @@ fn verify_linux_private_candidate(root: &Path) -> Result<()> {
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(path, fs::Permissions::from_mode(configured.mode))?;
+        }
+    }
+    if target.rust_target == "aarch64-unknown-linux-gnu" {
+        let helper = read_regular(&input.join("memcordon-arm32-abi-helper"))?;
+        if helper != memcordon_ci::arm32_abi_helper::static_aarch32_helper() {
+            return Err(failure(
+                "private candidate ARM32 helper differs from reviewed image",
+            ));
+        }
+        component_bytes.insert("memcordon-arm32-abi-helper".into(), helper);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                input.join("memcordon-arm32-abi-helper"),
+                fs::Permissions::from_mode(0o755),
+            )?;
         }
     }
     let agent_path = target
@@ -2754,6 +2798,11 @@ pub fn native_asset(root: &Path) -> Result<()> {
                 CommandSpec::new(executable, root, Duration::from_secs(30))
                     .args(["package", "inspect", "--json"])
                     .run()?;
+            }
+            RuntimeComponentRole::Arm32AbiHelper => {
+                return Err(failure(
+                    "ARM32 helper is built only for private candidate B",
+                ));
             }
             RuntimeComponentRole::DesktopBootstrap => {
                 let bytes = fs::read(executable)?;
@@ -6713,6 +6762,21 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         ReleaseCommand::Assemble => assemble(root),
         ReleaseCommand::VerifyPrivateCandidate => verify_linux_private_candidate(root),
         ReleaseCommand::InstallPrivateCandidate => install_linux_private_candidate(root),
+        ReleaseCommand::InspectPrivateCandidate { intent, build } => {
+            memcordon_ci::private_completed_run::inspect_completed_candidate_for_qualification(
+                &intent, &build,
+            )
+        }
+        ReleaseCommand::CollectPrivateQ {
+            intent,
+            build,
+            output,
+        } => memcordon_ci::private_completed_run::collect_private_q_after_completed_producer(
+            &intent, &build, &output,
+        ),
+        ReleaseCommand::InstallPrivateFinal { intent, archive } => {
+            memcordon_ci::private_final_install::install_final_same_host(root, &intent, &archive)
+        }
         ReleaseCommand::StageGithub => stage_github(root),
         ReleaseCommand::AttemptOidc { publication_slot } => {
             attempt_oidc_publication_at(root, publication_slot)

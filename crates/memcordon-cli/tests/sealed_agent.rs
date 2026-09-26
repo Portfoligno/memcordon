@@ -98,8 +98,19 @@ mod private_probe_faults;
 #[path = "sealed_agent/private_probe_loss.rs"]
 mod private_probe_loss;
 #[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_public_abi_control.rs"]
+mod private_public_abi_control;
+#[path = "sealed_agent/private_public_abi_filtered.rs"]
+mod private_public_abi_filtered;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_public_provider.rs"]
+mod private_public_provider;
+#[cfg(target_os = "linux")]
 #[path = "sealed_agent/private_public_release_case.rs"]
 mod private_public_release_case;
+#[cfg(target_os = "linux")]
+#[path = "sealed_agent/private_public_reuse.rs"]
+mod private_public_reuse;
 #[cfg(target_os = "linux")]
 #[path = "sealed_agent/private_qualification.rs"]
 mod private_qualification;

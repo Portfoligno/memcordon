@@ -14,6 +14,9 @@ use memcordon_core::package_inspection_v6::{
     InspectionVersionSix, LinuxInstalledInspectionV6, LinuxPackageInspectionV6, LinuxUnitHashesV6,
     NetworkLauncherStateV6, TrustedLinuxInspectionV6,
 };
+use memcordon_core::release_trust::{
+    NativeQualificationCertificateV1, SignedNativeQualificationCertificateV1,
+};
 use memcordon_core::runtime_manifest::{RuntimeComponentRecord, RuntimeComponentRole};
 use memcordon_core::runtime_manifest_v3::{
     QualificationArtifactReferenceV2, QualificationArtifactSchemaTwo, RuntimeProfileAvailabilityV3,
@@ -350,6 +353,43 @@ fn private_v2_acceptance_requires_every_checked_in_native_completion() {
     let final_manifest =
         prepare_private_final_manifest(&wrong_candidate, &bytes, reference.clone(), &expected)
             .unwrap();
+    let candidate_record_bytes = serde_json::to_vec(&wrong_candidate.record()).unwrap();
+    let certificate_bytes = serde_json::to_vec(&SignedNativeQualificationCertificateV1 {
+        payload: NativeQualificationCertificateV1 {
+            schema_version: 1,
+            policy_version: 1,
+            key_id: "fixture-q".into(),
+            release_sequence: 1,
+            build_sha256: String::from(hash_bytes(&candidate_record_bytes)),
+            build_context_sha256: String::from(digest(1)),
+            target: X64.into(),
+            native_machine: "x86_64".into(),
+            source_commit: SOURCE.into(),
+            release_version: "0.5.7-dev".into(),
+            qualification_sha256: String::from(hash_bytes(&bytes)),
+            qualification_size: bytes.len() as u64,
+            raw_index_sha256: String::from(digest(2)),
+            completed_provenance_sha256: String::from(digest(3)),
+            repository_id: 1,
+            repository: "fixture/repo".into(),
+            workflow_path: ".github/workflows/release.yml".into(),
+            workflow_revision: SOURCE.into(),
+            run_id: 1,
+            run_attempt: 1,
+            producer_job_id: 1,
+            artifact_id: 1,
+            verifier_sha256: String::from(digest(4)),
+            verifier_source_commit: SOURCE.into(),
+            verifier_policy_sha256: String::from(digest(5)),
+            catalogue_sha256: String::from(digest(6)),
+            accepted_case_set_sha256: String::from(digest(7)),
+            issued_at_unix: 1,
+            expires_at_unix: 2,
+            decision: "Complete".into(),
+        },
+        signature_hex: "00".repeat(64),
+    })
+    .unwrap();
     let manifest = final_manifest.manifest().clone();
     let manifest_bytes = final_manifest.manifest_bytes().to_vec();
     let manifest_digest = final_manifest.manifest_sha256().clone();
@@ -414,6 +454,8 @@ fn private_v2_acceptance_requires_every_checked_in_native_completion() {
     let offline_inputs = OfflinePrivateQualifiedInputs {
         candidate: &wrong_candidate,
         qualification_bytes: &bytes,
+        candidate_record_bytes: &candidate_record_bytes,
+        certificate_bytes: &certificate_bytes,
         qualification_reference: reference.clone(),
         expected_qualification: &expected,
         component_bytes: &binaries,
@@ -454,6 +496,14 @@ fn private_v2_acceptance_requires_every_checked_in_native_completion() {
     for path in memcordon_ci::release_archive::NATIVE_ARCHIVE_STATIC_PATHS {
         members.insert((*path).into(), b"reviewed static member".to_vec());
     }
+    members.insert(
+        "certification/workload/x64-private-build-v1.json".into(),
+        candidate_record_bytes.clone(),
+    );
+    members.insert(
+        "certification/workload/x64-private-cq-v1.json".into(),
+        certificate_bytes.clone(),
+    );
     let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
         Vec::new(),
         flate2::Compression::default(),
@@ -480,6 +530,8 @@ fn private_v2_acceptance_requires_every_checked_in_native_completion() {
                 members: &members,
                 final_manifest: &final_manifest,
                 qualification_bytes: &bytes,
+                candidate_record_bytes: &candidate_record_bytes,
+                certificate_bytes: &certificate_bytes,
             },
         )
         .is_ok()
@@ -489,6 +541,8 @@ fn private_v2_acceptance_requires_every_checked_in_native_completion() {
         members: &members,
         final_manifest: &final_manifest,
         qualification_bytes: &bytes,
+        candidate_record_bytes: &candidate_record_bytes,
+        certificate_bytes: &certificate_bytes,
     })
     .unwrap();
     assert_eq!(sealed_tar_digest, hash_bytes(&sealed_tar));
@@ -511,6 +565,8 @@ fn private_v2_acceptance_requires_every_checked_in_native_completion() {
                 members: &members,
                 final_manifest: &final_manifest,
                 qualification_bytes: &bytes,
+                candidate_record_bytes: &candidate_record_bytes,
+                certificate_bytes: &certificate_bytes,
             },
         )
         .is_ok()
@@ -520,6 +576,8 @@ fn private_v2_acceptance_requires_every_checked_in_native_completion() {
         members: &members,
         final_manifest: &final_manifest,
         qualification_bytes: &bytes,
+        candidate_record_bytes: &candidate_record_bytes,
+        certificate_bytes: &certificate_bytes,
     })
     .unwrap();
     assert_eq!(sealed_zip_digest, hash_bytes(&sealed_zip));
@@ -530,6 +588,8 @@ fn private_v2_acceptance_requires_every_checked_in_native_completion() {
             members: &members,
             final_manifest: &final_manifest,
             qualification_bytes: &bytes,
+            candidate_record_bytes: &candidate_record_bytes,
+            certificate_bytes: &certificate_bytes,
         })
         .is_err()
     );
@@ -559,6 +619,8 @@ fn private_v2_acceptance_requires_every_checked_in_native_completion() {
                 members: &members,
                 final_manifest: &final_manifest,
                 qualification_bytes: &bytes,
+                candidate_record_bytes: &candidate_record_bytes,
+                certificate_bytes: &certificate_bytes,
             },
         )
         .is_err()

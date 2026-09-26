@@ -7,6 +7,10 @@ use memcordon_core::DiagnosticSha256;
 use memcordon_core::package_inspection_v6::{
     LinuxInstalledInspectionV6, NetworkLauncherStateV6, TrustedLinuxInspectionV6,
 };
+pub use memcordon_core::private_release_build_v2::{
+    PrivateCandidateRecordV2, PrivateCandidateStageV2,
+};
+use memcordon_core::release_trust::SignedNativeQualificationCertificateV1;
 use memcordon_core::runtime_manifest::RuntimeComponentRecord;
 use memcordon_core::runtime_manifest_v3::{
     QualificationArtifactReferenceV2, RuntimeManifestV3, RuntimeProfileAvailabilityV3,
@@ -16,7 +20,6 @@ use memcordon_core::workload_codec::hash_bytes;
 use memcordon_core::workload_qualification_v2::{
     QualificationArtifactV2, TrustedQualificationExpectationV2,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
@@ -121,26 +124,6 @@ pub fn prepare_private_final_manifest(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PrivateCandidateStageV2 {
-    UnqualifiedCandidate,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PrivateCandidateRecordV2 {
-    pub schema_version: u32,
-    pub stage: PrivateCandidateStageV2,
-    pub version: String,
-    pub source_commit: String,
-    pub target: String,
-    pub runtime_manifest_sha256: DiagnosticSha256,
-    pub component_sha256: DiagnosticSha256,
-    pub unit_sha256: DiagnosticSha256,
-    pub filter_sha256: DiagnosticSha256,
-}
-
 impl PreparedPrivateCandidateV2 {
     pub fn record(&self) -> PrivateCandidateRecordV2 {
         PrivateCandidateRecordV2 {
@@ -170,7 +153,7 @@ pub fn validate_private_candidate_record(
     }
     memcordon_core::workload_contract::reject_duplicate_json_keys(record_bytes)
         .map_err(CiError::Message)?;
-    let actual: PrivateCandidateRecordV2 = serde_json::from_slice(record_bytes)?;
+    let actual = PrivateCandidateRecordV2::parse(record_bytes).map_err(CiError::Message)?;
     if actual != expected.record() {
         return Err(CiError::Message(
             "private candidate B/M0 record differs".into(),
@@ -253,6 +236,23 @@ pub struct QualifiedArchiveExpectation<'a> {
     pub members: &'a BTreeMap<String, Vec<u8>>,
     pub final_manifest: &'a PreparedPrivateFinalManifestV2,
     pub qualification_bytes: &'a [u8],
+    /// Exact candidate B bytes authenticated by the completed-job collector.
+    pub candidate_record_bytes: &'a [u8],
+    /// Signed Q decision. Signature/role/trust-root validation is performed by
+    /// the installed verifier, not by this archive format reader.
+    pub certificate_bytes: &'a [u8],
+}
+
+fn release_build_and_certificate_paths(target: &str) -> Result<(String, String)> {
+    let short = match target {
+        "x86_64-unknown-linux-gnu" => "x64",
+        "aarch64-unknown-linux-gnu" => "arm64",
+        _ => return Err(CiError::Message("private release target differs".into())),
+    };
+    Ok((
+        format!("certification/workload/{short}-private-build-v1.json"),
+        format!("certification/workload/{short}-private-cq-v1.json"),
+    ))
 }
 
 /// Seals the independently supplied fixed B/M1/Q/document inventory, then
@@ -371,11 +371,54 @@ pub fn validate_qualified_archive(
     {
         return Err(CiError::Message("qualified archive Q differs".into()));
     }
+    let (build_path, certificate_path) = release_build_and_certificate_paths(&manifest.target)?;
+    let build_bytes = expected
+        .members
+        .get(&build_path)
+        .ok_or_else(|| CiError::Message("qualified archive lacks exact candidate B".into()))?;
+    let certificate_bytes = expected
+        .members
+        .get(&certificate_path)
+        .ok_or_else(|| CiError::Message("qualified archive lacks signed Q certificate".into()))?;
+    if build_bytes != expected.candidate_record_bytes
+        || certificate_bytes != expected.certificate_bytes
+        || build_bytes.len() > 16 * 1024
+    {
+        return Err(CiError::Message(
+            "qualified archive B/CQ bytes differ".into(),
+        ));
+    }
+    let build = PrivateCandidateRecordV2::parse(build_bytes).map_err(CiError::Message)?;
+    let certificate = SignedNativeQualificationCertificateV1::parse(certificate_bytes)
+        .map_err(CiError::Message)?;
+    if build.schema_version != 2
+        || build.stage != PrivateCandidateStageV2::UnqualifiedCandidate
+        || build.version != manifest.version
+        || build.source_commit != manifest.source_commit
+        || build.target != manifest.target
+        || build.component_sha256 != parsed_q.component_digest
+        || build.unit_sha256 != parsed_q.unit_digest
+        || build.filter_sha256 != parsed_q.filter_digest
+        || certificate.payload.build_sha256 != String::from(hash_bytes(build_bytes))
+        || certificate.payload.qualification_sha256 != String::from(hash_bytes(qualification_bytes))
+        || certificate.payload.qualification_size != qualification_bytes.len() as u64
+        || certificate.payload.target != manifest.target
+        || certificate.payload.source_commit != manifest.source_commit
+        || certificate.payload.release_version != manifest.version
+        || certificate.payload.decision != "Complete"
+        || certificate.payload.canonical_bytes().is_err()
+    {
+        return Err(CiError::Message(
+            "qualified archive B/Q/CQ binding differs".into(),
+        ));
+    }
     let expected_root = format!("memcordon-v{}-{}", manifest.version, manifest.target);
     let mut expected_modes = BTreeMap::new();
     let mut required_members = BTreeSet::from([
         "runtime-manifest.json",
         qualification_reference.artifact.as_str(),
+        build_path.as_str(),
+        certificate_path.as_str(),
     ]);
     for component in &manifest.components {
         let bytes = expected
@@ -591,6 +634,8 @@ pub fn validate_qualified_linux_readback(
 pub struct OfflinePrivateQualifiedInputs<'a> {
     pub candidate: &'a PreparedPrivateCandidateV2,
     pub qualification_bytes: &'a [u8],
+    pub candidate_record_bytes: &'a [u8],
+    pub certificate_bytes: &'a [u8],
     pub qualification_reference: QualificationArtifactReferenceV2,
     pub expected_qualification: &'a TrustedQualificationExpectationV2<'a>,
     pub component_bytes: &'a BTreeMap<String, Vec<u8>>,
@@ -690,11 +735,27 @@ pub fn prepare_private_qualified_offline(
             "offline qualified asset inventory differs".into(),
         ));
     }
+    validate_private_candidate_record(inputs.candidate_record_bytes, inputs.candidate)?;
+    let (build_path, certificate_path) =
+        release_build_and_certificate_paths(&final_manifest.manifest().target)?;
+    if members
+        .insert(build_path, inputs.candidate_record_bytes.to_vec())
+        .is_some()
+        || members
+            .insert(certificate_path, inputs.certificate_bytes.to_vec())
+            .is_some()
+    {
+        return Err(CiError::Message(
+            "offline qualified asset member roles overlap".into(),
+        ));
+    }
     let (archive_bytes, archive_sha256) = seal_qualified_archive(&QualifiedArchiveExpectation {
         format: inputs.archive_format,
         members: &members,
         final_manifest: &final_manifest,
         qualification_bytes: inputs.qualification_bytes,
+        candidate_record_bytes: inputs.candidate_record_bytes,
+        certificate_bytes: inputs.certificate_bytes,
     })?;
     let installed_readback = validate_qualified_linux_readback(QualifiedLinuxReadbackInputs {
         qualification_bytes: inputs.qualification_bytes,

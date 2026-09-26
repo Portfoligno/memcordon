@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
@@ -1693,6 +1693,9 @@ pub fn private_plan_exchange_v2(
                     &response.payload,
                     contract,
                 )?;
+            // The service obtains this from SO_PEERCRED; the local process
+            // checks it before treating the receipt as its own plan.
+            receipt.validate_for_caller(unsafe { libc::geteuid() })?;
             super::linux_runtime::verify_private(&receipt)?;
             Ok(PrivatePlanExchangeV2::Available {
                 receipt,
@@ -1726,21 +1729,93 @@ pub fn execute_private_v2(
     contract: &memcordon_core::workload_contract::WorkloadContractV2,
     context: crate::AttemptContext,
 ) -> Result<PrivateServiceResultV2, PrivateLaunchErrorV2> {
+    execute_private_v2_with_expected_plan(policy, command, contract, context, None)
+}
+
+/// Compare a previously obtained public plan at the actual provider launch
+/// boundary. A matching receipt never bypasses current admission.
+pub fn execute_private_v2_with_expected_plan(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    context: crate::AttemptContext,
+    expected_plan: Option<&memcordon_core::workload_plan_v2::PrivatePlanReceiptV2>,
+) -> Result<PrivateServiceResultV2, PrivateLaunchErrorV2> {
+    execute_private_v2_plan_then_launch(
+        policy,
+        command,
+        contract,
+        contract,
+        context,
+        expected_plan,
+        false,
+    )
+}
+
+/// Deliberately plan the accepted contract, then submit one different
+/// one-port contract with that exact authenticated plan as its V5 frozen
+/// precondition. This is a negative release experiment, never an admission
+/// shortcut: success is a preallocation provider rejection.
+pub fn execute_private_v2_frozen_port_rejection(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    accepted_contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    tampered_contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    context: crate::AttemptContext,
+    expected_plan: &memcordon_core::workload_plan_v2::PrivatePlanReceiptV2,
+) -> Result<PrivateServiceResultV2, PrivateLaunchErrorV2> {
+    if !memcordon_core::private_release_branch_v1::one_policy_port_changed(
+        accepted_contract,
+        tampered_contract,
+    ) {
+        return Err(PrivateLaunchErrorV2::BeforeSubmission(
+            "frozen private contract is not exactly one approved-plan port change".into(),
+        ));
+    }
+    expected_plan
+        .validate_for_contract(accepted_contract)
+        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    expected_plan
+        .validate_for_caller(unsafe { libc::geteuid() })
+        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    execute_private_v2_plan_then_launch(
+        policy,
+        command,
+        accepted_contract,
+        tampered_contract,
+        context,
+        Some(expected_plan),
+        true,
+    )
+}
+
+fn execute_private_v2_plan_then_launch(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    plan_contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    launch_contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    context: crate::AttemptContext,
+    expected_plan: Option<&memcordon_core::workload_plan_v2::PrivatePlanReceiptV2>,
+    frozen_port_case: bool,
+) -> Result<PrivateServiceResultV2, PrivateLaunchErrorV2> {
     use memcordon_core::workload_contract::ExecutionIdentityRequestV2;
 
-    contract
+    plan_contract
+        .validate()
+        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    launch_contract
         .validate()
         .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
     if policy.boundary() != memcordon_core::BoundaryRequirement::Sealed
         || policy.workload_contract().is_some()
-        || contract.authorized_profile.id.as_str() != "linux-tcp4-private-v1"
+        || plan_contract.authorized_profile.id.as_str() != "linux-tcp4-private-v1"
     {
         return Err(PrivateLaunchErrorV2::BeforeSubmission(
             "V2 private launch requires sealed boundary, private profile and no V1 contract".into(),
         ));
     }
     if !matches!(
-        contract.execution_identity,
+        plan_contract.execution_identity,
         ExecutionIdentityRequestV2::AdministratorProfile { .. }
     ) {
         return Err(PrivateLaunchErrorV2::BeforeSubmission(
@@ -1748,21 +1823,27 @@ pub fn execute_private_v2(
         ));
     }
     let started = std::time::Instant::now();
-    let plan = private_plan_v2(contract).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
-    let deadline_budget = effective_deadline_duration(policy, context, started.elapsed());
-    let launch = encode_launch(policy, command, deadline_budget, context.restart_attempt)
-        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
-    let contract_bytes = serde_json::to_vec(contract)
-        .map_err(|error| PrivateLaunchErrorV2::BeforeSubmission(error.to_string()))?;
-    let contract_digest = memcordon_core::workload_codec::contract_digest_v2(contract)
-        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
-    let mut encoded = Vec::new();
-    encoded.extend_from_slice(&PRIVATE_VERSION.to_be_bytes());
-    encoded.extend_from_slice(plan.registry_digest.bytes());
-    encoded.extend_from_slice(plan.installed_qualification_sha256.bytes());
-    encoded.extend_from_slice(contract_digest.bytes());
-    put_bytes(&mut encoded, &contract_bytes).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
-    put_bytes(&mut encoded, &launch).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let plan = private_plan_v2(plan_contract).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    if frozen_port_case && expected_plan != Some(&plan) {
+        return Err(PrivateLaunchErrorV2::BeforeSubmission(
+            "frozen private plan differs from freshly authenticated accepted plan".into(),
+        ));
+    }
+    let precondition = expected_plan
+        .map(|receipt| {
+            memcordon_core::workload_plan_v2::PrivatePlanPreconditionV1::from_receipt(receipt)
+                .map_err(PrivateLaunchErrorV2::BeforeSubmission)
+        })
+        .transpose()?;
+    let encoded = encode_private_v2_with_plan(
+        policy,
+        command,
+        launch_contract,
+        context,
+        started.elapsed(),
+        &plan,
+        precondition.as_ref(),
+    )?;
     let expected = PrivateExpectedResultV2 {
         source_commit: &plan.source_commit,
         native_abi: plan.native_abi,
@@ -1770,6 +1851,270 @@ pub fn execute_private_v2(
         installed_qualification_sha256: &plan.installed_qualification_sha256,
     };
     run_private_v2(&encoded, &expected)
+}
+
+fn encode_private_v2_with_plan(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    launch_contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    context: crate::AttemptContext,
+    setup_elapsed: Duration,
+    plan: &memcordon_core::workload_plan_v2::PrivatePlanReceiptV2,
+    precondition: Option<&memcordon_core::workload_plan_v2::PrivatePlanPreconditionV1>,
+) -> Result<Vec<u8>, PrivateLaunchErrorV2> {
+    let deadline_budget = effective_deadline_duration(policy, context, setup_elapsed);
+    let launch = encode_launch(policy, command, deadline_budget, context.restart_attempt)
+        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let contract_bytes = serde_json::to_vec(launch_contract)
+        .map_err(|error| PrivateLaunchErrorV2::BeforeSubmission(error.to_string()))?;
+    let contract_digest = memcordon_core::workload_codec::contract_digest_v2(launch_contract)
+        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let mut encoded = Vec::new();
+    let request_version: u16 = if precondition.is_some() {
+        5
+    } else {
+        PRIVATE_VERSION
+    };
+    encoded.extend_from_slice(&request_version.to_be_bytes());
+    encoded.extend_from_slice(plan.registry_digest.bytes());
+    encoded.extend_from_slice(plan.installed_qualification_sha256.bytes());
+    encoded.extend_from_slice(contract_digest.bytes());
+    put_bytes(&mut encoded, &contract_bytes).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    put_bytes(&mut encoded, &launch).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    if let Some(precondition) = precondition {
+        encoded.extend_from_slice(precondition.contract_digest.bytes());
+        encoded.extend_from_slice(precondition.generation_digest.bytes());
+    }
+    Ok(encoded)
+}
+
+/// A final-public reuse experiment, never an ordinary retry. One installed
+/// nonroot CLI process obtains one authenticated plan and submits exactly two
+/// fresh V5 launch exchanges under that plan. The first must report a real
+/// postallocation CleanupIncomplete state; the second must be refused before
+/// allocation. The root supervisor brackets those exchanges with FD4 so two
+/// independent kernel intervals can be armed without changing actor PID.
+pub fn execute_private_v2_reuse_pair(
+    policy: &memcordon_core::Policy,
+    command: &memcordon_core::CommandSpec,
+    contract: &memcordon_core::workload_contract::WorkloadContractV2,
+    context: crate::AttemptContext,
+    expected_plan: Option<&memcordon_core::workload_plan_v2::PrivatePlanReceiptV2>,
+    barrier_fd: RawFd,
+) -> Result<PrivateServiceResultV2, PrivateLaunchErrorV2> {
+    use memcordon_core::provider_rejection_wire::{RejectionPhaseV1, RejectionWireV1};
+    use memcordon_core::workload_contract::ExecutionIdentityRequestV2;
+
+    if barrier_fd != 4 {
+        return Err(PrivateLaunchErrorV2::BeforeSubmission(
+            "reuse barrier must be inherited FD4".into(),
+        ));
+    }
+    verify_reuse_barrier_peer(barrier_fd).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    contract
+        .validate()
+        .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    if policy.boundary() != memcordon_core::BoundaryRequirement::Sealed
+        || policy.workload_contract().is_some()
+        || contract.authorized_profile.id.as_str() != "linux-tcp4-private-v1"
+        || !matches!(
+            contract.execution_identity,
+            ExecutionIdentityRequestV2::AdministratorProfile { .. }
+        )
+    {
+        return Err(PrivateLaunchErrorV2::BeforeSubmission(
+            "reuse pair requires exact sealed private V2 contract".into(),
+        ));
+    }
+    let started = std::time::Instant::now();
+    let plan = private_plan_v2(contract).map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    if let Some(expected) = expected_plan {
+        expected
+            .validate_for_contract(contract)
+            .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+        expected
+            .validate_for_caller(unsafe { libc::geteuid() })
+            .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+        if expected != &plan {
+            return Err(PrivateLaunchErrorV2::BeforeSubmission(
+                "reuse plan differs from protected expected plan".into(),
+            ));
+        }
+    }
+    let precondition =
+        memcordon_core::workload_plan_v2::PrivatePlanPreconditionV1::from_receipt(&plan)
+            .map_err(PrivateLaunchErrorV2::BeforeSubmission)?;
+    let encoded = encode_private_v2_with_plan(
+        policy,
+        command,
+        contract,
+        context,
+        started.elapsed(),
+        &plan,
+        Some(&precondition),
+    )?;
+    let expected = PrivateExpectedResultV2 {
+        source_commit: &plan.source_commit,
+        native_abi: plan.native_abi,
+        runtime_manifest_sha256: &plan.runtime_manifest_sha256,
+        installed_qualification_sha256: &plan.installed_qualification_sha256,
+    };
+    let first = run_private_v2(&encoded, &expected)?;
+    let first_raw = match first {
+        PrivateServiceResultV2::Rejected { raw_response, .. } => raw_response,
+        PrivateServiceResultV2::Complete(terminal) => {
+            return Err(reuse_after_submission(
+                "reuse first launch unexpectedly completed",
+                Some(terminal.raw_response().to_vec()),
+            ));
+        }
+        PrivateServiceResultV2::Indeterminate { raw_response, .. } => {
+            return Err(reuse_after_submission(
+                "reuse first launch is indeterminate",
+                Some(raw_response),
+            ));
+        }
+    };
+    let first_wire = RejectionWireV1::parse(&first_raw)
+        .map_err(|detail| reuse_after_submission(&detail, Some(first_raw.clone())))?;
+    if first_wire.code != "MCSEALED-PRIVATE-REUSE-CLEANUP-INCOMPLETE"
+        || first_wire.phase != RejectionPhaseV1::Retirement
+        || !first_wire.target_created
+        || !first_wire.target_released
+        || !first_wire.cleanup.attempted
+        || first_wire.cleanup.sealed_boundary_retired
+        || first_wire.cleanup.errors.is_empty()
+    {
+        return Err(reuse_after_submission(
+            "reuse first launch lacks protected CleanupIncomplete result",
+            Some(first_raw),
+        ));
+    }
+    reuse_between_attempts_barrier(barrier_fd)
+        .map_err(|detail| reuse_after_submission(&detail, None))?;
+    let second_encoded = encode_private_v2_with_plan(
+        policy,
+        command,
+        contract,
+        context,
+        started.elapsed(),
+        &plan,
+        Some(&precondition),
+    )
+    .map_err(|error| match error {
+        PrivateLaunchErrorV2::BeforeSubmission(detail) => reuse_after_submission(&detail, None),
+        PrivateLaunchErrorV2::AfterSubmission(failure) => {
+            reuse_after_submission(&failure.detail, failure.raw_response)
+        }
+    })?;
+    let second = run_private_v2(&second_encoded, &expected).map_err(|error| {
+        let (detail, raw_response) = match error {
+            PrivateLaunchErrorV2::BeforeSubmission(detail) => (detail, None),
+            PrivateLaunchErrorV2::AfterSubmission(failure) => {
+                (failure.detail, failure.raw_response)
+            }
+        };
+        reuse_after_submission(&detail, raw_response)
+    })?;
+    let PrivateServiceResultV2::Rejected { raw_response, .. } = &second else {
+        return Err(reuse_after_submission(
+            "reuse second launch was not a typed rejection",
+            match &second {
+                PrivateServiceResultV2::Complete(terminal) => {
+                    Some(terminal.raw_response().to_vec())
+                }
+                PrivateServiceResultV2::Indeterminate { raw_response, .. } => {
+                    Some(raw_response.clone())
+                }
+                PrivateServiceResultV2::Rejected { .. } => None,
+            },
+        ));
+    };
+    let second_wire = RejectionWireV1::parse(raw_response)
+        .map_err(|detail| reuse_after_submission(&detail, Some(raw_response.clone())))?;
+    if second_wire.code != "MCSEALED-PRIVATE-REUSE-BLOCKED"
+        || second_wire.phase != RejectionPhaseV1::RequestValidation
+        || second_wire.target_created
+        || second_wire.target_released
+        || second_wire.cleanup.attempted
+    {
+        return Err(reuse_after_submission(
+            "reuse second launch did not prove preallocation block",
+            Some(raw_response.clone()),
+        ));
+    }
+    Ok(second)
+}
+
+fn reuse_after_submission(detail: &str, raw_response: Option<Vec<u8>>) -> PrivateLaunchErrorV2 {
+    PrivateLaunchErrorV2::AfterSubmission(PrivateResponseFailureV2 {
+        detail: detail.into(),
+        raw_response,
+    })
+}
+
+fn verify_reuse_barrier_peer(fd: RawFd) -> Result<(), String> {
+    let mut socket_type: libc::c_int = 0;
+    let mut type_length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&raw mut socket_type).cast(),
+            &raw mut type_length,
+        )
+    } != 0
+        || type_length as usize != std::mem::size_of::<libc::c_int>()
+        || socket_type != libc::SOCK_STREAM
+    {
+        return Err("reuse barrier is not a Unix stream".into());
+    }
+    let mut peer = libc::ucred {
+        pid: 0,
+        uid: u32::MAX,
+        gid: u32::MAX,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut peer).cast(),
+            &raw mut length,
+        )
+    } != 0
+        || length as usize != std::mem::size_of::<libc::ucred>()
+        || peer.pid <= 0
+        || peer.uid != 0
+        || peer.pid == unsafe { libc::getpid() }
+    {
+        return Err("reuse barrier lacks root peer credentials".into());
+    }
+    Ok(())
+}
+
+fn reuse_between_attempts_barrier(fd: RawFd) -> Result<(), String> {
+    verify_reuse_barrier_peer(fd)?;
+    // SAFETY: CLI parsing fixed this inherited descriptor to FD4, and this
+    // function takes sole ownership after the first provider exchange.
+    let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(120)))
+        .map_err(|error| error.to_string())?;
+    stream.write_all(b"R").map_err(|error| error.to_string())?;
+    let mut release = [0_u8; 1];
+    stream
+        .read_exact(&mut release)
+        .map_err(|error| error.to_string())?;
+    if release != *b"G" {
+        return Err("reuse barrier release byte differs".into());
+    }
+    Ok(())
 }
 
 /// Decode only a response read from the already-connected, authenticated

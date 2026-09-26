@@ -62,6 +62,60 @@ fn sealed_is_a_single_high_level_pre_command_policy() {
     }
 }
 
+#[test]
+fn expected_private_plan_requires_exact_private_execution() {
+    let error = route(&native(&[
+        "--expected-private-plan",
+        "/tmp/old-plan.json",
+        "program",
+    ]))
+    .unwrap_err();
+    assert_eq!(error.code, "MCUSAGE-EXPECTED-PRIVATE-PLAN");
+    let error = route(&native(&[
+        "--sealed",
+        "--expected-private-plan",
+        "/tmp/old-plan.json",
+        "program",
+    ]))
+    .unwrap_err();
+    assert_eq!(error.code, "MCUSAGE-EXPECTED-PRIVATE-PLAN");
+}
+
+#[test]
+fn frozen_private_contract_requires_saved_plan_and_private_sealed_boundary() {
+    for values in [
+        ["--frozen-private-contract", "/tmp/tampered.json", "program"].as_slice(),
+        [
+            "--sealed",
+            "--frozen-private-contract",
+            "/tmp/tampered.json",
+            "program",
+        ]
+        .as_slice(),
+    ] {
+        let error = route(&native(values)).unwrap_err();
+        assert_eq!(error.code, "MCUSAGE-FROZEN-PRIVATE-CONTRACT");
+    }
+}
+
+#[test]
+fn reuse_two_attempts_requires_private_sealed_boundary_and_single_flag() {
+    for values in [
+        ["--reuse-private-two-attempts", "program"].as_slice(),
+        ["--sealed", "--reuse-private-two-attempts", "program"].as_slice(),
+    ] {
+        let error = route(&native(values)).unwrap_err();
+        assert_eq!(error.code, "MCUSAGE-REUSE-PRIVATE-TWO-ATTEMPTS");
+    }
+    let error = route(&native(&[
+        "--reuse-private-two-attempts",
+        "--reuse-private-two-attempts",
+        "program",
+    ]))
+    .unwrap_err();
+    assert_eq!(error.code, "MCUSAGE-REUSE-PRIVATE-TWO-ATTEMPTS");
+}
+
 #[cfg(unix)]
 #[test]
 fn sealed_execution_plan_and_doctor_fail_closed() {

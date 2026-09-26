@@ -365,10 +365,22 @@ impl RuntimeManifestV3 {
                 if !matches!(
                     self.target.as_str(),
                     "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
-                ) || !self.has_exact_roles(&[
-                    RuntimeComponentRole::PublicCli,
-                    RuntimeComponentRole::SealedAgent,
-                ]) || !self.has_agent_component(agent_component)
+                ) || !(if self.target == "aarch64-unknown-linux-gnu" {
+                    self.has_exact_roles(&[
+                        RuntimeComponentRole::PublicCli,
+                        RuntimeComponentRole::SealedAgent,
+                        RuntimeComponentRole::Arm32AbiHelper,
+                    ]) && self.components.iter().any(|component| {
+                        component.role == RuntimeComponentRole::Arm32AbiHelper
+                            && component.id == "arm32-abi-helper"
+                            && component.path == "memcordon-arm32-abi-helper"
+                    })
+                } else {
+                    self.has_exact_roles(&[
+                        RuntimeComponentRole::PublicCli,
+                        RuntimeComponentRole::SealedAgent,
+                    ])
+                }) || !self.has_agent_component(agent_component)
                     || supported_contract_versions.as_slice() != [1, 2]
                     || profile_catalog_sha256 != &profile_catalog_digest_v2()
                     || profiles.as_slice().len() != 2

@@ -731,9 +731,9 @@ fn check_private_native_diagnostic_job(
         .and_then(Value::as_sequence)
         .ok_or_else(|| failure("private native diagnostic steps absent"))?;
     let command = if candidate {
-        "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native"
+        "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage candidate-capability --target native --collector-intent-sha256 \"$COLLECTOR_INTENT_SHA256\" --policy-intent-sha256 \"$POLICY_INTENT_SHA256\""
     } else {
-        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage final-public --target native"
+        "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-private-v4 --stage final-public --target native"
     };
     let invocations: Vec<&Mapping> = steps
         .iter()
@@ -760,14 +760,46 @@ fn check_private_native_diagnostic_job(
         )?;
         exact_mapping_keys(
             environment,
-            &["GITHUB_TOKEN"],
+            &[
+                "GITHUB_TOKEN",
+                "COLLECTOR_INTENT_SHA256",
+                "POLICY_INTENT_SHA256",
+            ],
             "private candidate suite env",
         )?;
-        if scalar(environment, "GITHUB_TOKEN") != Some("${{ github.token }}") {
+        if scalar(environment, "GITHUB_TOKEN") != Some("${{ github.token }}")
+            || scalar(environment, "COLLECTOR_INTENT_SHA256")
+                != Some("${{ inputs.collector_intent_sha256 }}")
+            || scalar(environment, "POLICY_INTENT_SHA256")
+                != Some("${{ inputs.policy_intent_sha256 }}")
+        {
             return Err(failure("private candidate Actions token source differs"));
         }
     } else {
-        exact_mapping_keys(invocations[0], &["run"], "private native suite step")?;
+        exact_mapping_keys(
+            invocations[0],
+            &["name", "run", "env"],
+            "private native suite step",
+        )?;
+        if scalar(invocations[0], "name")
+            != Some("Final installed public V2 suite on the same host")
+        {
+            return Err(failure("private final-public suite step identity differs"));
+        }
+        let environment = mapping(
+            invocations[0]
+                .get(key("env"))
+                .ok_or_else(|| failure("private final-public Actions token absent"))?,
+            "private final-public suite environment",
+        )?;
+        exact_mapping_keys(
+            environment,
+            &["GITHUB_TOKEN"],
+            "private final-public suite env",
+        )?;
+        if scalar(environment, "GITHUB_TOKEN") != Some("${{ github.token }}") {
+            return Err(failure("private final-public Actions token source differs"));
+        }
     }
     if candidate {
         let downloads = action_steps(
@@ -823,10 +855,46 @@ fn check_private_native_diagnostic_job(
             ));
         }
     }
-    if !action_steps(steps, UPLOAD_ARTIFACT_ACTION)?.is_empty() {
-        return Err(failure(
-            "private diagnostic job must not publish Q-shaped artifact",
-        ));
+    let uploads = action_steps(steps, UPLOAD_ARTIFACT_ACTION)?;
+    if candidate {
+        let [upload] = uploads.as_slice() else {
+            return Err(failure("private candidate C V3 upload count differs"));
+        };
+        exact_mapping_keys(
+            upload,
+            &["name", "if", "uses", "with"],
+            "private candidate C V3 upload",
+        )?;
+        let with = mapping(
+            upload
+                .get(key("with"))
+                .ok_or_else(|| failure("private candidate C V3 upload inputs absent"))?,
+            "private candidate C V3 upload inputs",
+        )?;
+        exact_mapping_keys(
+            with,
+            &[
+                "name",
+                "path",
+                "if-no-files-found",
+                "retention-days",
+                "compression-level",
+            ],
+            "private candidate C V3 upload inputs",
+        )?;
+        if scalar(upload, "name") != Some("Upload completed private candidate C V3")
+            || scalar(upload, "if") != Some("success()")
+            || scalar(with, "name") != Some("release-private-candidate-${{ matrix.id }}")
+            || scalar(with, "path")
+                != Some("target/ci/reports/private-candidate-c-v3/${{ matrix.id }}")
+            || scalar(with, "if-no-files-found") != Some("error")
+            || with.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
+            || with.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
+        {
+            return Err(failure("private candidate C V3 diagnostic upload differs"));
+        }
+    } else if !uploads.is_empty() {
+        return Err(failure("private final-public diagnostic must not upload P"));
     }
     Ok(())
 }
@@ -2553,7 +2621,12 @@ fn check_release_structure(
             .ok_or_else(|| failure("release dispatch lacks inputs"))?,
         "release inputs",
     )?;
-    let input_names: Vec<&str> = vec!["tag", "private_native"];
+    let input_names: Vec<&str> = vec![
+        "tag",
+        "private_native",
+        "collector_intent_sha256",
+        "policy_intent_sha256",
+    ];
     exact_mapping_keys(inputs, &input_names, "release inputs")?;
     let tag = mapping(
         inputs
@@ -2582,6 +2655,26 @@ fn check_release_structure(
         || private_native.get(key("default")).and_then(Value::as_bool) != Some(false)
     {
         return Err(failure("private native opt-in must default closed"));
+    }
+    for name in ["collector_intent_sha256", "policy_intent_sha256"] {
+        let digest = mapping(
+            inputs
+                .get(key(name))
+                .ok_or_else(|| failure(format!("release {name} input is absent")))?,
+            "protected intent digest input",
+        )?;
+        exact_mapping_keys(
+            digest,
+            &["description", "required", "type"],
+            "protected intent digest input",
+        )?;
+        if digest.get(key("required")).and_then(Value::as_bool) != Some(false)
+            || scalar(digest, "type") != Some("string")
+        {
+            return Err(failure(format!(
+                "release {name} must be an optional digest string"
+            )));
+        }
     }
     check_top_level_permissions(workflow)?;
     let concurrency = mapping(
@@ -4740,6 +4833,19 @@ on:
       tag:
         description: Existing protected SemVer tag to publish or reconcile
         required: true
+        type: string
+      private_native:
+        description: Run fail-closed private native qualification diagnostics
+        required: false
+        type: boolean
+        default: false
+      collector_intent_sha256:
+        description: Digest only of the verifier host's protected candidate collector intent
+        required: false
+        type: string
+      policy_intent_sha256:
+        description: Digest only of the independently provisioned protected private-policy release intent
+        required: false
         type: string
 permissions:
   contents: read

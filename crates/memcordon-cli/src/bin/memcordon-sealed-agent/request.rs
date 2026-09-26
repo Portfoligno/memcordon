@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 pub const LAUNCH_REQUEST_VERSION: u16 = 3;
 pub const LAUNCH_BROKER_REQUEST_VERSION: u16 = 3;
 pub const NETWORK_LAUNCH_REQUEST_VERSION: u16 = 4;
+pub const NETWORK_LAUNCH_PRECONDITION_VERSION: u16 = 5;
 pub const NETWORK_LAUNCH_BROKER_REQUEST_VERSION: u16 = 4;
 const MAX_SUPPLEMENTARY_GROUPS: usize = 256;
 
@@ -64,6 +65,7 @@ pub struct NetworkLaunchRequestV4 {
     pub contract: memcordon_core::workload_contract::WorkloadContractV2,
     pub registry_digest: memcordon_core::DiagnosticSha256,
     pub qualification_digest: memcordon_core::DiagnosticSha256,
+    pub expected_plan: Option<memcordon_core::workload_plan_v2::PrivatePlanPreconditionV1>,
     pub launch: LaunchRequestV2,
 }
 
@@ -317,12 +319,21 @@ pub fn encode_network_launch_request(
         .map_err(|_| RequestCodecError::InvalidValue)?;
     let launch = encode_launch_request(&request.launch)?;
     let mut encoded = Vec::new();
-    encoded.extend_from_slice(&NETWORK_LAUNCH_REQUEST_VERSION.to_be_bytes());
+    let version = if request.expected_plan.is_some() {
+        NETWORK_LAUNCH_PRECONDITION_VERSION
+    } else {
+        NETWORK_LAUNCH_REQUEST_VERSION
+    };
+    encoded.extend_from_slice(&version.to_be_bytes());
     encoded.extend_from_slice(request.registry_digest.bytes());
     encoded.extend_from_slice(request.qualification_digest.bytes());
     encoded.extend_from_slice(contract_digest.bytes());
     put_bytes(&mut encoded, &contract)?;
     put_bytes(&mut encoded, &launch)?;
+    if let Some(expected) = &request.expected_plan {
+        encoded.extend_from_slice(expected.contract_digest.bytes());
+        encoded.extend_from_slice(expected.generation_digest.bytes());
+    }
     Ok(encoded)
 }
 
@@ -331,7 +342,10 @@ pub fn decode_network_launch_request(
 ) -> Result<NetworkLaunchRequestV4, RequestCodecError> {
     let mut cursor = Cursor::new(payload);
     let version = cursor.u16()?;
-    if version != NETWORK_LAUNCH_REQUEST_VERSION {
+    if !matches!(
+        version,
+        NETWORK_LAUNCH_REQUEST_VERSION | NETWORK_LAUNCH_PRECONDITION_VERSION
+    ) {
         return Err(RequestCodecError::UnsupportedVersion(version));
     }
     let registry_digest = memcordon_core::DiagnosticSha256::from_bytes(
@@ -357,6 +371,26 @@ pub fn decode_network_launch_request(
         return Err(RequestCodecError::InvalidValue);
     }
     let launch = decode_launch_request(&cursor.bytes()?)?;
+    let expected_plan = if version == NETWORK_LAUNCH_PRECONDITION_VERSION {
+        Some(
+            memcordon_core::workload_plan_v2::PrivatePlanPreconditionV1 {
+                contract_digest: memcordon_core::DiagnosticSha256::from_bytes(
+                    cursor
+                        .take(32)?
+                        .try_into()
+                        .expect("plan digest length is exact"),
+                ),
+                generation_digest: memcordon_core::DiagnosticSha256::from_bytes(
+                    cursor
+                        .take(32)?
+                        .try_into()
+                        .expect("generation digest length is exact"),
+                ),
+            },
+        )
+    } else {
+        None
+    };
     if !cursor.is_empty() {
         return Err(RequestCodecError::TrailingBytes);
     }
@@ -364,6 +398,7 @@ pub fn decode_network_launch_request(
         contract,
         registry_digest,
         qualification_digest,
+        expected_plan,
         launch,
     };
     validate_network_launch_request(&request)?;

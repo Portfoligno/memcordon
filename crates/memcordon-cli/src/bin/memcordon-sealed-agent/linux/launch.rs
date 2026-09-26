@@ -127,6 +127,8 @@ pub struct PrivateGatedPrelaunch {
     pub provider_control: File,
     pub expected_descriptors: ExpectedGatedDescriptorInventory,
     pub entrypoint_digest: memcordon_core::DiagnosticSha256,
+    pub entrypoint_device: u64,
+    pub entrypoint_inode: u64,
 }
 
 /// The native filter digest must come from the exact installed qualification
@@ -181,6 +183,13 @@ fn build_private_gated_prelaunch(
     abi: NativeAbi,
     expected_filter_digest: [u8; 32],
 ) -> Result<PrivateGatedPrelaunch, String> {
+    let entrypoint_identity = entrypoint.identity();
+    if entrypoint_identity.device == 0
+        || entrypoint_identity.inode == 0
+        || entrypoint_identity.sha256 != *entrypoint_digest.bytes()
+    {
+        return Err("MCSEALED-PRIVATE-PRELAUNCH: pinned entrypoint identity differs".into());
+    }
     let (target_stdio, provider_stdio) =
         provider_owned_byte_pipes().map_err(|error| format!("MCSEALED-PRIVATE-STDIO: {error}"))?;
     let (target_control, provider_control) =
@@ -210,6 +219,8 @@ fn build_private_gated_prelaunch(
         provider_control,
         expected_descriptors,
         entrypoint_digest,
+        entrypoint_device: entrypoint_identity.device,
+        entrypoint_inode: entrypoint_identity.inode,
     })
 }
 

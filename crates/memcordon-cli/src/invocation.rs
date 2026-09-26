@@ -50,6 +50,9 @@ Usage:
 Budgets and common options:
   --sealed                       Require certified sealed supervision; off
   --workload-contract PATH        Require exact workload admission; needs --sealed
+  --expected-private-plan PATH    Require the saved private plan at launch
+  --frozen-private-contract PATH  Test one-port tamper after an accepted private plan
+  --reuse-private-two-attempts    Test two real private launches under one plan and actor
   +MEMORY                        Memory ceiling; bytes, KB..EB, or KiB..EiB
   +TIME                          Elapsed-time deadline; decimal ms, s, m, or h
   --wait-for command|workload    Terminate remaining members after command exit
@@ -873,6 +876,9 @@ pub struct ExecutionArgs {
     pub policy: PolicyArgs,
     pub command: Vec<OsString>,
     pub output: OutputRequest,
+    pub expected_private_plan: Option<PathBuf>,
+    pub frozen_private_contract: Option<PathBuf>,
+    pub reuse_private_two_attempts: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1047,6 +1053,9 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
     let mut report_path = None;
     let mut summary = false;
     let mut quiet = false;
+    let mut expected_private_plan = None;
+    let mut frozen_private_contract = None;
+    let mut reuse_private_two_attempts = false;
     let mut index = 0;
     let mut budgets = BudgetSet::default();
     while index < argv.len() {
@@ -1087,6 +1096,43 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
                 }
                 report_path = Some(PathBuf::from(value));
             }
+            "--expected-private-plan" => {
+                if expected_private_plan.is_some() {
+                    return Err(CliError::new(
+                        "MCUSAGE-EXPECTED-PRIVATE-PLAN",
+                        "--expected-private-plan may be supplied once",
+                    ));
+                }
+                expected_private_plan = Some(PathBuf::from(option_value(
+                    argv,
+                    &mut index,
+                    inline_value,
+                    name,
+                )?));
+            }
+            "--frozen-private-contract" => {
+                if frozen_private_contract.is_some() {
+                    return Err(CliError::new(
+                        "MCUSAGE-FROZEN-PRIVATE-CONTRACT",
+                        "--frozen-private-contract may be supplied once",
+                    ));
+                }
+                frozen_private_contract = Some(PathBuf::from(option_value(
+                    argv,
+                    &mut index,
+                    inline_value,
+                    name,
+                )?));
+            }
+            "--reuse-private-two-attempts" if inline_value.is_none() => {
+                if reuse_private_two_attempts {
+                    return Err(CliError::new(
+                        "MCUSAGE-REUSE-PRIVATE-TWO-ATTEMPTS",
+                        "--reuse-private-two-attempts may be supplied once",
+                    ));
+                }
+                reuse_private_two_attempts = true;
+            }
             _ => parse_policy_option(name, inline_value, argv, &mut index, &mut policy)?,
         }
         index += 1;
@@ -1104,6 +1150,36 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
         ));
     }
     validate_policy_dependencies(&mut policy, &budgets)?;
+    if expected_private_plan.is_some()
+        && (policy.boundary != BoundaryRequirement::Sealed
+            || policy.private_workload_contract().is_none())
+    {
+        return Err(CliError::new(
+            "MCUSAGE-EXPECTED-PRIVATE-PLAN",
+            "--expected-private-plan requires --sealed and an exact V2 workload contract",
+        ));
+    }
+    if frozen_private_contract.is_some()
+        && (expected_private_plan.is_none()
+            || policy.boundary != BoundaryRequirement::Sealed
+            || policy.private_workload_contract().is_none())
+    {
+        return Err(CliError::new(
+            "MCUSAGE-FROZEN-PRIVATE-CONTRACT",
+            "--frozen-private-contract requires --sealed, an exact V2 contract and --expected-private-plan",
+        ));
+    }
+    if reuse_private_two_attempts
+        && (!cfg!(target_os = "linux")
+            || policy.boundary != BoundaryRequirement::Sealed
+            || policy.private_workload_contract().is_none()
+            || frozen_private_contract.is_some())
+    {
+        return Err(CliError::new(
+            "MCUSAGE-REUSE-PRIVATE-TWO-ATTEMPTS",
+            "--reuse-private-two-attempts requires Linux, --sealed, an exact V2 contract and no frozen contract",
+        ));
+    }
     Ok(ExecutionArgs {
         budgets,
         policy,
@@ -1113,6 +1189,9 @@ fn parse_execution(argv: &[OsString]) -> Result<ExecutionArgs, CliError> {
             summary,
             quiet,
         },
+        expected_private_plan,
+        frozen_private_contract,
+        reuse_private_two_attempts,
     })
 }
 

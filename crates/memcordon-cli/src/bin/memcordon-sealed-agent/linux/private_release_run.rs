@@ -25,6 +25,76 @@ pub(crate) struct PreparedReleaseCandidateRunV1 {
     pub(crate) request: ReleaseCaseRequestV1,
 }
 
+/// Decision-only policy custody. It pins M0 and a request-scoped protected
+/// directory but has no native attempt owner, launcher handle, or H1 grant.
+pub(crate) struct PolicyDecisionRunAuthorityV1 {
+    package: crate::package::VerifiedReleaseCandidatePackageLease,
+    directory: File,
+    result_key: DiagnosticSha256,
+    challenge: [u8; 32],
+    service_generation: DiagnosticSha256,
+}
+
+impl PolicyDecisionRunAuthorityV1 {
+    pub(crate) fn prepare(request: &ReleaseCaseRequestV1) -> Result<Self, String> {
+        if unsafe { libc::geteuid() } != 0
+            || request.stage != ReleaseStageV1::CandidateCapability
+            || request.selector != "private_tcp::wrong_grant_profile_and_port_rejected"
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: decision-only authority differs".into());
+        }
+        let package = crate::package::acquire_verified_release_candidate_package_lease()?;
+        let service = super::private_host_prerequisites::observe_sealed_service_generation()?;
+        if service.main().pid != unsafe { libc::getppid() } as u32 {
+            return Err("MCSEALED-PRIVATE-RELEASE: decision worker parent differs".into());
+        }
+        super::private_host_prerequisites::require_current_worker_cgroup(&service)?;
+        let pidfd = super::private_execution::pidfd_for_self()?;
+        let coordinator = ProcessIdentityV4::observe(unsafe { libc::getpid() }, pidfd.as_fd())?;
+        let result_key = request.result_key();
+        let root = open_or_create_root()?;
+        let directory = create_case_directory(&root, &result_key, 0)?;
+        let generation = service.digest()?;
+        let record = protected_request(request, &package, generation.clone(), coordinator);
+        let bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+        persist_request(&directory, &bytes, 0)?;
+        Ok(Self {
+            package,
+            directory,
+            result_key,
+            challenge: request.challenge,
+            service_generation: generation,
+        })
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), String> {
+        let service = super::private_host_prerequisites::observe_sealed_service_generation()?;
+        if service.digest()? != self.service_generation {
+            return Err("MCSEALED-PRIVATE-RELEASE: decision service generation changed".into());
+        }
+        super::private_host_prerequisites::require_current_worker_cgroup(&service)
+    }
+
+    pub(crate) fn challenge(&self) -> &[u8; 32] {
+        &self.challenge
+    }
+    pub(crate) fn result_key(&self) -> &DiagnosticSha256 {
+        &self.result_key
+    }
+    pub(crate) fn directory(&self) -> &File {
+        &self.directory
+    }
+    pub(crate) fn installation_epoch(&self) -> &DiagnosticSha256 {
+        &self.package.installation_epoch
+    }
+    pub(crate) fn installed_inspection_bytes(&self) -> Result<Vec<u8>, String> {
+        self.package.installed_inspection_bytes()
+    }
+    pub(crate) fn target(&self) -> &str {
+        &self.package.target
+    }
+}
+
 /// The detached service owns this after independently rechecking process
 /// exit, cgroup removal, exact selector output, and protected raw bytes. It
 /// is not Q provenance; CI must independently join the full native suite.
@@ -1264,6 +1334,37 @@ impl PreparedReleaseCandidateRunV1 {
         self.persist_control_cleanup_with_kind(worker, worker_pidfd, false)
     }
 
+    pub(crate) fn persist_control_policy_cleanup(
+        &self,
+        worker: &ProcessIdentityV4,
+        worker_pidfd: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<DiagnosticSha256, String> {
+        if unsafe { libc::geteuid() } != 0
+            || self.request.stage != ReleaseStageV1::CandidateCapability
+            || self.request.selector != "private_tcp::wrong_grant_profile_and_port_rejected"
+            || ProcessIdentityV4::observe(worker.pid as libc::pid_t, worker_pidfd)? != *worker
+        {
+            return Err("MCSEALED-PRIVATE-RELEASE: policy cleanup authority differs".into());
+        }
+        let package = crate::package::acquire_verified_release_candidate_package_lease()?;
+        let service = super::private_host_prerequisites::observe_service_generation()?;
+        if service.main().pid != unsafe { libc::getppid() } as u32 {
+            return Err("MCSEALED-PRIVATE-RELEASE: policy cleanup service differs".into());
+        }
+        super::private_host_prerequisites::require_current_worker_cgroup(&service)?;
+        let self_pidfd = super::private_execution::pidfd_for_self()?;
+        let coordinator =
+            ProcessIdentityV4::observe(unsafe { libc::getpid() }, self_pidfd.as_fd())?;
+        let expected = protected_request(&self.request, &package, service.digest()?, coordinator);
+        if read_request(&self.directory, 0)? != expected {
+            return Err("MCSEALED-PRIVATE-RELEASE: policy protected request differs".into());
+        }
+        super::private_release_policy_predicate::readback_protected_policy_raw(
+            &self.directory,
+            &self.request,
+        )
+    }
+
     pub(crate) fn persist_control_unix_intent_cleanup(
         &self,
         worker: &ProcessIdentityV4,
@@ -2122,6 +2223,68 @@ fn compare_protected_request(
     Ok(())
 }
 
+/// This is a protected E1 readback of an E0 request, not an admission result.
+/// It deliberately contains no no-allocation assertion; the CI interval
+/// observer must establish that independently around this invocation.
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoricalEpochReplayReadbackV1 {
+    schema_version: u8,
+    selector: &'static str,
+    result_key: DiagnosticSha256,
+    original_request_sha256: DiagnosticSha256,
+    e0_installation_epoch_sha256: DiagnosticSha256,
+    e1_installation_epoch_sha256: DiagnosticSha256,
+    mismatch: &'static str,
+}
+
+/// Reopen the exact old protected request under a current package-generation
+/// lease. A byte-identical reinstall advances installation epoch while
+/// retaining M0; any other origin change is not evidence for this branch.
+pub(crate) fn historical_epoch_replay_readback(
+    request: &ReleaseCaseRequestV1,
+) -> Result<HistoricalEpochReplayReadbackV1, String> {
+    if unsafe { libc::geteuid() } != 0
+        || request.stage != ReleaseStageV1::CandidateCapability
+        || request.selector != "private_tcp::native_tcp_bind_listen_connect"
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: historical replay authority differs".into());
+    }
+    let package = crate::package::acquire_verified_release_candidate_package_lease()?;
+    let service = super::private_host_prerequisites::observe_service_generation()?;
+    let self_pidfd = super::private_execution::pidfd_for_self()?;
+    let self_identity = ProcessIdentityV4::observe(unsafe { libc::getpid() }, self_pidfd.as_fd())?;
+    let root = open_existing_root()?;
+    let directory = open_case_directory(&root, &request.result_key(), 0)?;
+    let recorded = read_request(&directory, 0)?;
+    require_recorded_process_exited(&recorded.coordinator)?;
+    let expected = protected_request(request, &package, service.digest()?, self_identity);
+    if compare_protected_request(&recorded, &expected)
+        != Err(CandidateRequestMismatch::InstallationEpoch)
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: original E0 request is not stale by epoch".into());
+    }
+    let original_bytes = serde_json::to_vec(&recorded).map_err(|error| error.to_string())?;
+    Ok(HistoricalEpochReplayReadbackV1 {
+        schema_version: 1,
+        selector: request.selector,
+        result_key: request.result_key(),
+        original_request_sha256: memcordon_core::workload_codec::hash_bytes(&original_bytes),
+        e0_installation_epoch_sha256: recorded.installation_epoch,
+        e1_installation_epoch_sha256: package.installation_epoch.clone(),
+        mismatch: "installation-epoch",
+    })
+}
+
+pub(crate) fn run_historical_epoch_replay(request: ReleaseCaseRequestV1) -> Result<(), String> {
+    super::private_observer_hooks::mc_private_request_enter_v1();
+    let readback = historical_epoch_replay_readback(&request)?;
+    super::private_observer_hooks::mc_private_request_exit_v1();
+    let mut out = std::io::stdout().lock();
+    serde_json::to_writer(&mut out, &readback).map_err(|error| error.to_string())?;
+    out.write_all(b"\n").map_err(|error| error.to_string())
+}
+
 /// This capability owns a package lock and a pinned, never-reused release
 /// directory. It is neither serializable nor convertible into an H1 or
 /// production authority. A future physical candidate case runner must borrow
@@ -2142,6 +2305,27 @@ pub(crate) struct ReleaseCandidateRunAuthorityV1 {
 
 #[allow(dead_code)]
 impl ReleaseCandidateRunAuthorityV1 {
+    /// The helper is a separately inventoried B component on ARM64 GNU.
+    /// This read remains under the same package-generation lease as the case.
+    #[allow(dead_code)] // Consumed by the closed ARM32 physical subwitness.
+    pub(crate) fn installed_arm32_helper_digest(&self) -> Result<String, String> {
+        self.revalidate()?;
+        let (manifest, _) =
+            super::runtime_manifest::source_v3(Path::new("/usr/libexec/memcordon-sealed-agent"))?
+                .ok_or("MCSEALED-PRIVATE-RELEASE: ARM32 installed B absent")?;
+        if manifest.target != "aarch64-unknown-linux-gnu" {
+            return Err("MCSEALED-PRIVATE-RELEASE: ARM32 helper target differs".into());
+        }
+        let helper = manifest
+            .components
+            .iter()
+            .find(|component| {
+                component.role
+                    == memcordon_core::runtime_manifest::RuntimeComponentRole::Arm32AbiHelper
+            })
+            .ok_or("MCSEALED-PRIVATE-RELEASE: ARM32 helper B component absent")?;
+        Ok(helper.sha256.clone())
+    }
     /// A negative caller-authentication subcase must not allocate a second
     /// protected release run, even when it names another fixed challenge.
     #[allow(dead_code)] // Consumed by the closed caller/epoch physical witness.
@@ -2873,6 +3057,11 @@ impl ReleaseCandidateRunAuthorityV1 {
         Ok(&self.result_key)
     }
 
+    pub(crate) fn protected_installation_epoch(&self) -> Result<&DiagnosticSha256, String> {
+        self.revalidate()?;
+        Ok(&self.installation_epoch)
+    }
+
     pub(crate) fn installed_inspection_bytes(&self) -> Result<Vec<u8>, String> {
         self.revalidate()?;
         self.package.installed_inspection_bytes()
@@ -3602,6 +3791,9 @@ fn read_request(directory: &File, uid: u32) -> Result<ProtectedReleaseRequestV1,
     memcordon_core::workload_contract::reject_duplicate_json_keys(&bytes)?;
     let record: ProtectedReleaseRequestV1 =
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if serde_json::to_vec(&record).map_err(|error| error.to_string())? != bytes {
+        return Err("MCSEALED-PRIVATE-RELEASE: protected request is not canonical".into());
+    }
     if record.schema_version != 1
         || record.stage != "candidate-capability"
         || record.challenge.len() != [0_u8; 32].len() * 2
@@ -3771,6 +3963,48 @@ fn open_or_create_root() -> Result<File, String> {
     let root = unsafe { File::from_raw_fd(fd) };
     protected_directory(&root, 0)?;
     Ok(root)
+}
+
+fn open_existing_root() -> Result<File, String> {
+    let parent = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(super::STATE_ROOT)
+        .map_err(|error| error.to_string())?;
+    protected_directory(&parent, 0)?;
+    let name = CString::new(ROOT_LEAF).expect("fixed release root name");
+    // SAFETY: fixed leaf beneath a validated protected parent; no directory
+    // creation is permitted on the stale-request observation path.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return Err(format!(
+            "MCSEALED-PRIVATE-RELEASE: existing root open: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: successful openat transfers ownership of one directory fd.
+    let root = unsafe { File::from_raw_fd(fd) };
+    protected_directory(&root, 0)?;
+    Ok(root)
+}
+
+pub(crate) fn readback_closed_policy_raw(
+    request: &ReleaseCaseRequestV1,
+) -> Result<DiagnosticSha256, String> {
+    if request.stage != ReleaseStageV1::CandidateCapability
+        || request.selector != "private_tcp::wrong_grant_profile_and_port_rejected"
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: policy raw readback selector differs".into());
+    }
+    let root = open_existing_root()?;
+    let directory = open_case_directory(&root, &request.result_key(), 0)?;
+    super::private_release_policy_predicate::readback_protected_policy_raw(&directory, request)
 }
 
 fn key_name(key: &DiagnosticSha256) -> CString {

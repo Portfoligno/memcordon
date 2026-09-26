@@ -10,6 +10,7 @@ use std::{
 };
 
 pub const INSTALLED: &str = "/usr/libexec/memcordon-runtime-manifest.json";
+pub const INSTALLED_ARM32_HELPER: &str = "/usr/libexec/memcordon-arm32-abi-helper";
 const V3_IMAGE_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Read an exact installed M0/M1 candidate without inferring that Q came from
@@ -72,10 +73,22 @@ pub(crate) fn source_v3_candidate(
                     read_v3_image(&public_path, false)?,
                 )
             };
+            let helper_path = if installed {
+                Path::new(INSTALLED_ARM32_HELPER).to_path_buf()
+            } else {
+                source
+                    .parent()
+                    .expect("V3 source already has a parent")
+                    .join("memcordon-arm32-abi-helper")
+            };
+            let helper_bytes = (target()? == "aarch64-unknown-linux-gnu")
+                .then(|| read_v3_image(&helper_path, installed))
+                .transpose()?;
             super::installed_release_qualification::read_candidate(
                 bytes,
                 &agent_bytes,
                 &public_bytes,
+                helper_bytes.as_deref(),
                 installed,
             )
             .map(Some)
@@ -154,7 +167,23 @@ pub fn source_v3(source: &Path) -> Result<Option<(RuntimeManifestV3, Vec<u8>)>, 
             };
             let agent_bytes = read_v3_image(source, installed)?;
             let public_bytes = read_v3_image(&public_path, installed)?;
-            let manifest = validate_v3_source(&bytes, &agent_bytes, &public_bytes)?;
+            let helper_path = if installed {
+                Path::new(INSTALLED_ARM32_HELPER).to_path_buf()
+            } else {
+                source
+                    .parent()
+                    .expect("V3 source already has a parent")
+                    .join("memcordon-arm32-abi-helper")
+            };
+            let helper_bytes = (target()? == "aarch64-unknown-linux-gnu")
+                .then(|| read_v3_image(&helper_path, installed))
+                .transpose()?;
+            let manifest = validate_v3_source_with_helper(
+                &bytes,
+                &agent_bytes,
+                &public_bytes,
+                helper_bytes.as_deref(),
+            )?;
             Ok(Some((manifest, bytes)))
         }
     }
@@ -210,29 +239,52 @@ pub(crate) fn validate_v3_source(
     agent_bytes: &[u8],
     public_bytes: &[u8],
 ) -> Result<RuntimeManifestV3, String> {
+    validate_v3_source_with_helper(bytes, agent_bytes, public_bytes, None)
+}
+
+pub(crate) fn validate_v3_source_with_helper(
+    bytes: &[u8],
+    agent_bytes: &[u8],
+    public_bytes: &[u8],
+    helper_bytes: Option<&[u8]>,
+) -> Result<RuntimeManifestV3, String> {
     let manifest = RuntimeManifestV3::parse(bytes)?;
+    let mut components = vec![
+        RuntimeComponentRecord {
+            id: "public-cli".into(),
+            path: "memcordon".into(),
+            role: RuntimeComponentRole::PublicCli,
+            size: public_bytes.len() as u64,
+            mode: 0o755,
+            sha256: digest(public_bytes),
+        },
+        RuntimeComponentRecord {
+            id: "sealed-agent".into(),
+            path: "memcordon-sealed-agent".into(),
+            role: RuntimeComponentRole::SealedAgent,
+            size: agent_bytes.len() as u64,
+            mode: 0o755,
+            sha256: digest(agent_bytes),
+        },
+    ];
+    if target()? == "aarch64-unknown-linux-gnu" {
+        let helper = helper_bytes.ok_or("V3 ARM32 helper bytes absent")?;
+        components.push(RuntimeComponentRecord {
+            id: "arm32-abi-helper".into(),
+            path: "memcordon-arm32-abi-helper".into(),
+            role: RuntimeComponentRole::Arm32AbiHelper,
+            size: helper.len() as u64,
+            mode: 0o755,
+            sha256: digest(helper),
+        });
+    } else if helper_bytes.is_some() {
+        return Err("V3 unexpected ARM32 helper bytes".into());
+    }
     let expected = RuntimeManifestV3::linux_unqualified(
         env!("CARGO_PKG_VERSION").into(),
         crate::SOURCE_COMMIT.into(),
         target()?.into(),
-        vec![
-            RuntimeComponentRecord {
-                id: "public-cli".into(),
-                path: "memcordon".into(),
-                role: RuntimeComponentRole::PublicCli,
-                size: public_bytes.len() as u64,
-                mode: 0o755,
-                sha256: digest(public_bytes),
-            },
-            RuntimeComponentRecord {
-                id: "sealed-agent".into(),
-                path: "memcordon-sealed-agent".into(),
-                role: RuntimeComponentRole::SealedAgent,
-                size: agent_bytes.len() as u64,
-                mode: 0o755,
-                sha256: digest(agent_bytes),
-            },
-        ],
+        components,
     )?;
     if manifest != expected {
         return Err("V3 runtime generation differs from exact executable images".into());

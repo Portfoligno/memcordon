@@ -146,11 +146,68 @@ impl PrivateReleaseDualRetiredBranchV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "native_abi", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum PrivateReleaseAbiRawInventoryV1 {
+    X86_64 {
+        x32_sha256: DiagnosticSha256,
+        i386_sha256: DiagnosticSha256,
+    },
+    Aarch64 {
+        arm32_sha256: DiagnosticSha256,
+    },
+}
+
+impl PrivateReleaseAbiRawInventoryV1 {
+    fn valid_for_target(&self, target: &str) -> bool {
+        let zero = [0; 32];
+        match (self, target) {
+            (
+                Self::X86_64 {
+                    x32_sha256,
+                    i386_sha256,
+                },
+                "x86_64-unknown-linux-gnu",
+            ) => {
+                x32_sha256.bytes() != &zero
+                    && i386_sha256.bytes() != &zero
+                    && x32_sha256 != i386_sha256
+            }
+            (Self::Aarch64 { arm32_sha256 }, "aarch64-unknown-linux-gnu") => {
+                arm32_sha256.bytes() != &zero
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "phase", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum PrivateReleaseObservationV1 {
     PreallocationRejected {
         rejection_code: String,
         observer_sha256: DiagnosticSha256,
+    },
+    /// Candidate-only composite: an accepted decision-only control and four
+    /// separately armed preallocation rejections. All five intervals must
+    /// show no allocation. These digests are claims until CI joins protected
+    /// raw leaves, authenticated policy intent and BPF captures.
+    PolicyComposite {
+        accepted_decision_sha256: DiagnosticSha256,
+        branch_transcript_sha256: DiagnosticSha256,
+        independent_interval_inventory_sha256: DiagnosticSha256,
+        native_observer_sha256: DiagnosticSha256,
+    },
+    /// Candidate-only positive target lifecycle plus all native/x32/i386 or
+    /// native/ARM32 branches. Raw digests remain claims until the detached CI
+    /// reader joins protected leaves and one loss-free kernel interval.
+    AbiComposite {
+        attempt_id: String,
+        checkpoint_sha256: DiagnosticSha256,
+        terminal_sha256: DiagnosticSha256,
+        retirement_sha256: DiagnosticSha256,
+        abi_raw: PrivateReleaseAbiRawInventoryV1,
+        independent_interval_sha256: DiagnosticSha256,
+        native_observer_sha256: DiagnosticSha256,
     },
     AllocatedRetired {
         outcome: PrivateReleaseAllocatedOutcomeV1,
@@ -305,12 +362,33 @@ impl PrivateReleaseCaseResultV1 {
             | PrivateReleaseObservationV1::RetirementFailureBlockedReuse {
                 native_observer_sha256,
                 ..
+            }
+            | PrivateReleaseObservationV1::PolicyComposite {
+                native_observer_sha256,
+                ..
+            }
+            | PrivateReleaseObservationV1::AbiComposite {
+                native_observer_sha256,
+                ..
             } => native_observer_sha256,
         };
         if observer_hash != recorded_observer_hash {
             return Err("private release observer attachment hash differs".into());
         }
-        validate_release_observation_v1(&self.selector, self.installed.stage(), &self.observation)
+        validate_release_observation_v1(&self.selector, self.installed.stage(), &self.observation)?;
+        if let PrivateReleaseObservationV1::AbiComposite {
+            abi_raw,
+            independent_interval_sha256,
+            ..
+        } = &self.observation
+        {
+            if !abi_raw.valid_for_target(&self.target)
+                || independent_interval_sha256.bytes() == &[0; 32]
+            {
+                return Err("private ABI result raw/interval inventory differs".into());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -339,6 +417,38 @@ pub fn validate_release_observation_v1(
         "target-completed"
     };
     match (observation, expected) {
+        (
+            PrivateReleaseObservationV1::AbiComposite {
+                attempt_id,
+                checkpoint_sha256,
+                terminal_sha256,
+                retirement_sha256,
+                ..
+            },
+            "target-completed",
+        ) if stage == PrivateReleaseStageV1::CandidateCapability
+            && selector == "private_tcp::abi_alternate_entry_denied"
+            && valid_attempt_id(attempt_id)
+            && [checkpoint_sha256, terminal_sha256, retirement_sha256]
+                .iter()
+                .all(|digest| digest.bytes() != &[0; 32]) => {}
+        (
+            PrivateReleaseObservationV1::PolicyComposite {
+                accepted_decision_sha256,
+                branch_transcript_sha256,
+                independent_interval_inventory_sha256,
+                ..
+            },
+            "grant-rejected",
+        ) if stage == PrivateReleaseStageV1::CandidateCapability
+            && selector == "private_tcp::wrong_grant_profile_and_port_rejected"
+            && [
+                accepted_decision_sha256,
+                branch_transcript_sha256,
+                independent_interval_inventory_sha256,
+            ]
+            .iter()
+            .all(|digest| digest.bytes() != &[0; 32]) => {}
         (
             PrivateReleaseObservationV1::DualAttemptsRetired { first, second, .. },
             "target-completed",

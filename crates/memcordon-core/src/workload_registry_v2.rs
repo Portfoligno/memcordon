@@ -414,6 +414,7 @@ fn encode_identity_request(
 #[serde(rename_all = "kebab-case")]
 pub enum AdmissionCodeV2 {
     ProfileNotAuthorized,
+    PlanNotApproved,
     ProfileDigestMismatch,
     PolicyEpochStale,
     PolicyIncompatible,
@@ -517,13 +518,16 @@ pub fn resolve_v2<'a>(
                 && grant.revision == request.authorization.grant_revision
                 && grant.enabled
                 && grant.callers.as_slice().contains(authenticated_caller)
-                && grant
-                    .approved_plans
-                    .as_slice()
-                    .contains(&request.workload_plan_digest)
-                && request.authorization.approved_plan_digest == request.workload_plan_digest
         })
         .ok_or_else(|| reject(Code::ProfileNotAuthorized))?;
+    if !grant
+        .approved_plans
+        .as_slice()
+        .contains(&request.workload_plan_digest)
+        || request.authorization.approved_plan_digest != request.workload_plan_digest
+    {
+        return Err(reject(Code::PlanNotApproved));
+    }
     if current_epoch != &request.expected_epoch {
         return Err(reject(Code::PolicyEpochStale));
     }

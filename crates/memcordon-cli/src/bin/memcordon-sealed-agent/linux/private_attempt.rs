@@ -517,11 +517,17 @@ impl DurablePrivateAttempt {
             return Err("V4 target requires live guardian".into());
         }
         let mut next = self.record.clone();
-        next.namespace_init = Some(namespace_init);
-        next.target = Some(target);
+        next.namespace_init = Some(namespace_init.clone());
+        next.target = Some(target.clone());
         next.network_namespace_inode = Some(network_namespace_inode);
         next.phase = PrivateAttemptPhase::TargetGated;
-        self.replace(next)
+        self.replace(next)?;
+        super::private_public_provider::observe_gated_target(
+            self.record.attempt_id.as_str(),
+            &target,
+            &namespace_init,
+            network_namespace_inode,
+        )
     }
 
     pub fn commit_checkpoint(
@@ -722,4 +728,80 @@ impl DurablePrivateAttempt {
         }
         Ok(record)
     }
+}
+
+/// Explicit, narrow V4 recovery after the installed-public reuse observer has
+/// closed its exact namespace handle. Ordinary V4 recovery remains fail-closed;
+/// this cannot resurrect a launch authority or erase an active boundary.
+pub(crate) fn recover_exact_reuse_incomplete(
+    attempt_id: &str,
+    expected: &PrivateAttemptRecordV4,
+) -> Result<(), String> {
+    super::attempt::secure_state_root()?;
+    if !super::cgroup::valid_attempt_identity(attempt_id)
+        || expected.attempt_id.as_str() != attempt_id
+        || expected.phase != PrivateAttemptPhase::CleanupIncomplete
+        || expected.checkpoint.is_none()
+        || expected.network_namespace_inode.is_none()
+    {
+        return Err("V4 public reuse recovery attempt differs".into());
+    }
+    let cgroup = Path::new(super::CGROUP_ROOT).join(attempt_id);
+    match fs::symlink_metadata(&cgroup) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err("V4 public reuse cgroup remains".into()),
+    }
+    for member in [
+        expected.target.as_ref(),
+        expected.namespace_init.as_ref(),
+        expected.guardian.as_ref(),
+    ] {
+        let member = member.ok_or("V4 public reuse process identity absent")?;
+        match fs::symlink_metadata(format!("/proc/{}", member.pid)) {
+            Ok(_) => {
+                let start = super::envelope::process_start_time(member.pid as libc::pid_t)?;
+                if start == member.start_time {
+                    return Err("V4 public reuse process remains live".into());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let _policy = crate::policy_registry::native::Lease::acquire()?;
+    if !_policy
+        .versioned_live_bindings()?
+        .iter()
+        .any(|(identity, _)| identity == attempt_id)
+    {
+        return Err("V4 public reuse policy reference absent".into());
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(STATE_ROOT)
+        .map_err(|error| error.to_string())?;
+    let path = Path::new(STATE_ROOT).join(attempt_id);
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return Err("V4 public reuse durable file protection differs".into());
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_PRIVATE_RECORD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if PrivateAttemptRecordV4::parse(&bytes)? != *expected {
+        return Err("V4 public reuse durable record changed".into());
+    }
+    fs::remove_file(&path).map_err(|error| error.to_string())?;
+    directory.sync_all().map_err(|error| error.to_string())
 }

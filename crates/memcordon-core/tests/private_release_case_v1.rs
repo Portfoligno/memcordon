@@ -102,6 +102,38 @@ fn duplicate_keys_and_missing_retirement_are_rejected() {
 }
 
 #[test]
+fn abi_composite_is_candidate_only_and_architecture_exact() {
+    let mut value = result();
+    value["selector"] = serde_json::json!("private_tcp::abi_alternate_entry_denied");
+    value["observation"] = serde_json::json!({
+        "phase": "abi-composite",
+        "attempt_id": "ab".repeat(16),
+        "checkpoint_sha256": DiagnosticSha256::from_bytes([1; 32]),
+        "terminal_sha256": DiagnosticSha256::from_bytes([2; 32]),
+        "retirement_sha256": DiagnosticSha256::from_bytes([3; 32]),
+        "abi_raw": {
+            "native_abi": "x86-64",
+            "x32_sha256": DiagnosticSha256::from_bytes([4; 32]),
+            "i386_sha256": DiagnosticSha256::from_bytes([5; 32]),
+        },
+        "independent_interval_sha256": DiagnosticSha256::from_bytes([6; 32]),
+        "native_observer_sha256": DiagnosticSha256::from_bytes([7; 32]),
+    });
+    assert!(parse(&value).is_ok());
+    let mut alias = value.clone();
+    alias["observation"]["abi_raw"]["i386_sha256"] =
+        alias["observation"]["abi_raw"]["x32_sha256"].clone();
+    assert!(parse(&alias).is_err());
+    let mut wrong_arch = value.clone();
+    wrong_arch["target"] = serde_json::json!("aarch64-unknown-linux-gnu");
+    wrong_arch["native_machine"] = serde_json::json!("aarch64");
+    assert!(parse(&wrong_arch).is_err());
+    let mut wrong_stage = value;
+    wrong_stage["installed"]["stage"] = serde_json::json!("final-public");
+    assert!(parse(&wrong_stage).is_err());
+}
+
+#[test]
 fn dual_retirement_requires_two_distinct_completed_attempts_and_exact_selector() {
     let mut value = result();
     let digest = DiagnosticSha256::from_bytes([7; 32]);

@@ -145,12 +145,36 @@ pub(crate) fn request_private_host_qualification() -> Result<(), String> {
             rejection.validate()?;
             Err(format!("{}: {}", rejection.code, rejection.detail))
         }
-        _ => Err("MCSEALED-PRIVATE-PROBE: trusted H1 publication unavailable".into()),
+        MessageKind::PrivateProbeRunCompleted
+            if finalized.payload.len() == [0_u8; 32].len()
+                && finalized.payload.iter().any(|byte| *byte != 0) =>
+        {
+            Ok(())
+        }
+        _ => Err("MCSEALED-PRIVATE-PROBE: trusted H1 publication response differs".into()),
     }
 }
 
 pub(crate) fn request_release_candidate_case(
     case: &super::private_release_case::ReleaseCaseRequestV1,
+) -> Result<(), String> {
+    request_release_candidate_case_inner(case, false)
+}
+
+pub(crate) fn request_release_candidate_abi_raw(
+    case: &super::private_release_case::ReleaseCaseRequestV1,
+) -> Result<(), String> {
+    if case.stage != super::private_release_case::ReleaseStageV1::CandidateCapability
+        || case.selector != super::private_release_alt_abi::SELECTOR
+    {
+        return Err("MCSEALED-PRIVATE-RELEASE: raw ABI request selector differs".into());
+    }
+    request_release_candidate_case_inner(case, true)
+}
+
+fn request_release_candidate_case_inner(
+    case: &super::private_release_case::ReleaseCaseRequestV1,
+    abi_raw_only: bool,
 ) -> Result<(), String> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("MCSEALED-PRIVATE-RELEASE: root administrator required".into());
@@ -177,7 +201,9 @@ pub(crate) fn request_release_candidate_case(
         return Err("MCSEALED-PRIVATE-RELEASE: control response binding differs".into());
     }
     match response.kind {
-        MessageKind::ReleaseCaseIncomplete if response.payload.is_empty() => {}
+        MessageKind::ReleaseCaseIncomplete
+            if (!abi_raw_only && response.payload.is_empty())
+                || (abi_raw_only && response.payload == b"ABI-RAW-READY-V1") => {}
         MessageKind::Rejected => {
             let rejection: RejectionV1 =
                 serde_json::from_slice(&response.payload).map_err(|error| error.to_string())?;
@@ -198,6 +224,12 @@ pub(crate) fn request_release_candidate_case(
         return Err("MCSEALED-PRIVATE-RELEASE: first coordinator remained open".into());
     }
     drop(stream);
+    if abi_raw_only {
+        // This acknowledges only that the first coordinator exited. The
+        // detached ABI leaves and kernel interval still require independent
+        // readback; no V1 result is produced by this verb.
+        return Ok(());
+    }
     let mut final_stream = UnixStream::connect(super::SOCKET_PATH)
         .map_err(|error| format!("MCSEALED-PRIVATE-RELEASE: finalizer connection: {error}"))?;
     super::launcher::authenticate_control_service(&final_stream)?;
@@ -320,6 +352,27 @@ fn handle(
                 }
             }
         }
+        (PROTOCOL_VERSION, MessageKind::PublicAbiOuterControl) => {
+            if credentials.uid != 0
+                || !descriptors.is_empty()
+                || request.nonce == [0; 16]
+                || request.attempt_id == [0; 16]
+            {
+                return Err("MCSEALED-PUBLIC-ABI: root-only request differs".into());
+            }
+            super::private_observer_hooks::mc_private_request_enter_v1();
+            let observed = super::private_public_abi_control::service_control(&request.payload);
+            super::private_observer_hooks::mc_private_request_exit_v1();
+            let (key, raw_sha256) = observed?;
+            let mut payload = key.bytes().to_vec();
+            payload.extend_from_slice(raw_sha256.bytes());
+            Frame {
+                kind: MessageKind::PublicAbiOuterRecorded,
+                nonce: request.nonce,
+                attempt_id: request.attempt_id,
+                payload,
+            }
+        }
         (NETWORK_PROTOCOL_VERSION, MessageKind::ReleaseCase) => {
             if credentials.uid != 0 || !descriptors.is_empty() || request.attempt_id == [0; 16] {
                 rejected_text(
@@ -329,12 +382,47 @@ fn handle(
                 )?
             } else {
                 let fixed = super::private_release_run::decode_broker_request(&request.payload)?;
+                if fixed.selector == "private_tcp::wrong_grant_profile_and_port_rejected" {
+                    return Err(
+                        "policy decision selector requires distinct nonroot endpoint".into(),
+                    );
+                }
+                super::private_observer_hooks::mc_private_request_enter_v1();
                 let prepared =
                     super::private_release_run::ReleaseCandidateRunAuthorityV1::prepare_control(
                         fixed,
                     )?;
-                super::launcher::execute_release_candidate_case(&request, &prepared)?
+                let response =
+                    super::launcher::execute_release_candidate_case(&request, &prepared)?;
+                super::private_observer_hooks::mc_private_request_exit_v1();
+                response
             }
+        }
+        (NETWORK_PROTOCOL_VERSION, MessageKind::PolicyDecision) => {
+            if credentials.uid == 0
+                || !descriptors.is_empty()
+                || request.attempt_id == [0; 16]
+                || request.nonce == [0; 16]
+            {
+                return Err(
+                    "policy decision requires authenticated nonroot peer and no descriptors".into(),
+                );
+            }
+            let fixed = super::private_release_run::decode_broker_request(&request.payload)?;
+            super::private_policy_decision_peer::consume_registration(
+                &fixed,
+                credentials.pid,
+                credentials.uid,
+                credentials.gid,
+            )?;
+            super::private_observer_hooks::mc_private_request_enter_v1();
+            let observed =
+                super::private_release_policy_predicate::persist_authenticated_policy_decision_raw(
+                    &fixed,
+                    credentials.uid,
+                );
+            super::private_observer_hooks::mc_private_request_exit_v1();
+            super::private_policy_decision_peer::decision_response(&request, &observed?)
         }
         (NETWORK_PROTOCOL_VERSION, MessageKind::FinalizeReleaseCase) => {
             if credentials.uid != 0 || !descriptors.is_empty() || request.attempt_id == [0; 16] {
@@ -345,6 +433,11 @@ fn handle(
                 )?
             } else {
                 let fixed = super::private_release_run::decode_broker_request(&request.payload)?;
+                if fixed.selector == super::private_release_alt_abi::SELECTOR {
+                    return Err(
+                        "MCSEALED-PRIVATE-RELEASE: ABI composite has no detached finalizer".into(),
+                    );
+                }
                 if fixed.selector == super::private_release_case::AUTHORIZATION_UNCERTAIN_SELECTOR {
                     let readback =
                         super::private_release_run::verify_detached_uncertain_candidate_case(
@@ -432,20 +525,57 @@ fn handle(
             }
         }
         (NETWORK_PROTOCOL_VERSION, MessageKind::PrivatePlan) => {
-            private_plan_response(&request, descriptors.len(), credentials.uid)?
+            super::private_observer_hooks::mc_private_request_enter_v1();
+            let observed = (|| {
+                let response = private_plan_response(
+                    &request,
+                    descriptors.len(),
+                    credentials.pid,
+                    credentials.uid,
+                    credentials.gid,
+                )?;
+                super::private_public_provider::observe_plan(
+                    &request,
+                    &response,
+                    credentials.pid,
+                    credentials.uid,
+                    credentials.gid,
+                )?;
+                Ok::<_, String>(response)
+            })();
+            super::private_observer_hooks::mc_private_request_exit_v1();
+            observed?
         }
         (NETWORK_PROTOCOL_VERSION, MessageKind::PrivateLaunch) => {
-            match launch_private_response(request.clone(), descriptors, credentials, groups) {
-                Ok(response) => response,
-                Err(PrivateLaunchFailure::PreAdmission(rejection)) => {
-                    journal_rejection(request.attempt_id, &rejection);
-                    rejected(&request, &rejection)?
-                }
-                Err(PrivateLaunchFailure::AfterBroker(error)) => {
-                    eprintln!("sealed private terminal indeterminate: {error}");
-                    private_indeterminate_response(&request)?
-                }
-            }
+            super::private_observer_hooks::mc_private_request_enter_v1();
+            super::private_public_provider::begin_launch(
+                &request,
+                credentials.pid,
+                credentials.uid,
+                credentials.gid,
+            )?;
+            let response =
+                match launch_private_response(request.clone(), descriptors, credentials, groups) {
+                    Ok(response) => response,
+                    Err(PrivateLaunchFailure::PreAdmission(rejection)) => {
+                        journal_rejection(request.attempt_id, &rejection);
+                        rejected(&request, &rejection)?
+                    }
+                    Err(PrivateLaunchFailure::AfterBroker(error)) => {
+                        eprintln!("sealed private terminal indeterminate: {error}");
+                        private_indeterminate_response(&request)?
+                    }
+                };
+            super::private_public_reuse::record_blocked(&request, &response)?;
+            super::private_public_provider::observe_launch(
+                &request,
+                &response,
+                credentials.pid,
+                credentials.uid,
+                credentials.gid,
+            )?;
+            super::private_observer_hooks::mc_private_request_exit_v1();
+            response
         }
         (NETWORK_PROTOCOL_VERSION, MessageKind::QualifyPrivateHost) => {
             if credentials.uid != 0
@@ -478,12 +608,21 @@ fn handle(
             } else {
                 let mut run_nonce = [0_u8; 32];
                 run_nonce.copy_from_slice(&request.payload);
-                match super::private_host_receipt::verify_detached_candidate(&run_nonce) {
-                    Ok(_candidate) => rejected_text(
-                        &request,
-                        "MCSEALED-PRIVATE-RELEASE-Q-UNVERIFIED",
-                        "detached native host run verified, but independent release Q provenance is unavailable",
-                    )?,
+                match super::private_host_receipt::verify_detached_candidate(&run_nonce)
+                    .and_then(|candidate| {
+                        let installed = super::runtime_manifest::source_v3_candidate(
+                            std::path::Path::new("/usr/libexec/memcordon-sealed-agent"),
+                        )?
+                        .ok_or("MCSEALED-PRIVATE-PROBE: installed M1 absent")?;
+                        let release = super::installed_release_qualification::verify_anchored_native_qualification(&installed)?;
+                        super::private_host_receipt::publish_verified_active(&release, candidate)
+                    }) {
+                    Ok(active) => Frame {
+                        kind: MessageKind::PrivateProbeRunCompleted,
+                        nonce: request.nonce,
+                        attempt_id: request.attempt_id,
+                        payload: active.receipt_sha256().bytes().to_vec(),
+                    },
                     Err(error) => {
                         rejected_text(&request, "MCSEALED-PRIVATE-PROBE-FINALIZE-REJECTED", &error)?
                     }
@@ -674,7 +813,9 @@ fn workload_plan_response(
 fn private_plan_response(
     request: &Frame,
     descriptor_count: usize,
+    pid: libc::pid_t,
     uid: u32,
+    gid: u32,
 ) -> Result<Frame, String> {
     use memcordon_core::workload_contract::WorkloadContract;
     use memcordon_core::workload_evidence_v2::QualifiedNativeAbiV2;
@@ -730,41 +871,64 @@ fn private_plan_response(
             return rejected_text(request, "MCSEALED-PRIVATE-POLICY-UNAVAILABLE", &error);
         }
     };
-    if let Err(rejection) = resolve_v2(
+    let resolution = resolve_v2(
         &activation.registry,
         &activation.epoch,
         &contract,
         &CallerSelector::Linux { uid },
         ProfileKindV2::LinuxTcp4PrivateV1,
         installed.qualification_digest(),
-    ) {
-        return rejected_text(
+    );
+    if let Err(rejection) = &resolution {
+        let response = rejected_text(
             request,
             "MCSEALED-PRIVATE-PUBLIC-GRANT-REJECTED",
             &format!("current public V2 grant rejected: {:?}", rejection.code),
-        );
+        )?;
+        super::private_public_provider::observe_plan_authority(
+            request,
+            &response,
+            pid,
+            uid,
+            gid,
+            &activation,
+            &resolution,
+        )?;
+        return Ok(response);
     }
     let native_abi = match installed.filter_abi() {
         super::network_filter::NativeAbi::X86_64 => QualifiedNativeAbiV2::X86_64LinuxGnu,
         super::network_filter::NativeAbi::Aarch64 => QualifiedNativeAbiV2::Aarch64LinuxGnu,
     };
     let receipt = memcordon_core::workload_plan_v2::PrivatePlanReceiptV2 {
-        schema_version: 2,
+        schema_version: 3,
         contract_digest: memcordon_core::workload_codec::contract_digest_v2(&contract)?,
-        registry_digest: activation.registry_digest,
+        registry_digest: activation.registry_digest.clone(),
         installed_qualification_sha256: installed.qualification_digest().clone(),
         runtime_manifest_sha256: installed.runtime_manifest_sha256().clone(),
         generation_digest: installed.generation_digest().clone(),
+        caller_uid: uid,
+        policy_epoch: activation.epoch.clone(),
         source_commit: installed.source_commit().to_owned(),
         native_abi,
     };
     receipt.validate_for_contract(&contract)?;
-    Ok(Frame {
+    let response = Frame {
         kind: MessageKind::PrivatePlanReceipt,
         nonce: request.nonce,
         attempt_id: request.attempt_id,
         payload: serde_json::to_vec(&receipt).map_err(|error| error.to_string())?,
-    })
+    };
+    super::private_public_provider::observe_plan_authority(
+        request,
+        &response,
+        pid,
+        uid,
+        gid,
+        &activation,
+        &resolution,
+    )?;
+    Ok(response)
 }
 
 #[cfg(feature = "test-support")]
@@ -773,7 +937,7 @@ pub(crate) fn private_plan_response_for_test(
     descriptor_count: usize,
     uid: libc::uid_t,
 ) -> Result<Frame, String> {
-    private_plan_response(request, descriptor_count, uid)
+    private_plan_response(request, descriptor_count, 0, uid, 0)
 }
 
 fn probe_response(
@@ -917,6 +1081,13 @@ fn launch_private_response(
                 &format!("invalid private launch request: {error:?}"),
             )
         })?;
+    if let Some(expected) = &launch.expected_plan {
+        expected
+            .verify_current(&launch.contract, installed.generation_digest())
+            .map_err(|predicate| {
+                RejectionV1::request_error("MCSEALED-PRIVATE-EXPECTED-PLAN", predicate)
+            })?;
+    }
     if launch.qualification_digest != *installed.qualification_digest() {
         return Err(RejectionV1::request_error(
             "MCSEALED-PRIVATE-QUALIFICATION",
@@ -930,6 +1101,11 @@ fn launch_private_response(
             "exact five public descriptors and a nonzero attempt are required",
         )
         .into());
+    }
+    if let Some(rejection) = super::private_public_reuse::blocked_second(&request)
+        .map_err(|error| RejectionV1::request_error("MCSEALED-PRIVATE-REUSE-CUSTODY", &error))?
+    {
+        return Err(rejection.into());
     }
     if peer_inside_active_attempt(credentials.pid).map_err(|error| {
         RejectionV1::request_error("MCSEALED-RECURSIVE-PROVIDER-REQUEST", &error)
@@ -989,7 +1165,9 @@ fn launch_private_response(
     let response = super::launcher::launch_network(&request, &broker, &descriptor_fds)
         .map_err(PrivateLaunchFailure::AfterBroker)?;
     if response.kind == MessageKind::Rejected {
-        return Ok(response);
+        return super::private_public_reuse::first_failure(&request, &response)
+            .map(|projected| projected.unwrap_or(response))
+            .map_err(PrivateLaunchFailure::AfterBroker);
     }
     let binding = installed.into_report_binding();
     let terminal = super::private_lifecycle::PrivateTerminalReceiptV4::parse_verified(
