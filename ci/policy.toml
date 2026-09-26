@@ -37,15 +37,24 @@ allowed_run_commands = [
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite native",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite supply-chain",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite miri",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite miri-first",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite miri-second",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-first",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-second",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-quarter-one",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-quarter-two",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-quarter-three",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite fuzz-quarter-four",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite stress",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-linux-sealed-v2",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite backend-windows-sealed-v2",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production --native-channel required-downloaded-archive",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle --native-channel required-downloaded-archive",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel --native-channel required-downloaded-archive",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-lab",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite package-windows-sealed",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite channel-parity-windows-sealed",
@@ -70,8 +79,17 @@ allowed_run_commands = [
   "target/ci/publish-bootstrap/debug/memcordon-ci release publish-token-fallback --publication-slot 4",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release verify-crates",
   "rustup run 1.97.1 cargo run --locked --target-dir target/ci/publish-bootstrap --package memcordon-ci -- release finalize-github",
-  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public-global",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public-host",
   "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release collect-private-q-certificate --intent /etc/memcordon/release-trust/candidate-collector.v3.json --build target/ci/release-inputs/release-native-linux-x64/private-candidate-linux-x64/candidate-build-v2.json --signing-intent /etc/memcordon/release-trust/native-q-signing.v1.json --credential-fd 3 --output-dir /var/lib/memcordon/release-handoff/q/x64",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release collect-private-q-certificate --intent /etc/memcordon/release-trust/candidate-collector.v3.json --build target/ci/release-inputs/release-native-linux-arm64/private-candidate-linux-arm64/candidate-build-v2.json --signing-intent /etc/memcordon/release-trust/native-q-signing.v1.json --credential-fd 3 --output-dir /var/lib/memcordon/release-handoff/q/arm64",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release seal-private-final --intent /etc/memcordon/release-trust/final-seal.v1.json --candidate target/ci/release-inputs/release-native-linux-x64/private-candidate-linux-x64 --qualification target/ci/release-inputs/private-qualified-x64 --output-dir /var/lib/memcordon/release-handoff/seal/x64",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release seal-private-final --intent /etc/memcordon/release-trust/final-seal.v1.json --candidate target/ci/release-inputs/release-native-linux-arm64/private-candidate-linux-arm64 --qualification target/ci/release-inputs/private-qualified-arm64 --output-dir /var/lib/memcordon/release-handoff/seal/arm64",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release collect-private-p --intent /etc/memcordon/release-trust/public-collector.v2.json --build target/ci/release-inputs/release-native-linux-x64/private-candidate-linux-x64/candidate-build-v2.json --signing-intent /etc/memcordon/release-trust/public-p-signing.v1.json --credential-fd 3 --output-dir /var/lib/memcordon/release-handoff/p/x64",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release collect-private-p --intent /etc/memcordon/release-trust/public-collector.v2.json --build target/ci/release-inputs/release-native-linux-arm64/private-candidate-linux-arm64/candidate-build-v2.json --signing-intent /etc/memcordon/release-trust/public-p-signing.v1.json --credential-fd 3 --output-dir /var/lib/memcordon/release-handoff/p/arm64",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-completion --intent /etc/memcordon/release-trust/public-completion.v1.json --qualification /var/lib/memcordon/release-handoff/complete/x64",
+  "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-completion --intent /etc/memcordon/release-trust/public-completion.v1.json --qualification /var/lib/memcordon/release-handoff/complete/arm64",
   "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-candidate",
   "sudo apt-get update",
   "sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev linux-tools-common",
@@ -85,22 +103,10 @@ allowed_run_commands = [
 ]
 
 [[workflow.environment_allowlist]]
-file = ".github/workflows/backend-certification.yml"
-variable = "CARGO_TARGET_DIR"
-source = "target/ci/windows-sealed-cargo/build"
-steps = ["Certify packaged Cargo channel"]
-
-[[workflow.environment_allowlist]]
-file = ".github/workflows/release.yml"
-variable = "CARGO_TARGET_DIR"
-source = "target/ci/windows-sealed-cargo/build"
-steps = ["Certify packaged Cargo channel"]
-
-[[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"
 variable = "GITHUB_TOKEN"
 source = "${{ github.token }}"
-steps = ["Stage GitHub draft and assets", "Finalize GitHub release", "Private candidate suite", "Final installed public source suite on the same enrolled host"]
+steps = ["Stage GitHub draft and assets", "Finalize GitHub release", "Private candidate suite", "Final installed public source suite on the same enrolled host", "Collect authenticated private Q and CQ", "Seal authenticated private final A", "Collect authenticated private P and CP"]
 
 [[workflow.environment_allowlist]]
 file = ".github/workflows/release.yml"

@@ -521,7 +521,7 @@ fn cold_seed_compiles_without_cargo_dependencies_and_rejects_override_before_boo
     );
     let result = Command::new(&executable)
         .current_dir(output.path())
-        .args(["--output"])
+        .args(["--profile", "stable", "--output"])
         .arg(output.path().join("manifest"))
         .env("RUSTC_WRAPPER", "unapproved")
         .output()

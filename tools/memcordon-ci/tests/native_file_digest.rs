@@ -5,6 +5,53 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
+#[test]
+fn protected_helpers_serialize_and_cancelled_waiters_do_not_execute() {
+    use memcordon_ci::inventory_progress::InventoryProgress;
+    use memcordon_ci::native_file_digest::ProtectedDigestGate;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+    let gate = Arc::new(ProtectedDigestGate::default());
+    let progress = InventoryProgress::new(Path::new("helper-test"));
+    let cancellation = progress.cancellation();
+    let (started, observed) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let first = std::thread::spawn({
+        let gate = Arc::clone(&gate);
+        let cancellation = cancellation.clone();
+        move || {
+            gate.run(&cancellation, || {
+                started.send(()).unwrap();
+                wait.recv().unwrap();
+                Ok(())
+            })
+        }
+    });
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    let other = InventoryProgress::new(Path::new("helper-waiter"));
+    let other_cancellation = other.cancellation();
+    let (second_started, second_observed) = mpsc::channel();
+    let second = std::thread::spawn({
+        let cancellation = other_cancellation.clone();
+        move || {
+            gate.run(&cancellation, || {
+                second_started.send(()).unwrap();
+                Ok(())
+            })
+        }
+    });
+    assert!(
+        second_observed
+            .recv_timeout(Duration::from_millis(50))
+            .is_err()
+    );
+    other_cancellation.cancel();
+    release.send(()).unwrap();
+    first.join().unwrap().unwrap();
+    assert!(second.join().unwrap().is_err());
+    assert!(second_observed.try_recv().is_err());
+}
+
 fn valid_output() -> (String, Vec<u8>) {
     let digest = hex::encode(Sha256::digest(b"bounded native digest fixture"));
     let mut output = digest.as_bytes().to_vec();

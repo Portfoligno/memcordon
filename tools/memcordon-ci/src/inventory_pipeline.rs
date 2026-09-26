@@ -12,6 +12,45 @@ use crate::{CiError, Result};
 
 pub const ADMISSION: usize = CAPACITY * 2;
 
+/// Each independent controller owns these credits. A reserved preparation
+/// frontier prevents speculative siblings from blocking descendant traversal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TraversalLimits {
+    pub outstanding: usize,
+    pub files: usize,
+    pub preparations: usize,
+}
+
+impl TraversalLimits {
+    pub const NATIVE: Self = Self {
+        outstanding: ADMISSION,
+        files: CAPACITY,
+        preparations: CAPACITY,
+    };
+    pub const DOMAIN: Self = Self {
+        outstanding: ADMISSION / 2,
+        files: CAPACITY / 2,
+        preparations: CAPACITY / 2,
+    };
+
+    fn validate(self) -> Result<Self> {
+        if self.outstanding == 0
+            || self.files == 0
+            || self.preparations == 0
+            || self.outstanding > ADMISSION
+            || self.files > CAPACITY
+            || self.preparations > CAPACITY
+            || self.files > self.outstanding
+            || self.preparations > self.outstanding
+        {
+            return Err(CiError::Message(
+                "invalid inventory traversal limits".into(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
 pub struct ValidatedDigest {
     pub digest: String,
     pub bytes: u64,
@@ -86,13 +125,29 @@ enum Frame<B: InventoryBackend> {
 /// identity is retained by the executor itself.
 pub struct InventorySession {
     executor: Arc<InventoryExecutor>,
+    limits: TraversalLimits,
 }
 
 impl InventorySession {
     pub fn new() -> Result<Self> {
+        Self::with_executor(
+            InventoryExecutor::native_pipeline()?,
+            TraversalLimits::NATIVE,
+        )
+    }
+
+    pub fn with_executor(
+        executor: Arc<InventoryExecutor>,
+        limits: TraversalLimits,
+    ) -> Result<Self> {
         Ok(Self {
-            executor: InventoryExecutor::native_pipeline()?,
+            executor,
+            limits: limits.validate()?,
         })
+    }
+
+    pub fn limits(&self) -> TraversalLimits {
+        self.limits
     }
 
     pub fn measure<B: InventoryBackend>(
@@ -101,9 +156,10 @@ impl InventorySession {
         root: B::Entry,
         visited: &mut BTreeSet<PathBuf>,
     ) -> Result<Vec<B::Record>> {
-        let (sender, receiver) = mpsc::sync_channel(ADMISSION);
+        let (sender, receiver) = mpsc::sync_channel(self.limits.outstanding);
         let mut traversal = Traversal {
             executor: &self.executor,
+            limits: self.limits,
             backend: Arc::new(backend),
             sender,
             receiver,
@@ -145,6 +201,7 @@ impl InventorySession {
 
 struct Traversal<'a, B: InventoryBackend> {
     executor: &'a Arc<InventoryExecutor>,
+    limits: TraversalLimits,
     backend: Arc<B>,
     sender: mpsc::SyncSender<Completion<B>>,
     receiver: mpsc::Receiver<Completion<B>>,
@@ -168,7 +225,7 @@ impl<B: InventoryBackend> Traversal<'_, B> {
         action: impl FnOnce(&B, &mut [u8]) -> Result<Outcome<B>> + Send + 'static,
     ) -> Result<usize> {
         self.backend.check_cancelled()?;
-        while self.pending == ADMISSION {
+        while self.pending == self.limits.outstanding {
             self.receive()?;
         }
         let id = self.next_id;
@@ -278,7 +335,10 @@ impl<B: InventoryBackend> Traversal<'_, B> {
     }
 
     fn prepare(&mut self, entry: B::Entry, parent: Option<usize>) -> Result<usize> {
-        assert!(self.preparations < CAPACITY, "preparation window exceeded");
+        assert!(
+            self.preparations < self.limits.preparations,
+            "preparation window exceeded"
+        );
         let id = self.submit(TaskClass::Prepare, parent, None, move |backend, _| {
             backend.prepare(entry).map(Outcome::Prepared)
         })?;
@@ -329,7 +389,7 @@ impl<B: InventoryBackend> Traversal<'_, B> {
                     // Do not retain speculative siblings across a possible
                     // descent: that would consume the descendant's window.
                     while prepared.front().is_some_and(|(_, leaf)| *leaf)
-                        && self.preparations < CAPACITY - 1
+                        && self.preparations < self.limits.preparations - 1
                         && entries
                             .front()
                             .is_some_and(|entry| self.backend.is_leaf_hint(entry))
@@ -375,7 +435,7 @@ impl<B: InventoryBackend> Traversal<'_, B> {
                     });
                 }
                 Node::File(request, record) => {
-                    while self.files.len() == CAPACITY {
+                    while self.files.len() == self.limits.files {
                         self.receive()?;
                     }
                     if !self.errors.is_empty() {

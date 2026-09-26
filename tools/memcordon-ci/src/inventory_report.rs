@@ -1,5 +1,5 @@
 //! Bounded asynchronous machine snapshots, independent of stderr backpressure.
-use super::{OPERATIONS, Shared};
+use super::{DomainSummary, OPERATIONS, ReportDomain, Shared};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,6 +7,7 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
 static DIRECTORY: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static DOMAIN_SEQUENCE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static LOST: AtomicU64 = AtomicU64::new(0);
 pub fn set_report_directory(directory: Option<PathBuf>) -> std::io::Result<()> {
     if let Some(path) = &directory {
@@ -68,7 +69,12 @@ pub(super) fn persist(shared: &Shared, complete: Option<bool>, wait: bool) {
         .collect::<Vec<_>>()
         .join(",");
     let payload = format!(
-        "{{\"schema\":1,\"file_counters_scope\":\"windows_linux_native_pipeline\",\"sequence\":{sequence},\"root_id\":{},\"root_sample\":{},\"root_complete\":{},\"elapsed_ns\":{},\"sample\":\"actor_publication_vector\",\"files_attempted\":{},\"files_completed\":{},\"files_validated\":{},\"files_committed\":{},\"manifest_bytes_committed\":{},\"outstanding\":{},\"lost_reports\":{},\"overwritten_events\":{},\"events\":[{events}],\"actors\":[{actors}]}}\n",
+        "{{\"schema\":1,\"file_counters_scope\":\"domain_pipeline\",\"sequence\":{sequence},\"domain\":{},\"root_ordinal\":{},\"limits\":{{\"outstanding\":{},\"files\":{},\"preparations\":{}}},\"root_id\":{},\"root_sample\":{},\"root_complete\":{},\"elapsed_ns\":{},\"sample\":\"actor_publication_vector\",\"files_attempted\":{},\"files_completed\":{},\"files_validated\":{},\"files_committed\":{},\"manifest_bytes_committed\":{},\"outstanding\":{},\"lost_reports\":{},\"overwritten_events\":{},\"events\":[{events}],\"actors\":[{actors}]}}\n",
+        quoted(shared.domain.name()),
+        shared.root_ordinal,
+        shared.limits[0],
+        shared.limits[1],
+        shared.limits[2],
         sample.root_id,
         quoted(&root),
         complete.map_or("null", |ok| if ok { "true" } else { "false" }),
@@ -82,6 +88,43 @@ pub(super) fn persist(shared: &Shared, complete: Option<bool>, wait: bool) {
         LOST.load(Ordering::Relaxed),
         sample.overwritten_events
     );
+    let domain_index = match shared.domain {
+        ReportDomain::Standalone => 0,
+        ReportDomain::Source => 1,
+        ReportDomain::Native => 2,
+    };
+    let slot = DOMAIN_SEQUENCE[domain_index].fetch_add(1, Ordering::Relaxed) % 2;
+    let name = match shared.domain {
+        ReportDomain::Standalone => format!("inventory-{slot}.json"),
+        domain => format!("inventory-{}-{slot}.json", domain.name()),
+    };
+    enqueue(directory.join(name), payload, wait);
+}
+
+pub(super) fn persist_domains(domains: &[DomainSummary]) {
+    let directory = DIRECTORY
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("report configuration poisoned")
+        .clone();
+    let Some(directory) = directory else {
+        return;
+    };
+    let domains = domains.iter().map(|domain| format!(
+        "{{\"domain\":{},\"roots\":{},\"limits\":{{\"outstanding\":16,\"files\":8,\"preparations\":8}},\"elapsed_ns\":{},\"files_committed\":{},\"bytes_committed\":{},\"complete\":{}}}",
+        quoted(domain.domain.name()), domain.roots, domain.elapsed_ns, domain.files, domain.bytes, domain.complete
+    )).collect::<Vec<_>>().join(",");
+    enqueue(
+        directory.join("inventory-domains.json"),
+        format!(
+            "{{\"schema\":1,\"threads\":16,\"aggregate_limits\":{{\"outstanding\":32,\"files\":16,\"preparations\":16}},\"lost_reports\":{},\"domains\":[{domains}]}}\n",
+            LOST.load(Ordering::Relaxed)
+        ),
+        true,
+    );
+}
+
+fn enqueue(path: PathBuf, payload: String, wait: bool) {
     type Record = (PathBuf, String, mpsc::SyncSender<()>);
     static WRITER: OnceLock<mpsc::SyncSender<Record>> = OnceLock::new();
     let sender = WRITER.get_or_init(|| {
@@ -105,18 +148,7 @@ pub(super) fn persist(shared: &Shared, complete: Option<bool>, wait: bool) {
         return;
     }
     let (ack, done) = mpsc::sync_channel(1);
-    if sender
-        .try_send((
-            directory.join(if sequence.is_multiple_of(2) {
-                "inventory-0.json"
-            } else {
-                "inventory-1.json"
-            }),
-            payload,
-            ack,
-        ))
-        .is_err()
-    {
+    if sender.try_send((path, payload, ack)).is_err() {
         LOST.fetch_add(1, Ordering::Relaxed);
     } else if wait {
         let _ = done.recv_timeout(Duration::from_millis(100));

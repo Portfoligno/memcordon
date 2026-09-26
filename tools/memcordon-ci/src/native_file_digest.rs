@@ -5,6 +5,29 @@ use std::path::{Path, PathBuf};
 use sha2::Sha256;
 use sha2::digest::OutputSizeUser;
 
+/// Only privileged fallback execution takes this gate. Ordinary readers keep
+/// their independent executor credits and never hold it.
+#[derive(Default)]
+pub struct ProtectedDigestGate(std::sync::Mutex<()>);
+
+impl ProtectedDigestGate {
+    pub fn run<T>(
+        &self,
+        cancellation: &crate::inventory_progress::CancellationToken,
+        action: impl FnOnce() -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        cancellation.check()?;
+        let _guard = self
+            .0
+            .lock()
+            .map_err(|_| crate::CiError::Message("protected digest gate poisoned".into()))?;
+        cancellation.check()?;
+        let result = action();
+        cancellation.check()?;
+        result
+    }
+}
+
 pub fn validate_system_path(path: &Path) -> io::Result<PathBuf> {
     if !path.is_absolute() {
         return Err(io::Error::other("system digest requires an absolute path"));

@@ -19,9 +19,12 @@ use crate::inventory_progress::{InventoryProgress, Operation};
 use crate::inventory_reader::{BUFFER_SIZE, digest_reader, open_sequential};
 use crate::{CiError, Result};
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 #[path = "inventory_native.rs"]
 mod native_pipeline;
+
+#[path = "inventory_source.rs"]
+mod source_pipeline;
 
 static ACTIVE: OnceLock<ValidatedBuildContext> = OnceLock::new();
 
@@ -104,6 +107,7 @@ pub(crate) struct Input {
 #[serde(deny_unknown_fields)]
 pub struct ValidatedBuildContext {
     schema_version: u32,
+    profile: crate::bootstrap_profile::BootstrapProfile,
     root: PathBuf,
     environment: Vec<(String, String)>,
     toolchains: BTreeMap<String, PathBuf>,
@@ -493,14 +497,75 @@ fn measure_root(
     visited: &mut BTreeSet<PathBuf>,
     session: &mut Option<crate::inventory_pipeline::InventorySession>,
 ) -> Result<()> {
+    measure_domain_root(
+        path,
+        scope,
+        inputs,
+        visited,
+        session,
+        RootObservation {
+            domain: crate::inventory_progress::ReportDomain::Standalone,
+            ordinal: 0,
+            summary: None,
+        },
+    )
+}
+
+struct RootObservation<'a> {
+    domain: crate::inventory_progress::ReportDomain,
+    ordinal: u64,
+    summary: Option<&'a mut crate::inventory_progress::DomainSummary>,
+}
+
+fn measure_domain_root(
+    path: &Path,
+    scope: MeasurementScope<'_>,
+    inputs: &mut Vec<Input>,
+    visited: &mut BTreeSet<PathBuf>,
+    session: &mut Option<crate::inventory_pipeline::InventorySession>,
+    observation: RootObservation<'_>,
+) -> Result<()> {
+    let RootObservation {
+        domain,
+        ordinal,
+        mut summary,
+    } = observation;
     let kind = match scope {
         MeasurementScope::Source(_) => "source",
         MeasurementScope::Required => "required",
         MeasurementScope::NativeRoot | MeasurementScope::NativeDescendant => "native",
     };
     environment::progress::phase(&format!("inventory {kind} root {path:?}"), || {
-        let mut progress = InventoryProgress::new(path);
-        #[cfg(any(windows, target_os = "linux"))]
+        let limits = session.as_ref().map_or(
+            crate::inventory_pipeline::TraversalLimits::NATIVE,
+            crate::inventory_pipeline::InventorySession::limits,
+        );
+        let mut progress = InventoryProgress::for_domain(
+            path,
+            domain,
+            ordinal,
+            [limits.outstanding, limits.files, limits.preparations],
+        );
+        if let Some(root) = scope.source() {
+            if session.is_none() {
+                *session = Some(crate::inventory_pipeline::InventorySession::new()?);
+            }
+            let result = session.as_ref().expect("source inventory session").measure(
+                source_pipeline::Backend::new(&progress, root),
+                source_pipeline::Entry::root(path),
+                visited,
+            );
+            progress.finish(result.is_ok());
+            if let Some(summary) = summary.as_mut() {
+                let snapshot = progress.structured_snapshot();
+                summary.roots += 1;
+                summary.files += snapshot.tasks.files_committed;
+                summary.bytes += snapshot.tasks.committed_bytes;
+            }
+            inputs.extend(result?);
+            return Ok(());
+        }
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
         if scope.source().is_none() {
             if session.is_none() {
                 *session = Some(crate::inventory_pipeline::InventorySession::new()?);
@@ -519,6 +584,12 @@ fn measure_root(
                 );
             }
             progress.finish(successful);
+            if let Some(summary) = summary.as_mut() {
+                let snapshot = progress.structured_snapshot();
+                summary.roots += 1;
+                summary.files += snapshot.tasks.files_committed;
+                summary.bytes += snapshot.tasks.committed_bytes;
+            }
             inputs.extend(result?);
             return Ok(());
         }
@@ -840,10 +911,22 @@ fn identity_output(command: &mut Command) -> Result<Vec<u8>> {
 
 impl ValidatedBuildContext {
     pub fn prepare(root: &Path) -> Result<Self> {
-        environment::progress::phase("prepare build context", || Self::prepare_inner(root))
+        Self::prepare_with_profile(root, crate::bootstrap_profile::BootstrapProfile::Stable)
     }
 
-    fn prepare_inner(root: &Path) -> Result<Self> {
+    pub fn prepare_with_profile(
+        root: &Path,
+        profile: crate::bootstrap_profile::BootstrapProfile,
+    ) -> Result<Self> {
+        environment::progress::phase("prepare build context", || {
+            Self::prepare_inner(root, profile)
+        })
+    }
+
+    fn prepare_inner(
+        root: &Path,
+        profile: crate::bootstrap_profile::BootstrapProfile,
+    ) -> Result<Self> {
         let root = root.canonicalize()?;
         let command_root = environment::command_path(&root)?;
         let ambient: BTreeMap<_, _> = std::env::vars_os().collect();
@@ -958,11 +1041,7 @@ impl ValidatedBuildContext {
         if !toolchains.contains_key(&config.stable) {
             return Err(CiError::Message("pinned stable toolchain missing".into()));
         }
-        if ambient
-            .get(OsStr::new("GITHUB_JOB"))
-            .and_then(|job| job.to_str())
-            .is_some_and(|job| job.contains("miri"))
-        {
+        if profile == crate::bootstrap_profile::BootstrapProfile::Miri {
             let bytes = output(
                 &rustup,
                 &[
@@ -1046,7 +1125,8 @@ impl ValidatedBuildContext {
         })
         .collect();
         let mut context = Self {
-            schema_version: 3,
+            schema_version: 4,
+            profile,
             root,
             environment: env
                 .iter()
@@ -1059,44 +1139,165 @@ impl ValidatedBuildContext {
             worker,
         };
         context.inputs = context.measure_inputs()?;
+        context.require_profile(profile)?;
+        context.validate_prepared_capabilities(profile)?;
         Ok(context)
     }
 
     fn measure_inputs(&self) -> Result<Vec<Input>> {
+        use crate::inventory_pipeline::{InventorySession, TraversalLimits};
+        use crate::inventory_progress::{DomainSummary, ReportDomain, finish_domains};
+        let executor = crate::inventory_workers::InventoryExecutor::native_pipeline()?;
+        let source_session = InventorySession::with_executor(
+            std::sync::Arc::clone(&executor),
+            TraversalLimits::DOMAIN,
+        )?;
+        let native_session = InventorySession::with_executor(
+            std::sync::Arc::clone(&executor),
+            TraversalLimits::DOMAIN,
+        )?;
+        let (source, native) = std::thread::scope(|scope| {
+            let run = |domain, session| {
+                let start = std::time::Instant::now();
+                let mut summary = DomainSummary {
+                    domain,
+                    roots: 0,
+                    elapsed_ns: 0,
+                    files: 0,
+                    bytes: 0,
+                    complete: false,
+                };
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match domain {
+                        ReportDomain::Source => self.measure_source_inputs(session, &mut summary),
+                        ReportDomain::Native => self.measure_native_inputs(session, &mut summary),
+                        ReportDomain::Standalone => {
+                            unreachable!("combined measurement has two domains")
+                        }
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(CiError::Message(format!(
+                            "{domain:?} inventory controller panicked"
+                        )))
+                    });
+                summary.elapsed_ns = start.elapsed().as_nanos();
+                summary.complete = result.is_ok();
+                (result, summary)
+            };
+            let source = std::thread::Builder::new()
+                .name("inventory-source".into())
+                .spawn_scoped(scope, move || run(ReportDomain::Source, source_session));
+            let native = std::thread::Builder::new()
+                .name("inventory-native".into())
+                .spawn_scoped(scope, move || run(ReportDomain::Native, native_session));
+            let settle = |handle: io::Result<
+                std::thread::ScopedJoinHandle<'_, (Result<Vec<Input>>, DomainSummary)>,
+            >,
+                          domain| {
+                let failed = |error| {
+                    (
+                        Err(error),
+                        DomainSummary {
+                            domain,
+                            roots: 0,
+                            elapsed_ns: 0,
+                            files: 0,
+                            bytes: 0,
+                            complete: false,
+                        },
+                    )
+                };
+                match handle {
+                    Ok(handle) => handle.join().unwrap_or_else(|_| {
+                        failed(CiError::Message(format!(
+                            "{domain:?} inventory controller panicked"
+                        )))
+                    }),
+                    Err(error) => failed(CiError::Message(format!(
+                        "starting {domain:?} inventory controller: {error}"
+                    ))),
+                }
+            };
+            // Join both regardless of outcome, then select source's failure first.
+            (
+                settle(source, ReportDomain::Source),
+                settle(native, ReportDomain::Native),
+            )
+        });
+        // The last executor owner closes the queue and joins every worker before
+        // evidence or input identity can be accepted.
+        drop(executor);
+        finish_domains(&[source.1, native.1]);
+        let mut inputs = source.0?;
+        inputs.extend(native.0?);
+        // Stable sorting preserves equal-path multiplicity and source-first order.
+        inputs.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(inputs)
+    }
+
+    fn measure_source_inputs(
+        &self,
+        session: crate::inventory_pipeline::InventorySession,
+        summary: &mut crate::inventory_progress::DomainSummary,
+    ) -> Result<Vec<Input>> {
         let mut inputs = Vec::new();
         let mut visited = BTreeSet::new();
-        let mut session = None;
-        measure_root(
+        let mut session = Some(session);
+        measure_domain_root(
             &self.root,
             MeasurementScope::Source(&self.root),
             &mut inputs,
             &mut visited,
             &mut session,
+            RootObservation {
+                domain: crate::inventory_progress::ReportDomain::Source,
+                ordinal: 0,
+                summary: Some(summary),
+            },
         )?;
-        // Native inputs must not inherit source-output exclusions.
-        visited.clear();
-        for root in &self.input_roots {
-            measure_root(
+        Ok(inputs)
+    }
+
+    fn measure_native_inputs(
+        &self,
+        session: crate::inventory_pipeline::InventorySession,
+        summary: &mut crate::inventory_progress::DomainSummary,
+    ) -> Result<Vec<Input>> {
+        let mut inputs = Vec::new();
+        // Required and discovery roots share identities; source owns its own set.
+        let mut visited = BTreeSet::new();
+        let mut session = Some(session);
+        for (ordinal, root) in self.input_roots.iter().enumerate() {
+            measure_domain_root(
                 root,
                 MeasurementScope::Required,
                 &mut inputs,
                 &mut visited,
                 &mut session,
+                RootObservation {
+                    domain: crate::inventory_progress::ReportDomain::Native,
+                    ordinal: ordinal as u64,
+                    summary: Some(summary),
+                },
             )?;
         }
-        for root in &self.discovery_roots {
-            measure_root(
+        for (ordinal, root) in self.discovery_roots.iter().enumerate() {
+            measure_domain_root(
                 root,
                 MeasurementScope::NativeRoot,
                 &mut inputs,
                 &mut visited,
                 &mut session,
+                RootObservation {
+                    domain: crate::inventory_progress::ReportDomain::Native,
+                    ordinal: (self.input_roots.len() + ordinal) as u64,
+                    summary: Some(summary),
+                },
             )?;
         }
         // Every root has fenced its completions; close/join the shared pool before
         // accepting or serializing the complete measurement.
         drop(session);
-        inputs.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(inputs)
     }
 
@@ -1116,11 +1317,130 @@ impl ValidatedBuildContext {
 
     pub fn read(path: &Path) -> Result<Self> {
         let context: Self = serde_json::from_slice(&fs::read(path)?)?;
-        if context.schema_version != 3 || context.inputs.is_empty() || context.toolchains.is_empty()
+        if context.schema_version != 4 || context.inputs.is_empty() || context.toolchains.is_empty()
         {
             return Err(CiError::Message("incomplete managed build context".into()));
         }
         Ok(context)
+    }
+
+    pub fn require_profile(
+        &self,
+        required: crate::bootstrap_profile::BootstrapProfile,
+    ) -> Result<()> {
+        if !self.profile.satisfies(required) {
+            return Err(CiError::Message(format!(
+                "prepared profile {:?} does not satisfy {:?}",
+                self.profile, required
+            )));
+        }
+        self.validate_prepared_capabilities(required)
+    }
+
+    fn validate_prepared_capabilities(
+        &self,
+        required: crate::bootstrap_profile::BootstrapProfile,
+    ) -> Result<()> {
+        use crate::bootstrap_profile::BootstrapProfile;
+        let config = crate::config::toolchains(&self.root)?;
+        let required_toolchain = match required {
+            BootstrapProfile::Msrv | BootstrapProfile::ReleasePreflight => Some(&config.msrv),
+            BootstrapProfile::Miri | BootstrapProfile::Fuzz => Some(&config.miri),
+            _ => None,
+        };
+        for toolchain in std::iter::once(&config.stable).chain(required_toolchain) {
+            if !self.toolchains.contains_key(toolchain) {
+                return Err(CiError::Message(format!(
+                    "required prepared toolchain missing: {toolchain}"
+                )));
+            }
+        }
+        let tools: &[&str] = match required {
+            BootstrapProfile::Fuzz => &["cargo-fuzz"],
+            BootstrapProfile::SupplyChain | BootstrapProfile::ReleasePreflight => {
+                &["cargo-audit", "cargo-deny"]
+            }
+            _ => &[],
+        };
+        let versions = crate::config::tools(&self.root)?;
+        for tool in tools {
+            let mut executable = self.root.join("target/ci-tools/bin").join(tool);
+            if cfg!(windows) {
+                executable.set_extension("exe");
+            }
+            if !self.inputs.iter().any(|input| {
+                input.path == native(executable.as_os_str())
+                    && matches!(input.kind.as_str(), "file" | "symlink")
+            }) {
+                return Err(CiError::Message(format!(
+                    "required prepared executable missing: {tool}"
+                )));
+            }
+            let expected = match *tool {
+                "cargo-fuzz" => &versions.cargo_fuzz,
+                "cargo-audit" => &versions.cargo_audit,
+                "cargo-deny" => &versions.cargo_deny,
+                _ => unreachable!("closed prepared tool inventory"),
+            };
+            let version = output(
+                &executable,
+                &[OsStr::new("--version")],
+                &self.environment()?,
+                &self.root,
+            )?;
+            if !String::from_utf8_lossy(&version)
+                .split_whitespace()
+                .any(|version| version == expected)
+            {
+                return Err(CiError::Message(format!(
+                    "prepared tool identity differs from pinned policy: {tool}"
+                )));
+            }
+        }
+        if required == BootstrapProfile::Miri {
+            let env = self.environment()?;
+            let rustup = environment::resolve_tool(OsStr::new("rustup"), &env)?;
+            let bytes = output(
+                &rustup,
+                &[
+                    OsStr::new("run"),
+                    OsStr::new(&config.miri),
+                    OsStr::new("cargo"),
+                    OsStr::new("miri"),
+                    OsStr::new("setup"),
+                    OsStr::new("--print-sysroot"),
+                ],
+                &env,
+                &self.root,
+            )?;
+            let sysroot = PathBuf::from(
+                String::from_utf8(bytes)
+                    .map_err(|error| CiError::Message(error.to_string()))?
+                    .trim(),
+            )
+            .canonicalize()?;
+            if !self.input_roots.contains(&sysroot) {
+                return Err(CiError::Message(
+                    "prepared Miri sysroot missing from measured inputs".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn verify_prepared_suite_inputs(
+        &self,
+        required: crate::bootstrap_profile::BootstrapProfile,
+    ) -> Result<()> {
+        if !self.profile.satisfies(required) {
+            return Err(CiError::Message(
+                "prepared profile does not satisfy suite capability".into(),
+            ));
+        }
+        // Reuse the complete measured closure so cache restoration cannot replace
+        // any executable, sysroot or source dependency before suite admission.
+        self.audit()?;
+        self.require_profile(required)
     }
 
     pub fn audit(&self) -> Result<()> {

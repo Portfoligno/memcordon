@@ -69,9 +69,42 @@ const OPERATIONS: [Operation; observation::OPERATION_COUNT] = [
 ];
 struct Shared {
     root: PathBuf,
+    domain: ReportDomain,
+    root_ordinal: u64,
+    limits: [usize; 3],
     observation: Observer,
     stop: Mutex<bool>,
     wake: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReportDomain {
+    Standalone,
+    Source,
+    Native,
+}
+impl ReportDomain {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::Source => "source",
+            Self::Native => "native",
+        }
+    }
+}
+
+/// Bounded per-domain totals, written after both controllers have settled.
+pub struct DomainSummary {
+    pub domain: ReportDomain,
+    pub roots: u64,
+    pub elapsed_ns: u128,
+    pub files: u64,
+    pub bytes: u64,
+    pub complete: bool,
+}
+
+pub fn finish_domains(domains: &[DomainSummary]) {
+    report::persist_domains(domains);
 }
 
 // One bounded writer for the process, not one blocked stderr writer per root.
@@ -176,12 +209,42 @@ impl InventoryProgress {
         Self::with_intervals(root, interval, interval)
     }
     fn with_intervals(root: &Path, interval: Duration, human_interval: Duration) -> Self {
+        Self::configured(
+            root,
+            interval,
+            human_interval,
+            ReportDomain::Standalone,
+            0,
+            [32, 16, 16],
+        )
+    }
+    pub fn for_domain(root: &Path, domain: ReportDomain, ordinal: u64, limits: [usize; 3]) -> Self {
+        Self::configured(
+            root,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            domain,
+            ordinal,
+            limits,
+        )
+    }
+    fn configured(
+        root: &Path,
+        interval: Duration,
+        human_interval: Duration,
+        domain: ReportDomain,
+        root_ordinal: u64,
+        limits: [usize; 3],
+    ) -> Self {
         assert!(
             !interval.is_zero(),
             "inventory progress interval must be positive"
         );
         let shared = Arc::new(Shared {
             root: root.to_path_buf(),
+            domain,
+            root_ordinal,
+            limits,
             observation: Observer::new(),
             stop: Mutex::new(false),
             wake: Condvar::new(),

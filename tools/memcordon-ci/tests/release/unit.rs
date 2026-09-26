@@ -886,6 +886,10 @@ struct MockServer {
 impl MockServer {
     fn scripted(responses: Vec<MockResponse>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("mock listener should bind");
+        Self::scripted_on(listener, responses)
+    }
+
+    fn scripted_on(listener: TcpListener, responses: Vec<MockResponse>) -> Self {
         let root = format!(
             "http://{}",
             listener
@@ -2286,6 +2290,51 @@ fn mock_github_exact_published_release_is_immutable_and_reconciled() {
         .expect("published release should classify"),
         RemoteReleaseState::Published(41)
     );
+}
+
+#[test]
+fn already_published_finalization_invokes_full_verifier_once_after_authenticated_report_readback() {
+    let (temporary, release) = release_fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let bytes = b"authenticated transport fixture".to_vec();
+    let mut published = remote(false);
+    published["assets"] = serde_json::json!([{
+        "name":release.assets.publication_report,"url":format!("{origin}/report"),
+        "size":bytes.len(),"digest":format!("sha256:{}",sha256_bytes(&bytes))
+    }]);
+    let server = MockServer::scripted_on(
+        listener,
+        vec![
+            MockResponse::Json(200, serde_json::json!([published])),
+            MockResponse::Bytes(200, bytes.clone()),
+        ],
+    );
+    let calls = Cell::new(0);
+    let error = finalize_github_at(
+        temporary.path(),
+        "test-token",
+        &HttpEndpoints::fixed_test_server(&server.root),
+        |root| {
+            calls.set(calls.get() + 1);
+            assert_eq!(root, temporary.path());
+            assert_eq!(
+                fs::read(
+                    root.join(&release.assets.output_directory)
+                        .join(&release.assets.publication_report)
+                )
+                .unwrap(),
+                bytes
+            );
+            Err(failure("full public provenance rejected"))
+        },
+    )
+    .unwrap_err();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(error.to_string(), "full public provenance rejected");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| request.starts_with("GET ")));
 }
 
 #[test]
@@ -3893,4 +3942,228 @@ fn http_mock_version_state_fails_closed_on_malformed_or_wrong_identity() {
         );
         assert_eq!(server.finish().len(), 1);
     }
+}
+
+#[test]
+fn public_host_verifier_reads_only_identity_and_host_archive_and_runs_every_consumer_serially() {
+    let (temporary, release) = release_fixture();
+    let output = temporary.path().join(&release.assets.output_directory);
+    let manifest_path = output.join(&release.assets.manifest);
+    let mut manifest: ReleaseManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let host =
+        config::release_target_id_for_host(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+    let target = release
+        .assets
+        .target
+        .iter()
+        .find(|target| target.id == host)
+        .unwrap();
+    let host_bytes = b"controlled archive transport".to_vec();
+    let host_record = AssetRecord {
+        name: "host-archive.tar.gz".into(),
+        target: target.rust_target.clone(),
+        size: host_bytes.len() as u64,
+        sha256: sha256_bytes(&host_bytes),
+        runtime_manifest_sha256: "ab".repeat(32),
+        components: Vec::new(),
+    };
+    let foreign_target = release
+        .assets
+        .target
+        .iter()
+        .find(|target| target.id != host)
+        .unwrap();
+    let foreign = AssetRecord {
+        name: "foreign-archive.tar.gz".into(),
+        target: foreign_target.rust_target.clone(),
+        ..host_record.clone()
+    };
+    manifest.assets = vec![host_record.clone(), foreign];
+    write_json(&manifest_path, &manifest).unwrap();
+    fs::write(output.join(&host_record.name), &host_bytes).unwrap();
+    let manifest_bytes = fs::read(&manifest_path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let mut records = vec![
+        PublicAssetRecord {
+            id: 11,
+            name: host_record.name.clone(),
+            size: host_bytes.len() as u64,
+            sha256: sha256_bytes(&host_bytes),
+            runtime_manifest_sha256: Some(host_record.runtime_manifest_sha256.clone()),
+            components: Vec::new(),
+        },
+        PublicAssetRecord {
+            id: 12,
+            name: release.assets.manifest.clone(),
+            size: manifest_bytes.len() as u64,
+            sha256: sha256_bytes(&manifest_bytes),
+            runtime_manifest_sha256: None,
+            components: Vec::new(),
+        },
+    ];
+    records.sort_by(|left, right| left.name.cmp(&right.name));
+    let report = PublicationReport {
+        schema_version: 2,
+        manifest_sha256: sha256_bytes(&manifest_bytes),
+        github_release_id: 41,
+        source_commit: manifest.source_commit.clone(),
+        workflow_commit: manifest.workflow_commit.clone(),
+        prerelease: manifest.prerelease,
+        assets: records,
+        crates: verified_public_crate_records(
+            &release,
+            &manifest,
+            &HttpEndpoints::fixed_test_server(&origin),
+            false,
+        )
+        .unwrap(),
+    };
+    let report_bytes = serde_json::to_vec(&report).unwrap();
+    let mut assets = vec![
+        serde_json::json!({"id":11,"name":host_record.name,"size":host_bytes.len(),"digest":format!("sha256:{}",sha256_bytes(&host_bytes)),"url":format!("{origin}/host")}),
+        serde_json::json!({"id":12,"name":release.assets.manifest,"size":manifest_bytes.len(),"digest":format!("sha256:{}",sha256_bytes(&manifest_bytes)),"url":format!("{origin}/manifest")}),
+        serde_json::json!({"id":13,"name":release.assets.publication_report,"size":report_bytes.len(),"digest":format!("sha256:{}",sha256_bytes(&report_bytes)),"url":format!("{origin}/report")}),
+    ];
+    // A foreign archive URL must never be requested in host mode.
+    assets.push(serde_json::json!({"id":14,"name":"foreign-archive.tar.gz","url":format!("{origin}/foreign")}));
+    let remote = serde_json::json!({"id":41,"draft":false,"prerelease":manifest.prerelease,"target_commitish":manifest.source_commit,"assets":assets});
+    let selected = static_asset_paths(&release, &manifest, &output)
+        .unwrap()
+        .into_iter()
+        .filter(|path| {
+            path.file_name() == Some(std::ffi::OsStr::new(&release.assets.manifest))
+                || path.file_name() == Some(std::ffi::OsStr::new(&host_record.name))
+        });
+    let mut responses = vec![
+        MockResponse::Json(200, remote),
+        MockResponse::Bytes(200, report_bytes),
+    ];
+    for path in selected {
+        responses.push(MockResponse::Bytes(200, fs::read(path).unwrap()));
+    }
+    let server = MockServer::scripted_on(listener, responses);
+    let inspected = Cell::new(0);
+    let mut consumers = Vec::new();
+    verify_public_state_with(
+        temporary.path(),
+        false,
+        &HttpEndpoints::fixed_test_server(&server.root),
+        |_, archive, target, identity, execute| {
+            assert_eq!(target.id, host);
+            assert!(execute);
+            assert_eq!(identity.commit, manifest.source_commit);
+            assert_eq!(fs::read(archive).unwrap(), host_bytes);
+            inspected.set(inspected.get() + 1);
+            Ok(ArchiveInspection {
+                runtime_manifest_sha256: host_record.runtime_manifest_sha256.clone(),
+                components: Vec::new(),
+                archive_member_inventory_sha256: String::new(),
+                smoke: NativeSmokeReport::default(),
+            })
+        },
+        |_, record| {
+            consumers.push(record.name.clone());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(inspected.get(), 1);
+    assert_eq!(
+        consumers,
+        manifest
+            .crates
+            .iter()
+            .map(|record| record.name.clone())
+            .collect::<Vec<_>>()
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 4);
+    assert!(!requests.iter().any(|request| request.contains("/foreign")
+        || request.contains("/actions/")
+        || request.contains("/crates/")));
+}
+
+#[test]
+fn expired_shared_registry_deadline_prevents_requests_and_retry_budget_restart() {
+    let (_, release) = release_fixture();
+    let mut endpoints = HttpEndpoints::fixed_test_server("http://127.0.0.1:1");
+    endpoints.registry_deadline = Some(Instant::now());
+    let error = crate_version_state_at(&release, &endpoints, "example", "1.2.3").unwrap_err();
+    assert!(error.to_string().contains("deadline expired"));
+    let deadline = Instant::now() + Duration::from_millis(5);
+    endpoints.registry_deadline = Some(deadline);
+    let calls = Cell::new(0);
+    let result: Result<()> = retry_registry_read(&release.network_retry, &endpoints, || {
+        calls.set(calls.get() + 1);
+        std::thread::sleep(Duration::from_millis(10));
+        Ok(())
+    });
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("exceeded phase deadline")
+    );
+    assert_eq!(calls.get(), 1);
+    assert_eq!(endpoints.clone().registry_deadline, Some(deadline));
+}
+
+#[test]
+fn registry_http_request_timeout_is_capped_by_remaining_shared_phase_time() {
+    let (_, release) = release_fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        std::thread::sleep(Duration::from_millis(250));
+        request
+    });
+    let mut endpoints = HttpEndpoints::fixed_test_server(&origin);
+    let started = Instant::now();
+    endpoints.registry_deadline = Some(started + Duration::from_millis(40));
+    assert!(crate_version_state_at(&release, &endpoints, "example", "1.2.3").is_err());
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "HTTP call must not consume a fresh network retry budget"
+    );
+    assert!(server.join().unwrap().starts_with("GET /ex/am/example "));
+}
+
+#[test]
+fn public_global_rejects_remote_source_identity_before_downloads_or_host_mutation() {
+    let (temporary, release) = release_fixture();
+    let server = MockServer::scripted(vec![MockResponse::Json(
+        200,
+        serde_json::json!({
+            "id":41,"draft":false,"prerelease":false,"target_commitish":"ffffffffffffffffffffffffffffffffffffffff","assets":[]
+        }),
+    )]);
+    let inspected = Cell::new(0);
+    let consumed = Cell::new(0);
+    let error = verify_public_state_with(
+        temporary.path(),
+        true,
+        &HttpEndpoints::fixed_test_server(&server.root),
+        |_, _, _, _, _| {
+            inspected.set(inspected.get() + 1);
+            Err(failure("unexpected archive operation"))
+        },
+        |_, _| {
+            consumed.set(consumed.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("identity/classification mismatch")
+    );
+    assert_eq!(inspected.get(), 0);
+    assert_eq!(consumed.get(), 0);
+    assert_eq!(server.finish().len(), 1);
+    assert!(!release.publish_packages.is_empty());
 }

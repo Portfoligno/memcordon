@@ -5,7 +5,41 @@ use serde::Deserialize;
 
 use crate::{CiError, Result};
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MiriShard {
+    First,
+    Second,
+}
+
+impl MiriShard {
+    pub fn spec(self) -> crate::target_shard::ShardSpec {
+        crate::target_shard::ShardSpec::new(
+            usize::from(self == Self::Second),
+            std::num::NonZeroUsize::new(2).expect("nonzero partition"),
+        )
+        .expect("valid two-way partition")
+    }
+}
+
+pub fn plan_shard(
+    metadata: &[u8],
+    package_name: &str,
+    shard: MiriShard,
+) -> Result<Vec<MiriTarget>> {
+    let targets: Vec<_> = plan(metadata, package_name)?
+        .into_iter()
+        .enumerate()
+        .filter_map(|(ordinal, target)| shard.spec().selects(ordinal).then_some(target))
+        .collect();
+    if targets.is_empty() {
+        return Err(CiError::Message(
+            "Miri shard selected no test targets".into(),
+        ));
+    }
+    Ok(targets)
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
 pub enum MiriTarget {
     Library,
     Binary(String),

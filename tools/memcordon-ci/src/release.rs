@@ -161,6 +161,7 @@ struct CargoRegistryConfig {
 #[derive(Clone, Debug)]
 struct HttpEndpoints {
     github_started: Instant,
+    registry_deadline: Option<Instant>,
     github_api: String,
     github_uploads: String,
     crates_io: String,
@@ -172,6 +173,7 @@ impl HttpEndpoints {
     fn production() -> Self {
         Self {
             github_started: Instant::now(),
+            registry_deadline: None,
             github_api: GITHUB_API_ROOT.to_owned(),
             github_uploads: GITHUB_UPLOADS_ROOT.to_owned(),
             crates_io: CRATES_IO_API_ROOT.to_owned(),
@@ -184,12 +186,33 @@ impl HttpEndpoints {
     fn fixed_test_server(root: &str) -> Self {
         Self {
             github_started: Instant::now(),
+            registry_deadline: None,
             github_api: root.to_owned(),
             github_uploads: root.to_owned(),
             crates_io: root.to_owned(),
             crates_io_index: root.to_owned(),
             crates_io_download: root.to_owned(),
         }
+    }
+
+    fn remaining_registry_budget(&self, wait: &config::RegistryWait) -> Result<Duration> {
+        let remaining = self
+            .registry_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_secs(wait.total_seconds));
+        if remaining.is_zero() {
+            return Err(failure("public registry read deadline expired"));
+        }
+        Ok(remaining)
+    }
+
+    fn remaining_github_budget(&self) -> Result<Duration> {
+        let remaining =
+            (self.github_started + RELEASE_DEADLINE).saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(failure("public GitHub read deadline expired"));
+        }
+        Ok(remaining)
     }
 }
 #[derive(Clone, Debug)]
@@ -719,7 +742,8 @@ pub fn validate_packages(root: &Path) -> Result<()> {
     let release = config::release(root)?;
     let default_cargo_binaries = configured_default_cargo_binaries(&release)?;
     let toolchains = config::toolchains(root)?;
-    let archives = create_package_archives(root, &toolchains.stable, &release.publish_packages)?;
+    let archives =
+        create_package_archives(root, &toolchains.stable, &release.publish_packages, None)?;
     for package in &release.publish_packages {
         let record = package_crate(
             root,
@@ -1154,9 +1178,9 @@ pub(crate) fn create_package_archives(
     root: &Path,
     stable: &str,
     packages: &[String],
+    target: Option<&Path>,
 ) -> Result<PathBuf> {
-    let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
-    let output = crate::command::PackageOutput::new(root, target.as_deref())?;
+    let output = crate::command::PackageOutput::new(root, target)?;
     output.command(root, stable, packages).run()?;
     Ok(output.archive_directory())
 }
@@ -3405,7 +3429,8 @@ fn assemble(root: &Path) -> Result<()> {
         checksums.push('\n');
     }
     fs::write(output.join(&release.assets.checksums), checksums)?;
-    let archives = create_package_archives(root, &toolchains.stable, &release.publish_packages)?;
+    let archives =
+        create_package_archives(root, &toolchains.stable, &release.publish_packages, None)?;
     let mut crates = Vec::new();
     for package in &release.publish_packages {
         crates.push(package_crate(
@@ -3576,6 +3601,34 @@ fn validate_manifest_crates(release: &config::Release, manifest: &ReleaseManifes
 
 fn github_token() -> Result<String> {
     std::env::var("GITHUB_TOKEN").map_err(|_| failure("GITHUB_TOKEN is required for this phase"))
+}
+
+fn retry_registry_read<T>(
+    wait: &config::RegistryWait,
+    endpoints: &HttpEndpoints,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let started = Instant::now();
+    let deadline = endpoints
+        .registry_deadline
+        .unwrap_or(started + Duration::from_secs(wait.total_seconds));
+    let mut delay = Duration::from_millis(wait.initial_milliseconds);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(failure("public registry read deadline expired"));
+        }
+        match operation() {
+            Ok(value) if Instant::now() <= deadline => return Ok(value),
+            Ok(_) => return Err(failure("public registry read exceeded phase deadline")),
+            Err(error) if transient_network_error(&error) && Instant::now() < deadline => {
+                thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
+                delay = delay
+                    .saturating_mul(2)
+                    .min(Duration::from_millis(wait.maximum_milliseconds));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn retry_transient<T>(
@@ -3791,6 +3844,7 @@ fn retry_github_read<T>(
     let started = Instant::now();
     let mut backoff = Duration::from_millis(release.network_retry.initial_milliseconds);
     loop {
+        endpoints.remaining_github_budget()?;
         match operation() {
             Ok(value) => return Ok(value),
             Err(error) => {
@@ -3809,7 +3863,7 @@ fn retry_github_read<T>(
                     return Err(error);
                 };
                 eprintln!("{error}; retrying GitHub read after {delay:?}");
-                thread::sleep(delay);
+                thread::sleep(delay.min(endpoints.remaining_github_budget()?));
                 backoff = backoff.saturating_mul(2).min(Duration::from_millis(
                     release.network_retry.maximum_milliseconds,
                 ));
@@ -3880,6 +3934,7 @@ fn github_json_request(
     let send = || {
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .timeout_global(Some(endpoints.remaining_github_budget()?))
             .timeout_connect(Some(Duration::from_secs(15)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
             .timeout_recv_body(Some(Duration::from_secs(60)))
@@ -3952,6 +4007,7 @@ fn github_raw_get(
     retry_github_read(release, endpoints, || {
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .timeout_global(Some(endpoints.remaining_github_budget()?))
             .timeout_connect(Some(Duration::from_secs(15)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
             .timeout_recv_body(Some(Duration::from_secs(60)))
@@ -4194,6 +4250,7 @@ fn download_github_asset_at(
     let bytes = retry_github_read(release, endpoints, || {
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .timeout_global(Some(endpoints.remaining_github_budget()?))
             .timeout_connect(Some(Duration::from_secs(15)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
             .timeout_recv_body(Some(Duration::from_secs(60)))
@@ -4563,8 +4620,14 @@ fn crate_version_state_at(
 ) -> Result<CrateVersionLookup> {
     let record_path = sparse_index_path(name)?;
     let url = format!("{}/{record_path}", endpoints.crates_io_index);
-    let result = retry_transient(&release.network_retry, || {
-        ureq::get(&url)
+    let result = retry_registry_read(&release.network_retry, endpoints, || {
+        let remaining = endpoints.remaining_registry_budget(&release.network_retry)?;
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(remaining))
+            .build()
+            .new_agent();
+        agent
+            .get(&url)
             .header("User-Agent", REGISTRY_USER_AGENT)
             .call()
             .map_err(|error| registry_http_error("sparse-index version lookup", &url, error))
@@ -4573,6 +4636,8 @@ fn crate_version_state_at(
         Ok(mut response) => {
             let body = response
                 .body_mut()
+                .with_config()
+                .limit(release.maximum_package_bytes)
                 .read_to_string()
                 .map_err(|error| CiError::Http(Box::new(error)))?;
             sparse_crate_version_state(&body, name, version)
@@ -4601,8 +4666,14 @@ fn public_crate_archive_at(
 ) -> Result<()> {
     let download_root = endpoints.crates_io_download.clone();
     let url = format!("{download_root}/crates/{name}/{name}-{version}.crate");
-    let bytes = retry_transient(&release.network_retry, || {
-        let mut response = ureq::get(&url)
+    let bytes = retry_registry_read(&release.network_retry, endpoints, || {
+        let remaining = endpoints.remaining_registry_budget(&release.network_retry)?;
+        let agent = ureq::Agent::config_builder()
+            .timeout_global(Some(remaining))
+            .build()
+            .new_agent();
+        let mut response = agent
+            .get(&url)
             .header("User-Agent", REGISTRY_USER_AGENT)
             .call()
             .map_err(|error| registry_http_error("public crate archive download", &url, error))?;
@@ -4919,35 +4990,13 @@ fn wait_for_public_crate(
     wait: &config::RegistryWait,
 ) -> Result<PublicCrateRecord> {
     let started = Instant::now();
-    let mut delay = Duration::from_millis(wait.initial_milliseconds);
-    let maximum = Duration::from_millis(wait.maximum_milliseconds);
-    let total = Duration::from_secs(wait.total_seconds);
-    loop {
-        match crate_version_state(release, &record.name, &record.version) {
-            Ok(CrateVersionLookup::Absent) if started.elapsed() < total => {
-                thread::sleep(delay);
-                delay = delay.saturating_mul(2).min(maximum);
-            }
-            Ok(CrateVersionLookup::Absent) => {
-                return Err(failure(format!(
-                    "crate visibility retry budget expired: {} {}",
-                    record.name, record.version
-                )));
-            }
-            Ok(CrateVersionLookup::Present(_)) => {
-                let verified = verify_public_crate(release, record)?;
-                wait_for_registry_consumer(record, wait, started, || {
-                    verify_crate_consumer(root, record)
-                })?;
-                return Ok(verified);
-            }
-            Err(error) if transient_network_error(&error) && started.elapsed() < total => {
-                thread::sleep(delay);
-                delay = delay.saturating_mul(2).min(maximum);
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    let deadline = started + Duration::from_secs(wait.total_seconds);
+    let endpoints = HttpEndpoints::production();
+    let verified = wait_for_public_crate_record_until(release, &endpoints, record, deadline)?;
+    wait_for_registry_consumer_until(record, wait, deadline, || {
+        verify_crate_consumer(root, record)
+    })?;
+    Ok(verified)
 }
 
 fn consumer_index_version_absent(error: &CiError, record: &CrateRecord) -> bool {
@@ -4968,18 +5017,31 @@ fn wait_for_registry_consumer(
     record: &CrateRecord,
     wait: &config::RegistryWait,
     started: Instant,
+    verify: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    wait_for_registry_consumer_until(
+        record,
+        wait,
+        started + Duration::from_secs(wait.total_seconds),
+        verify,
+    )
+}
+
+fn wait_for_registry_consumer_until(
+    record: &CrateRecord,
+    wait: &config::RegistryWait,
+    deadline: Instant,
     mut verify: impl FnMut() -> Result<()>,
 ) -> Result<()> {
-    let total = Duration::from_secs(wait.total_seconds);
     let maximum = Duration::from_millis(wait.maximum_milliseconds);
     let mut delay = Duration::from_millis(wait.initial_milliseconds);
     loop {
         match verify() {
             Ok(()) => return Ok(()),
             Err(error)
-                if consumer_index_version_absent(&error, record) && started.elapsed() < total =>
+                if consumer_index_version_absent(&error, record) && Instant::now() < deadline =>
             {
-                thread::sleep(delay.min(total.saturating_sub(started.elapsed())));
+                thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
                 delay = delay.saturating_mul(2).min(maximum);
             }
             Err(error) => return Err(error),
@@ -6402,8 +6464,17 @@ fn verify_crates(root: &Path) -> Result<Vec<PublicCrateRecord>> {
 
 fn finalize_github(root: &Path) -> Result<()> {
     let token = github_token()?;
-    let (release, manifest, output) = bundle_manifest(root)?;
     let endpoints = HttpEndpoints::production();
+    finalize_github_at(root, &token, &endpoints, verify_public)
+}
+
+fn finalize_github_at(
+    root: &Path,
+    token: &str,
+    endpoints: &HttpEndpoints,
+    mut verify_full: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    let (release, manifest, output) = bundle_manifest(root)?;
     let remote = github_release_at(root, Some(&token), &endpoints)?
         .ok_or_else(|| failure("GitHub draft is absent"))?;
     let state = classify_remote_release(
@@ -6424,8 +6495,8 @@ fn finalize_github(root: &Path) -> Result<()> {
             })
             .ok_or_else(|| failure("published release lacks publication report"))?;
         let report_path = output.join(&release.assets.publication_report);
-        download_github_asset(&release, report_asset, Some(&token), &report_path)?;
-        return verify_public(root);
+        download_github_asset_at(&release, endpoints, report_asset, Some(token), &report_path)?;
+        return verify_full(root);
     }
     let RemoteReleaseState::Draft(release_id) = state else {
         unreachable!("published release returned above")
@@ -6574,10 +6645,138 @@ fn verify_public_workflow_provenance(
     Ok(())
 }
 
+fn verified_public_crate_records(
+    release: &config::Release,
+    manifest: &ReleaseManifest,
+    endpoints: &HttpEndpoints,
+    global: bool,
+) -> Result<Vec<PublicCrateRecord>> {
+    let mut records = if global {
+        let deadline = Instant::now() + Duration::from_secs(release.registry_wait.total_seconds);
+        memcordon_ci::public_reads::map_public_reads_ordered(
+            &manifest.crates,
+            std::num::NonZeroUsize::new(4).unwrap(),
+            deadline,
+            |_, record, deadline| {
+                wait_for_public_crate_record_until(release, endpoints, record, deadline)
+            },
+        )?
+    } else {
+        manifest
+            .crates
+            .iter()
+            .map(|record| PublicCrateRecord {
+                name: record.name.clone(),
+                version: record.version.clone(),
+                state: "VerifiedPublic".into(),
+                registry_checksum: record.archive_sha256.clone(),
+                canonical_tree_sha256: record.canonical_tree_sha256.clone(),
+                canonical_identity_sha256: record.canonical_identity_sha256.clone(),
+                vcs_commit: record.vcs_commit.clone(),
+            })
+            .collect()
+    };
+    records.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(records)
+}
+
+fn wait_for_public_crate_record_until(
+    release: &config::Release,
+    endpoints: &HttpEndpoints,
+    record: &CrateRecord,
+    deadline: Instant,
+) -> Result<PublicCrateRecord> {
+    let mut endpoints = endpoints.clone();
+    endpoints.registry_deadline = Some(deadline);
+    let mut delay = Duration::from_millis(release.registry_wait.initial_milliseconds);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(failure("public crate phase deadline expired"));
+        }
+        match crate_version_state_at(release, &endpoints, &record.name, &record.version) {
+            Ok(CrateVersionLookup::Present(_)) => {
+                return verify_public_crate_at(release, &endpoints, record);
+            }
+            Ok(CrateVersionLookup::Absent) => {}
+            Err(error) if transient_network_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+        thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
+        delay = delay.saturating_mul(2).min(Duration::from_millis(
+            release.registry_wait.maximum_milliseconds,
+        ));
+    }
+}
+
 fn verify_public(root: &Path) -> Result<()> {
+    verify_public_with_diagnostics(root, true)
+}
+
+fn verify_public_global(root: &Path) -> Result<()> {
+    if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
+        return Err(failure("public global verification requires Linux x64"));
+    }
+    verify_public_with_diagnostics(root, true)
+}
+
+fn verify_public_host(root: &Path) -> Result<()> {
+    verify_public_with_diagnostics(root, false)
+}
+
+fn verify_public_with_diagnostics(root: &Path, global: bool) -> Result<()> {
+    let started = Instant::now();
+    let outcome = verify_public_state(root, global);
+    let directory = root.join("target/ci/reports/public-verification");
+    let report = serde_json::json!({
+        "schema_version": 1, "scope": if global { "global-and-host" } else { "host" },
+        "host_os": std::env::consts::OS, "host_arch": std::env::consts::ARCH,
+        "maximum_read_workers": if global { 4 } else { 1 },
+        "duration_milliseconds": started.elapsed().as_millis(),
+        "status": if outcome.is_ok() { "passed" } else { "failed" },
+    });
+    let diagnostics = fs::create_dir_all(&directory)
+        .map_err(CiError::from)
+        .and_then(|()| write_json(&directory.join("verification.json"), &report));
+    match outcome {
+        Err(error) => {
+            if diagnostics.is_err() {
+                eprintln!("public verification diagnostics could not be written");
+            }
+            Err(error)
+        }
+        Ok(()) => diagnostics,
+    }
+}
+
+fn verify_public_state(root: &Path, global: bool) -> Result<()> {
     // Every GitHub read shares this deadline, so sequential throttles cannot
     // each consume a fresh wait budget inside the 90-minute verification job.
     let endpoints = HttpEndpoints::production();
+    verify_public_state_with(
+        root,
+        global,
+        &endpoints,
+        inspect_extract_and_smoke,
+        verify_crate_consumer,
+    )
+}
+
+struct PublicVerificationContext {
+    release: config::Release,
+    manifest: ReleaseManifest,
+    output: PathBuf,
+    endpoints: HttpEndpoints,
+    remote: serde_json::Value,
+    report: PublicationReport,
+    report_path: PathBuf,
+    public_downloads: TempDir,
+    release_id: u64,
+}
+
+fn open_public_verification(
+    root: &Path,
+    endpoints: &HttpEndpoints,
+) -> Result<PublicVerificationContext> {
     let (release, manifest, output) = bundle_manifest(root)?;
     let remote = github_release_at(root, None, &endpoints)?
         .ok_or_else(|| failure("public GitHub release is absent"))?;
@@ -6619,48 +6818,187 @@ fn verify_public(root: &Path) -> Result<()> {
         .get("id")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| failure("public release has no id"))?;
-    let local_static_paths = static_asset_paths(&release, &manifest, &output)?;
-    let mut static_paths = Vec::new();
-    for local_path in local_static_paths {
-        let name = local_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| failure("public asset name is not UTF-8"))?;
-        let asset = remote_assets
-            .iter()
-            .find(|asset| asset.get("name").and_then(serde_json::Value::as_str) == Some(name))
-            .ok_or_else(|| failure(format!("public asset is missing: {name}")))?;
-        let destination = public_downloads.path().join(name);
-        download_github_asset_at(&release, &endpoints, asset, None, &destination)?;
-        if !asset_matches(asset, &destination)? {
-            return Err(failure(format!("public asset digest differs: {name}")));
-        }
-        static_paths.push(destination);
+    Ok(PublicVerificationContext {
+        release,
+        manifest,
+        output,
+        endpoints: endpoints.clone(),
+        remote,
+        report,
+        report_path,
+        public_downloads,
+        release_id,
+    })
+}
+
+fn verify_public_state_with(
+    root: &Path,
+    global: bool,
+    endpoints: &HttpEndpoints,
+    mut inspect: impl FnMut(
+        &Path,
+        &Path,
+        &AssetTarget,
+        &ReleaseIdentity,
+        bool,
+    ) -> Result<ArchiveInspection>,
+    mut consumer: impl FnMut(&Path, &CrateRecord) -> Result<()>,
+) -> Result<()> {
+    let context = open_public_verification(root, endpoints)?;
+    let PublicVerificationContext {
+        ref release,
+        ref manifest,
+        ref output,
+        ref endpoints,
+        ref remote,
+        ref report,
+        ref report_path,
+        ref public_downloads,
+        release_id,
+    } = context;
+    let remote_assets = remote
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| failure("public GitHub release has no asset array"))?;
+    let host = config::release_target_id_for_host(std::env::consts::OS, std::env::consts::ARCH)?;
+    let host_assets = manifest
+        .assets
+        .iter()
+        .filter(|asset| {
+            release
+                .assets
+                .target
+                .iter()
+                .any(|target| target.id == host && target.rust_target == asset.target)
+        })
+        .count();
+    if host_assets != 1 {
+        return Err(failure(
+            "public verification requires exactly one host archive",
+        ));
     }
-    memcordon_ci::release_evidence::validate_required_certification_records(
-        &manifest.certification,
-        &manifest.certification_origin,
-        |path| {
-            let name = Path::new(path)
+    let local_static_paths = static_asset_paths(&release, &manifest, &output)?;
+    let local_static_paths: Vec<_> =
+        local_static_paths
+            .into_iter()
+            .filter(|path| {
+                global
+                    || path.file_name() == Some(std::ffi::OsStr::new(&release.assets.manifest))
+                    || manifest.assets.iter().any(|asset| {
+                        path.file_name() == Some(std::ffi::OsStr::new(&asset.name))
+                            && release.assets.target.iter().any(|target| {
+                                target.id == host && target.rust_target == asset.target
+                            })
+                    })
+            })
+            .collect();
+    // Validate unique names and destinations before spawning any download.
+    let downloads: Vec<_> = local_static_paths
+        .iter()
+        .map(|path| {
+            let name = path
                 .file_name()
-                .ok_or_else(|| failure("public certification has no filename"))?;
-            memcordon_ci::release_evidence::read_certification_record(
-                &public_downloads.path().join(name),
-                path,
-            )
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| failure("public asset name is not UTF-8"))?;
+            let matching: Vec<_> = remote_assets
+                .iter()
+                .filter(|asset| asset.get("name").and_then(serde_json::Value::as_str) == Some(name))
+                .collect();
+            if matching.len() != 1 {
+                return Err(failure("public asset missing or duplicated"));
+            }
+            Ok((matching[0], public_downloads.path().join(name)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let static_paths = memcordon_ci::public_reads::map_public_reads_ordered(
+        &downloads,
+        std::num::NonZeroUsize::new(if global { 4 } else { 1 }).unwrap(),
+        endpoints.github_started + RELEASE_DEADLINE,
+        |_, (asset, destination), _| {
+            download_github_asset_at(&release, &endpoints, asset, None, destination)?;
+            if !asset_matches(asset, destination)? {
+                return Err(failure("public asset digest differs"));
+            }
+            Ok(destination.clone())
         },
     )?;
-    verify_standard_producers(
-        &release,
-        &endpoints,
-        &manifest.certification_origin,
-        |contract| {
-            memcordon_ci::release_evidence::read_report(
-                &public_downloads.path().join(contract.report_name),
-            )
-        },
-    )?;
-    let public_assets = public_asset_records(&release, &remote, &static_paths, &manifest.assets)?;
+    if sha256_file(&public_downloads.path().join(&release.assets.manifest))?
+        != sha256_file(&output.join(&release.assets.manifest))?
+    {
+        return Err(failure(
+            "public manifest differs from validated local bundle",
+        ));
+    }
+    if global {
+        memcordon_ci::release_evidence::validate_required_certification_records(
+            &manifest.certification,
+            &manifest.certification_origin,
+            |path| {
+                let name = Path::new(path)
+                    .file_name()
+                    .ok_or_else(|| failure("public certification has no filename"))?;
+                memcordon_ci::release_evidence::read_certification_record(
+                    &public_downloads.path().join(name),
+                    path,
+                )
+            },
+        )?;
+        verify_standard_producers(
+            &release,
+            &endpoints,
+            &manifest.certification_origin,
+            |contract| {
+                memcordon_ci::release_evidence::read_report(
+                    &public_downloads.path().join(contract.report_name),
+                )
+            },
+        )?;
+    }
+    let public_assets = if global {
+        public_asset_records(&release, &remote, &static_paths, &manifest.assets)?
+    } else {
+        // Compare host and manifest bytes to their authenticated local bundle copies.
+        for (local, downloaded) in local_static_paths.iter().zip(&static_paths) {
+            if sha256_file(local)? != sha256_file(downloaded)? {
+                return Err(failure(
+                    "public host asset differs from validated local bundle",
+                ));
+            }
+            let name = downloaded
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| failure("asset name is not UTF-8"))?;
+            let records: Vec<_> = report
+                .assets
+                .iter()
+                .filter(|asset| asset.name == name)
+                .collect();
+            if records.len() != 1
+                || records[0].sha256 != sha256_file(downloaded)?
+                || records[0].size != fs::metadata(downloaded)?.len()
+            {
+                return Err(failure("publication report host asset binding differs"));
+            }
+            let remote_asset = remote_assets
+                .iter()
+                .find(|asset| asset.get("name").and_then(serde_json::Value::as_str) == Some(name))
+                .ok_or_else(|| failure("remote host asset is absent"))?;
+            let runtime = manifest.assets.iter().find(|asset| asset.name == name);
+            if remote_asset.get("id").and_then(serde_json::Value::as_u64) != Some(records[0].id)
+                || records[0].runtime_manifest_sha256
+                    != runtime.map(|asset| asset.runtime_manifest_sha256.clone())
+                || records[0].components
+                    != runtime
+                        .map(|asset| asset.components.clone())
+                        .unwrap_or_default()
+            {
+                return Err(failure(
+                    "publication report host inventory or remote identity differs",
+                ));
+            }
+        }
+        report.assets.clone()
+    };
     let identity = ReleaseIdentity {
         tag: manifest.tag.clone(),
         version: Version::parse(&manifest.version)?,
@@ -6668,7 +7006,6 @@ fn verify_public(root: &Path) -> Result<()> {
         changelog_section: String::new(),
         source_date: manifest.source_date.clone(),
     };
-    let host = config::release_target_id_for_host(std::env::consts::OS, std::env::consts::ARCH)?;
     for asset in &manifest.assets {
         let target = release
             .assets
@@ -6676,9 +7013,11 @@ fn verify_public(root: &Path) -> Result<()> {
             .iter()
             .find(|target| target.rust_target == asset.target)
             .ok_or_else(|| failure(format!("public asset target is unknown: {}", asset.target)))?;
+        if !global && target.id != host {
+            continue;
+        }
         let archive = public_downloads.path().join(&asset.name);
-        let inspection =
-            inspect_extract_and_smoke(root, &archive, target, &identity, target.id == host)?;
+        let inspection = inspect(root, &archive, target, &identity, target.id == host)?;
         if inspection.runtime_manifest_sha256 != asset.runtime_manifest_sha256
             || inspection.components != asset.components
         {
@@ -6691,7 +7030,7 @@ fn verify_public(root: &Path) -> Result<()> {
     if report.schema_version != 2
         || report.manifest_sha256
             != sha256_file(&public_downloads.path().join(&release.assets.manifest))?
-        || report.crates != verify_crates(root)?
+        || report.crates != verified_public_crate_records(&release, &manifest, &endpoints, global)?
         || report.github_release_id != release_id
         || report.source_commit != manifest.source_commit
         || report.workflow_commit != manifest.workflow_commit
@@ -6699,6 +7038,16 @@ fn verify_public(root: &Path) -> Result<()> {
         || report.assets != public_assets
     {
         return Err(failure("publication report does not match public state"));
+    }
+    // Mutating registry consumers remain serial, after all public reads.
+    for record in &manifest.crates {
+        let started = Instant::now();
+        wait_for_registry_consumer(record, &release.registry_wait, started, || {
+            consumer(root, record)
+        })?;
+    }
+    if !global {
+        return Ok(());
     }
     let mut expected = static_paths;
     expected.push(report_path.clone());
@@ -6797,6 +7146,12 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         ReleaseCommand::InstallPrivateFinal { intent, archive } => {
             memcordon_ci::private_final_install::install_final_same_host(root, &intent, &archive)
         }
+        ReleaseCommand::SealPrivateFinal { intent, candidate, qualification, output_dir } => {
+            memcordon_ci::private_completed_run::seal_private_final_from_protected_intent(root, &intent, &candidate, &qualification, &output_dir)
+        }
+        ReleaseCommand::VerifyPrivateCompletion { intent, qualification } => {
+            memcordon_ci::private_public_completion::verify_private_completion(&intent, &qualification)
+        }
         ReleaseCommand::StageGithub => stage_github(root),
         ReleaseCommand::AttemptOidc { publication_slot } => {
             attempt_oidc_publication_at(root, publication_slot)
@@ -6811,6 +7166,8 @@ pub fn run(root: &Path, command: ReleaseCommand) -> Result<()> {
         ReleaseCommand::FinalizeGithub => finalize_github(root),
         ReleaseCommand::RehearsePublic { bundle, report } => rehearsal::run(root, &bundle, &report),
         ReleaseCommand::VerifyPublic => verify_public(root),
+        ReleaseCommand::VerifyPublicGlobal => verify_public_global(root),
+        ReleaseCommand::VerifyPublicHost => verify_public_host(root),
     }
 }
 

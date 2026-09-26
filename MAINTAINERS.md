@@ -5,6 +5,26 @@ boundary. Public behavior belongs in `README.md`, `docs/reference.md`, generated
 CLI help, and Rust API documentation. Historical proposals are available in Git
 history and are not current contracts.
 
+Release scheduling preserves six native assets with separate Linux and Windows
+architecture producers and a macOS producer matrix. Each Windows architecture
+advances through fresh native, loader, provider and package runners without an
+opposite-architecture barrier. Public producers overlap full preflight;
+assembly requires its successful completion and every public evidence family.
+Protected private candidates retain a direct preflight edge and advance through
+independent completed Q/CQ, pre-install A sealing, installed final observation
+and completed P/CP collection on their own architecture. See
+[RELEASING.md](RELEASING.md) and [private trust](docs/private-release-trust.md)
+for the separate publication and provisioning contracts.
+
+Release Miri/fuzz halves retain complete deterministic coverage. Build-context
+profiles and native input requirements are typed CLI arguments; package creation
+and installation use explicit target directories. Public global/Linux and
+Windows-host verification share authenticated source/report identity, while
+global reads are bounded and host provider mutations remain serial. Temporary
+staging, evidence, admission files, installed state and authority material are
+excluded from compiled caches. Review graph, command, permission, environment,
+artifact and cache mutation tests whenever changing these boundaries.
+
 ## Workspace architecture
 
 The workspace separates platform-neutral contracts from native execution:

@@ -1,5 +1,65 @@
 # Private native qualification trust
 
+The release workflow has two independent architecture chains. For `x64` and
+`arm64`, `linux-native-*` produces the historical public archive and B/M0;
+`linux-private-candidate-inputs-*` reads B/M0; candidate installation waits for
+that readback and preflight. The completed candidate then feeds the independent
+`linux-private-q-*` collector, `linux-private-seal-*`, installed
+`linux-private-final-*`, independent `linux-private-p-*`, and
+`linux-private-complete-*`. Ordinary public assembly requires the six historical
+native assets and its public evidence; these optional private jobs are separate
+completion statuses and do not silently certify historical archives.
+
+The Q collector uploads `release-private-qualified-<arch>` containing exact
+`qualification.json` and `qualification.certificate.json`. Sealing reacquires
+the completed candidate and independent replay under a protected sealing intent
+before accepting that download. It uploads `release-private-final-a-<arch>`:
+`memcordon-private-final-<arch>.tar.gz`, `runtime-manifest.json`, and
+`seal-receipt.json`. This is authenticated A/M1 assembly before installation;
+it neither creates H1 nor claims final public completion.
+
+The final producer installs that exact A on its enrolled host and produces
+`release-private-public-raw-<arch>`. The schema-2 protected public collector
+intent names this raw contract explicitly. Legacy final-envelope readers retain
+their separate `release-private-final-<arch>` contract; their artifact names and
+formats are not alternatives. The completed P collector independently replays
+all 25 cases and emits `release-private-public-qualified-<arch>` with
+`public-evidence.json`, `public-evidence.certificate.json`,
+`completed-provenance.json`, and `raw-public.zip`. The completion command checks
+the actual P bytes and signed CP against a separately administered
+`public-completion.v1.json` with exact expected V2 certificate payload, root
+anchor, signed policy, and monotonic policy/release/wall high-water floors.
+The expectation must never be copied from an unauthenticated downloaded CP.
+
+Q/seal/P/completion jobs require independently managed runner labels
+`[self-hosted, linux, memcordon-private-collector-x64]` or the ARM64 counterpart.
+Labels alone confer no trust. Administrators must provision separate native
+hosts, exclusive host leases, enrolled numeric subjects for the exact run and
+attempt, protected observer/custodian sockets and policies, reviewed workflow
+bytes and verifier digests, root/policy/high-water state, and delegated signing
+intents. Job renames require new independently approved intents and enrollment;
+old evidence is never rewritten to claim the new identities.
+
+The collector execution service must deliver its delegated signing credential
+as inherited descriptor 3 to the Rust executable. A standard Actions shell
+cannot manufacture that authority or guarantee descriptor inheritance: the
+independently managed execution launcher must preserve the descriptor through
+the invocation and the credential must retain the expected protected ownership
+and mode. No repository shell script, environment secret, or argument containing
+private key bytes substitutes for this provisioning. Missing descriptor, host,
+root, signing role, custody socket, or protected intent fails closed.
+
+Administrators allocate fresh per-run collector output leaves beneath
+`/var/lib/memcordon/release-handoff/{q,seal,p,complete}/<arch>` and preserve the
+independent high-water state outside these ephemeral handoff leaves. Q/seal/P
+reject pre-existing output directories. Output reuse or runner overlap must be
+prevented by independently managed leases and cleanup between runs; the workflow
+does not erase protected state. These jobs do not cache evidence or credentials.
+Actions read permission enables exact completed producer metadata checks; it
+does not grant observation or signing authority. A producer can complete while
+the enclosing workflow remains in progress, so collection has no whole-run
+completion cycle.
+
 The installed Linux agent accepts native Q only with a completed-CI Ed25519
 certificate (CQ) under an administrator-provisioned release trust root. Q,
 the build inventory (B), and CQ are installed as exact bytes below

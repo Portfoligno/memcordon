@@ -29,12 +29,16 @@ Worker idle and task-other time are separate from named operation envelopes.
 Cumulative operation time across threads is not elapsed wall time.
 
 File attempted/completed/validated/committed counters and committed manifest
-bytes have explicit `file_counters_scope: windows_linux_native_pipeline`. Generic
-source and other platform scans retain operation/read counters and full manifests but
-do not claim native identity-validation counters. Returned read bytes include
+bytes have explicit `file_counters_scope: domain_pipeline` and a source/native/
+standalone domain identifier. Validation means acceptance under that domain's
+existing reader contract: source and ordinary macOS EOF reads do not claim the
+Linux/Windows native identity-validation protocol. Returned read bytes include
 work that can subsequently fail validation and must not be used as committed
 manifest bytes. `root_complete` describes one root, not complete context or
 parent admission. Only successful parent supervision can admit the final context.
+Managed scans use two rotating snapshot slots per domain plus a bounded final
+`inventory-domains.json` summary after both controllers join. Root ordinals and
+configured outstanding/file/preparation limits are diagnostics, not digest inputs.
 
 There are at most 32 registered actor slots, 64 live task ledger entries and a
 256-event tail per observer; terminal tasks reconcile online and release their

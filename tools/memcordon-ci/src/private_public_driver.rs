@@ -373,7 +373,7 @@ pub(crate) fn run(root: &Path, target: &str, path: &Path) -> Result<()> {
         &read(&run_url, 1024 * 1024, "application/vnd.github+json")?,
         1024 * 1024,
     )?;
-    let spec = crate::private_native::PRODUCERS
+    let spec = crate::private_native::PUBLIC_RAW_PRODUCERS
         .iter()
         .find(|spec| {
             spec.stage == crate::private_native::NativeRunStageV2::FinalPublic

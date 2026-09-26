@@ -563,6 +563,7 @@ const STRESS_MATRIX: [(&str, &str); 5] = [
     ("windows-arm64", "windows-11-arm"),
 ];
 const DEEP_CI_FUZZ_MINIMUM_TIMEOUT_MINUTES: u64 = 60;
+const RELEASE_BUILD_INPUTS: &str = "${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', '.cargo/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'rust-toolchain.toml', '.github/workflows/**') }}";
 
 fn check_runner_matrix(
     jobs: &Mapping,
@@ -623,6 +624,7 @@ fn check_private_native_diagnostic_job(
     name: &str,
     dependency: &str,
     stage: &str,
+    architecture: &str,
 ) -> Result<()> {
     let job = mapping(
         jobs.get(key(job_id))
@@ -639,11 +641,9 @@ fn check_private_native_diagnostic_job(
         "timeout-minutes",
         "steps",
     ];
-    if candidate {
-        job_keys.push("permissions");
-    }
+    job_keys.push("permissions");
     exact_mapping_keys(job, &job_keys, "private native diagnostic job")?;
-    if candidate {
+    {
         let permissions = mapping(
             job.get(key("permissions"))
                 .ok_or_else(|| failure("candidate Actions permissions absent"))?,
@@ -663,12 +663,23 @@ fn check_private_native_diagnostic_job(
     if scalar(job, "name") != Some(name)
         || scalar(job, "if")
             != Some("github.event_name == 'workflow_dispatch' && inputs.private_native == true")
-        || scalar(job, "needs") != Some(dependency)
         || scalar(job, "runs-on") != Some("${{ matrix.runner }}")
         || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(75)
     {
         return Err(failure(
             "private native diagnostic job is not opt-in and bounded",
+        ));
+    }
+    if candidate {
+        exact_string_sequence(
+            job.get(key("needs"))
+                .ok_or_else(|| failure("private candidate dependencies absent"))?,
+            &["preflight", dependency],
+            "private candidate protected start dependencies",
+        )?;
+    } else if scalar(job, "needs") != Some(dependency) {
+        return Err(failure(
+            "private final must depend on same-target authenticated seal",
         ));
     }
     let strategy = mapping(
@@ -723,6 +734,10 @@ fn check_private_native_diagnostic_job(
             ("arm64", "ubuntu-24.04-arm", None),
         ]
     };
+    let expected: Vec<_> = expected
+        .into_iter()
+        .filter(|row| row.0 == architecture)
+        .collect();
     if actual != expected {
         return Err(failure("private native matrix target/runner differs"));
     }
@@ -858,6 +873,71 @@ fn check_private_native_diagnostic_job(
         {
             return Err(failure(
                 "private native candidate provisioning order differs",
+            ));
+        }
+    }
+    if !candidate {
+        let downloads = action_steps(
+            steps,
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        )?;
+        if downloads.len() != 1 {
+            return Err(failure(
+                "private final requires exactly one authenticated A download",
+            ));
+        }
+        let with = mapping(
+            downloads[0]
+                .get(key("with"))
+                .ok_or_else(|| failure("private final archive download absent"))?,
+            "private final archive download",
+        )?;
+        exact_mapping_keys(with, &["name", "path"], "private final archive download")?;
+        if scalar(with, "name") != Some("release-private-final-a-${{ matrix.id }}")
+            || scalar(with, "path")
+                != Some("target/ci/release-inputs/private-final-a-${{ matrix.id }}")
+        {
+            return Err(failure("private final exact same-target A handoff differs"));
+        }
+        let install = "sudo -E ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release install-private-final --intent /etc/memcordon/release-trust/final-install-intent.v1.json --archive \"$PRIVATE_FINAL_ARCHIVE\"";
+        let install_steps: Vec<_> = steps
+            .iter()
+            .enumerate()
+            .filter_map(|(index, step)| {
+                step.as_mapping()
+                    .filter(|step| scalar(step, "run") == Some(install))
+                    .map(|step| (index, step))
+            })
+            .collect();
+        if install_steps.len() != 1 {
+            return Err(failure("private final exact-A install missing"));
+        }
+        let (position, step) = install_steps[0];
+        let env = mapping(
+            step.get(key("env"))
+                .ok_or_else(|| failure("private final archive binding absent"))?,
+            "private final archive binding",
+        )?;
+        exact_mapping_keys(
+            env,
+            &["PRIVATE_FINAL_ARCHIVE"],
+            "private final archive binding",
+        )?;
+        if scalar(env, "PRIVATE_FINAL_ARCHIVE")
+            != Some(
+                "target/ci/release-inputs/private-final-a-${{ matrix.id }}/memcordon-private-final-${{ matrix.id }}.tar.gz",
+            )
+            || !steps
+                .iter()
+                .position(|step| step.as_mapping() == Some(downloads[0]))
+                .is_some_and(|download| download < position)
+            || !steps
+                .iter()
+                .position(|step| step.as_mapping() == Some(invocations[0]))
+                .is_some_and(|suite| position < suite)
+        {
+            return Err(failure(
+                "private final download/install/observation custody order differs",
             ));
         }
     }
@@ -1178,9 +1258,318 @@ fn check_deep_ci_structure(workflow: &Mapping, jobs: &Mapping) -> Result<()> {
             "deep CI fuzz timeout differs from workload deadline",
         ));
     }
-    check_fuzz_shards(fuzz)?;
+    check_deep_shards(
+        fuzz,
+        "fuzz",
+        &[
+            "quarter-one",
+            "quarter-two",
+            "quarter-three",
+            "quarter-four",
+        ],
+        60,
+    )?;
+    let miri = mapping(
+        jobs.get(key("miri"))
+            .ok_or_else(|| failure("deep CI Miri job is absent"))?,
+        "deep CI Miri",
+    )?;
+    check_deep_shards(miri, "miri", &["first", "second"], 45)?;
     check_runner_matrix(jobs, "stress", &STRESS_MATRIX, "deep CI stress")?;
+    let stress = mapping(
+        jobs.get(key("stress")).expect("validated stress job"),
+        "deep CI stress",
+    )?;
+    let stress_steps = certification_steps(stress, "deep CI stress")?;
+    let mut phase_uploads = 0;
+    for step in stress_steps.iter().filter_map(Value::as_mapping) {
+        if scalar(step, "uses") != Some("./.github/actions/upload-artifact") {
+            continue;
+        }
+        let with = mapping(
+            step.get(key("with"))
+                .ok_or_else(|| failure("stress phase upload settings absent"))?,
+            "stress phase upload",
+        )?;
+        exact_mapping_keys(step, &["if", "uses", "with"], "stress phase upload")?;
+        exact_mapping_keys(
+            with,
+            &["name", "path", "if-no-files-found"],
+            "stress phase upload settings",
+        )?;
+        if scalar(step, "if") != Some("always()")
+            || scalar(with, "name") != Some("stress-phases-${{ matrix.id }}")
+            || scalar(with, "if-no-files-found") != Some("warn")
+            || scalar(with, "path")
+                != Some(
+                    "target/ci/reports/stress\ntarget/ci/reports/stress-seed.txt\ntarget/ci/reports/stress-active-target.txt\ntarget/ci/reports/stress-deep_short_child_iterations.json\n",
+                )
+        {
+            return Err(failure(
+                "stress phase evidence must preserve phase, seed, active target and child reports on failure",
+            ));
+        }
+        phase_uploads += 1;
+    }
+    if phase_uploads != 1 {
+        return Err(failure(
+            "deep stress requires exactly one phase evidence upload",
+        ));
+    }
     Ok(())
+}
+
+fn check_deep_shards(job: &Mapping, family: &str, shards: &[&str], timeout: u64) -> Result<()> {
+    exact_mapping_keys(
+        job,
+        &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
+        "deep shard job",
+    )?;
+    let strategy = mapping(
+        job.get(key("strategy"))
+            .ok_or_else(|| failure("shard strategy absent"))?,
+        "shard strategy",
+    )?;
+    exact_mapping_keys(strategy, &["fail-fast", "matrix"], "shard strategy")?;
+    let matrix = mapping(
+        strategy
+            .get(key("matrix"))
+            .ok_or_else(|| failure("shard matrix absent"))?,
+        "shard matrix",
+    )?;
+    exact_mapping_keys(matrix, &["shard"], "shard matrix")?;
+    exact_string_sequence(
+        matrix
+            .get(key("shard"))
+            .ok_or_else(|| failure("shard inventory absent"))?,
+        shards,
+        "complete shard inventory",
+    )?;
+    if strategy.get(key("fail-fast")).and_then(Value::as_bool) != Some(false)
+        || scalar(job, "runs-on") != Some("ubuntu-24.04")
+        || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(timeout)
+    {
+        return Err(failure("deep shard runner or execution bounds differ"));
+    }
+    let steps = certification_steps(job, "deep shards")?;
+    let ids: &[Option<&str>] = if family == "fuzz" {
+        &[
+            None,
+            Some("fuzz-deps"),
+            Some("fuzz-target"),
+            Some("fuzz-tools"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]
+    } else {
+        &[
+            None,
+            Some("miri-deps"),
+            Some("miri-target"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]
+    };
+    if steps.len() != ids.len() {
+        return Err(failure("deep shard ordered step inventory differs"));
+    }
+    let restore_count = if family == "fuzz" { 3 } else { 2 };
+    for (ordinal, value) in steps.iter().enumerate() {
+        let step = mapping(value, "deep shard step")?;
+        let keys: &[&str] = if ordinal == 0 {
+            &["uses", "with"]
+        } else if ordinal <= restore_count {
+            &["id", "uses", "with"]
+        } else if ordinal == restore_count + 1 {
+            &["run"]
+        } else if ordinal <= restore_count + 1 + shards.len() {
+            &["if", "run"]
+        } else {
+            &["if", "uses", "with"]
+        };
+        exact_mapping_keys(step, keys, "deep shard ordered step")?;
+        if scalar(step, "id") != ids[ordinal] {
+            return Err(failure("deep shard cache restore ordering differs"));
+        }
+        if ordinal == 0
+            && scalar(step, "uses")
+                != Some("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1")
+        {
+            return Err(failure("deep shard checkout differs"));
+        }
+        if (1..=restore_count).contains(&ordinal)
+            && scalar(step, "uses")
+                != Some("actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
+        {
+            return Err(failure("deep shard restore action differs"));
+        }
+    }
+    let runs: Vec<_> = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter_map(|step| scalar(step, "run").map(|run| (run, scalar(step, "if"))))
+        .collect();
+    let mut expected = vec![(
+        "rustup toolchain install 1.97.1 --profile minimal".to_owned(),
+        None,
+    )];
+    for shard in shards {
+        expected.push((format!("./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite {family}-{shard}"), Some(format!("matrix.shard == '{shard}'"))));
+    }
+    if runs.len() != expected.len()
+        || runs.iter().zip(&expected).any(
+            |((run, condition), (expected_run, expected_condition))| {
+                *run != expected_run || *condition != expected_condition.as_deref()
+            },
+        )
+    {
+        return Err(failure("deep shard invocation coverage differs"));
+    }
+    let target_id = format!("{family}-target");
+    let target = step_with_id(steps, &target_id, "deep shard cache")?;
+    let target_with = mapping(
+        target
+            .get(key("with"))
+            .ok_or_else(|| failure("shard target cache absent"))?,
+        "shard target cache",
+    )?;
+    let expected_key = if family == "fuzz" {
+        "cargo-target-deep-v4-fuzz-${{ runner.os }}-${{ runner.arch }}-${{ matrix.shard }}-nightly-2026-07-31-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml', 'fuzz/fuzz_targets/**', 'crates/**', 'tools/**', 'ci/**', '.github/workflows/deep-ci.yml') }}"
+    } else {
+        "cargo-target-deep-v2-miri-${{ runner.os }}-${{ runner.arch }}-${{ matrix.shard }}-nightly-2026-07-31-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain.toml', 'crates/**', 'tools/**', 'ci/**', '.github/workflows/deep-ci.yml') }}"
+    };
+    let expected_path = if family == "fuzz" {
+        "target/ci\nfuzz/target\n"
+    } else {
+        "target/ci"
+    };
+    if scalar(target_with, "key") != Some(expected_key)
+        || scalar(target_with, "path") != Some(expected_path)
+        || target_with.contains_key(key("restore-keys"))
+    {
+        return Err(failure("deep shard target cache identity differs"));
+    }
+    let dependency_id = format!("{family}-deps");
+    let dependencies = step_with_id(steps, &dependency_id, "deep shard source cache")?;
+    let source_with = mapping(
+        dependencies
+            .get(key("with"))
+            .ok_or_else(|| failure("source cache absent"))?,
+        "source cache",
+    )?;
+    let source_key = format!(
+        "cargo-deps-deep-v2-{family}-${{{{ runner.os }}}}-${{{{ runner.arch }}}}-${{{{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml') }}}}"
+    );
+    if scalar(source_with, "key") != Some(&source_key) {
+        return Err(failure("deep shard shared cache purpose differs"));
+    }
+    let publisher = shards[0];
+    if family == "fuzz" {
+        let tools = step_with_id(steps, "fuzz-tools", "deep fuzz tools")?;
+        let with = mapping(
+            tools
+                .get(key("with"))
+                .ok_or_else(|| failure("fuzz tools inputs absent"))?,
+            "fuzz tools inputs",
+        )?;
+        if scalar(with, "path") != Some("target/ci-tools/bin\ntarget/ci-tools/build\n")
+            || scalar(with, "key")
+                != Some(
+                    "cargo-tools-deep-v2-fuzz-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain.toml', 'ci/tools.toml', 'tools/**', '.github/workflows/deep-ci.yml') }}",
+                )
+        {
+            return Err(failure("deep fuzz tool cache paths or identity differ"));
+        }
+    }
+    let source_condition = format!(
+        "always() && matrix.shard == '{publisher}' && steps.{dependency_id}.outputs.cache-hit != 'true'"
+    );
+    let source_save_key = format!("${{{{ steps.{dependency_id}.outputs.cache-primary-key }}}}");
+    let mut target_saves = 0;
+    let mut source_saves = 0;
+    let mut plans = 0;
+    for step in steps.iter().filter_map(Value::as_mapping) {
+        if scalar(step, "uses") == Some("./.github/actions/upload-artifact") {
+            let inputs = mapping(
+                step.get(key("with"))
+                    .ok_or_else(|| failure("plan upload absent"))?,
+                "plan upload",
+            )?;
+            if scalar(step, "if") != Some("always()")
+                || scalar(inputs, "path") != Some(format!("target/ci/reports/{family}").as_str())
+            {
+                return Err(failure("shard plan evidence must be uploaded on failure"));
+            }
+            plans += 1;
+        }
+        if scalar(step, "uses")
+            != Some("actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9")
+        {
+            continue;
+        }
+        let inputs = mapping(
+            step.get(key("with"))
+                .ok_or_else(|| failure("cache save absent"))?,
+            "cache save",
+        )?;
+        let expected_target_key = format!("${{{{ steps.{target_id}.outputs.cache-primary-key }}}}");
+        if scalar(inputs, "key") == Some(&expected_target_key) {
+            if scalar(step, "if")
+                != Some(
+                    format!("always() && steps.{target_id}.outputs.cache-hit != 'true'").as_str(),
+                )
+                || scalar(inputs, "path") != Some(expected_path)
+            {
+                return Err(failure("shard target cache save differs"));
+            }
+            target_saves += 1;
+        }
+        if scalar(inputs, "key") == Some(&source_save_key) {
+            if scalar(step, "if") != Some(&source_condition) {
+                return Err(failure("shared source cache publisher differs"));
+            }
+            source_saves += 1;
+        }
+        if family == "fuzz"
+            && scalar(inputs, "key") == Some("${{ steps.fuzz-tools.outputs.cache-primary-key }}")
+            && (scalar(step, "if")
+                != Some(
+                    "always() && matrix.shard == 'quarter-one' && steps.fuzz-tools.outputs.cache-hit != 'true'",
+                )
+                || scalar(inputs, "path") != Some("target/ci-tools/bin\ntarget/ci-tools/build\n"))
+        {
+            return Err(failure("shared fuzz tool publisher or paths differ"));
+        }
+    }
+    if target_saves != 1 || source_saves != 1 || plans != 1 {
+        return Err(failure("shard cache/evidence coverage differs"));
+    }
+    Ok(())
+}
+
+pub fn check_deep_fuzz_shards(job: &Mapping) -> Result<()> {
+    check_deep_shards(
+        job,
+        "fuzz",
+        &[
+            "quarter-one",
+            "quarter-two",
+            "quarter-three",
+            "quarter-four",
+        ],
+        60,
+    )
 }
 
 fn check_ci_structure(workflow: &Mapping, jobs: &Mapping, policy: &config::Policy) -> Result<()> {
@@ -1390,15 +1779,11 @@ fn check_standard_certification_job(
     release: bool,
 ) -> Result<()> {
     let context = "standard certification job";
-    let keys = if release {
-        vec!["name", "needs", "runs-on", "timeout-minutes", "steps"]
-    } else {
-        vec!["name", "runs-on", "timeout-minutes", "steps"]
-    };
+    let keys = vec!["name", "runs-on", "timeout-minutes", "steps"];
     exact_mapping_keys(job, &keys, context)?;
     if scalar(job, "runs-on") != Some(contract.runner_label)
         || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(75)
-        || (release && scalar(job, "needs") != Some("preflight"))
+        || job.contains_key(key("needs"))
     {
         return Err(failure("standard certification runner/dependency differs"));
     }
@@ -1961,10 +2346,14 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         jobs,
         &[
             "linux",
-            "windows-loader-production",
-            "windows-provider-lifecycle",
-            "windows-package-channel",
-            "windows-loader-lab",
+            "windows-loader-production-x64",
+            "windows-loader-production-arm64",
+            "windows-provider-lifecycle-x64",
+            "windows-provider-lifecycle-arm64",
+            "windows-package-channel-x64",
+            "windows-package-channel-arm64",
+            "windows-loader-lab-x64",
+            "windows-loader-lab-arm64",
             "standard-linux",
             "standard-windows",
         ],
@@ -2010,46 +2399,6 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
         "backend certification linux job",
     )?;
 
-    for job_name in [
-        "windows-loader-production",
-        "windows-provider-lifecycle",
-        "windows-package-channel",
-        "windows-loader-lab",
-    ] {
-        check_runner_matrix(
-            jobs,
-            job_name,
-            &[("x64", "windows-2025"), ("arm64", "windows-11-arm")],
-            job_name,
-        )?;
-    }
-    for (job_name, required_dependency) in [
-        ("windows-provider-lifecycle", "windows-loader-production"),
-        ("windows-package-channel", "windows-provider-lifecycle"),
-        ("windows-loader-lab", "windows-loader-production"),
-    ] {
-        let job = mapping(
-            jobs.get(key(job_name))
-                .ok_or_else(|| failure(format!("{job_name} job is absent")))?,
-            job_name,
-        )?;
-        if scalar(job, "needs") != Some(required_dependency) {
-            return Err(failure(format!(
-                "{job_name} does not depend on {required_dependency}"
-            )));
-        }
-    }
-    let lab = mapping(
-        jobs.get(key("windows-loader-lab"))
-            .ok_or_else(|| failure("windows-loader-lab job is absent"))?,
-        "windows-loader-lab",
-    )?;
-    if scalar(lab, "if") != Some("always() && github.event_name == 'workflow_dispatch'") {
-        return Err(failure(
-            "Windows loader lab must remain dispatch-only and run after a failed production gate",
-        ));
-    }
-
     for contract in [
         SplitWindowsJobContract {
             name: "windows-loader-production",
@@ -2064,7 +2413,7 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
             downloads: &[],
             dependency_cache_id: "certification-deps",
             target_cache_id: "certification-target",
-            target_cache_path: "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n",
+            target_cache_path: "target/ci/bootstrap\ntarget/ci/backend\ntarget/ci/windows-sealed\n",
             checkout_count: 1,
             timeout_minutes: 45,
         },
@@ -2104,7 +2453,7 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
             )],
             dependency_cache_id: "package-deps",
             target_cache_id: "package-target",
-            target_cache_path: "target/ci/bootstrap\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n",
+            target_cache_path: "target/ci/bootstrap\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo/build\n",
             checkout_count: 1,
             timeout_minutes: 75,
         },
@@ -2129,12 +2478,58 @@ fn check_backend_certification_structure(workflow: &Mapping, jobs: &Mapping) -> 
             timeout_minutes: 45,
         },
     ] {
-        let job = mapping(
-            jobs.get(key(contract.name))
-                .ok_or_else(|| failure(format!("{} job is absent", contract.name)))?,
-            contract.name,
-        )?;
-        check_split_windows_job(job, contract)?;
+        for architecture in ["x64", "arm64"] {
+            let name = format!("{}-{architecture}", contract.name);
+            let artifact = contract
+                .artifact_name
+                .replace("${{ matrix.id }}", architecture);
+            let dependency = contract
+                .dependency
+                .map(|name| format!("{name}-{architecture}"));
+            let downloads: Vec<_> = contract
+                .downloads
+                .iter()
+                .map(|(name, path)| (name.replace("${{ matrix.id }}", architecture), *path))
+                .collect();
+            let borrowed: Vec<_> = downloads
+                .iter()
+                .map(|(name, path)| (name.as_str(), *path))
+                .collect();
+            let job = mapping(
+                jobs.get(key(&name))
+                    .ok_or_else(|| failure(format!("{name} job is absent")))?,
+                &name,
+            )?;
+            if job.contains_key(key("strategy"))
+                || scalar(job, "runs-on")
+                    != Some(if architecture == "x64" {
+                        "windows-2025"
+                    } else {
+                        "windows-11-arm"
+                    })
+            {
+                return Err(failure(
+                    "Windows architecture jobs require independent scalar runners",
+                ));
+            }
+            check_split_windows_job(
+                job,
+                SplitWindowsJobContract {
+                    name: &name,
+                    suite: contract.suite,
+                    artifact_name: &artifact,
+                    artifact_path: contract.artifact_path,
+                    dependency: dependency.as_deref(),
+                    condition: contract.condition,
+                    downloads: &borrowed,
+                    dependency_cache_id: contract.dependency_cache_id,
+                    target_cache_id: contract.target_cache_id,
+                    target_cache_path: contract.target_cache_path,
+                    checkout_count: contract.checkout_count,
+                    timeout_minutes: contract.timeout_minutes,
+                },
+            )?;
+        }
     }
     Ok(())
 }
@@ -2177,7 +2572,21 @@ fn check_split_windows_job(job: &Mapping, contract: SplitWindowsJobContract<'_>)
         (None, None) => &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
         (None, Some(_)) => return Err(failure(format!("{context} has an invalid contract"))),
     };
-    exact_mapping_keys(job, expected_keys, context)?;
+    let explicit = contract.name.ends_with("-x64") || contract.name.ends_with("-arm64");
+    let explicit_keys: Vec<_> = expected_keys
+        .iter()
+        .copied()
+        .filter(|name| *name != "strategy")
+        .collect();
+    exact_mapping_keys(
+        job,
+        if explicit && !job.contains_key(key("strategy")) {
+            &explicit_keys
+        } else {
+            expected_keys
+        },
+        context,
+    )?;
     if scalar(job, "needs") != contract.dependency
         || scalar(job, "if") != contract.condition
         || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(contract.timeout_minutes)
@@ -2626,6 +3035,369 @@ fn check_release_credentials(
     Ok(())
 }
 
+fn check_release_shards(jobs: &Mapping, family: &str) -> Result<()> {
+    let job = mapping(
+        jobs.get(key(family))
+            .ok_or_else(|| failure("release shard job missing"))?,
+        family,
+    )?;
+    exact_mapping_keys(
+        job,
+        &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
+        family,
+    )?;
+    if scalar(job, "name")
+        != Some(
+            format!(
+                "Release / {} / ${{{{ matrix.shard }}}}",
+                if family == "miri" { "Miri" } else { "fuzz" }
+            )
+            .as_str(),
+        )
+        || scalar(job, "runs-on") != Some("ubuntu-24.04")
+        || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(60)
+    {
+        return Err(failure("release shard runner/name/deadline differs"));
+    }
+    let strategy = mapping(job.get(key("strategy")).expect("exact keys"), family)?;
+    exact_mapping_keys(strategy, &["fail-fast", "matrix"], family)?;
+    let matrix = mapping(strategy.get(key("matrix")).expect("exact keys"), family)?;
+    exact_mapping_keys(matrix, &["shard"], family)?;
+    exact_string_sequence(
+        matrix.get(key("shard")).expect("exact keys"),
+        &["first", "second"],
+        "release complete shard partition",
+    )?;
+    if strategy.get(key("fail-fast")).and_then(Value::as_bool) != Some(false) {
+        return Err(failure("release shards must settle both halves"));
+    }
+    let steps = certification_steps(job, family)?;
+    let runs: Vec<_> = steps
+        .iter()
+        .filter_map(Value::as_mapping)
+        .filter(|step| scalar(step, "run").is_some())
+        .collect();
+    if runs.len() != 3
+        || scalar(runs[0], "run") != Some("rustup toolchain install 1.97.1 --profile minimal")
+    {
+        return Err(failure("release shard command inventory differs"));
+    }
+    exact_mapping_keys(runs[0], &["run"], family)?;
+    for (step, shard) in runs[1..].iter().zip(["first", "second"]) {
+        exact_mapping_keys(step, &["if", "run"], family)?;
+        if scalar(step, "if") != Some(format!("matrix.shard == '{shard}'").as_str()) || scalar(step, "run") != Some(format!("./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite {family}-{shard}").as_str()) { return Err(failure("release shard literal suite/condition differs")); }
+    }
+    let inputs = "${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', '.cargo/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'rust-toolchain.toml', '.github/workflows/**') }}";
+    let target_key = format!(
+        "cargo-target-release-v3-{family}-${{{{ matrix.shard }}}}-nightly-2026-07-31-{inputs}"
+    );
+    let target_path = if family == "miri" {
+        "target/ci/miri-${{ matrix.shard }}"
+    } else {
+        "fuzz/target"
+    };
+    let tool_key = format!(
+        "cargo-tools-release-v3-fuzz-${{{{ matrix.shard }}}}-${{{{ runner.os }}}}-${{{{ runner.arch }}}}-1.97.1-{inputs}"
+    );
+    let mut caches = vec![(format!("{family}-target"), target_path, target_key)];
+    if family == "fuzz" {
+        caches.push((
+            "fuzz-tools".into(),
+            "target/ci-tools/bin\ntarget/ci-tools/build\n",
+            tool_key,
+        ));
+    }
+    let restore = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
+    let save = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9";
+    if action_steps(steps, restore)?.len() != caches.len()
+        || action_steps(steps, save)?.len() != caches.len()
+    {
+        return Err(failure("release shard cache inventory differs"));
+    }
+    for (id, path, cache_key) in caches {
+        let step = step_with_id(steps, &id, family)?;
+        exact_mapping_keys(step, &["id", "uses", "with"], family)?;
+        let with = mapping(step.get(key("with")).expect("exact keys"), family)?;
+        exact_mapping_keys(with, &["path", "key"], family)?;
+        if scalar(step, "uses") != Some(restore)
+            || scalar(with, "path") != Some(path)
+            || scalar(with, "key") != Some(&cache_key)
+        {
+            return Err(failure("release shard exact cache identity differs"));
+        }
+        let condition = format!("always() && steps.{id}.outputs.cache-hit != 'true'");
+        let saves: Vec<_> = action_steps(steps, save)?
+            .into_iter()
+            .filter(|step| scalar(step, "if") == Some(&condition))
+            .collect();
+        if saves.len() != 1 {
+            return Err(failure("release shard cache save condition differs"));
+        }
+        exact_mapping_keys(saves[0], &["if", "uses", "with"], family)?;
+        let with = mapping(saves[0].get(key("with")).expect("exact keys"), family)?;
+        exact_mapping_keys(with, &["path", "key"], family)?;
+        if scalar(with, "path") != Some(path)
+            || scalar(with, "key")
+                != Some(format!("${{{{ steps.{id}.outputs.cache-primary-key }}}}").as_str())
+        {
+            return Err(failure("release shard cache save path/key differs"));
+        }
+    }
+    let uploads = action_steps(steps, UPLOAD_ARTIFACT_ACTION)?;
+    if uploads.len() != 1 {
+        return Err(failure("release shard plan upload missing"));
+    }
+    exact_mapping_keys(uploads[0], &["if", "uses", "with"], family)?;
+    let with = mapping(uploads[0].get(key("with")).expect("exact keys"), family)?;
+    exact_mapping_keys(
+        with,
+        &[
+            "name",
+            "path",
+            "if-no-files-found",
+            "retention-days",
+            "compression-level",
+        ],
+        family,
+    )?;
+    if scalar(uploads[0], "if") != Some("always()")
+        || scalar(with, "name")
+            != Some(
+                format!(
+                    "release-{family}-plan-${{{{ matrix.shard }}}}-${{{{ github.run_attempt }}}}"
+                )
+                .as_str(),
+            )
+        || scalar(with, "path")
+            != Some(format!("target/ci/reports/{family}/${{{{ matrix.shard }}}}.json").as_str())
+        || scalar(with, "if-no-files-found") != Some("warn")
+        || with.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
+        || with.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
+    {
+        return Err(failure("release shard plan upload contract differs"));
+    }
+    if steps.len() != if family == "miri" { 8 } else { 10 } {
+        return Err(failure("release shard ordered step inventory differs"));
+    }
+    Ok(())
+}
+
+fn check_private_handoff_jobs(jobs: &Mapping, architecture: &str) -> Result<()> {
+    let prefix = "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release";
+    let build = format!(
+        "target/ci/release-inputs/release-native-linux-{architecture}/private-candidate-linux-{architecture}/candidate-build-v2.json"
+    );
+    for (role, predecessor, command, artifact, output, step_name) in [
+        (
+            "q",
+            "candidate",
+            format!(
+                "{prefix} collect-private-q-certificate --intent /etc/memcordon/release-trust/candidate-collector.v3.json --build {build} --signing-intent /etc/memcordon/release-trust/native-q-signing.v1.json --credential-fd 3 --output-dir /var/lib/memcordon/release-handoff/q/{architecture}"
+            ),
+            Some(format!("release-private-qualified-{architecture}")),
+            format!("/var/lib/memcordon/release-handoff/q/{architecture}"),
+            Some("Collect authenticated private Q and CQ"),
+        ),
+        (
+            "seal",
+            "q",
+            format!(
+                "{prefix} seal-private-final --intent /etc/memcordon/release-trust/final-seal.v1.json --candidate target/ci/release-inputs/release-native-linux-{architecture}/private-candidate-linux-{architecture} --qualification target/ci/release-inputs/private-qualified-{architecture} --output-dir /var/lib/memcordon/release-handoff/seal/{architecture}"
+            ),
+            Some(format!("release-private-final-a-{architecture}")),
+            format!("/var/lib/memcordon/release-handoff/seal/{architecture}"),
+            Some("Seal authenticated private final A"),
+        ),
+        (
+            "p",
+            "final",
+            format!(
+                "{prefix} collect-private-p --intent /etc/memcordon/release-trust/public-collector.v2.json --build {build} --signing-intent /etc/memcordon/release-trust/public-p-signing.v1.json --credential-fd 3 --output-dir /var/lib/memcordon/release-handoff/p/{architecture}"
+            ),
+            Some(format!("release-private-public-qualified-{architecture}")),
+            format!("/var/lib/memcordon/release-handoff/p/{architecture}"),
+            Some("Collect authenticated private P and CP"),
+        ),
+        (
+            "complete",
+            "p",
+            format!(
+                "{prefix} verify-private-completion --intent /etc/memcordon/release-trust/public-completion.v1.json --qualification /var/lib/memcordon/release-handoff/complete/{architecture}"
+            ),
+            None,
+            String::new(),
+            None,
+        ),
+    ] {
+        let name = format!("linux-private-{role}-{architecture}");
+        let job = mapping(
+            jobs.get(key(&name))
+                .ok_or_else(|| failure(format!("private handoff {name} absent")))?,
+            &name,
+        )?;
+        exact_mapping_keys(
+            job,
+            &[
+                "name",
+                "if",
+                "needs",
+                "runs-on",
+                "permissions",
+                "timeout-minutes",
+                "steps",
+            ],
+            &name,
+        )?;
+        if scalar(job, "name")
+            != Some(format!("Release / Linux private {role} / {architecture}").as_str())
+            || scalar(job, "needs")
+                != Some(format!("linux-private-{predecessor}-{architecture}").as_str())
+            || scalar(job, "if")
+                != Some("github.event_name == 'workflow_dispatch' && inputs.private_native == true")
+            || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(75)
+        {
+            return Err(failure(
+                "private handoff same-target dependency/opt-in/timeout differs",
+            ));
+        }
+        let runner = format!("memcordon-private-collector-{architecture}");
+        exact_string_sequence(
+            job.get(key("runs-on"))
+                .ok_or_else(|| failure("private collector runner absent"))?,
+            &["self-hosted", "linux", &runner],
+            &name,
+        )?;
+        let permissions = mapping(job.get(key("permissions")).expect("exact keys"), &name)?;
+        exact_mapping_keys(permissions, &["contents", "actions"], &name)?;
+        if scalar(permissions, "contents") != Some("read")
+            || scalar(permissions, "actions") != Some("read")
+        {
+            return Err(failure("private handoff readback permissions differ"));
+        }
+        let steps = certification_steps(job, &name)?;
+        let expected_downloads = if role == "complete" {
+            vec![(
+                format!("release-private-public-qualified-{architecture}"),
+                format!("/var/lib/memcordon/release-handoff/complete/{architecture}"),
+            )]
+        } else {
+            let mut downloads = vec![(
+                format!("release-native-linux-{architecture}"),
+                format!("target/ci/release-inputs/release-native-linux-{architecture}"),
+            )];
+            if role == "seal" {
+                downloads.push((
+                    format!("release-private-qualified-{architecture}"),
+                    format!("target/ci/release-inputs/private-qualified-{architecture}"),
+                ));
+            }
+            downloads
+        };
+        let checkout = action_steps(
+            steps,
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        )?;
+        if checkout.len() != 1 {
+            return Err(failure("private handoff checkout differs"));
+        }
+        exact_mapping_keys(checkout[0], &["uses", "with"], &name)?;
+        let with = mapping(checkout[0].get(key("with")).expect("exact keys"), &name)?;
+        exact_mapping_keys(with, &["ref", "fetch-depth", "persist-credentials"], &name)?;
+        if scalar(with, "ref") != Some("${{ inputs.tag }}")
+            || with.get(key("fetch-depth")).and_then(Value::as_u64) != Some(0)
+            || with
+                .get(key("persist-credentials"))
+                .and_then(Value::as_bool)
+                != Some(false)
+        {
+            return Err(failure("private handoff protected checkout differs"));
+        }
+        let downloads = action_steps(
+            steps,
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        )?;
+        if downloads.len() != expected_downloads.len() {
+            return Err(failure(
+                "private handoff artifact download inventory differs",
+            ));
+        }
+        for (step, (artifact, path)) in downloads.iter().zip(&expected_downloads) {
+            exact_mapping_keys(step, &["uses", "with"], &name)?;
+            let with = mapping(step.get(key("with")).expect("exact keys"), &name)?;
+            exact_mapping_keys(with, &["name", "path"], &name)?;
+            if scalar(with, "name") != Some(artifact) || scalar(with, "path") != Some(path) {
+                return Err(failure("private handoff exact artifact/path differs"));
+            }
+        }
+        let runs: Vec<_> = steps
+            .iter()
+            .filter_map(Value::as_mapping)
+            .filter(|step| scalar(step, "run").is_some())
+            .collect();
+        if runs.len() != 2
+            || scalar(runs[0], "run") != Some("rustup toolchain install 1.97.1 --profile minimal")
+            || scalar(runs[1], "run") != Some(&command)
+        {
+            return Err(failure("private handoff exact command inventory differs"));
+        }
+        exact_mapping_keys(runs[0], &["run"], &name)?;
+        if let Some(step_name) = step_name {
+            exact_mapping_keys(runs[1], &["name", "run", "env"], &name)?;
+            let env = mapping(runs[1].get(key("env")).expect("exact keys"), &name)?;
+            exact_mapping_keys(env, &["GITHUB_TOKEN"], &name)?;
+            if scalar(runs[1], "name") != Some(step_name)
+                || scalar(env, "GITHUB_TOKEN") != Some("${{ github.token }}")
+            {
+                return Err(failure("private handoff token binding differs"));
+            }
+        } else {
+            exact_mapping_keys(runs[1], &["run"], &name)?;
+        }
+        let uploads = action_steps(steps, UPLOAD_ARTIFACT_ACTION)?;
+        if uploads.len() != usize::from(artifact.is_some()) {
+            return Err(failure("private handoff producer upload count differs"));
+        }
+        if let Some(artifact) = artifact {
+            let upload = uploads[0];
+            exact_mapping_keys(upload, &["if", "uses", "with"], &name)?;
+            let with = mapping(upload.get(key("with")).expect("exact keys"), &name)?;
+            exact_mapping_keys(
+                with,
+                &[
+                    "name",
+                    "path",
+                    "if-no-files-found",
+                    "retention-days",
+                    "compression-level",
+                ],
+                &name,
+            )?;
+            if scalar(upload, "if") != Some("success()")
+                || scalar(with, "name") != Some(&artifact)
+                || scalar(with, "path") != Some(&output)
+                || scalar(with, "if-no-files-found") != Some("error")
+                || with.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
+                || with.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
+            {
+                return Err(failure(
+                    "private handoff exact authenticated upload differs",
+                ));
+            }
+        }
+        let expected_steps = 1 + 2 + expected_downloads.len() + uploads.len();
+        if steps.len() != expected_steps
+            || steps.first().and_then(Value::as_mapping) != Some(checkout[0])
+            || steps
+                .iter()
+                .position(|step| step.as_mapping() == Some(runs[1]))
+                .is_none_or(|position| position != 2 + expected_downloads.len())
+        {
+            return Err(failure("private handoff custody step order differs"));
+        }
+    }
+    Ok(())
+}
+
 fn check_release_structure(
     workflow: &Mapping,
     jobs: &Mapping,
@@ -2633,6 +3405,48 @@ fn check_release_structure(
     toolchains: &config::Toolchains,
     auth_action: &str,
 ) -> Result<()> {
+    let mut job_names: Vec<String> = [
+        "linux-standard-certification",
+        "windows-standard-certification",
+        "preflight",
+        "macos-native",
+        "miri",
+        "fuzz",
+        "linux-certification",
+        "macos-acceptance",
+        "assemble",
+        "rehearse-public",
+        "publish",
+        "verify-public-global",
+        "verify-public-windows",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    for architecture in ["x64", "arm64"] {
+        job_names.push(format!("linux-native-{architecture}"));
+        for role in [
+            "candidate-inputs",
+            "candidate",
+            "q",
+            "seal",
+            "final",
+            "p",
+            "complete",
+        ] {
+            job_names.push(format!("linux-private-{role}-{architecture}"));
+        }
+        for role in [
+            "native",
+            "loader-production",
+            "provider-lifecycle",
+            "package-channel",
+        ] {
+            job_names.push(format!("windows-{role}-{architecture}"));
+        }
+    }
+    let job_names: Vec<_> = job_names.iter().map(String::as_str).collect();
+    exact_mapping_keys(jobs, &job_names, "release exact producer inventory")?;
     let events = mapping(
         workflow
             .get(key("on"))
@@ -2751,121 +3565,236 @@ fn check_release_structure(
         return Err(failure("release publication must be globally serialized"));
     }
     config::validate_release_configuration_identity(release)?;
-    check_runner_matrix(jobs, "native", &NATIVE_MATRIX, "release native")?;
+    check_release_shards(jobs, "miri")?;
+    check_release_shards(jobs, "fuzz")?;
     check_runner_matrix(
         jobs,
-        "linux-private-candidate-inputs",
-        &[
-            ("linux-x64", "ubuntu-24.04"),
-            ("linux-arm64", "ubuntu-24.04-arm"),
-        ],
-        "release private candidate inputs",
+        "linux-native-x64",
+        &NATIVE_MATRIX[..1],
+        "release Linux x64 native",
     )?;
-    let private_inputs = mapping(
-        jobs.get(key("linux-private-candidate-inputs"))
-            .ok_or_else(|| failure("release private candidate input job is absent"))?,
-        "release private candidate inputs",
-    )?;
-    exact_mapping_keys(
-        private_inputs,
-        &[
-            "name",
-            "needs",
-            "strategy",
-            "runs-on",
-            "timeout-minutes",
-            "steps",
-        ],
-        "release private candidate inputs",
-    )?;
-    if scalar(private_inputs, "name")
-        != Some("Release / private candidate inputs / ${{ matrix.id }}")
-        || scalar(private_inputs, "needs") != Some("native")
-        || private_inputs
-            .get(key("timeout-minutes"))
-            .and_then(Value::as_u64)
-            != Some(45)
-    {
-        return Err(failure(
-            "release private candidate job is not native and bounded",
-        ));
-    }
-    let private_steps = private_inputs
-        .get(key("steps"))
-        .and_then(Value::as_sequence)
-        .ok_or_else(|| failure("release private candidate steps are absent"))?;
-    let verification_command = "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate";
-    let verification_steps: Vec<&Mapping> = private_steps
-        .iter()
-        .filter_map(Value::as_mapping)
-        .filter(|step| scalar(step, "run") == Some(verification_command))
-        .collect();
-    if verification_steps.len() != 1 {
-        return Err(failure(
-            "release private candidate readback invocation differs",
-        ));
-    }
-    exact_mapping_keys(
-        verification_steps[0],
-        &["run"],
-        "release private candidate readback step",
-    )?;
-    let downloads = action_steps(
-        private_steps,
-        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-    )?;
-    if downloads.len() != 1 {
-        return Err(failure("release private candidate download count differs"));
-    }
-    let download_inputs = mapping(
-        downloads[0]
-            .get(key("with"))
-            .ok_or_else(|| failure("release private candidate download inputs absent"))?,
-        "release private candidate download",
-    )?;
-    exact_mapping_keys(
-        download_inputs,
-        &["name", "path"],
-        "release private candidate download",
-    )?;
-    if scalar(download_inputs, "name") != Some("release-native-${{ matrix.id }}")
-        || scalar(download_inputs, "path")
-            != Some("target/ci/release-inputs/release-native-${{ matrix.id }}")
-    {
-        return Err(failure("release private candidate download target differs"));
-    }
-    let uploads = action_steps(private_steps, UPLOAD_ARTIFACT_ACTION)?;
-    if uploads.len() != 1 || scalar(uploads[0], "if") != Some("always()") {
-        return Err(failure(
-            "release private candidate diagnostic upload differs",
-        ));
-    }
-    let upload_inputs = mapping(
-        uploads[0]
-            .get(key("with"))
-            .ok_or_else(|| failure("release private candidate upload inputs absent"))?,
-        "release private candidate upload",
-    )?;
-    if scalar(upload_inputs, "name") != Some("private-candidate-inputs-${{ matrix.id }}")
-        || scalar(upload_inputs, "path") != Some("target/ci/reports/private-candidate-inputs")
-        || scalar(upload_inputs, "if-no-files-found") != Some("warn")
-    {
-        return Err(failure("release private candidate upload target differs"));
-    }
-    check_private_native_diagnostic_job(
+    check_runner_matrix(
         jobs,
-        "linux-private-candidate",
-        "Release / Linux private candidate / ${{ matrix.id }}",
-        "linux-private-candidate-inputs",
-        "candidate-capability",
+        "linux-native-arm64",
+        &NATIVE_MATRIX[1..2],
+        "release Linux ARM64 native",
     )?;
-    check_private_native_diagnostic_job(
+    check_runner_matrix(
         jobs,
-        "linux-private-final",
-        "Release / Linux private final / ${{ matrix.id }}",
-        "linux-private-candidate",
-        "final-public",
+        "macos-native",
+        &NATIVE_MATRIX[2..4],
+        "release macOS native",
     )?;
+    check_runner_matrix(
+        jobs,
+        "windows-native-x64",
+        &NATIVE_MATRIX[4..5],
+        "release Windows x64 native",
+    )?;
+    check_runner_matrix(
+        jobs,
+        "windows-native-arm64",
+        &NATIVE_MATRIX[5..],
+        "release Windows ARM64 native",
+    )?;
+    for name in [
+        "linux-native-x64",
+        "linux-native-arm64",
+        "macos-native",
+        "windows-native-x64",
+        "windows-native-arm64",
+    ] {
+        let job = mapping(jobs.get(key(name)).expect("checked matrix"), name)?;
+        exact_mapping_keys(
+            job,
+            &["name", "strategy", "runs-on", "timeout-minutes", "steps"],
+            name,
+        )?;
+        if scalar(job, "name") != Some("Release / native / ${{ matrix.id }}")
+            || job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(75)
+        {
+            return Err(failure("release native producer identity/deadline differs"));
+        }
+        let steps = certification_steps(job, name)?;
+        let invocations: Vec<_> = steps.iter().filter_map(Value::as_mapping).filter(|step| scalar(step, "run") == Some("./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite release-native")).collect();
+        if invocations.len() != 1 {
+            return Err(failure("release native asset producer command differs"));
+        }
+        exact_mapping_keys(invocations[0], &["run"], name)?;
+        let uploads = action_steps(steps, UPLOAD_ARTIFACT_ACTION)?;
+        if uploads.len() != 1 {
+            return Err(failure(
+                "release native requires exactly one artifact writer",
+            ));
+        }
+        exact_mapping_keys(uploads[0], &["uses", "with"], name)?;
+        let with = mapping(uploads[0].get(key("with")).expect("exact keys"), name)?;
+        exact_mapping_keys(
+            with,
+            &[
+                "name",
+                "path",
+                "if-no-files-found",
+                "retention-days",
+                "compression-level",
+            ],
+            name,
+        )?;
+        if scalar(with, "name") != Some("release-native-${{ matrix.id }}")
+            || scalar(with, "path") != Some("target/ci/release-output")
+            || scalar(with, "if-no-files-found") != Some("error")
+            || with.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
+            || with.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
+        {
+            return Err(failure("release native artifact identity differs"));
+        }
+        let target = step_with_id(steps, "native-target", name)?;
+        let with = mapping(
+            target
+                .get(key("with"))
+                .ok_or_else(|| failure("native target cache absent"))?,
+            name,
+        )?;
+        if scalar(with, "path") != Some("target/ci/release-native")
+            || scalar(with, "key")
+                != Some(
+                    "cargo-target-release-v3-native-${{ matrix.id }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', '.cargo/**', 'docs/**', 'spec/**', 'packaging/**', 'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md', 'rust-toolchain.toml', '.github/workflows/**') }}",
+                )
+        {
+            return Err(failure(
+                "release native target-specific cache identity differs",
+            ));
+        }
+    }
+    for architecture in ["x64", "arm64"] {
+        let input_job = format!("linux-private-candidate-inputs-{architecture}");
+        let native_job = format!("linux-native-{architecture}");
+        check_runner_matrix(
+            jobs,
+            &input_job,
+            &[(
+                if architecture == "x64" {
+                    "linux-x64"
+                } else {
+                    "linux-arm64"
+                },
+                if architecture == "x64" {
+                    "ubuntu-24.04"
+                } else {
+                    "ubuntu-24.04-arm"
+                },
+            )],
+            "release private candidate inputs",
+        )?;
+        let private_inputs = mapping(
+            jobs.get(key(&input_job))
+                .ok_or_else(|| failure("release private candidate input job is absent"))?,
+            "release private candidate inputs",
+        )?;
+        exact_mapping_keys(
+            private_inputs,
+            &[
+                "name",
+                "needs",
+                "strategy",
+                "runs-on",
+                "timeout-minutes",
+                "steps",
+            ],
+            "release private candidate inputs",
+        )?;
+        if scalar(private_inputs, "name")
+            != Some("Release / private candidate inputs / ${{ matrix.id }}")
+            || scalar(private_inputs, "needs") != Some(native_job.as_str())
+            || private_inputs
+                .get(key("timeout-minutes"))
+                .and_then(Value::as_u64)
+                != Some(45)
+        {
+            return Err(failure(
+                "release private candidate job is not native and bounded",
+            ));
+        }
+        let private_steps = private_inputs
+            .get(key("steps"))
+            .and_then(Value::as_sequence)
+            .ok_or_else(|| failure("release private candidate steps are absent"))?;
+        let verification_command = "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-private-candidate";
+        let verification_steps: Vec<&Mapping> = private_steps
+            .iter()
+            .filter_map(Value::as_mapping)
+            .filter(|step| scalar(step, "run") == Some(verification_command))
+            .collect();
+        if verification_steps.len() != 1 {
+            return Err(failure(
+                "release private candidate readback invocation differs",
+            ));
+        }
+        exact_mapping_keys(
+            verification_steps[0],
+            &["run"],
+            "release private candidate readback step",
+        )?;
+        let downloads = action_steps(
+            private_steps,
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        )?;
+        if downloads.len() != 1 {
+            return Err(failure("release private candidate download count differs"));
+        }
+        let download_inputs = mapping(
+            downloads[0]
+                .get(key("with"))
+                .ok_or_else(|| failure("release private candidate download inputs absent"))?,
+            "release private candidate download",
+        )?;
+        exact_mapping_keys(
+            download_inputs,
+            &["name", "path"],
+            "release private candidate download",
+        )?;
+        if scalar(download_inputs, "name") != Some("release-native-${{ matrix.id }}")
+            || scalar(download_inputs, "path")
+                != Some("target/ci/release-inputs/release-native-${{ matrix.id }}")
+        {
+            return Err(failure("release private candidate download target differs"));
+        }
+        let uploads = action_steps(private_steps, UPLOAD_ARTIFACT_ACTION)?;
+        if uploads.len() != 1 || scalar(uploads[0], "if") != Some("always()") {
+            return Err(failure(
+                "release private candidate diagnostic upload differs",
+            ));
+        }
+        let upload_inputs = mapping(
+            uploads[0]
+                .get(key("with"))
+                .ok_or_else(|| failure("release private candidate upload inputs absent"))?,
+            "release private candidate upload",
+        )?;
+        if scalar(upload_inputs, "name") != Some("private-candidate-inputs-${{ matrix.id }}")
+            || scalar(upload_inputs, "path") != Some("target/ci/reports/private-candidate-inputs")
+            || scalar(upload_inputs, "if-no-files-found") != Some("warn")
+        {
+            return Err(failure("release private candidate upload target differs"));
+        }
+        check_private_native_diagnostic_job(
+            jobs,
+            &format!("linux-private-candidate-{architecture}"),
+            "Release / Linux private candidate / ${{ matrix.id }}",
+            &input_job,
+            "candidate-capability",
+            architecture,
+        )?;
+        check_private_native_diagnostic_job(
+            jobs,
+            &format!("linux-private-final-{architecture}"),
+            "Release / Linux private final / ${{ matrix.id }}",
+            &format!("linux-private-seal-{architecture}"),
+            "final-public",
+            architecture,
+        )?;
+        check_private_handoff_jobs(jobs, architecture)?;
+    }
     let preflight = mapping(
         jobs.get(key("preflight"))
             .ok_or_else(|| failure("release preflight job is absent"))?,
@@ -2927,12 +3856,12 @@ fn check_release_structure(
     let linux_context = format!("release {linux_job_name} job");
     exact_mapping_keys(
         linux_job,
-        &["name", "needs", "runs-on", "timeout-minutes", "steps"],
+        &["name", "runs-on", "timeout-minutes", "steps"],
         &linux_context,
     )?;
-    if scalar(linux_job, "needs") != Some("preflight") {
+    if linux_job.contains_key(key("needs")) {
         return Err(failure(format!(
-            "release {linux_job_name} must depend on preflight"
+            "release {linux_job_name} must not have a producer-start preflight barrier"
         )));
     }
     check_certification_job(
@@ -2947,22 +3876,10 @@ fn check_release_structure(
         "target/ci/reports/linux-sealed-v2",
         &linux_context,
     )?;
-    for job_name in [
-        "windows-loader-production",
-        "windows-provider-lifecycle",
-        "windows-package-channel",
-    ] {
-        check_runner_matrix(
-            jobs,
-            job_name,
-            &[("x64", "windows-2025"), ("arm64", "windows-11-arm")],
-            job_name,
-        )?;
-    }
     for contract in [
         SplitWindowsJobContract {
             name: "windows-loader-production",
-            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production",
+            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production --native-channel required-downloaded-archive",
             artifact_name: "release-windows-loader-production-${{ matrix.id }}",
             artifact_path: "target/ci/reports/windows-sealed-v2/loader-production",
             dependency: Some("native"),
@@ -2979,7 +3896,7 @@ fn check_release_structure(
         },
         SplitWindowsJobContract {
             name: "windows-provider-lifecycle",
-            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle",
+            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle --native-channel required-downloaded-archive",
             artifact_name: "release-windows-provider-lifecycle-${{ matrix.id }}",
             artifact_path: "target/ci/reports/windows-sealed-v2/provider-lifecycle",
             dependency: Some("windows-loader-production"),
@@ -3002,7 +3919,7 @@ fn check_release_structure(
         },
         SplitWindowsJobContract {
             name: "windows-package-channel",
-            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel",
+            suite: "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel --native-channel required-downloaded-archive",
             artifact_name: "release-windows-package-channel-${{ matrix.id }}",
             artifact_path: "target/ci/windows-sealed-cargo",
             dependency: Some("windows-provider-lifecycle"),
@@ -3023,17 +3940,73 @@ fn check_release_structure(
             ],
             dependency_cache_id: "package-deps",
             target_cache_id: "package-target",
-            target_cache_path: "target/ci/bootstrap\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo\n",
+            target_cache_path: "target/ci/bootstrap\ntarget/ci/windows-sealed\ntarget/ci/windows-sealed-cargo/build\n",
             checkout_count: 2,
             timeout_minutes: 75,
         },
     ] {
-        let job = mapping(
-            jobs.get(key(contract.name))
-                .ok_or_else(|| failure(format!("release {} job is absent", contract.name)))?,
-            contract.name,
-        )?;
-        check_split_windows_job(job, contract)?;
+        for architecture in ["x64", "arm64"] {
+            let name = format!("{}-{architecture}", contract.name);
+            check_runner_matrix(
+                jobs,
+                &name,
+                &[(
+                    architecture,
+                    if architecture == "x64" {
+                        "windows-2025"
+                    } else {
+                        "windows-11-arm"
+                    },
+                )],
+                &name,
+            )?;
+            let dependency = contract.dependency.map(|predecessor| {
+                if predecessor == "native" {
+                    format!("windows-native-{architecture}")
+                } else {
+                    format!("{predecessor}-{architecture}")
+                }
+            });
+            let job = mapping(
+                jobs.get(key(&name))
+                    .ok_or_else(|| failure(format!("release {name} job is absent")))?,
+                &name,
+            )?;
+            check_split_windows_job(
+                job,
+                SplitWindowsJobContract {
+                    name: &name,
+                    suite: contract.suite,
+                    artifact_name: contract.artifact_name,
+                    artifact_path: contract.artifact_path,
+                    dependency: dependency.as_deref(),
+                    condition: None,
+                    downloads: contract.downloads,
+                    dependency_cache_id: contract.dependency_cache_id,
+                    target_cache_id: contract.target_cache_id,
+                    target_cache_path: contract.target_cache_path,
+                    checkout_count: contract.checkout_count,
+                    timeout_minutes: contract.timeout_minutes,
+                },
+            )?;
+            let steps = certification_steps(job, &name)?;
+            let target = step_with_id(steps, contract.target_cache_id, &name)?;
+            let with = mapping(
+                target
+                    .get(key("with"))
+                    .ok_or_else(|| failure("release Windows phase cache inputs absent"))?,
+                &name,
+            )?;
+            let expected_key = format!(
+                "cargo-target-release-{}-v3-${{{{ matrix.id }}}}-${{{{ runner.os }}}}-${{{{ runner.arch }}}}-1.97.1-{RELEASE_BUILD_INPUTS}",
+                contract.name
+            );
+            if scalar(with, "key") != Some(&expected_key) {
+                return Err(failure(
+                    "release Windows phase/architecture/full-input cache identity differs",
+                ));
+            }
+        }
     }
     check_macos_deadline_job(jobs, "macos-acceptance")?;
     let assemble = mapping(
@@ -3046,11 +4019,15 @@ fn check_release_structure(
             .get(key("needs"))
             .ok_or_else(|| failure("release assemble dependencies are absent"))?,
         &[
-            "native",
+            "preflight",
+            "linux-native-x64",
+            "linux-native-arm64",
+            "macos-native",
             "miri",
             "fuzz",
             "linux-certification",
-            "windows-package-channel",
+            "windows-package-channel-x64",
+            "windows-package-channel-arm64",
             "macos-acceptance",
             "linux-standard-certification",
             "windows-standard-certification",
@@ -3164,12 +4141,20 @@ fn check_release_structure(
     {
         return Err(failure("publish job permissions differ"));
     }
-    let verify = mapping(
-        jobs.get(key("verify-public"))
-            .ok_or_else(|| failure("verify-public job is absent"))?,
-        "verify-public job",
-    )?;
-    check_verify_public_job(jobs, verify, toolchains)?;
+    for (name, global) in [
+        ("verify-public-global", true),
+        ("verify-public-windows", false),
+    ] {
+        let verify = mapping(
+            jobs.get(key(name))
+                .ok_or_else(|| failure(format!("{name} job is absent")))?,
+            name,
+        )?;
+        check_verify_public_job(jobs, verify, toolchains, global)?;
+    }
+    if jobs.contains_key(key("verify-public")) {
+        return Err(failure("legacy aggregate public verifier job is forbidden"));
+    }
     check_release_credentials(jobs, release, auth_action)?;
     Ok(())
 }
@@ -3355,25 +4340,38 @@ fn check_verify_public_job(
     jobs: &Mapping,
     job: &Mapping,
     toolchains: &config::Toolchains,
+    global: bool,
 ) -> Result<()> {
     let context = "verify-public job";
-    exact_mapping_keys(
-        job,
-        &[
-            "name",
-            "needs",
-            "strategy",
-            "runs-on",
-            "timeout-minutes",
-            "permissions",
-            "steps",
-        ],
-        context,
-    )?;
+    let expected_keys = [
+        "name",
+        "needs",
+        "strategy",
+        "runs-on",
+        "timeout-minutes",
+        "permissions",
+        "steps",
+    ];
+    let keys: Vec<_> = expected_keys
+        .into_iter()
+        .filter(|name| !global || *name != "strategy")
+        .collect();
+    exact_mapping_keys(job, &keys, context)?;
     if scalar(job, "needs") != Some("publish") {
         return Err(failure("verify-public must depend on publish"));
     }
-    check_runner_matrix(jobs, "verify-public", &VERIFY_PUBLIC_MATRIX, context)?;
+    if global {
+        if scalar(job, "runs-on") != Some("ubuntu-24.04") {
+            return Err(failure("global public verifier must qualify Linux x64"));
+        }
+    } else {
+        check_runner_matrix(
+            jobs,
+            "verify-public-windows",
+            &VERIFY_PUBLIC_MATRIX[1..],
+            context,
+        )?;
+    }
     if job.get(key("timeout-minutes")).and_then(Value::as_u64) != Some(90) {
         return Err(failure("verify-public timeout differs"));
     }
@@ -3387,8 +4385,42 @@ fn check_verify_public_job(
         return Err(failure("verify-public permissions differ"));
     }
     let steps = certification_steps(job, context)?;
-    if steps.len() != 10 {
+    if steps.len() != 11 {
         return Err(failure("verify-public step count differs"));
+    }
+    let diagnostics = action_steps(steps, UPLOAD_ARTIFACT_ACTION)?;
+    if diagnostics.len() != 1 {
+        return Err(failure("public verification diagnostics upload missing"));
+    }
+    let upload = diagnostics[0];
+    exact_mapping_keys(upload, &["if", "uses", "with"], context)?;
+    let with = mapping(upload.get(key("with")).expect("exact keys"), context)?;
+    exact_mapping_keys(
+        with,
+        &[
+            "name",
+            "path",
+            "if-no-files-found",
+            "retention-days",
+            "compression-level",
+        ],
+        context,
+    )?;
+    if scalar(upload, "if") != Some("always()")
+        || scalar(with, "name")
+            != Some(if global {
+                "public-verification-global-${{ github.run_attempt }}"
+            } else {
+                "public-verification-${{ matrix.id }}-${{ github.run_attempt }}"
+            })
+        || scalar(with, "path") != Some("target/ci/reports/public-verification")
+        || scalar(with, "if-no-files-found") != Some("warn")
+        || with.get(key("retention-days")).and_then(Value::as_u64) != Some(14)
+        || with.get(key("compression-level")).and_then(Value::as_u64) != Some(0)
+    {
+        return Err(failure(
+            "public verification bounded diagnostics contract differs",
+        ));
     }
     let checkout = action_steps(
         steps,
@@ -3413,7 +4445,11 @@ fn check_verify_public_job(
             "rustup toolchain install {} --profile minimal",
             toolchains.stable
         ),
-        "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public".into(),
+        if global {
+            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public-global".into()
+        } else {
+            "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin release verify-public-host".into()
+        },
     ];
     if run_commands.len() != expected.len()
         || !run_commands
@@ -3432,12 +4468,20 @@ fn check_verify_public_job(
         (
             "verify-public-deps",
             "target/ci/source-home/registry/index\ntarget/ci/source-home/registry/cache\ntarget/ci/source-home/git/db\n",
-            "cargo-deps-release-verify-public-v2-",
+            if global {
+                "cargo-deps-release-verify-public-global-v3-"
+            } else {
+                "cargo-deps-release-verify-public-host-v3-"
+            },
         ),
         (
             "verify-public-target",
             "target/ci/verify-bootstrap",
-            "cargo-target-release-verify-public-v2-",
+            if global {
+                "cargo-target-release-verify-public-global-v3-"
+            } else {
+                "cargo-target-release-verify-public-host-v3-"
+            },
         ),
     ] {
         let restore_step = step_with_id(steps, id, context)?;
@@ -3452,14 +4496,16 @@ fn check_verify_public_job(
                 .ok_or_else(|| failure(format!("verify-public {id} inputs are absent")))?,
             context,
         )?;
-        if scalar(inputs, "path") != Some(path)
-            || !scalar(inputs, "key").is_some_and(|value| {
-                value.starts_with(key_fragment)
-                    && value.contains("${{ runner.os }}")
-                    && value.contains("${{ runner.arch }}")
-                    && value.contains("hashFiles(")
-            })
-        {
+        let expected_key = if id == "verify-public-target" {
+            format!(
+                "{key_fragment}${{{{ runner.os }}}}-${{{{ runner.arch }}}}-1.97.1-{RELEASE_BUILD_INPUTS}"
+            )
+        } else {
+            format!(
+                "{key_fragment}${{{{ runner.os }}}}-${{{{ runner.arch }}}}-1.97.1-${{{{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}}}"
+            )
+        };
+        if scalar(inputs, "path") != Some(path) || scalar(inputs, "key") != Some(&expected_key) {
             return Err(failure(format!("verify-public {id} cache inputs differ")));
         }
         let condition = format!("always() && steps.{id}.outputs.cache-hit != 'true'");
@@ -3509,6 +4555,7 @@ fn check_step_environment(
     step: &Mapping,
     policy: &config::Policy,
     definitions: &mut BTreeSet<EnvironmentDefinition>,
+    repeated_architecture_role: bool,
 ) -> Result<()> {
     let Some(environment) = step.get(key("env")) else {
         return Ok(());
@@ -3544,7 +4591,7 @@ fn check_step_environment(
             variable: variable.to_owned(),
             source: source.to_owned(),
         };
-        if !definitions.insert(definition) {
+        if !definitions.insert(definition) && !repeated_architecture_role {
             return Err(failure("duplicate workflow environment definition"));
         }
     }
@@ -3634,7 +4681,15 @@ fn validate_workflow_bytes_into(
         if let Some(runner) = job.get(key("runs-on"))
             && runner_selects_self_hosted(runner)
         {
-            return Err(failure("workflow may not select self-hosted runners"));
+            let protected_collector = relative == Path::new(".github/workflows/release.yml")
+                && ["q", "seal", "p", "complete"].into_iter().any(|role| {
+                    ["x64", "arm64"].into_iter().any(|architecture| {
+                        job_name == format!("linux-private-{role}-{architecture}")
+                    })
+                });
+            if !protected_collector {
+                return Err(failure("workflow may not select self-hosted runners"));
+            }
         }
         let Some(steps) = job.get(key("steps")).and_then(Value::as_sequence) else {
             continue;
@@ -3646,7 +4701,21 @@ fn validate_workflow_bytes_into(
                     "workflow step defines shell: {relative:?}"
                 )));
             }
-            check_step_environment(relative, step, policy, environment_definitions)?;
+            let repeated_architecture_role = relative == Path::new(".github/workflows/release.yml")
+                && ["candidate", "final", "q", "seal", "p"]
+                    .into_iter()
+                    .any(|role| {
+                        ["x64", "arm64"].into_iter().any(|architecture| {
+                            job_name == format!("linux-private-{role}-{architecture}")
+                        })
+                    });
+            check_step_environment(
+                relative,
+                step,
+                policy,
+                environment_definitions,
+                repeated_architecture_role,
+            )?;
             if scalar(step, "if").is_some_and(|condition| condition.contains("secrets.")) {
                 return Err(failure("workflow conditions may not inspect secrets"));
             }
@@ -3749,11 +4818,15 @@ fn validate_workflow_bytes_into(
                     if cache_path.contains("target/ci-tools")
                         && cache_path.lines().any(|line| {
                             let trimmed = line.trim();
-                            !trimmed.is_empty() && trimmed != "target/ci-tools"
+                            !trimmed.is_empty()
+                                && !matches!(
+                                    trimmed,
+                                    "target/ci-tools/bin" | "target/ci-tools/build"
+                                )
                         })
                     {
                         return Err(failure(
-                            "tool binaries must use a cache separate from build targets",
+                            "tool caches must contain only final binaries and tool compilation outputs",
                         ));
                     }
                 }
@@ -4822,7 +5895,7 @@ pub fn run(root: &Path) -> Result<()> {
             == config::RegistryCredentialPolicy::OidcFirstNewCrateFallback,
     ) * policy.workspace.publish_packages.len();
     let expected_release_environment_count =
-        3 + policy.workspace.publish_packages.len() * 2 + fallback_environment_slots * 2;
+        12 + policy.workspace.publish_packages.len() * 2 + fallback_environment_slots * 2;
     if release_environment.len() != expected_release_environment_count {
         return Err(failure(
             "release workflow step-local environment mapping count does not match the publish package set",

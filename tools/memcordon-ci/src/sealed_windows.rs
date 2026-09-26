@@ -212,6 +212,18 @@ struct ChannelFingerprint {
 /// comparisons deliberately live in their own suites so none of them can
 /// influence the production loader result.
 pub fn loader_production(root: &Path, stable: &str) -> Result<()> {
+    loader_production_with_requirement(
+        root,
+        stable,
+        memcordon_ci::native_channel::NativeChannelRequirement::DevelopmentSourceAllowed,
+    )
+}
+
+pub fn loader_production_with_requirement(
+    root: &Path,
+    stable: &str,
+    requirement: memcordon_ci::native_channel::NativeChannelRequirement,
+) -> Result<()> {
     require_windows()?;
     require_native_architecture()?;
     let reports = report_directory(root).join("loader-production");
@@ -227,7 +239,7 @@ pub fn loader_production(root: &Path, stable: &str) -> Result<()> {
             "architecture": std::env::consts::ARCH,
         }),
     )?;
-    let native = native_channel_binaries(root, stable)?;
+    let native = native_channel_binaries(root, stable, requirement)?;
     let agent = native.root.join("memcordon-sealed-agent.exe");
     let bootstrap = native.root.join("memcordon-target-desktop-bootstrap.exe");
     for binary in [
@@ -391,6 +403,18 @@ fn collect_loader_production_artifacts(
 /// gate. Package mutation/channel checks and diagnostic token/fault matrices
 /// intentionally do not run in this suite.
 pub fn provider_lifecycle(root: &Path, stable: &str) -> Result<()> {
+    provider_lifecycle_with_requirement(
+        root,
+        stable,
+        memcordon_ci::native_channel::NativeChannelRequirement::DevelopmentSourceAllowed,
+    )
+}
+
+pub fn provider_lifecycle_with_requirement(
+    root: &Path,
+    stable: &str,
+    requirement: memcordon_ci::native_channel::NativeChannelRequirement,
+) -> Result<()> {
     require_windows()?;
     require_native_architecture()?;
     let production_reports = report_directory(root).join("loader-production");
@@ -418,7 +442,7 @@ pub fn provider_lifecycle(root: &Path, stable: &str) -> Result<()> {
             "provider lifecycle input plan and result digests differ".to_owned(),
         ));
     }
-    let native = native_channel_binaries(root, stable)?;
+    let native = native_channel_binaries(root, stable, requirement)?;
     let reports = report_directory(root).join("provider-lifecycle");
     if reports.exists() {
         fs::remove_dir_all(&reports)?;
@@ -516,7 +540,11 @@ pub fn provider_lifecycle(root: &Path, stable: &str) -> Result<()> {
 pub fn loader_lab(root: &Path, stable: &str) -> Result<()> {
     require_windows()?;
     require_native_architecture()?;
-    let native = native_channel_binaries(root, stable)?;
+    let native = native_channel_binaries(
+        root,
+        stable,
+        memcordon_ci::native_channel::NativeChannelRequirement::DevelopmentSourceAllowed,
+    )?;
     let output = report_directory(root).join("loader-lab");
     if output.exists() {
         fs::remove_dir_all(&output)?;
@@ -696,7 +724,11 @@ pub fn certify(root: &Path, stable: &str) -> Result<()> {
     require_native_architecture()?;
     certify_qualification_preflight_regressions(root, stable)?;
     certify_causal_diagnostics(root, stable)?;
-    let native = native_channel_binaries(root, stable)?;
+    let native = native_channel_binaries(
+        root,
+        stable,
+        memcordon_ci::native_channel::NativeChannelRequirement::DevelopmentSourceAllowed,
+    )?;
     let reports = report_directory(root);
     if reports.exists() {
         fs::remove_dir_all(&reports)?;
@@ -1541,10 +1573,22 @@ impl StatusScenarioRunner<'_> {
 }
 
 pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
+    package_certify_with_requirement(
+        root,
+        stable,
+        memcordon_ci::native_channel::NativeChannelRequirement::DevelopmentSourceAllowed,
+    )
+}
+
+pub fn package_certify_with_requirement(
+    root: &Path,
+    stable: &str,
+    requirement: memcordon_ci::native_channel::NativeChannelRequirement,
+) -> Result<()> {
     require_windows()?;
     require_native_architecture()?;
     certify_causal_diagnostics(root, stable)?;
-    let native = native_channel_binaries(root, stable)?;
+    let native = native_channel_binaries(root, stable, requirement)?;
     let fixture = if native.provenance == NativeChannelProvenance::PublishedArchive {
         rustup_cargo(
             root,
@@ -1590,7 +1634,8 @@ pub fn package_certify(root: &Path, stable: &str) -> Result<()> {
     fs::create_dir_all(&durable_sources)?;
     let version = env!("CARGO_PKG_VERSION");
     let packages = WINDOWS_PACKAGE_NAMES.map(str::to_owned);
-    let archives = create_package_archives(root, stable, &packages)?;
+    let package_target = channel.join("build");
+    let archives = create_package_archives(root, stable, &packages, Some(&package_target))?;
     let durable_layout = WindowsPackageSourceLayout::new(durable_sources);
     let execution_sources = ExternalWindowsPackageSources::new(root)?;
     for layout in [&durable_layout, execution_sources.layout()] {
@@ -1857,8 +1902,13 @@ enum NativeChannelProvenance {
     DevelopmentBuild,
 }
 
-fn native_channel_binaries(root: &Path, stable: &str) -> Result<NativeChannel> {
+fn native_channel_binaries(
+    root: &Path,
+    stable: &str,
+    requirement: memcordon_ci::native_channel::NativeChannelRequirement,
+) -> Result<NativeChannel> {
     let input = root.join("target").join("ci").join("release-input");
+    requirement.validate_input(&input)?;
     if !input.is_dir() {
         build(root, stable)?;
         return Ok(NativeChannel {

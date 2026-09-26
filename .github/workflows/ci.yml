@@ -42,7 +42,7 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
@@ -125,7 +125,7 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
@@ -210,7 +210,7 @@ jobs:
         run: rustup toolchain install 1.85.0 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile msrv --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
@@ -293,7 +293,7 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile supply-chain --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
@@ -311,8 +311,10 @@ jobs:
         if: steps.build-context-prepare.outcome == 'success'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: target/ci-tools
-          key: managed-v2-cargo-tools-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'ci/tools.toml') }}
+          path: |
+            target/ci-tools/bin
+            target/ci-tools/build
+          key: managed-v2-cargo-tools-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.toml', 'Cargo.lock', '.cargo/**', 'rust-toolchain.toml', 'ci/tools.toml', 'tools/**', '.github/workflows/ci.yml') }}
       - name: Restore supply target
         id: supply-target
         if: steps.build-context-prepare.outcome == 'success'
@@ -355,7 +357,9 @@ jobs:
         if: always() && steps.supply-tools.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.supply-tools.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: target/ci-tools
+          path: |
+            target/ci-tools/bin
+            target/ci-tools/build
           key: ${{ steps.supply-tools.outputs.cache-primary-key }}
       - name: Save Cargo sources
         if: always() && steps.supply-deps.outputs.cache-hit != 'true'
@@ -405,7 +409,7 @@ jobs:
         run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
@@ -493,7 +497,7 @@ jobs:
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact

@@ -686,9 +686,41 @@ impl OfflinePrivateQualifiedResultV2 {
     }
 }
 
-pub fn prepare_private_qualified_offline(
-    inputs: OfflinePrivateQualifiedInputs<'_>,
-) -> Result<OfflinePrivateQualifiedResultV2> {
+/// Pre-install archive inputs are created only by the authenticated completed
+/// collector. No installed receipt or public success can be supplied here.
+pub(crate) struct AuthenticatedPrivateArchiveInputs<'a> {
+    pub(crate) candidate: &'a PreparedPrivateCandidateV2,
+    pub(crate) qualification_bytes: &'a [u8],
+    pub(crate) candidate_record_bytes: &'a [u8],
+    pub(crate) certificate_bytes: &'a [u8],
+    pub(crate) qualification_reference: QualificationArtifactReferenceV2,
+    pub(crate) expected_qualification: &'a TrustedQualificationExpectationV2<'a>,
+    pub(crate) component_bytes: &'a BTreeMap<String, Vec<u8>>,
+    pub(crate) static_bytes: &'a BTreeMap<String, Vec<u8>>,
+    pub(crate) archive_format: PrivateArchiveFormat,
+}
+
+pub struct SealedPrivateArchive {
+    final_manifest: PreparedPrivateFinalManifestV2,
+    archive_bytes: Vec<u8>,
+    archive_sha256: DiagnosticSha256,
+}
+
+impl SealedPrivateArchive {
+    pub fn manifest(&self) -> &PreparedPrivateFinalManifestV2 {
+        &self.final_manifest
+    }
+    pub fn archive_bytes(&self) -> &[u8] {
+        &self.archive_bytes
+    }
+    pub fn archive_sha256(&self) -> &DiagnosticSha256 {
+        &self.archive_sha256
+    }
+}
+
+pub(crate) fn seal_private_archive_before_install(
+    inputs: AuthenticatedPrivateArchiveInputs<'_>,
+) -> Result<SealedPrivateArchive> {
     let final_manifest = prepare_private_final_manifest(
         inputs.candidate,
         inputs.qualification_bytes,
@@ -757,6 +789,32 @@ pub fn prepare_private_qualified_offline(
         candidate_record_bytes: inputs.candidate_record_bytes,
         certificate_bytes: inputs.certificate_bytes,
     })?;
+    Ok(SealedPrivateArchive {
+        final_manifest,
+        archive_bytes,
+        archive_sha256,
+    })
+}
+
+pub fn prepare_private_qualified_offline(
+    inputs: OfflinePrivateQualifiedInputs<'_>,
+) -> Result<OfflinePrivateQualifiedResultV2> {
+    let sealed = seal_private_archive_before_install(AuthenticatedPrivateArchiveInputs {
+        candidate: inputs.candidate,
+        qualification_bytes: inputs.qualification_bytes,
+        candidate_record_bytes: inputs.candidate_record_bytes,
+        certificate_bytes: inputs.certificate_bytes,
+        qualification_reference: inputs.qualification_reference.clone(),
+        expected_qualification: inputs.expected_qualification,
+        component_bytes: inputs.component_bytes,
+        static_bytes: inputs.static_bytes,
+        archive_format: inputs.archive_format,
+    })?;
+    let SealedPrivateArchive {
+        final_manifest,
+        archive_bytes,
+        archive_sha256,
+    } = sealed;
     let installed_readback = validate_qualified_linux_readback(QualifiedLinuxReadbackInputs {
         qualification_bytes: inputs.qualification_bytes,
         qualification_reference: &inputs.qualification_reference,

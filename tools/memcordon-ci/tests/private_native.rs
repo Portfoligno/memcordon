@@ -72,7 +72,7 @@ fn hosted_arm64_context_is_valid_without_weakening_target_joins() {
             repository: "owner/memcordon".into(),
             run_id: NonZeroU64::new(123456).unwrap(),
             run_attempt: NonZeroU32::new(1).unwrap(),
-            job: "linux-private-candidate".into(),
+            job: "linux-private-candidate-arm64".into(),
             workflow_ref: "owner/memcordon/.github/workflows/release.yml@refs/tags/0.5.7".into(),
             workflow_commit: SOURCE.into(),
             runner_environment: "github-hosted".into(),
@@ -184,7 +184,7 @@ fn fixture() -> (NativeRunEnvelopeV2, BTreeMap<String, Vec<u8>>) {
             target: TARGET.into(),
             native_machine: "x86_64".into(),
             workflow_run_id: "123456".into(),
-            workflow_job: "linux-private-candidate".into(),
+            workflow_job: "linux-private-candidate-x64".into(),
             workflow_attempt: 1,
             challenge: CHALLENGE.into(),
             invocation_argv: vec![
@@ -222,7 +222,7 @@ fn expected(envelope: &NativeRunEnvelopeV2) -> ExpectedNativeRunV2<'_> {
         target: TARGET,
         native_machine: "x86_64",
         workflow_run_id: "123456",
-        workflow_job: "linux-private-candidate",
+        workflow_job: "linux-private-candidate-x64",
         workflow_attempt: 1,
         challenge: CHALLENGE,
         invocation_argv: &envelope.invocation_argv,
@@ -445,7 +445,7 @@ fn raw_supervisor_observation_must_match_bound_case_and_challenge() {
 fn final_public_stage_requires_public_denial_observation() {
     let (mut envelope, mut attachments) = fixture();
     envelope.stage = NativeRunStageV2::FinalPublic;
-    envelope.workflow_job = "linux-private-final".into();
+    envelope.workflow_job = "linux-private-final-x64".into();
     envelope.candidate_installed = None;
     envelope.final_installed = Some(FinalInstalledBindingV2 {
         archive_sha256: digest(21),
@@ -471,7 +471,7 @@ fn final_public_stage_requires_public_denial_observation() {
     }
     let mut expected = expected(&envelope);
     expected.stage = NativeRunStageV2::FinalPublic;
-    expected.workflow_job = "linux-private-final";
+    expected.workflow_job = "linux-private-final-x64";
     expected.candidate_installed = None;
     expected.final_installed = envelope.final_installed.as_ref();
     assert!(
@@ -507,7 +507,7 @@ fn final_public_structural_join_requires_fresh_stage_and_independent_a_m1_h1() {
     let installed = digest(23);
     let mut final_public = candidate.clone();
     final_public.stage = NativeRunStageV2::FinalPublic;
-    final_public.workflow_job = "linux-private-final".into();
+    final_public.workflow_job = "linux-private-final-x64".into();
     final_public.candidate_installed = None;
     final_public
         .cases
@@ -786,6 +786,7 @@ fn github_run_job_and_downloaded_zip_must_join_the_candidate_target() {
     );
     let mut arm_envelope = envelope.clone();
     arm_envelope.target = "aarch64-unknown-linux-gnu".into();
+    arm_envelope.workflow_job = "linux-private-candidate-arm64".into();
     arm_envelope.native_machine = "aarch64".into();
     let mut arm_jobs = jobs.clone();
     arm_jobs["jobs"][0]["name"] = serde_json::json!("Release / Linux private candidate / arm64");
@@ -807,7 +808,7 @@ fn github_run_job_and_downloaded_zip_must_join_the_candidate_target() {
     );
     let mut final_envelope = envelope.clone();
     final_envelope.stage = NativeRunStageV2::FinalPublic;
-    final_envelope.workflow_job = "linux-private-final".into();
+    final_envelope.workflow_job = "linux-private-final-x64".into();
     final_envelope.candidate_installed = None;
     final_envelope.final_installed = Some(FinalInstalledBindingV2 {
         archive_sha256: digest(10),

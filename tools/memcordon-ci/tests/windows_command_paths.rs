@@ -143,7 +143,7 @@ fn managed_commands_keep_canonical_authorization_and_native_tool_paths() {
     let encoded = |value: &OsStr| hex::encode(value.as_encoded_bytes());
     let manifest = root.join("context.json");
     fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
-        "schema_version": 3, "root": root,
+        "schema_version": 4, "profile": "stable", "root": root,
         "environment": [
             [encoded(OsStr::new("PATH")), encoded(command_path(&bin).unwrap().as_os_str())],
             [encoded(OsStr::new("CARGO_HOME")), encoded(command_home.as_os_str())]

@@ -244,7 +244,13 @@ pub(crate) fn collect_completed_candidate_from_intent(
         target: &intent.target,
         native_machine: &intent.native_machine,
         workflow_run_id: &intent.origin.run_id.to_string(),
-        workflow_job: "linux-private-candidate",
+        workflow_job: PRODUCERS
+            .iter()
+            .find(|spec| {
+                spec.stage == NativeRunStageV2::CandidateCapability && spec.target == intent.target
+            })
+            .ok_or_else(|| CiError::Message("candidate producer target absent".into()))?
+            .job_id,
         workflow_attempt: intent.workflow_attempt,
         challenge: &intent.challenge,
         invocation_argv: &intent.invocation_argv,
@@ -813,6 +819,288 @@ struct ProtectedNativeSigningIntentV1 {
     verifier_source_commit: String,
     issued_at_unix: u64,
     expires_at_unix: u64,
+}
+
+/// Administrator-reviewed pre-install contract. This carries no signing key
+/// and cannot supply installed H1 or completed public evidence.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedPrivateSealIntentV1 {
+    schema_version: u8,
+    collector_intent: std::path::PathBuf,
+    root_key_id: String,
+    root_public_key_hex: String,
+    signed_policy: memcordon_core::release_trust::SignedReleaseTrustPolicyV1,
+    high_water_policy_version: u64,
+    high_water_release_sequence: u64,
+    high_water_wall_unix: u64,
+    verifier_sha256: String,
+    static_sha256: std::collections::BTreeMap<String, DiagnosticSha256>,
+}
+
+/// Reacquires completed producer custody and reproduces Q before accepting
+/// downloaded Q/CQ. All trust and static pins come from protected host state.
+pub fn seal_private_final_from_protected_intent(
+    root: &Path,
+    intent_path: &Path,
+    candidate_dir: &Path,
+    qualification_dir: &Path,
+    output_dir: &Path,
+) -> Result<()> {
+    use crate::release_private::{
+        AuthenticatedPrivateArchiveInputs, PrivateArchiveFormat, PrivateCandidateInputs,
+        prepare_private_candidate, seal_private_archive_before_install,
+    };
+    use memcordon_core::release_trust::{
+        ExpectedNativeQualificationV1, ReleaseTrustAnchorV1, SignedNativeQualificationCertificateV1,
+    };
+    use memcordon_core::workload_qualification_v2::{
+        QualificationArtifactV2, TrustedNativeCompletionV2, TrustedQualificationExpectationV2,
+    };
+    use std::collections::BTreeMap;
+    if !output_dir.is_absolute() || std::fs::symlink_metadata(output_dir).is_ok() {
+        return Err(CiError::Message(
+            "private final output must be fresh and absolute".into(),
+        ));
+    }
+    let seal: ProtectedPrivateSealIntentV1 = crate::private_observer_session::strict_json(
+        &crate::private_protected_readback::read_protected_raw_case_file(intent_path)?,
+        256 * 1024,
+    )?;
+    if seal.schema_version != 1 || !seal.collector_intent.is_absolute() {
+        return Err(CiError::Message(
+            "protected private sealing contract differs".into(),
+        ));
+    }
+    let (intent, intent_digest) = read_protected_candidate_intent(&seal.collector_intent)?;
+    let read = |directory: &Path, name: &str, bound| {
+        crate::private_observer_session::read_bounded_file(&directory.join(name), bound)
+    };
+    let build_bytes = read(candidate_dir, "candidate-build-v2.json", 16 * 1024)?;
+    let build = PrivateCandidateRecordV2::parse(&build_bytes).map_err(CiError::Message)?;
+    if hash_bytes(&build_bytes) != intent.build_sha256
+        || build.target != intent.target
+        || build.source_commit != intent.origin.source_commit
+        || build.version != intent.release_version
+    {
+        return Err(CiError::Message(
+            "pre-install B differs from protected completed subject".into(),
+        ));
+    }
+    let token = std::env::var("GITHUB_TOKEN")
+        .map_err(|_| CiError::Message("sealing Actions token absent".into()))?;
+    let producer = collect_completed_candidate_c3(&intent, &intent_digest, &token)?;
+    let semantics = replay_completed_candidate(&intent, &producer, &build)?;
+    let identity = crate::private_release_gate::IndependentBuildIdentityV2 {
+        version: &build.version,
+        source_commit: &build.source_commit,
+        target: &build.target,
+        component_sha256: &build.component_sha256,
+        unit_sha256: &build.unit_sha256,
+        filter_sha256: &build.filter_sha256,
+        host_prerequisites_sha256: &intent.host_prerequisites_sha256,
+    };
+    let qualification = crate::private_release_gate::produce_private_qualification_c3(
+        &semantics, &producer, &identity,
+    )?;
+    if read(qualification_dir, "qualification.json", 128 * 1024)? != qualification.bytes {
+        return Err(CiError::Message(
+            "downloaded Q differs from independently reproduced Q".into(),
+        ));
+    }
+    let certificate_bytes = read(
+        qualification_dir,
+        "qualification.certificate.json",
+        128 * 1024,
+    )?;
+    let certificate = SignedNativeQualificationCertificateV1::parse(&certificate_bytes)
+        .map_err(CiError::Message)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| CiError::Message("private sealing wall clock precedes epoch".into()))?
+        .as_secs();
+    let anchor = ReleaseTrustAnchorV1 {
+        root_key_id: seal.root_key_id,
+        public_key_hex: seal.root_public_key_hex,
+    };
+    let high_water = memcordon_core::release_trust::TrustHighWaterV1 {
+        policy_version: seal.high_water_policy_version,
+        release_sequence: seal.high_water_release_sequence,
+        last_accepted_wall_unix: seal.high_water_wall_unix,
+    };
+    let policy = seal
+        .signed_policy
+        .verify(&anchor, &high_water, now)
+        .map_err(CiError::Message)?;
+    let q: QualificationArtifactV2 = serde_json::from_slice(&qualification.bytes)?;
+    let mut accepted_set = Vec::new();
+    for result in q.observed_results.as_slice() {
+        let name = result.name.as_str();
+        accepted_set.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        accepted_set.extend_from_slice(name.as_bytes());
+        accepted_set.extend_from_slice(result.runner_completion_digest.bytes());
+    }
+    certificate
+        .verify(
+            &policy,
+            &ExpectedNativeQualificationV1 {
+                repository_id: producer.repository_id,
+                repository: &intent.origin.repository,
+                workflow_path: ".github/workflows/release.yml",
+                workflow_revision: &intent.origin.workflow_commit,
+                target: &build.target,
+                native_machine: &intent.native_machine,
+                verifier_sha256: &seal.verifier_sha256,
+                source_commit: &build.source_commit,
+                release_version: &build.version,
+                build_sha256: &String::from(intent.build_sha256.clone()),
+                build_context_sha256: &String::from(intent.build_context_sha256.clone()),
+                qualification_bytes: &qualification.bytes,
+                raw_index_sha256: &String::from(producer.raw_index_sha256.clone()),
+                completed_provenance_sha256: &String::from(producer.provenance_sha256.clone()),
+                accepted_case_set_sha256: &String::from(hash_bytes(&accepted_set)),
+            },
+            &high_water,
+            now,
+        )
+        .map_err(CiError::Message)?;
+    if certificate.payload.run_id != producer.run_id
+        || certificate.payload.run_attempt != producer.run_attempt
+        || certificate.payload.producer_job_id != producer.producer_job_id
+        || certificate.payload.artifact_id != producer.artifact_id
+    {
+        return Err(CiError::Message(
+            "CQ completed producer identity differs".into(),
+        ));
+    }
+    let manifest_bytes = read(candidate_dir, "runtime-manifest.json", 128 * 1024)?;
+    let manifest = memcordon_core::runtime_manifest_v3::RuntimeManifestV3::parse(&manifest_bytes)
+        .map_err(CiError::Message)?;
+    let inspection: memcordon_core::package_inspection_v6::LinuxPackageInspectionV6 =
+        crate::private_observer_session::strict_json(
+            &read(candidate_dir, "package-inspection-v6.json", 128 * 1024)?,
+            128 * 1024,
+        )?;
+    let mut components = BTreeMap::new();
+    for component in &manifest.components {
+        let path = std::path::Path::new(&component.path);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(CiError::Message(
+                "private component path is not a bounded relative member".into(),
+            ));
+        }
+        components.insert(
+            component.path.clone(),
+            crate::private_observer_session::read_bounded_file(
+                &candidate_dir.join(path),
+                256 * 1024 * 1024,
+            )?,
+        );
+    }
+    let candidate = prepare_private_candidate(PrivateCandidateInputs {
+        version: &build.version,
+        source_commit: &build.source_commit,
+        target: &build.target,
+        components: &manifest.components,
+        component_bytes: &components,
+        compiled_units: &inspection.compiled_units,
+        filter_sha256: &build.filter_sha256,
+    })?;
+    crate::release_private::validate_private_candidate_record(&build_bytes, &candidate)?;
+    if candidate.manifest_bytes != manifest_bytes {
+        return Err(CiError::Message("pre-install M0 bytes differ".into()));
+    }
+    let mut static_bytes = BTreeMap::new();
+    if seal.static_sha256.len() != crate::release_archive::NATIVE_ARCHIVE_STATIC_PATHS.len() {
+        return Err(CiError::Message(
+            "protected static inventory differs".into(),
+        ));
+    }
+    for name in crate::release_archive::NATIVE_ARCHIVE_STATIC_PATHS {
+        let bytes =
+            crate::private_observer_session::read_bounded_file(&root.join(name), 4 * 1024 * 1024)?;
+        if seal.static_sha256.get(*name) != Some(&hash_bytes(&bytes)) {
+            return Err(CiError::Message(
+                "reviewed static member digest differs".into(),
+            ));
+        }
+        static_bytes.insert((*name).into(), bytes);
+    }
+    let completions: Vec<_> = q
+        .observed_results
+        .as_slice()
+        .iter()
+        .map(|result| TrustedNativeCompletionV2 {
+            name: result.name.as_str(),
+            target: &build.target,
+            native_executed: true,
+            completion_digest: &result.runner_completion_digest,
+        })
+        .collect();
+    let expected = TrustedQualificationExpectationV2 {
+        source_commit: &build.source_commit,
+        target: &build.target,
+        profile: &q.profile,
+        filter_digest: &build.filter_sha256,
+        unit_digest: &build.unit_sha256,
+        component_digest: &build.component_sha256,
+        runner_run_digest: &producer.archive_sha256,
+        host_prerequisites_digest: &intent.host_prerequisites_sha256,
+        completions: &completions,
+    };
+    let sealed = seal_private_archive_before_install(AuthenticatedPrivateArchiveInputs {
+        candidate: &candidate,
+        qualification_bytes: &qualification.bytes,
+        candidate_record_bytes: &build_bytes,
+        certificate_bytes: &certificate_bytes,
+        qualification_reference: qualification.reference,
+        expected_qualification: &expected,
+        component_bytes: &components,
+        static_bytes: &static_bytes,
+        archive_format: PrivateArchiveFormat::TarGz,
+    })?;
+    let archive_name = match build.target.as_str() {
+        "x86_64-unknown-linux-gnu" => "memcordon-private-final-x64.tar.gz",
+        "aarch64-unknown-linux-gnu" => "memcordon-private-final-arm64.tar.gz",
+        _ => {
+            return Err(CiError::Message(
+                "private final archive target differs".into(),
+            ));
+        }
+    };
+    std::fs::create_dir(output_dir)?;
+    for (name, bytes) in [
+        (archive_name, sealed.archive_bytes()),
+        ("runtime-manifest.json", sealed.manifest().manifest_bytes()),
+    ] {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output_dir.join(name))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    let receipt = serde_json::to_vec(
+        &serde_json::json!({ "schema_version":1, "archive":archive_name,
+        "archive_sha256":sealed.archive_sha256(), "manifest_sha256":sealed.manifest().manifest_sha256(),
+        "build_sha256":intent.build_sha256, "qualification_sha256":hash_bytes(&qualification.bytes),
+        "certificate_sha256":hash_bytes(&certificate_bytes), "producer_job_id":producer.producer_job_id,
+        "run_id":producer.run_id, "run_attempt":producer.run_attempt, "artifact_id":producer.artifact_id }),
+    )?;
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output_dir.join("seal-receipt.json"))?;
+    file.write_all(&receipt)?;
+    file.sync_all()?;
+    std::fs::File::open(output_dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Shared inherited-descriptor boundary for the existing release signing

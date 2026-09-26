@@ -80,9 +80,17 @@ fn deleting_each_standard_job_rejects_with_sealed_jobs_intact() {
                 .is_some()
         );
         for sealed in if path == RELEASE {
-            ["linux-certification", "windows-package-channel"]
+            [
+                "linux-certification",
+                "windows-package-channel-x64",
+                "windows-package-channel-arm64",
+            ]
         } else {
-            ["linux", "windows-package-channel"]
+            [
+                "linux",
+                "windows-package-channel-x64",
+                "windows-package-channel-arm64",
+            ]
         } {
             assert!(!original["jobs"][sealed].is_null());
             assert_eq!(changed["jobs"][sealed], original["jobs"][sealed]);
@@ -114,7 +122,7 @@ fn release_requires_each_standard_assembly_dependency() {
         assert!(
             needs
                 .iter()
-                .any(|value| value.as_str() == Some("windows-package-channel"))
+                .any(|value| value.as_str() == Some("windows-package-channel-x64"))
         );
         rejected(RELEASE, &workflow, required);
     }

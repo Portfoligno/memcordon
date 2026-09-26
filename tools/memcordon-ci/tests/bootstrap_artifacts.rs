@@ -89,7 +89,7 @@ fn bootstrap_pdb_is_an_output_only_at_the_source_root() {
     inputs.sort_by_key(|input| input["path"].as_str().unwrap().to_owned());
     let manifest = base.join("context.json");
     fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
-        "schema_version": 3, "root": root,
+        "schema_version": 4, "profile": "stable", "root": root,
         "environment": [[encode(OsStr::new("CARGO_HOME")), encode(base.join("cargo-home").as_os_str())]],
         "toolchains": {"1.97.1": cargo},
         "input_roots": [cargo], "discovery_roots": [],

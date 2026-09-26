@@ -10,10 +10,21 @@ fn fail(message: &str) -> CiError {
     CiError::Message(message.into())
 }
 
-const TRACED_PREPARE: &str = "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin --trace-inventory ${{ matrix.inventory-trace }}";
+const TRACED_PREPARE: &str = "./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin --trace-inventory ${{ matrix.inventory-trace }}";
 const QUALIFY_VOLUME: &str = "./ci-native-fingerprint.exe --qualify-trace-volume";
 
 fn project_trace_configuration(job: &mut Value) -> Result<bool> {
+    let explicit = job.get("steps").and_then(Value::as_sequence).is_some_and(|steps| steps.iter().any(|step| step.get("run").and_then(Value::as_str) == Some("./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin --trace-inventory true")));
+    if explicit {
+        if job.get("runs-on").and_then(Value::as_str) != Some("windows-11-arm")
+            || job.get("strategy").is_some()
+        {
+            return Err(fail(
+                "explicit inventory tracing requires the native ARM64 runner",
+            ));
+        }
+        return Ok(true);
+    }
     let traced = job
         .get("steps")
         .and_then(Value::as_sequence)
@@ -64,6 +75,7 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
     };
     for job in jobs.values_mut() {
         let traced = project_trace_configuration(job)?;
+        let matrix_trace = job.get("strategy").is_some();
         let Some(steps) = job.get_mut("steps").and_then(Value::as_sequence_mut) else {
             continue;
         };
@@ -76,6 +88,26 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                 run.ends_with("suite macos-deadline") || run.ends_with("suite release-macos")
             })
         });
+        let required_profile = steps
+            .iter()
+            .filter_map(|step| step.get("run").and_then(Value::as_str))
+            .find_map(|run| {
+                let (_, suite) = run.split_once(" suite ")?;
+                Some(if suite == "release-preflight" {
+                    "release-preflight"
+                } else if suite == "msrv" {
+                    "msrv"
+                } else if suite == "supply-chain" {
+                    "supply-chain"
+                } else if suite == "miri" || suite.starts_with("miri-") {
+                    "miri"
+                } else if suite == "fuzz" || suite.starts_with("fuzz-") {
+                    "fuzz"
+                } else {
+                    "stable"
+                })
+            })
+            .unwrap_or("stable");
         for value in steps.iter_mut() {
             let Some(step) = value.as_mapping_mut() else {
                 continue;
@@ -85,18 +117,45 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                     "rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe",
                 )
             {
-                if step.len() != 1 {
+                if seed_compiled || step.len() != 1 {
                     return Err(fail(
                         "seed compilation must be unconditional and fail closed",
                     ));
                 }
                 seed_compiled = true;
             }
-            if text(step, "run")
-                == Some("./ci-native-fingerprint.exe --output target/ci/native-inputs.bin")
-                || (traced && text(step, "run") == Some(TRACED_PREPARE))
-            {
-                if !seed_compiled
+            let preparation = text(step, "run")
+                .and_then(|run| run.strip_prefix("./ci-native-fingerprint.exe --profile "))
+                .and_then(|run| run.split_once(" --output target/ci/native-inputs.bin"));
+            if let Some((profile, trace)) = preparation {
+                if ![
+                    "stable",
+                    "msrv",
+                    "miri",
+                    "fuzz",
+                    "supply-chain",
+                    "release-preflight",
+                ]
+                .contains(&profile)
+                    || !matches!(
+                        trace,
+                        "" | " --trace-inventory false"
+                            | " --trace-inventory true"
+                            | " --trace-inventory ${{ matrix.inventory-trace }}"
+                    )
+                    || (trace.ends_with(" true") && !traced)
+                {
+                    return Err(fail(
+                        "managed preparation has an invalid profile or trace grammar",
+                    ));
+                }
+                if profile != required_profile {
+                    return Err(fail(
+                        "managed preparation profile differs from suite capability",
+                    ));
+                }
+                if planned
+                    || !seed_compiled
                     || (traced && !volume_qualified)
                     || step.len() != 2
                     || text(step, "id") != Some("build-context-prepare")
@@ -107,23 +166,24 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                 }
                 planned = true;
                 step.remove(Value::from("id"));
-                if traced {
-                    step.insert(
-                        Value::from("run"),
-                        Value::from(
-                            "./ci-native-fingerprint.exe --output target/ci/native-inputs.bin",
-                        ),
-                    );
-                }
+                step.insert(
+                    Value::from("run"),
+                    Value::from("./ci-native-fingerprint.exe --output target/ci/native-inputs.bin"),
+                );
             }
             if text(step, "run") == Some(QUALIFY_VOLUME) {
                 if !traced
                     || !seed_compiled
                     || planned
                     || volume_qualified
-                    || step.len() != 3
+                    || step.len() != if matrix_trace { 3 } else { 2 }
                     || text(step, "id") != Some("trace-volume-qualification")
-                    || text(step, "if") != Some("matrix.inventory-trace")
+                    || text(step, "if")
+                        != if matrix_trace {
+                            Some("matrix.inventory-trace")
+                        } else {
+                            None
+                        }
                 {
                     return Err(fail(
                         "trace volume qualification must fail closed after seed compilation and before preparation",
@@ -136,7 +196,8 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                     "./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin",
                 )
             {
-                if !planned
+                if audited
+                    || !planned
                     || text(step, "id") != Some("build-context-audit")
                     || text(step, "if")
                         != Some("always() && steps.build-context-prepare.outcome == 'success'")
@@ -189,6 +250,24 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                 continue;
             };
             let paths = text(with, "path").unwrap_or_default().to_owned();
+            if paths.lines().any(|path| {
+                path == "target/ci-tools" || path.starts_with("target/ci-tools/staging")
+            }) {
+                return Err(fail(
+                    "compiled tool caches must exclude ephemeral installation staging",
+                ));
+            }
+            if paths
+                .lines()
+                .any(|path| path == "target/ci/windows-sealed-cargo/build")
+                && !paths
+                    .lines()
+                    .any(|path| path == "!target/ci/windows-sealed-cargo/build/package")
+            {
+                return Err(fail(
+                    "compiled package cache must exclude package archive evidence",
+                ));
+            }
             if paths
                 .lines()
                 .any(|path| path.starts_with("target/ci/source-home/"))
@@ -211,6 +290,23 @@ pub fn validate_and_project(document: &mut Value) -> Result<()> {
                 return Err(fail(
                     "compiled cache requires a fresh controller and validated build context",
                 ));
+            }
+            if paths.lines().any(|path| path == "target/ci") {
+                for excluded in [
+                    "!target/ci/source-home",
+                    "!target/ci/native-inputs.bin",
+                    "!target/ci/reports",
+                    "!target/ci/*evidence*",
+                    "!target/ci/*diagnostic*",
+                    "!target/ci/release-bundle",
+                    "!target/ci/release-inputs",
+                ] {
+                    if !paths.lines().any(|path| path == excluded) {
+                        return Err(fail(
+                            "compiled cache must exclude source ownership, live contexts and evidence",
+                        ));
+                    }
+                }
             }
             if paths.lines().any(|path| path == "target/ci")
                 && !paths

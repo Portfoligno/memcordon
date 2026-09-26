@@ -5,7 +5,131 @@ use bounded::{Clock, Outcome, Process};
 use std::io;
 use std::process::ExitStatus;
 use std::time::Duration;
+
+#[test]
+fn task_journals_are_distinct_and_group_failures_keep_ordinal_order() {
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = bounded::Journal::create(temporary.path()).unwrap();
+    let controller = journal.task(bounded::TaskKind::Controller).unwrap();
+    let auxiliary = journal.task(bounded::TaskKind::Auxiliary).unwrap();
+    let audit = auxiliary.task(bounded::TaskKind::CargoAudit).unwrap();
+    let deny = auxiliary.task(bounded::TaskKind::CargoDeny).unwrap();
+    assert_ne!(controller.directory(), auxiliary.directory());
+    assert_ne!(audit.directory(), deny.directory());
+    journal
+        .group_outcome(&[
+            Err(io::Error::other("first")),
+            Err(io::Error::other("second")),
+        ])
+        .unwrap();
+    let evidence: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(journal.directory().join("phase-bootstrap-group.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(evidence["failures"][0]["ordinal"], 0);
+    assert_eq!(evidence["failures"][1]["ordinal"], 1);
+    let exhausted = bounded::GroupDeadline::new(Duration::ZERO).unwrap();
+    assert!(exhausted.remaining().is_err());
+    let deadline = bounded::GroupDeadline::new(Duration::from_secs(10)).unwrap();
+    let before = deadline.remaining().unwrap();
+    let _task = journal.task(bounded::TaskKind::MiriSysroot).unwrap();
+    assert!(deadline.remaining().unwrap() <= before);
+}
+
+#[test]
+fn two_lanes_overlap_settle_panics_and_select_failures_by_ordinal() {
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = bounded::Journal::create(temporary.path()).unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let deadline = bounded::GroupDeadline::new(Duration::from_secs(10)).unwrap();
+    let error = bounded::run_two_lanes(
+        &journal,
+        deadline,
+        |_, _| {
+            barrier.wait();
+            Err(io::Error::other("controller failure"))
+        },
+        |_, _| {
+            barrier.wait();
+            Err(io::Error::other("auxiliary failure"))
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("controller failure"));
+    let evidence: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(journal.directory().join("phase-bootstrap-group.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(evidence["failures"].as_array().unwrap().len(), 2);
+    let completed = std::sync::atomic::AtomicBool::new(false);
+    let error = bounded::run_two_lanes(
+        &journal,
+        deadline,
+        |_, _| panic!("controlled lane panic"),
+        |_, _| {
+            completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("controller lane panicked"));
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+}
 struct FakeClock(Duration);
+
+#[test]
+fn a_spawn_failure_still_settles_the_other_lane_and_preserves_primary_error() {
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = bounded::Journal::create(temporary.path()).unwrap();
+    let deadline = bounded::GroupDeadline::new(Duration::from_secs(10)).unwrap();
+    let completed = std::sync::atomic::AtomicBool::new(false);
+    let error = bounded::run_two_lanes(
+        &journal,
+        deadline,
+        |task, deadline| {
+            let mut command =
+                std::process::Command::new(temporary.path().join("nonexistent-executable"));
+            bounded::run_in_group(&mut command, "spawn failure", task, deadline).map(|_| ())
+        },
+        |_, _| {
+            completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(io::Error::other("secondary auxiliary failure"))
+        },
+    )
+    .unwrap_err();
+    assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!error.to_string().contains("secondary auxiliary failure"));
+    let evidence: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(journal.directory().join("phase-bootstrap-group.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(evidence["outcome"], "failed");
+    assert_eq!(evidence["failures"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn successful_lane_actions_cannot_extend_the_group_deadline() {
+    let temporary = tempfile::tempdir().unwrap();
+    let journal = bounded::Journal::create(temporary.path()).unwrap();
+    let deadline = bounded::GroupDeadline::new(Duration::from_millis(100)).unwrap();
+    let error = bounded::run_two_lanes(
+        &journal,
+        deadline,
+        |_, _| {
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(())
+        },
+        |_, _| Ok(()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("group budget exhausted"));
+    let evidence: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(journal.directory().join("phase-bootstrap-group.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(evidence["outcome"], "failed");
+    assert_eq!(evidence["failures"][0]["ordinal"], 2);
+}
 impl Clock for FakeClock {
     fn elapsed(&self) -> Duration {
         self.0

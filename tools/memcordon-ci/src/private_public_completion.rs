@@ -1,6 +1,179 @@
 //! Completed public collection and canonical P. The producer cannot obtain
 //! these capabilities while its job is running. No artifact JSON revives one.
 
+/// Protected expectations are administered independently of the downloaded P/CP.
+/// Exact payload equality also pins all case/catalogue and expiry commitments.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProtectedPublicCompletionIntentV1 {
+    schema_version: u8,
+    root_key_id: String,
+    root_public_key_hex: String,
+    signed_policy: memcordon_core::release_trust::SignedReleaseTrustPolicyV1,
+    high_water_policy_version: u64,
+    high_water_release_sequence: u64,
+    high_water_wall_unix: u64,
+    expected: memcordon_core::public_release_trust::PublicQualificationCertificateV2,
+}
+
+/// Validates the signed completed P/CP against independent protected authority.
+pub fn verify_private_completion(
+    intent_path: &std::path::Path,
+    qualification: &std::path::Path,
+) -> Result<()> {
+    if !qualification.is_absolute() {
+        return fail("private completion protected path differs");
+    }
+    let intent = crate::private_protected_readback::read_protected_raw_case_file(intent_path)?;
+    let p = crate::private_observer_session::read_bounded_file(
+        &qualification.join("public-evidence.json"),
+        4 * 1024 * 1024,
+    )?;
+    let cp = crate::private_observer_session::read_bounded_file(
+        &qualification.join("public-evidence.certificate.json"),
+        128 * 1024,
+    )?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| CiError::Message("private completion wall clock precedes epoch".into()))?
+        .as_secs();
+    validate_private_completion_bytes(&intent, &p, &cp, now)
+}
+
+/// Pure validation only: success does not create authority or a signing capability.
+/// The filesystem entrypoint alone supplies independently protected expectations.
+pub fn validate_private_completion_bytes(
+    intent_bytes: &[u8],
+    p: &[u8],
+    cp_bytes: &[u8],
+    now: u64,
+) -> Result<()> {
+    use memcordon_core::public_release_trust::{
+        ExpectedPublicQualificationV1, ExpectedPublicQualificationV2,
+        SignedPublicQualificationCertificateV2,
+    };
+    use memcordon_core::release_trust::{ReleaseTrustAnchorV1, TrustHighWaterV1};
+    let intent: ProtectedPublicCompletionIntentV1 =
+        crate::private_observer_session::strict_json(intent_bytes, 256 * 1024)?;
+    if intent.schema_version != 1 {
+        return fail("private completion protected schema differs");
+    }
+    let index = PublicEvidenceIndexV3::parse(p)?;
+    let subject = &intent.expected.subject;
+    if index.target != subject.target
+        || index.native_machine != subject.native_machine
+        || index.source_commit != subject.source_commit
+        || index.release_version != subject.release_version
+        || [
+            (&index.build_sha256, &subject.build_sha256),
+            (&index.archive_sha256, &subject.archive_sha256),
+            (&index.manifest_sha256, &subject.manifest_sha256),
+            (&index.qualification_sha256, &subject.qualification_sha256),
+            (
+                &index.qualification_certificate_payload_sha256,
+                &subject.qualification_certificate_sha256,
+            ),
+            (&index.host_receipt_sha256, &subject.host_receipt_sha256),
+            (&index.raw_index_sha256, &subject.raw_index_sha256),
+            (
+                &index.completed_provenance_sha256,
+                &subject.completed_provenance_sha256,
+            ),
+            (&index.catalogue_sha256, &subject.catalogue_sha256),
+            (
+                &index.payload_index_sha256,
+                &intent.expected.payload_index_sha256,
+            ),
+            (
+                &index.origin_commitment_sha256,
+                &intent.expected.origin_commitment_sha256,
+            ),
+            (
+                &index.custody_receipt_sha256,
+                &intent.expected.custody_receipt_sha256,
+            ),
+            (
+                &index.generation_timeline_sha256,
+                &intent.expected.generation_timeline_sha256,
+            ),
+            (
+                &index.qualification_certificate_file_sha256,
+                &intent.expected.qualification_certificate_file_sha256,
+            ),
+            (&index.semantics_sha256, &intent.expected.semantics_sha256),
+        ]
+        .iter()
+        .any(|(actual, expected)| String::from((*actual).clone()) != **expected)
+    {
+        return fail("private completion P subject differs from independent expectation");
+    }
+    let cp = SignedPublicQualificationCertificateV2::parse(cp_bytes).map_err(CiError::Message)?;
+    if cp.payload != intent.expected {
+        return fail("private completion independently approved subject differs");
+    }
+    let high_water = TrustHighWaterV1 {
+        policy_version: intent.high_water_policy_version,
+        release_sequence: intent.high_water_release_sequence,
+        last_accepted_wall_unix: intent.high_water_wall_unix,
+    };
+    let policy = intent
+        .signed_policy
+        .verify(
+            &ReleaseTrustAnchorV1 {
+                root_key_id: intent.root_key_id,
+                public_key_hex: intent.root_public_key_hex,
+            },
+            &high_water,
+            now,
+        )
+        .map_err(CiError::Message)?;
+    let s = &intent.expected.subject;
+    cp.verify(
+        &policy,
+        &ExpectedPublicQualificationV2 {
+            subject: ExpectedPublicQualificationV1 {
+                release_sequence: s.release_sequence,
+                repository_id: s.repository_id,
+                repository: &s.repository,
+                workflow_path: &s.workflow_path,
+                workflow_revision: &s.workflow_revision,
+                run_id: s.run_id,
+                run_attempt: s.run_attempt,
+                producer_job_id: s.producer_job_id,
+                artifact_id: s.artifact_id,
+                target: &s.target,
+                native_machine: &s.native_machine,
+                source_commit: &s.source_commit,
+                release_version: &s.release_version,
+                verifier_sha256: &s.verifier_sha256,
+                verifier_source_commit: &s.verifier_source_commit,
+                build_sha256: &s.build_sha256,
+                qualification_sha256: &s.qualification_sha256,
+                qualification_certificate_sha256: &s.qualification_certificate_sha256,
+                archive_sha256: &s.archive_sha256,
+                manifest_sha256: &s.manifest_sha256,
+                host_receipt_sha256: &s.host_receipt_sha256,
+                raw_index_sha256: &s.raw_index_sha256,
+                completed_provenance_sha256: &s.completed_provenance_sha256,
+                accepted_case_set_sha256: &s.accepted_case_set_sha256,
+                public_evidence_bytes: &p,
+            },
+            payload_index_sha256: &intent.expected.payload_index_sha256,
+            origin_commitment_sha256: &intent.expected.origin_commitment_sha256,
+            custody_receipt_sha256: &intent.expected.custody_receipt_sha256,
+            generation_timeline_sha256: &intent.expected.generation_timeline_sha256,
+            qualification_certificate_file_sha256: &intent
+                .expected
+                .qualification_certificate_file_sha256,
+            semantics_sha256: &intent.expected.semantics_sha256,
+        },
+        &high_water,
+        now,
+    )
+    .map_err(CiError::Message)?;
+    Ok(())
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Duration;
@@ -54,7 +227,7 @@ impl ProtectedPublicCollectorIntentV1 {
     pub fn validate(&self) -> Result<()> {
         self.suite.validate()?;
         let parts = self.repository.split('/').collect::<Vec<_>>();
-        if self.schema_version != 1
+        if self.schema_version != 2
             || parts.len() != 2
             || parts.iter().any(|part| {
                 part.is_empty()
@@ -77,7 +250,7 @@ impl ProtectedPublicCollectorIntentV1 {
         {
             return fail("protected public collector workflow/runner identity differs");
         }
-        let spec = crate::private_native::PRODUCERS
+        let spec = crate::private_native::PUBLIC_RAW_PRODUCERS
             .iter()
             .find(|spec| {
                 spec.stage == crate::private_native::NativeRunStageV2::FinalPublic

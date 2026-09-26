@@ -42,7 +42,7 @@ fn workspace_metadata_removes_registry_credentials_with_and_without_a_context() 
     let encode = |value: &OsStr| hex::encode(value.as_encoded_bytes());
     let manifest = root.join("context.json");
     fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
-        "schema_version": 3, "root": root,
+        "schema_version": 4, "profile": "stable", "root": root,
         "environment": [[encode(OsStr::new("PATH")), encode(bin.as_os_str())]],
         "toolchains": {toolchains.stable: cargo}, "input_roots": [bin], "discovery_roots": [],
         "inputs": [{"path": encode(cargo.as_os_str()), "kind": "file", "mode": 0, "digest": "fixture"}],
@@ -131,7 +131,7 @@ fn enrolled_auxiliaries_use_closed_toolchain_context_but_workloads_keep_their_en
     };
     let manifest = root.join("context.json");
     fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
-        "schema_version": 3, "root": root,
+        "schema_version": 4, "profile": "stable", "root": root,
         "environment": [[hex(OsStr::new("PATH")), hex(OsStr::new("/usr/bin"))]],
         "toolchains": {"nightly": cargo}, "input_roots": [root], "discovery_roots": [],
         "inputs": ([&cargo, &fuzz, &audit, &deny].map(|tool| serde_json::json!({"path": hex(tool.as_os_str()), "kind": "symlink", "mode": 0, "digest": "fixture"}))),

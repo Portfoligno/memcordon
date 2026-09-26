@@ -80,6 +80,8 @@ enum TopLevel {
         specification: PathBuf,
     },
     BuildContext {
+        #[arg(long, value_enum)]
+        profile: memcordon_ci::bootstrap_profile::BootstrapProfile,
         #[arg(long)]
         output: PathBuf,
         #[arg(long)]
@@ -92,6 +94,8 @@ enum TopLevel {
     Suite {
         #[arg(value_enum)]
         suite: Suite,
+        #[arg(long, value_enum)]
+        native_channel: Option<memcordon_ci::native_channel::NativeChannelRequirement>,
         #[arg(long, value_enum)]
         stage: Option<PrivateStage>,
         #[arg(long)]
@@ -128,10 +132,18 @@ enum Suite {
     Native,
     SupplyChain,
     Miri,
+    MiriFirst,
+    MiriSecond,
     Fuzz,
     FuzzFirst,
     FuzzSecond,
+    FuzzQuarterOne,
+    FuzzQuarterTwo,
+    FuzzQuarterThree,
+    FuzzQuarterFour,
     Stress,
+    StressPackages,
+    StressLifecycle,
     BackendLinuxCgroup,
     BackendLinuxSealedV2,
     BackendLinuxPrivateV4,
@@ -148,6 +160,8 @@ enum Suite {
     ReleasePreflight,
     ReleaseNative,
     ReleaseMacos,
+    ReleaseMacosNative,
+    ReleaseMacosAcceptance,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -167,6 +181,12 @@ impl From<PrivateStage> for memcordon_ci::private_native::NativeRunStageV2 {
 
 #[derive(Debug, Subcommand)]
 enum ReleaseCommand {
+    VerifyPrivateCompletion {
+        #[arg(long)]
+        intent: PathBuf,
+        #[arg(long)]
+        qualification: PathBuf,
+    },
     Assemble,
     VerifyPrivateCandidate,
     InstallPrivateCandidate,
@@ -214,6 +234,16 @@ enum ReleaseCommand {
         #[arg(long)]
         archive: PathBuf,
     },
+    SealPrivateFinal {
+        #[arg(long)]
+        intent: PathBuf,
+        #[arg(long)]
+        candidate: PathBuf,
+        #[arg(long)]
+        qualification: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
     StageGithub,
     AttemptOidc {
         #[arg(long)]
@@ -236,6 +266,10 @@ enum ReleaseCommand {
         report: PathBuf,
     },
     VerifyPublic,
+    /// Complete public state validation and Linux host qualification.
+    VerifyPublicGlobal,
+    /// Authenticated host archive and serial registry consumer qualification.
+    VerifyPublicHost,
 }
 
 fn workspace_root(start: &Path) -> Result<PathBuf> {
@@ -317,12 +351,16 @@ fn run() -> Result<()> {
         (
             false,
             Some(TopLevel::BuildContext {
+                profile,
                 output,
                 observation_dir,
             }),
         ) => {
             memcordon_ci::inventory_progress::set_report_directory(observation_dir)?;
-            memcordon_ci::build_context::ValidatedBuildContext::prepare(&root)?.write(&output)
+            memcordon_ci::build_context::ValidatedBuildContext::prepare_with_profile(
+                &root, profile,
+            )?
+            .write(&output)
         }
         (false, Some(TopLevel::AuditBuildContext { input })) => {
             memcordon_ci::inventory_benchmark::require_admission(&input)?;
@@ -333,6 +371,7 @@ fn run() -> Result<()> {
             false,
             Some(TopLevel::Suite {
                 suite,
+                native_channel,
                 stage,
                 target,
                 collector_intent_sha256,
@@ -343,6 +382,7 @@ fn run() -> Result<()> {
         ) => suites::run(
             &root,
             suite,
+            native_channel,
             stage,
             target.as_deref(),
             collector_intent_sha256.as_deref(),

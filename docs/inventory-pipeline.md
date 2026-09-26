@@ -1,9 +1,11 @@
 # Native inventory scheduling
 
-Windows and Linux native roots use one 16-thread executor per measurement. Each root
+Source and Windows, Linux, and macOS native roots share one 16-thread executor per managed measurement. Each root
 fences all its tasks before reporting completion; the executor is joined before
-the complete measurement returns. Source inventory and other native paths
-retain their existing synchronous filesystem protocol. Root enrollment,
+the complete measurement returns. Two controllers overlap the source and native
+domains. Native required roots precede discovery roots, sharing one visited set;
+source owns its own visited set. Their joined records retain equal-path
+multiplicity and source-first order under the existing stable path sort. Root enrollment,
 source-output exclusions and the final serialized Input identity are unchanged.
 
 The coordinator alone owns sorted depth-first traversal and canonical visited
@@ -13,8 +15,11 @@ an earlier child can run while a later sibling is still being prepared. Ready
 ancestor preparations retain their window credits. A globally reserved frontier
 slot allows arbitrarily deep descent without allocating a window at each depth.
 
-At most 32 tasks are admitted but unreceived, 16 file tasks are admitted, and
-16 preparation results are queued/running/ready but unconsumed. Workers never
+Each domain admits at most 16 unreceived tasks, eight file tasks, and eight
+queued/running/ready but unconsumed preparation results. Aggregate limits remain
+32/16/16. Standalone native snapshots retain their existing 32/16/16 session
+limits. Each controller owns its completion channel and reserved frontier credit;
+workers never wait for another domain's admission. Workers never
 submit child tasks. The completion channel can hold all outstanding results.
 Preparation lookahead stays within runs of entries hinted as regular files;
 it stops before directories, links, or unknown entries. This prevents ready
@@ -33,7 +38,13 @@ reading and after reopening the current path. Native opens refuse final symlinks
 and cannot block waiting for a substituted FIFO. Access time is excluded from
 the comparison because reading can update it. Linux null-device records remain
 limited to native descendants; missing links and proven access-denied descendants
-retain their existing identities. macOS retains its protected-file helper route.
+retain their existing identities. macOS and source retain ordinary EOF reader
+acceptance; this scheduling change does not silently apply Linux read hardening
+to them. macOS protected fallback alone enters a process-shared one-slot gate,
+after typed permission denial and system-path validation. Cancellation is checked
+before and after acquiring it. The helper retains its 30-second/8,192-byte capture
+limit and now binds the protected read to the enumerated stamp before and after
+execution; concurrent protected-file mutation fails explicitly.
 
 Errors use logical traversal order: an earlier admitted file failure wins over
 a later directory/preparation failure after the root fence settles the earlier
@@ -41,6 +52,15 @@ file tasks. This makes mixed worker/controller error precedence deterministic;
 the previous implementation could return the controller failure while dropping
 an earlier pending file failure. No failed or canceled traversal returns a
 partial manifest. Speculative errors are consumed only at their sorted frontier.
+Both domains settle on failure; source errors take precedence over native errors,
+independent of completion order. Neither domain cancels the other on failure.
+
+Observations rotate through two slots per domain, `inventory-source-0/1.json` and
+`inventory-native-0/1.json`. Root ordinal, domain, limits and status disambiguate
+local task ids. After both joins, `inventory-domains.json` records elapsed time,
+committed files/bytes and outcomes. Queue/payload limits, loss counters and bounded
+acknowledgement waits remain in place. Standalone snapshots retain their original
+two filenames. These observations never enter the measured content identity.
 
 Cancellation is cooperative between actions and read chunks. It cannot interrupt
 an indefinitely blocked filesystem call; the bootstrap process supervisor still

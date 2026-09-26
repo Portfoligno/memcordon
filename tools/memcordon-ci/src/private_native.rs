@@ -44,7 +44,7 @@ pub const PRODUCERS: [PrivateNativeProducerSpec; 4] = [
         stage: NativeRunStageV2::CandidateCapability,
         target: "aarch64-unknown-linux-gnu",
         native_machine: "aarch64",
-        job_id: "linux-private-candidate",
+        job_id: "linux-private-candidate-arm64",
         job_name: "Release / Linux private candidate / arm64",
         runner_label: "ubuntu-24.04-arm",
         artifact_name: "release-private-candidate-arm64",
@@ -53,7 +53,7 @@ pub const PRODUCERS: [PrivateNativeProducerSpec; 4] = [
         stage: NativeRunStageV2::CandidateCapability,
         target: "x86_64-unknown-linux-gnu",
         native_machine: "x86_64",
-        job_id: "linux-private-candidate",
+        job_id: "linux-private-candidate-x64",
         job_name: "Release / Linux private candidate / x64",
         runner_label: "ubuntu-24.04",
         artifact_name: "release-private-candidate-x64",
@@ -62,7 +62,7 @@ pub const PRODUCERS: [PrivateNativeProducerSpec; 4] = [
         stage: NativeRunStageV2::FinalPublic,
         target: "aarch64-unknown-linux-gnu",
         native_machine: "aarch64",
-        job_id: "linux-private-final",
+        job_id: "linux-private-final-arm64",
         job_name: "Release / Linux private final / arm64",
         runner_label: "ubuntu-24.04-arm",
         artifact_name: "release-private-final-arm64",
@@ -71,10 +71,33 @@ pub const PRODUCERS: [PrivateNativeProducerSpec; 4] = [
         stage: NativeRunStageV2::FinalPublic,
         target: "x86_64-unknown-linux-gnu",
         native_machine: "x86_64",
-        job_id: "linux-private-final",
+        job_id: "linux-private-final-x64",
         job_name: "Release / Linux private final / x64",
         runner_label: "ubuntu-24.04",
         artifact_name: "release-private-final-x64",
+    },
+];
+
+/// V3 raw observations have their own role. Legacy FinalPublic envelopes
+/// remain bound to PRODUCERS and cannot masquerade as completed public P.
+pub const PUBLIC_RAW_PRODUCERS: [PrivateNativeProducerSpec; 2] = [
+    PrivateNativeProducerSpec {
+        stage: NativeRunStageV2::FinalPublic,
+        target: "aarch64-unknown-linux-gnu",
+        native_machine: "aarch64",
+        job_id: "linux-private-final-arm64",
+        job_name: "Release / Linux private final / arm64",
+        runner_label: "ubuntu-24.04-arm",
+        artifact_name: "release-private-public-raw-arm64",
+    },
+    PrivateNativeProducerSpec {
+        stage: NativeRunStageV2::FinalPublic,
+        target: "x86_64-unknown-linux-gnu",
+        native_machine: "x86_64",
+        job_id: "linux-private-final-x64",
+        job_name: "Release / Linux private final / x64",
+        runner_label: "ubuntu-24.04",
+        artifact_name: "release-private-public-raw-x64",
     },
 ];
 

@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
-use memcordon_ci::inventory_pipeline::{InventoryBackend, InventorySession, Node, ValidatedDigest};
+use memcordon_ci::inventory_pipeline::{
+    InventoryBackend, InventorySession, Node, TraversalLimits, ValidatedDigest,
+};
 use memcordon_ci::inventory_progress::{TaskClass, TaskState};
 use memcordon_ci::inventory_workers::CAPACITY;
 use memcordon_ci::{CiError, Result};
@@ -30,6 +32,8 @@ struct Backend {
     cancelled: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
+    class_active: [Arc<AtomicUsize>; 3],
+    class_peak: [Arc<AtomicUsize>; 3],
 }
 
 impl Backend {
@@ -43,6 +47,8 @@ impl Backend {
             cancelled: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicUsize::new(0)),
             peak: Arc::new(AtomicUsize::new(0)),
+            class_active: std::array::from_fn(|_| Arc::new(AtomicUsize::new(0))),
+            class_peak: std::array::from_fn(|_| Arc::new(AtomicUsize::new(0))),
         }
     }
 }
@@ -106,14 +112,22 @@ impl InventoryBackend for Backend {
             Ok(())
         }
     }
-    fn transition(&self, _: u64, _: TaskClass, state: TaskState) -> Result<()> {
+    fn transition(&self, _: u64, class: TaskClass, state: TaskState) -> Result<()> {
+        let index = match class {
+            TaskClass::Prepare => 0,
+            TaskClass::Enumerate => 1,
+            TaskClass::File => 2,
+        };
         match state {
             TaskState::Offered => {
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak.fetch_max(active, Ordering::SeqCst);
+                let active = self.class_active[index].fetch_add(1, Ordering::SeqCst) + 1;
+                self.class_peak[index].fetch_max(active, Ordering::SeqCst);
             }
             TaskState::Received => {
                 self.active.fetch_sub(1, Ordering::SeqCst);
+                self.class_active[index].fetch_sub(1, Ordering::SeqCst);
             }
             _ => {}
         }
@@ -136,6 +150,167 @@ impl Gate {
         *lock.lock().unwrap() = true;
         wake.notify_all();
     }
+}
+
+#[test]
+fn shared_domain_sessions_overlap_with_bounded_admission_and_settle_independently() {
+    let executor = memcordon_ci::inventory_workers::InventoryExecutor::native_pipeline().unwrap();
+    let gate = Gate::default();
+    let (started, observed) = mpsc::channel();
+    let mut controllers = Vec::new();
+    let mut peaks = Vec::new();
+    let mut actives = Vec::new();
+    let mut class_peaks = Vec::new();
+    for domain in 0..2 {
+        let backend = Backend::new(
+            std::iter::once((0, Kind::Directory((1..=64).collect())))
+                .chain((1..=64).map(|id| (id, Kind::File)))
+                .collect(),
+            {
+                let gate = gate.clone();
+                let started = started.clone();
+                move |event, id| {
+                    if event == Event::Read && id == 1 {
+                        started.send(domain).unwrap();
+                        gate.wait();
+                    }
+                    Ok(())
+                }
+            },
+        );
+        peaks.push(Arc::clone(&backend.peak));
+        actives.push(Arc::clone(&backend.active));
+        class_peaks.push(backend.class_peak.clone());
+        let session =
+            InventorySession::with_executor(Arc::clone(&executor), TraversalLimits::DOMAIN)
+                .unwrap();
+        controllers.push(std::thread::spawn(move || {
+            session.measure(backend, 0, &mut BTreeSet::new())
+        }));
+    }
+    let first = observed.recv_timeout(Duration::from_secs(5));
+    let second = observed.recv_timeout(Duration::from_secs(5));
+    gate.release();
+    for controller in controllers {
+        assert_eq!(controller.join().unwrap().unwrap().len(), 65);
+    }
+    assert!(
+        first.is_ok() && second.is_ok(),
+        "independent domains must overlap: {first:?}, {second:?}"
+    );
+    assert_ne!(first.unwrap(), second.unwrap());
+    assert!(peaks.iter().all(|peak| peak.load(Ordering::SeqCst) <= 16));
+    assert!(
+        actives
+            .iter()
+            .all(|active| active.load(Ordering::SeqCst) == 0)
+    );
+    for peaks in class_peaks {
+        assert!(
+            peaks[0].load(Ordering::SeqCst) <= 8,
+            "domain preparation quota"
+        );
+        assert!(peaks[2].load(Ordering::SeqCst) <= 8, "domain file quota");
+    }
+    drop(executor);
+}
+
+#[test]
+fn invalid_domain_limits_are_rejected_and_one_frontier_credit_makes_progress() {
+    let executor = memcordon_ci::inventory_workers::InventoryExecutor::native_pipeline().unwrap();
+    for limits in [
+        TraversalLimits {
+            outstanding: 0,
+            files: 1,
+            preparations: 1,
+        },
+        TraversalLimits {
+            outstanding: 16,
+            files: 0,
+            preparations: 8,
+        },
+        TraversalLimits {
+            outstanding: 16,
+            files: 8,
+            preparations: 0,
+        },
+        TraversalLimits {
+            outstanding: 33,
+            files: 8,
+            preparations: 8,
+        },
+        TraversalLimits {
+            outstanding: 1,
+            files: 2,
+            preparations: 1,
+        },
+        TraversalLimits {
+            outstanding: 1,
+            files: 1,
+            preparations: 2,
+        },
+    ] {
+        assert!(InventorySession::with_executor(Arc::clone(&executor), limits).is_err());
+    }
+    let session = InventorySession::with_executor(
+        executor,
+        TraversalLimits {
+            outstanding: 1,
+            files: 1,
+            preparations: 1,
+        },
+    )
+    .unwrap();
+    let backend = Backend::new(
+        BTreeMap::from([
+            (0, Kind::Directory(vec![1, 2])),
+            (1, Kind::File),
+            (2, Kind::File),
+        ]),
+        |_, _| Ok(()),
+    );
+    assert_eq!(
+        session
+            .measure(backend, 0, &mut BTreeSet::new())
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn a_failed_domain_settles_without_cancelling_the_other_shared_session() {
+    let executor = memcordon_ci::inventory_workers::InventoryExecutor::native_pipeline().unwrap();
+    let mut controllers = Vec::new();
+    for domain in 0..2 {
+        let backend = Backend::new(
+            std::iter::once((0, Kind::Directory((1..=64).collect())))
+                .chain((1..=64).map(|id| (id, Kind::File)))
+                .collect(),
+            move |event, id| {
+                if domain == 0 && event == Event::Read && id == 1 {
+                    panic!("injected domain worker panic");
+                }
+                Ok(())
+            },
+        );
+        let session =
+            InventorySession::with_executor(Arc::clone(&executor), TraversalLimits::DOMAIN)
+                .unwrap();
+        controllers.push(std::thread::spawn(move || {
+            session.measure(backend, 0, &mut BTreeSet::new())
+        }));
+    }
+    let source = controllers.remove(0).join().unwrap();
+    let native = controllers.remove(0).join().unwrap();
+    assert!(
+        source
+            .unwrap_err()
+            .to_string()
+            .contains("inventory worker panicked")
+    );
+    assert_eq!(native.unwrap().len(), 65);
+    drop(executor);
 }
 
 #[test]

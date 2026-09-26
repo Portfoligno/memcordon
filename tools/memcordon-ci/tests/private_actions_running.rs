@@ -14,7 +14,7 @@ fn context() -> CertificationContext {
             repository: "Portfoligno/memcordon".into(),
             run_id: NonZeroU64::new(42).unwrap(),
             run_attempt: NonZeroU32::new(3).unwrap(),
-            job: "linux-private-candidate".into(),
+            job: "linux-private-candidate-x64".into(),
             workflow_ref: "Portfoligno/memcordon/.github/workflows/release.yml@refs/heads/main"
                 .into(),
             workflow_commit: "a".repeat(40),

@@ -32,7 +32,7 @@ jobs:
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
@@ -108,7 +108,7 @@ jobs:
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
@@ -183,7 +183,7 @@ jobs:
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
@@ -235,18 +235,10 @@ jobs:
             target/ci/source-home/git/db
           key: ${{ steps.certification-deps.outputs.cache-primary-key }}
 
-  windows-provider-lifecycle:
-    name: Windows provider lifecycle / ${{ matrix.id }}
-    needs: windows-loader-production
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: x64
-            runner: windows-2025
-          - id: arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
+  windows-provider-lifecycle-x64:
+    name: Windows provider lifecycle / x64
+    needs: windows-loader-production-x64
+    runs-on: windows-2025
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -254,7 +246,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: windows-loader-production-${{ matrix.id }}
+          name: windows-loader-production-x64
           path: target/ci/reports/windows-sealed-v2/loader-production
       - id: lifecycle-deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -263,16 +255,16 @@ jobs:
             target/ci/source-home/registry/index
             target/ci/source-home/registry/cache
             target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+          key: managed-sources-v2-cargo-deps-windows-provider-lifecycle-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
         with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          name: inventory-${{ github.job }}-${{ github.run_attempt }}
           path: |
             target/ci/reports/inventory-observation/v1/**/run-start.json
             target/ci/reports/inventory-observation/v1/**/phase-*.json
@@ -288,12 +280,12 @@ jobs:
             target/ci/bootstrap
             target/ci/backend
             target/ci/windows-sealed
-          key: managed-v2-cargo-target-windows-provider-lifecycle-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
+          key: managed-v2-cargo-target-windows-provider-lifecycle-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle
       - if: always()
         uses: ./.github/actions/upload-artifact
         with:
-          name: windows-provider-lifecycle-${{ matrix.id }}
+          name: windows-provider-lifecycle-x64
           path: target/ci/reports/windows-sealed-v2
           if-no-files-found: error
           retention-days: 14
@@ -318,18 +310,85 @@ jobs:
             target/ci/source-home/git/db
           key: ${{ steps.lifecycle-deps.outputs.cache-primary-key }}
 
-  windows-package-channel:
-    name: Windows package channel / ${{ matrix.id }}
-    needs: windows-provider-lifecycle
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: x64
-            runner: windows-2025
-          - id: arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
+  windows-provider-lifecycle-arm64:
+    name: Windows provider lifecycle / arm64
+    needs: windows-loader-production-arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: windows-loader-production-arm64
+          path: target/ci/reports/windows-sealed-v2/loader-production
+      - id: lifecycle-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-windows-provider-lifecycle-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
+      - id: inventory-observation
+        if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: inventory-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
+      - id: lifecycle-target
+        if: steps.build-context-prepare.outcome == 'success'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/backend
+            target/ci/windows-sealed
+          key: managed-v2-cargo-target-windows-provider-lifecycle-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
+      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-provider-lifecycle
+      - if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: windows-provider-lifecycle-arm64
+          path: target/ci/reports/windows-sealed-v2
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - id: build-context-audit
+        if: always() && steps.build-context-prepare.outcome == 'success'
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.lifecycle-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.lifecycle-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/backend
+            target/ci/windows-sealed
+          key: ${{ steps.lifecycle-target.outputs.cache-primary-key }}
+      - if: always() && steps.lifecycle-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: ${{ steps.lifecycle-deps.outputs.cache-primary-key }}
+
+  windows-package-channel-x64:
+    name: Windows package channel / x64
+    needs: windows-provider-lifecycle-x64
+    runs-on: windows-2025
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -337,7 +396,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: windows-provider-lifecycle-${{ matrix.id }}
+          name: windows-provider-lifecycle-x64
           path: target/ci/reports/windows-sealed-v2
       - id: package-deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -346,16 +405,16 @@ jobs:
             target/ci/source-home/registry/index
             target/ci/source-home/registry/cache
             target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-windows-package-channel-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+          key: managed-sources-v2-cargo-deps-windows-package-channel-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
         with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          name: inventory-${{ github.job }}-${{ github.run_attempt }}
           path: |
             target/ci/reports/inventory-observation/v1/**/run-start.json
             target/ci/reports/inventory-observation/v1/**/phase-*.json
@@ -370,16 +429,15 @@ jobs:
           path: |
             target/ci/bootstrap
             target/ci/windows-sealed
-            target/ci/windows-sealed-cargo
-          key: managed-v2-cargo-target-windows-package-channel-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
+            target/ci/windows-sealed-cargo/build
+            !target/ci/windows-sealed-cargo/build/package
+          key: managed-v2-cargo-target-windows-package-channel-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
       - name: Certify packaged Cargo channel
-        env:
-          CARGO_TARGET_DIR: target/ci/windows-sealed-cargo/build
         run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel
       - if: always()
         uses: ./.github/actions/upload-artifact
         with:
-          name: windows-package-channel-${{ matrix.id }}
+          name: windows-package-channel-x64
           path: target/ci/windows-sealed-cargo
           if-no-files-found: error
           retention-days: 14
@@ -393,7 +451,8 @@ jobs:
           path: |
             target/ci/bootstrap
             target/ci/windows-sealed
-            target/ci/windows-sealed-cargo
+            target/ci/windows-sealed-cargo/build
+            !target/ci/windows-sealed-cargo/build/package
           key: ${{ steps.package-target.outputs.cache-primary-key }}
       - if: always() && steps.package-deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -404,19 +463,89 @@ jobs:
             target/ci/source-home/git/db
           key: ${{ steps.package-deps.outputs.cache-primary-key }}
 
-  windows-loader-lab:
-    name: Windows loader lab / ${{ matrix.id }}
+  windows-package-channel-arm64:
+    name: Windows package channel / arm64
+    needs: windows-provider-lifecycle-arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: windows-provider-lifecycle-arm64
+          path: target/ci/reports/windows-sealed-v2
+      - id: package-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-windows-package-channel-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
+      - id: inventory-observation
+        if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: inventory-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
+      - id: package-target
+        if: steps.build-context-prepare.outcome == 'success'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/windows-sealed
+            target/ci/windows-sealed-cargo/build
+            !target/ci/windows-sealed-cargo/build/package
+          key: managed-v2-cargo-target-windows-package-channel-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
+      - name: Certify packaged Cargo channel
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-package-channel
+      - if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: windows-package-channel-arm64
+          path: target/ci/windows-sealed-cargo
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - id: build-context-audit
+        if: always() && steps.build-context-prepare.outcome == 'success'
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.package-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.package-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/windows-sealed
+            target/ci/windows-sealed-cargo/build
+            !target/ci/windows-sealed-cargo/build/package
+          key: ${{ steps.package-target.outputs.cache-primary-key }}
+      - if: always() && steps.package-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: ${{ steps.package-deps.outputs.cache-primary-key }}
+
+  windows-loader-lab-x64:
+    name: Windows loader lab / x64
     if: always() && github.event_name == 'workflow_dispatch'
-    needs: windows-loader-production
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: x64
-            runner: windows-2025
-          - id: arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
+    needs: windows-loader-production-x64
+    runs-on: windows-2025
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -424,7 +553,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: windows-loader-production-${{ matrix.id }}
+          name: windows-loader-production-x64
           path: target/ci/reports/windows-sealed-v2/loader-production
       - id: lab-deps
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -433,16 +562,16 @@ jobs:
             target/ci/source-home/registry/index
             target/ci/source-home/registry/cache
             target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-windows-loader-lab-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+          key: managed-sources-v2-cargo-deps-windows-loader-lab-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
         with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          name: inventory-${{ github.job }}-${{ github.run_attempt }}
           path: |
             target/ci/reports/inventory-observation/v1/**/run-start.json
             target/ci/reports/inventory-observation/v1/**/phase-*.json
@@ -458,12 +587,12 @@ jobs:
             target/ci/bootstrap
             target/ci/windows-sealed
             target/ci/windows-loader-lab
-          key: managed-v2-cargo-target-windows-loader-lab-v1-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
+          key: managed-v2-cargo-target-windows-loader-lab-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-lab
       - if: always()
         uses: ./.github/actions/upload-artifact
         with:
-          name: windows-loader-lab-${{ matrix.id }}
+          name: windows-loader-lab-x64
           path: target/ci/reports/windows-sealed-v2/loader-lab
           if-no-files-found: error
           retention-days: 14
@@ -488,19 +617,85 @@ jobs:
             target/ci/source-home/git/db
           key: ${{ steps.lab-deps.outputs.cache-primary-key }}
 
-  windows-loader-production:
-    name: Windows loader production / ${{ matrix.id }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: x64
-            runner: windows-2025
-            inventory-trace: false
-          - id: arm64
-            runner: windows-11-arm
-            inventory-trace: true
-    runs-on: ${{ matrix.runner }}
+  windows-loader-lab-arm64:
+    name: Windows loader lab / arm64
+    if: always() && github.event_name == 'workflow_dispatch'
+    needs: windows-loader-production-arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: windows-loader-production-arm64
+          path: target/ci/reports/windows-sealed-v2/loader-production
+      - id: lab-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-windows-loader-lab-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin
+      - id: inventory-observation
+        if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: inventory-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
+      - id: lab-target
+        if: steps.build-context-prepare.outcome == 'success'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/windows-sealed
+            target/ci/windows-loader-lab
+          key: managed-v2-cargo-target-windows-loader-lab-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'ci/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml') }}
+      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-lab
+      - if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: windows-loader-lab-arm64
+          path: target/ci/reports/windows-sealed-v2/loader-lab
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - id: build-context-audit
+        if: always() && steps.build-context-prepare.outcome == 'success'
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.lab-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.lab-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/windows-sealed
+            target/ci/windows-loader-lab
+          key: ${{ steps.lab-target.outputs.cache-primary-key }}
+      - if: always() && steps.lab-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: ${{ steps.lab-deps.outputs.cache-primary-key }}
+
+  windows-loader-production-x64:
+    name: Windows loader production / x64
+    runs-on: windows-2025
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -513,19 +708,88 @@ jobs:
             target/ci/source-home/registry/index
             target/ci/source-home/registry/cache
             target/ci/source-home/git/db
-          key: managed-sources-v2-cargo-deps-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
+          key: managed-sources-v2-cargo-deps-windows-loader-production-v3-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
       - run: rustup toolchain install 1.97.1 --profile minimal
       - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
-      - id: trace-volume-qualification
-        if: matrix.inventory-trace
-        run: ./ci-native-fingerprint.exe --qualify-trace-volume
       - id: build-context-prepare
-        run: ./ci-native-fingerprint.exe --output target/ci/native-inputs.bin --trace-inventory ${{ matrix.inventory-trace }}
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin --trace-inventory false
       - id: inventory-observation
         if: always()
         uses: ./.github/actions/upload-artifact
         with:
-          name: inventory-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          name: inventory-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            target/ci/reports/inventory-observation/v1/**/run-start.json
+            target/ci/reports/inventory-observation/v1/**/phase-*.json
+            target/ci/reports/inventory-observation/v1/**/inventory-*.json
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 0
+      - id: certification-target
+        if: steps.build-context-prepare.outcome == 'success'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/backend
+            target/ci/windows-sealed
+          key: managed-v2-cargo-target-windows-loader-production-v3-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
+      - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production
+      - if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: windows-loader-production-x64
+          path: target/ci/reports/windows-sealed-v2/loader-production
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - id: build-context-audit
+        if: always() && steps.build-context-prepare.outcome == 'success'
+        run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci audit-build-context --input target/ci/native-inputs.bin
+      - if: always() && steps.certification-target.outputs.cache-hit != 'true' && steps.build-context-audit.outcome == 'success' && steps.build-context-prepare.outcome == 'success' && steps.certification-target.outputs.cache-primary-key != '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/bootstrap
+            target/ci/backend
+            target/ci/windows-sealed
+          key: ${{ steps.certification-target.outputs.cache-primary-key }}
+      - if: always() && steps.certification-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: ${{ steps.certification-deps.outputs.cache-primary-key }}
+
+  windows-loader-production-arm64:
+    name: Windows loader production / arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: certification-deps
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            target/ci/source-home/registry/index
+            target/ci/source-home/registry/cache
+            target/ci/source-home/git/db
+          key: managed-sources-v2-cargo-deps-windows-loader-production-v3-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/**/Cargo.toml', 'tools/**/Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock', 'rust-toolchain.toml') }}
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup run 1.97.1 rustc --edition=2021 tools/ci-native-fingerprint.rs -o ci-native-fingerprint.exe
+      - id: trace-volume-qualification
+        run: ./ci-native-fingerprint.exe --qualify-trace-volume
+      - id: build-context-prepare
+        run: ./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin --trace-inventory true
+      - id: inventory-observation
+        if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: inventory-${{ github.job }}-${{ github.run_attempt }}
           path: |
             target/ci/reports/inventory-observation/v1/**/run-start.json
             target/ci/reports/inventory-observation/v1/**/phase-*.json
@@ -543,13 +807,12 @@ jobs:
             target/ci/bootstrap
             target/ci/backend
             target/ci/windows-sealed
-            target/ci/windows-sealed-cargo
-          key: managed-v2-cargo-target-backend-certification-v2-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
+          key: managed-v2-cargo-target-windows-loader-production-v3-${{ runner.os }}-${{ runner.arch }}-1.97.1-${{ hashFiles('target/ci/native-inputs.bin', 'Cargo.lock', 'Cargo.toml', 'crates/**', 'tools/**', 'fuzz/**', 'ci/**', 'docs/**', 'spec/**', 'packaging/**', 'rust-toolchain.toml', '.github/workflows/backend-certification.yml', '.github/workflows/release.yml') }}
       - run: ./target/ci/control-bootstrap/ci-bootstrap/memcordon-ci --build-context target/ci/native-inputs.bin suite windows-loader-production
       - if: always()
         uses: ./.github/actions/upload-artifact
         with:
-          name: windows-loader-production-${{ matrix.id }}
+          name: windows-loader-production-arm64
           path: target/ci/reports/windows-sealed-v2/loader-production
           if-no-files-found: error
           retention-days: 14
@@ -564,7 +827,6 @@ jobs:
             target/ci/bootstrap
             target/ci/backend
             target/ci/windows-sealed
-            target/ci/windows-sealed-cargo
           key: ${{ steps.certification-target.outputs.cache-primary-key }}
       - if: always() && steps.certification-deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9

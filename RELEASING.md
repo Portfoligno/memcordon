@@ -18,6 +18,50 @@ agent; Windows archives contain all four binaries. Each archive includes
 runtime not applicable. Release schema 3, native asset report schema 2, and
 publication report schema 2 bind that exact inventory.
 
+Native archive production starts alongside full preflight. Linux x64 and ARM64
+have separate producers; macOS retains its two-target producer matrix. Each
+Windows architecture has its own native → loader → provider → package chain,
+with a fresh runner for every phase. Release Windows qualification requires
+the downloaded native archive and cannot fall back to a development build.
+Assembly directly waits for preflight, every native producer, both Windows
+package leaves, both complete Miri/fuzz halves, and all certification and macOS
+acceptance families. Rehearsal and publication require that full public
+closure. Individual phases retain independent rerun and host-state boundaries.
+
+After publication, `verify-public-global` validates all public assets, registry
+records, certification producer provenance, workflow/composite-action resources,
+release-note binding and ordered checksums, then qualifies Linux x64.
+`verify-public-windows` qualifies the matching Windows archive and every pinned
+registry consumer on each architecture. Host jobs authenticate manifest,
+report and archive against the validated local bundle. The compatibility
+`release verify-public` command retains full verification for reconciliation.
+Public reads use at most four workers per global phase, shared absolute request
+deadlines and ordered failure reporting; provider operations remain serial.
+Bounded verification diagnostics are uploaded on success and failure.
+
+Compiled caches contain compilation outputs only. Tool caches contain
+`target/ci-tools/bin` and `target/ci-tools/build`; temporary tool staging,
+inventory admission, evidence, release bundles, installed provider state and
+private trust/signing/observer state are excluded. Compiled writes require
+successful preparation/audit and the default branch. Package creation and
+Cargo installation share explicit typed target paths; packaging does not read
+an ambient `CARGO_TARGET_DIR` override.
+
+Private native dispatch is a separate optional qualification chain described in
+[the private trust runbook](docs/private-release-trust.md). Its B/M0 sidecars,
+completed Q/CQ collection, pre-install M1/A sealing, fresh installed H1 and
+completed P/CP collection do not replace historical public asset authority.
+Ordinary publication does not depend on skipped opt-in private jobs. Changed
+workflow/verifier identities require independently reissued protected intents
+and enrolled native subjects before that branch can succeed.
+
+Record queue, preparation/audit, shard execution, artifact-ready-to-next-start,
+cache-hit and public-throttle times on comparable release candidates. Historical
+timing estimates are not guarantees. Separate `release-macos-native` and
+`release-macos-acceptance` suite APIs are available; enabling their two workflow
+matrices remains gated on queue-inclusive macOS runner measurements. The
+current combined acceptance family retains both tests and acceptance coverage.
+
 Repository architecture, validation suites, and backend certification are
 described in [MAINTAINERS.md](MAINTAINERS.md). Record user-visible changes in
 [CHANGELOG.md](CHANGELOG.md).

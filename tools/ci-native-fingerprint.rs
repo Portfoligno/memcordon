@@ -9,6 +9,71 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub const CONTROL_PROFILE: &str = "ci-bootstrap";
+pub const PREPARATION_PROFILES: &[&str] = &[
+    "stable",
+    "msrv",
+    "miri",
+    "fuzz",
+    "supply-chain",
+    "release-preflight",
+];
+
+pub fn parse_preparation_arguments(arguments: &[OsString]) -> io::Result<(&str, &Path, bool)> {
+    if !matches!(arguments.len(), 4 | 6)
+        || arguments[0] != "--profile"
+        || arguments[2] != "--output"
+        || arguments[3].is_empty()
+        || arguments[3]
+            .to_str()
+            .is_some_and(|value| value.starts_with("--"))
+    {
+        return Err(io::Error::other(
+            "usage: ci-native-fingerprint --profile PROFILE --output PATH [--trace-inventory true|false]",
+        ));
+    }
+    let profile = arguments[1]
+        .to_str()
+        .filter(|profile| PREPARATION_PROFILES.contains(profile))
+        .ok_or_else(|| io::Error::other("unknown preparation profile"))?;
+    let trace_inventory = if arguments.len() == 6 {
+        if arguments[4] != "--trace-inventory" {
+            return Err(io::Error::other("unknown native fingerprint option"));
+        }
+        match arguments[5].to_str() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => return Err(io::Error::other("trace-inventory must be true or false")),
+        }
+    } else {
+        false
+    };
+    if trace_inventory && !cfg!(windows) {
+        return Err(io::Error::other("inventory tracing requires Windows"));
+    }
+    Ok((profile, Path::new(&arguments[3]), trace_inventory))
+}
+
+pub fn promote_tool(staging: &Path, destination: &Path, expected_digest: &str) -> io::Result<()> {
+    if !fs::symlink_metadata(staging)?.file_type().is_file() {
+        return Err(io::Error::other("staged tool must be a regular executable"));
+    }
+    if bounded::sha256::digest(&mut fs::File::open(staging)?)? != expected_digest {
+        return Err(io::Error::other("staged tool changed before promotion"));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::other("tool destination lacks parent"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = destination.with_extension("promoting");
+    fs::copy(staging, &temporary)?;
+    if bounded::sha256::digest(&mut fs::File::open(&temporary)?)? != expected_digest {
+        return Err(io::Error::other("tool promotion changed executable bytes"));
+    }
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+    fs::rename(temporary, destination)
+}
 
 #[path = "ci-build-environment.rs"]
 mod environment;
@@ -25,8 +90,17 @@ pub fn capture(
     arguments: &[&str],
     environment: &BTreeMap<OsString, OsString>,
 ) -> io::Result<Vec<u8>> {
+    capture_with_budget(program, arguments, environment, Duration::from_secs(15))
+}
+
+fn capture_with_budget(
+    program: &str,
+    arguments: &[&str],
+    environment: &BTreeMap<OsString, OsString>,
+    budget: Duration,
+) -> io::Result<Vec<u8>> {
     let description = format!("program={program:?} arguments={arguments:?}");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + budget;
     let program = program.to_owned();
     let arguments: Vec<String> = arguments.iter().map(|value| (*value).to_owned()).collect();
     let environment = environment.clone();
@@ -153,28 +227,11 @@ fn run() -> io::Result<()> {
             configure_recording_environment,
         );
     }
-    if !matches!(arguments.len(), 2 | 4) || arguments[0] != "--output" {
-        return Err(io::Error::other(
-            "usage: ci-native-fingerprint --output PATH [--trace-inventory true|false]",
-        ));
-    }
-    let trace_inventory = if arguments.len() == 4 {
-        if arguments[2] != "--trace-inventory" {
-            return Err(io::Error::other("unknown native fingerprint option"));
-        }
-        match arguments[3].to_str() {
-            Some("true") => true,
-            Some("false") => false,
-            _ => return Err(io::Error::other("trace-inventory must be true or false")),
-        }
-    } else {
-        false
-    };
-    if trace_inventory && !cfg!(windows) {
-        return Err(io::Error::other("inventory tracing requires Windows"));
-    }
+    let (profile, output, trace_inventory) = parse_preparation_arguments(&arguments)?;
+    #[cfg(not(windows))]
+    let _ = trace_inventory;
     let root = environment::command_path(&std::env::current_dir()?)?;
-    let path = root.join(&arguments[1]);
+    let path = root.join(output);
     bounded::revoke(&path)?;
     let mut journal =
         bounded::Journal::create(&root.join("target/ci/reports/inventory-observation/v1"))?;
@@ -216,8 +273,23 @@ fn run() -> io::Result<()> {
     fs::create_dir_all(&work)?;
     fs::create_dir_all(&cargo_home)?;
     let rustup = environment::resolve_tool(std::ffi::OsStr::new("rustup"), &env)?;
-    let job = std::env::var("GITHUB_JOB").unwrap_or_default();
-    if job.contains("miri") || job.contains("fuzz") {
+    if matches!(profile, "msrv" | "release-preflight") {
+        let policy = fs::read_to_string(root.join("ci/toolchains.toml"))?;
+        let msrv = policy
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("msrv = \"")
+                    .and_then(|value| value.strip_suffix('"'))
+            })
+            .ok_or_else(|| io::Error::other("pinned MSRV policy missing"))?;
+        let mut install = Command::new(&rustup);
+        install
+            .args(["toolchain", "install", msrv, "--profile", "minimal"])
+            .env_clear()
+            .envs(&env);
+        run_bounded("install MSRV toolchain", &mut install, &mut journal)?;
+    }
+    if matches!(profile, "miri" | "fuzz") {
         let policy = fs::read_to_string(root.join("ci/toolchains.toml"))?;
         let nightly = policy
             .lines()
@@ -242,7 +314,7 @@ fn run() -> io::Result<()> {
             .env_clear()
             .envs(&env);
         run_bounded("install nightly toolchain", &mut install, &mut journal)?;
-        if job.contains("miri") {
+        if profile == "miri" {
             let mut setup = Command::new(&rustup);
             setup
                 .args(["run", nightly, "cargo", "miri", "setup"])
@@ -282,7 +354,7 @@ fn run() -> io::Result<()> {
             bin.join(if cfg!(windows) { "rustc.exe" } else { "rustc" }),
         );
     run_bounded("fetch workspace sources", &mut fetch, &mut journal)?;
-    if job.contains("fuzz") {
+    if profile == "fuzz" {
         let mut fetch = Command::new(&cargo);
         fetch
             .args(["fetch", "--locked", "--manifest-path"])
@@ -321,14 +393,22 @@ fn run() -> io::Result<()> {
                 "rustdoc"
             }),
         );
-    run_bounded("compile fingerprint controller", &mut build, &mut journal)?;
+    let group_deadline = bounded::GroupDeadline::new(bounded::CHILD_BUDGET)?;
+    journal.group_start(group_deadline)?;
+    let mut controller_journal = journal.task(bounded::TaskKind::Controller)?;
+    bounded::run_in_group(
+        &mut build,
+        "compile fingerprint controller",
+        &mut controller_journal,
+        group_deadline,
+    )?;
     // Auxiliary packages have their own published lockfiles. Acquire and build
     // them before measuring source trees, so later compilation cannot introduce
     // an unmeasured resolver or toolchain input into a shared cache identity.
     let tool_policy = fs::read_to_string(root.join("ci/tools.toml"))?;
-    let selected: &[(&str, &str)] = if job.contains("fuzz") {
+    let selected: &[(&str, &str)] = if profile == "fuzz" {
         &[("cargo_fuzz", "cargo-fuzz")]
-    } else if job.contains("supply") || job.contains("preflight") {
+    } else if matches!(profile, "supply-chain" | "release-preflight") {
         &[("cargo_audit", "cargo-audit"), ("cargo_deny", "cargo-deny")]
     } else {
         &[]
@@ -348,6 +428,10 @@ fn run() -> io::Result<()> {
                     .flatten()
             })
             .ok_or_else(|| io::Error::other("pinned auxiliary tool policy missing"))?;
+        let staging = root.join("target/ci-tools/staging").join(package);
+        if staging.exists() {
+            fs::remove_dir_all(&staging)?;
+        }
         let mut install = Command::new(&cargo);
         install
             .args([
@@ -358,9 +442,9 @@ fn run() -> io::Result<()> {
                 version,
                 "--root",
             ])
-            .arg(root.join("target/ci-tools"))
+            .arg(&staging)
             .arg("--target-dir")
-            .arg(root.join("target/ci-tools/build"))
+            .arg(root.join("target/ci-tools/build").join(package))
             .current_dir(&work)
             .env_clear()
             .envs(&env)
@@ -369,8 +453,52 @@ fn run() -> io::Result<()> {
                 "RUSTC",
                 bin.join(if cfg!(windows) { "rustc.exe" } else { "rustc" }),
             );
-        run_bounded("install managed native tool", &mut install, &mut journal)?;
+        let auxiliary = journal.task(bounded::TaskKind::Auxiliary)?;
+        let kind = match *package {
+            "cargo-audit" => bounded::TaskKind::CargoAudit,
+            "cargo-deny" => bounded::TaskKind::CargoDeny,
+            "cargo-fuzz" => bounded::TaskKind::CargoFuzz,
+            _ => unreachable!("closed tool inventory"),
+        };
+        let mut tool_journal = auxiliary.task(kind)?;
+        bounded::run_in_group(
+            &mut install,
+            "install managed native tool",
+            &mut tool_journal,
+            group_deadline,
+        )?;
+        let mut name = std::path::PathBuf::from(package);
+        if cfg!(windows) {
+            name.set_extension("exe");
+        }
+        let executable = staging.join("bin").join(&name);
+        let identity = capture_with_budget(
+            executable
+                .to_str()
+                .ok_or_else(|| io::Error::other("non-Unicode staged executable"))?,
+            &["--version"],
+            &env,
+            group_deadline.remaining()?.min(Duration::from_secs(15)),
+        )?;
+        if identity.len() > 8192
+            || !String::from_utf8_lossy(&identity)
+                .split_whitespace()
+                .any(|value| value == version)
+        {
+            return Err(io::Error::other(
+                "staged tool version differs from pinned policy",
+            ));
+        }
+        group_deadline.remaining()?;
+        let digest = bounded::sha256::digest(&mut fs::File::open(&executable)?)?;
+        promote_tool(
+            &executable,
+            &root.join("target/ci-tools/bin").join(name),
+            &digest,
+        )?;
     }
+    group_deadline.remaining()?;
+    journal.group_outcome(&[Ok(()), Ok(())])?;
     let controller = root
         .join("target/ci/control-bootstrap")
         .join(CONTROL_PROFILE)
@@ -380,7 +508,7 @@ fn run() -> io::Result<()> {
             "memcordon-ci"
         });
     let mut plan = Command::new(controller);
-    plan.args(["build-context", "--output"])
+    plan.args(["build-context", "--profile", profile, "--output"])
         .arg(&candidate)
         .arg("--observation-dir")
         .arg(journal.directory())

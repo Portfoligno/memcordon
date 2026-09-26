@@ -178,6 +178,50 @@ pub struct Journal {
     directory: PathBuf,
     sequence: u64,
 }
+
+#[derive(Clone, Copy, Debug)]
+pub enum TaskKind {
+    Controller,
+    Auxiliary,
+    CargoAudit,
+    CargoDeny,
+    CargoFuzz,
+    MiriSysroot,
+}
+
+impl TaskKind {
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Controller => "000-controller",
+            Self::Auxiliary => "001-auxiliary",
+            Self::CargoAudit => "000-cargo-audit",
+            Self::CargoDeny => "001-cargo-deny",
+            Self::CargoFuzz => "000-cargo-fuzz",
+            Self::MiriSysroot => "000-miri-sysroot",
+        }
+    }
+}
+
+/// One immutable group deadline is copied into each lane; task creation cannot
+/// renew the parent budget. Parallel scheduling remains a measured rollout.
+#[derive(Clone, Copy)]
+pub struct GroupDeadline(Instant);
+
+impl GroupDeadline {
+    pub fn new(budget: Duration) -> io::Result<Self> {
+        Instant::now()
+            .checked_add(budget)
+            .map(Self)
+            .ok_or_else(|| io::Error::other("bootstrap group deadline overflow"))
+    }
+
+    pub fn remaining(self) -> io::Result<Duration> {
+        self.0
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::other("bootstrap group budget exhausted"))
+    }
+}
 impl Journal {
     pub fn create(base: &Path) -> io::Result<Self> {
         fs::create_dir_all(base)?;
@@ -205,6 +249,46 @@ impl Journal {
     pub fn directory(&self) -> &Path {
         &self.directory
     }
+    pub fn task(&self, kind: TaskKind) -> io::Result<Self> {
+        let directory = self.directory.join("tasks").join(kind.directory());
+        fs::create_dir_all(&directory)?;
+        Ok(Self {
+            directory,
+            sequence: 0,
+        })
+    }
+
+    pub fn group_outcome(&self, results: &[io::Result<()>]) -> io::Result<()> {
+        let failures: Vec<_> = results
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, result)| {
+                result.as_ref().err().map(|error| {
+                    format!(
+                        "{{\"ordinal\":{ordinal},\"error\":{}}}",
+                        json_string(&error.to_string())
+                    )
+                })
+            })
+            .collect();
+        let record = format!(
+            "{{\"schema\":1,\"outcome\":{},\"failures\":[{}]}}\n",
+            json_string(if failures.is_empty() {
+                "passed"
+            } else {
+                "failed"
+            }),
+            failures.join(",")
+        );
+        self.write("phase-bootstrap-group.json", record.as_bytes())
+    }
+    pub fn group_start(&self, deadline: GroupDeadline) -> io::Result<()> {
+        let record = format!(
+            "{{\"schema\":1,\"outcome\":\"incomplete\",\"remaining_ms\":{}}}\n",
+            deadline.remaining()?.as_millis()
+        );
+        self.write("phase-bootstrap-group.json", record.as_bytes())
+    }
     fn write(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
         if bytes.len() > 65536 {
             return Err(io::Error::other("bootstrap journal record limit"));
@@ -218,12 +302,15 @@ impl Journal {
         file.sync_all()
     }
     pub fn start(&mut self, label: &str) -> io::Result<()> {
+        self.start_with_budget(label, CHILD_BUDGET)
+    }
+    fn start_with_budget(&mut self, label: &str, budget: Duration) -> io::Result<()> {
         self.sequence += 1;
         let record = format!(
             "{{\"schema\":1,\"sequence\":{},\"phase\":{},\"outcome\":\"running\",\"budget_ms\":{}}}\n",
             self.sequence,
             json_string(label),
-            CHILD_BUDGET.as_millis()
+            budget.as_millis()
         );
         self.write("phase-start.json", record.as_bytes())
     }
@@ -278,16 +365,84 @@ pub(crate) fn json_string(value: &str) -> String {
     output
 }
 pub fn run(command: &mut Command, label: &str, journal: &mut Journal) -> io::Result<Completion> {
-    journal.start(label)?;
+    run_with_budget(command, label, journal, CHILD_BUDGET)
+}
+
+pub fn run_in_group(
+    command: &mut Command,
+    label: &str,
+    journal: &mut Journal,
+    deadline: GroupDeadline,
+) -> io::Result<Completion> {
+    run_with_budget(
+        command,
+        label,
+        journal,
+        deadline.remaining()?.min(CHILD_BUDGET),
+    )
+}
+
+pub fn run_two_lanes<C, A>(
+    journal: &Journal,
+    deadline: GroupDeadline,
+    controller: C,
+    auxiliary: A,
+) -> io::Result<()>
+where
+    C: FnOnce(&mut Journal, GroupDeadline) -> io::Result<()> + Send,
+    A: FnOnce(&mut Journal, GroupDeadline) -> io::Result<()> + Send,
+{
+    let mut controller_journal = journal.task(TaskKind::Controller)?;
+    let mut auxiliary_journal = journal.task(TaskKind::Auxiliary)?;
+    journal.group_start(deadline)?;
+    let results = std::thread::scope(|scope| {
+        let controller = std::thread::Builder::new()
+            .name("bootstrap-controller".into())
+            .spawn_scoped(scope, move || controller(&mut controller_journal, deadline));
+        let auxiliary = std::thread::Builder::new()
+            .name("bootstrap-auxiliary".into())
+            .spawn_scoped(scope, move || auxiliary(&mut auxiliary_journal, deadline));
+        let settle = |handle: io::Result<std::thread::ScopedJoinHandle<'_, io::Result<()>>>,
+                      name: &str| {
+            match handle {
+                Ok(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| Err(io::Error::other(format!("{name} lane panicked")))),
+                Err(error) => Err(io::Error::other(format!("starting {name} lane: {error}"))),
+            }
+        };
+        // Both started lanes settle before fixed-ordinal errors or evidence are
+        // returned, including an OS failure to start either controller thread.
+        [
+            settle(controller, "controller"),
+            settle(auxiliary, "auxiliary"),
+        ]
+    });
+    let [controller, auxiliary] = results;
+    // Validation or promotion performed after a child settles still belongs to
+    // the original deadline. Budget failure follows lane failures by ordinal.
+    let results = [controller, auxiliary, deadline.remaining().map(|_| ())];
+    let observation = journal.group_outcome(&results);
+    for result in results {
+        result?;
+    }
+    observation
+}
+
+fn run_with_budget(
+    command: &mut Command,
+    label: &str,
+    journal: &mut Journal,
+    budget: Duration,
+) -> io::Result<Completion> {
+    journal.start_with_budget(label, budget)?;
     let mut clock = WallClock(Instant::now());
     #[cfg(windows)]
     let spawned = windows::spawn(command);
     #[cfg(not(windows))]
     let spawned = command.spawn();
     let (completion, history) = match spawned {
-        Ok(mut child) => {
-            supervise_with_usage(&mut child, &mut clock, CHILD_BUDGET, TERMINATION_BUDGET)
-        }
+        Ok(mut child) => supervise_with_usage(&mut child, &mut clock, budget, TERMINATION_BUDGET),
         Err(error) => {
             let completion = Completion {
                 outcome: Outcome::SpawnFailure,

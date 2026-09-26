@@ -1,10 +1,6 @@
-use memcordon_ci::release_private::{
-    OfflinePrivateQualifiedInputs, PrivateArchiveFormat, PrivateCandidateInputs,
-    QualifiedArchiveExpectation, QualifiedLinuxReadbackInputs, prepare_private_candidate,
-    prepare_private_final_manifest, prepare_private_qualified_offline, seal_qualified_archive,
-    validate_private_candidate_record, validate_qualified_archive,
-    validate_qualified_linux_readback,
-};
+pub use memcordon_ci::{CiError, Result, private_native, release_archive, workload_qualification};
+#[path = "../src/release_private.rs"]
+mod private_seal;
 use memcordon_ci::workload_qualification::{
     ARTIFACTS, PRIVATE_V2_ARTIFACTS, QualificationArtifactV1, QualificationKind,
     private_component_digest_v2, private_unit_digest_v2, reject_proposed_private_qualification_v2,
@@ -30,6 +26,13 @@ use memcordon_core::workload_qualification_v2::{
 };
 use memcordon_core::workload_registry_v2::ProfileKindV2;
 use memcordon_core::{BoundedText, BoundedVec, DiagnosticSha256};
+use private_seal::{
+    OfflinePrivateQualifiedInputs, PrivateArchiveFormat, PrivateCandidateInputs,
+    QualifiedArchiveExpectation, QualifiedLinuxReadbackInputs, prepare_private_candidate,
+    prepare_private_final_manifest, prepare_private_qualified_offline, seal_qualified_archive,
+    validate_private_candidate_record, validate_qualified_archive,
+    validate_qualified_linux_readback,
+};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
@@ -465,6 +468,103 @@ fn private_v2_acceptance_requires_every_checked_in_native_completion() {
         trusted_installed: &trusted,
     };
     let offline = prepare_private_qualified_offline(offline_inputs.clone()).unwrap();
+    let preinstall_inputs = private_seal::AuthenticatedPrivateArchiveInputs {
+        candidate: &wrong_candidate,
+        qualification_bytes: &bytes,
+        candidate_record_bytes: &candidate_record_bytes,
+        certificate_bytes: &certificate_bytes,
+        qualification_reference: reference.clone(),
+        expected_qualification: &expected,
+        component_bytes: &binaries,
+        static_bytes: &static_bytes,
+        archive_format: PrivateArchiveFormat::TarGz,
+    };
+    let preinstall = private_seal::seal_private_archive_before_install(preinstall_inputs).unwrap();
+    assert_eq!(preinstall.manifest().manifest(), &manifest);
+    assert_eq!(preinstall.archive_bytes(), offline.archive_bytes());
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(preinstall.archive_bytes()));
+    let names: Vec<_> = archive
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path().unwrap().into_owned())
+        .collect();
+    assert!(names.iter().all(|path| {
+        !path.to_string_lossy().contains("host-receipt")
+            && !path.to_string_lossy().contains("public-evidence")
+            && !path.to_string_lossy().contains("installed-inspection")
+    }));
+    // H1 is deliberately absent from pre-install inputs and archive inventory.
+    assert!(
+        !String::from_utf8_lossy(preinstall.manifest().manifest_bytes()).contains("host_receipt")
+    );
+    assert_eq!(
+        preinstall.archive_sha256(),
+        &hash_bytes(preinstall.archive_bytes())
+    );
+    let seal = |q: &[u8],
+                b: &[u8],
+                c: &[u8],
+                components: &BTreeMap<String, Vec<u8>>,
+                statics: &BTreeMap<String, Vec<u8>>| {
+        private_seal::seal_private_archive_before_install(
+            private_seal::AuthenticatedPrivateArchiveInputs {
+                candidate: &wrong_candidate,
+                qualification_bytes: q,
+                candidate_record_bytes: b,
+                certificate_bytes: c,
+                qualification_reference: reference.clone(),
+                expected_qualification: &expected,
+                component_bytes: components,
+                static_bytes: statics,
+                archive_format: PrivateArchiveFormat::TarGz,
+            },
+        )
+    };
+    assert!(
+        seal(
+            b"{}",
+            &candidate_record_bytes,
+            &certificate_bytes,
+            &binaries,
+            &static_bytes
+        )
+        .is_err()
+    );
+    assert!(seal(&bytes, b"{}", &certificate_bytes, &binaries, &static_bytes).is_err());
+    assert!(
+        seal(
+            &bytes,
+            &candidate_record_bytes,
+            b"{}",
+            &binaries,
+            &static_bytes
+        )
+        .is_err()
+    );
+    let mut surplus = binaries.clone();
+    surplus.insert("unreviewed-component".into(), vec![1]);
+    assert!(
+        seal(
+            &bytes,
+            &candidate_record_bytes,
+            &certificate_bytes,
+            &surplus,
+            &static_bytes
+        )
+        .is_err()
+    );
+    let mut missing = static_bytes.clone();
+    missing.pop_first();
+    assert!(
+        seal(
+            &bytes,
+            &candidate_record_bytes,
+            &certificate_bytes,
+            &binaries,
+            &missing
+        )
+        .is_err()
+    );
     assert_eq!(offline.final_manifest().manifest(), &manifest);
     assert_eq!(
         offline.archive_sha256(),

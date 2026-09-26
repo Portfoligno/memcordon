@@ -268,17 +268,89 @@ impl InventoryBackend for Backend {
     }
 
     fn read(&self, request: FileRequest, buffer: &mut [u8]) -> Result<ValidatedDigest> {
-        #[cfg(windows)]
-        use crate::inventory_reader::digest_native_file as digest_file;
-        #[cfg(target_os = "linux")]
-        use crate::inventory_reader::digest_unix_file as digest_file;
-        digest_file(
-            &request.path,
-            &request.expected,
-            buffer,
-            &self.progress,
-            |_| Ok(()),
-        )
+        #[cfg(target_os = "macos")]
+        {
+            // Keep macOS's established ordinary EOF read acceptance. Enabling
+            // the Linux stamp protocol here would be a separate behavior change.
+            self.check_cancelled()?;
+            let opened = self.progress.run(Operation::Open, &request.path, || {
+                open_sequential(&request.path)
+            });
+            let (digest, bytes) = match opened {
+                Ok(mut file) => self.progress.run(Operation::ReadHash, &request.path, || {
+                    crate::inventory_reader::digest_reader_with_length(
+                        &mut file,
+                        buffer,
+                        &self.progress,
+                        None,
+                    )
+                })?,
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    // Validate the fallback boundary before entering the shared
+                    // one-slot helper gate; never serialize ordinary reads.
+                    let canonical = crate::native_file_digest::validate_system_path(&request.path)?;
+                    static GATE: std::sync::OnceLock<
+                        crate::native_file_digest::ProtectedDigestGate,
+                    > = std::sync::OnceLock::new();
+                    let digest = GATE.get_or_init(Default::default).run(
+                        &self.progress.cancellation(),
+                        || {
+                            use std::os::unix::fs::MetadataExt;
+                            let stamp = |metadata: &fs::Metadata| {
+                                (
+                                    metadata.dev(),
+                                    metadata.ino(),
+                                    metadata.mode(),
+                                    metadata.size(),
+                                    metadata.mtime(),
+                                    metadata.mtime_nsec(),
+                                    metadata.ctime(),
+                                    metadata.ctime_nsec(),
+                                )
+                            };
+                            let before = fs::symlink_metadata(&canonical)?;
+                            if stamp(&before) != stamp(&request.expected) {
+                                return Err(CiError::Message(
+                                    "protected input changed before helper read".into(),
+                                ));
+                            }
+                            let digest =
+                                self.progress.run(Operation::Access, &canonical, || {
+                                    protected_native_digest(&canonical)
+                                })?;
+                            let after = fs::symlink_metadata(&canonical)?;
+                            if stamp(&after) != stamp(&before) {
+                                return Err(CiError::Message(
+                                    "protected input changed during helper read".into(),
+                                ));
+                            }
+                            Ok(digest)
+                        },
+                    )?;
+                    // The protected helper requires an exact regular-file length
+                    // and validates its content stamp. Ordinary EOF reads above
+                    // count returned bytes, including zero-length virtual files.
+                    (digest, request.expected.len())
+                }
+                Err(error) => return Err(error.into()),
+            };
+            self.progress.file_validated(bytes);
+            return Ok(ValidatedDigest { digest, bytes });
+        }
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            #[cfg(windows)]
+            use crate::inventory_reader::digest_native_file as digest_file;
+            #[cfg(target_os = "linux")]
+            use crate::inventory_reader::digest_unix_file as digest_file;
+            digest_file(
+                &request.path,
+                &request.expected,
+                buffer,
+                &self.progress,
+                |_| Ok(()),
+            )
+        }
     }
 
     fn set_digest(&self, record: &mut Input, digest: ValidatedDigest) {

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod bootstrap_profile;
 pub mod build_context;
 pub mod capability;
 pub mod certification_context;
@@ -15,6 +16,7 @@ pub mod inventory_workers;
 pub mod line_evidence;
 pub mod managed_workflow;
 pub mod miri_targets;
+pub mod native_channel;
 pub mod native_file_digest;
 pub mod native_profile;
 pub mod native_test_plan;
@@ -95,6 +97,7 @@ pub mod private_supervisor;
 pub mod private_terminal_live;
 pub mod private_unix_live;
 pub mod producer_metadata;
+pub mod public_reads;
 pub mod release_archive;
 pub mod release_evidence;
 pub mod release_private;
@@ -105,6 +108,8 @@ pub mod sealed_identity;
 pub mod sealed_selector;
 pub mod standard_contract;
 pub mod standard_runner;
+pub mod stress;
+pub mod target_shard;
 pub mod windows_causal_acceptance;
 pub mod windows_channel_identity;
 pub mod windows_package_cleanup;

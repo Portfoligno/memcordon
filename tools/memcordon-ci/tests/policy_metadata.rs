@@ -40,7 +40,8 @@ fn metadata_materializes_as_measured_cargo_with_closed_environment() {
     let encode = |value: &OsStr| hex::encode(value.as_encoded_bytes());
     let manifest = root.join("context.json");
     fs::write(&manifest, serde_json::to_vec(&serde_json::json!({
-        "schema_version": 3,
+        "schema_version": 4,
+        "profile": "stable",
         "root": root,
         "environment": [[encode(OsStr::new("PATH")), encode(command_root.as_os_str())]],
         "toolchains": {"1.97.1": cargo},

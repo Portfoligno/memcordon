@@ -25,10 +25,21 @@ fn trace_opt_in_cannot_expand_architectures_or_upload_unbounded_working_volume()
             "../../../.github/workflows/backend-certification.yml"
         ))
         .unwrap();
-        let job = &mut document["jobs"]["windows-loader-production"];
+        let job = &mut document["jobs"][if mutation == "x64" {
+            "windows-loader-production-x64"
+        } else {
+            "windows-loader-production-arm64"
+        }];
         match mutation {
-            "x64" => job["strategy"]["matrix"]["include"][0]["inventory-trace"] = true.into(),
-            "arm64" => job["strategy"]["matrix"]["include"][1]["inventory-trace"] = false.into(),
+            "x64" | "arm64" => {
+                let preparation = job["steps"]
+                    .as_sequence_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|step| step["id"] == "build-context-prepare")
+                    .unwrap();
+                preparation["run"] = if mutation == "x64" { "./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin --trace-inventory true" } else { "./ci-native-fingerprint.exe --profile stable --output target/ci/native-inputs.bin --trace-inventory false" }.into();
+            }
             "upload" => {
                 let observation = job["steps"]
                     .as_sequence_mut()
@@ -52,7 +63,7 @@ fn trace_volume_qualification_is_required_before_prepare_and_cannot_ignore_failu
             "../../../.github/workflows/backend-certification.yml"
         ))
         .unwrap();
-        let steps = document["jobs"]["windows-loader-production"]["steps"]
+        let steps = document["jobs"]["windows-loader-production-arm64"]["steps"]
             .as_sequence_mut()
             .unwrap();
         let index = steps

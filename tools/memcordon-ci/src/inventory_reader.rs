@@ -203,7 +203,7 @@ pub fn digest_reader_exact(
     digest_reader_with_length(reader, buffer, progress, Some(length)).map(|(digest, _)| digest)
 }
 
-fn digest_reader_with_length(
+pub(crate) fn digest_reader_with_length(
     reader: &mut impl Read,
     buffer: &mut [u8],
     progress: &InventoryProgress,
