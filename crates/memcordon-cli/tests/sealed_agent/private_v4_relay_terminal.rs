@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::linux::descriptor_custody::provider_owned_byte_pipes;
 use crate::linux::private_relay::PrivateRelay;
@@ -25,6 +25,16 @@ fn write_bytes(fd: BorrowedFd<'_>, bytes: &[u8]) -> isize {
 fn read_bytes(fd: BorrowedFd<'_>, bytes: &mut [u8]) -> isize {
     // SAFETY: the live descriptor writes no more than the provided capacity.
     unsafe { libc::read(fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len()) }
+}
+
+fn wait_for_completion(relay: &mut PrivateRelay) -> bool {
+    // Forking sibling fixtures can briefly retain pipe writers until their
+    // children close inherited descriptors. Still require observed EOF.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !relay.completed() && Instant::now() < deadline {
+        relay.tick(Duration::from_millis(5)).unwrap();
+    }
+    relay.completed()
 }
 
 #[test]
@@ -57,13 +67,7 @@ fn private_relay_preserves_byte_directions_and_observes_all_eofs() {
         "live target writers are not terminal EOF"
     );
     drop(target);
-    for _ in 0..16 {
-        relay.tick(Duration::ZERO).unwrap();
-        if relay.completed() {
-            break;
-        }
-    }
-    assert!(relay.completed());
+    assert!(wait_for_completion(&mut relay), "target writers reach EOF");
     assert_eq!(read_bytes(stdout_read.as_fd(), &mut output), 0);
     assert_eq!(read_bytes(stderr_read.as_fd(), &mut error), 0);
 }
@@ -148,14 +152,8 @@ fn private_relay_backpressure_is_bounded_and_target_exit_closes_stdin() {
     relay.close_stdin_after_target_exit();
     drop(target);
     drop(stdin_write);
-    for _ in 0..16 {
-        relay.tick(Duration::ZERO).unwrap();
-        if relay.completed() {
-            break;
-        }
-    }
     assert!(
-        relay.completed(),
+        wait_for_completion(&mut relay),
         "target exit cancels a blocked stdin relay"
     );
 }
