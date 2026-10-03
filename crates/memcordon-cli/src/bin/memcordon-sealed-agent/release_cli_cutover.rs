@@ -44,11 +44,27 @@ fn windows_product_package_command(arguments: &[OsString]) -> bool {
     }
 }
 
+fn linux_entrypoint_install_command(arguments: &[OsString]) -> bool {
+    matches!(
+        arguments,
+        [package, policy, entrypoint, operation, definition, _, source, _]
+            if package == "package"
+                && policy == "policy"
+                && entrypoint == "entrypoint"
+                && operation == "install"
+                && definition == "--definition"
+                && source == "--source"
+    )
+}
+
 pub(crate) fn retired_release_command(platform: ReleasePlatform, arguments: &[OsString]) -> bool {
     let Some(command) = arguments.first().and_then(|argument| argument.to_str()) else {
         return false;
     };
     if command == "package" {
+        if platform == ReleasePlatform::Linux && linux_entrypoint_install_command(arguments) {
+            return false;
+        }
         return !matches!(platform, ReleasePlatform::Linux | ReleasePlatform::Windows)
             || !windows_product_package_command(arguments);
     }

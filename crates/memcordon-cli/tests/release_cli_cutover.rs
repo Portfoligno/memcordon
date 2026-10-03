@@ -11,6 +11,67 @@ fn denied(platform: ReleasePlatform, arguments: &[&str]) -> bool {
 }
 
 #[test]
+fn linux_protected_image_install_reaches_its_existing_operational_dispatch() {
+    let arguments = [
+        "package",
+        "policy",
+        "entrypoint",
+        "install",
+        "--definition",
+        "/usr/libexec/selected image.json",
+        "--source",
+        "/tmp/selected image",
+    ];
+    assert!(!denied(ReleasePlatform::Linux, &arguments));
+    assert!(denied(ReleasePlatform::Windows, &arguments));
+    assert!(denied(ReleasePlatform::Other, &arguments));
+
+    for index in [1, 2, 3, 4, 6] {
+        let mut changed = arguments;
+        changed[index] = "unsupported";
+        assert!(denied(ReleasePlatform::Linux, &changed), "{changed:?}");
+    }
+    for length in 1..arguments.len() {
+        assert!(denied(ReleasePlatform::Linux, &arguments[..length]));
+    }
+    let mut extra = arguments.to_vec();
+    extra.push("--ephemeral-ci");
+    assert!(denied(ReleasePlatform::Linux, &extra));
+    let mut qualification = arguments;
+    qualification[4] = "--qualification-artifact-directory";
+    assert!(denied(ReleasePlatform::Linux, &qualification));
+    let mut reordered = arguments;
+    reordered.swap(4, 6);
+    assert!(denied(ReleasePlatform::Linux, &reordered));
+}
+
+#[cfg(unix)]
+#[test]
+fn linux_image_install_preserves_native_path_arguments_for_protected_validation() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut arguments = [
+        "package",
+        "policy",
+        "entrypoint",
+        "install",
+        "--definition",
+        "definition",
+        "--source",
+        "source",
+    ]
+    .map(OsString::from);
+    arguments[5] = OsString::from_vec(b"/usr/libexec/definition\xff.json".to_vec());
+    arguments[7] = OsString::from_vec(b"/tmp/source\xff".to_vec());
+    assert!(!retired_release_command(ReleasePlatform::Linux, &arguments));
+    assert!(retired_release_command(
+        ReleasePlatform::Windows,
+        &arguments
+    ));
+    assert!(retired_release_command(ReleasePlatform::Other, &arguments));
+}
+
+#[test]
 fn retired_release_entrypoints_close_without_blocking_operational_packages() {
     let expected_platform = if cfg!(target_os = "linux") {
         ReleasePlatform::Linux
