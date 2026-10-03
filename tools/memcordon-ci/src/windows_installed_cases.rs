@@ -195,6 +195,35 @@ pub struct InstalledWindowsPayload {
     pub output_directory: PathBuf,
 }
 
+/// Resolve selected paths in the driver context before changing the child cwd.
+pub fn installed_public_command(
+    cli: &Path,
+    fixture: &Path,
+    directory: &Path,
+    report: &Path,
+    mode: &str,
+) -> Result<crate::command::CommandSpec> {
+    let cli = std::path::absolute(cli)?;
+    let fixture = std::path::absolute(fixture)?;
+    let directory = std::path::absolute(directory)?;
+    let report = std::path::absolute(report)?;
+    Ok(
+        crate::command::CommandSpec::new(cli, &directory, std::time::Duration::from_secs(180))
+            .args([
+                std::ffi::OsString::from("+4GiB"),
+                std::ffi::OsString::from("+120s"),
+                std::ffi::OsString::from("--sealed"),
+                std::ffi::OsString::from("--report-format"),
+                std::ffi::OsString::from("result-v1"),
+                std::ffi::OsString::from("--report"),
+                report.into_os_string(),
+                std::ffi::OsString::from("--"),
+                fixture.into_os_string(),
+                std::ffi::OsString::from(mode),
+            ]),
+    )
+}
+
 impl InstalledWindowsPayload {
     /// Bind the installed case inputs to the measured channel payload, independently
     /// of any report produced by the workload. This is inventory, not permission.
@@ -532,23 +561,13 @@ mod native {
         report: &Path,
         mode: &str,
     ) -> Result<Command> {
-        CommandSpec::new(
+        installed_public_command(
             &config.cli.path,
+            &config.fixture.path,
             &config.output_directory,
-            Duration::from_secs(180),
-        )
-        .args([
-            std::ffi::OsString::from("+4GiB"),
-            std::ffi::OsString::from("+120s"),
-            std::ffi::OsString::from("--sealed"),
-            std::ffi::OsString::from("--report-format"),
-            std::ffi::OsString::from("result-v1"),
-            std::ffi::OsString::from("--report"),
-            report.as_os_str().to_os_string(),
-            std::ffi::OsString::from("--"),
-            config.fixture.path.as_os_str().to_os_string(),
-            std::ffi::OsString::from(mode),
-        ])
+            report,
+            mode,
+        )?
         .materialize()
     }
 
