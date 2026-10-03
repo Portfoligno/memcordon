@@ -9,6 +9,138 @@ use crate::{CiError, Result};
 
 pub const CONTEXT_BYTE_LIMIT: u64 = 64 * 1024;
 
+fn validate_owned_unit(unit: &OsStr) -> Result<()> {
+    let name = unit
+        .to_str()
+        .ok_or_else(|| CiError::Message("invalid unit encoding".into()))?;
+    if !name.starts_with("memcordon-standard-")
+        || !name.ends_with(".service")
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(CiError::Message("invalid owned standard unit name".into()));
+    }
+    Ok(())
+}
+
+/// Run unchanged selected CLI argv below a real systemd delegation boundary.
+/// The frontend stays unprivileged in a subgroup of the empty delegated root.
+pub fn delegated_case_command(
+    command: &std::process::Command,
+    unit: &OsStr,
+    uid: u32,
+) -> Result<CommandSpec> {
+    validate_owned_unit(unit)?;
+    if uid == 0 {
+        return Err(CiError::Message(
+            "standard consumer must start unprivileged".into(),
+        ));
+    }
+    let cwd = command
+        .get_current_dir()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| CiError::Message("selected consumer cwd must be absolute".into()))?;
+    let program = Path::new(command.get_program());
+    if !program.is_absolute() {
+        return Err(CiError::Message(
+            "selected consumer executable must be absolute".into(),
+        ));
+    }
+    Ok(
+        CommandSpec::new("/usr/bin/sudo", cwd, Duration::from_secs(60))
+            .args([
+                OsString::from("--non-interactive"),
+                "--".into(),
+                "/usr/bin/systemd-run".into(),
+                "--wait".into(),
+                "--pipe".into(),
+                "--collect".into(),
+                "--service-type".into(),
+                "exec".into(),
+                "--expand-environment=no".into(),
+                "--unit".into(),
+                unit.to_os_string(),
+                "--uid".into(),
+                uid.to_string().into(),
+                "--property".into(),
+                "Delegate=memory".into(),
+                "--property".into(),
+                "DelegateSubgroup=memcordon-ci".into(),
+                "--property".into(),
+                "RuntimeMaxSec=45s".into(),
+                "--property".into(),
+                "TimeoutStartSec=10s".into(),
+                "--property".into(),
+                "TimeoutStopSec=5s".into(),
+                "--property".into(),
+                "KillMode=control-group".into(),
+                "--property".into(),
+                "Restart=no".into(),
+                "--working-directory".into(),
+                cwd.as_os_str().to_os_string(),
+                "--".into(),
+                program.as_os_str().to_os_string(),
+            ])
+            .args(command.get_args()),
+    )
+}
+
+#[cfg(unix)]
+pub fn run_delegated_case(
+    command: &CommandSpec,
+    capture: impl FnOnce(&memcordon_testkit::ObservedOutput) -> Result<()>,
+) -> Result<memcordon_testkit::ObservedOutput> {
+    if !cfg!(target_os = "linux") {
+        return Err(CiError::Message(
+            "delegated consumer requires native Linux".into(),
+        ));
+    }
+    let selected = command.materialize()?;
+    let directory = tempfile::Builder::new()
+        .prefix("memcordon-standard-")
+        .suffix(".service")
+        .tempdir_in("/tmp")?;
+    let unit = directory
+        .path()
+        .file_name()
+        .ok_or_else(|| CiError::Message("owned unit basename absent".into()))?;
+    let cwd = selected
+        .get_current_dir()
+        .ok_or_else(|| CiError::Message("selected consumer cwd absent".into()))?;
+    let identity = CommandSpec::new("/usr/bin/id", cwd, Duration::from_secs(10))
+        .arg("-u")
+        .output_quiet()?;
+    if !identity.status.success() {
+        return Err(CiError::Message(
+            "cannot observe current consumer uid".into(),
+        ));
+    }
+    let uid = std::str::from_utf8(&identity.stdout)
+        .map_err(|error| CiError::Message(error.to_string()))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|error| CiError::Message(error.to_string()))?;
+    let delegated = delegated_case_command(&selected, unit, uid)?;
+    let mut lease = DelegatedUnitLease::new(cwd, unit.to_os_string())?;
+    let execution = delegated
+        .materialize()
+        .and_then(|mut command| {
+            memcordon_testkit::run_with_deadline_output_limit(
+                &mut command,
+                Duration::from_secs(60),
+                1024 * 1024,
+            )
+            .map_err(Into::into)
+        })
+        .and_then(|output| {
+            capture(&output)?;
+            Ok(output)
+        });
+    let retirement = lease.retire();
+    finish_delegation(execution, retirement, directory.close())
+}
+
 /// Preserve the child result unless cleanup adds a failure. Cleanup failure
 /// cannot promote a failed child or publish a successful certificate.
 pub fn finish_delegation<T>(
@@ -173,17 +305,7 @@ impl DelegatedUnitLease<NativeUnitControl> {
 
 impl<C: UnitControl> DelegatedUnitLease<C> {
     pub fn with_control(root: &Path, unit: OsString, control: C) -> Result<Self> {
-        let name = unit
-            .to_str()
-            .ok_or_else(|| CiError::Message("invalid unit encoding".into()))?;
-        if !name.starts_with("memcordon-standard-")
-            || !name.ends_with(".service")
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
-            return Err(CiError::Message("invalid owned standard unit name".into()));
-        }
+        validate_owned_unit(&unit)?;
         Ok(Self {
             root: root.into(),
             unit,

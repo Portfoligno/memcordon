@@ -14,6 +14,84 @@ const ACTIVE: &[u8] = b"LoadState=loaded\nActiveState=active\n";
 const RETIRED: &[u8] = b"LoadState=loaded\nActiveState=inactive\n";
 
 #[test]
+fn delegated_selected_case_preserves_identity_paths_literal_argv_and_native_teardown_limits() {
+    use memcordon_ci::standard_runner::delegated_case_command;
+    let owner = if cfg!(unix) {
+        tempfile::tempdir_in("/tmp").unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    };
+    let cwd = owner.path().join("selected payload");
+    let program = cwd.join("memcordon");
+    let report = owner.path().join("cases/report.json");
+    let fixture = owner.path().join("fixture with spaces");
+    let mut selected = std::process::Command::new(&program);
+    selected.current_dir(&cwd).args([
+        OsString::from("+200ms"),
+        "--report".into(),
+        report.as_os_str().to_os_string(),
+        "--".into(),
+        fixture.as_os_str().to_os_string(),
+        "".into(),
+        "$literal;value".into(),
+    ]);
+    let delegated = delegated_case_command(&selected, OsStr::new(UNIT), 1001)
+        .unwrap()
+        .materialize()
+        .unwrap();
+    assert_eq!(delegated.get_program(), OsStr::new("/usr/bin/sudo"));
+    assert_eq!(delegated.get_current_dir(), Some(cwd.as_path()));
+    let args: Vec<_> = delegated.get_args().collect();
+    let selected_index = args
+        .iter()
+        .position(|argument| *argument == program.as_os_str())
+        .unwrap();
+    assert_eq!(
+        &args[selected_index + 1..],
+        &selected.get_args().collect::<Vec<_>>()
+    );
+    let prefix = &args[..selected_index];
+    for property in [
+        "Delegate=memory",
+        "DelegateSubgroup=memcordon-ci",
+        "RuntimeMaxSec=45s",
+        "TimeoutStartSec=10s",
+        "TimeoutStopSec=5s",
+        "KillMode=control-group",
+        "Restart=no",
+    ] {
+        assert!(
+            prefix
+                .windows(2)
+                .any(|pair| pair == [OsStr::new("--property"), OsStr::new(property)])
+        );
+    }
+    for pair in [
+        [OsStr::new("--unit"), OsStr::new(UNIT)],
+        [OsStr::new("--uid"), OsStr::new("1001")],
+        [OsStr::new("--working-directory"), cwd.as_os_str()],
+    ] {
+        assert!(prefix.windows(2).any(|arguments| arguments == pair));
+    }
+    for option in [
+        "--non-interactive",
+        "--wait",
+        "--pipe",
+        "--collect",
+        "--expand-environment=no",
+    ] {
+        assert!(prefix.contains(&OsStr::new(option)));
+    }
+    assert!(delegated_case_command(&selected, OsStr::new(UNIT), 0).is_err());
+    assert!(delegated_case_command(&selected, OsStr::new("unowned.service"), 1001).is_err());
+    selected.current_dir("relative");
+    assert!(delegated_case_command(&selected, OsStr::new(UNIT), 1001).is_err());
+    let mut relative = std::process::Command::new("memcordon");
+    relative.current_dir(cwd);
+    assert!(delegated_case_command(&relative, OsStr::new(UNIT), 1001).is_err());
+}
+
+#[test]
 fn delegation_result_preserves_exact_primary_error_when_cleanup_succeeds() {
     let primary = CiError::Io(std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,

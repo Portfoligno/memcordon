@@ -296,21 +296,30 @@ pub fn run_cli_case(
         wrapper_arguments,
         fixture_arguments,
     )?;
+    let capture = |output: &memcordon_testkit::ObservedOutput| -> Result<()> {
+        fs::write(
+            output_directory.join(name).with_extension("stdout.bin"),
+            &output.stdout,
+        )?;
+        fs::write(
+            output_directory.join(name).with_extension("stderr.bin"),
+            &output.stderr,
+        )?;
+        Ok(())
+    };
+    #[cfg(target_os = "linux")]
+    let output = crate::standard_runner::run_delegated_case(&command, capture)?;
+    #[cfg(not(target_os = "linux"))]
     let mut command = command.materialize()?;
+    #[cfg(not(target_os = "linux"))]
     let output = memcordon_testkit::run_with_deadline_output_limit(
         &mut command,
         Duration::from_secs(60),
         1024 * 1024,
     )
     .map_err(|error| CiError::Message(error.to_string()))?;
-    fs::write(
-        output_directory.join(name).with_extension("stdout.bin"),
-        &output.stdout,
-    )?;
-    fs::write(
-        output_directory.join(name).with_extension("stderr.bin"),
-        &output.stderr,
-    )?;
+    #[cfg(not(target_os = "linux"))]
+    capture(&output)?;
     let result = ResultV1::parse(&artifacts::read_file(&report_path)?).map_err(CiError::Message)?;
     if result.tool.version != payload.source.version().to_string()
         || output.status.code() != Some(result.outcome.wrapper_status)
