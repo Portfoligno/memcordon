@@ -123,7 +123,7 @@ pub fn source(source: &Path, agent_bytes: &[u8]) -> Result<Vec<u8>, String> {
         }
         verify_image(&manifest, RuntimeComponentRole::SealedAgent, agent_bytes)?;
         let public = super::protected_read::read_protected_absolute(
-            Path::new("/usr/bin/memcordon"),
+            Path::new(crate::package::PUBLIC_CLI),
             IMAGE_MAX_BYTES,
             Some(0o755),
         )?;

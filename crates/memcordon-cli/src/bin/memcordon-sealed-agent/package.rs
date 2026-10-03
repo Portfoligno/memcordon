@@ -158,7 +158,7 @@ pub fn export_unit_files(directory: &Path) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 const BINARY: &str = "/usr/libexec/memcordon-sealed-agent";
 #[cfg(target_os = "linux")]
-const PUBLIC_CLI: &str = "/usr/libexec/memcordon";
+pub(crate) const PUBLIC_CLI: &str = "/usr/libexec/memcordon";
 #[cfg(target_os = "linux")]
 const UNIT: &str = "/usr/lib/systemd/system/memcordon-sealed-agent.service";
 #[cfg(target_os = "linux")]
