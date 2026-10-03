@@ -20,6 +20,10 @@ sorted plans `11` and `33` each repeated 32 times, and drain disposition 1.
 It excludes epoch activation metadata. Effective policy binds the contract,
 profile, registry digests, then the five ceiling tags.
 
+`registry.json` is the fixed historical JSON representation for `registry.hex`.
+Tests check the frozen digest and rejection by the operational policy parser;
+they do not depend on generated files in the ignored fuzz corpus.
+
 The attempt binds request/plan/profile/grant/epoch, registry/qualification,
 generation `0.5.3-dev:` followed by 40 ASCII `a` bytes, source 40 `a` bytes,
 manifest `22` repeated 32 times, boot `boot-a`, effective digest, attempt

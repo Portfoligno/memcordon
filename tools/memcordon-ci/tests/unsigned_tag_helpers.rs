@@ -127,3 +127,60 @@ fn native_git_status_disables_local_executable_helpers_and_detects_dirty_inputs(
     git.text(["add", "--", "untracked-build-input"]).unwrap();
     assert!(git.require_clean().is_err());
 }
+
+#[test]
+fn checkout_normalization_must_match_the_isolated_clean_source_check() {
+    let root = repository();
+    let git = Git::new(root.path()).unwrap();
+    let input = root.path().join("tracked-input");
+    fs::write(&input, b"source input\n").unwrap();
+    git.text(["add", "--", "tracked-input"]).unwrap();
+    git.text(["commit", "--no-gpg-sign", "-m", "Track source input"])
+        .unwrap();
+    #[cfg(unix)]
+    let checkout = tempfile::Builder::new()
+        .prefix("memcordon-checkout-fixture-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    #[cfg(not(unix))]
+    let checkout = tempfile::Builder::new()
+        .prefix("memcordon-checkout-fixture-")
+        .tempdir()
+        .unwrap();
+    let clone = git
+        .command(["-c", "core.autocrlf=true", "clone", "--no-local", "--"])
+        .arg(root.path())
+        .arg(checkout.path())
+        .output()
+        .unwrap();
+    assert!(clone.status.success(), "{:?}", clone.stderr);
+    let git = Git::new(checkout.path()).unwrap();
+    let input = checkout.path().join("tracked-input");
+    assert_eq!(fs::read(&input).unwrap(), b"source input\r\n");
+    let normalized_status = git
+        .text([
+            "-c",
+            "core.autocrlf=true",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+        ])
+        .unwrap();
+    assert!(normalized_status.is_empty(), "{normalized_status:?}");
+    fs::write(&input, b"source input\r\n").unwrap();
+    assert!(git.require_clean().is_err());
+
+    fs::remove_file(&input).unwrap();
+    git.text([
+        "-c",
+        "core.autocrlf=false",
+        "checkout-index",
+        "--force",
+        "--all",
+    ])
+    .unwrap();
+    assert_eq!(fs::read(&input).unwrap(), b"source input\n");
+    git.require_clean().unwrap();
+    fs::write(&input, b"changed source input\n").unwrap();
+    assert!(git.require_clean().is_err());
+}

@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 mod native_acceptance_catalogue;
-mod package_archive;
 mod suites;
 
 use std::path::{Path, PathBuf};

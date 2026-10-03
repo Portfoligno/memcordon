@@ -485,6 +485,35 @@ fn certification_runner_regressions_are_rejected_structurally() {
 }
 
 #[test]
+fn windows_working_source_jobs_disable_eol_conversion_before_checkout() {
+    let root = repository_root();
+    let repository_policy = config::policy(&root).unwrap();
+    let path = Path::new(".github/workflows/backend-certification.yml");
+    let bytes = include_bytes!("../../../.github/workflows/backend-certification.yml");
+    policy::validate_workflow_bytes(&root, path, bytes, &repository_policy).unwrap();
+    let workflow: serde_yaml::Value = serde_yaml::from_slice(bytes).unwrap();
+    for job in [
+        "windows-payload-x64",
+        "windows-payload-arm64",
+        "windows-installed-x64",
+        "windows-installed-arm64",
+    ] {
+        let steps = workflow["jobs"][job]["steps"].as_sequence().unwrap();
+        assert_eq!(
+            steps.first().unwrap()["run"].as_str(),
+            Some("git config --global core.autocrlf false"),
+            "{job} must configure checkout before source materialization",
+        );
+        assert!(
+            steps[1]["uses"]
+                .as_str()
+                .unwrap()
+                .starts_with("actions/checkout@")
+        );
+    }
+}
+
+#[test]
 fn stress_uploads_retain_hidden_failure_diagnostics() {
     let root = repository_root();
     let repository_policy = config::policy(&root).expect("repository policy should parse");

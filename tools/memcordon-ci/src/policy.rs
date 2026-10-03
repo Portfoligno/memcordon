@@ -1623,20 +1623,6 @@ fn check_macos_deadline_job(jobs: &Mapping, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn step_with_id<'a>(steps: &'a [Value], id: &str, context: &str) -> Result<&'a Mapping> {
-    let matches: Vec<&Mapping> = steps
-        .iter()
-        .filter_map(Value::as_mapping)
-        .filter(|step| scalar(step, "id") == Some(id))
-        .collect();
-    if matches.len() != 1 {
-        return Err(failure(format!(
-            "{context} must contain exactly one {id} step"
-        )));
-    }
-    Ok(matches[0])
-}
-
 fn runner_selects_self_hosted(value: &Value) -> bool {
     match value {
         Value::String(runner) => runner == "self-hosted",

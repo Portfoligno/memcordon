@@ -984,8 +984,8 @@ impl ResultV1 {
 
 #[derive(Clone, Debug)]
 pub enum ResultReport {
-    Legacy(MemcordonReport),
-    Operational(ResultV1),
+    Legacy(Box<MemcordonReport>),
+    Operational(Box<ResultV1>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

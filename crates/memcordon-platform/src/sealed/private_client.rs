@@ -107,6 +107,10 @@ pub struct PrivateFrontendExecution {
     pub relay_error: Option<String>,
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the backend boundary preserves the public categorized Error contract"
+)]
 pub(crate) fn private_backend_run(
     policy: &memcordon_core::Policy,
     command: &memcordon_core::CommandSpec,
@@ -275,13 +279,7 @@ pub(crate) fn private_backend_run(
                         "deadline offset range differs",
                     )
                 })?,
-                u64::try_from(observed).map_err(|_| {
-                    Error::new(
-                        ErrorCategory::Monitor,
-                        "MCSEALED-PRIVATE-DEADLINE",
-                        "observed deadline range differs",
-                    )
-                })?,
+                observed,
                 0,
                 0,
                 None,
@@ -381,18 +379,6 @@ pub(crate) fn private_backend_run(
         restart_safety,
         boundary_detail: BoundaryMechanismEvidence::LinuxPrivateTcp4(Box::new(private)),
     })
-}
-
-/// Send fresh owned byte channels and relay their bytes under the invocation's
-/// immutable deadline. Native file IO is not claimed to be perfectly interruptible.
-pub fn private_run(
-    policy: &memcordon_core::Policy,
-    command: &memcordon_core::CommandSpec,
-    contract: &memcordon_core::workload_contract::WorkloadContractV2,
-    context: crate::supervisor::AttemptContext,
-) -> Result<PrivateFrontendExecution, String> {
-    private_run_at(policy, command, contract, context, Instant::now(), || None)
-        .map_err(|failure| failure.to_string())
 }
 
 fn private_run_at(

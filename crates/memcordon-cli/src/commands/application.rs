@@ -1377,7 +1377,9 @@ fn selected_result(
     association: Option<memcordon_core::result_v1::ProviderAttemptAssociationV1>,
 ) -> Result<memcordon_core::ResultReport, String> {
     match args.output.report_format {
-        memcordon_core::ReportFormat::Legacy => Ok(memcordon_core::ResultReport::Legacy(report)),
+        memcordon_core::ReportFormat::Legacy => {
+            Ok(memcordon_core::ResultReport::Legacy(Box::new(report)))
+        }
         memcordon_core::ReportFormat::ResultV1 => {
             let features = [
                 ("sealed-runtime", cfg!(feature = "sealed-runtime")),
@@ -1397,7 +1399,7 @@ fn selected_result(
                 value.provider_association = association;
             }
             value.validate()?;
-            Ok(memcordon_core::ResultReport::Operational(value))
+            Ok(memcordon_core::ResultReport::Operational(Box::new(value)))
         }
     }
 }

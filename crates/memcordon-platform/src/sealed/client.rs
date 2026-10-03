@@ -7,7 +7,6 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use serde::Deserialize;
 use sha2::digest::OutputSizeUser;
 use sha2::{Digest, Sha256};
 
@@ -18,7 +17,7 @@ mod private_client;
 #[path = "private_relay.rs"]
 mod private_relay;
 pub(crate) use private_client::private_backend_run;
-pub use private_client::{PrivateFrontendExecution, private_discovery, private_plan, private_run};
+pub use private_client::{private_discovery, private_plan};
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use private_relay::NativeByteRelayProbe;

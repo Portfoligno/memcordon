@@ -26,6 +26,7 @@ environment_allowlist = [
   { file = ".github/workflows/release.yml", steps = ["Publish prepared bytes"], variable = "CARGO_REGISTRY_TOKEN", source = "${{ steps.registry-auth.outputs.token }}" },
 ]
 allowed_run_commands = [
+  "git config --global core.autocrlf false",
   "./target/ci/release/memcordon-ci ci performance-plan",
   "./target/ci/release/memcordon-ci release verify-source",
   "./target/ci/release/memcordon-ci release consumer-cache",

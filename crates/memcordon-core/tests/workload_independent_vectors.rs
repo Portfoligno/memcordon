@@ -226,7 +226,7 @@ fn fixed_preimages_have_independently_calculated_sha256_answers() {
 
 #[test]
 fn saved_registry_cannot_activate_in_named_operational_domain() {
-    let bytes = include_bytes!("../../../fuzz/corpus/workload-registry/authorized.json");
+    let bytes = include_bytes!("fixtures/workload_independent/registry.json");
     let historical = historical_registry::HistoricalRegistryV1::parse(bytes).unwrap();
     assert_eq!(
         String::from(historical.canonical_digest().unwrap()),

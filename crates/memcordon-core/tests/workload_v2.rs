@@ -133,7 +133,7 @@ fn v2_fuzz_seeds_reach_strict_version_dispatch() {
     assert!(WorkloadContractV1::parse(request).is_err());
     assert!(RuntimePrivatePolicyRegistry::parse(registry).is_err());
     assert!(memcordon_core::workload_registry::RuntimePolicyRegistry::parse(registry).is_err());
-    let ordinary = include_bytes!("../../../fuzz/corpus/workload-registry/local-private.json");
+    let ordinary = include_bytes!("fixtures/workload-v2/local-private-policy.json");
     assert!(RuntimePrivatePolicyRegistry::parse(ordinary).is_ok());
     assert!(memcordon_core::workload_registry::RuntimePolicyRegistry::parse(ordinary).is_err());
 }

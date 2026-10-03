@@ -1887,7 +1887,7 @@ fn profile_and_identity_cases(
     ))?;
     let disabled_epoch = activate(cwd, output, "disable-private-profile", &disabled)?;
     let assessment = (|| -> Result<()> {
-        for (contract, plan_name, launch_name) in contracts.iter().zip([
+        for (contract, (plan_name, launch_name)) in contracts.iter().zip([
             (
                 "preserved-profile-disabled-plan",
                 "preserved-profile-disabled-launch",
@@ -2415,7 +2415,7 @@ pub fn run(root: &Path, payload: &MaterializedPayload, output: &Path) -> Result<
         {
             descendant_and_restart_cases(payload, work.path(), output, group, contract, name)?;
         }
-        epoch = profile_and_identity_cases(
+        profile_and_identity_cases(
             payload,
             work.path(),
             output,

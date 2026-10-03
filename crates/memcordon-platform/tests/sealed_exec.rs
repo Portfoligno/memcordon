@@ -102,7 +102,7 @@ fn terminal(status: i32, exec_status: &str, os_code: &str) -> Vec<u8> {
         exec_status = exec_status,
         os_code = os_code,
         policy_enforcement = serde_json::to_string(
-            &memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::LegacyUnspecified,
+            &memcordon_core::workload_evidence::RuntimePolicyEnforcement::LegacyUnspecified,
         )
         .unwrap(),
         caller_envelope_digest = CALLER_ENVELOPE_DIGEST,
@@ -113,22 +113,55 @@ fn terminal(status: i32, exec_status: &str, os_code: &str) -> Vec<u8> {
 }
 
 #[test]
-fn private_v4_indeterminate_and_rejection_never_create_restart_proof() {
-    use memcordon_core::DiagnosticSha256;
-    use memcordon_core::workload_evidence_v2::QualifiedNativeAbiV2;
-    use memcordon_platform::{
-        PrivateExpectedResultV2, PrivateReleaseKnowledgeV2, PrivateReplayDispositionV2,
-        private_response_disposition_for_test,
-    };
+fn private_preallocation_rejection_needs_exact_live_invocation_binding() {
+    use memcordon_core::private_runtime::PrivateRuntimeRejection;
+    use memcordon_core::workload_contract::WorkloadContractV2;
+    use memcordon_core::{BoundedText, DiagnosticSha256, PublicProviderBindingV1};
 
-    let attempt = [0x12; 16];
-    let digest = DiagnosticSha256::from_bytes([0x34; 32]);
-    let expected = PrivateExpectedResultV2 {
-        source_commit: "a",
-        native_abi: QualifiedNativeAbiV2::X86_64LinuxGnu,
-        runtime_manifest_sha256: &digest,
-        installed_qualification_sha256: &digest,
+    let contract = WorkloadContractV2::parse(include_bytes!(
+        "../../../fuzz/corpus/workload-request/baseline-v2.json"
+    ))
+    .unwrap();
+    let expected = PrivateRuntimeRejection {
+        format: "memcordon.private-runtime-rejection".into(),
+        revision: 1,
+        provider: PublicProviderBindingV1 {
+            generation: BoundedText::new("1.2.3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            source_commit: BoundedText::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            runtime_manifest_sha256: DiagnosticSha256::from_bytes([7; 32]),
+        },
+        attempt_id: [0x12; 16],
+        request_sha256: DiagnosticSha256::from_bytes([0x34; 32]),
+        invocation_sha256: DiagnosticSha256::from_bytes([0x56; 32]),
+        contract,
+        boundary_allocated: false,
+        reservation_may_remain: true,
+        detail: BoundedText::new("live grant rejected before boundary allocation").unwrap(),
     };
+    let parse = |bytes: &[u8]| {
+        PrivateRuntimeRejection::parse_bound(
+            bytes,
+            &expected.provider,
+            expected.attempt_id,
+            &expected.request_sha256,
+            &expected.contract,
+            &expected.invocation_sha256,
+        )
+    };
+    let bytes = serde_json::to_vec(&expected).unwrap();
+    assert_eq!(parse(&bytes).unwrap(), expected);
+    for field in ["attempt_id", "request_sha256", "invocation_sha256"] {
+        let mut swapped = serde_json::to_value(&expected).unwrap();
+        swapped[field] = if field == "attempt_id" {
+            serde_json::to_value([0x34; 16]).unwrap()
+        } else {
+            serde_json::to_value(DiagnosticSha256::from_bytes([0x78; 32])).unwrap()
+        };
+        assert!(
+            parse(&serde_json::to_vec(&swapped).unwrap()).is_err(),
+            "{field}"
+        );
+    }
     let indeterminate = serde_json::json!({
         "schema_version": 11,
         "attempt_id": "12121212121212121212121212121212",
@@ -137,39 +170,7 @@ fn private_v4_indeterminate_and_rejection_never_create_restart_proof() {
         "replay_disposition": "do-not-replay",
         "reason_code": "MCSEALED-PRIVATE-TERMINAL-UNVERIFIED"
     });
-    let bytes = serde_json::to_vec(&indeterminate).unwrap();
-    let (release, replay, restart_safe, raw) = private_response_disposition_for_test(
-        110, [0x56; 16], attempt, [0x56; 16], attempt, &bytes, &expected,
-    )
-    .unwrap();
-    assert_eq!(release, PrivateReleaseKnowledgeV2::PossiblyReleased);
-    assert_eq!(replay, PrivateReplayDispositionV2::DoNotReplay);
-    assert!(!restart_safe);
-    assert_eq!(raw, bytes);
-
-    let swapped_attempt = String::from_utf8(bytes.clone()).unwrap().replace(
-        "12121212121212121212121212121212",
-        "34343434343434343434343434343434",
-    );
-    let error = private_response_disposition_for_test(
-        110,
-        [0x56; 16],
-        attempt,
-        [0x56; 16],
-        attempt,
-        swapped_attempt.as_bytes(),
-        &expected,
-    )
-    .expect_err("swapped attempt must be rejected");
-    assert_eq!(
-        error.release_knowledge(),
-        PrivateReleaseKnowledgeV2::PossiblyReleased
-    );
-    assert_eq!(
-        error.replay_disposition(),
-        PrivateReplayDispositionV2::DoNotReplay
-    );
-    assert_eq!(error.raw_response, Some(swapped_attempt.into_bytes()));
+    assert!(parse(&serde_json::to_vec(&indeterminate).unwrap()).is_err());
 
     let rejection = br#"{
         "schema_version":1,
@@ -183,34 +184,16 @@ fn private_v4_indeterminate_and_rejection_never_create_restart_proof() {
             "workload_empty":null,"helpers_reaped":false,
             "containment_removed":false,"sealed_boundary_retired":false,"errors":[]}
     }"#;
-    let (release, replay, restart_safe, raw) = private_response_disposition_for_test(
-        106, [0x56; 16], attempt, [0x56; 16], attempt, rejection, &expected,
-    )
-    .unwrap();
-    assert_eq!(release, PrivateReleaseKnowledgeV2::NotReleased);
-    assert_eq!(
-        replay,
-        PrivateReplayDispositionV2::NewAttemptWithFreshAdmission
-    );
-    assert!(!restart_safe);
-    assert_eq!(raw, rejection);
-
-    let error = private_response_disposition_for_test(
-        106, [0x56; 16], attempt, [0x57; 16], attempt, rejection, &expected,
-    )
-    .expect_err("response nonce mismatch must reject even a valid rejection");
-    assert_eq!(
-        error.replay_disposition(),
-        PrivateReplayDispositionV2::DoNotReplay
-    );
+    assert!(parse(rejection).is_err());
 }
 
 #[test]
-fn private_v4_terminal_needs_exact_installed_binding_and_retirement() {
+fn historical_private_report_preserves_exact_binding_and_retirement_checks() {
     use std::num::NonZeroU64;
 
     use memcordon_core::report_v11::{
         PRIVATE_EXECUTION_REPORT_SCHEMA_V11, PrivateExecutionReportV11, PrivateTerminalOutcomeV11,
+        TrustedPrivateExecutionV11,
     };
     use memcordon_core::workload_admission_v2::AttemptBindingV2;
     use memcordon_core::workload_contract::{LogicalId, Nonce128, ProfileRef};
@@ -220,10 +203,6 @@ fn private_v4_terminal_needs_exact_installed_binding_and_retirement() {
         TargetIdentityObservationV2, VerifiedTrue,
     };
     use memcordon_core::{BoundedText, DiagnosticSha256};
-    use memcordon_platform::{
-        PrivateExpectedResultV2, PrivateReleaseKnowledgeV2, PrivateReplayDispositionV2,
-        private_response_disposition_for_test,
-    };
 
     fn digest(byte: u8) -> DiagnosticSha256 {
         DiagnosticSha256::from_bytes([byte; 32])
@@ -231,7 +210,6 @@ fn private_v4_terminal_needs_exact_installed_binding_and_retirement() {
     fn yes() -> VerifiedTrue {
         VerifiedTrue::observed(true).unwrap()
     }
-    let attempt_bytes = [0x12; 16];
     let attempt = AttemptBindingV2 {
         attempt_id: BoundedText::new("12121212121212121212121212121212").unwrap(),
         admission_digest: digest(7),
@@ -285,62 +263,50 @@ fn private_v4_terminal_needs_exact_installed_binding_and_retirement() {
         outcome: PrivateTerminalOutcomeV11::Exited { code: 0 },
     };
     let bytes = serde_json::to_vec(&report).unwrap();
-    let expected = PrivateExpectedResultV2 {
+    let checkpoint_sha256 = report.checkpoint.canonical_digest().unwrap();
+    let retirement_sha256 = report.retirement.canonical_digest().unwrap();
+    let expected = TrustedPrivateExecutionV11 {
         source_commit: &report.source_commit,
         native_abi: report.native_abi,
         runtime_manifest_sha256: &report.runtime_manifest_sha256,
         installed_qualification_sha256: &report.installed_qualification_sha256,
+        attempt: &report.attempt,
+        checkpoint_sha256: &checkpoint_sha256,
+        retirement_sha256: &retirement_sha256,
+        terminal_receipt_sha256: &report.terminal_receipt_sha256,
+        outcome: &report.outcome,
     };
-    let (release, replay, restart_safe, raw) = private_response_disposition_for_test(
-        105,
-        [0x56; 16],
-        attempt_bytes,
-        [0x56; 16],
-        attempt_bytes,
-        &bytes,
-        &expected,
-    )
-    .unwrap();
-    assert_eq!(release, PrivateReleaseKnowledgeV2::Released);
-    assert_eq!(replay, PrivateReplayDispositionV2::QuerySameAttemptOnly);
-    assert!(restart_safe);
-    assert_eq!(raw, bytes);
+    assert_eq!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &bytes,
+            PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
+            &expected,
+        )
+        .unwrap(),
+        report
+    );
 
     let wrong_manifest = digest(99);
-    let swapped_expected = PrivateExpectedResultV2 {
+    let swapped_expected = TrustedPrivateExecutionV11 {
         runtime_manifest_sha256: &wrong_manifest,
         ..expected
     };
-    let error = private_response_disposition_for_test(
-        105,
-        [0x56; 16],
-        attempt_bytes,
-        [0x56; 16],
-        attempt_bytes,
-        &bytes,
-        &swapped_expected,
-    )
-    .expect_err("swapped installed manifest must be rejected");
-    assert_eq!(
-        error.release_knowledge(),
-        PrivateReleaseKnowledgeV2::PossiblyReleased
-    );
-    assert_eq!(
-        error.replay_disposition(),
-        PrivateReplayDispositionV2::DoNotReplay
+    assert!(
+        PrivateExecutionReportV11::parse_and_validate(
+            &bytes,
+            PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
+            &swapped_expected,
+        )
+        .is_err()
     );
 
     let mut unretired = serde_json::to_value(&report).unwrap();
     unretired["retirement"]["provider_network_references_closed"] = serde_json::json!(false);
     let unretired = serde_json::to_vec(&unretired).unwrap();
     assert!(
-        private_response_disposition_for_test(
-            105,
-            [0x56; 16],
-            attempt_bytes,
-            [0x56; 16],
-            attempt_bytes,
+        PrivateExecutionReportV11::parse_and_validate(
             &unretired,
+            PRIVATE_EXECUTION_REPORT_SCHEMA_V11,
             &expected,
         )
         .is_err()
@@ -408,7 +374,7 @@ fn revoked_terminal() -> Vec<u8> {
         true,
     )
     .unwrap();
-    let enforcement = AttemptPolicyEnforcementV1::retired(binding, checkpoint, true, true).unwrap();
+    let enforcement = RuntimePolicyEnforcement::retired(binding, checkpoint, true, true).unwrap();
     let ordinary = String::from_utf8(terminal(0, "success", "none")).unwrap();
     let mut payload = String::new();
     for line in ordinary.lines() {
@@ -485,7 +451,7 @@ fn policy_revocation_preserves_authorized_attempt_and_verified_retirement() {
         );
     }
     let legacy = serde_json::to_string(
-        &memcordon_core::workload_evidence::AttemptPolicyEnforcementV1::LegacyUnspecified,
+        &memcordon_core::workload_evidence::RuntimePolicyEnforcement::LegacyUnspecified,
     )
     .unwrap();
     let mut unbound = String::new();

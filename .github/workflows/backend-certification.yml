@@ -233,6 +233,8 @@ jobs:
       matrix:
         include: [{id: x64}]
     steps: &windows-working-producer
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -292,6 +294,8 @@ jobs:
       matrix:
         include: [{id: x64, channel: native}, {id: x64, channel: cargo}]
     steps: &windows-working-consumer
+      - name: Configure checkout line endings
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false

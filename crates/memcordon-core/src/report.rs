@@ -1505,7 +1505,7 @@ pub fn write_report_atomic_with_test_observer(
     path: &Path,
     report: &MemcordonReport,
     barrier: Option<(ReportWritePhase, &Path)>,
-    mut observer: impl FnMut(ReportWritePhase),
+    observer: impl FnMut(ReportWritePhase),
 ) -> Result<(), Error> {
     let mut bytes = serde_json::to_vec_pretty(report)
         .map_err(|error| report_error(path, std::io::Error::other(error)))?;
