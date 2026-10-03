@@ -206,8 +206,7 @@ pub fn materialize_cargo(
     let manifest = measured_manifest(&bundle.source, &bundle.distribution, &directory)?;
     source::write_json(&directory.join("runtime-manifest.json"), &manifest)?;
     if !bundle.distribution.units.is_empty() {
-        let units = owner.path().join("units");
-        fs::create_dir(&units)?;
+        let units = target::unit_export_directory(owner.path())?;
         CommandSpec::new(
             binary_path(
                 &directory,
@@ -218,12 +217,12 @@ pub fn materialize_cargo(
             Duration::from_secs(30),
         )
         .arg("__export-unit-files")
-        .arg(&units)
+        .arg(units.path())
         .run()?;
         for unit in &bundle.distribution.units {
             fs::write(
                 directory.join(unit),
-                artifacts::read_file(&units.join(unit))?,
+                artifacts::read_file(&units.path().join(unit))?,
             )?;
         }
     }

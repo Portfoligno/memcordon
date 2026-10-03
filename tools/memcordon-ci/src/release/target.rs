@@ -37,6 +37,20 @@ pub fn binary_name(binary: &str, target: &str) -> String {
     }
 }
 
+/// Fresh directory for the native unit producer's held-directory contract.
+/// Set private permissions at creation rather than relying on runner umask or
+/// modifying a preexisting directory containing another operation's evidence.
+pub fn unit_export_directory(parent: &Path) -> Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("unit-export-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    Ok(builder.tempdir_in(parent)?)
+}
+
 pub fn validate_executable(bytes: &[u8], target: &str) -> Result<()> {
     let arm = target.starts_with("aarch64-");
     let valid = if target.contains("linux") {
@@ -444,7 +458,7 @@ pub fn build_selected(
     manifest_bytes.push(b'\n');
     members.insert("runtime-manifest.json".into(), manifest_bytes);
     if !distribution.units.is_empty() {
-        let directory = tempfile::tempdir()?;
+        let directory = unit_export_directory(Path::new("/tmp"))?;
         crate::command::CommandSpec::new(
             product
                 .join(&distribution.target)

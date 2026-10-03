@@ -3,6 +3,7 @@ use memcordon_ci::release::{
     distribution::TargetDistribution,
     installed_consumer::{binary_path, create_fresh_destination, measured_manifest},
     source::{BuildSourceIdentity, SelectedSource},
+    target::unit_export_directory,
 };
 use memcordon_core::runtime_manifest::SealedRuntime;
 
@@ -12,6 +13,48 @@ fn directory() -> tempfile::TempDir {
     } else {
         tempfile::tempdir().unwrap()
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn unit_export_creation_satisfies_held_producer_contract_without_reusing_existing_evidence() {
+    use std::os::unix::fs::MetadataExt;
+
+    let owner = directory();
+    let existing = owner.path().join("units");
+    std::fs::create_dir(&existing).unwrap();
+    let evidence = existing.join("failure.json");
+    std::fs::write(&evidence, b"existing operation diagnostics").unwrap();
+    // A separately created file provides the actual creating process's owner,
+    // independent of the directory helper's requested metadata.
+    let creating_owner = std::fs::metadata(&evidence).unwrap().uid();
+    let first = unit_export_directory(owner.path()).unwrap();
+    let second = unit_export_directory(owner.path()).unwrap();
+    for directory in [&first, &second] {
+        let held = std::fs::File::open(directory.path()).unwrap();
+        let metadata = held.metadata().unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), creating_owner);
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_ne!(directory.path(), existing);
+    }
+    let first_path = first.path().to_owned();
+    assert_ne!(first_path, second.path());
+    let first_metadata = std::fs::metadata(&first_path).unwrap();
+    let second_metadata = std::fs::metadata(second.path()).unwrap();
+    assert_ne!(
+        (first_metadata.dev(), first_metadata.ino()),
+        (second_metadata.dev(), second_metadata.ino())
+    );
+    drop(first);
+    assert!(!first_path.exists());
+    assert!(second.path().is_dir());
+    assert_eq!(
+        std::fs::read(evidence).unwrap(),
+        b"existing operation diagnostics"
+    );
+    assert!(unit_export_directory(&owner.path().join("absent-parent")).is_err());
 }
 
 fn source() -> BuildSourceIdentity {
