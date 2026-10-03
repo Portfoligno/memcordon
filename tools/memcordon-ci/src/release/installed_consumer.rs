@@ -416,9 +416,12 @@ pub fn run_materialized_channel(
         let assessment = crate::windows_installed_cases::run_cases_for_installed_payload(&config)?;
         source::write_json(&output.join("windows-assessment.json"), &assessment)?;
         if !assessment.accepted() {
-            return Err(CiError::Message(
-                "actual installed Windows case or retirement failed".into(),
-            ));
+            return Err(CiError::Message(format!(
+                "actual installed Windows case or retirement failed; install/smoke: {:?}; upgrade: {:?}; uninstall: {:?}",
+                assessment.public_smoke_before,
+                assessment.package_upgrade,
+                assessment.package_uninstall,
+            )));
         }
     } else if payload
         .distribution

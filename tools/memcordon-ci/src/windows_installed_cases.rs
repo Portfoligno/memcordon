@@ -1,10 +1,175 @@
 //! Installed-channel lifecycle using selected payload bytes and the public CLI.
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::windows_causal_acceptance::{InstalledCaseResult, InstalledChannel};
 use crate::{CiError, Result};
+
+#[derive(Serialize)]
+struct PackageOperationCapture<'a> {
+    format: &'static str,
+    revision: u32,
+    operation: &'a str,
+    operation_complete: bool,
+    streams_available: bool,
+    stdout_reader_finished: Option<bool>,
+    stderr_reader_finished: Option<bool>,
+    observed_exit_code: Option<i32>,
+    failure: Option<String>,
+}
+
+/// Retain actual bounded package output before assessing native success. Timeout
+/// streams are snapshots; cleanup does not turn them into a completed operation.
+pub fn retain_package_operation(
+    directory: &Path,
+    operation: &str,
+    output: std::result::Result<
+        memcordon_testkit::ObservedOutput,
+        memcordon_testkit::ProcessTestError,
+    >,
+) -> std::result::Result<(), String> {
+    let (stdout_name, stderr_name, capture_name) = match operation {
+        "install" => (
+            "package-install.stdout.bin",
+            "package-install.stderr.bin",
+            "package-install.capture.json",
+        ),
+        "upgrade" => (
+            "package-upgrade.stdout.bin",
+            "package-upgrade.stderr.bin",
+            "package-upgrade.capture.json",
+        ),
+        "uninstall" => (
+            "package-uninstall.stdout.bin",
+            "package-uninstall.stderr.bin",
+            "package-uninstall.capture.json",
+        ),
+        _ => return Err("unknown package operation".to_owned()),
+    };
+    let streams = match &output {
+        Ok(output) => Some((output.stdout.as_slice(), output.stderr.as_slice())),
+        Err(memcordon_testkit::ProcessTestError::Timeout { stdout, stderr, .. }) => {
+            Some((stdout.as_slice(), stderr.as_slice()))
+        }
+        Err(_) => None,
+    };
+    if let Some((stdout, stderr)) = streams {
+        let limit = crate::windows_causal_acceptance::MAX_STREAM_BYTES;
+        if stdout.len() > limit || stderr.len() > limit {
+            return Err("package output exceeds retained stream bound".to_owned());
+        }
+        for (name, bytes) in [(stdout_name, stdout), (stderr_name, stderr)] {
+            if let Err(error) = retain_package_leaf(directory, name, bytes, None) {
+                // Only assess on this exceptional recording path, so losing a
+                // diagnostic file cannot replace the native failure itself.
+                let mut failure = match &output {
+                    Ok(output) => format!(
+                        "package {operation} native exit: {:?}",
+                        output.status.code()
+                    ),
+                    Err(memcordon_testkit::ProcessTestError::Timeout {
+                        deadline, cleanup, ..
+                    }) => format!(
+                        "package {operation} timed out after {deadline:?}; capture incomplete; cleanup {cleanup:?}"
+                    ),
+                    Err(error) => format!("package {operation} failed: {error}"),
+                };
+                append_package_stderr(&mut failure, stderr);
+                return Err(format!("{failure}; {error}"));
+            }
+        }
+    }
+    let mut capture = PackageOperationCapture {
+        format: "memcordon.package-operation-capture",
+        revision: 1,
+        operation,
+        operation_complete: false,
+        streams_available: false,
+        stdout_reader_finished: None,
+        stderr_reader_finished: None,
+        observed_exit_code: None,
+        failure: None,
+    };
+    let stderr = match output {
+        Ok(output) => {
+            capture.operation_complete = true;
+            capture.streams_available = true;
+            capture.stdout_reader_finished = Some(true);
+            capture.stderr_reader_finished = Some(true);
+            capture.observed_exit_code = output.status.code();
+            if !output.status.success() {
+                capture.failure = Some(format!(
+                    "package {operation} failed: {:?}",
+                    output.status.code()
+                ));
+            }
+            Some(output.stderr)
+        }
+        Err(memcordon_testkit::ProcessTestError::Timeout {
+            deadline,
+            stdout: _,
+            stderr,
+            cleanup,
+            observation,
+        }) => {
+            capture.streams_available = true;
+            capture.stdout_reader_finished = Some(observation.stdout_reader_finished);
+            capture.stderr_reader_finished = Some(observation.stderr_reader_finished);
+            capture.observed_exit_code =
+                observation.observed_status.and_then(|status| status.code());
+            capture.failure = Some(format!(
+                "package {operation} timed out after {deadline:?}; capture incomplete; cleanup {cleanup:?}"
+            ));
+            Some(stderr)
+        }
+        Err(error) => {
+            capture.failure = Some(format!(
+                "package {operation} failed: {error}; output unavailable"
+            ));
+            None
+        }
+    };
+    if let (Some(stderr), Some(failure)) = (stderr, &mut capture.failure) {
+        // Keep errors useful and bounded; the exact binary stream remains in
+        // its separate diagnostic leaf, including any non-UTF-8 bytes.
+        append_package_stderr(failure, &stderr);
+    }
+    let bytes = serde_json::to_vec_pretty(&capture).map_err(|error| error.to_string())?;
+    retain_package_leaf(directory, capture_name, &bytes, capture.failure.as_deref())?;
+    match capture.failure {
+        Some(failure) => Err(failure),
+        None => Ok(()),
+    }
+}
+
+fn append_package_stderr(failure: &mut String, stderr: &[u8]) {
+    const ERROR_STDERR_BYTES: usize = 4096;
+    let prefix = &stderr[..stderr.len().min(ERROR_STDERR_BYTES)];
+    failure.push_str("; stderr: ");
+    failure.push_str(&String::from_utf8_lossy(prefix));
+    if prefix.len() != stderr.len() {
+        failure.push_str(" [truncated; see bounded raw stream capture]");
+    }
+}
+
+fn retain_package_leaf(
+    directory: &Path,
+    name: &str,
+    bytes: &[u8],
+    operation_failure: Option<&str>,
+) -> std::result::Result<(), String> {
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join(name))
+        .and_then(|mut file| file.write_all(bytes));
+    result.map_err(|error| {
+        let failure = operation_failure.unwrap_or("package operation status not assessed");
+        format!("{failure}; retaining package diagnostic {name} failed: {error}")
+    })
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -349,16 +514,8 @@ mod native {
             &mut command,
             Duration::from_secs(120),
             MAX_STREAM_BYTES,
-        )
-        .map_err(|error| error.to_string())?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "package {operation} failed: {:?}",
-                output.status.code()
-            ))
-        }
+        );
+        retain_package_operation(&config.output_directory, operation, output)
     }
 
     fn quiescent(config: &InstalledWindowsPayload) -> Result<GuardianBaseline> {
