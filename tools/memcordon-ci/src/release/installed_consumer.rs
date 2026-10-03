@@ -9,7 +9,7 @@ use std::{
 
 use memcordon_core::{
     result_v1::{CleanupStateV1, OutcomeKindV1, ResultV1},
-    runtime_manifest::{RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest},
+    runtime_manifest::{RuntimeComponentRole, RuntimeManifest},
 };
 
 use super::{
@@ -76,22 +76,14 @@ pub fn measured_manifest(
                 ));
             }
         };
-        components.push(RuntimeComponentRecord {
-            id: if role == RuntimeComponentRole::SealedAgent {
-                "sealed-agent".into()
-            } else {
-                binary.clone()
-            },
-            path: path
-                .file_name()
+        components.push(target::runtime_component(
+            role,
+            path.file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| CiError::Message("consumer filename is not UTF-8".into()))?
                 .into(),
-            role,
-            size: bytes.len() as u64,
-            mode: 0o755,
-            sha256: artifacts::checksum(&bytes),
-        });
+            &bytes,
+        ));
     }
     let args = (
         source.version().to_string(),

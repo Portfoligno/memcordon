@@ -7,7 +7,9 @@ use memcordon_ci::release::{
     source::{BuildSourceIdentity, SelectedSource},
     target::unit_export_directory,
 };
-use memcordon_core::runtime_manifest::SealedRuntime;
+use memcordon_core::runtime_manifest::{
+    RuntimeComponentRecord, RuntimeComponentRole, RuntimeManifest, SealedRuntime,
+};
 
 fn directory() -> tempfile::TempDir {
     if cfg!(unix) {
@@ -272,4 +274,182 @@ fn linux_inventory_selects_private_profile_only_with_actual_private_feature_grap
         panic!("selected runtime missing");
     };
     assert_eq!(profiles, ["linux-unix-create-v1", "linux-tcp4-private-v1"]);
+}
+
+fn retained_component(
+    directory: &std::path::Path,
+    role: RuntimeComponentRole,
+    id: &str,
+    path: &str,
+) -> RuntimeComponentRecord {
+    let bytes = std::fs::read(directory.join(path)).unwrap();
+    RuntimeComponentRecord {
+        id: id.into(),
+        path: path.into(),
+        role,
+        size: bytes.len() as u64,
+        mode: 0o755,
+        sha256: artifacts::checksum(&bytes),
+    }
+}
+
+#[test]
+fn runtime_inventory_matches_retained_linux_source_contract_in_both_channels() {
+    use memcordon_ci::release::target::runtime_component;
+    for (target, machine) in [
+        ("x86_64-unknown-linux-gnu", 62_u16),
+        ("aarch64-unknown-linux-gnu", 183_u16),
+    ] {
+        for private in [false, true] {
+            let owner = directory();
+            let mut selected = TargetDistribution {
+                target: target.into(),
+                features: vec!["sealed-runtime".into()],
+                binaries: vec!["memcordon".into(), "memcordon-sealed-agent".into()],
+                units: [
+                    "memcordon-sealed-agent.service",
+                    "memcordon-sealed-agent.socket",
+                    "memcordon-sealed-launcher.service",
+                    "memcordon-sealed-launcher.socket",
+                    "memcordon.conf",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            };
+            if private {
+                selected.features.push("private-tcp".into());
+                selected.units.extend(
+                    [
+                        "memcordon-sealed-network-launcher.service",
+                        "memcordon-sealed-network-launcher.socket",
+                    ]
+                    .map(str::to_owned),
+                );
+            }
+            let mut native = Vec::new();
+            let mut retained = Vec::new();
+            // Match the retained source reader's independent semantic tuple,
+            // not the producer's mapping or the executable basename.
+            for (index, (role, id, path)) in [
+                (RuntimeComponentRole::PublicCli, "public-cli", "memcordon"),
+                (
+                    RuntimeComponentRole::SealedAgent,
+                    "sealed-agent",
+                    "memcordon-sealed-agent",
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut bytes = vec![index as u8; 64];
+                bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
+                bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+                std::fs::write(owner.path().join(path), &bytes).unwrap();
+                native.push(runtime_component(role, path.into(), &bytes));
+                retained.push(retained_component(owner.path(), role, id, path));
+            }
+            let expected = RuntimeManifest::linux_selected(
+                "1.2.3".into(),
+                source().commit().into(),
+                target.into(),
+                retained,
+                private,
+            )
+            .unwrap();
+            let produced = RuntimeManifest::linux_selected(
+                "1.2.3".into(),
+                source().commit().into(),
+                target.into(),
+                native,
+                private,
+            )
+            .unwrap();
+            assert_eq!(
+                RuntimeManifest::parse(&serde_json::to_vec(&produced).unwrap()).unwrap(),
+                expected
+            );
+            assert_eq!(
+                measured_manifest(&source(), &selected, owner.path()).unwrap(),
+                expected
+            );
+            let mut old = expected.clone();
+            old.components[0].id = "memcordon".into();
+            old.validate().unwrap(); // Generic validity did not catch the source mismatch.
+            assert_ne!(old, expected);
+        }
+    }
+    let helper = runtime_component(
+        RuntimeComponentRole::Arm32AbiHelper,
+        "memcordon-arm32-abi-helper".into(),
+        b"selected helper bytes",
+    );
+    assert_eq!(helper.id, "arm32-abi-helper");
+    assert_eq!(helper.path, "memcordon-arm32-abi-helper");
+}
+
+#[test]
+fn runtime_inventory_matches_retained_windows_source_contract_in_both_channels() {
+    use memcordon_ci::release::target::runtime_component;
+    for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+        let owner = directory();
+        let mut selected = windows();
+        selected.target = target.into();
+        let mut native = Vec::new();
+        let mut retained = Vec::new();
+        for (index, (role, id, path)) in [
+            (
+                RuntimeComponentRole::PublicCli,
+                "public-cli",
+                "memcordon.exe",
+            ),
+            (
+                RuntimeComponentRole::SealedAgent,
+                "sealed-agent",
+                "memcordon-sealed-agent.exe",
+            ),
+            (
+                RuntimeComponentRole::DesktopBootstrap,
+                "target-desktop-bootstrap",
+                "memcordon-target-desktop-bootstrap.exe",
+            ),
+            (
+                RuntimeComponentRole::SessionBroker,
+                "session-broker",
+                "memcordon-session-broker.exe",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut bytes = pe(index as u8);
+            if target.starts_with("aarch64-") {
+                bytes[68..70].copy_from_slice(&[0x64, 0xaa]);
+            }
+            std::fs::write(owner.path().join(path), &bytes).unwrap();
+            native.push(runtime_component(role, path.into(), &bytes));
+            retained.push(retained_component(owner.path(), role, id, path));
+        }
+        let expected = RuntimeManifest::windows(
+            "1.2.3".into(),
+            source().commit().into(),
+            target.into(),
+            retained,
+        )
+        .unwrap();
+        let produced = RuntimeManifest::windows(
+            "1.2.3".into(),
+            source().commit().into(),
+            target.into(),
+            native,
+        )
+        .unwrap();
+        assert_eq!(
+            RuntimeManifest::parse(&serde_json::to_vec(&produced).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            measured_manifest(&source(), &selected, owner.path()).unwrap(),
+            expected
+        );
+    }
 }

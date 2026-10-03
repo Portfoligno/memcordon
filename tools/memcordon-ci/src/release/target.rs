@@ -37,6 +37,29 @@ pub fn binary_name(binary: &str, target: &str) -> String {
     }
 }
 
+/// Semantic component identity stays independent of its executable filename.
+pub fn runtime_component(
+    role: RuntimeComponentRole,
+    path: String,
+    bytes: &[u8],
+) -> RuntimeComponentRecord {
+    let id = match role {
+        RuntimeComponentRole::PublicCli => "public-cli",
+        RuntimeComponentRole::SealedAgent => "sealed-agent",
+        RuntimeComponentRole::Arm32AbiHelper => "arm32-abi-helper",
+        RuntimeComponentRole::DesktopBootstrap => "target-desktop-bootstrap",
+        RuntimeComponentRole::SessionBroker => "session-broker",
+    };
+    RuntimeComponentRecord {
+        id: id.into(),
+        path,
+        role,
+        size: bytes.len() as u64,
+        mode: 0o755,
+        sha256: artifacts::checksum(bytes),
+    }
+}
+
 /// Fresh directory for the native unit producer's held-directory contract.
 /// Set private permissions at creation rather than relying on runner umask or
 /// modifying a preexisting directory containing another operation's evidence.
@@ -412,18 +435,7 @@ pub fn build_selected(
             "memcordon-session-broker" => RuntimeComponentRole::SessionBroker,
             _ => return Err(CiError::Message("unexpected production binary".into())),
         };
-        components.push(RuntimeComponentRecord {
-            id: if role == RuntimeComponentRole::SealedAgent {
-                "sealed-agent".into()
-            } else {
-                binary.clone()
-            },
-            path: filename.clone(),
-            role,
-            size: bytes.len() as u64,
-            mode: 0o755,
-            sha256: artifacts::checksum(&bytes),
-        });
+        components.push(runtime_component(role, filename.clone(), &bytes));
         executable_names.insert(filename.clone());
         members.insert(filename, bytes);
     }
